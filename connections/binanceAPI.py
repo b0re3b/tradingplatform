@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import websocket
 from utils.config import BINANCE_API_SECRET, BINANCE_API_KEY
-from data.db import DatabaseManager
+from exchanges.db import DatabaseManager
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -272,7 +272,7 @@ class BinanceClient:
             self.db_manager.log_event('ERROR', f"Error getting 24hr ticker statistics: {e}", 'BinanceClient')
             return {}
 
-    # ===== WebSocket methods for real-time data =====
+    # ===== WebSocket methods for real-time exchanges =====
 
     def _save_kline_to_db(self, kline_data):
         """
