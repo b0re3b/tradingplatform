@@ -607,3 +607,15 @@ class OrderBookCache:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+#Важливе архітектурне правило, якого я дотримався
+
+#OrderBookCache тут:
+
+#не підключається сам до біржі
+#не приймає торгових рішень
+#не робить аналітику
+#не зберігає історію в БД
+
+#Він робить тільки своє:
+#snapshot + delta + sequence validation + локальний state.
