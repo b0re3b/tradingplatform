@@ -1,276 +1,140 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
-from decimal import Decimal, InvalidOperation
-from enum import Enum
-from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Any
 
 from core.logger import get_logger
 
+from .enums import (
+    InstrumentType,
+    OpportunityStatus,
+    PricingSource,
+    QuoteValidity,
+    SpreadRegime,
+    SpreadSignalType,
+    SpreadType,
+)
+from .models import ArbitrageOpportunity, QuoteSnapshot, SpreadSignal, SpreadSnapshot
+from .utils import (
+    RollingDecimalWindow,
+    aligned_quotes,
+    estimate_fee_cost,
+    estimate_simple_slippage,
+    infer_direction,
+    infer_regime,
+    net_edge_after_costs,
+    normalize_exchange,
+    normalize_symbol,
+    quote_age_ms,
+    safe_div,
+    spread_abs,
+    spread_bps,
+    spread_pct,
+    validate_quote_snapshot,
+)
 
-class SpreadSide(str, Enum):
-    BUY_A_SELL_B = "buy_a_sell_b"
-    BUY_B_SELL_A = "buy_b_sell_a"
-
-
-class OpportunityStatus(str, Enum):
-    ACTIVE = "active"
-    EXPIRED = "expired"
-    REJECTED = "rejected"
-
-
-@dataclass(slots=True)
-class ExchangeFee:
-    maker: Decimal = Decimal("0")
-    taker: Decimal = Decimal("0")
-    withdrawal: Decimal = Decimal("0")
-
-    @classmethod
-    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "ExchangeFee":
-        if not data:
-            return cls()
-        return cls(
-            maker=_d(data.get("maker", 0)),
-            taker=_d(data.get("taker", 0)),
-            withdrawal=_d(data.get("withdrawal", 0)),
-        )
-
-
-@dataclass(slots=True)
-class BestQuote:
-    exchange: str
-    symbol: str
-    bid: Decimal
-    ask: Decimal
-    bid_size: Decimal
-    ask_size: Decimal
-    ts_exchange: float
-    ts_received: float
-    sequence: Optional[int] = None
-    raw: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def mid(self) -> Decimal:
-        if self.bid <= 0 or self.ask <= 0:
-            return Decimal("0")
-        return (self.bid + self.ask) / Decimal("2")
-
-    @property
-    def spread_abs(self) -> Decimal:
-        return max(Decimal("0"), self.ask - self.bid)
-
-    @property
-    def is_valid(self) -> bool:
-        return (
-            self.bid > 0
-            and self.ask > 0
-            and self.ask >= self.bid
-            and self.bid_size >= 0
-            and self.ask_size >= 0
-        )
+DEFAULT_ZERO = Decimal("0")
 
 
 @dataclass(slots=True)
-class SpreadOpportunity:
-    symbol: str
-    buy_exchange: str
-    sell_exchange: str
-    buy_price: Decimal
-    sell_price: Decimal
-    executable_size: Decimal
-    gross_spread_abs: Decimal
-    gross_spread_bps: Decimal
-    estimated_fees_abs: Decimal
-    estimated_slippage_abs: Decimal
-    net_spread_abs: Decimal
-    net_spread_bps: Decimal
-    confidence: Decimal
-    side: SpreadSide
-    detected_at: float
-    latency_ms_buy: float
-    latency_ms_sell: float
-    quote_age_diff_ms: float
-    status: OpportunityStatus = OpportunityStatus.ACTIVE
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-    def to_payload(self) -> Dict[str, Any]:
-        data = asdict(self)
-        for key, value in list(data.items()):
-            if isinstance(value, Decimal):
-                data[key] = str(value)
-            elif isinstance(value, Enum):
-                data[key] = value.value
-        return data
-
-
-@dataclass(slots=True)
-class SpreadStats:
-    quotes_ingested: int = 0
-    opportunities_emitted: int = 0
-    opportunities_rejected: int = 0
-    stale_quotes_dropped: int = 0
-    invalid_quotes_dropped: int = 0
-    symbols_evaluated: int = 0
-    pairs_evaluated: int = 0
-    cooldown_skips: int = 0
-    same_exchange_skips: int = 0
-    insufficient_size_skips: int = 0
-
-    def to_dict(self) -> Dict[str, int]:
-        return asdict(self)
-
-
-@dataclass(slots=True)
-class CrossExchangeSpreadsConfig:
+class CrossExchangeSpreadConfig:
     enabled: bool = True
-    symbols: Tuple[str, ...] = ()
-    exchanges: Tuple[str, ...] = ()
-    min_net_spread_bps: Decimal = Decimal("4")
-    min_gross_spread_bps: Decimal = Decimal("6")
-    min_executable_notional_usdt: Decimal = Decimal("100")
-    min_confidence: Decimal = Decimal("0.55")
-    max_quote_age_ms: int = 1800
-    max_cross_exchange_time_diff_ms: int = 800
-    opportunity_ttl_ms: int = 1500
-    evaluation_cooldown_ms: int = 300
-    default_slippage_bps: Decimal = Decimal("1.5")
-    slippage_multiplier: Decimal = Decimal("1.0")
-    emit_rejections: bool = False
-    publish_topic: str = "analytics.cross_exchange_spreads.opportunity"
-    rejection_topic: str = "analytics.cross_exchange_spreads.rejection"
-    metrics_topic: str = "analytics.cross_exchange_spreads.metrics"
-    health_topic: str = "analytics.cross_exchange_spreads.health"
-    log_snapshots: bool = False
-    snapshot_depth: int = 200
 
-    @classmethod
-    def from_mapping(cls, data: Optional[Mapping[str, Any]]) -> "CrossExchangeSpreadsConfig":
-        if not data:
-            return cls()
-        return cls(
-            enabled=bool(data.get("enabled", True)),
-            symbols=tuple(data.get("symbols", ()) or ()),
-            exchanges=tuple(data.get("exchanges", ()) or ()),
-            min_net_spread_bps=_d(data.get("min_net_spread_bps", 4)),
-            min_gross_spread_bps=_d(data.get("min_gross_spread_bps", 6)),
-            min_executable_notional_usdt=_d(data.get("min_executable_notional_usdt", 100)),
-            min_confidence=_d(data.get("min_confidence", "0.55")),
-            max_quote_age_ms=int(data.get("max_quote_age_ms", 1800)),
-            max_cross_exchange_time_diff_ms=int(data.get("max_cross_exchange_time_diff_ms", 800)),
-            opportunity_ttl_ms=int(data.get("opportunity_ttl_ms", 1500)),
-            evaluation_cooldown_ms=int(data.get("evaluation_cooldown_ms", 300)),
-            default_slippage_bps=_d(data.get("default_slippage_bps", "1.5")),
-            slippage_multiplier=_d(data.get("slippage_multiplier", "1.0")),
-            emit_rejections=bool(data.get("emit_rejections", False)),
-            publish_topic=str(
-                data.get("publish_topic", "analytics.cross_exchange_spreads.opportunity")
-            ),
-            rejection_topic=str(
-                data.get("rejection_topic", "analytics.cross_exchange_spreads.rejection")
-            ),
-            metrics_topic=str(data.get("metrics_topic", "analytics.cross_exchange_spreads.metrics")),
-            health_topic=str(data.get("health_topic", "analytics.cross_exchange_spreads.health")),
-            log_snapshots=bool(data.get("log_snapshots", False)),
-            snapshot_depth=int(data.get("snapshot_depth", 200)),
-        )
+    max_quote_age_ms: int = 2_000
+    max_quote_skew_ms: int = 1_000
+
+    rolling_window_size: int = 500
+    ema_alpha: Decimal = Decimal("0.2")
+
+    min_emit_interval_ms: int = 250
+    cooldown_seconds: int = 10
+
+    arbitrage_min_bps: Decimal = Decimal("5")
+    anomaly_zscore_threshold: Decimal = Decimal("2.5")
+    widening_bps_threshold: Decimal = Decimal("8")
+
+    default_trade_size: Decimal = Decimal("1")
+    slippage_max_bps: Decimal = Decimal("5")
+    safety_buffer_bps: Decimal = Decimal("1")
+
+    default_taker_fee_rate: Decimal = Decimal("0.001")
+    default_maker_fee_rate: Decimal = Decimal("0.0005")
+
+    allowed_instrument_types: set[InstrumentType] = field(
+        default_factory=lambda: {InstrumentType.SPOT, InstrumentType.PERPETUAL, InstrumentType.FUTURES}
+    )
+    preferred_exchanges: set[str] = field(default_factory=set)
+
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-class CrossExchangeSpreads:
+class CrossExchangeSpreadAnalyzer:
     """
-    Analytics-модуль для пошуку крос-біржових спредів.
+    Аналізатор cross-exchange спредів.
 
-    Концепція:
-    - слухає нормалізовані top-of-book / best bid-ask події
-    - зберігає останні котирування по symbol/exchange
-    - порівнює біржі між собою
-    - оцінює gross/net spread з урахуванням fees/slippage
-    - публікує opportunity events у EventBus
-
-    Очікуваний формат події:
-    {
-        "exchange": "binance",
-        "symbol": "BTCUSDT",
-        "bid": "65000.10",
-        "ask": "65000.30",
-        "bid_size": "0.8",
-        "ask_size": "1.2",
-        "ts_exchange": 1710000000.123,
-        "ts_received": 1710000000.130,
-        "sequence": 12345,
-        ...
-    }
+    Основні задачі:
+    - приймати quotes з кількох бірж
+    - порівнювати той самий інструмент між біржами
+    - рахувати gross spread / spread bps / net edge
+    - враховувати fees/slippage
+    - знаходити arbitrage opportunities
+    - публікувати snapshots і signals
     """
 
     def __init__(
         self,
-        *,
+        config: CrossExchangeSpreadConfig,
         event_bus: Any,
-        config: Optional[CrossExchangeSpreadsConfig | Mapping[str, Any]] = None,
-        scheduler: Optional[Any] = None,
-        module_name: str = "CrossExchangeSpreads",
-        exchange_fees: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        scheduler: Any | None = None,
     ) -> None:
-        self.event_bus = event_bus
-        self.scheduler = scheduler
-        self.config = (
-            config
-            if isinstance(config, CrossExchangeSpreadsConfig)
-            else CrossExchangeSpreadsConfig.from_mapping(config)
-        )
-        self.module_name = module_name
-
-        self.logger = get_logger(
-            __name__,
-            service_name="analytics.cross_exchange_spreads",
-            component=self.module_name,
-        )
-
-        self._quotes: Dict[str, Dict[str, BestQuote]] = defaultdict(dict)
-        self._fees: Dict[str, ExchangeFee] = {
-            exchange.lower(): ExchangeFee.from_mapping(data)
-            for exchange, data in (exchange_fees or {}).items()
-        }
-        self._last_eval_ts: Dict[str, float] = {}
-        self._active_opportunities: Dict[str, SpreadOpportunity] = {}
-        self._history: Deque[Dict[str, Any]] = deque(maxlen=self.config.snapshot_depth)
-        self._stats = SpreadStats()
+        self._config = config
+        self._event_bus = event_bus
+        self._scheduler = scheduler
+        self._logger = get_logger(__name__, service_name="cross_exchange_spread")
 
         self._running = False
         self._lock = asyncio.Lock()
-        self._subscriptions: List[Any] = []
-        self._scheduler_jobs: List[str] = []
 
-        self.logger.info(
-            "CrossExchangeSpreads initialized",
-            extra={
-                "enabled": self.config.enabled,
-                "symbols": list(self.config.symbols),
-                "exchanges": list(self.config.exchanges),
-                "min_net_spread_bps": str(self.config.min_net_spread_bps),
-                "max_quote_age_ms": self.config.max_quote_age_ms,
-            },
-        )
+        self._quotes: dict[tuple[str, str, InstrumentType], QuoteSnapshot] = {}
+        self._spread_windows: dict[tuple[str, str, str, InstrumentType], RollingDecimalWindow] = {}
+        self._latest_snapshots: dict[tuple[str, str, str, InstrumentType], SpreadSnapshot] = {}
+        self._latest_opportunities: dict[tuple[str, str, str, InstrumentType], ArbitrageOpportunity] = {}
 
-    # =========================
-    # Lifecycle
-    # =========================
+        self._last_signal_times: dict[str, datetime] = {}
+        self._last_emit_times: dict[tuple[str, str, str, InstrumentType], datetime] = {}
+
+        self._stats: dict[str, int] = {
+            "quotes_received": 0,
+            "calculations_total": 0,
+            "snapshots_published": 0,
+            "signals_published": 0,
+            "opportunities_published": 0,
+            "invalid_quotes": 0,
+            "stale_quotes": 0,
+            "unaligned_quotes": 0,
+            "cooldown_skips": 0,
+            "emit_skips": 0,
+            "exceptions": 0,
+        }
 
     async def start(self) -> None:
         if self._running:
-            self.logger.warning("CrossExchangeSpreads already running")
             return
 
         self._running = True
-
         await self._subscribe_events()
-        await self._register_jobs()
 
-        self.logger.info(
-            "CrossExchangeSpreads started",
-            extra={"module": self.module_name},
+        self._logger.info(
+            "CrossExchangeSpreadAnalyzer started",
+            extra={
+                "max_quote_age_ms": self._config.max_quote_age_ms,
+                "max_quote_skew_ms": self._config.max_quote_skew_ms,
+                "rolling_window_size": self._config.rolling_window_size,
+                "arbitrage_min_bps": str(self._config.arbitrage_min_bps),
+            },
         )
 
     async def stop(self) -> None:
@@ -278,732 +142,660 @@ class CrossExchangeSpreads:
             return
 
         self._running = False
+        self._logger.info("CrossExchangeSpreadAnalyzer stopped")
 
-        await self._unsubscribe_events()
-        await self._remove_jobs()
+    async def on_quote_update(self, quote: QuoteSnapshot) -> None:
+        if not self._running or not self._config.enabled:
+            return
 
-        self.logger.info(
-            "CrossExchangeSpreads stopped",
-            extra={
-                "stats": self._stats.to_dict(),
-                "active_opportunities": len(self._active_opportunities),
-            },
+        async with self._lock:
+            try:
+                self._stats["quotes_received"] += 1
+
+                normalized_quote = self._normalize_quote(quote)
+
+                if normalized_quote.instrument_type not in self._config.allowed_instrument_types:
+                    return
+
+                validity = validate_quote_snapshot(
+                    normalized_quote,
+                    max_age_ms=self._config.max_quote_age_ms,
+                )
+
+                if validity == QuoteValidity.INVALID:
+                    self._stats["invalid_quotes"] += 1
+                    return
+
+                if validity == QuoteValidity.STALE:
+                    self._stats["stale_quotes"] += 1
+                    return
+
+                if validity == QuoteValidity.INCOMPLETE:
+                    return
+
+                self._store_quote(normalized_quote)
+                await self._recalculate_for_quote(normalized_quote)
+
+            except Exception as exc:
+                self._stats["exceptions"] += 1
+                self._logger.exception(
+                    "Failed to process cross-exchange quote update",
+                    extra={"error": str(exc)},
+                )
+
+    def get_latest_snapshot(
+        self,
+        symbol: str,
+        exchange_a: str,
+        exchange_b: str,
+        instrument_type: InstrumentType,
+    ) -> SpreadSnapshot | None:
+        key = (
+            normalize_symbol(symbol),
+            normalize_exchange(exchange_a),
+            normalize_exchange(exchange_b),
+            instrument_type,
         )
+        return self._latest_snapshots.get(key)
 
-    @property
-    def is_running(self) -> bool:
-        return self._running
+    def get_best_opportunities(
+        self,
+        symbol: str | None = None,
+        instrument_type: InstrumentType | None = None,
+        profitable_only: bool = True,
+    ) -> list[ArbitrageOpportunity]:
+        opportunities = list(self._latest_opportunities.values())
 
-    # =========================
-    # Event wiring
-    # =========================
+        if symbol is not None:
+            symbol = normalize_symbol(symbol)
+            opportunities = [op for op in opportunities if op.symbol == symbol]
 
-    async def _subscribe_events(self) -> None:
-        """
-        Підписки підлаштуй під свій EventBus API.
-        Нижче — концептуально нейтральна форма.
-        """
-        if hasattr(self.event_bus, "subscribe"):
-            handlers = [
-                ("market.best_quote", self.on_best_quote),
-                ("market.ticker", self.on_best_quote),
-                ("market.orderbook.top", self.on_best_quote),
+        if instrument_type is not None:
+            opportunities = [
+                op
+                for op in opportunities
+                if op.buy_instrument_type == instrument_type and op.sell_instrument_type == instrument_type
             ]
 
-            for topic, handler in handlers:
-                try:
-                    sub = await _maybe_await(self.event_bus.subscribe(topic, handler))
-                    self._subscriptions.append((topic, handler, sub))
-                    self.logger.info(
-                        "Subscribed to topic",
-                        extra={"topic": topic},
-                    )
-                except Exception as exc:
-                    self.logger.exception(
-                        "Failed to subscribe",
-                        extra={"topic": topic, "error": str(exc)},
-                    )
+        if profitable_only:
+            opportunities = [op for op in opportunities if op.is_profitable]
 
-    async def _unsubscribe_events(self) -> None:
-        if not hasattr(self.event_bus, "unsubscribe"):
-            self._subscriptions.clear()
+        opportunities.sort(key=lambda item: item.net_edge, reverse=True)
+        return opportunities
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            **self._stats,
+            "quotes_cached": len(self._quotes),
+            "active_windows": len(self._spread_windows),
+            "latest_snapshots": len(self._latest_snapshots),
+            "latest_opportunities": len(self._latest_opportunities),
+        }
+
+    async def _subscribe_events(self) -> None:
+        subscribe = getattr(self._event_bus, "subscribe", None)
+        if subscribe is None:
+            self._logger.warning("EventBus does not expose subscribe()")
             return
 
-        for topic, handler, sub in self._subscriptions:
-            try:
-                if sub is not None:
-                    await _maybe_await(self.event_bus.unsubscribe(topic, sub))
-                else:
-                    await _maybe_await(self.event_bus.unsubscribe(topic, handler))
-            except Exception as exc:
-                self.logger.exception(
-                    "Failed to unsubscribe",
-                    extra={"topic": topic, "error": str(exc)},
-                )
-        self._subscriptions.clear()
-
-    async def _register_jobs(self) -> None:
-        if self.scheduler is None:
-            return
-
-        if hasattr(self.scheduler, "add_interval_job"):
-            try:
-                job = await _maybe_await(
-                    self.scheduler.add_interval_job(
-                        name="cross_exchange_spreads_prune",
-                        interval_seconds=max(1, self.config.opportunity_ttl_ms // 1000),
-                        coro=self.prune_expired_opportunities,
-                        enabled=True,
-                        tags=["analytics", "cross_exchange_spreads"],
-                    )
-                )
-                self._scheduler_jobs.append(getattr(job, "id", "cross_exchange_spreads_prune"))
-            except Exception as exc:
-                self.logger.exception(
-                    "Failed to register prune job",
-                    extra={"error": str(exc)},
-                )
-
-            try:
-                job = await _maybe_await(
-                    self.scheduler.add_interval_job(
-                        name="cross_exchange_spreads_emit_health",
-                        interval_seconds=5,
-                        coro=self.emit_health,
-                        enabled=True,
-                        tags=["analytics", "cross_exchange_spreads"],
-                    )
-                )
-                self._scheduler_jobs.append(
-                    getattr(job, "id", "cross_exchange_spreads_emit_health")
-                )
-            except Exception as exc:
-                self.logger.exception(
-                    "Failed to register health job",
-                    extra={"error": str(exc)},
-                )
-
-    async def _remove_jobs(self) -> None:
-        if self.scheduler is None or not hasattr(self.scheduler, "remove_job"):
-            self._scheduler_jobs.clear()
-            return
-
-        for job_id in self._scheduler_jobs:
-            try:
-                await _maybe_await(self.scheduler.remove_job(job_id))
-            except Exception as exc:
-                self.logger.exception(
-                    "Failed to remove scheduler job",
-                    extra={"job_id": job_id, "error": str(exc)},
-                )
-        self._scheduler_jobs.clear()
-
-    # =========================
-    # Public ingestion API
-    # =========================
-
-    async def on_best_quote(self, event: Mapping[str, Any]) -> None:
-        if not self._running or not self.config.enabled:
-            return
-
-        quote = self._normalize_quote(event)
-        if quote is None:
-            return
-
-        async with self._lock:
-            self._stats.quotes_ingested += 1
-            self._quotes[quote.symbol][quote.exchange] = quote
-
-            if self.config.log_snapshots:
-                self._history.append(
-                    {
-                        "type": "quote",
-                        "ts": time.time(),
-                        "symbol": quote.symbol,
-                        "exchange": quote.exchange,
-                        "bid": str(quote.bid),
-                        "ask": str(quote.ask),
-                        "bid_size": str(quote.bid_size),
-                        "ask_size": str(quote.ask_size),
-                    }
-                )
-
-            if self._should_skip_eval_due_to_cooldown(quote.symbol):
-                self._stats.cooldown_skips += 1
-                return
-
-            self._last_eval_ts[quote.symbol] = time.time()
-
-            await self._evaluate_symbol(quote.symbol)
-
-    async def update_fee(self, exchange: str, *, maker: Any = None, taker: Any = None, withdrawal: Any = None) -> None:
-        exchange = exchange.lower().strip()
-        current = self._fees.get(exchange, ExchangeFee())
-
-        self._fees[exchange] = ExchangeFee(
-            maker=_d(maker) if maker is not None else current.maker,
-            taker=_d(taker) if taker is not None else current.taker,
-            withdrawal=_d(withdrawal) if withdrawal is not None else current.withdrawal,
+        await self._maybe_await(
+            subscribe("quote.updated", self.on_quote_update)
         )
 
-        self.logger.info(
-            "Exchange fee updated",
-            extra={
-                "exchange": exchange,
-                "maker": str(self._fees[exchange].maker),
-                "taker": str(self._fees[exchange].taker),
-                "withdrawal": str(self._fees[exchange].withdrawal),
+    def _normalize_quote(self, quote: QuoteSnapshot) -> QuoteSnapshot:
+        return QuoteSnapshot(
+            exchange=normalize_exchange(quote.exchange),
+            symbol=normalize_symbol(quote.symbol),
+            instrument_type=quote.instrument_type,
+            bid=quote.bid,
+            ask=quote.ask,
+            bid_size=quote.bid_size,
+            ask_size=quote.ask_size,
+            last_price=quote.last_price,
+            mark_price=quote.mark_price,
+            index_price=quote.index_price,
+            timestamp=quote.timestamp,
+            received_at=quote.received_at,
+            sequence_id=quote.sequence_id,
+            metadata=dict(quote.metadata),
+        )
+
+    def _store_quote(self, quote: QuoteSnapshot) -> None:
+        key = (quote.exchange, quote.symbol, quote.instrument_type)
+        self._quotes[key] = quote
+
+    async def _recalculate_for_quote(self, quote: QuoteSnapshot) -> None:
+        candidates = [
+            other
+            for (exchange, symbol, instrument_type), other in self._quotes.items()
+            if symbol == quote.symbol
+            and instrument_type == quote.instrument_type
+            and exchange != quote.exchange
+        ]
+
+        for other_quote in candidates:
+            if self._config.preferred_exchanges:
+                if (
+                    quote.exchange not in self._config.preferred_exchanges
+                    or other_quote.exchange not in self._config.preferred_exchanges
+                ):
+                    continue
+
+            await self._try_build_and_publish(quote, other_quote)
+
+    async def _try_build_and_publish(
+        self,
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> None:
+        if quote_a.symbol != quote_b.symbol:
+            return
+
+        if quote_a.instrument_type != quote_b.instrument_type:
+            return
+
+        validity_a = validate_quote_snapshot(
+            quote_a,
+            max_age_ms=self._config.max_quote_age_ms,
+        )
+        validity_b = validate_quote_snapshot(
+            quote_b,
+            max_age_ms=self._config.max_quote_age_ms,
+        )
+
+        if validity_a == QuoteValidity.STALE or validity_b == QuoteValidity.STALE:
+            self._stats["stale_quotes"] += 1
+            return
+
+        if validity_a != QuoteValidity.VALID or validity_b != QuoteValidity.VALID:
+            self._stats["invalid_quotes"] += 1
+            return
+
+        if not aligned_quotes(
+            quote_a,
+            quote_b,
+            max_age_diff_ms=self._config.max_quote_skew_ms,
+        ):
+            self._stats["unaligned_quotes"] += 1
+            return
+
+        ordered_a, ordered_b = self._order_quotes(quote_a, quote_b)
+
+        snapshot = self._build_snapshot(ordered_a, ordered_b)
+        if snapshot is None:
+            return
+
+        key = (
+            snapshot.symbol,
+            snapshot.leg_a_exchange,
+            snapshot.leg_b_exchange,
+            snapshot.leg_a_type,
+        )
+
+        if self._should_skip_emit(key, snapshot.timestamp):
+            self._stats["emit_skips"] += 1
+            return
+
+        self._latest_snapshots[key] = snapshot
+        self._stats["calculations_total"] += 1
+
+        await self._publish_snapshot(snapshot)
+        await self._evaluate_and_publish_signals(snapshot)
+        await self._maybe_publish_opportunity(snapshot)
+
+    def _order_quotes(
+        self,
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> tuple[QuoteSnapshot, QuoteSnapshot]:
+        if quote_a.exchange <= quote_b.exchange:
+            return quote_a, quote_b
+        return quote_b, quote_a
+
+    def _build_snapshot(
+        self,
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> SpreadSnapshot | None:
+        symbol = quote_a.symbol
+        instrument_type = quote_a.instrument_type
+
+        mid_a = quote_a.mid_price
+        mid_b = quote_b.mid_price
+
+        raw_spread = spread_abs(mid_b, mid_a)
+        if raw_spread is None:
+            return None
+
+        spread_percent = spread_pct(raw_spread, mid_a)
+        spread_bps_value = spread_bps(raw_spread, mid_a)
+
+        buy_exchange, sell_exchange, buy_price, sell_price = self._best_arbitrage_legs(
+            quote_a,
+            quote_b,
+        )
+
+        gross_edge = None
+        estimated_fees = None
+        estimated_slippage = None
+        net_edge = None
+
+        if buy_exchange is not None and sell_exchange is not None:
+            gross_edge = sell_price - buy_price
+
+            estimated_fees = self._estimate_total_fees(
+                buy_price=buy_price,
+                sell_price=sell_price,
+                quantity=self._config.default_trade_size,
+                buy_exchange=buy_exchange,
+                sell_exchange=sell_exchange,
+            )
+            estimated_slippage = self._estimate_total_slippage(
+                quote_a=quote_a,
+                quote_b=quote_b,
+                quantity=self._config.default_trade_size,
+            )
+            net_edge = net_edge_after_costs(
+                gross_edge=gross_edge,
+                fees=estimated_fees,
+                slippage=estimated_slippage,
+            )
+
+        window_key = (symbol, quote_a.exchange, quote_b.exchange, instrument_type)
+        window = self._spread_windows.get(window_key)
+        if window is None:
+            window = RollingDecimalWindow(
+                maxlen=self._config.rolling_window_size,
+                ema_alpha=self._config.ema_alpha,
+            )
+            self._spread_windows[window_key] = window
+
+        window.append(raw_spread)
+        stats = window.stats()
+
+        regime = infer_regime(
+            stats.zscore,
+            elevated_threshold=Decimal("1.5"),
+            extreme_threshold=self._config.anomaly_zscore_threshold,
+            compressed_threshold=Decimal("0.5"),
+        )
+
+        return SpreadSnapshot(
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=symbol,
+            leg_a_exchange=quote_a.exchange,
+            leg_b_exchange=quote_b.exchange,
+            leg_a_type=instrument_type,
+            leg_b_type=instrument_type,
+            pricing_source=PricingSource.BID_ASK,
+            raw_spread=raw_spread,
+            spread_pct=spread_percent,
+            spread_bps=spread_bps_value,
+            net_spread=net_edge,
+            basis=None,
+            funding_adjusted_spread=None,
+            direction=infer_direction(raw_spread),
+            regime=regime,
+            stats=stats,
+            leg_a_bid=quote_a.bid,
+            leg_a_ask=quote_a.ask,
+            leg_b_bid=quote_b.bid,
+            leg_b_ask=quote_b.ask,
+            leg_a_mid=mid_a,
+            leg_b_mid=mid_b,
+            estimated_fees=estimated_fees,
+            estimated_slippage=estimated_slippage,
+            quote_validity=QuoteValidity.VALID,
+            timestamp=max(quote_a.timestamp, quote_b.timestamp),
+            metadata={
+                "instrument_type": instrument_type.value,
+                "buy_exchange": buy_exchange,
+                "sell_exchange": sell_exchange,
+                "buy_price": str(buy_price) if buy_price is not None else None,
+                "sell_price": str(sell_price) if sell_price is not None else None,
+                "gross_edge": str(gross_edge) if gross_edge is not None else None,
+                "quote_a_age_ms": quote_age_ms(quote_a),
+                "quote_b_age_ms": quote_age_ms(quote_b),
             },
         )
 
-    async def force_evaluate(self, symbol: str) -> None:
-        async with self._lock:
-            await self._evaluate_symbol(symbol.upper().strip())
-
-    # =========================
-    # Core logic
-    # =========================
-
-    async def _evaluate_symbol(self, symbol: str) -> None:
-        quotes_map = self._quotes.get(symbol, {})
-        if len(quotes_map) < 2:
-            return
-
-        self._stats.symbols_evaluated += 1
-
-        quotes = [q for q in quotes_map.values() if self._is_quote_usable(q)]
-        if len(quotes) < 2:
-            return
-
-        best_opportunity: Optional[SpreadOpportunity] = None
-        best_rejection: Optional[Dict[str, Any]] = None
-
-        for i in range(len(quotes)):
-            for j in range(i + 1, len(quotes)):
-                qa = quotes[i]
-                qb = quotes[j]
-
-                self._stats.pairs_evaluated += 1
-
-                candidate_ab = self._build_opportunity(buy_quote=qa, sell_quote=qb)
-                candidate_ba = self._build_opportunity(buy_quote=qb, sell_quote=qa)
-
-                for candidate in (candidate_ab, candidate_ba):
-                    if candidate is None:
-                        continue
-
-                    accepted, reason = self._accept_opportunity(candidate)
-
-                    if accepted:
-                        if (
-                            best_opportunity is None
-                            or candidate.net_spread_bps > best_opportunity.net_spread_bps
-                        ):
-                            best_opportunity = candidate
-                    else:
-                        if best_rejection is None:
-                            best_rejection = {
-                                "symbol": symbol,
-                                "reason": reason,
-                                "candidate": candidate.to_payload(),
-                            }
-
-        if best_opportunity:
-            await self._emit_opportunity(best_opportunity)
-        elif best_rejection and self.config.emit_rejections:
-            await self._emit_rejection(best_rejection)
-
-    def _build_opportunity(
+    def _best_arbitrage_legs(
         self,
-        *,
-        buy_quote: BestQuote,
-        sell_quote: BestQuote,
-    ) -> Optional[SpreadOpportunity]:
-        if buy_quote.exchange == sell_quote.exchange:
-            self._stats.same_exchange_skips += 1
-            return None
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> tuple[str | None, str | None, Decimal | None, Decimal | None]:
+        if quote_a.ask is None or quote_a.bid is None or quote_b.ask is None or quote_b.bid is None:
+            return None, None, None, None
 
-        if buy_quote.ask <= 0 or sell_quote.bid <= 0:
-            return None
+        option_1_buy = quote_a.exchange
+        option_1_sell = quote_b.exchange
+        option_1_buy_price = quote_a.ask
+        option_1_sell_price = quote_b.bid
+        option_1_edge = option_1_sell_price - option_1_buy_price
 
-        gross_spread_abs = sell_quote.bid - buy_quote.ask
-        if gross_spread_abs <= 0:
-            return None
+        option_2_buy = quote_b.exchange
+        option_2_sell = quote_a.exchange
+        option_2_buy_price = quote_b.ask
+        option_2_sell_price = quote_a.bid
+        option_2_edge = option_2_sell_price - option_2_buy_price
 
-        executable_size = min(buy_quote.ask_size, sell_quote.bid_size)
-        if executable_size <= 0:
-            self._stats.insufficient_size_skips += 1
-            return None
+        if option_1_edge >= option_2_edge and option_1_edge > DEFAULT_ZERO:
+            return option_1_buy, option_1_sell, option_1_buy_price, option_1_sell_price
 
-        reference_price = max(buy_quote.ask, Decimal("0.00000001"))
-        gross_spread_bps = (gross_spread_abs / reference_price) * Decimal("10000")
+        if option_2_edge > option_1_edge and option_2_edge > DEFAULT_ZERO:
+            return option_2_buy, option_2_sell, option_2_buy_price, option_2_sell_price
 
-        fees_abs = self._estimate_total_fees_abs(
-            buy_exchange=buy_quote.exchange,
-            sell_exchange=sell_quote.exchange,
-            buy_price=buy_quote.ask,
-            sell_price=sell_quote.bid,
-            size=executable_size,
-        )
+        return None, None, None, None
 
-        slippage_abs = self._estimate_slippage_abs(
-            buy_quote=buy_quote,
-            sell_quote=sell_quote,
-            size=executable_size,
-        )
-
-        net_spread_abs = gross_spread_abs - fees_abs - slippage_abs
-        net_spread_bps = (net_spread_abs / reference_price) * Decimal("10000")
-
-        now = time.time()
-        latency_ms_buy = max(0.0, (now - buy_quote.ts_received) * 1000.0)
-        latency_ms_sell = max(0.0, (now - sell_quote.ts_received) * 1000.0)
-        quote_age_diff_ms = abs(buy_quote.ts_received - sell_quote.ts_received) * 1000.0
-
-        confidence = self._estimate_confidence(
-            buy_quote=buy_quote,
-            sell_quote=sell_quote,
-            gross_spread_bps=gross_spread_bps,
-            net_spread_bps=net_spread_bps,
-            executable_size=executable_size,
-            quote_age_diff_ms=quote_age_diff_ms,
-        )
-
-        return SpreadOpportunity(
-            symbol=buy_quote.symbol,
-            buy_exchange=buy_quote.exchange,
-            sell_exchange=sell_quote.exchange,
-            buy_price=buy_quote.ask,
-            sell_price=sell_quote.bid,
-            executable_size=executable_size,
-            gross_spread_abs=gross_spread_abs,
-            gross_spread_bps=gross_spread_bps,
-            estimated_fees_abs=fees_abs,
-            estimated_slippage_abs=slippage_abs,
-            net_spread_abs=net_spread_abs,
-            net_spread_bps=net_spread_bps,
-            confidence=confidence,
-            side=SpreadSide.BUY_A_SELL_B,
-            detected_at=now,
-            latency_ms_buy=latency_ms_buy,
-            latency_ms_sell=latency_ms_sell,
-            quote_age_diff_ms=quote_age_diff_ms,
-            meta={
-                "buy_mid": str(buy_quote.mid),
-                "sell_mid": str(sell_quote.mid),
-                "buy_bid": str(buy_quote.bid),
-                "buy_ask": str(buy_quote.ask),
-                "sell_bid": str(sell_quote.bid),
-                "sell_ask": str(sell_quote.ask),
-                "buy_sequence": buy_quote.sequence,
-                "sell_sequence": sell_quote.sequence,
-            },
-        )
-
-    def _accept_opportunity(self, opportunity: SpreadOpportunity) -> Tuple[bool, str]:
-        if opportunity.gross_spread_bps < self.config.min_gross_spread_bps:
-            self._stats.opportunities_rejected += 1
-            return False, "gross_spread_below_threshold"
-
-        if opportunity.net_spread_bps < self.config.min_net_spread_bps:
-            self._stats.opportunities_rejected += 1
-            return False, "net_spread_below_threshold"
-
-        notional = opportunity.buy_price * opportunity.executable_size
-        if notional < self.config.min_executable_notional_usdt:
-            self._stats.opportunities_rejected += 1
-            return False, "notional_below_threshold"
-
-        if opportunity.quote_age_diff_ms > self.config.max_cross_exchange_time_diff_ms:
-            self._stats.opportunities_rejected += 1
-            return False, "quote_time_diff_too_large"
-
-        if opportunity.confidence < self.config.min_confidence:
-            self._stats.opportunities_rejected += 1
-            return False, "confidence_below_threshold"
-
-        return True, "accepted"
-
-    def _estimate_total_fees_abs(
+    def _estimate_total_fees(
         self,
-        *,
-        buy_exchange: str,
-        sell_exchange: str,
         buy_price: Decimal,
         sell_price: Decimal,
-        size: Decimal,
+        quantity: Decimal,
+        buy_exchange: str,
+        sell_exchange: str,
     ) -> Decimal:
-        buy_fee = self._fees.get(buy_exchange.lower(), ExchangeFee())
-        sell_fee = self._fees.get(sell_exchange.lower(), ExchangeFee())
+        buy_fee_rate = self._get_fee_rate(buy_exchange, side="buy")
+        sell_fee_rate = self._get_fee_rate(sell_exchange, side="sell")
 
-        buy_notional = buy_price * size
-        sell_notional = sell_price * size
+        buy_fee = estimate_fee_cost(
+            price=buy_price,
+            quantity=quantity,
+            fee_rate=buy_fee_rate,
+        )
+        sell_fee = estimate_fee_cost(
+            price=sell_price,
+            quantity=quantity,
+            fee_rate=sell_fee_rate,
+        )
+        return buy_fee + sell_fee
 
-        buy_fee_abs = buy_notional * buy_fee.taker
-        sell_fee_abs = sell_notional * sell_fee.taker
-
-        return buy_fee_abs + sell_fee_abs
-
-    def _estimate_slippage_abs(
+    def _estimate_total_slippage(
         self,
-        *,
-        buy_quote: BestQuote,
-        sell_quote: BestQuote,
-        size: Decimal,
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+        quantity: Decimal,
     ) -> Decimal:
-        """
-        Базова модель:
-        - беремо default_slippage_bps
-        - штрафуємо за низьку ліквідність top-of-book
-        - масштабуємо через slippage_multiplier
-        """
-        base_bps = self.config.default_slippage_bps
+        slip_a_ratio = estimate_simple_slippage(
+            quantity=quantity,
+            top_book_size=quote_a.ask_size or quote_a.bid_size,
+            max_slippage_bps=self._config.slippage_max_bps,
+        )
+        slip_b_ratio = estimate_simple_slippage(
+            quantity=quantity,
+            top_book_size=quote_b.ask_size or quote_b.bid_size,
+            max_slippage_bps=self._config.slippage_max_bps,
+        )
 
-        buy_liquidity_penalty = self._liquidity_penalty(size=size, visible_size=buy_quote.ask_size)
-        sell_liquidity_penalty = self._liquidity_penalty(size=size, visible_size=sell_quote.bid_size)
+        cost_a = (quote_a.mid_price or DEFAULT_ZERO) * slip_a_ratio
+        cost_b = (quote_b.mid_price or DEFAULT_ZERO) * slip_b_ratio
 
-        total_bps = (base_bps + buy_liquidity_penalty + sell_liquidity_penalty) * self.config.slippage_multiplier
+        return cost_a + cost_b
 
-        ref_price = max(buy_quote.ask, sell_quote.bid)
-        return (ref_price * size) * (total_bps / Decimal("10000"))
+    def _get_fee_rate(self, exchange: str, side: str) -> Decimal:
+        fee_overrides = self._config.metadata.get("fee_rates", {})
+        exchange_rates = fee_overrides.get(exchange, {})
 
-    def _liquidity_penalty(self, *, size: Decimal, visible_size: Decimal) -> Decimal:
-        if visible_size <= 0:
-            return Decimal("50")
+        if side == "buy":
+            return Decimal(str(exchange_rates.get("buy", self._config.default_taker_fee_rate)))
 
-        ratio = size / visible_size
-        if ratio <= Decimal("0.25"):
-            return Decimal("0.20")
-        if ratio <= Decimal("0.50"):
-            return Decimal("0.50")
-        if ratio <= Decimal("0.80"):
-            return Decimal("1.20")
-        if ratio <= Decimal("1.00"):
-            return Decimal("2.50")
-        return Decimal("5.00")
+        if side == "sell":
+            return Decimal(str(exchange_rates.get("sell", self._config.default_taker_fee_rate)))
 
-    def _estimate_confidence(
-        self,
-        *,
-        buy_quote: BestQuote,
-        sell_quote: BestQuote,
-        gross_spread_bps: Decimal,
-        net_spread_bps: Decimal,
-        executable_size: Decimal,
-        quote_age_diff_ms: float,
-    ) -> Decimal:
-        """
-        Confidence score [0..1]:
-        - вищий net spread => краще
-        - менша розсинхронізація котирувань => краще
-        - більший executable size => краще
-        - надто широкий own spread на біржі => гірше
-        """
-        score = Decimal("0.50")
+        return self._config.default_taker_fee_rate
 
-        if net_spread_bps >= self.config.min_net_spread_bps * Decimal("2"):
-            score += Decimal("0.20")
-        elif net_spread_bps >= self.config.min_net_spread_bps:
-            score += Decimal("0.10")
+    async def _publish_snapshot(self, snapshot: SpreadSnapshot) -> None:
+        self._stats["snapshots_published"] += 1
 
-        if gross_spread_bps >= self.config.min_gross_spread_bps * Decimal("2"):
-            score += Decimal("0.05")
+        self._logger.debug(
+            "Cross-exchange spread snapshot published",
+            extra={
+                "symbol": snapshot.symbol,
+                "exchange_a": snapshot.leg_a_exchange,
+                "exchange_b": snapshot.leg_b_exchange,
+                "spread_bps": str(snapshot.spread_bps) if snapshot.spread_bps is not None else None,
+                "net_spread": str(snapshot.net_spread) if snapshot.net_spread is not None else None,
+            },
+        )
 
-        if quote_age_diff_ms <= self.config.max_cross_exchange_time_diff_ms * 0.25:
-            score += Decimal("0.10")
-        elif quote_age_diff_ms <= self.config.max_cross_exchange_time_diff_ms * 0.50:
-            score += Decimal("0.05")
-        else:
-            score -= Decimal("0.10")
+        publish = getattr(self._event_bus, "publish", None)
+        if publish is None:
+            return
 
-        if executable_size > 0:
-            score += Decimal("0.05")
+        await self._maybe_await(
+            publish("spread.cross_exchange.updated", snapshot)
+        )
 
-        buy_own_spread_bps = _safe_bps(buy_quote.ask - buy_quote.bid, buy_quote.ask)
-        sell_own_spread_bps = _safe_bps(sell_quote.ask - sell_quote.bid, sell_quote.ask)
+    async def _evaluate_and_publish_signals(self, snapshot: SpreadSnapshot) -> None:
+        await self._maybe_publish_widening_signal(snapshot)
+        await self._maybe_publish_anomaly_signal(snapshot)
 
-        if buy_own_spread_bps > Decimal("5"):
-            score -= Decimal("0.05")
-        if sell_own_spread_bps > Decimal("5"):
-            score -= Decimal("0.05")
+    async def _maybe_publish_widening_signal(self, snapshot: SpreadSnapshot) -> None:
+        if snapshot.spread_bps is None:
+            return
 
-        return min(Decimal("1.0"), max(Decimal("0.0"), score))
+        if abs(snapshot.spread_bps) < self._config.widening_bps_threshold:
+            return
 
-    # =========================
-    # Emit / health / metrics
-    # =========================
+        signal = SpreadSignal(
+            signal_type=SpreadSignalType.WIDENING,
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=snapshot.symbol,
+            message=(
+                f"Cross-exchange spread widened to {snapshot.spread_bps} bps "
+                f"between {snapshot.leg_a_exchange} and {snapshot.leg_b_exchange}"
+            ),
+            value=snapshot.spread_bps,
+            threshold=self._config.widening_bps_threshold,
+            confidence=self._confidence_from_snapshot(snapshot),
+            exchange_a=snapshot.leg_a_exchange,
+            exchange_b=snapshot.leg_b_exchange,
+            metadata={
+                "instrument_type": snapshot.leg_a_type.value,
+                "net_spread": str(snapshot.net_spread) if snapshot.net_spread is not None else None,
+            },
+        )
+        await self._publish_signal(signal)
 
-    async def _emit_opportunity(self, opportunity: SpreadOpportunity) -> None:
-        key = self._make_opportunity_key(
+    async def _maybe_publish_anomaly_signal(self, snapshot: SpreadSnapshot) -> None:
+        zscore = snapshot.stats.zscore if snapshot.stats else None
+        if zscore is None:
+            return
+
+        if abs(zscore) < self._config.anomaly_zscore_threshold:
+            return
+
+        signal = SpreadSignal(
+            signal_type=SpreadSignalType.ANOMALY,
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=snapshot.symbol,
+            message=(
+                f"Cross-exchange spread anomaly detected: z-score={zscore} "
+                f"for {snapshot.symbol} on {snapshot.leg_a_exchange}/{snapshot.leg_b_exchange}"
+            ),
+            value=zscore,
+            threshold=self._config.anomaly_zscore_threshold,
+            confidence=self._confidence_from_snapshot(snapshot),
+            exchange_a=snapshot.leg_a_exchange,
+            exchange_b=snapshot.leg_b_exchange,
+            metadata={
+                "spread_bps": str(snapshot.spread_bps) if snapshot.spread_bps is not None else None,
+                "regime": snapshot.regime.value,
+            },
+        )
+        await self._publish_signal(signal)
+
+    async def _maybe_publish_opportunity(self, snapshot: SpreadSnapshot) -> None:
+        buy_exchange = snapshot.metadata.get("buy_exchange")
+        sell_exchange = snapshot.metadata.get("sell_exchange")
+
+        buy_price_raw = snapshot.metadata.get("buy_price")
+        sell_price_raw = snapshot.metadata.get("sell_price")
+        gross_edge_raw = snapshot.metadata.get("gross_edge")
+
+        if not buy_exchange or not sell_exchange:
+            return
+        if buy_price_raw is None or sell_price_raw is None or gross_edge_raw is None:
+            return
+        if snapshot.net_spread is None:
+            return
+
+        reference_price = Decimal(str(buy_price_raw))
+        net_bps = spread_bps(snapshot.net_spread, reference_price)
+        if net_bps is None:
+            return
+
+        threshold_bps = self._config.arbitrage_min_bps + self._config.safety_buffer_bps
+        if net_bps < threshold_bps:
+            return
+
+        opportunity = ArbitrageOpportunity(
+            symbol=snapshot.symbol,
+            buy_exchange=buy_exchange,
+            sell_exchange=sell_exchange,
+            buy_instrument_type=snapshot.leg_a_type,
+            sell_instrument_type=snapshot.leg_b_type,
+            buy_price=Decimal(str(buy_price_raw)),
+            sell_price=Decimal(str(sell_price_raw)),
+            gross_edge=Decimal(str(gross_edge_raw)),
+            estimated_fees=snapshot.estimated_fees or DEFAULT_ZERO,
+            estimated_slippage=snapshot.estimated_slippage or DEFAULT_ZERO,
+            net_edge=snapshot.net_spread,
+            spread_pct=spread_pct(snapshot.net_spread, reference_price),
+            spread_bps=net_bps,
+            confidence=self._confidence_from_snapshot(snapshot),
+            status=OpportunityStatus.ACTIVE,
+            timestamp=snapshot.timestamp,
+            expires_at=snapshot.timestamp + timedelta(milliseconds=self._config.max_quote_age_ms),
+            metadata={
+                "leg_a_exchange": snapshot.leg_a_exchange,
+                "leg_b_exchange": snapshot.leg_b_exchange,
+                "regime": snapshot.regime.value,
+            },
+        )
+
+        key = (
             opportunity.symbol,
             opportunity.buy_exchange,
             opportunity.sell_exchange,
+            opportunity.buy_instrument_type,
         )
-        self._active_opportunities[key] = opportunity
-        self._stats.opportunities_emitted += 1
+        self._latest_opportunities[key] = opportunity
 
-        payload = {
-            "event_type": "cross_exchange_spread_opportunity",
-            "module": self.module_name,
-            "symbol": opportunity.symbol,
-            "opportunity": opportunity.to_payload(),
-            "ts": time.time(),
-        }
+        self._stats["opportunities_published"] += 1
 
-        if self.config.log_snapshots:
-            self._history.append(
-                {
-                    "type": "opportunity",
-                    "ts": time.time(),
-                    "payload": payload,
-                }
-            )
-
-        try:
-            if hasattr(self.event_bus, "emit"):
-                await _maybe_await(self.event_bus.emit(self.config.publish_topic, payload))
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to emit opportunity",
-                extra={"error": str(exc), "payload": payload},
-            )
-            return
-
-        self.logger.info(
-            "Cross-exchange opportunity detected",
-            extra={
-                "symbol": opportunity.symbol,
-                "buy_exchange": opportunity.buy_exchange,
-                "sell_exchange": opportunity.sell_exchange,
+        signal = SpreadSignal(
+            signal_type=SpreadSignalType.ARBITRAGE,
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=opportunity.symbol,
+            message=(
+                f"Arbitrage candidate detected: buy on {opportunity.buy_exchange}, "
+                f"sell on {opportunity.sell_exchange}, net edge={opportunity.net_edge}"
+            ),
+            value=opportunity.spread_bps,
+            threshold=threshold_bps,
+            confidence=opportunity.confidence,
+            exchange_a=opportunity.buy_exchange,
+            exchange_b=opportunity.sell_exchange,
+            metadata={
                 "buy_price": str(opportunity.buy_price),
                 "sell_price": str(opportunity.sell_price),
-                "size": str(opportunity.executable_size),
-                "net_spread_bps": str(opportunity.net_spread_bps),
-                "confidence": str(opportunity.confidence),
+                "gross_edge": str(opportunity.gross_edge),
+                "net_edge": str(opportunity.net_edge),
+            },
+        )
+        await self._publish_signal(signal)
+
+        publish = getattr(self._event_bus, "publish", None)
+        if publish is None:
+            return
+
+        await self._maybe_await(
+            publish("spread.cross_exchange.opportunity", opportunity)
+        )
+
+    async def _publish_signal(self, signal: SpreadSignal) -> None:
+        signal_key = (
+            f"{signal.signal_type.value}:{signal.symbol}:"
+            f"{signal.exchange_a or 'na'}:{signal.exchange_b or 'na'}"
+        )
+
+        if self._is_in_cooldown(signal_key):
+            self._stats["cooldown_skips"] += 1
+            return
+
+        self._last_signal_times[signal_key] = datetime.utcnow()
+        self._stats["signals_published"] += 1
+
+        self._logger.info(
+            "Cross-exchange spread signal published",
+            extra={
+                "signal_type": signal.signal_type.value,
+                "symbol": signal.symbol,
+                "value": str(signal.value) if signal.value is not None else None,
+                "threshold": str(signal.threshold) if signal.threshold is not None else None,
             },
         )
 
-    async def _emit_rejection(self, rejection: Dict[str, Any]) -> None:
-        try:
-            if hasattr(self.event_bus, "emit"):
-                await _maybe_await(self.event_bus.emit(self.config.rejection_topic, rejection))
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to emit rejection",
-                extra={"error": str(exc), "rejection": rejection},
-            )
+        publish = getattr(self._event_bus, "publish", None)
+        if publish is None:
+            return
 
-    async def emit_health(self) -> None:
-        payload = self.get_health_snapshot()
+        await self._maybe_await(
+            publish("spread.signal", signal)
+        )
 
-        try:
-            if hasattr(self.event_bus, "emit"):
-                await _maybe_await(self.event_bus.emit(self.config.health_topic, payload))
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to emit health snapshot",
-                extra={"error": str(exc)},
-            )
+    def _confidence_from_snapshot(self, snapshot: SpreadSnapshot) -> Decimal:
+        base = Decimal("0.50")
+        stats = snapshot.stats
 
-    async def emit_metrics(self) -> None:
-        payload = {
-            "event_type": "cross_exchange_spreads_metrics",
-            "module": self.module_name,
-            "stats": self._stats.to_dict(),
-            "symbols_tracked": len(self._quotes),
-            "active_opportunities": len(self._active_opportunities),
-            "ts": time.time(),
-        }
+        if stats and stats.zscore is not None:
+            abs_z = abs(stats.zscore)
 
-        try:
-            if hasattr(self.event_bus, "emit"):
-                await _maybe_await(self.event_bus.emit(self.config.metrics_topic, payload))
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to emit metrics",
-                extra={"error": str(exc)},
-            )
+            if abs_z >= Decimal("3.0"):
+                base += Decimal("0.20")
+            elif abs_z >= Decimal("2.0"):
+                base += Decimal("0.10")
 
-    async def prune_expired_opportunities(self) -> None:
-        now = time.time()
-        ttl_sec = self.config.opportunity_ttl_ms / 1000.0
+        if snapshot.net_spread is not None and snapshot.net_spread > DEFAULT_ZERO:
+            base += Decimal("0.15")
 
-        expired_keys = [
-            key
-            for key, opp in self._active_opportunities.items()
-            if (now - opp.detected_at) > ttl_sec
-        ]
+        if snapshot.quote_validity == QuoteValidity.VALID:
+            base += Decimal("0.10")
 
-        for key in expired_keys:
-            opp = self._active_opportunities.pop(key)
-            opp.status = OpportunityStatus.EXPIRED
+        if snapshot.estimated_slippage is not None and snapshot.estimated_slippage <= DEFAULT_ZERO:
+            base += Decimal("0.05")
 
-            self.logger.debug(
-                "Expired opportunity removed",
-                extra={
-                    "symbol": opp.symbol,
-                    "buy_exchange": opp.buy_exchange,
-                    "sell_exchange": opp.sell_exchange,
-                },
-            )
+        if base > Decimal("0.99"):
+            return Decimal("0.99")
+        return base
 
-    # =========================
-    # Query / snapshot API
-    # =========================
-
-    def get_symbol_snapshot(self, symbol: str) -> Dict[str, Any]:
-        symbol = symbol.upper().strip()
-        quotes = self._quotes.get(symbol, {})
-
-        return {
-            "symbol": symbol,
-            "quotes": {
-                exchange: {
-                    "bid": str(quote.bid),
-                    "ask": str(quote.ask),
-                    "bid_size": str(quote.bid_size),
-                    "ask_size": str(quote.ask_size),
-                    "ts_exchange": quote.ts_exchange,
-                    "ts_received": quote.ts_received,
-                    "is_valid": quote.is_valid,
-                }
-                for exchange, quote in quotes.items()
-            },
-            "last_eval_ts": self._last_eval_ts.get(symbol),
-        }
-
-    def get_health_snapshot(self) -> Dict[str, Any]:
-        now = time.time()
-
-        stale_quotes = 0
-        total_quotes = 0
-        for _, qmap in self._quotes.items():
-            for q in qmap.values():
-                total_quotes += 1
-                if ((now - q.ts_received) * 1000.0) > self.config.max_quote_age_ms:
-                    stale_quotes += 1
-
-        return {
-            "event_type": "cross_exchange_spreads_health",
-            "module": self.module_name,
-            "running": self._running,
-            "enabled": self.config.enabled,
-            "symbols_tracked": len(self._quotes),
-            "total_quotes": total_quotes,
-            "stale_quotes": stale_quotes,
-            "active_opportunities": len(self._active_opportunities),
-            "stats": self._stats.to_dict(),
-            "ts": now,
-        }
-
-    def get_recent_history(self, limit: int = 50) -> List[Dict[str, Any]]:
-        if limit <= 0:
-            return []
-        return list(self._history)[-limit:]
-
-    # =========================
-    # Helpers
-    # =========================
-
-    def _normalize_quote(self, event: Mapping[str, Any]) -> Optional[BestQuote]:
-        try:
-            exchange = str(event.get("exchange", "")).lower().strip()
-            symbol = str(event.get("symbol", "")).upper().strip()
-
-            if not exchange or not symbol:
-                self._stats.invalid_quotes_dropped += 1
-                return None
-
-            if self.config.symbols and symbol not in self.config.symbols:
-                return None
-
-            if self.config.exchanges and exchange not in self.config.exchanges:
-                return None
-
-            quote = BestQuote(
-                exchange=exchange,
-                symbol=symbol,
-                bid=_d(event.get("bid", 0)),
-                ask=_d(event.get("ask", 0)),
-                bid_size=_d(event.get("bid_size", 0)),
-                ask_size=_d(event.get("ask_size", 0)),
-                ts_exchange=float(event.get("ts_exchange", event.get("timestamp", time.time()))),
-                ts_received=float(event.get("ts_received", time.time())),
-                sequence=event.get("sequence"),
-                raw=dict(event),
-            )
-
-            if not quote.is_valid:
-                self._stats.invalid_quotes_dropped += 1
-                self.logger.debug(
-                    "Invalid quote dropped",
-                    extra={
-                        "exchange": exchange,
-                        "symbol": symbol,
-                        "bid": str(quote.bid),
-                        "ask": str(quote.ask),
-                    },
-                )
-                return None
-
-            age_ms = (time.time() - quote.ts_received) * 1000.0
-            if age_ms > self.config.max_quote_age_ms:
-                self._stats.stale_quotes_dropped += 1
-                self.logger.debug(
-                    "Stale quote dropped",
-                    extra={
-                        "exchange": exchange,
-                        "symbol": symbol,
-                        "age_ms": age_ms,
-                    },
-                )
-                return None
-
-            return quote
-
-        except Exception as exc:
-            self._stats.invalid_quotes_dropped += 1
-            self.logger.exception(
-                "Failed to normalize quote",
-                extra={"error": str(exc), "event": dict(event)},
-            )
-            return None
-
-    def _is_quote_usable(self, quote: BestQuote) -> bool:
-        if not quote.is_valid:
+    def _is_in_cooldown(self, signal_key: str) -> bool:
+        last_time = self._last_signal_times.get(signal_key)
+        if last_time is None:
             return False
-        age_ms = (time.time() - quote.ts_received) * 1000.0
-        return age_ms <= self.config.max_quote_age_ms
 
-    def _should_skip_eval_due_to_cooldown(self, symbol: str) -> bool:
-        last_ts = self._last_eval_ts.get(symbol)
-        if last_ts is None:
+        elapsed = (datetime.utcnow() - last_time).total_seconds()
+        return elapsed < self._config.cooldown_seconds
+
+    def _should_skip_emit(
+        self,
+        key: tuple[str, str, str, InstrumentType],
+        now: datetime,
+    ) -> bool:
+        last_emit = self._last_emit_times.get(key)
+        if last_emit is None:
+            self._last_emit_times[key] = now
             return False
-        elapsed_ms = (time.time() - last_ts) * 1000.0
-        return elapsed_ms < self.config.evaluation_cooldown_ms
 
-    def _make_opportunity_key(self, symbol: str, buy_exchange: str, sell_exchange: str) -> str:
-        return f"{symbol}:{buy_exchange}->{sell_exchange}"
+        elapsed_ms = (now - last_emit).total_seconds() * 1000
+        if elapsed_ms < self._config.min_emit_interval_ms:
+            return True
 
+        self._last_emit_times[key] = now
+        return False
 
-def _d(value: Any) -> Decimal:
-    try:
-        if isinstance(value, Decimal):
-            return value
-        if value is None:
-            return Decimal("0")
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        return Decimal("0")
-
-
-def _safe_bps(abs_value: Decimal, price: Decimal) -> Decimal:
-    if price <= 0:
-        return Decimal("0")
-    return (abs_value / price) * Decimal("10000")
-
-
-async def _maybe_await(result: Any) -> Any:
-    if asyncio.iscoroutine(result):
-        return await result
-    return result
+    async def _maybe_await(self, value: Any) -> Any:
+        if asyncio.iscoroutine(value):
+            return await value
+        return value
