@@ -1,625 +1,1007 @@
 from __future__ import annotations
 
 import asyncio
-import math
+import contextlib
 import time
-from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, field
-from statistics import mean, pstdev
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
 from core.logger import get_logger
 
 
 @dataclass(slots=True)
-class WhaleTradeEvent:
+class WhaleTrackerConfig:
     """
-    Подія про виявлену велику активність (whale activity).
+    Конфігурація WhaleTracker.
+
+    WhaleTracker не визначає large trade самостійно.
+    Він працює поверх already detected large trades та liquidation events.
     """
+
+    enabled: bool = True
+
+    # EventBus event names
+    large_trade_event_name: str = "analytics.whales.large_trade"
+    liquidation_event_name: str = "market.liquidation"
+
+    whale_activity_event_name: str = "analytics.whales.whale_activity"
+    whale_pressure_event_name: str = "analytics.whales.whale_pressure"
+    whale_liquidation_context_event_name: str = "analytics.whales.whale_liquidation_context"
+
+    # Rolling windows
+    cluster_window_sec: int = 30
+    pressure_window_sec: int = 60
+    liquidation_window_sec: int = 60
+
+    # Thresholds
+    cluster_min_trades: int = 3
+    cluster_min_total_notional: float = 300_000.0
+
+    pressure_min_trades: int = 4
+    pressure_min_total_notional: float = 500_000.0
+    pressure_imbalance_ratio_threshold: float = 0.65
+
+    liquidation_context_min_notional: float = 100_000.0
+
+    # Signal cooldowns per symbol
+    whale_activity_cooldown_sec: float = 5.0
+    whale_pressure_cooldown_sec: float = 5.0
+    whale_liquidation_context_cooldown_sec: float = 5.0
+
+    # Cleanup
+    cleanup_interval_sec: int = 60
+    stats_ttl_sec: int = 60 * 60
+
+    # Logging / emissions
+    emit_on_bus: bool = True
+    log_signals: bool = True
+
+    # Optional behavior
+    subscribe_liquidations: bool = True
+
+
+@dataclass(slots=True)
+class WhaleTradeRecord:
     symbol: str
     side: str
+    notional: float
     price: float
     quantity: float
-    notional: float
-    timestamp: float
-
-    event_type: str = "whale_trade"
-    score: float = 0.0
+    timestamp_ms: int
     zscore: float = 0.0
-    threshold_used: float = 0.0
-
-    trades_in_cluster: int = 1
-    cluster_notional: float = 0.0
-    cluster_duration_sec: float = 0.0
-
-    aggressor: Optional[str] = None
+    trigger_type: str = "unknown"
+    trade_id: Optional[str] = None
     exchange: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    raw_event: Optional[Dict[str, Any]] = None
 
 
 @dataclass(slots=True)
-class WhaleTrackerStats:
-    """
-    Внутрішня статистика по символу.
-    """
+class LiquidationRecord:
     symbol: str
-    processed_trades: int = 0
-    detected_whale_trades: int = 0
-    last_trade_ts: float = 0.0
-    last_whale_ts: float = 0.0
-    rolling_mean_notional: float = 0.0
-    rolling_std_notional: float = 0.0
-    last_threshold: float = 0.0
-
-
-@dataclass(slots=True)
-class TradeRecord:
-    """
-    Нормалізований трейд для внутрішнього використання.
-    """
-    symbol: str
+    side: str
+    notional: float
     price: float
     quantity: float
-    side: str
-    timestamp: float
-    notional: float
-    aggressor: Optional[str] = None
+    timestamp_ms: int
+    liquidation_id: Optional[str] = None
     exchange: Optional[str] = None
-    raw: Dict[str, Any] = field(default_factory=dict)
+    raw_event: Optional[Dict[str, Any]] = None
+
+
+@dataclass(slots=True)
+class WhaleActivitySignal:
+    symbol: str
+    side: str
+    trade_count: int
+    total_notional: float
+    avg_notional: float
+    max_notional: float
+    window_sec: int
+    timestamp_ms: int
+
+    detector_name: str = "WhaleTracker"
+    event_type: str = "whale_activity"
+    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_event(self) -> Dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "detector": self.detector_name,
+            "symbol": self.symbol,
+            "side": self.side,
+            "trade_count": self.trade_count,
+            "total_notional": self.total_notional,
+            "avg_notional": self.avg_notional,
+            "max_notional": self.max_notional,
+            "window_sec": self.window_sec,
+            "timestamp_ms": self.timestamp_ms,
+            "created_at_ms": self.created_at_ms,
+        }
+
+
+@dataclass(slots=True)
+class WhalePressureSignal:
+    symbol: str
+    dominant_side: str
+    buy_trade_count: int
+    sell_trade_count: int
+    buy_notional: float
+    sell_notional: float
+    total_notional: float
+    imbalance_ratio: float
+    net_flow_notional: float
+    window_sec: int
+    timestamp_ms: int
+
+    detector_name: str = "WhaleTracker"
+    event_type: str = "whale_pressure"
+    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_event(self) -> Dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "detector": self.detector_name,
+            "symbol": self.symbol,
+            "dominant_side": self.dominant_side,
+            "buy_trade_count": self.buy_trade_count,
+            "sell_trade_count": self.sell_trade_count,
+            "buy_notional": self.buy_notional,
+            "sell_notional": self.sell_notional,
+            "total_notional": self.total_notional,
+            "imbalance_ratio": self.imbalance_ratio,
+            "net_flow_notional": self.net_flow_notional,
+            "window_sec": self.window_sec,
+            "timestamp_ms": self.timestamp_ms,
+            "created_at_ms": self.created_at_ms,
+        }
+
+
+@dataclass(slots=True)
+class WhaleLiquidationContextSignal:
+    symbol: str
+    whale_side: str
+    whale_total_notional: float
+    whale_trade_count: int
+    liquidation_side: str
+    liquidation_total_notional: float
+    liquidation_count: int
+    context_strength: float
+    timestamp_ms: int
+
+    detector_name: str = "WhaleTracker"
+    event_type: str = "whale_liquidation_context"
+    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    def to_event(self) -> Dict[str, Any]:
+        return {
+            "event_type": self.event_type,
+            "detector": self.detector_name,
+            "symbol": self.symbol,
+            "whale_side": self.whale_side,
+            "whale_total_notional": self.whale_total_notional,
+            "whale_trade_count": self.whale_trade_count,
+            "liquidation_side": self.liquidation_side,
+            "liquidation_total_notional": self.liquidation_total_notional,
+            "liquidation_count": self.liquidation_count,
+            "context_strength": self.context_strength,
+            "timestamp_ms": self.timestamp_ms,
+            "created_at_ms": self.created_at_ms,
+        }
+
+
+@dataclass(slots=True)
+class SymbolTrackerState:
+    large_trades: Deque[WhaleTradeRecord]
+    liquidations: Deque[LiquidationRecord]
+
+    total_large_trades_seen: int = 0
+    total_liquidations_seen: int = 0
+
+    whale_activity_signals_emitted: int = 0
+    whale_pressure_signals_emitted: int = 0
+    whale_liquidation_context_signals_emitted: int = 0
+
+    last_whale_activity_signal_ts_monotonic: float = 0.0
+    last_whale_pressure_signal_ts_monotonic: float = 0.0
+    last_whale_liquidation_context_signal_ts_monotonic: float = 0.0
+
+    last_update_ts_monotonic: float = field(default_factory=time.monotonic)
+
+    def touch(self) -> None:
+        self.last_update_ts_monotonic = time.monotonic()
 
 
 class WhaleTracker:
     """
-    WhaleTracker виявляє аномально великі трейди та кластери великих трейдів.
+    High-level tracker whale activity.
 
-    Основні можливості:
-    - детекція окремих великих трейдів за абсолютним порогом
-    - адаптивна детекція через z-score від rolling window
-    - виявлення серій великих трейдів за короткий час
-    - публікація сигналів у EventBus
+    Вхід:
+        - large trade signals від LargeTradeDetector
+        - liquidation events (опційно)
 
-    Очікується, що вхідні події приходять із EventBus у вигляді dict:
-    {
-        "symbol": "BTCUSDT",
-        "price": 65000.0,
-        "quantity": 4.2,
-        "side": "buy",
-        "timestamp": 1710000000.123,
-        "aggressor": "buyer",
-        "exchange": "binance"
-    }
-
-    Або з альтернативними назвами полів:
-    - qty / size / amount
-    - ts / event_time / trade_time
+    Вихід:
+        - whale_activity
+        - whale_pressure
+        - whale_liquidation_context
     """
 
     def __init__(
         self,
-        event_bus: Any,
-        *,
-        service_name: str = "whale_tracker",
-        enabled: bool = True,
-        default_abs_notional_threshold: float = 100_000.0,
-        symbol_abs_thresholds: Optional[Dict[str, float]] = None,
-        rolling_window_size: int = 300,
-        zscore_threshold: float = 3.5,
-        min_samples_for_zscore: int = 30,
-        cluster_window_sec: float = 3.0,
-        cluster_min_trades: int = 3,
-        cluster_min_notional: float = 250_000.0,
-        publish_event_name: str = "analytics.whale.detected",
-        subscribe_trade_event: str = "market.trade",
-        subscribe_liquidation_event: Optional[str] = "market.liquidation",
-        cleanup_interval_sec: float = 30.0,
-        history_retention_sec: float = 120.0,
+        config: Optional[WhaleTrackerConfig] = None,
+        event_bus: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
     ) -> None:
-        self._event_bus = event_bus
-        self._enabled = enabled
+        self.config = config or WhaleTrackerConfig()
+        self.event_bus = event_bus
+        self.scheduler = scheduler
 
-        self._default_abs_notional_threshold = float(default_abs_notional_threshold)
-        self._symbol_abs_thresholds = symbol_abs_thresholds or {}
-
-        self._rolling_window_size = int(rolling_window_size)
-        self._zscore_threshold = float(zscore_threshold)
-        self._min_samples_for_zscore = int(min_samples_for_zscore)
-
-        self._cluster_window_sec = float(cluster_window_sec)
-        self._cluster_min_trades = int(cluster_min_trades)
-        self._cluster_min_notional = float(cluster_min_notional)
-
-        self._publish_event_name = publish_event_name
-        self._subscribe_trade_event = subscribe_trade_event
-        self._subscribe_liquidation_event = subscribe_liquidation_event
-
-        self._cleanup_interval_sec = float(cleanup_interval_sec)
-        self._history_retention_sec = float(history_retention_sec)
-
-        self._logger = get_logger(__name__, service_name=service_name)
-
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._cleanup_task: Optional[asyncio.Task] = None
-
-        self._notional_history: Dict[str, Deque[float]] = defaultdict(
-            lambda: deque(maxlen=self._rolling_window_size)
+        self.logger = get_logger(
+            __name__,
+            service_name="analytics.whales.whale_tracker",
         )
-        self._recent_large_trades: Dict[str, Deque[TradeRecord]] = defaultdict(deque)
-        self._stats: Dict[str, WhaleTrackerStats] = {}
+
+        self._states: Dict[str, SymbolTrackerState] = {}
+        self._started = False
+        self._cleanup_task: Optional[asyncio.Task[Any]] = None
+        self._lock = asyncio.Lock()
 
     # -------------------------------------------------------------------------
-    # lifecycle
+    # Lifecycle
     # -------------------------------------------------------------------------
 
     async def start(self) -> None:
-        """
-        Запуск трекера і підписка на події.
-        """
-        if self._running:
-            self._logger.warning("WhaleTracker already running")
+        if self._started:
+            self.logger.warning("WhaleTracker already started")
             return
 
-        self._running = True
+        if not self.config.enabled:
+            self.logger.info("WhaleTracker is disabled by config")
+            return
 
-        if hasattr(self._event_bus, "subscribe"):
-            await self._event_bus.subscribe(self._subscribe_trade_event, self.handle_trade_event)
+        self._started = True
 
-            if self._subscribe_liquidation_event:
-                await self._event_bus.subscribe(
-                    self._subscribe_liquidation_event,
-                    self.handle_liquidation_event
-                )
+        if self.event_bus is not None:
+            await self._safe_subscribe()
 
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="whale_tracker_cleanup")
+        if self.scheduler is not None:
+            await self._register_scheduler_jobs()
+        else:
+            self._cleanup_task = asyncio.create_task(
+                self._cleanup_loop(),
+                name="whale_tracker_cleanup_loop",
+            )
 
-        self._logger.info(
+        self.logger.info(
             "WhaleTracker started",
             extra={
-                "trade_event": self._subscribe_trade_event,
-                "liquidation_event": self._subscribe_liquidation_event,
-                "publish_event": self._publish_event_name,
-                "rolling_window_size": self._rolling_window_size,
-                "zscore_threshold": self._zscore_threshold,
-                "cluster_window_sec": self._cluster_window_sec,
-                "cluster_min_trades": self._cluster_min_trades,
-                "cluster_min_notional": self._cluster_min_notional,
+                "large_trade_event_name": self.config.large_trade_event_name,
+                "liquidation_event_name": self.config.liquidation_event_name,
+                "cluster_window_sec": self.config.cluster_window_sec,
+                "pressure_window_sec": self.config.pressure_window_sec,
+                "liquidation_window_sec": self.config.liquidation_window_sec,
             },
         )
 
     async def stop(self) -> None:
-        """
-        Акуратна зупинка.
-        """
-        if not self._running:
+        if not self._started:
             return
 
-        self._running = False
+        if self.event_bus is not None:
+            await self._safe_unsubscribe()
 
-        if self._cleanup_task and not self._cleanup_task.done():
+        if self._cleanup_task is not None:
             self._cleanup_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+            self._cleanup_task = None
 
-        self._logger.info("WhaleTracker stopped")
+        self._started = False
+        self.logger.info("WhaleTracker stopped")
 
-    # -------------------------------------------------------------------------
-    # public handlers
-    # -------------------------------------------------------------------------
-
-    async def handle_trade_event(self, event: Dict[str, Any]) -> None:
-        """
-        Основний обробник трейдів із EventBus.
-        """
-        if not self._enabled:
-            return
-
+    async def _safe_subscribe(self) -> None:
         try:
-            trade = self._normalize_trade(event)
-            if trade is None:
-                return
-
-            detected = await self.process_trade(trade)
-            if detected:
-                await self._publish_whale_event(detected)
-
-        except Exception as exc:
-            self._logger.exception(
-                "Failed to handle trade event",
-                extra={"error": str(exc), "event": event},
+            await self.event_bus.subscribe(
+                self.config.large_trade_event_name,
+                self.handle_large_trade_event,
             )
+            self.logger.info(
+                "Subscribed to large trade events",
+                extra={"event_name": self.config.large_trade_event_name},
+            )
+
+            if self.config.subscribe_liquidations:
+                await self.event_bus.subscribe(
+                    self.config.liquidation_event_name,
+                    self.handle_liquidation_event,
+                )
+                self.logger.info(
+                    "Subscribed to liquidation events",
+                    extra={"event_name": self.config.liquidation_event_name},
+                )
+        except Exception:
+            self.logger.exception("Failed to subscribe WhaleTracker to EventBus")
+            raise
+
+    async def _safe_unsubscribe(self) -> None:
+        try:
+            await self.event_bus.unsubscribe(
+                self.config.large_trade_event_name,
+                self.handle_large_trade_event,
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to unsubscribe from large trade events",
+                extra={"event_name": self.config.large_trade_event_name},
+            )
+
+        if self.config.subscribe_liquidations:
+            try:
+                await self.event_bus.unsubscribe(
+                    self.config.liquidation_event_name,
+                    self.handle_liquidation_event,
+                )
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsubscribe from liquidation events",
+                    extra={"event_name": self.config.liquidation_event_name},
+                )
+
+    async def _register_scheduler_jobs(self) -> None:
+        try:
+            await self.scheduler.add_interval_job(
+                name="whale_tracker_cleanup",
+                interval_seconds=self.config.cleanup_interval_sec,
+                coro=self.cleanup,
+                replace_existing=True,
+            )
+            self.logger.info(
+                "Cleanup job registered in Scheduler",
+                extra={"interval_sec": self.config.cleanup_interval_sec},
+            )
+        except Exception:
+            self.logger.exception("Failed to register WhaleTracker cleanup job")
+            raise
+
+    # -------------------------------------------------------------------------
+    # Event handlers
+    # -------------------------------------------------------------------------
+
+    async def handle_large_trade_event(self, event: Dict[str, Any]) -> None:
+        try:
+            await self.process_large_trade_event(event)
+        except Exception:
+            self.logger.exception("Unhandled error while processing large trade event")
 
     async def handle_liquidation_event(self, event: Dict[str, Any]) -> None:
-        """
-        Опціональна обробка liquidation подій.
-        Можна трактувати великі ліквідації як whale-like pressure.
-        """
-        if not self._enabled:
+        try:
+            await self.process_liquidation_event(event)
+        except Exception:
+            self.logger.exception("Unhandled error while processing liquidation event")
+
+    async def process_large_trade_event(
+        self,
+        event: Dict[str, Any],
+    ) -> Dict[str, Optional[object]]:
+        if not self.config.enabled:
+            return {
+                "whale_activity_signal": None,
+                "whale_pressure_signal": None,
+                "whale_liquidation_context_signal": None,
+            }
+
+        record = self._normalize_large_trade_event(event)
+        if record is None:
+            return {
+                "whale_activity_signal": None,
+                "whale_pressure_signal": None,
+                "whale_liquidation_context_signal": None,
+            }
+
+        async with self._lock:
+            state = self._get_or_create_state(record.symbol)
+            state.large_trades.append(record)
+            state.total_large_trades_seen += 1
+            state.touch()
+
+            self._prune_symbol_state(state, record.timestamp_ms)
+
+            whale_activity_signal = self._detect_whale_activity(record.symbol, state, record.timestamp_ms)
+            whale_pressure_signal = self._detect_whale_pressure(record.symbol, state, record.timestamp_ms)
+            whale_liquidation_context_signal = self._detect_whale_liquidation_context(
+                record.symbol,
+                state,
+                record.timestamp_ms,
+            )
+
+        await self._emit_detected_signals(
+            whale_activity_signal=whale_activity_signal,
+            whale_pressure_signal=whale_pressure_signal,
+            whale_liquidation_context_signal=whale_liquidation_context_signal,
+        )
+
+        return {
+            "whale_activity_signal": whale_activity_signal,
+            "whale_pressure_signal": whale_pressure_signal,
+            "whale_liquidation_context_signal": whale_liquidation_context_signal,
+        }
+
+    async def process_liquidation_event(
+        self,
+        event: Dict[str, Any],
+    ) -> Optional[WhaleLiquidationContextSignal]:
+        if not self.config.enabled or not self.config.subscribe_liquidations:
+            return None
+
+        record = self._normalize_liquidation_event(event)
+        if record is None:
+            return None
+
+        async with self._lock:
+            state = self._get_or_create_state(record.symbol)
+            state.liquidations.append(record)
+            state.total_liquidations_seen += 1
+            state.touch()
+
+            self._prune_symbol_state(state, record.timestamp_ms)
+
+            whale_liquidation_context_signal = self._detect_whale_liquidation_context(
+                record.symbol,
+                state,
+                record.timestamp_ms,
+            )
+
+        await self._emit_detected_signals(
+            whale_activity_signal=None,
+            whale_pressure_signal=None,
+            whale_liquidation_context_signal=whale_liquidation_context_signal,
+        )
+
+        return whale_liquidation_context_signal
+
+    # -------------------------------------------------------------------------
+    # Detection logic
+    # -------------------------------------------------------------------------
+
+    def _detect_whale_activity(
+        self,
+        symbol: str,
+        state: SymbolTrackerState,
+        current_ts_ms: int,
+    ) -> Optional[WhaleActivitySignal]:
+        cluster_start_ms = current_ts_ms - self.config.cluster_window_sec * 1000
+
+        buys = [t for t in state.large_trades if t.timestamp_ms >= cluster_start_ms and t.side == "buy"]
+        sells = [t for t in state.large_trades if t.timestamp_ms >= cluster_start_ms and t.side == "sell"]
+
+        buy_signal = self._build_whale_activity_signal_if_triggered(
+            symbol=symbol,
+            side="buy",
+            trades=buys,
+            state=state,
+            current_ts_ms=current_ts_ms,
+        )
+        if buy_signal is not None:
+            return buy_signal
+
+        sell_signal = self._build_whale_activity_signal_if_triggered(
+            symbol=symbol,
+            side="sell",
+            trades=sells,
+            state=state,
+            current_ts_ms=current_ts_ms,
+        )
+        return sell_signal
+
+    def _build_whale_activity_signal_if_triggered(
+        self,
+        symbol: str,
+        side: str,
+        trades: List[WhaleTradeRecord],
+        state: SymbolTrackerState,
+        current_ts_ms: int,
+    ) -> Optional[WhaleActivitySignal]:
+        if len(trades) < self.config.cluster_min_trades:
+            return None
+
+        total_notional = sum(t.notional for t in trades)
+        if total_notional < self.config.cluster_min_total_notional:
+            return None
+
+        if not self._passes_cooldown(
+            last_ts=state.last_whale_activity_signal_ts_monotonic,
+            cooldown_sec=self.config.whale_activity_cooldown_sec,
+        ):
+            return None
+
+        max_notional = max(t.notional for t in trades)
+        avg_notional = total_notional / len(trades)
+
+        signal = WhaleActivitySignal(
+            symbol=symbol,
+            side=side,
+            trade_count=len(trades),
+            total_notional=total_notional,
+            avg_notional=avg_notional,
+            max_notional=max_notional,
+            window_sec=self.config.cluster_window_sec,
+            timestamp_ms=current_ts_ms,
+        )
+
+        state.whale_activity_signals_emitted += 1
+        state.last_whale_activity_signal_ts_monotonic = time.monotonic()
+
+        return signal
+
+    def _detect_whale_pressure(
+        self,
+        symbol: str,
+        state: SymbolTrackerState,
+        current_ts_ms: int,
+    ) -> Optional[WhalePressureSignal]:
+        pressure_start_ms = current_ts_ms - self.config.pressure_window_sec * 1000
+        trades = [t for t in state.large_trades if t.timestamp_ms >= pressure_start_ms]
+
+        if len(trades) < self.config.pressure_min_trades:
+            return None
+
+        buy_trades = [t for t in trades if t.side == "buy"]
+        sell_trades = [t for t in trades if t.side == "sell"]
+
+        buy_notional = sum(t.notional for t in buy_trades)
+        sell_notional = sum(t.notional for t in sell_trades)
+        total_notional = buy_notional + sell_notional
+
+        if total_notional < self.config.pressure_min_total_notional:
+            return None
+
+        dominant_side = "buy" if buy_notional >= sell_notional else "sell"
+        dominant_notional = max(buy_notional, sell_notional)
+        imbalance_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
+
+        if imbalance_ratio < self.config.pressure_imbalance_ratio_threshold:
+            return None
+
+        if not self._passes_cooldown(
+            last_ts=state.last_whale_pressure_signal_ts_monotonic,
+            cooldown_sec=self.config.whale_pressure_cooldown_sec,
+        ):
+            return None
+
+        signal = WhalePressureSignal(
+            symbol=symbol,
+            dominant_side=dominant_side,
+            buy_trade_count=len(buy_trades),
+            sell_trade_count=len(sell_trades),
+            buy_notional=buy_notional,
+            sell_notional=sell_notional,
+            total_notional=total_notional,
+            imbalance_ratio=imbalance_ratio,
+            net_flow_notional=buy_notional - sell_notional,
+            window_sec=self.config.pressure_window_sec,
+            timestamp_ms=current_ts_ms,
+        )
+
+        state.whale_pressure_signals_emitted += 1
+        state.last_whale_pressure_signal_ts_monotonic = time.monotonic()
+
+        return signal
+
+    def _detect_whale_liquidation_context(
+        self,
+        symbol: str,
+        state: SymbolTrackerState,
+        current_ts_ms: int,
+    ) -> Optional[WhaleLiquidationContextSignal]:
+        if not self.config.subscribe_liquidations:
+            return None
+
+        pressure_start_ms = current_ts_ms - self.config.pressure_window_sec * 1000
+        liquidation_start_ms = current_ts_ms - self.config.liquidation_window_sec * 1000
+
+        recent_whales = [t for t in state.large_trades if t.timestamp_ms >= pressure_start_ms]
+        recent_liquidations = [l for l in state.liquidations if l.timestamp_ms >= liquidation_start_ms]
+
+        if not recent_whales or not recent_liquidations:
+            return None
+
+        whale_buy = [t for t in recent_whales if t.side == "buy"]
+        whale_sell = [t for t in recent_whales if t.side == "sell"]
+
+        whale_buy_notional = sum(t.notional for t in whale_buy)
+        whale_sell_notional = sum(t.notional for t in whale_sell)
+
+        whale_side = "buy" if whale_buy_notional >= whale_sell_notional else "sell"
+        whale_total_notional = max(whale_buy_notional, whale_sell_notional)
+        whale_trade_count = len(whale_buy) if whale_side == "buy" else len(whale_sell)
+
+        liq_buy = [l for l in recent_liquidations if l.side == "buy"]
+        liq_sell = [l for l in recent_liquidations if l.side == "sell"]
+
+        liq_buy_notional = sum(l.notional for l in liq_buy)
+        liq_sell_notional = sum(l.notional for l in liq_sell)
+
+        liquidation_side = "buy" if liq_buy_notional >= liq_sell_notional else "sell"
+        liquidation_total_notional = max(liq_buy_notional, liq_sell_notional)
+        liquidation_count = len(liq_buy) if liquidation_side == "buy" else len(liq_sell)
+
+        if liquidation_total_notional < self.config.liquidation_context_min_notional:
+            return None
+
+        # Контекст цікавий тоді, коли великі трейди тиснуть в один бік,
+        # а ліквідації переважають у протилежному.
+        if whale_side == liquidation_side:
+            return None
+
+        if whale_trade_count <= 0 or liquidation_count <= 0:
+            return None
+
+        if not self._passes_cooldown(
+            last_ts=state.last_whale_liquidation_context_signal_ts_monotonic,
+            cooldown_sec=self.config.whale_liquidation_context_cooldown_sec,
+        ):
+            return None
+
+        context_strength = min(
+            1.0,
+            (whale_total_notional + liquidation_total_notional)
+            / max(
+                self.config.pressure_min_total_notional + self.config.liquidation_context_min_notional,
+                1.0,
+            ),
+        )
+
+        signal = WhaleLiquidationContextSignal(
+            symbol=symbol,
+            whale_side=whale_side,
+            whale_total_notional=whale_total_notional,
+            whale_trade_count=whale_trade_count,
+            liquidation_side=liquidation_side,
+            liquidation_total_notional=liquidation_total_notional,
+            liquidation_count=liquidation_count,
+            context_strength=context_strength,
+            timestamp_ms=current_ts_ms,
+        )
+
+        state.whale_liquidation_context_signals_emitted += 1
+        state.last_whale_liquidation_context_signal_ts_monotonic = time.monotonic()
+
+        return signal
+
+    # -------------------------------------------------------------------------
+    # Emission
+    # -------------------------------------------------------------------------
+
+    async def _emit_detected_signals(
+        self,
+        whale_activity_signal: Optional[WhaleActivitySignal],
+        whale_pressure_signal: Optional[WhalePressureSignal],
+        whale_liquidation_context_signal: Optional[WhaleLiquidationContextSignal],
+    ) -> None:
+        if whale_activity_signal is not None:
+            if self.config.log_signals:
+                self.logger.info(
+                    "Whale activity detected",
+                    extra={
+                        "symbol": whale_activity_signal.symbol,
+                        "side": whale_activity_signal.side,
+                        "trade_count": whale_activity_signal.trade_count,
+                        "total_notional": whale_activity_signal.total_notional,
+                    },
+                )
+            await self._emit_signal(
+                event_name=self.config.whale_activity_event_name,
+                payload=whale_activity_signal.to_event(),
+            )
+
+        if whale_pressure_signal is not None:
+            if self.config.log_signals:
+                self.logger.info(
+                    "Whale pressure detected",
+                    extra={
+                        "symbol": whale_pressure_signal.symbol,
+                        "dominant_side": whale_pressure_signal.dominant_side,
+                        "imbalance_ratio": whale_pressure_signal.imbalance_ratio,
+                        "total_notional": whale_pressure_signal.total_notional,
+                    },
+                )
+            await self._emit_signal(
+                event_name=self.config.whale_pressure_event_name,
+                payload=whale_pressure_signal.to_event(),
+            )
+
+        if whale_liquidation_context_signal is not None:
+            if self.config.log_signals:
+                self.logger.info(
+                    "Whale liquidation context detected",
+                    extra={
+                        "symbol": whale_liquidation_context_signal.symbol,
+                        "whale_side": whale_liquidation_context_signal.whale_side,
+                        "liquidation_side": whale_liquidation_context_signal.liquidation_side,
+                        "context_strength": whale_liquidation_context_signal.context_strength,
+                    },
+                )
+            await self._emit_signal(
+                event_name=self.config.whale_liquidation_context_event_name,
+                payload=whale_liquidation_context_signal.to_event(),
+            )
+
+    async def _emit_signal(self, event_name: str, payload: Dict[str, Any]) -> None:
+        if not self.config.emit_on_bus or self.event_bus is None:
             return
 
         try:
-            trade = self._normalize_liquidation_as_trade(event)
-            if trade is None:
-                return
-
-            detected = await self.process_trade(trade, source="liquidation")
-            if detected:
-                await self._publish_whale_event(detected)
-
-        except Exception as exc:
-            self._logger.exception(
-                "Failed to handle liquidation event",
-                extra={"error": str(exc), "event": event},
+            await self.event_bus.emit(event_name, payload)
+        except Exception:
+            self.logger.exception(
+                "Failed to emit WhaleTracker signal",
+                extra={"event_name": event_name},
             )
 
     # -------------------------------------------------------------------------
-    # core logic
+    # Normalization
     # -------------------------------------------------------------------------
 
-    async def process_trade(
-        self,
-        trade: TradeRecord,
-        *,
-        source: str = "trade",
-    ) -> Optional[WhaleTradeEvent]:
-        """
-        Обробляє один трейд і за потреби повертає WhaleTradeEvent.
-        """
-        async with self._lock:
-            stats = self._stats.setdefault(trade.symbol, WhaleTrackerStats(symbol=trade.symbol))
-            stats.processed_trades += 1
-            stats.last_trade_ts = trade.timestamp
+    def _normalize_large_trade_event(self, event: Dict[str, Any]) -> Optional[WhaleTradeRecord]:
+        try:
+            payload = event.get("data", event)
 
-            history = self._notional_history[trade.symbol]
+            symbol = self._normalize_symbol(payload.get("symbol") or payload.get("s"))
+            side = self._normalize_side(payload.get("side"))
+            notional = self._safe_float(payload.get("notional"))
+            price = self._safe_float(payload.get("price"))
+            quantity = self._safe_float(payload.get("quantity"))
+            timestamp_ms = self._extract_timestamp_ms(payload)
 
-            abs_threshold = self._get_abs_threshold(trade.symbol)
-            rolling_mean, rolling_std = self._compute_rolling_stats(history)
-            zscore = self._compute_zscore(
-                value=trade.notional,
-                mean_value=rolling_mean,
-                std_value=rolling_std,
-            )
-
-            dynamic_trigger = (
-                len(history) >= self._min_samples_for_zscore
-                and rolling_std > 0
-                and zscore >= self._zscore_threshold
-            )
-            absolute_trigger = trade.notional >= abs_threshold
-
-            stats.rolling_mean_notional = rolling_mean
-            stats.rolling_std_notional = rolling_std
-            stats.last_threshold = abs_threshold
-
-            # Оновлюємо history після обчислення статистики,
-            # щоб поточний трейд не впливав на свою ж оцінку.
-            history.append(trade.notional)
-
-            if not (absolute_trigger or dynamic_trigger):
+            if not symbol or not side or notional <= 0:
                 return None
 
-            self._append_large_trade(trade)
-            cluster = self._build_cluster_info(trade.symbol, trade.timestamp)
-
-            score = self._compute_score(
-                notional=trade.notional,
-                abs_threshold=abs_threshold,
-                zscore=zscore,
-                cluster_notional=cluster["cluster_notional"],
-                trades_in_cluster=cluster["trades_in_cluster"],
+            return WhaleTradeRecord(
+                symbol=symbol,
+                side=side,
+                notional=notional,
+                price=price,
+                quantity=quantity,
+                timestamp_ms=timestamp_ms,
+                zscore=self._safe_float(payload.get("zscore")),
+                trigger_type=str(payload.get("trigger_type", "unknown")),
+                trade_id=self._safe_str(payload.get("trade_id")),
+                exchange=self._safe_str(payload.get("exchange")),
+                raw_event=event,
             )
+        except Exception:
+            self.logger.exception("Failed to normalize large trade event")
+            return None
 
-            stats.detected_whale_trades += 1
-            stats.last_whale_ts = trade.timestamp
+    def _normalize_liquidation_event(self, event: Dict[str, Any]) -> Optional[LiquidationRecord]:
+        try:
+            payload = event.get("data", event)
 
-            whale_event = WhaleTradeEvent(
-                symbol=trade.symbol,
-                side=trade.side,
-                price=trade.price,
-                quantity=trade.quantity,
-                notional=trade.notional,
-                timestamp=trade.timestamp,
-                event_type="whale_trade" if source == "trade" else "whale_liquidation",
-                score=score,
-                zscore=zscore,
-                threshold_used=abs_threshold,
-                trades_in_cluster=cluster["trades_in_cluster"],
-                cluster_notional=cluster["cluster_notional"],
-                cluster_duration_sec=cluster["cluster_duration_sec"],
-                aggressor=trade.aggressor,
-                exchange=trade.exchange,
-                metadata={
-                    "source": source,
-                    "absolute_trigger": absolute_trigger,
-                    "dynamic_trigger": dynamic_trigger,
-                    "rolling_mean_notional": rolling_mean,
-                    "rolling_std_notional": rolling_std,
-                },
+            symbol = self._normalize_symbol(
+                payload.get("symbol")
+                or payload.get("s")
+                or payload.get("instrument")
             )
+            side = self._normalize_side(
+                payload.get("side")
+                or payload.get("S")
+                or payload.get("direction")
+            )
+            price = self._safe_float(payload.get("price") or payload.get("p"))
+            quantity = self._safe_float(
+                payload.get("quantity")
+                or payload.get("qty")
+                or payload.get("q")
+                or payload.get("size")
+            )
+            notional = self._safe_float(payload.get("notional"))
+            if notional <= 0 and price > 0 and quantity > 0:
+                notional = price * quantity
 
-            self._logger.info(
-                "Whale activity detected",
+            timestamp_ms = self._extract_timestamp_ms(payload)
+
+            if not symbol or not side or notional <= 0:
+                return None
+
+            return LiquidationRecord(
+                symbol=symbol,
+                side=side,
+                notional=notional,
+                price=price,
+                quantity=quantity,
+                timestamp_ms=timestamp_ms,
+                liquidation_id=self._safe_str(
+                    payload.get("liquidation_id")
+                    or payload.get("id")
+                ),
+                exchange=self._safe_str(payload.get("exchange") or event.get("exchange")),
+                raw_event=event,
+            )
+        except Exception:
+            self.logger.exception("Failed to normalize liquidation event")
+            return None
+
+    # -------------------------------------------------------------------------
+    # State / housekeeping
+    # -------------------------------------------------------------------------
+
+    def _get_or_create_state(self, symbol: str) -> SymbolTrackerState:
+        state = self._states.get(symbol)
+        if state is None:
+            state = SymbolTrackerState(
+                large_trades=deque(),
+                liquidations=deque(),
+            )
+            self._states[symbol] = state
+        return state
+
+    def _prune_symbol_state(self, state: SymbolTrackerState, current_ts_ms: int) -> None:
+        keep_from_ms = current_ts_ms - max(
+            self.config.cluster_window_sec,
+            self.config.pressure_window_sec,
+            self.config.liquidation_window_sec,
+        ) * 1000
+
+        while state.large_trades and state.large_trades[0].timestamp_ms < keep_from_ms:
+            state.large_trades.popleft()
+
+        while state.liquidations and state.liquidations[0].timestamp_ms < keep_from_ms:
+            state.liquidations.popleft()
+
+    async def cleanup(self) -> None:
+        ttl = self.config.stats_ttl_sec
+        now = time.monotonic()
+
+        removed_symbols: List[str] = []
+
+        async with self._lock:
+            for symbol, state in list(self._states.items()):
+                if (now - state.last_update_ts_monotonic) > ttl:
+                    del self._states[symbol]
+                    removed_symbols.append(symbol)
+
+        if removed_symbols:
+            self.logger.info(
+                "Cleaned stale WhaleTracker states",
                 extra={
-                    "symbol": whale_event.symbol,
-                    "side": whale_event.side,
-                    "price": whale_event.price,
-                    "quantity": whale_event.quantity,
-                    "notional": whale_event.notional,
-                    "score": whale_event.score,
-                    "zscore": whale_event.zscore,
-                    "cluster_notional": whale_event.cluster_notional,
-                    "trades_in_cluster": whale_event.trades_in_cluster,
-                    "source": source,
+                    "removed_count": len(removed_symbols),
+                    "symbols": removed_symbols,
                 },
             )
-
-            return whale_event
-
-    # -------------------------------------------------------------------------
-    # normalization
-    # -------------------------------------------------------------------------
-
-    def _normalize_trade(self, event: Dict[str, Any]) -> Optional[TradeRecord]:
-        """
-        Приводить довільний market trade event до уніфікованого вигляду.
-        """
-        symbol = event.get("symbol")
-        if not symbol:
-            self._logger.debug("Trade skipped: missing symbol", extra={"event": event})
-            return None
-
-        price = self._safe_float(event.get("price"))
-        quantity = self._safe_float(
-            event.get("quantity", event.get("qty", event.get("size", event.get("amount"))))
-        )
-
-        if price <= 0 or quantity <= 0:
-            self._logger.debug(
-                "Trade skipped: invalid price or quantity",
-                extra={"symbol": symbol, "price": price, "quantity": quantity},
-            )
-            return None
-
-        side = str(event.get("side", "unknown")).lower()
-        timestamp = self._extract_timestamp(event)
-
-        return TradeRecord(
-            symbol=str(symbol).upper(),
-            price=price,
-            quantity=quantity,
-            side=side,
-            timestamp=timestamp,
-            notional=price * quantity,
-            aggressor=event.get("aggressor"),
-            exchange=event.get("exchange"),
-            raw=event,
-        )
-
-    def _normalize_liquidation_as_trade(self, event: Dict[str, Any]) -> Optional[TradeRecord]:
-        """
-        Перетворює liquidation event у формат TradeRecord.
-        """
-        symbol = event.get("symbol")
-        if not symbol:
-            return None
-
-        price = self._safe_float(event.get("price"))
-        quantity = self._safe_float(
-            event.get("quantity", event.get("qty", event.get("size", event.get("amount"))))
-        )
-        if price <= 0 or quantity <= 0:
-            return None
-
-        side = str(event.get("side", event.get("liquidation_side", "unknown"))).lower()
-        timestamp = self._extract_timestamp(event)
-
-        return TradeRecord(
-            symbol=str(symbol).upper(),
-            price=price,
-            quantity=quantity,
-            side=side,
-            timestamp=timestamp,
-            notional=price * quantity,
-            aggressor="liquidation",
-            exchange=event.get("exchange"),
-            raw=event,
-        )
-
-    # -------------------------------------------------------------------------
-    # stats / thresholds / cluster logic
-    # -------------------------------------------------------------------------
-
-    def _get_abs_threshold(self, symbol: str) -> float:
-        return float(self._symbol_abs_thresholds.get(symbol.upper(), self._default_abs_notional_threshold))
-
-    def _compute_rolling_stats(self, history: Deque[float]) -> tuple[float, float]:
-        if not history:
-            return 0.0, 0.0
-        if len(history) == 1:
-            return history[0], 0.0
-        values = list(history)
-        return mean(values), pstdev(values)
-
-    def _compute_zscore(self, value: float, mean_value: float, std_value: float) -> float:
-        if std_value <= 0:
-            return 0.0
-        return (value - mean_value) / std_value
-
-    def _append_large_trade(self, trade: TradeRecord) -> None:
-        bucket = self._recent_large_trades[trade.symbol]
-        bucket.append(trade)
-        self._prune_old_large_trades(bucket, now_ts=trade.timestamp)
-
-    def _prune_old_large_trades(self, bucket: Deque[TradeRecord], *, now_ts: float) -> None:
-        while bucket and (now_ts - bucket[0].timestamp) > self._history_retention_sec:
-            bucket.popleft()
-
-    def _build_cluster_info(self, symbol: str, now_ts: float) -> Dict[str, Any]:
-        bucket = self._recent_large_trades[symbol]
-
-        cluster_trades: List[TradeRecord] = [
-            trade for trade in bucket
-            if (now_ts - trade.timestamp) <= self._cluster_window_sec
-        ]
-
-        if not cluster_trades:
-            return {
-                "trades_in_cluster": 1,
-                "cluster_notional": 0.0,
-                "cluster_duration_sec": 0.0,
-            }
-
-        cluster_notional = sum(t.notional for t in cluster_trades)
-        first_ts = min(t.timestamp for t in cluster_trades)
-        last_ts = max(t.timestamp for t in cluster_trades)
-        duration = max(0.0, last_ts - first_ts)
-
-        qualifies = (
-            len(cluster_trades) >= self._cluster_min_trades
-            or cluster_notional >= self._cluster_min_notional
-        )
-
-        if not qualifies:
-            return {
-                "trades_in_cluster": len(cluster_trades),
-                "cluster_notional": cluster_notional,
-                "cluster_duration_sec": duration,
-            }
-
-        return {
-            "trades_in_cluster": len(cluster_trades),
-            "cluster_notional": cluster_notional,
-            "cluster_duration_sec": duration,
-        }
-
-    def _compute_score(
-        self,
-        *,
-        notional: float,
-        abs_threshold: float,
-        zscore: float,
-        cluster_notional: float,
-        trades_in_cluster: int,
-    ) -> float:
-        """
-        Композитний score для ранжування whale-сигналів.
-        """
-        threshold_ratio = notional / abs_threshold if abs_threshold > 0 else 0.0
-        cluster_bonus = math.log1p(max(cluster_notional, 0.0) / max(abs_threshold, 1.0))
-        trade_count_bonus = min(trades_in_cluster / 10.0, 1.5)
-        zscore_bonus = max(zscore, 0.0) / 5.0
-
-        score = (
-            threshold_ratio * 0.55
-            + zscore_bonus * 0.20
-            + cluster_bonus * 0.15
-            + trade_count_bonus * 0.10
-        )
-
-        return round(score, 6)
-
-    # -------------------------------------------------------------------------
-    # publishing
-    # -------------------------------------------------------------------------
-
-    async def _publish_whale_event(self, whale_event: WhaleTradeEvent) -> None:
-        payload = asdict(whale_event)
-
-        if hasattr(self._event_bus, "publish"):
-            await self._event_bus.publish(self._publish_event_name, payload)
-        elif hasattr(self._event_bus, "emit"):
-            await self._event_bus.emit(self._publish_event_name, payload)
-        else:
-            self._logger.warning(
-                "EventBus has no publish/emit method; whale event not dispatched",
-                extra={"event_name": self._publish_event_name, "payload": payload},
-            )
-
-    # -------------------------------------------------------------------------
-    # monitoring / introspection
-    # -------------------------------------------------------------------------
-
-    def get_symbol_stats(self, symbol: str) -> Optional[Dict[str, Any]]:
-        stats = self._stats.get(symbol.upper())
-        if not stats:
-            return None
-        return asdict(stats)
-
-    def get_all_stats(self) -> Dict[str, Dict[str, Any]]:
-        return {symbol: asdict(stats) for symbol, stats in self._stats.items()}
-
-    def reset_symbol(self, symbol: str) -> None:
-        symbol = symbol.upper()
-        self._notional_history.pop(symbol, None)
-        self._recent_large_trades.pop(symbol, None)
-        self._stats.pop(symbol, None)
-
-        self._logger.info("WhaleTracker symbol state reset", extra={"symbol": symbol})
-
-    def reset_all(self) -> None:
-        self._notional_history.clear()
-        self._recent_large_trades.clear()
-        self._stats.clear()
-
-        self._logger.info("WhaleTracker state reset")
-
-    # -------------------------------------------------------------------------
-    # cleanup
-    # -------------------------------------------------------------------------
 
     async def _cleanup_loop(self) -> None:
         try:
-            while self._running:
-                await asyncio.sleep(self._cleanup_interval_sec)
-
-                async with self._lock:
-                    now_ts = time.time()
-
-                    for symbol, bucket in list(self._recent_large_trades.items()):
-                        self._prune_old_large_trades(bucket, now_ts=now_ts)
-                        if not bucket:
-                            self._recent_large_trades.pop(symbol, None)
-
-                self._logger.debug("WhaleTracker cleanup completed")
-
+            while True:
+                await asyncio.sleep(self.config.cleanup_interval_sec)
+                await self.cleanup()
         except asyncio.CancelledError:
-            self._logger.debug("WhaleTracker cleanup task cancelled")
+            self.logger.debug("WhaleTracker cleanup loop cancelled")
             raise
-        except Exception as exc:
-            self._logger.exception(
-                "WhaleTracker cleanup loop failed",
-                extra={"error": str(exc)},
-            )
+        except Exception:
+            self.logger.exception("Unexpected error in WhaleTracker cleanup loop")
 
     # -------------------------------------------------------------------------
-    # utils
+    # Public stats
     # -------------------------------------------------------------------------
 
-    def _extract_timestamp(self, event: Dict[str, Any]) -> float:
-        raw_ts = (
-            event.get("timestamp")
-            or event.get("ts")
-            or event.get("event_time")
-            or event.get("trade_time")
-            or time.time()
+    def get_symbol_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        state = self._states.get(symbol)
+        if state is None:
+            return None
+
+        buy_notional = sum(t.notional for t in state.large_trades if t.side == "buy")
+        sell_notional = sum(t.notional for t in state.large_trades if t.side == "sell")
+
+        return {
+            "symbol": symbol,
+            "large_trades_buffer_size": len(state.large_trades),
+            "liquidations_buffer_size": len(state.liquidations),
+            "total_large_trades_seen": state.total_large_trades_seen,
+            "total_liquidations_seen": state.total_liquidations_seen,
+            "current_buy_notional": buy_notional,
+            "current_sell_notional": sell_notional,
+            "whale_activity_signals_emitted": state.whale_activity_signals_emitted,
+            "whale_pressure_signals_emitted": state.whale_pressure_signals_emitted,
+            "whale_liquidation_context_signals_emitted": state.whale_liquidation_context_signals_emitted,
+        }
+
+    def get_all_states(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            symbol: self.get_symbol_state(symbol) or {}
+            for symbol in self._states
+        }
+
+    async def reset_symbol(self, symbol: str) -> None:
+        async with self._lock:
+            self._states.pop(symbol, None)
+
+        self.logger.info(
+            "Reset symbol state in WhaleTracker",
+            extra={"symbol": symbol},
         )
 
-        ts = self._safe_float(raw_ts)
-        if ts <= 0:
-            return time.time()
+    async def reset_all(self) -> None:
+        async with self._lock:
+            self._states.clear()
 
-        # Якщо timestamp у мілісекундах
-        if ts > 10_000_000_000:
-            ts /= 1000.0
+        self.logger.info("Reset all WhaleTracker states")
 
-        return ts
+    # -------------------------------------------------------------------------
+    # Utils
+    # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _safe_float(value: Any, default: float = 0.0) -> float:
+    def _passes_cooldown(self, last_ts: float, cooldown_sec: float) -> bool:
+        now = time.monotonic()
+        return (now - last_ts) >= cooldown_sec
+
+    def _normalize_symbol(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        result = str(value).strip().upper()
+        return result or None
+
+    def _normalize_side(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+
+        side = str(value).strip().lower()
+        mapping = {
+            "buy": "buy",
+            "bid": "buy",
+            "b": "buy",
+            "sell": "sell",
+            "ask": "sell",
+            "s": "sell",
+        }
+        return mapping.get(side)
+
+    def _safe_float(self, value: Any) -> float:
+        if value is None:
+            return 0.0
         try:
-            if value is None:
-                return default
             return float(value)
         except (TypeError, ValueError):
-            return default
+            return 0.0
+
+    def _safe_str(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _extract_timestamp_ms(self, payload: Dict[str, Any]) -> int:
+        raw_ts = (
+            payload.get("timestamp_ms")
+            or payload.get("ts")
+            or payload.get("timestamp")
+            or payload.get("T")
+            or payload.get("time")
+        )
+
+        if raw_ts is None:
+            return int(time.time() * 1000)
+
+        if isinstance(raw_ts, datetime):
+            if raw_ts.tzinfo is None:
+                raw_ts = raw_ts.replace(tzinfo=timezone.utc)
+            return int(raw_ts.timestamp() * 1000)
+
+        if isinstance(raw_ts, str):
+            try:
+                dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except ValueError:
+                pass
+
+        try:
+            ts = float(raw_ts)
+        except (TypeError, ValueError):
+            return int(time.time() * 1000)
+
+        if ts < 10_000_000_000:
+            ts *= 1000.0
+
+        return int(ts)
