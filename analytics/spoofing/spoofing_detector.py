@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -41,11 +41,17 @@ class SpoofingDetectorConfig:
     - min_lifetime_ms / max_lifetime_ms: типовий spoof живе недовго
     - cancel_ratio_threshold: яка частина обсягу має зникнути
     - price_move_confirmation_bps: на скільки має зрушити mid price після зникнення
-    - trade_pressure_window_ms: вікно угод для оцінки агресії
+    - trade_pressure_window_ms: вікно угод для оцінки агресії після зникнення
     - min_opposite_pressure_ratio: підтвердження, що рух іде у "маніпулятивний" бік
     - cooldown_ms_same_level: щоб не спамити повторними сигналами по тому ж рівню
     - cleanup_interval_sec: періодична очистка state
+
+    Додатково:
+    - similar_candidate_tolerance_bps: толеранс для визначення "схожого" активного кандидата
+    - score_*_cap: caps для нормалізації score без magic numbers
+    - logical_invalidation_distance_multiplier: коли ринок надто далеко відійшов від рівня
     """
+
     enabled: bool = True
     symbols: Optional[List[str]] = None
 
@@ -70,6 +76,13 @@ class SpoofingDetectorConfig:
 
     cleanup_interval_sec: int = 5
     emit_raw_candidate_events: bool = False
+
+    similar_candidate_tolerance_bps: float = 1.0
+
+    score_size_multiple_cap: float = 8.0
+    score_price_move_bps_cap: float = 12.0
+    score_opposite_pressure_ratio_cap: float = 3.0
+    logical_invalidation_distance_multiplier: float = 3.0
 
 
 @dataclass(slots=True)
@@ -109,14 +122,12 @@ class SpoofingCandidate:
 
     status: CandidateStatus = CandidateStatus.ACTIVE
     removed_ts_ms: Optional[int] = None
-    removal_size: Optional[float] = None
+    remaining_size: Optional[float] = None
     cancel_ratio: Optional[float] = None
 
     confirmation_ts_ms: Optional[int] = None
     confirmation_price_move_bps: Optional[float] = None
     opposite_pressure_ratio: Optional[float] = None
-
-    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -146,7 +157,7 @@ class SpoofingSignal:
     score: float
     confidence: float
 
-    details: Dict[str, Any] = field(default_factory=dict)
+    details: Dict[str, Any]
 
 
 class SpoofingDetector:
@@ -156,31 +167,12 @@ class SpoofingDetector:
     Очікувані події:
     - market.orderbook.updated
     - market.trade
-    - market.trades.aggressive   (опціонально, якщо у тебе вже є AggressiveTrades)
+    - market.trades.aggressive   (опціонально)
 
     Публікує:
     - analytics.spoofing.candidate_detected
     - analytics.spoofing.candidate_removed
     - analytics.spoofing.detected
-
-    Формат orderbook event (мінімально потрібне):
-    {
-        "symbol": "BTCUSDT",
-        "ts_ms": 1712345678901,
-        "best_bid": 68000.0,
-        "best_ask": 68000.5,
-        "bids": [{"price": 67999.9, "size": 1200.0}, ...],
-        "asks": [{"price": 68000.5, "size": 900.0}, ...]
-    }
-
-    Формат trade event:
-    {
-        "symbol": "BTCUSDT",
-        "price": 68001.0,
-        "qty": 12.5,
-        "side": "buy",
-        "ts_ms": 1712345678950
-    }
     """
 
     def __init__(
@@ -225,6 +217,7 @@ class SpoofingDetector:
                 "min_abs_size": self.config.min_abs_size,
                 "min_size_multiple_vs_avg": self.config.min_size_multiple_vs_avg,
                 "max_distance_bps": self.config.max_distance_bps,
+                "trade_pressure_window_ms": self.config.trade_pressure_window_ms,
             },
         )
 
@@ -256,10 +249,6 @@ class SpoofingDetector:
         self.logger.info("SpoofingDetector stopped")
 
     async def _subscribe_events(self) -> None:
-        """
-        Передбачається, що EventBus вміє subscribe(event_name, handler).
-        Якщо у тебе інший контракт EventBus — адаптуєш лише цей шар.
-        """
         subscribe = getattr(self.event_bus, "subscribe", None)
         if subscribe is None:
             raise AttributeError("EventBus does not support 'subscribe'")
@@ -315,20 +304,20 @@ class SpoofingDetector:
             return
 
         try:
-            symbol = str(event["symbol"])
+            parsed = self._parse_orderbook_event(event)
+            if parsed is None:
+                return
+
+            symbol = parsed["symbol"]
             if not self._symbol_allowed(symbol):
                 return
 
-            ts_ms = int(event.get("ts_ms") or self._now_ms())
-            best_bid = float(event["best_bid"])
-            best_ask = float(event["best_ask"])
-            bids = self._normalize_levels(event.get("bids", []))
-            asks = self._normalize_levels(event.get("asks", []))
-
-            if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
-                return
-
-            mid = (best_bid + best_ask) / 2.0
+            ts_ms = parsed["ts_ms"]
+            best_bid = parsed["best_bid"]
+            best_ask = parsed["best_ask"]
+            bids = parsed["bids"]
+            asks = parsed["asks"]
+            mid = parsed["mid"]
 
             self._latest_best_bid_by_symbol[symbol] = best_bid
             self._latest_best_ask_by_symbol[symbol] = best_ask
@@ -367,31 +356,26 @@ class SpoofingDetector:
             return
 
         try:
-            symbol = str(event["symbol"])
-            if not self._symbol_allowed(symbol):
+            trade = self._parse_trade_event(event)
+            if trade is None:
                 return
 
-            trade = TradeTick(
-                symbol=symbol,
-                price=float(event["price"]),
-                qty=float(event.get("qty", event.get("size", 0.0))),
-                side=str(event["side"]).lower(),
-                ts_ms=int(event.get("ts_ms") or self._now_ms()),
-            )
-
-            if trade.qty <= 0:
+            if not self._symbol_allowed(trade.symbol):
                 return
 
-            dq = self._trades_by_symbol[symbol]
+            dq = self._trades_by_symbol[trade.symbol]
             dq.append(trade)
             self._stats["trade_events"] += 1
 
             while len(dq) > self.config.max_trade_events_per_symbol:
                 dq.popleft()
 
-            self._prune_old_trades(symbol=symbol, now_ms=trade.ts_ms)
+            # Прюнимо тільки один раз тут.
+            # Далі _calc_opposite_pressure_ratio вже НЕ робить додатковий prune,
+            # щоб уникнути дублювання роботи та прихованих побічних ефектів.
+            self._prune_old_trades(symbol=trade.symbol, now_ms=trade.ts_ms)
 
-            await self._try_confirm_removed_candidates(symbol=symbol, now_ms=trade.ts_ms)
+            await self._try_confirm_removed_candidates(symbol=trade.symbol, now_ms=trade.ts_ms)
 
         except Exception as exc:
             self._stats["errors"] += 1
@@ -501,16 +485,16 @@ class SpoofingDetector:
         bids: List[OrderBookLevel],
         asks: List[OrderBookLevel],
     ) -> None:
-        active_candidates = self._candidates_by_symbol.get(symbol, {})
-        if not active_candidates:
+        candidates = self._candidates_by_symbol.get(symbol, {})
+        if not candidates:
             return
 
         bid_map = {round(x.price, 8): x.size for x in bids}
         ask_map = {round(x.price, 8): x.size for x in asks}
 
-        to_remove: List[str] = []
+        to_finalize: List[Tuple[str, CandidateStatus, Optional[str]]] = []
 
-        for candidate_id, candidate in list(active_candidates.items()):
+        for candidate_id, candidate in list(candidates.items()):
             if candidate.status != CandidateStatus.ACTIVE:
                 continue
 
@@ -527,19 +511,27 @@ class SpoofingDetector:
 
             lifetime_ms = ts_ms - candidate.detected_ts_ms
             if lifetime_ms > self.config.candidate_ttl_ms:
-                candidate.status = CandidateStatus.EXPIRED
-                to_remove.append(candidate_id)
-                self._stats["expired_candidates"] += 1
+                to_finalize.append((candidate_id, CandidateStatus.EXPIRED, "expired_candidates"))
                 continue
 
             if current_size <= 0:
                 removed = await self._mark_candidate_removed(
                     candidate=candidate,
                     removed_ts_ms=ts_ms,
-                    removal_size=0.0,
+                    remaining_size=0.0,
                     mid=mid,
                 )
+                # removed=True => кандидат стає CANCELLED і спеціально лишається в dict,
+                # бо його ще має перевірити _try_confirm_removed_candidates().
                 if removed:
+                    continue
+
+                if candidate.status == CandidateStatus.INVALIDATED:
+                    to_finalize.append((candidate_id, CandidateStatus.INVALIDATED, "invalidated_candidates"))
+                    continue
+
+                if candidate.status == CandidateStatus.EXPIRED:
+                    to_finalize.append((candidate_id, CandidateStatus.EXPIRED, "expired_candidates"))
                     continue
 
             cancel_ratio = 1.0 - (current_size / candidate.peak_size if candidate.peak_size > 0 else 1.0)
@@ -547,44 +539,51 @@ class SpoofingDetector:
                 removed = await self._mark_candidate_removed(
                     candidate=candidate,
                     removed_ts_ms=ts_ms,
-                    removal_size=current_size,
+                    remaining_size=current_size,
                     mid=mid,
                 )
+                # Аналогічно: якщо removed=True, кандидат переходить у CANCELLED
+                # та очікує confirm/expire в окремому етапі.
                 if removed:
                     continue
 
-            if not self._still_logically_valid(candidate, best_bid=best_bid, best_ask=best_ask):
-                candidate.status = CandidateStatus.INVALIDATED
-                to_remove.append(candidate_id)
-                self._stats["invalidated_candidates"] += 1
+                if candidate.status == CandidateStatus.INVALIDATED:
+                    to_finalize.append((candidate_id, CandidateStatus.INVALIDATED, "invalidated_candidates"))
+                    continue
 
-        for candidate_id in to_remove:
-            active_candidates.pop(candidate_id, None)
+                if candidate.status == CandidateStatus.EXPIRED:
+                    to_finalize.append((candidate_id, CandidateStatus.EXPIRED, "expired_candidates"))
+                    continue
+
+            if not self._still_logically_valid(candidate, best_bid=best_bid, best_ask=best_ask):
+                to_finalize.append((candidate_id, CandidateStatus.INVALIDATED, "invalidated_candidates"))
+
+        for candidate_id, final_status, stat_name in to_finalize:
+            candidate = candidates.get(candidate_id)
+            if candidate is not None:
+                self._finalize_candidate(candidate, final_status, increment_stat=stat_name)
 
     async def _mark_candidate_removed(
         self,
         candidate: SpoofingCandidate,
         removed_ts_ms: int,
-        removal_size: float,
+        remaining_size: float,
         mid: float,
     ) -> bool:
         lifetime_ms = removed_ts_ms - candidate.detected_ts_ms
+
         if lifetime_ms < self.config.min_lifetime_ms:
             candidate.status = CandidateStatus.INVALIDATED
-            self._candidates_by_symbol[candidate.symbol].pop(candidate.id, None)
-            self._stats["invalidated_candidates"] += 1
             return False
 
         if lifetime_ms > self.config.max_lifetime_ms:
             candidate.status = CandidateStatus.EXPIRED
-            self._candidates_by_symbol[candidate.symbol].pop(candidate.id, None)
-            self._stats["expired_candidates"] += 1
             return False
 
         candidate.removed_ts_ms = removed_ts_ms
-        candidate.removal_size = removal_size
+        candidate.remaining_size = remaining_size
         candidate.cancel_ratio = 1.0 - (
-            removal_size / candidate.peak_size if candidate.peak_size > 0 else 1.0
+            remaining_size / candidate.peak_size if candidate.peak_size > 0 else 1.0
         )
         candidate.status = CandidateStatus.CANCELLED
 
@@ -610,7 +609,7 @@ class SpoofingDetector:
         if latest_mid is None:
             return
 
-        to_delete: List[str] = []
+        to_finalize: List[Tuple[str, CandidateStatus, Optional[str]]] = []
 
         for candidate_id, candidate in list(candidates.items()):
             if candidate.status != CandidateStatus.CANCELLED:
@@ -621,9 +620,7 @@ class SpoofingDetector:
 
             time_since_removed_ms = now_ms - candidate.removed_ts_ms
             if time_since_removed_ms > self.config.trade_pressure_window_ms:
-                candidate.status = CandidateStatus.EXPIRED
-                to_delete.append(candidate_id)
-                self._stats["expired_candidates"] += 1
+                to_finalize.append((candidate_id, CandidateStatus.EXPIRED, "expired_candidates"))
                 continue
 
             price_move_bps = self._calc_price_move_after_removal_bps(candidate, latest_mid)
@@ -664,7 +661,7 @@ class SpoofingDetector:
 
             await self._emit_event("analytics.spoofing.detected", asdict(signal))
             self._stats["signals_confirmed"] += 1
-            to_delete.append(candidate_id)
+            to_finalize.append((candidate_id, CandidateStatus.CONFIRMED, None))
 
             self.logger.info(
                 "Spoofing confirmed",
@@ -679,8 +676,10 @@ class SpoofingDetector:
                 },
             )
 
-        for candidate_id in to_delete:
-            candidates.pop(candidate_id, None)
+        for candidate_id, final_status, stat_name in to_finalize:
+            candidate = candidates.get(candidate_id)
+            if candidate is not None:
+                self._finalize_candidate(candidate, final_status, increment_stat=stat_name)
 
     def _build_signal(
         self,
@@ -735,9 +734,16 @@ class SpoofingDetector:
 
     async def _register_candidate(self, candidate: SpoofingCandidate) -> None:
         symbol_candidates = self._candidates_by_symbol[candidate.symbol]
+
         if len(symbol_candidates) >= self.config.max_candidates_per_symbol:
             oldest_id = min(symbol_candidates, key=lambda x: symbol_candidates[x].detected_ts_ms)
-            symbol_candidates.pop(oldest_id, None)
+            oldest_candidate = symbol_candidates.get(oldest_id)
+            if oldest_candidate is not None:
+                self._finalize_candidate(
+                    oldest_candidate,
+                    CandidateStatus.EXPIRED,
+                    increment_stat="expired_candidates",
+                )
 
         symbol_candidates[candidate.id] = candidate
         self._stats["candidates_created"] += 1
@@ -765,16 +771,17 @@ class SpoofingDetector:
         now_ms = self._now_ms()
 
         for symbol, candidates in list(self._candidates_by_symbol.items()):
-            to_delete: List[str] = []
-            for candidate_id, candidate in candidates.items():
+            to_finalize: List[Tuple[str, CandidateStatus, Optional[str]]] = []
+
+            for candidate_id, candidate in list(candidates.items()):
                 age_ms = now_ms - candidate.detected_ts_ms
                 if age_ms > self.config.candidate_ttl_ms:
-                    candidate.status = CandidateStatus.EXPIRED
-                    to_delete.append(candidate_id)
+                    to_finalize.append((candidate_id, CandidateStatus.EXPIRED, "expired_candidates"))
 
-            for candidate_id in to_delete:
-                candidates.pop(candidate_id, None)
-                self._stats["expired_candidates"] += 1
+            for candidate_id, final_status, stat_name in to_finalize:
+                candidate = candidates.get(candidate_id)
+                if candidate is not None:
+                    self._finalize_candidate(candidate, final_status, increment_stat=stat_name)
 
         for symbol in list(self._trades_by_symbol.keys()):
             self._prune_old_trades(symbol=symbol, now_ms=now_ms)
@@ -825,6 +832,87 @@ class SpoofingDetector:
             return True
         return symbol in self.config.symbols
 
+    def _parse_orderbook_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(event, dict):
+            self.logger.warning(
+                "Orderbook event is not a dict",
+                extra={"event": self._safe_event(event)},
+            )
+            return None
+
+        required = ("symbol", "best_bid", "best_ask")
+        missing = [k for k in required if k not in event]
+        if missing:
+            self.logger.warning(
+                "Orderbook event missing required fields",
+                extra={"missing_fields": missing, "event": self._safe_event(event)},
+            )
+            return None
+
+        try:
+            symbol = str(event["symbol"])
+            ts_ms = int(event.get("ts_ms") or self._now_ms())
+            best_bid = float(event["best_bid"])
+            best_ask = float(event["best_ask"])
+            bids = self._normalize_levels(event.get("bids", []))
+            asks = self._normalize_levels(event.get("asks", []))
+        except (TypeError, ValueError) as exc:
+            self.logger.warning(
+                "Invalid orderbook event payload",
+                extra={"event": self._safe_event(event), "error": str(exc)},
+            )
+            return None
+
+        if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+            return None
+
+        return {
+            "symbol": symbol,
+            "ts_ms": ts_ms,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bids": bids,
+            "asks": asks,
+            "mid": (best_bid + best_ask) / 2.0,
+        }
+
+    def _parse_trade_event(self, event: Dict[str, Any]) -> Optional[TradeTick]:
+        if not isinstance(event, dict):
+            self.logger.warning(
+                "Trade event is not a dict",
+                extra={"event": self._safe_event(event)},
+            )
+            return None
+
+        required = ("symbol", "price", "side")
+        missing = [k for k in required if k not in event]
+        if missing:
+            self.logger.warning(
+                "Trade event missing required fields",
+                extra={"missing_fields": missing, "event": self._safe_event(event)},
+            )
+            return None
+
+        try:
+            trade = TradeTick(
+                symbol=str(event["symbol"]),
+                price=float(event["price"]),
+                qty=float(event.get("qty", event.get("size", 0.0))),
+                side=str(event["side"]).lower(),
+                ts_ms=int(event.get("ts_ms") or self._now_ms()),
+            )
+        except (TypeError, ValueError) as exc:
+            self.logger.warning(
+                "Invalid trade event payload",
+                extra={"event": self._safe_event(event), "error": str(exc)},
+            )
+            return None
+
+        if trade.price <= 0 or trade.qty <= 0 or trade.side not in {"buy", "sell"}:
+            return None
+
+        return trade
+
     def _normalize_levels(self, levels: List[Any]) -> List[OrderBookLevel]:
         normalized: List[OrderBookLevel] = []
 
@@ -835,15 +923,23 @@ class SpoofingDetector:
                 continue
 
             if isinstance(item, dict):
-                price = float(item.get("price", 0.0))
-                size = float(item.get("size", item.get("qty", 0.0)))
+                try:
+                    price = float(item.get("price", 0.0))
+                    size = float(item.get("size", item.get("qty", 0.0)))
+                except (TypeError, ValueError):
+                    continue
+
                 if price > 0 and size >= 0:
                     normalized.append(OrderBookLevel(price=price, size=size))
                 continue
 
             if isinstance(item, (list, tuple)) and len(item) >= 2:
-                price = float(item[0])
-                size = float(item[1])
+                try:
+                    price = float(item[0])
+                    size = float(item[1])
+                except (TypeError, ValueError):
+                    continue
+
                 if price > 0 and size >= 0:
                     normalized.append(OrderBookLevel(price=price, size=size))
 
@@ -902,16 +998,17 @@ class SpoofingDetector:
         symbol: str,
         side: SpoofingSide,
         price: float,
-        tolerance_bps: float = 1.0,
     ) -> bool:
         candidates = self._candidates_by_symbol.get(symbol, {})
+        tolerance_bps = self.config.similar_candidate_tolerance_bps
+
         for candidate in candidates.values():
             if candidate.status != CandidateStatus.ACTIVE:
                 continue
             if candidate.side != side:
                 continue
 
-            diff_bps = abs(candidate.price - price) / price * 10_000.0
+            diff_bps = abs(candidate.price - price) / max(price, 1e-9) * 10_000.0
             if diff_bps <= tolerance_bps:
                 return True
 
@@ -923,17 +1020,15 @@ class SpoofingDetector:
         best_bid: float,
         best_ask: float,
     ) -> bool:
-        """
-        Якщо ринок уже сильно відійшов або рівень втратив сенс,
-        candidate можна інвалідовувати.
-        """
         distance_bps = self._distance_bps_from_touch(
             side=candidate.side,
             price=candidate.price,
             best_bid=best_bid,
             best_ask=best_ask,
         )
-        return distance_bps <= self.config.max_distance_bps * 3.0
+        return distance_bps <= (
+            self.config.max_distance_bps * self.config.logical_invalidation_distance_multiplier
+        )
 
     def _calc_price_move_after_removal_bps(
         self,
@@ -944,11 +1039,11 @@ class SpoofingDetector:
             return None
 
         if candidate.side == SpoofingSide.BID:
-            # bid spoof -> підтримка "фейкова" -> після зникнення ціна має піти вниз
+            # bid spoof -> фейкова підтримка -> після зникнення очікуємо рух вниз
             move = (candidate.mid_at_detection - latest_mid) / candidate.mid_at_detection * 10_000.0
             return max(move, 0.0)
 
-        # ask spoof -> опір "фейковий" -> після зникнення ціна має піти вгору
+        # ask spoof -> фейковий опір -> після зникнення очікуємо рух вгору
         move = (latest_mid - candidate.mid_at_detection) / candidate.mid_at_detection * 10_000.0
         return max(move, 0.0)
 
@@ -958,7 +1053,13 @@ class SpoofingDetector:
         candidate: SpoofingCandidate,
         now_ms: int,
     ) -> float:
-        trades = self._trades_by_symbol.get(symbol, deque())
+        """
+        Навмисно повертаємось до O(n)-scan по deque, але у вузькому та семантично
+        правильному вікні trade_pressure_window_ms.
+
+        Це краще за некоректний rolling counter по ширшому вікну.
+        """
+        trades = self._trades_by_symbol.get(symbol)
         if not trades:
             return 0.0
 
@@ -969,6 +1070,7 @@ class SpoofingDetector:
         for trade in trades:
             if trade.ts_ms < start_ms:
                 continue
+
             if trade.side == "buy":
                 buy_qty += trade.qty
             elif trade.side == "sell":
@@ -989,13 +1091,24 @@ class SpoofingDetector:
         opposite_pressure_ratio: float,
         distance_bps: float,
     ) -> float:
-        size_score = min(size_multiple / 8.0, 1.0) * 30.0
-        cancel_score = min(cancel_ratio, 1.0) * 25.0
-        move_score = min(price_move_bps / 12.0, 1.0) * 25.0
-        pressure_score = min(opposite_pressure_ratio / 3.0, 1.0) * 15.0
+        size_score = min(
+            size_multiple / max(self.config.score_size_multiple_cap, 1e-9), 1.0
+        ) * 30.0
 
-        # чим ближче до touch, тим підозріліше
-        proximity_score = max(0.0, 1.0 - (distance_bps / max(self.config.max_distance_bps, 1e-9))) * 5.0
+        cancel_score = min(cancel_ratio, 1.0) * 25.0
+
+        move_score = min(
+            price_move_bps / max(self.config.score_price_move_bps_cap, 1e-9), 1.0
+        ) * 25.0
+
+        pressure_score = min(
+            opposite_pressure_ratio / max(self.config.score_opposite_pressure_ratio_cap, 1e-9), 1.0
+        ) * 15.0
+
+        proximity_score = max(
+            0.0,
+            1.0 - (distance_bps / max(self.config.max_distance_bps, 1e-9)),
+        ) * 5.0
 
         score = size_score + cancel_score + move_score + pressure_score + proximity_score
         return round(min(score, 100.0), 2)
@@ -1033,6 +1146,19 @@ class SpoofingDetector:
         while dq and dq[0].ts_ms < cutoff:
             dq.popleft()
 
+    def _finalize_candidate(
+        self,
+        candidate: SpoofingCandidate,
+        final_status: CandidateStatus,
+        *,
+        increment_stat: Optional[str] = None,
+    ) -> None:
+        candidate.status = final_status
+        self._candidates_by_symbol[candidate.symbol].pop(candidate.id, None)
+
+        if increment_stat:
+            self._stats[increment_stat] += 1
+
     async def _emit_event(self, event_name: str, payload: Dict[str, Any]) -> None:
         emit = getattr(self.event_bus, "emit", None)
         if emit is None:
@@ -1046,10 +1172,10 @@ class SpoofingDetector:
         if asyncio.iscoroutine(result):
             await result
 
-    def _safe_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+    def _safe_event(self, event: Any) -> Dict[str, Any]:
         if not isinstance(event, dict):
             return {"raw_type": str(type(event))}
-        return {k: event.get(k) for k in list(event.keys())[:20]}
+        return {k: v for k, v in list(event.items())[:20]}
 
     @staticmethod
     def _now_ms() -> int:
