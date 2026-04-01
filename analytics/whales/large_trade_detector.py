@@ -17,19 +17,23 @@ class LargeTradeDetectorConfig:
     """
     Конфігурація детектора великих трейдів.
 
-    absolute threshold:
-        Мінімальний notional, після якого трейд вважається великим.
+    Absolute trigger:
+        Трейд вважається великим, якщо його notional >= absolute threshold.
 
-    relative threshold:
-        Трейд також може бути визначений як великий відносно
-        rolling distribution notional-значень по символу.
+    Relative trigger:
+        Трейд також може бути визначений як великий відносно rolling
+        distribution notional-значень по символу.
 
     Детекція спрацьовує, якщо:
         1) notional >= absolute threshold
         або
         2) z-score >= zscore threshold
-        або
-        3) обидві умови разом
+
+    Примітка:
+        Relative detection тут навмисно орієнтована лише на аномально ВЕЛИКІ
+        трейди, тому перевіряється лише позитивний z-score.
+        Якщо в майбутньому знадобиться виявлення аномально малих трейдів,
+        цю логіку треба буде розширити окремо.
     """
 
     enabled: bool = True
@@ -50,10 +54,14 @@ class LargeTradeDetectorConfig:
 
     # Cooldown між сигналами по одному символу
     signal_cooldown_sec: float = 2.0
+    symbol_cooldown_sec: Dict[str, float] = field(default_factory=dict)
 
     # Housekeeping
     cleanup_interval_sec: int = 60
     stats_ttl_sec: int = 60 * 60
+
+    # Recalibration для боротьби з накопиченням floating-point drift
+    recalibration_interval: int = 2_000
 
     # Event names
     input_event_name: str = "market.trade"
@@ -108,10 +116,12 @@ class LargeTradeSignal:
 
     detector_name: str = "LargeTradeDetector"
     event_type: str = "large_trade"
+    schema_version: int = 1
     created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
 
     def to_event(self) -> Dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "event_type": self.event_type,
             "detector": self.detector_name,
             "symbol": self.symbol,
@@ -135,6 +145,17 @@ class LargeTradeSignal:
 class SymbolStats:
     """
     Rolling-статистика по символу.
+
+    Реалізація використовує:
+        - deque для rolling window
+        - running_sum / running_sum_sq для O(1) mean/std
+        - періодичний _recalibrate() для боротьби з floating-point drift
+          при довгій роботі та постійних eviction у deque
+
+    Примітка:
+        Тут використовується sample std (n - 1), а не population std.
+        Для rolling z-score це зазвичай більш коректно, особливо на відносно
+        невеликих вибірках.
     """
 
     notionals: Deque[float]
@@ -143,20 +164,63 @@ class SymbolStats:
     last_signal_ts_monotonic: float = 0.0
     last_update_ts_monotonic: float = field(default_factory=time.monotonic)
 
+    running_sum: float = 0.0
+    running_sum_sq: float = 0.0
+    updates_since_recalibration: int = 0
+
     def touch(self) -> None:
         self.last_update_ts_monotonic = time.monotonic()
 
+    @property
+    def sample_size(self) -> int:
+        return len(self.notionals)
+
+    def add(self, value: float, recalibration_interval: int) -> None:
+        if self.notionals.maxlen is not None and len(self.notionals) == self.notionals.maxlen:
+            evicted = self.notionals[0]
+            self.running_sum -= evicted
+            self.running_sum_sq -= evicted * evicted
+
+        self.notionals.append(value)
+        self.running_sum += value
+        self.running_sum_sq += value * value
+        self.updates_since_recalibration += 1
+        self.touch()
+
+        if recalibration_interval > 0 and self.updates_since_recalibration >= recalibration_interval:
+            self.recalibrate()
+
+    def recalibrate(self) -> None:
+        """
+        Повний перерахунок running_sum / running_sum_sq з deque.
+
+        Це дешевий спосіб прибрати накопичений floating-point drift
+        без суттєвого ускладнення sliding-window логіки.
+        """
+        values = list(self.notionals)
+        self.running_sum = math.fsum(values)
+        self.running_sum_sq = math.fsum(x * x for x in values)
+        self.updates_since_recalibration = 0
+
     def mean(self) -> float:
-        if not self.notionals:
+        n = len(self.notionals)
+        if n == 0:
             return 0.0
-        return sum(self.notionals) / len(self.notionals)
+        return self.running_sum / n
 
     def std(self) -> float:
+        """
+        Sample std (n - 1).
+        """
         n = len(self.notionals)
         if n < 2:
             return 0.0
-        mean_value = self.mean()
-        variance = sum((x - mean_value) ** 2 for x in self.notionals) / n
+
+        mean_value = self.running_sum / n
+        numerator = self.running_sum_sq - (n * mean_value * mean_value)
+        numerator = max(numerator, 0.0)
+
+        variance = numerator / (n - 1)
         return math.sqrt(max(variance, 0.0))
 
 
@@ -179,8 +243,12 @@ class LargeTradeDetector:
             await event_bus.unsubscribe(event_name, handler)
             await event_bus.emit(event_name, payload)
 
-        Якщо сигнатура у твоєму EventBus інша — адаптуєш лише
-        маленький блок start()/stop()/_emit_signal().
+    Примітка щодо stop():
+        stop() відписує detector від EventBus і завершує cleanup loop,
+        але навмисно не робить explicit drain усіх in-flight process_trade().
+        Тобто корутини, які вже зайшли всередину handle_event/process_trade,
+        можуть завершитися після виклику stop(). Це архітектурне обмеження
+        типового async EventBus без окремого drain/shutdown protocol.
     """
 
     def __init__(
@@ -199,9 +267,11 @@ class LargeTradeDetector:
         )
 
         self._stats: Dict[str, SymbolStats] = {}
+        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        self._registry_lock = asyncio.Lock()
+
         self._started = False
         self._cleanup_task: Optional[asyncio.Task[Any]] = None
-        self._lock = asyncio.Lock()
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -237,6 +307,7 @@ class LargeTradeDetector:
                 "rolling_window_size": self.config.rolling_window_size,
                 "zscore_threshold": self.config.zscore_threshold,
                 "default_abs_notional_threshold": self.config.default_abs_notional_threshold,
+                "recalibration_interval": self.config.recalibration_interval,
             },
         )
 
@@ -254,7 +325,6 @@ class LargeTradeDetector:
             self._cleanup_task = None
 
         self._started = False
-
         self.logger.info("LargeTradeDetector stopped")
 
     async def _safe_subscribe(self) -> None:
@@ -291,13 +361,6 @@ class LargeTradeDetector:
             )
 
     async def _register_scheduler_jobs(self) -> None:
-        """
-        Реєструє housekeeping job у Scheduler.
-
-        Тут припускається, що scheduler підтримує add_interval_job(...)
-        у стилі, який ми раніше обговорювали.
-        Якщо в тебе сигнатура відрізняється — треба адаптувати тільки цей блок.
-        """
         try:
             await self.scheduler.add_interval_job(
                 name="large_trade_detector_cleanup",
@@ -318,9 +381,6 @@ class LargeTradeDetector:
     # -------------------------------------------------------------------------
 
     async def handle_event(self, event: Dict[str, Any]) -> None:
-        """
-        Callback для EventBus.
-        """
         try:
             await self.process_trade(event)
         except Exception:
@@ -329,9 +389,9 @@ class LargeTradeDetector:
     async def process_trade(self, event: Dict[str, Any]) -> Optional[LargeTradeSignal]:
         """
         Основний вхід для обробки трейду.
-        Може викликатися:
-            - напряму
-            - через EventBus callback
+
+        Реалізація використовує per-symbol lock замість одного глобального,
+        щоб уникати зайвої contention між різними символами.
         """
         if not self.config.enabled:
             return None
@@ -343,9 +403,11 @@ class LargeTradeDetector:
         if not self._passes_basic_filters(trade):
             return None
 
-        async with self._lock:
-            stats = self._get_or_create_stats(trade.symbol)
+        stats, symbol_lock = await self._get_or_create_symbol_state(trade.symbol)
 
+        signal: Optional[LargeTradeSignal] = None
+
+        async with symbol_lock:
             mean_before = stats.mean()
             std_before = stats.std()
 
@@ -359,12 +421,11 @@ class LargeTradeDetector:
             abs_trigger = trade.notional >= abs_threshold
             rel_trigger = self._is_relative_trigger(
                 zscore=zscore,
-                sample_size=len(stats.notionals),
+                sample_size=stats.sample_size,
             )
 
-            signal: Optional[LargeTradeSignal] = None
             if abs_trigger or rel_trigger:
-                if self._passes_cooldown(stats):
+                if self._passes_cooldown(stats, trade.symbol):
                     signal = self._build_signal(
                         trade=trade,
                         abs_threshold=abs_threshold,
@@ -377,9 +438,11 @@ class LargeTradeDetector:
                     stats.signals_emitted += 1
                     stats.last_signal_ts_monotonic = time.monotonic()
 
-            stats.notionals.append(trade.notional)
+            stats.add(
+                trade.notional,
+                recalibration_interval=self.config.recalibration_interval,
+            )
             stats.trades_processed += 1
-            stats.touch()
 
         if signal is not None:
             if self.config.log_signals:
@@ -408,7 +471,8 @@ class LargeTradeDetector:
         """
         Нормалізація різних форм event payload у TradeRecord.
 
-        Очікувані ключі можуть бути різними, тому зроблено tolerant parsing.
+        Якщо payload відкидається, це логуються на debug-рівні з причиною,
+        щоб уникнути мовчазних дропів через parsing / data quality issues.
         """
         try:
             payload = event.get("data", event)
@@ -418,9 +482,6 @@ class LargeTradeDetector:
                 or payload.get("s")
                 or payload.get("instrument")
             )
-            if not symbol:
-                return None
-
             price = self._safe_float(
                 payload.get("price")
                 or payload.get("p")
@@ -448,7 +509,32 @@ class LargeTradeDetector:
                 or event.get("exchange")
             )
 
-            if not symbol or price <= 0 or quantity <= 0 or not side:
+            if not symbol:
+                self.logger.debug(
+                    "Dropping trade event: missing symbol",
+                    extra={"payload": payload},
+                )
+                return None
+
+            if price <= 0:
+                self.logger.debug(
+                    "Dropping trade event: invalid price",
+                    extra={"symbol": symbol, "price": price, "payload": payload},
+                )
+                return None
+
+            if quantity <= 0:
+                self.logger.debug(
+                    "Dropping trade event: invalid quantity",
+                    extra={"symbol": symbol, "quantity": quantity, "payload": payload},
+                )
+                return None
+
+            if not side:
+                self.logger.debug(
+                    "Dropping trade event: invalid side",
+                    extra={"symbol": symbol, "payload": payload},
+                )
                 return None
 
             return TradeRecord(
@@ -474,19 +560,47 @@ class LargeTradeDetector:
 
         return True
 
-    def _get_or_create_stats(self, symbol: str) -> SymbolStats:
-        stats = self._stats.get(symbol)
-        if stats is None:
-            stats = SymbolStats(
-                notionals=deque(maxlen=self.config.rolling_window_size),
-            )
-            self._stats[symbol] = stats
-        return stats
+    async def _get_or_create_symbol_state(self, symbol: str) -> tuple[SymbolStats, asyncio.Lock]:
+        """
+        Повертає пару (stats, symbol_lock) для символу.
+
+        Використовується double-checked creation:
+            - об'єкти алокуються поза registry lock
+            - під lock лише перевірка/вставка
+        """
+        existing_stats = self._stats.get(symbol)
+        existing_lock = self._symbol_locks.get(symbol)
+        if existing_stats is not None and existing_lock is not None:
+            return existing_stats, existing_lock
+
+        new_stats = SymbolStats(
+            notionals=deque(maxlen=self.config.rolling_window_size),
+        )
+        new_lock = asyncio.Lock()
+
+        async with self._registry_lock:
+            stats = self._stats.get(symbol)
+            if stats is None:
+                stats = new_stats
+                self._stats[symbol] = stats
+
+            symbol_lock = self._symbol_locks.get(symbol)
+            if symbol_lock is None:
+                symbol_lock = new_lock
+                self._symbol_locks[symbol] = symbol_lock
+
+            return stats, symbol_lock
 
     def _get_abs_threshold(self, symbol: str) -> float:
         return self.config.symbol_abs_thresholds.get(
             symbol,
             self.config.default_abs_notional_threshold,
+        )
+
+    def _get_cooldown_sec(self, symbol: str) -> float:
+        return self.config.symbol_cooldown_sec.get(
+            symbol,
+            self.config.signal_cooldown_sec,
         )
 
     def _calculate_zscore(self, value: float, mean: float, std: float) -> float:
@@ -495,15 +609,20 @@ class LargeTradeDetector:
         return (value - mean) / std
 
     def _is_relative_trigger(self, zscore: float, sample_size: int) -> bool:
+        """
+        Навмисно перевіряється лише позитивний z-score, бо detector
+        орієнтований на unusually large trades, а не на unusually small trades.
+        """
         if not self.config.use_relative_detection:
             return False
         if sample_size < self.config.min_samples_for_relative_detection:
             return False
         return zscore >= self.config.zscore_threshold
 
-    def _passes_cooldown(self, stats: SymbolStats) -> bool:
+    def _passes_cooldown(self, stats: SymbolStats, symbol: str) -> bool:
         now = time.monotonic()
-        return (now - stats.last_signal_ts_monotonic) >= self.config.signal_cooldown_sec
+        cooldown = self._get_cooldown_sec(symbol)
+        return (now - stats.last_signal_ts_monotonic) >= cooldown
 
     def _build_signal(
         self,
@@ -567,17 +686,32 @@ class LargeTradeDetector:
     async def cleanup(self) -> None:
         """
         Видалення протухлих symbol stats.
+
+        Примітка:
+            `now` спеціально береться ДО входу в lock. Це нормально, бо нам
+            потрібен лише консистентний monotonic snapshot для TTL-перевірки,
+            а не ідеально свіжий час на кожному symbol.
         """
         ttl = self.config.stats_ttl_sec
         now = time.monotonic()
-
         removed_symbols: list[str] = []
 
-        async with self._lock:
-            for symbol, stats in list(self._stats.items()):
-                if (now - stats.last_update_ts_monotonic) > ttl:
-                    del self._stats[symbol]
-                    removed_symbols.append(symbol)
+        async with self._registry_lock:
+            items = [(symbol, stats, self._symbol_locks.get(symbol)) for symbol, stats in self._stats.items()]
+
+        for symbol, stats, symbol_lock in items:
+            if symbol_lock is None:
+                continue
+
+            async with symbol_lock:
+                if (now - stats.last_update_ts_monotonic) <= ttl:
+                    continue
+
+                async with self._registry_lock:
+                    if self._stats.get(symbol) is stats:
+                        del self._stats[symbol]
+                        self._symbol_locks.pop(symbol, None)
+                        removed_symbols.append(symbol)
 
         if removed_symbols:
             self.logger.info(
@@ -597,7 +731,7 @@ class LargeTradeDetector:
                 await asyncio.sleep(self.config.cleanup_interval_sec)
                 await self.cleanup()
         except asyncio.CancelledError:
-            self.logger.debug("Cleanup loop cancelled")
+            self.logger.info("Cleanup loop cancelled")
             raise
         except Exception:
             self.logger.exception("Unexpected error in cleanup loop")
@@ -607,29 +741,47 @@ class LargeTradeDetector:
     # -------------------------------------------------------------------------
 
     def get_symbol_stats(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Повертає best-effort snapshot без лока.
+
+        Важливо:
+            Це sync-метод, тому він навмисно не await-ить asyncio lock.
+            Значення можуть бути зчитані під час конкурентного оновлення і
+            тому не гарантують ідеально атомарний snapshot.
+            Для metrics/observability це зазвичай прийнятно.
+        """
         stats = self._stats.get(symbol)
         if stats is None:
             return None
 
         return {
             "symbol": symbol,
-            "samples": len(stats.notionals),
+            "samples": stats.sample_size,
             "mean_notional": stats.mean(),
             "std_notional": stats.std(),
             "trades_processed": stats.trades_processed,
             "signals_emitted": stats.signals_emitted,
             "last_signal_ts_monotonic": stats.last_signal_ts_monotonic,
+            "last_update_ts_monotonic": stats.last_update_ts_monotonic,
         }
 
     def get_all_stats(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            symbol: self.get_symbol_stats(symbol) or {}
-            for symbol in self._stats
-        }
+        """
+        Повертає best-effort snapshots без лока.
+
+        Це навмисно не "strongly consistent" view, а легкий observability helper.
+        """
+        result: Dict[str, Dict[str, Any]] = {}
+        for symbol in list(self._stats.keys()):
+            snapshot = self.get_symbol_stats(symbol)
+            if snapshot is not None:
+                result[symbol] = snapshot
+        return result
 
     async def reset_symbol(self, symbol: str) -> None:
-        async with self._lock:
+        async with self._registry_lock:
             self._stats.pop(symbol, None)
+            self._symbol_locks.pop(symbol, None)
 
         self.logger.info(
             "Reset symbol stats in LargeTradeDetector",
@@ -637,8 +789,9 @@ class LargeTradeDetector:
         )
 
     async def reset_all(self) -> None:
-        async with self._lock:
+        async with self._registry_lock:
             self._stats.clear()
+            self._symbol_locks.clear()
 
         self.logger.info("Reset all LargeTradeDetector stats")
 
@@ -700,7 +853,6 @@ class LargeTradeDetector:
                 raw_ts = raw_ts.replace(tzinfo=timezone.utc)
             return int(raw_ts.timestamp() * 1000)
 
-        # ISO string
         if isinstance(raw_ts, str):
             try:
                 dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
@@ -710,13 +862,12 @@ class LargeTradeDetector:
             except ValueError:
                 pass
 
-        # int / float
         try:
             ts = float(raw_ts)
         except (TypeError, ValueError):
             return int(time.time() * 1000)
 
-        # евристика: секунди чи мілісекунди
+        # Евристика: секунди чи мілісекунди
         if ts < 10_000_000_000:
             ts *= 1000.0
 
