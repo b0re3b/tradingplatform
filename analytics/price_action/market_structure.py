@@ -1,197 +1,84 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 
-from core.logger import get_logger
-
-
-class SwingType(str, Enum):
-    HIGH = "high"
-    LOW = "low"
-
-
-class StructureLayer(str, Enum):
-    INTERNAL = "internal"
-    EXTERNAL = "external"
-
-
-class StructureEventType(str, Enum):
-    SWING_HIGH = "swing_high"
-    SWING_LOW = "swing_low"
-    HH = "hh"
-    HL = "hl"
-    LH = "lh"
-    LL = "ll"
-    BOS = "bos"
-    CHOCH = "choch"
-    MSS = "mss"
-
-
-class MarketBias(str, Enum):
-    BULLISH = "bullish"
-    BEARISH = "bearish"
-    RANGING = "ranging"
-    UNKNOWN = "unknown"
+from analytics.price_action.base import BasePriceActionConfig, BasePriceActionModule
+from analytics.price_action.enums import MarketBias, StructureEventType, StructureLayer, SwingType
+from analytics.price_action.models import (
+    Candle,
+    MarketStructureState,
+    MultiTimeframeAlignment,
+    StructureEvent,
+    StructureLayerState,
+    SwingPoint,
+)
 
 
 @dataclass(slots=True)
-class MarketStructureConfig:
+class MarketStructureConfig(BasePriceActionConfig):
     pivot_left: int = 3
     pivot_right: int = 3
+
     internal_min_swing_distance_pct: float = 0.0008
     external_min_swing_distance_pct: float = 0.0020
+
     structure_break_threshold_pct: float = 0.0005
     require_close_break: bool = True
+
     max_candles: int = 4000
     max_internal_swings: int = 800
     max_external_swings: int = 400
     max_events: int = 1000
-    emit_events: bool = True
-    event_namespace: str = "price_action.market_structure"
-    publish_snapshots: bool = False
+
     alignment_window: int = 5
     external_strength_multiplier: float = 1.35
     min_external_strength: float = 0.30
 
+    emit_events: bool = True
+    event_namespace: str = "price_action.market_structure"
+    publish_snapshots: bool = False
+
     def validate(self) -> None:
+        super().validate()
+
         if self.pivot_left < 1 or self.pivot_right < 1:
             raise ValueError("pivot_left and pivot_right must be >= 1")
+
         if self.internal_min_swing_distance_pct < 0:
             raise ValueError("internal_min_swing_distance_pct must be >= 0")
+
         if self.external_min_swing_distance_pct < 0:
             raise ValueError("external_min_swing_distance_pct must be >= 0")
+
         if self.structure_break_threshold_pct < 0:
             raise ValueError("structure_break_threshold_pct must be >= 0")
+
         if self.max_candles < (self.pivot_left + self.pivot_right + 10):
             raise ValueError("max_candles is too small for selected pivot settings")
+
+        if self.max_internal_swings < 10:
+            raise ValueError("max_internal_swings must be >= 10")
+
+        if self.max_external_swings < 10:
+            raise ValueError("max_external_swings must be >= 10")
+
+        if self.max_events < 10:
+            raise ValueError("max_events must be >= 10")
+
         if self.alignment_window < 1:
             raise ValueError("alignment_window must be >= 1")
 
+        if self.external_strength_multiplier <= 0:
+            raise ValueError("external_strength_multiplier must be > 0")
 
-@dataclass(slots=True)
-class Candle:
-    timestamp: datetime
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float = 0.0
-    index: int = 0
-
-    @property
-    def range_size(self) -> float:
-        return max(self.high - self.low, 0.0)
-
-    @property
-    def body_high(self) -> float:
-        return max(self.open, self.close)
-
-    @property
-    def body_low(self) -> float:
-        return min(self.open, self.close)
-
-    @property
-    def body_size(self) -> float:
-        return abs(self.close - self.open)
+        if not 0.0 <= self.min_external_strength <= 1.0:
+            raise ValueError("min_external_strength must be in [0.0, 1.0]")
 
 
-@dataclass(slots=True)
-class SwingPoint:
-    swing_id: str
-    timestamp: datetime
-    price: float
-    swing_type: SwingType
-    layer: StructureLayer
-    index: int
-    candle_open: float
-    candle_high: float
-    candle_low: float
-    candle_close: float
-    strength: float
-    is_confirmed: bool = True
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class StructureEvent:
-    event_id: str
-    event_type: StructureEventType
-    timestamp: datetime
-    price: float
-    layer: StructureLayer
-    direction: Optional[MarketBias] = None
-    swing_id: Optional[str] = None
-    reference_price: Optional[float] = None
-    reference_swing_id: Optional[str] = None
-    confidence: float = 0.0
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class StructureLayerState:
-    layer: StructureLayer
-    bias: MarketBias = MarketBias.UNKNOWN
-    confidence: float = 0.0
-    trend_strength: float = 0.0
-    in_breakout: bool = False
-
-    last_swing_high: Optional[SwingPoint] = None
-    previous_swing_high: Optional[SwingPoint] = None
-    last_swing_low: Optional[SwingPoint] = None
-    previous_swing_low: Optional[SwingPoint] = None
-
-    last_hh: Optional[StructureEvent] = None
-    last_hl: Optional[StructureEvent] = None
-    last_lh: Optional[StructureEvent] = None
-    last_ll: Optional[StructureEvent] = None
-    last_bos: Optional[StructureEvent] = None
-    last_choch: Optional[StructureEvent] = None
-    last_mss: Optional[StructureEvent] = None
-
-    swing_count: int = 0
-    event_count: int = 0
-    sequence: List[str] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class MultiTimeframeAlignment:
-    higher_timeframe: Optional[str] = None
-    higher_timeframe_bias: MarketBias = MarketBias.UNKNOWN
-    higher_timeframe_confidence: float = 0.0
-
-    internal_bias_aligned: bool = False
-    external_bias_aligned: bool = False
-    internal_with_external_aligned: bool = False
-
-    alignment_score: float = 0.0
-    last_updated: Optional[datetime] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class MarketStructureState:
-    symbol: str
-    timeframe: str
-    last_price: Optional[float] = None
-    last_update: Optional[datetime] = None
-
-    internal: StructureLayerState = field(
-        default_factory=lambda: StructureLayerState(layer=StructureLayer.INTERNAL)
-    )
-    external: StructureLayerState = field(
-        default_factory=lambda: StructureLayerState(layer=StructureLayer.EXTERNAL)
-    )
-    mtf_alignment: MultiTimeframeAlignment = field(default_factory=MultiTimeframeAlignment)
-
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-class MarketStructureAnalyzer:
+class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
     """
     Stateful production-style market structure analyzer.
 
@@ -200,7 +87,7 @@ class MarketStructureAnalyzer:
     - incremental pivot-based swing detection
     - internal / external structure separation
     - HH / HL / LH / LL classification
-    - BOS / CHoCH / MSS detection
+    - BOS / CHOCH / MSS detection
     - EventBus integration
     - optional higher timeframe alignment
     - snapshot-oriented API for strategy layer
@@ -215,14 +102,16 @@ class MarketStructureAnalyzer:
         config: Optional[MarketStructureConfig] = None,
         higher_timeframe: Optional[str] = None,
     ) -> None:
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.event_bus = event_bus
-        self.config = config or MarketStructureConfig()
-        self.config.validate()
+        resolved_config = config or MarketStructureConfig()
+        super().__init__(
+            symbol=symbol,
+            timeframe=timeframe,
+            event_bus=event_bus,
+            config=resolved_config,
+            service_name="price_action.market_structure",
+        )
+        self.config: MarketStructureConfig = resolved_config
         self.higher_timeframe = higher_timeframe
-
-        self.logger = get_logger(__name__, service_name="price_action.market_structure")
 
         self._candles: Deque[Candle] = deque(maxlen=self.config.max_candles)
         self._internal_swings: Deque[SwingPoint] = deque(maxlen=self.config.max_internal_swings)
@@ -278,6 +167,19 @@ class MarketStructureAnalyzer:
             extra={"symbol": self.symbol, "timeframe": self.timeframe},
         )
 
+    def get_state(self) -> MarketStructureState:
+        return self._state
+
+    def get_swings(self, layer: Optional[StructureLayer] = None) -> List[SwingPoint]:
+        if layer == StructureLayer.INTERNAL:
+            return list(self._internal_swings)
+        if layer == StructureLayer.EXTERNAL:
+            return list(self._external_swings)
+        return [*self._internal_swings, *self._external_swings]
+
+    def get_events(self) -> List[StructureEvent]:
+        return list(self._events)
+
     def update(
         self,
         candles: Sequence[Mapping[str, Any]],
@@ -303,7 +205,9 @@ class MarketStructureAnalyzer:
         if not candles:
             if higher_timeframe_context is not None:
                 self.update_higher_timeframe_context(higher_timeframe_context)
+
             self._refresh_state()
+
             return {
                 "state": self.snapshot(),
                 "new_swings": [],
@@ -314,7 +218,9 @@ class MarketStructureAnalyzer:
         new_events: List[StructureEvent] = []
 
         for raw in candles:
-            candle = self._parse_candle(raw)
+            candle = self._parse_candle(raw, index=self._global_candle_index)
+            self._global_candle_index += 1
+
             self._candles.append(candle)
             self._state.last_price = candle.close
             self._state.last_update = candle.timestamp
@@ -364,338 +270,281 @@ class MarketStructureAnalyzer:
         mtf = self._state.mtf_alignment
 
         tf = context.get("timeframe") or context.get("higher_timeframe") or self.higher_timeframe
-        bias_raw = context.get("bias", context.get("higher_timeframe_bias", MarketBias.UNKNOWN.value))
-        conf = float(context.get("confidence", context.get("higher_timeframe_confidence", 0.0)))
+        bias_raw = context.get("bias") or context.get("higher_timeframe_bias") or MarketBias.UNKNOWN
+        confidence = float(context.get("confidence", context.get("higher_timeframe_confidence", 0.0)))
 
-        if isinstance(bias_raw, MarketBias):
-            bias = bias_raw
-        else:
-            try:
-                bias = MarketBias(str(bias_raw))
-            except ValueError:
-                bias = MarketBias.UNKNOWN
+        try:
+            higher_bias = bias_raw if isinstance(bias_raw, MarketBias) else MarketBias(str(bias_raw))
+        except ValueError:
+            higher_bias = MarketBias.UNKNOWN
 
         mtf.higher_timeframe = tf
-        mtf.higher_timeframe_bias = bias
-        mtf.higher_timeframe_confidence = max(0.0, min(1.0, conf))
-        mtf.last_updated = self._state.last_update or datetime.now(timezone.utc)
-        mtf.metadata = {
-            "raw_context_keys": list(context.keys()),
-        }
+        mtf.higher_timeframe_bias = higher_bias
+        mtf.higher_timeframe_confidence = max(0.0, min(1.0, confidence))
+        mtf.last_updated = self._state.last_update
+        mtf.metadata = dict(context.get("metadata", {}))
 
-        self._compute_alignment()
+        self._refresh_alignment_state()
 
     def snapshot(self) -> Dict[str, Any]:
-        return {
-            "symbol": self._state.symbol,
-            "timeframe": self._state.timeframe,
-            "last_price": self._state.last_price,
-            "last_update": self._state.last_update.isoformat() if self._state.last_update else None,
-            "internal": self._layer_state_to_dict(self._state.internal),
-            "external": self._layer_state_to_dict(self._state.external),
-            "mtf_alignment": self._alignment_to_dict(self._state.mtf_alignment),
-            "metadata": dict(self._state.metadata),
-        }
-
-    def get_state(self) -> MarketStructureState:
-        return self._state
-
-    def get_internal_swings(self) -> List[SwingPoint]:
-        return list(self._internal_swings)
-
-    def get_external_swings(self) -> List[SwingPoint]:
-        return list(self._external_swings)
-
-    def get_events(self) -> List[StructureEvent]:
-        return list(self._events)
-
-    # -------------------------------------------------------------------------
-    # Incremental processing
-    # -------------------------------------------------------------------------
-
-    def _process_incremental_pivot_detection(self) -> List[SwingPoint]:
-        """
-        True incremental pivot processing:
-        on each newly appended candle, only one pivot-center becomes confirmable:
-            center = current_index - pivot_right
-        """
-        if len(self._candles) < (self.config.pivot_left + self.config.pivot_right + 1):
-            return []
-
-        last_local_index = len(self._candles) - 1
-        center_local_index = last_local_index - self.config.pivot_right
-
-        if center_local_index <= self._last_processed_pivot_center_index:
-            return []
-
-        self._last_processed_pivot_center_index = center_local_index
-        return self._detect_pivot_at_local_index(center_local_index)
-
-    def _detect_pivot_at_local_index(self, center_local_index: int) -> List[SwingPoint]:
-        left = self.config.pivot_left
-        right = self.config.pivot_right
-
-        if center_local_index - left < 0:
-            return []
-        if center_local_index + right >= len(self._candles):
-            return []
-
-        candles = list(self._candles)
-        center = candles[center_local_index]
-        window = candles[center_local_index - left:center_local_index + right + 1]
-
-        is_swing_high = all(
-            center.high >= candle.high
-            for idx, candle in enumerate(window)
-            if idx != left
-        )
-        is_swing_low = all(
-            center.low <= candle.low
-            for idx, candle in enumerate(window)
-            if idx != left
-        )
-
-        detected: List[SwingPoint] = []
-
-        if is_swing_high:
-            pivot_key = (center.index, SwingType.HIGH)
-            if pivot_key not in self._processed_pivots:
-                internal_swing = self._build_swing(center, SwingType.HIGH, StructureLayer.INTERNAL)
-                if self._accept_internal_swing(internal_swing):
-                    self._internal_swings.append(internal_swing)
-                    detected.append(internal_swing)
-                    self._processed_pivots.add(pivot_key)
-                    self._register_swing_event(internal_swing)
-
-                    external_candidate = self._try_promote_external_swing(internal_swing)
-                    if external_candidate is not None:
-                        self._external_swings.append(external_candidate)
-                        detected.append(external_candidate)
-                        self._register_swing_event(external_candidate)
-
-        if is_swing_low:
-            pivot_key = (center.index, SwingType.LOW)
-            if pivot_key not in self._processed_pivots:
-                internal_swing = self._build_swing(center, SwingType.LOW, StructureLayer.INTERNAL)
-                if self._accept_internal_swing(internal_swing):
-                    self._internal_swings.append(internal_swing)
-                    detected.append(internal_swing)
-                    self._processed_pivots.add(pivot_key)
-                    self._register_swing_event(internal_swing)
-
-                    external_candidate = self._try_promote_external_swing(internal_swing)
-                    if external_candidate is not None:
-                        self._external_swings.append(external_candidate)
-                        detected.append(external_candidate)
-                        self._register_swing_event(external_candidate)
-
-        return detected
-
-    # -------------------------------------------------------------------------
-    # Swing construction / filtering
-    # -------------------------------------------------------------------------
-
-    def _build_swing(
-        self,
-        candle: Candle,
-        swing_type: SwingType,
-        layer: StructureLayer,
-    ) -> SwingPoint:
-        if swing_type == SwingType.HIGH:
-            price = candle.high
-            wick_component = (candle.high - candle.body_high) / max(candle.high, 1e-12)
-        else:
-            price = candle.low
-            wick_component = (candle.body_low - candle.low) / max(abs(candle.low), 1e-12)
-
-        range_component = candle.range_size / max(abs(candle.close), 1e-12)
-        body_component = candle.body_size / max(abs(candle.close), 1e-12)
-
-        base_strength = max(
-            0.0,
-            min(
-                1.0,
-                wick_component * 8.0 + range_component * 6.0 + body_component * 2.0,
-            ),
-        )
-
-        if layer == StructureLayer.EXTERNAL:
-            base_strength = min(1.0, base_strength * self.config.external_strength_multiplier)
-
-        return SwingPoint(
-            swing_id=self._new_id(),
-            timestamp=candle.timestamp,
-            price=price,
-            swing_type=swing_type,
-            layer=layer,
-            index=candle.index,
-            candle_open=candle.open,
-            candle_high=candle.high,
-            candle_low=candle.low,
-            candle_close=candle.close,
-            strength=base_strength,
-            is_confirmed=True,
+        return self._snapshot_envelope(
+            state=self._state,
             metadata={
-                "range_size": candle.range_size,
-                "body_size": candle.body_size,
+                "total_candles": len(self._candles),
+                "internal_swings": len(self._internal_swings),
+                "external_swings": len(self._external_swings),
+                "events": len(self._events),
+                "higher_timeframe": self.higher_timeframe,
+                "last_processed_pivot_center_index": self._last_processed_pivot_center_index,
+                "global_candle_index": self._global_candle_index,
+                "config": self._serialize_config(),
             },
         )
 
-    def _accept_internal_swing(self, swing: SwingPoint) -> bool:
-        same_type = [s for s in self._internal_swings if s.swing_type == swing.swing_type]
-        if not same_type:
-            return True
+    # -------------------------------------------------------------------------
+    # Incremental pivot detection
+    # -------------------------------------------------------------------------
 
-        prev = same_type[-1]
-        min_distance = max(abs(prev.price) * self.config.internal_min_swing_distance_pct, 1e-12)
+    def _process_incremental_pivot_detection(self) -> List[SwingPoint]:
+        candles = list(self._candles)
+        needed = self.config.pivot_left + self.config.pivot_right + 1
+        if len(candles) < needed:
+            return []
 
-        if swing.index <= prev.index:
-            return False
-        if abs(swing.price - prev.price) < min_distance:
-            return False
+        center_pos = len(candles) - self.config.pivot_right - 1
+        center_candle = candles[center_pos]
 
-        return True
+        if center_candle.index <= self._last_processed_pivot_center_index:
+            return []
 
-    def _try_promote_external_swing(self, internal_swing: SwingPoint) -> Optional[SwingPoint]:
-        """
-        External structure = more significant pivots.
-        Promotion rules:
-        - stronger distance from previous same-type external swing
-        - minimum strength threshold
-        - usually meaningful expansion vs last external same-type swing
-        """
-        if internal_swing.strength < self.config.min_external_strength:
-            return None
+        left_slice = candles[center_pos - self.config.pivot_left:center_pos]
+        right_slice = candles[center_pos + 1:center_pos + 1 + self.config.pivot_right]
 
-        same_type_ext = [s for s in self._external_swings if s.swing_type == internal_swing.swing_type]
-        if not same_type_ext:
-            return self._clone_swing_for_external(internal_swing)
-
-        prev = same_type_ext[-1]
-        min_distance = max(abs(prev.price) * self.config.external_min_swing_distance_pct, 1e-12)
-
-        if internal_swing.index <= prev.index:
-            return None
-        if abs(internal_swing.price - prev.price) < min_distance:
-            return None
-
-        if internal_swing.swing_type == SwingType.HIGH and internal_swing.price <= prev.price:
-            # external highs usually matter more when they actually extend or strongly reset structure
-            # but still allow lower highs if strength is very strong
-            if internal_swing.strength < 0.7:
-                return None
-
-        if internal_swing.swing_type == SwingType.LOW and internal_swing.price >= prev.price:
-            if internal_swing.strength < 0.7:
-                return None
-
-        return self._clone_swing_for_external(internal_swing)
-
-    def _clone_swing_for_external(self, swing: SwingPoint) -> SwingPoint:
-        return SwingPoint(
-            swing_id=self._new_id(),
-            timestamp=swing.timestamp,
-            price=swing.price,
-            swing_type=swing.swing_type,
-            layer=StructureLayer.EXTERNAL,
-            index=swing.index,
-            candle_open=swing.candle_open,
-            candle_high=swing.candle_high,
-            candle_low=swing.candle_low,
-            candle_close=swing.candle_close,
-            strength=min(1.0, swing.strength * self.config.external_strength_multiplier),
-            is_confirmed=swing.is_confirmed,
-            metadata={**swing.metadata, "promoted_from_internal": swing.swing_id},
+        is_swing_high = all(center_candle.high > x.high for x in left_slice) and all(
+            center_candle.high >= x.high for x in right_slice
+        )
+        is_swing_low = all(center_candle.low < x.low for x in left_slice) and all(
+            center_candle.low <= x.low for x in right_slice
         )
 
-    # -------------------------------------------------------------------------
-    # Structure classification
-    # -------------------------------------------------------------------------
+        self._last_processed_pivot_center_index = center_candle.index
 
-    def _classify_structure_labels(self, new_swings: Sequence[SwingPoint]) -> List[StructureEvent]:
-        events: List[StructureEvent] = []
+        created_swings: List[SwingPoint] = []
 
-        for swing in new_swings:
-            storage = self._swings_by_layer(swing.layer)
+        if is_swing_high:
+            created_swings.extend(
+                self._register_pivot(center_candle=center_candle, swing_type=SwingType.HIGH)
+            )
 
-            if swing.swing_type == SwingType.HIGH:
-                previous_highs = [x for x in storage if x.swing_type == SwingType.HIGH and x.swing_id != swing.swing_id]
-                if previous_highs:
-                    prev = previous_highs[-1]
-                    event_type = StructureEventType.HH if swing.price > prev.price else StructureEventType.LH
-                    direction = MarketBias.BULLISH if event_type == StructureEventType.HH else MarketBias.BEARISH
-                    event = self._create_structure_label_event(
-                        swing=swing,
-                        event_type=event_type,
-                        direction=direction,
-                        reference_swing=prev,
-                    )
-                    if event is not None:
-                        events.append(event)
+        if is_swing_low:
+            created_swings.extend(
+                self._register_pivot(center_candle=center_candle, swing_type=SwingType.LOW)
+            )
 
-            elif swing.swing_type == SwingType.LOW:
-                previous_lows = [x for x in storage if x.swing_type == SwingType.LOW and x.swing_id != swing.swing_id]
-                if previous_lows:
-                    prev = previous_lows[-1]
-                    event_type = StructureEventType.HL if swing.price > prev.price else StructureEventType.LL
-                    direction = MarketBias.BULLISH if event_type == StructureEventType.HL else MarketBias.BEARISH
-                    event = self._create_structure_label_event(
-                        swing=swing,
-                        event_type=event_type,
-                        direction=direction,
-                        reference_swing=prev,
-                    )
-                    if event is not None:
-                        events.append(event)
+        return created_swings
 
-        for event in events:
-            self._append_event(event)
+    def _register_pivot(self, *, center_candle: Candle, swing_type: SwingType) -> List[SwingPoint]:
+        pivot_key = (center_candle.index, swing_type)
+        if pivot_key in self._processed_pivots:
+            return []
 
-        return events
+        self._processed_pivots.add(pivot_key)
 
-    def _create_structure_label_event(
+        created: List[SwingPoint] = []
+
+        internal_swing = self._maybe_create_swing(
+            center_candle=center_candle,
+            swing_type=swing_type,
+            layer=StructureLayer.INTERNAL,
+        )
+        if internal_swing is not None:
+            self._internal_swings.append(internal_swing)
+            created.append(internal_swing)
+            self._emit_structure_event_for_swing(internal_swing)
+
+        external_swing = self._maybe_create_swing(
+            center_candle=center_candle,
+            swing_type=swing_type,
+            layer=StructureLayer.EXTERNAL,
+        )
+        if external_swing is not None:
+            self._external_swings.append(external_swing)
+            created.append(external_swing)
+            self._emit_structure_event_for_swing(external_swing)
+
+        return created
+
+    def _maybe_create_swing(
         self,
         *,
-        swing: SwingPoint,
-        event_type: StructureEventType,
-        direction: MarketBias,
-        reference_swing: SwingPoint,
-    ) -> Optional[StructureEvent]:
-        key = (swing.swing_id, event_type, swing.layer)
-        if key in self._processed_structure_labels:
+        center_candle: Candle,
+        swing_type: SwingType,
+        layer: StructureLayer,
+    ) -> Optional[SwingPoint]:
+        price = center_candle.high if swing_type == SwingType.HIGH else center_candle.low
+        min_distance_pct = self._layer_min_distance_pct(layer)
+        strength = self._calculate_swing_strength(center_candle, swing_type, layer)
+
+        if layer == StructureLayer.EXTERNAL and strength < self.config.min_external_strength:
             return None
 
-        delta_pct = abs(swing.price - reference_swing.price) / max(abs(reference_swing.price), 1e-12)
-        confidence = max(
-            0.0,
-            min(
-                1.0,
-                0.45 + delta_pct * 20.0 + swing.strength * 0.25,
-            ),
+        existing_swings = self._swings_for_layer(layer)
+        previous_same_type = self._last_swing_of_type(existing_swings, swing_type)
+
+        if previous_same_type is not None:
+            if previous_same_type.price <= 0:
+                return None
+
+            distance_pct = abs(price - previous_same_type.price) / previous_same_type.price
+            if distance_pct < min_distance_pct:
+                return None
+
+        return SwingPoint(
+            swing_id=uuid4().hex,
+            timestamp=center_candle.timestamp,
+            price=price,
+            swing_type=swing_type,
+            layer=layer,
+            index=center_candle.index,
+            candle_open=center_candle.open,
+            candle_high=center_candle.high,
+            candle_low=center_candle.low,
+            candle_close=center_candle.close,
+            strength=max(0.0, min(1.0, strength)),
+            is_confirmed=True,
+            metadata={
+                "body_ratio": center_candle.body_ratio,
+                "range_size": center_candle.range_size,
+            },
         )
 
+    def _calculate_swing_strength(
+        self,
+        center_candle: Candle,
+        swing_type: SwingType,
+        layer: StructureLayer,
+    ) -> float:
+        candles = list(self._candles)
+        center_pos = None
+        for idx, candle in enumerate(candles):
+            if candle.index == center_candle.index:
+                center_pos = idx
+                break
+
+        if center_pos is None:
+            return 0.0
+
+        left_slice = candles[max(0, center_pos - self.config.pivot_left):center_pos]
+        right_slice = candles[center_pos + 1:center_pos + 1 + self.config.pivot_right]
+        neighbors = [*left_slice, *right_slice]
+        if not neighbors:
+            return 0.0
+
+        if swing_type == SwingType.HIGH:
+            pivot_distance = mean_safe([max(center_candle.high - x.high, 0.0) for x in neighbors])
+            normalizer = center_candle.high if center_candle.high > 0 else 1.0
+        else:
+            pivot_distance = mean_safe([max(x.low - center_candle.low, 0.0) for x in neighbors])
+            normalizer = center_candle.low if center_candle.low > 0 else 1.0
+
+        distance_score = pivot_distance / normalizer
+        candle_quality = min(1.0, center_candle.body_ratio + 0.25)
+        range_score = min(1.0, center_candle.range_size / max(center_candle.close, 1e-9))
+
+        score = (distance_score * 8.0 + candle_quality + range_score) / 3.0
+
+        if layer == StructureLayer.EXTERNAL:
+            score *= self.config.external_strength_multiplier
+
+        return max(0.0, min(1.0, score))
+
+    # -------------------------------------------------------------------------
+    # Structure label classification
+    # -------------------------------------------------------------------------
+
+    def _classify_structure_labels(self, swings: Sequence[SwingPoint]) -> List[StructureEvent]:
+        created_events: List[StructureEvent] = []
+
+        grouped: Dict[StructureLayer, List[SwingPoint]] = {
+            StructureLayer.INTERNAL: [],
+            StructureLayer.EXTERNAL: [],
+        }
+        for swing in swings:
+            grouped[swing.layer].append(swing)
+
+        for layer, layer_swings in grouped.items():
+            if not layer_swings:
+                continue
+
+            all_swings = self._sorted_swings_for_layer(layer)
+            for swing in layer_swings:
+                event = self._classify_single_swing(all_swings, swing)
+                if event is not None:
+                    created_events.append(event)
+
+        return created_events
+
+    def _classify_single_swing(
+        self,
+        all_swings: Sequence[SwingPoint],
+        swing: SwingPoint,
+    ) -> Optional[StructureEvent]:
+        same_type_swings = [x for x in all_swings if x.swing_type == swing.swing_type and x.index < swing.index]
+        if not same_type_swings:
+            return None
+
+        previous = same_type_swings[-1]
+
+        if swing.swing_type == SwingType.HIGH:
+            event_type = StructureEventType.HH if swing.price > previous.price else StructureEventType.LH
+            direction = MarketBias.BULLISH if event_type == StructureEventType.HH else MarketBias.BEARISH
+        else:
+            event_type = StructureEventType.HL if swing.price > previous.price else StructureEventType.LL
+            direction = MarketBias.BULLISH if event_type == StructureEventType.HL else MarketBias.BEARISH
+
+        dedup_key = (swing.swing_id, event_type, swing.layer)
+        if dedup_key in self._processed_structure_labels:
+            return None
+
+        self._processed_structure_labels.add(dedup_key)
+
         event = StructureEvent(
-            event_id=self._new_id(),
+            event_id=uuid4().hex,
             event_type=event_type,
             timestamp=swing.timestamp,
             price=swing.price,
             layer=swing.layer,
             direction=direction,
             swing_id=swing.swing_id,
-            reference_price=reference_swing.price,
-            reference_swing_id=reference_swing.swing_id,
-            confidence=confidence,
+            reference_price=previous.price,
+            reference_swing_id=previous.swing_id,
+            confidence=self._label_confidence(swing, previous),
             metadata={
-                "delta_pct": delta_pct,
-                "reference_index": reference_swing.index,
-                "current_index": swing.index,
+                "previous_price": previous.price,
+                "previous_index": previous.index,
+                "swing_strength": swing.strength,
             },
         )
-        self._processed_structure_labels.add(key)
+
+        self._events.append(event)
+        self._emit_event(
+            self._build_event_name(event.event_type.value),
+            self._event_to_dict(event),
+            source="market_structure_analyzer",
+        )
+
         return event
 
+    def _label_confidence(self, current: SwingPoint, previous: SwingPoint) -> float:
+        if previous.price <= 0:
+            return max(0.0, min(1.0, current.strength))
+
+        move_pct = abs(current.price - previous.price) / previous.price
+        raw = (current.strength + min(1.0, move_pct * 100.0)) / 2.0
+        return max(0.0, min(1.0, raw))
+
     # -------------------------------------------------------------------------
-    # Break events: BOS / CHoCH / MSS
+    # Break detection
     # -------------------------------------------------------------------------
 
     def _detect_break_events(self) -> List[StructureEvent]:
@@ -703,159 +552,129 @@ class MarketStructureAnalyzer:
             return []
 
         current_candle = self._candles[-1]
-        events: List[StructureEvent] = []
+        created_events: List[StructureEvent] = []
 
         for layer in (StructureLayer.INTERNAL, StructureLayer.EXTERNAL):
-            swings = self._swings_by_layer(layer)
-            if len(swings) < 2:
-                continue
+            swings = self._sorted_swings_for_layer(layer)
+            last_high = self._last_swing_of_type(swings, SwingType.HIGH)
+            last_low = self._last_swing_of_type(swings, SwingType.LOW)
 
-            last_high = self._last_swing(layer, SwingType.HIGH)
-            last_low = self._last_swing(layer, SwingType.LOW)
-
-            if last_high and self._is_break_above(current_candle, last_high.price):
-                bos = self._create_break_event(
+            if last_high is not None:
+                high_break = self._maybe_break_event(
                     layer=layer,
-                    break_type=StructureEventType.BOS,
-                    direction=MarketBias.BULLISH,
-                    candle=current_candle,
-                    reference_swing=last_high,
+                    current_candle=current_candle,
+                    swing=last_high,
+                    broken_side="high",
                 )
-                if bos is not None:
-                    events.append(bos)
+                if high_break is not None:
+                    created_events.append(high_break)
 
-            if last_low and self._is_break_below(current_candle, last_low.price):
-                bos = self._create_break_event(
+            if last_low is not None:
+                low_break = self._maybe_break_event(
                     layer=layer,
-                    break_type=StructureEventType.BOS,
-                    direction=MarketBias.BEARISH,
-                    candle=current_candle,
-                    reference_swing=last_low,
+                    current_candle=current_candle,
+                    swing=last_low,
+                    broken_side="low",
                 )
-                if bos is not None:
-                    events.append(bos)
+                if low_break is not None:
+                    created_events.append(low_break)
 
-        derived = self._derive_choch_and_mss(events)
-        if derived:
-            events.extend(derived)
+        return created_events
 
-        for event in events:
-            self._append_event(event)
-
-        return events
-
-    def _create_break_event(
+    def _maybe_break_event(
         self,
         *,
         layer: StructureLayer,
-        break_type: StructureEventType,
-        direction: MarketBias,
-        candle: Candle,
-        reference_swing: SwingPoint,
+        current_candle: Candle,
+        swing: SwingPoint,
+        broken_side: str,
     ) -> Optional[StructureEvent]:
-        break_key = (
-            layer,
-            direction.value,
-            reference_swing.swing_id,
-            candle.timestamp.isoformat(),
-        )
-        if break_key in self._processed_breaks:
+        threshold = self.config.structure_break_threshold_pct
+        reference_price = swing.price
+
+        if broken_side == "high":
+            required_price = reference_price * (1.0 + threshold)
+            broken = current_candle.close > required_price if self.config.require_close_break else current_candle.high > required_price
+            direction = MarketBias.BULLISH
+        else:
+            required_price = reference_price * (1.0 - threshold)
+            broken = current_candle.close < required_price if self.config.require_close_break else current_candle.low < required_price
+            direction = MarketBias.BEARISH
+
+        if not broken:
             return None
 
-        if direction == MarketBias.BULLISH:
-            penetration = (
-                candle.close - reference_swing.price
-                if self.config.require_close_break
-                else candle.high - reference_swing.price
-            )
-        else:
-            penetration = (
-                reference_swing.price - candle.close
-                if self.config.require_close_break
-                else reference_swing.price - candle.low
-            )
+        prev_bias = self._layer_state(layer).bias
+        event_type = self._resolve_break_event_type(prev_bias=prev_bias, direction=direction)
 
-        confidence = max(
-            0.0,
-            min(
-                1.0,
-                0.50
-                + (penetration / max(abs(reference_swing.price), 1e-12)) * 45.0
-                + (candle.body_size / max(abs(candle.close), 1e-12)) * 5.0,
-            ),
-        )
+        dedup_key = (layer, swing.swing_id, str(current_candle.index), event_type.value)
+        if dedup_key in self._processed_breaks:
+            return None
+
+        self._processed_breaks.add(dedup_key)
+
+        confidence = self._break_confidence(current_candle=current_candle, swing=swing, direction=direction)
 
         event = StructureEvent(
-            event_id=self._new_id(),
-            event_type=break_type,
-            timestamp=candle.timestamp,
-            price=candle.close,
+            event_id=uuid4().hex,
+            event_type=event_type,
+            timestamp=current_candle.timestamp,
+            price=current_candle.close,
             layer=layer,
             direction=direction,
             swing_id=None,
-            reference_price=reference_swing.price,
-            reference_swing_id=reference_swing.swing_id,
+            reference_price=swing.price,
+            reference_swing_id=swing.swing_id,
             confidence=confidence,
             metadata={
-                "reference_swing_type": reference_swing.swing_type.value,
-                "reference_index": reference_swing.index,
-                "penetration": penetration,
-                "require_close_break": self.config.require_close_break,
+                "broken_side": broken_side,
+                "trigger_candle_index": current_candle.index,
+                "trigger_close": current_candle.close,
+                "trigger_high": current_candle.high,
+                "trigger_low": current_candle.low,
+                "threshold_pct": threshold,
             },
         )
 
-        self._processed_breaks.add(break_key)
+        self._events.append(event)
+        self._emit_event(
+            self._build_event_name(event.event_type.value),
+            self._event_to_dict(event),
+            source="market_structure_analyzer",
+        )
+
         return event
 
-    def _derive_choch_and_mss(self, bos_events: Sequence[StructureEvent]) -> List[StructureEvent]:
-        derived: List[StructureEvent] = []
+    def _resolve_break_event_type(
+        self,
+        *,
+        prev_bias: MarketBias,
+        direction: MarketBias,
+    ) -> StructureEventType:
+        if prev_bias == MarketBias.UNKNOWN or prev_bias == MarketBias.RANGING:
+            return StructureEventType.BOS
 
-        for bos in bos_events:
-            if bos.direction is None:
-                continue
+        if prev_bias == direction:
+            return StructureEventType.BOS
 
-            previous_bias = self._infer_layer_bias_before_timestamp(
-                layer=bos.layer,
-                timestamp=bos.timestamp,
-                exclude_event_id=bos.event_id,
-            )
+        # Якщо був розворот проти попереднього bias
+        return StructureEventType.CHOCH
 
-            if previous_bias in (MarketBias.BULLISH, MarketBias.BEARISH) and previous_bias != bos.direction:
-                choch = StructureEvent(
-                    event_id=self._new_id(),
-                    event_type=StructureEventType.CHOCH,
-                    timestamp=bos.timestamp,
-                    price=bos.price,
-                    layer=bos.layer,
-                    direction=bos.direction,
-                    swing_id=None,
-                    reference_price=bos.reference_price,
-                    reference_swing_id=bos.reference_swing_id,
-                    confidence=min(1.0, bos.confidence * 0.96),
-                    metadata={
-                        "trigger_event_id": bos.event_id,
-                        "previous_bias": previous_bias.value,
-                    },
-                )
-                mss = StructureEvent(
-                    event_id=self._new_id(),
-                    event_type=StructureEventType.MSS,
-                    timestamp=bos.timestamp,
-                    price=bos.price,
-                    layer=bos.layer,
-                    direction=bos.direction,
-                    swing_id=None,
-                    reference_price=bos.reference_price,
-                    reference_swing_id=bos.reference_swing_id,
-                    confidence=min(1.0, bos.confidence * 0.92),
-                    metadata={
-                        "trigger_event_id": bos.event_id,
-                        "previous_bias": previous_bias.value,
-                    },
-                )
-                derived.extend([choch, mss])
+    def _break_confidence(
+        self,
+        *,
+        current_candle: Candle,
+        swing: SwingPoint,
+        direction: MarketBias,
+    ) -> float:
+        reference = swing.price if swing.price > 0 else 1.0
+        if direction == MarketBias.BULLISH:
+            move_pct = max(current_candle.close - swing.price, 0.0) / reference
+        else:
+            move_pct = max(swing.price - current_candle.close, 0.0) / reference
 
-        return derived
+        raw = (swing.strength + current_candle.body_ratio + min(1.0, move_pct * 100.0)) / 3.0
+        return max(0.0, min(1.0, raw))
 
     # -------------------------------------------------------------------------
     # State refresh
@@ -864,257 +683,151 @@ class MarketStructureAnalyzer:
     def _refresh_state(self) -> None:
         self._refresh_layer_state(StructureLayer.INTERNAL)
         self._refresh_layer_state(StructureLayer.EXTERNAL)
-        self._compute_alignment()
-
-        self._state.metadata = {
-            "internal_swings_total": len(self._internal_swings),
-            "external_swings_total": len(self._external_swings),
-            "events_total": len(self._events),
-        }
+        self._refresh_alignment_state()
 
     def _refresh_layer_state(self, layer: StructureLayer) -> None:
-        layer_state = self._layer_state(layer)
-        swings = self._swings_by_layer(layer)
-        layer_events = [e for e in self._events if e.layer == layer]
+        state = self._layer_state(layer)
+        swings = self._sorted_swings_for_layer(layer)
+        events = [x for x in self._events if x.layer == layer]
 
-        layer_state.last_swing_high = self._last_swing(layer, SwingType.HIGH)
-        layer_state.previous_swing_high = self._previous_swing(layer, SwingType.HIGH)
-        layer_state.last_swing_low = self._last_swing(layer, SwingType.LOW)
-        layer_state.previous_swing_low = self._previous_swing(layer, SwingType.LOW)
+        highs = [x for x in swings if x.swing_type == SwingType.HIGH]
+        lows = [x for x in swings if x.swing_type == SwingType.LOW]
 
-        layer_state.last_hh = self._last_event(layer, StructureEventType.HH)
-        layer_state.last_hl = self._last_event(layer, StructureEventType.HL)
-        layer_state.last_lh = self._last_event(layer, StructureEventType.LH)
-        layer_state.last_ll = self._last_event(layer, StructureEventType.LL)
-        layer_state.last_bos = self._last_event(layer, StructureEventType.BOS)
-        layer_state.last_choch = self._last_event(layer, StructureEventType.CHOCH)
-        layer_state.last_mss = self._last_event(layer, StructureEventType.MSS)
+        state.last_swing_high = highs[-1] if highs else None
+        state.previous_swing_high = highs[-2] if len(highs) >= 2 else None
+        state.last_swing_low = lows[-1] if lows else None
+        state.previous_swing_low = lows[-2] if len(lows) >= 2 else None
 
-        layer_state.swing_count = len(swings)
-        layer_state.event_count = len(layer_events)
-        layer_state.sequence = [
-            event.event_type.value
-            for event in layer_events[-8:]
-            if event.event_type in {
-                StructureEventType.HH,
-                StructureEventType.HL,
-                StructureEventType.LH,
-                StructureEventType.LL,
-                StructureEventType.BOS,
-                StructureEventType.CHOCH,
-                StructureEventType.MSS,
-            }
-        ]
+        state.last_hh = self._last_event_of_type(events, StructureEventType.HH)
+        state.last_hl = self._last_event_of_type(events, StructureEventType.HL)
+        state.last_lh = self._last_event_of_type(events, StructureEventType.LH)
+        state.last_ll = self._last_event_of_type(events, StructureEventType.LL)
+        state.last_bos = self._last_event_of_type(events, StructureEventType.BOS)
+        state.last_choch = self._last_event_of_type(events, StructureEventType.CHOCH)
+        state.last_mss = self._last_event_of_type(events, StructureEventType.MSS)
 
-        bias = self._infer_layer_bias(layer)
-        confidence = self._compute_layer_confidence(layer, bias)
-        trend_strength = self._compute_layer_trend_strength(layer, bias)
-        in_breakout = self._is_layer_in_recent_breakout(layer)
+        state.swing_count = len(swings)
+        state.event_count = len(events)
+        state.sequence = [x.event_type.value for x in events[-10:]]
 
-        layer_state.bias = bias
-        layer_state.confidence = confidence
-        layer_state.trend_strength = trend_strength
-        layer_state.in_breakout = in_breakout
+        state.bias = self._infer_bias(layer)
+        state.trend_strength = self._infer_trend_strength(layer)
+        state.confidence = self._infer_layer_confidence(layer)
+        state.in_breakout = bool(
+            state.last_bos is not None
+            and state.last_bos.timestamp == self._state.last_update
+        )
 
-    # -------------------------------------------------------------------------
-    # Bias / confidence / alignment
-    # -------------------------------------------------------------------------
-
-    def _infer_layer_bias(self, layer: StructureLayer) -> MarketBias:
-        relevant = [
-            e for e in self._events
-            if e.layer == layer and e.event_type in {
-                StructureEventType.HH,
-                StructureEventType.HL,
-                StructureEventType.LH,
-                StructureEventType.LL,
-                StructureEventType.BOS,
-                StructureEventType.CHOCH,
-            }
-        ]
-
-        if not relevant:
-            return MarketBias.UNKNOWN
-
-        score = 0.0
-        for event in relevant[-8:]:
-            if event.event_type in {StructureEventType.HH, StructureEventType.HL}:
-                score += 1.0
-            elif event.event_type in {StructureEventType.LH, StructureEventType.LL}:
-                score -= 1.0
-            elif event.event_type == StructureEventType.BOS and event.direction == MarketBias.BULLISH:
-                score += 1.6
-            elif event.event_type == StructureEventType.BOS and event.direction == MarketBias.BEARISH:
-                score -= 1.6
-            elif event.event_type == StructureEventType.CHOCH and event.direction == MarketBias.BULLISH:
-                score += 1.2
-            elif event.event_type == StructureEventType.CHOCH and event.direction == MarketBias.BEARISH:
-                score -= 1.2
-
-        if score >= 2.0:
-            return MarketBias.BULLISH
-        if score <= -2.0:
-            return MarketBias.BEARISH
-        return MarketBias.RANGING
-
-    def _infer_layer_bias_before_timestamp(
-        self,
-        *,
-        layer: StructureLayer,
-        timestamp: datetime,
-        exclude_event_id: Optional[str] = None,
-    ) -> MarketBias:
-        relevant = [
-            e for e in self._events
-            if e.layer == layer
-            and e.timestamp <= timestamp
-            and e.event_id != exclude_event_id
-            and e.event_type in {
-                StructureEventType.HH,
-                StructureEventType.HL,
-                StructureEventType.LH,
-                StructureEventType.LL,
-                StructureEventType.BOS,
-                StructureEventType.CHOCH,
-            }
-        ]
-
-        if not relevant:
-            return MarketBias.UNKNOWN
-
-        score = 0.0
-        for event in relevant[-8:]:
-            if event.event_type in {StructureEventType.HH, StructureEventType.HL}:
-                score += 1.0
-            elif event.event_type in {StructureEventType.LH, StructureEventType.LL}:
-                score -= 1.0
-            elif event.event_type == StructureEventType.BOS and event.direction == MarketBias.BULLISH:
-                score += 1.6
-            elif event.event_type == StructureEventType.BOS and event.direction == MarketBias.BEARISH:
-                score -= 1.6
-            elif event.event_type == StructureEventType.CHOCH and event.direction == MarketBias.BULLISH:
-                score += 1.2
-            elif event.event_type == StructureEventType.CHOCH and event.direction == MarketBias.BEARISH:
-                score -= 1.2
-
-        if score >= 2.0:
-            return MarketBias.BULLISH
-        if score <= -2.0:
-            return MarketBias.BEARISH
-        return MarketBias.RANGING
-
-    def _compute_layer_confidence(self, layer: StructureLayer, bias: MarketBias) -> float:
-        if bias == MarketBias.UNKNOWN:
-            return 0.0
-
-        relevant = [
-            e for e in self._events
-            if e.layer == layer and e.event_type in {
-                StructureEventType.HH,
-                StructureEventType.HL,
-                StructureEventType.LH,
-                StructureEventType.LL,
-                StructureEventType.BOS,
-                StructureEventType.CHOCH,
-                StructureEventType.MSS,
-            }
-        ][-8:]
-
-        if not relevant:
-            return 0.0
-
-        aligned = 0
-        for event in relevant:
-            if bias == MarketBias.BULLISH:
-                if event.event_type in {StructureEventType.HH, StructureEventType.HL}:
-                    aligned += 1
-                elif event.direction == MarketBias.BULLISH:
-                    aligned += 1
-            elif bias == MarketBias.BEARISH:
-                if event.event_type in {StructureEventType.LH, StructureEventType.LL}:
-                    aligned += 1
-                elif event.direction == MarketBias.BEARISH:
-                    aligned += 1
-            elif bias == MarketBias.RANGING:
-                if event.event_type in {StructureEventType.CHOCH}:
-                    aligned += 1
-
-        return max(0.0, min(1.0, aligned / max(len(relevant), 1)))
-
-    def _compute_layer_trend_strength(self, layer: StructureLayer, bias: MarketBias) -> float:
-        if bias in {MarketBias.UNKNOWN, MarketBias.RANGING}:
-            return 0.0
-
-        last_bos = self._last_event(layer, StructureEventType.BOS)
-        if last_bos is None or last_bos.direction != bias:
-            return max(0.0, min(1.0, self._compute_layer_confidence(layer, bias) * 0.7))
-
-        return max(0.0, min(1.0, 0.4 + last_bos.confidence * 0.6))
-
-    def _is_layer_in_recent_breakout(self, layer: StructureLayer) -> bool:
-        last_bos = self._last_event(layer, StructureEventType.BOS)
-        if last_bos is None or self._state.last_update is None:
-            return False
-
-        recent = [
-            e for e in self._events
-            if e.layer == layer and e.timestamp >= last_bos.timestamp
-        ]
-        return any(e.event_type == StructureEventType.BOS for e in recent)
-
-    def _compute_alignment(self) -> None:
+    def _refresh_alignment_state(self) -> None:
         mtf = self._state.mtf_alignment
         internal_bias = self._state.internal.bias
         external_bias = self._state.external.bias
-        htf_bias = mtf.higher_timeframe_bias
 
         mtf.internal_with_external_aligned = (
             internal_bias == external_bias
-            and internal_bias in {MarketBias.BULLISH, MarketBias.BEARISH}
+            and internal_bias not in {MarketBias.UNKNOWN, MarketBias.RANGING}
         )
 
-        mtf.internal_bias_aligned = (
-            htf_bias in {MarketBias.BULLISH, MarketBias.BEARISH}
-            and internal_bias == htf_bias
-        )
-        mtf.external_bias_aligned = (
-            htf_bias in {MarketBias.BULLISH, MarketBias.BEARISH}
-            and external_bias == htf_bias
-        )
+        if mtf.higher_timeframe_bias not in {MarketBias.UNKNOWN, MarketBias.RANGING}:
+            mtf.internal_bias_aligned = internal_bias == mtf.higher_timeframe_bias
+            mtf.external_bias_aligned = external_bias == mtf.higher_timeframe_bias
+        else:
+            mtf.internal_bias_aligned = False
+            mtf.external_bias_aligned = False
 
         score = 0.0
-
         if mtf.internal_with_external_aligned:
-            score += 0.35
-
+            score += 0.4
         if mtf.internal_bias_aligned:
-            score += 0.30
-
+            score += 0.3
         if mtf.external_bias_aligned:
-            score += 0.35
+            score += 0.3
 
-        score *= max(0.5, mtf.higher_timeframe_confidence if htf_bias != MarketBias.UNKNOWN else 1.0)
         mtf.alignment_score = max(0.0, min(1.0, score))
 
-        mtf.metadata = {
-            **mtf.metadata,
-            "internal_bias": internal_bias.value,
-            "external_bias": external_bias.value,
-        }
+    def _infer_bias(self, layer: StructureLayer) -> MarketBias:
+        state = self._layer_state(layer)
+
+        if state.last_hh and state.last_hl:
+            latest_bullish_ts = max(state.last_hh.timestamp, state.last_hl.timestamp)
+        else:
+            latest_bullish_ts = None
+
+        if state.last_lh and state.last_ll:
+            latest_bearish_ts = max(state.last_lh.timestamp, state.last_ll.timestamp)
+        else:
+            latest_bearish_ts = None
+
+        last_break = None
+        if state.last_bos and state.last_choch:
+            last_break = max([state.last_bos, state.last_choch], key=lambda x: x.timestamp)
+        else:
+            last_break = state.last_bos or state.last_choch
+
+        if last_break is not None and last_break.direction is not None:
+            return last_break.direction
+
+        if latest_bullish_ts and latest_bearish_ts:
+            if latest_bullish_ts > latest_bearish_ts:
+                return MarketBias.BULLISH
+            if latest_bearish_ts > latest_bullish_ts:
+                return MarketBias.BEARISH
+
+        if latest_bullish_ts:
+            return MarketBias.BULLISH
+        if latest_bearish_ts:
+            return MarketBias.BEARISH
+
+        return MarketBias.UNKNOWN
+
+    def _infer_trend_strength(self, layer: StructureLayer) -> float:
+        swings = self._sorted_swings_for_layer(layer)
+        if len(swings) < 2:
+            return 0.0
+
+        recent = swings[-self.config.alignment_window:]
+        avg_strength = mean_safe([x.strength for x in recent])
+
+        prices = [x.price for x in recent if x.price > 0]
+        if len(prices) >= 2:
+            price_dispersion = abs(prices[-1] - prices[0]) / prices[0]
+        else:
+            price_dispersion = 0.0
+
+        raw = (avg_strength + min(1.0, price_dispersion * 100.0)) / 2.0
+        return max(0.0, min(1.0, raw))
+
+    def _infer_layer_confidence(self, layer: StructureLayer) -> float:
+        state = self._layer_state(layer)
+
+        components: List[float] = [state.trend_strength]
+
+        if state.last_bos:
+            components.append(state.last_bos.confidence)
+        if state.last_choch:
+            components.append(state.last_choch.confidence)
+
+        if state.last_swing_high:
+            components.append(state.last_swing_high.strength)
+        if state.last_swing_low:
+            components.append(state.last_swing_low.strength)
+
+        if not components:
+            return 0.0
+
+        return max(0.0, min(1.0, sum(components) / len(components)))
 
     # -------------------------------------------------------------------------
-    # EventBus integration
+    # Event helpers
     # -------------------------------------------------------------------------
 
-    def _register_swing_event(self, swing: SwingPoint) -> None:
+    def _emit_structure_event_for_swing(self, swing: SwingPoint) -> None:
         event_type = (
-            StructureEventType.SWING_HIGH
-            if swing.swing_type == SwingType.HIGH
-            else StructureEventType.SWING_LOW
+            StructureEventType.SWING_HIGH if swing.swing_type == SwingType.HIGH else StructureEventType.SWING_LOW
         )
 
         event = StructureEvent(
-            event_id=self._new_id(),
+            event_id=uuid4().hex,
             event_type=event_type,
             timestamp=swing.timestamp,
             price=swing.price,
@@ -1123,290 +836,64 @@ class MarketStructureAnalyzer:
             swing_id=swing.swing_id,
             reference_price=None,
             reference_swing_id=None,
-            confidence=min(1.0, 0.4 + swing.strength),
+            confidence=swing.strength,
             metadata={
                 "index": swing.index,
                 "strength": swing.strength,
             },
         )
-        self._append_event(event)
 
-    def _append_event(self, event: StructureEvent) -> None:
         self._events.append(event)
-        self._emit_event(event)
-
-    def _emit_event(self, event: StructureEvent) -> None:
-        if not self.config.emit_events or self.event_bus is None:
-            return
-
-        payload = {
-            "source": self.config.event_namespace,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "higher_timeframe": self.higher_timeframe,
-            "event": self._event_to_dict(event),
-            "state": {
-                "internal_bias": self._state.internal.bias.value,
-                "external_bias": self._state.external.bias.value,
-                "alignment_score": self._state.mtf_alignment.alignment_score,
-            },
-        }
-
-        event_name = f"{self.config.event_namespace}.{event.event_type.value}"
-
-        try:
-            if hasattr(self.event_bus, "emit"):
-                self.event_bus.emit(event_name, payload)
-            elif hasattr(self.event_bus, "publish"):
-                self.event_bus.publish(event_name, payload)
-            elif hasattr(self.event_bus, "dispatch"):
-                self.event_bus.dispatch(event_name, payload)
-            else:
-                self.logger.warning(
-                    "EventBus provided but no supported method found",
-                    extra={
-                        "symbol": self.symbol,
-                        "timeframe": self.timeframe,
-                        "event_name": event_name,
-                    },
-                )
-                return
-
-            self.logger.debug(
-                "Market structure event emitted",
-                extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
-                    "event_name": event_name,
-                    "layer": event.layer.value,
-                },
-            )
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to emit market structure event",
-                extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
-                    "event_name": event_name,
-                    "error": str(exc),
-                },
-            )
-
-    def _publish_snapshot(self) -> None:
-        if self.event_bus is None:
-            return
-
-        payload = {
-            "source": self.config.event_namespace,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "snapshot": self.snapshot(),
-        }
-
-        event_name = f"{self.config.event_namespace}.snapshot"
-
-        try:
-            if hasattr(self.event_bus, "emit"):
-                self.event_bus.emit(event_name, payload)
-            elif hasattr(self.event_bus, "publish"):
-                self.event_bus.publish(event_name, payload)
-            elif hasattr(self.event_bus, "dispatch"):
-                self.event_bus.dispatch(event_name, payload)
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to publish market structure snapshot",
-                extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
-                    "event_name": event_name,
-                    "error": str(exc),
-                },
-            )
-
-    # -------------------------------------------------------------------------
-    # Parsing / normalization
-    # -------------------------------------------------------------------------
-
-    def _parse_candle(self, raw: Mapping[str, Any]) -> Candle:
-        timestamp = raw.get("timestamp", raw.get("time", raw.get("ts")))
-        if timestamp is None:
-            raise ValueError("Candle is missing timestamp/time/ts")
-
-        open_ = raw.get("open", raw.get("o"))
-        high = raw.get("high", raw.get("h"))
-        low = raw.get("low", raw.get("l"))
-        close = raw.get("close", raw.get("c"))
-        volume = raw.get("volume", raw.get("v", 0.0))
-
-        if open_ is None or high is None or low is None or close is None:
-            raise ValueError("Candle must contain open/high/low/close")
-
-        dt = self._normalize_timestamp(timestamp)
-
-        candle = Candle(
-            timestamp=dt,
-            open=float(open_),
-            high=float(high),
-            low=float(low),
-            close=float(close),
-            volume=float(volume),
-            index=self._global_candle_index,
+        self._emit_event(
+            self._build_event_name(event.event_type.value),
+            self._event_to_dict(event),
+            source="market_structure_analyzer",
         )
-        self._global_candle_index += 1
-
-        if candle.low > candle.high:
-            raise ValueError("Invalid candle: low cannot be greater than high")
-        if min(candle.open, candle.high, candle.low, candle.close) < 0:
-            raise ValueError("Invalid candle: OHLC cannot be negative")
-
-        return candle
-
-    @staticmethod
-    def _normalize_timestamp(value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value
-
-        if isinstance(value, (int, float)):
-            if value > 1e12:
-                return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
-            return datetime.fromtimestamp(value, tz=timezone.utc)
-
-        if isinstance(value, str):
-            normalized = value.strip().replace("Z", "+00:00")
-            dt = datetime.fromisoformat(normalized)
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            return dt
-
-        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
 
     # -------------------------------------------------------------------------
-    # Helpers
+    # Utility helpers
     # -------------------------------------------------------------------------
 
-    def _swings_by_layer(self, layer: StructureLayer) -> Deque[SwingPoint]:
-        if layer == StructureLayer.INTERNAL:
-            return self._internal_swings
-        return self._external_swings
+    def _layer_min_distance_pct(self, layer: StructureLayer) -> float:
+        return (
+            self.config.internal_min_swing_distance_pct
+            if layer == StructureLayer.INTERNAL
+            else self.config.external_min_swing_distance_pct
+        )
+
+    def _swings_for_layer(self, layer: StructureLayer) -> Deque[SwingPoint]:
+        return self._internal_swings if layer == StructureLayer.INTERNAL else self._external_swings
+
+    def _sorted_swings_for_layer(self, layer: StructureLayer) -> List[SwingPoint]:
+        return sorted(self._swings_for_layer(layer), key=lambda x: x.index)
 
     def _layer_state(self, layer: StructureLayer) -> StructureLayerState:
-        if layer == StructureLayer.INTERNAL:
-            return self._state.internal
-        return self._state.external
+        return self._state.internal if layer == StructureLayer.INTERNAL else self._state.external
 
-    def _last_swing(self, layer: StructureLayer, swing_type: SwingType) -> Optional[SwingPoint]:
-        swings = self._swings_by_layer(layer)
-        for swing in reversed(swings):
-            if swing.swing_type == swing_type:
-                return swing
-        return None
+    def _last_swing_of_type(
+        self,
+        swings: Sequence[SwingPoint],
+        swing_type: SwingType,
+    ) -> Optional[SwingPoint]:
+        filtered = [x for x in swings if x.swing_type == swing_type]
+        return filtered[-1] if filtered else None
 
-    def _previous_swing(self, layer: StructureLayer, swing_type: SwingType) -> Optional[SwingPoint]:
-        swings = self._swings_by_layer(layer)
-        found = 0
-        for swing in reversed(swings):
-            if swing.swing_type == swing_type:
-                found += 1
-                if found == 2:
-                    return swing
-        return None
+    def _last_event_of_type(
+        self,
+        events: Sequence[StructureEvent],
+        event_type: StructureEventType,
+    ) -> Optional[StructureEvent]:
+        filtered = [x for x in events if x.event_type == event_type]
+        return filtered[-1] if filtered else None
 
-    def _last_event(self, layer: StructureLayer, event_type: StructureEventType) -> Optional[StructureEvent]:
-        for event in reversed(self._events):
-            if event.layer == layer and event.event_type == event_type:
-                return event
-        return None
+    def _swing_to_dict(self, swing: SwingPoint) -> Dict[str, Any]:
+        return self._safe_serialize(swing)
 
-    def _is_break_above(self, candle: Candle, level: float) -> bool:
-        threshold = abs(level) * self.config.structure_break_threshold_pct
-        if self.config.require_close_break:
-            return candle.close > (level + threshold)
-        return candle.high > (level + threshold)
+    def _event_to_dict(self, event: StructureEvent) -> Dict[str, Any]:
+        return self._safe_serialize(event)
 
-    def _is_break_below(self, candle: Candle, level: float) -> bool:
-        threshold = abs(level) * self.config.structure_break_threshold_pct
-        if self.config.require_close_break:
-            return candle.close < (level - threshold)
-        return candle.low < (level - threshold)
 
-    @staticmethod
-    def _new_id() -> str:
-        return uuid4().hex
-
-    # -------------------------------------------------------------------------
-    # Serialization helpers
-    # -------------------------------------------------------------------------
-
-    def _swing_to_dict(self, swing: Optional[SwingPoint]) -> Optional[Dict[str, Any]]:
-        if swing is None:
-            return None
-
-        return {
-            "swing_id": swing.swing_id,
-            "timestamp": swing.timestamp.isoformat(),
-            "price": swing.price,
-            "swing_type": swing.swing_type.value,
-            "layer": swing.layer.value,
-            "index": swing.index,
-            "candle_open": swing.candle_open,
-            "candle_high": swing.candle_high,
-            "candle_low": swing.candle_low,
-            "candle_close": swing.candle_close,
-            "strength": swing.strength,
-            "is_confirmed": swing.is_confirmed,
-            "metadata": dict(swing.metadata),
-        }
-
-    def _event_to_dict(self, event: Optional[StructureEvent]) -> Optional[Dict[str, Any]]:
-        if event is None:
-            return None
-
-        return {
-            "event_id": event.event_id,
-            "event_type": event.event_type.value,
-            "timestamp": event.timestamp.isoformat(),
-            "price": event.price,
-            "layer": event.layer.value,
-            "direction": event.direction.value if event.direction else None,
-            "swing_id": event.swing_id,
-            "reference_price": event.reference_price,
-            "reference_swing_id": event.reference_swing_id,
-            "confidence": event.confidence,
-            "metadata": dict(event.metadata),
-        }
-
-    def _layer_state_to_dict(self, state: StructureLayerState) -> Dict[str, Any]:
-        return {
-            "layer": state.layer.value,
-            "bias": state.bias.value,
-            "confidence": state.confidence,
-            "trend_strength": state.trend_strength,
-            "in_breakout": state.in_breakout,
-            "swing_count": state.swing_count,
-            "event_count": state.event_count,
-            "sequence": list(state.sequence),
-            "last_swing_high": self._swing_to_dict(state.last_swing_high),
-            "previous_swing_high": self._swing_to_dict(state.previous_swing_high),
-            "last_swing_low": self._swing_to_dict(state.last_swing_low),
-            "previous_swing_low": self._swing_to_dict(state.previous_swing_low),
-            "last_hh": self._event_to_dict(state.last_hh),
-            "last_hl": self._event_to_dict(state.last_hl),
-            "last_lh": self._event_to_dict(state.last_lh),
-            "last_ll": self._event_to_dict(state.last_ll),
-            "last_bos": self._event_to_dict(state.last_bos),
-            "last_choch": self._event_to_dict(state.last_choch),
-            "last_mss": self._event_to_dict(state.last_mss),
-        }
-
-    def _alignment_to_dict(self, alignment: MultiTimeframeAlignment) -> Dict[str, Any]:
-        return {
-            "higher_timeframe": alignment.higher_timeframe,
-            "higher_timeframe_bias": alignment.higher_timeframe_bias.value,
-            "higher_timeframe_confidence": alignment.higher_timeframe_confidence,
-            "internal_bias_aligned": alignment.internal_bias_aligned,
-            "external_bias_aligned": alignment.external_bias_aligned,
-            "internal_with_external_aligned": alignment.internal_with_external_aligned,
-            "alignment_score": alignment.alignment_score,
-            "last_updated": alignment.last_updated.isoformat() if alignment.last_updated else None,
-            "metadata": dict(alignment.metadata),
-        }
+def mean_safe(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
