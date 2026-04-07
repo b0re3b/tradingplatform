@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 from core.logger import get_logger
 
@@ -35,7 +35,6 @@ class StopClusterCandidate:
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
-    # додаткові фактори
     volume_score: float = 0.0
     orderbook_score: float = 0.0
     compression_score: float = 0.0
@@ -84,33 +83,6 @@ class StopClustersDetector:
         candles: Sequence[Any] | None = None,
         orderbook: dict[str, Sequence[Any]] | None = None,
     ) -> list[StopCluster]:
-        """
-        Основний метод побудови stop clusters.
-
-        Parameters
-        ----------
-        symbol:
-            Торговий символ.
-        timeframe:
-            Таймфрейм.
-        levels:
-            Список liquidity levels.
-        current_price:
-            Поточна ціна.
-        candles:
-            Свічки для аналізу volume/compression.
-        orderbook:
-            Опціонально:
-            {
-                "bids": [...],
-                "asks": [...]
-            }
-
-            Кожен елемент може бути:
-            - dict {"price": ..., "size": ...}
-            - tuple/list [price, size]
-            - object.price / object.size
-        """
         if not levels:
             return []
 
@@ -277,12 +249,6 @@ class StopClustersDetector:
         return max(padding, base_padding * 0.5)
 
     def _calculate_partial_sweep_factor(self, level: LiquidityLevel) -> float:
-        """
-        Частково sweeped рівень:
-        - stop cluster залишається релевантним
-        - але трохи слабшає
-        - іноді зона трохи розширюється, бо ліквідність стала "розмазана"
-        """
         if level.sweep_status == SweepStatus.PARTIALLY_SWEPT:
             return 0.82
         if level.sweep_status == SweepStatus.SWEPT:
@@ -294,23 +260,31 @@ class StopClustersDetector:
         level: LiquidityLevel,
         candles: Sequence[Any] | None,
     ) -> float:
-        """
-        Оцінка volume pressure біля рівня.
-        """
         if not candles or len(candles) < 5:
             return 0.0
 
-        level_price = level.price
+        tolerance_raw = level.metadata.get("tolerance_pct", 0.0)
+        tolerance_value = self._safe_float(tolerance_raw, default=0.0)
+
         window = self._find_candles_near_level(
             candles=candles,
-            level_price=level_price,
-            tolerance_pct=max(level.metadata.get("tolerance_pct", 0.0), self._config.equal_level_tolerance_pct) * 2.0,
+            level_price=level.price,
+            tolerance_pct=max(tolerance_value, self._config.equal_level_tolerance_pct) * 2.0,
         )
         if not window:
             return 0.0
 
-        near_volumes = [self._get_candle_volume(c) for c in window if self._get_candle_volume(c) is not None]
-        all_volumes = [self._get_candle_volume(c) for c in candles if self._get_candle_volume(c) is not None]
+        near_volumes: list[float] = []
+        for candle in window:
+            volume = self._get_candle_volume(candle)
+            if volume is not None:
+                near_volumes.append(volume)
+
+        all_volumes: list[float] = []
+        for candle in candles:
+            volume = self._get_candle_volume(candle)
+            if volume is not None:
+                all_volumes.append(volume)
 
         if not near_volumes or not all_volumes:
             return 0.0
@@ -328,9 +302,6 @@ class StopClustersDetector:
         candidate: StopClusterCandidate,
         orderbook: dict[str, Sequence[Any]] | None,
     ) -> float:
-        """
-        Якщо біля stop-zone є помітна resting liquidity / wall, посилюємо кластер.
-        """
         if not orderbook:
             return 0.0
 
@@ -367,13 +338,10 @@ class StopClustersDetector:
         level: LiquidityLevel,
         candles: Sequence[Any] | None,
     ) -> float:
-        """
-        Якщо перед рівнем волатильність стискається, stop hunt стає більш імовірним.
-        """
         if not candles or len(candles) < 10:
             return 0.0
 
-        pivot_indexes = level.metadata.get("pivot_indexes")
+        pivot_indexes = self._extract_int_list(level.metadata.get("pivot_indexes"))
         if not pivot_indexes:
             return 0.0
 
@@ -385,7 +353,7 @@ class StopClustersDetector:
         if len(lookback_slice) < 4:
             return 0.0
 
-        ranges = []
+        ranges: list[float] = []
         for candle in lookback_slice:
             high = self._get_candle_high(candle)
             low = self._get_candle_low(candle)
@@ -413,9 +381,6 @@ class StopClustersDetector:
         return clamp(compression_ratio, 0.0, 1.0)
 
     def _calculate_time_decay_factor(self, level: LiquidityLevel) -> float:
-        """
-        Старі рівні поступово послаблюємо.
-        """
         anchor = level.last_seen_at or level.first_seen_at
         if anchor is None:
             return 1.0
@@ -441,15 +406,9 @@ class StopClustersDetector:
         self,
         candidate: StopClusterCandidate,
     ) -> StopClusterCandidate:
-        """
-        Застосовує:
-        - partial sweep → трохи ширша зона, слабший кластер
-        - compression/orderbook/volume → можуть посилити кластер
-        """
         low_price = candidate.low_price
         high_price = candidate.high_price
 
-        # partial sweep -> зона трохи розширюється
         if candidate.partial_sweep_factor < 1.0:
             extra_width = candidate.width() * (1.0 - candidate.partial_sweep_factor) * 0.75
             if candidate.side == LiquiditySide.BUY_SIDE:
@@ -775,31 +734,64 @@ class StopClustersDetector:
         parsed: list[OrderbookLevel] = []
 
         for item in levels:
-            if isinstance(item, dict):
-                price = item.get("price")
-                size = item.get("size") or item.get("qty") or item.get("quantity")
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                price = item[0]
-                size = item[1]
-            else:
-                price = getattr(item, "price", None)
-                size = getattr(item, "size", None)
+            raw_price: Any | None
+            raw_size: Any | None
 
-            if price is None or size is None:
+            if isinstance(item, dict):
+                raw_price = item.get("price")
+                raw_size = item.get("size")
+                if raw_size is None:
+                    raw_size = item.get("qty")
+                if raw_size is None:
+                    raw_size = item.get("quantity")
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                raw_price = item[0]
+                raw_size = item[1]
+            else:
+                raw_price = getattr(item, "price", None)
+                raw_size = getattr(item, "size", None)
+
+            if raw_price is None or raw_size is None:
                 continue
 
             try:
-                parsed.append(
-                    OrderbookLevel(
-                        price=float(price),
-                        size=float(size),
-                        side=side,
-                    )
-                )
+                price = float(cast(object, raw_price))
+                size = float(cast(object, raw_size))
             except (TypeError, ValueError):
                 continue
 
+            parsed.append(
+                OrderbookLevel(
+                    price=price,
+                    size=size,
+                    side=side,
+                )
+            )
+
         return parsed
+
+    def _extract_int_list(self, value: Any) -> list[int]:
+        if not isinstance(value, (list, tuple)):
+            return []
+
+        result: list[int] = []
+        for item in value:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                result.append(item)
+            elif isinstance(item, float) and item.is_integer():
+                result.append(int(item))
+
+        return result
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def _get_candle_value(self, candle: Any, field: str, default: Any = None) -> Any:
         if isinstance(candle, dict):
@@ -828,4 +820,7 @@ class StopClustersDetector:
         value = self._get_candle_value(candle, "volume")
         if value is None:
             return None
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None

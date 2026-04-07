@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from analytics.liquidity.enums import (
+from .enums import (
     ClusterStrength,
     LiquidityBias,
     LiquidityLevelType,
@@ -28,8 +28,8 @@ class LiquidityLevel:
 
     status: LiquidityStatus = LiquidityStatus.ACTIVE
     sweep_status: SweepStatus = SweepStatus.NOT_SWEPT
-
     confidence: float = 0.0
+
     touches_count: int = 0
     reaction_count: int = 0
 
@@ -55,10 +55,12 @@ class LiquidityLevel:
         self.status = LiquidityStatus.INVALIDATED
 
 
-@dataclass(slots=True)
+@dataclass
 class EqualLevel(LiquidityLevel):
     """
     Рівень типу equal highs / equal lows.
+    Наслідує всі службові поля з LiquidityLevel:
+    status, sweep_status, confidence, swept_at тощо.
     """
 
     tolerance_pct: float = 0.0
@@ -123,6 +125,7 @@ class LiquidityZone:
     side: LiquiditySide
     low_price: float
     high_price: float
+
     score: float = 0.0
     label: str | None = None
     source_types: list[LiquidityLevelType] = field(default_factory=list)
