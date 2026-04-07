@@ -343,7 +343,7 @@ class FundingPressureState:
 @dataclass(slots=True)
 class FundingSignal:
     """
-    Нормалізований funding-сигнал для strategy layer.
+    Нормалізований funding-сигнал для strategies layer.
     """
 
     symbol: str

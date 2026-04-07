@@ -115,7 +115,7 @@ class StopCluster:
 class LiquidityZone:
     """
     Узагальнена зона ліквідності.
-    Може використовуватись для dashboard / strategy / AI-пояснення.
+    Може використовуватись для dashboard / strategies / AI-пояснення.
     """
 
     symbol: str
@@ -139,7 +139,7 @@ class LiquidityZone:
 @dataclass(slots=True)
 class LiquiditySignal:
     """
-    Підсумковий сигнал для strategy engine.
+    Підсумковий сигнал для strategies engine.
     """
 
     symbol: str

@@ -706,7 +706,7 @@ class RiskManager:
             decision.final_leverage,
             extra={
                 "symbol": request.symbol,
-                "strategy": request.strategy_name,
+                "strategies": request.strategy_name,
                 "signal_id": request.signal_id,
             },
         )

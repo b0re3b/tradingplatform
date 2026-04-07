@@ -455,7 +455,7 @@ class FundingPressureAnalyzer:
         return max(0.0, min(1.0, probability))
 
     # ------------------------------------------------------------------
-    # Optional helper methods for analyzer / strategy
+    # Optional helper methods for analyzer / strategies
     # ------------------------------------------------------------------
 
     def is_high_pressure(self, state: FundingPressureState) -> bool:

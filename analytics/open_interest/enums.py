@@ -98,7 +98,7 @@ class OIConfidenceBand(str, Enum):
 class OIEventType(str, Enum):
     """
     Уніфіковані event names, які буде зручно використовувати
-    в analyzer / strategy / dashboard.
+    в analyzer / strategies / dashboard.
     """
 
     UPDATED = "analytics.oi.updated"

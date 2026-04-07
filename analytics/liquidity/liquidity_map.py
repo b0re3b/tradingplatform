@@ -389,7 +389,7 @@ class LiquidityMap:
         clusters: Sequence[StopCluster],
     ) -> list[LiquidityZone]:
         """
-        Формує агреговані liquidity zones для strategy/dashboard/AI.
+        Формує агреговані liquidity zones для strategies/dashboard/AI.
         """
         ranges: list[tuple[float, float]] = []
 

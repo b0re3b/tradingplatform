@@ -90,7 +90,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
     - BOS / CHOCH / MSS detection
     - EventBus integration
     - optional higher timeframe alignment
-    - snapshot-oriented API for strategy layer
+    - snapshot-oriented API for strategies layer
     """
 
     def __init__(

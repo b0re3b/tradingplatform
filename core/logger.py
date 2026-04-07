@@ -160,7 +160,7 @@ class JsonFormatter(logging.Formatter):
         for field in (
             "exchange",
             "symbol",
-            "strategy",
+            "strategies",
             "signal_id",
             "order_id",
             "position_id",

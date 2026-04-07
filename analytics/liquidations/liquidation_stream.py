@@ -685,7 +685,7 @@ class LiquidationStream:
     ) -> list[LiquidationEvent]:
         """
         Повертає останні великі liquidation events.
-        Корисно для dashboard / debug / strategy context.
+        Корисно для dashboard / debug / strategies context.
         """
         target_symbol = normalize_symbol(symbol) if symbol else None
         result: list[LiquidationEvent] = []
