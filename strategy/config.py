@@ -227,11 +227,39 @@ class PortfolioCoordinatorConfig:
     correlation_guard_enabled: bool = True
     symbol_cooldown_seconds: int = 15
 
+    side_cooldown_seconds: int = 10
+    repeated_signal_suppression_seconds: int = 30
+    volatility_throttle_enabled: bool = True
+    volatility_throttle_threshold: float = 3.0
+    high_volatility_max_signals_per_symbol: int = 1
+
+    max_signals_per_category: dict[StrategyCategory, int] = field(default_factory=dict)
+    priority_overrides: dict[str, int] = field(default_factory=dict)
+
+    exposure_bucket_limits: dict[str, int] = field(default_factory=dict)
+    enable_correlation_direction_conflict: bool = True
+
     def validate(self) -> None:
         if self.max_signals_per_symbol < 1:
             raise StrategyConfigError("max_signals_per_symbol must be >= 1")
         if self.symbol_cooldown_seconds < 0:
             raise StrategyConfigError("symbol_cooldown_seconds must be >= 0")
+        if self.side_cooldown_seconds < 0:
+            raise StrategyConfigError("side_cooldown_seconds must be >= 0")
+        if self.repeated_signal_suppression_seconds < 0:
+            raise StrategyConfigError("repeated_signal_suppression_seconds must be >= 0")
+        if self.volatility_throttle_threshold < 0:
+            raise StrategyConfigError("volatility_throttle_threshold must be >= 0")
+        if self.high_volatility_max_signals_per_symbol < 1:
+            raise StrategyConfigError("high_volatility_max_signals_per_symbol must be >= 1")
+
+        for category, value in self.max_signals_per_category.items():
+            if value < 1:
+                raise StrategyConfigError(f"max_signals_per_category[{category}] must be >= 1")
+
+        for bucket_name, value in self.exposure_bucket_limits.items():
+            if value < 1:
+                raise StrategyConfigError(f"exposure_bucket_limits[{bucket_name}] must be >= 1")
 
 
 @dataclass(slots=True)
@@ -314,46 +342,3 @@ class StrategyConfig:
 
     def get_regime_adjustment(self, regime: MarketRegime) -> float:
         return self.weighting.regime_adjustments.get(regime, 1.0)
-@dataclass(slots=True)
-class PortfolioCoordinatorConfig:
-    enabled: bool = True
-    max_signals_per_symbol: int = 3
-    deduplicate_by_side: bool = True
-    merge_similar_signals: bool = True
-    correlation_guard_enabled: bool = True
-    symbol_cooldown_seconds: int = 15
-
-    # NEW
-    side_cooldown_seconds: int = 10
-    repeated_signal_suppression_seconds: int = 30
-    volatility_throttle_enabled: bool = True
-    volatility_throttle_threshold: float = 3.0
-    high_volatility_max_signals_per_symbol: int = 1
-
-    max_signals_per_category: dict[StrategyCategory, int] = field(default_factory=dict)
-    priority_overrides: dict[str, int] = field(default_factory=dict)
-
-    exposure_bucket_limits: dict[str, int] = field(default_factory=dict)
-    enable_correlation_direction_conflict: bool = True
-
-    def validate(self) -> None:
-        if self.max_signals_per_symbol < 1:
-            raise StrategyConfigError("max_signals_per_symbol must be >= 1")
-        if self.symbol_cooldown_seconds < 0:
-            raise StrategyConfigError("symbol_cooldown_seconds must be >= 0")
-        if self.side_cooldown_seconds < 0:
-            raise StrategyConfigError("side_cooldown_seconds must be >= 0")
-        if self.repeated_signal_suppression_seconds < 0:
-            raise StrategyConfigError("repeated_signal_suppression_seconds must be >= 0")
-        if self.volatility_throttle_threshold < 0:
-            raise StrategyConfigError("volatility_throttle_threshold must be >= 0")
-        if self.high_volatility_max_signals_per_symbol < 1:
-            raise StrategyConfigError("high_volatility_max_signals_per_symbol must be >= 1")
-
-        for category, value in self.max_signals_per_category.items():
-            if value < 1:
-                raise StrategyConfigError(f"max_signals_per_category[{category}] must be >= 1")
-
-        for bucket_name, value in self.exposure_bucket_limits.items():
-            if value < 1:
-                raise StrategyConfigError(f"exposure_bucket_limits[{bucket_name}] must be >= 1")

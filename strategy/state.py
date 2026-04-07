@@ -6,7 +6,7 @@ from typing import Any
 
 from .context import StrategyContext
 from .enums import MarketRegime
-from strategy.exceptions import FeatureStoreError, StrategyStateError, ValidationError
+from .exceptions import FeatureStoreError, StrategyStateError, ValidationError
 from .models import (
     CooldownState,
     FeatureSnapshot,
@@ -30,11 +30,16 @@ class SymbolState:
     last_context: StrategyContext | None = None
     last_signal: StrategySignal | None = None
     active_signals: list[StrategySignal] = field(default_factory=list)
+
     cooldowns: dict[str, CooldownState] = field(default_factory=dict)
+    side_cooldowns: dict[str, CooldownState] = field(default_factory=dict)
+
+    last_signal_by_side: dict[str, StrategySignal] = field(default_factory=dict)
+    signal_history: list[StrategySignal] = field(default_factory=list)
+
     active_conflicts: list[str] = field(default_factory=list)
     last_updated_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-
 
     def validate(self) -> None:
         if not self.symbol.strip():
@@ -45,7 +50,13 @@ class SymbolState:
             self.last_signal.validate()
         for signal in self.active_signals:
             signal.validate()
+        for signal in self.last_signal_by_side.values():
+            signal.validate()
+        for signal in self.signal_history:
+            signal.validate()
         for cooldown in self.cooldowns.values():
+            cooldown.validate()
+        for cooldown in self.side_cooldowns.values():
             cooldown.validate()
 
     def touch(self) -> None:
@@ -110,6 +121,45 @@ class SymbolState:
         }
         self.touch()
 
+    def add_side_cooldown(self, side: str, seconds: int, reason: str | None = None) -> None:
+        if seconds < 0:
+            raise StrategyStateError("Side cooldown seconds must be >= 0")
+
+        self.side_cooldowns[side] = CooldownState(
+            symbol=self.symbol,
+            strategy_name=f"__side__:{side}",
+            until=utcnow() + timedelta(seconds=seconds),
+            reason=reason,
+        )
+        self.touch()
+
+    def is_side_on_cooldown(self, side: str, now: datetime | None = None) -> bool:
+        cooldown = self.side_cooldowns.get(side)
+        if cooldown is None:
+            return False
+        return cooldown.is_active(now)
+
+    def clear_expired_side_cooldowns(self, now: datetime | None = None) -> None:
+        current = now or utcnow()
+        self.side_cooldowns = {
+            name: cooldown
+            for name, cooldown in self.side_cooldowns.items()
+            if cooldown.is_active(current)
+        }
+        self.touch()
+
+    def remember_signal(self, signal: StrategySignal) -> None:
+        signal.validate()
+        if signal.symbol != self.symbol:
+            raise StrategyStateError(
+                f"Signal symbol mismatch: expected {self.symbol}, got {signal.symbol}"
+            )
+
+        self.last_signal_by_side[signal.side.value] = signal
+        self.signal_history.append(signal)
+        self.last_signal = signal
+        self.touch()
+
 
 @dataclass(slots=True)
 class MarketRegimeState:
@@ -149,41 +199,6 @@ class PortfolioState:
     blocked_symbols: set[str] = field(default_factory=set)
     symbol_signal_counts: dict[str, int] = field(default_factory=dict)
     updated_at: datetime | None = None
-    side_cooldowns: dict[str, CooldownState] = field(default_factory=dict)
-    last_signal_by_side: dict[str, StrategySignal] = field(default_factory=dict)
-    signal_history: list[StrategySignal] = field(default_factory=list)
-
-    def add_side_cooldown(self, side: str, seconds: int, reason: str | None = None) -> None:
-        if seconds < 0:
-            raise StrategyStateError("Side cooldown seconds must be >= 0")
-
-        self.side_cooldowns[side] = CooldownState(
-            symbol=self.symbol,
-            strategy_name=f"__side__:{side}",
-            until=utcnow() + timedelta(seconds=seconds),
-            reason=reason,
-        )
-        self.touch()
-
-    def is_side_on_cooldown(self, side: str, now: datetime | None = None) -> bool:
-        cooldown = self.side_cooldowns.get(side)
-        if cooldown is None:
-            return False
-        return cooldown.is_active(now)
-
-    def clear_expired_side_cooldowns(self, now: datetime | None = None) -> None:
-        current = now or utcnow()
-        self.side_cooldowns = {
-            name: cooldown
-            for name, cooldown in self.side_cooldowns.items()
-            if cooldown.is_active(current)
-        }
-        self.touch()
-
-    def remember_signal(self, signal: StrategySignal) -> None:
-        self.last_signal_by_side[signal.side.value] = signal
-        self.signal_history.append(signal)
-        self.touch()
 
     def set_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         snapshot.validate()
@@ -384,6 +399,7 @@ class StrategyState:
     def prune(self) -> None:
         for symbol_state in self.symbols.values():
             symbol_state.clear_expired_cooldowns()
+            symbol_state.clear_expired_side_cooldowns()
             symbol_state.remove_inactive_signals()
 
         self.feature_store.prune_stale()
