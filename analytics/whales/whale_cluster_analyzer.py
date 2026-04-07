@@ -3,245 +3,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from core.logger import get_logger
-
-
-@dataclass(slots=True)
-class WhaleClusterAnalyzerConfig:
-    """
-    Конфігурація аналізатора whale cluster-ів.
-    """
-
-    enabled: bool = True
-
-    # Вхідні події
-    whale_activity_event_name: str = "analytics.whales.whale_activity"
-    whale_pressure_event_name: str = "analytics.whales.whale_pressure"
-    whale_liquidation_context_event_name: str = "analytics.whales.whale_liquidation_context"
-
-    # Вихідні події
-    whale_cluster_event_name: str = "analytics.whales.whale_cluster"
-    whale_cluster_update_event_name: str = "analytics.whales.whale_cluster_update"
-    whale_cluster_exhaustion_event_name: str = "analytics.whales.whale_cluster_exhaustion"
-
-    # Вікна аналізу
-    analysis_window_sec: int = 180
-    cluster_ttl_sec: int = 300
-
-    # Мінімальні умови формування cluster
-    min_activity_signals: int = 2
-    min_total_activity_notional: float = 500_000.0
-
-    # Скоринг
-    activity_weight: float = 0.35
-    pressure_weight: float = 0.35
-    liquidation_context_weight: float = 0.20
-    persistence_weight: float = 0.10
-
-    # Cluster thresholds
-    min_cluster_score_to_emit: float = 0.55
-    min_continuation_probability_to_emit: float = 0.60
-    min_exhaustion_probability_to_emit: float = 0.65
-
-    # Cooldowns
-    cluster_emit_cooldown_sec: float = 5.0
-    cluster_update_cooldown_sec: float = 5.0
-    cluster_exhaustion_cooldown_sec: float = 5.0
-
-    # Cleanup
-    cleanup_interval_sec: int = 60
-    stats_ttl_sec: int = 60 * 60
-
-    # Поведінка
-    emit_on_bus: bool = True
-    log_signals: bool = True
+from analytics.whales.base import BaseWhaleComponent
+from analytics.whales.config import WhaleClusterAnalyzerConfig
+from analytics.whales.enums import WhaleTradeSide
+from analytics.whales.models import (
+    SymbolClusterState,
+    WhaleActivityRecord,
+    WhaleClusterAnalysisResult,
+    WhaleClusterExhaustionSignal,
+    WhaleClusterSignal,
+    WhaleClusterUpdateSignal,
+    WhaleLiquidationContextRecord,
+    WhalePressureRecord,
+    make_symbol_cluster_state,
+)
 
 
-@dataclass(slots=True)
-class WhaleActivityRecord:
-    symbol: str
-    side: str
-    trade_count: int
-    total_notional: float
-    avg_notional: float
-    max_notional: float
-    window_sec: int
-    timestamp_ms: int
-    raw_event: Optional[Dict[str, Any]] = None
-
-
-@dataclass(slots=True)
-class WhalePressureRecord:
-    symbol: str
-    dominant_side: str
-    buy_trade_count: int
-    sell_trade_count: int
-    buy_notional: float
-    sell_notional: float
-    total_notional: float
-    imbalance_ratio: float
-    net_flow_notional: float
-    window_sec: int
-    timestamp_ms: int
-    raw_event: Optional[Dict[str, Any]] = None
-
-
-@dataclass(slots=True)
-class WhaleLiquidationContextRecord:
-    symbol: str
-    whale_side: str
-    whale_total_notional: float
-    whale_trade_count: int
-    liquidation_side: str
-    liquidation_total_notional: float
-    liquidation_count: int
-    context_strength: float
-    timestamp_ms: int
-    raw_event: Optional[Dict[str, Any]] = None
-
-
-@dataclass(slots=True)
-class WhaleClusterSignal:
-    symbol: str
-    cluster_side: str
-    cluster_score: float
-    persistence_score: float
-    directional_bias: float
-    continuation_probability: float
-    exhaustion_probability: float
-
-    activity_signal_count: int
-    pressure_signal_count: int
-    liquidation_context_count: int
-
-    total_activity_notional: float
-    total_pressure_notional: float
-    total_liquidation_context_notional: float
-
-    first_seen_ts_ms: int
-    last_seen_ts_ms: int
-    timestamp_ms: int
-
-    detector_name: str = "WhaleClusterAnalyzer"
-    event_type: str = "whale_cluster"
-    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
-
-    def to_event(self) -> Dict[str, Any]:
-        return {
-            "event_type": self.event_type,
-            "detector": self.detector_name,
-            "symbol": self.symbol,
-            "cluster_side": self.cluster_side,
-            "cluster_score": self.cluster_score,
-            "persistence_score": self.persistence_score,
-            "directional_bias": self.directional_bias,
-            "continuation_probability": self.continuation_probability,
-            "exhaustion_probability": self.exhaustion_probability,
-            "activity_signal_count": self.activity_signal_count,
-            "pressure_signal_count": self.pressure_signal_count,
-            "liquidation_context_count": self.liquidation_context_count,
-            "total_activity_notional": self.total_activity_notional,
-            "total_pressure_notional": self.total_pressure_notional,
-            "total_liquidation_context_notional": self.total_liquidation_context_notional,
-            "first_seen_ts_ms": self.first_seen_ts_ms,
-            "last_seen_ts_ms": self.last_seen_ts_ms,
-            "timestamp_ms": self.timestamp_ms,
-            "created_at_ms": self.created_at_ms,
-        }
-
-
-@dataclass(slots=True)
-class WhaleClusterUpdateSignal:
-    symbol: str
-    cluster_side: str
-    cluster_score: float
-    persistence_score: float
-    continuation_probability: float
-    exhaustion_probability: float
-    activity_signal_count: int
-    pressure_signal_count: int
-    liquidation_context_count: int
-    timestamp_ms: int
-
-    detector_name: str = "WhaleClusterAnalyzer"
-    event_type: str = "whale_cluster_update"
-    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
-
-    def to_event(self) -> Dict[str, Any]:
-        return {
-            "event_type": self.event_type,
-            "detector": self.detector_name,
-            "symbol": self.symbol,
-            "cluster_side": self.cluster_side,
-            "cluster_score": self.cluster_score,
-            "persistence_score": self.persistence_score,
-            "continuation_probability": self.continuation_probability,
-            "exhaustion_probability": self.exhaustion_probability,
-            "activity_signal_count": self.activity_signal_count,
-            "pressure_signal_count": self.pressure_signal_count,
-            "liquidation_context_count": self.liquidation_context_count,
-            "timestamp_ms": self.timestamp_ms,
-            "created_at_ms": self.created_at_ms,
-        }
-
-
-@dataclass(slots=True)
-class WhaleClusterExhaustionSignal:
-    symbol: str
-    cluster_side: str
-    cluster_score: float
-    exhaustion_probability: float
-    reversal_risk: float
-    timestamp_ms: int
-
-    detector_name: str = "WhaleClusterAnalyzer"
-    event_type: str = "whale_cluster_exhaustion"
-    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
-
-    def to_event(self) -> Dict[str, Any]:
-        return {
-            "event_type": self.event_type,
-            "detector": self.detector_name,
-            "symbol": self.symbol,
-            "cluster_side": self.cluster_side,
-            "cluster_score": self.cluster_score,
-            "exhaustion_probability": self.exhaustion_probability,
-            "reversal_risk": self.reversal_risk,
-            "timestamp_ms": self.timestamp_ms,
-            "created_at_ms": self.created_at_ms,
-        }
-
-
-@dataclass(slots=True)
-class SymbolClusterState:
-    activity_records: Deque[WhaleActivityRecord]
-    pressure_records: Deque[WhalePressureRecord]
-    liquidation_context_records: Deque[WhaleLiquidationContextRecord]
-
-    total_events_seen: int = 0
-    total_clusters_emitted: int = 0
-    total_cluster_updates_emitted: int = 0
-    total_cluster_exhaustions_emitted: int = 0
-
-    cluster_first_seen_ts_ms: Optional[int] = None
-    cluster_last_seen_ts_ms: Optional[int] = None
-
-    last_cluster_emit_ts_monotonic: float = 0.0
-    last_cluster_update_emit_ts_monotonic: float = 0.0
-    last_cluster_exhaustion_emit_ts_monotonic: float = 0.0
-
-    last_update_ts_monotonic: float = field(default_factory=time.monotonic)
-
-    def touch(self) -> None:
-        self.last_update_ts_monotonic = time.monotonic()
-
-
-class WhaleClusterAnalyzer:
+class WhaleClusterAnalyzer(BaseWhaleComponent):
     """
     Третій шар whale-аналітики.
 
@@ -262,23 +43,20 @@ class WhaleClusterAnalyzer:
         event_bus: Optional[Any] = None,
         scheduler: Optional[Any] = None,
     ) -> None:
-        self.config = config or WhaleClusterAnalyzerConfig()
-        self.event_bus = event_bus
-        self.scheduler = scheduler
-
-        self.logger = get_logger(
-            __name__,
-            service_name="analytics.whales.whale_cluster_analyzer",
+        super().__init__(
+            component_name="whale_cluster_analyzer",
+            event_bus=event_bus,
+            scheduler=scheduler,
         )
+        self.config = config or WhaleClusterAnalyzerConfig()
 
         self._states: Dict[str, SymbolClusterState] = {}
-        self._started = False
-        self._cleanup_task: Optional[asyncio.Task[Any]] = None
         self._lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task[Any]] = None
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Lifecycle
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     async def start(self) -> None:
         if self._started:
@@ -289,22 +67,41 @@ class WhaleClusterAnalyzer:
             self.logger.info("WhaleClusterAnalyzer is disabled by config")
             return
 
-        self._started = True
-
         if self.event_bus is not None:
-            await self._safe_subscribe()
+            await self._safe_subscribe(
+                self.config.whale_activity_event_name,
+                self.handle_whale_activity_event,
+            )
+            await self._safe_subscribe(
+                self.config.whale_pressure_event_name,
+                self.handle_whale_pressure_event,
+            )
+            await self._safe_subscribe(
+                self.config.whale_liquidation_context_event_name,
+                self.handle_whale_liquidation_context_event,
+            )
 
         if self.scheduler is not None:
-            await self._register_scheduler_jobs()
+            await self._register_interval_job(
+                name="whales_whale_cluster_analyzer_cleanup",
+                interval_seconds=self.config.cleanup_interval_sec,
+                coro=self.cleanup,
+                replace_existing=True,
+            )
         else:
             self._cleanup_task = asyncio.create_task(
                 self._cleanup_loop(),
-                name="whale_cluster_analyzer_cleanup_loop",
+                name="whales_whale_cluster_analyzer_cleanup_loop",
             )
+
+        self._started = True
 
         self.logger.info(
             "WhaleClusterAnalyzer started",
             extra={
+                "activity_event_name": self.config.whale_activity_event_name,
+                "pressure_event_name": self.config.whale_pressure_event_name,
+                "liquidation_context_event_name": self.config.whale_liquidation_context_event_name,
                 "analysis_window_sec": self.config.analysis_window_sec,
                 "cluster_ttl_sec": self.config.cluster_ttl_sec,
                 "min_cluster_score_to_emit": self.config.min_cluster_score_to_emit,
@@ -316,7 +113,18 @@ class WhaleClusterAnalyzer:
             return
 
         if self.event_bus is not None:
-            await self._safe_unsubscribe()
+            await self._safe_unsubscribe(
+                self.config.whale_activity_event_name,
+                self.handle_whale_activity_event,
+            )
+            await self._safe_unsubscribe(
+                self.config.whale_pressure_event_name,
+                self.handle_whale_pressure_event,
+            )
+            await self._safe_unsubscribe(
+                self.config.whale_liquidation_context_event_name,
+                self.handle_whale_liquidation_context_event,
+            )
 
         if self._cleanup_task is not None:
             self._cleanup_task.cancel()
@@ -327,66 +135,9 @@ class WhaleClusterAnalyzer:
         self._started = False
         self.logger.info("WhaleClusterAnalyzer stopped")
 
-    async def _safe_subscribe(self) -> None:
-        try:
-            await self.event_bus.subscribe(
-                self.config.whale_activity_event_name,
-                self.handle_whale_activity_event,
-            )
-            await self.event_bus.subscribe(
-                self.config.whale_pressure_event_name,
-                self.handle_whale_pressure_event,
-            )
-            await self.event_bus.subscribe(
-                self.config.whale_liquidation_context_event_name,
-                self.handle_whale_liquidation_context_event,
-            )
-
-            self.logger.info(
-                "Subscribed WhaleClusterAnalyzer to EventBus",
-                extra={
-                    "activity_event": self.config.whale_activity_event_name,
-                    "pressure_event": self.config.whale_pressure_event_name,
-                    "liquidation_context_event": self.config.whale_liquidation_context_event_name,
-                },
-            )
-        except Exception:
-            self.logger.exception("Failed to subscribe WhaleClusterAnalyzer to EventBus")
-            raise
-
-    async def _safe_unsubscribe(self) -> None:
-        for event_name, handler in (
-            (self.config.whale_activity_event_name, self.handle_whale_activity_event),
-            (self.config.whale_pressure_event_name, self.handle_whale_pressure_event),
-            (self.config.whale_liquidation_context_event_name, self.handle_whale_liquidation_context_event),
-        ):
-            try:
-                await self.event_bus.unsubscribe(event_name, handler)
-            except Exception:
-                self.logger.exception(
-                    "Failed to unsubscribe WhaleClusterAnalyzer from EventBus",
-                    extra={"event_name": event_name},
-                )
-
-    async def _register_scheduler_jobs(self) -> None:
-        try:
-            await self.scheduler.add_interval_job(
-                name="whale_cluster_analyzer_cleanup",
-                interval_seconds=self.config.cleanup_interval_sec,
-                coro=self.cleanup,
-                replace_existing=True,
-            )
-            self.logger.info(
-                "Cleanup job registered in Scheduler",
-                extra={"interval_sec": self.config.cleanup_interval_sec},
-            )
-        except Exception:
-            self.logger.exception("Failed to register WhaleClusterAnalyzer cleanup job")
-            raise
-
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Event handlers
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     async def handle_whale_activity_event(self, event: Dict[str, Any]) -> None:
         try:
@@ -406,17 +157,20 @@ class WhaleClusterAnalyzer:
         except Exception:
             self.logger.exception("Unhandled error while processing whale liquidation context event")
 
-    # -------------------------------------------------------------------------
-    # Public processing methods
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # Public processing API
+    # =========================================================================
 
     async def process_whale_activity_event(
         self,
         event: Dict[str, Any],
-    ) -> Dict[str, Optional[object]]:
+    ) -> WhaleClusterAnalysisResult:
+        if not self.config.enabled:
+            return WhaleClusterAnalysisResult()
+
         record = self._normalize_whale_activity_event(event)
         if record is None:
-            return self._empty_result()
+            return WhaleClusterAnalysisResult()
 
         async with self._lock:
             state = self._get_or_create_state(record.symbol)
@@ -427,7 +181,11 @@ class WhaleClusterAnalyzer:
             self._update_cluster_seen_range(state, record.timestamp_ms)
             self._prune_symbol_state(state, record.timestamp_ms)
 
-            result = self._analyze_symbol(record.symbol, state, record.timestamp_ms)
+            result = self._analyze_symbol(
+                symbol=record.symbol,
+                state=state,
+                current_ts_ms=record.timestamp_ms,
+            )
 
         await self._emit_analysis_result(result)
         return result
@@ -435,10 +193,13 @@ class WhaleClusterAnalyzer:
     async def process_whale_pressure_event(
         self,
         event: Dict[str, Any],
-    ) -> Dict[str, Optional[object]]:
+    ) -> WhaleClusterAnalysisResult:
+        if not self.config.enabled:
+            return WhaleClusterAnalysisResult()
+
         record = self._normalize_whale_pressure_event(event)
         if record is None:
-            return self._empty_result()
+            return WhaleClusterAnalysisResult()
 
         async with self._lock:
             state = self._get_or_create_state(record.symbol)
@@ -449,7 +210,11 @@ class WhaleClusterAnalyzer:
             self._update_cluster_seen_range(state, record.timestamp_ms)
             self._prune_symbol_state(state, record.timestamp_ms)
 
-            result = self._analyze_symbol(record.symbol, state, record.timestamp_ms)
+            result = self._analyze_symbol(
+                symbol=record.symbol,
+                state=state,
+                current_ts_ms=record.timestamp_ms,
+            )
 
         await self._emit_analysis_result(result)
         return result
@@ -457,10 +222,13 @@ class WhaleClusterAnalyzer:
     async def process_whale_liquidation_context_event(
         self,
         event: Dict[str, Any],
-    ) -> Dict[str, Optional[object]]:
+    ) -> WhaleClusterAnalysisResult:
+        if not self.config.enabled:
+            return WhaleClusterAnalysisResult()
+
         record = self._normalize_whale_liquidation_context_event(event)
         if record is None:
-            return self._empty_result()
+            return WhaleClusterAnalysisResult()
 
         async with self._lock:
             state = self._get_or_create_state(record.symbol)
@@ -471,29 +239,34 @@ class WhaleClusterAnalyzer:
             self._update_cluster_seen_range(state, record.timestamp_ms)
             self._prune_symbol_state(state, record.timestamp_ms)
 
-            result = self._analyze_symbol(record.symbol, state, record.timestamp_ms)
+            result = self._analyze_symbol(
+                symbol=record.symbol,
+                state=state,
+                current_ts_ms=record.timestamp_ms,
+            )
 
         await self._emit_analysis_result(result)
         return result
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Core analysis
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     def _analyze_symbol(
         self,
+        *,
         symbol: str,
         state: SymbolClusterState,
         current_ts_ms: int,
-    ) -> Dict[str, Optional[object]]:
+    ) -> WhaleClusterAnalysisResult:
         activity_count = len(state.activity_records)
-        total_activity_notional = sum(r.total_notional for r in state.activity_records)
+        total_activity_notional = sum(record.total_notional for record in state.activity_records)
 
         if activity_count < self.config.min_activity_signals:
-            return self._empty_result()
+            return WhaleClusterAnalysisResult()
 
         if total_activity_notional < self.config.min_total_activity_notional:
-            return self._empty_result()
+            return WhaleClusterAnalysisResult()
 
         cluster_side = self._determine_cluster_side(state)
         directional_bias = self._calculate_directional_bias(state, cluster_side)
@@ -545,9 +318,10 @@ class WhaleClusterAnalyzer:
                 pressure_signal_count=len(state.pressure_records),
                 liquidation_context_count=len(state.liquidation_context_records),
                 total_activity_notional=total_activity_notional,
-                total_pressure_notional=sum(r.total_notional for r in state.pressure_records),
+                total_pressure_notional=sum(record.total_notional for record in state.pressure_records),
                 total_liquidation_context_notional=sum(
-                    r.liquidation_total_notional for r in state.liquidation_context_records
+                    record.liquidation_total_notional
+                    for record in state.liquidation_context_records
                 ),
                 first_seen_ts_ms=state.cluster_first_seen_ts_ms or current_ts_ms,
                 last_seen_ts_ms=state.cluster_last_seen_ts_ms or current_ts_ms,
@@ -596,94 +370,156 @@ class WhaleClusterAnalyzer:
             state.total_cluster_exhaustions_emitted += 1
             state.last_cluster_exhaustion_emit_ts_monotonic = time.monotonic()
 
-        return {
-            "whale_cluster_signal": cluster_signal,
-            "whale_cluster_update_signal": cluster_update_signal,
-            "whale_cluster_exhaustion_signal": cluster_exhaustion_signal,
-        }
+        return WhaleClusterAnalysisResult(
+            whale_cluster_signal=cluster_signal,
+            whale_cluster_update_signal=cluster_update_signal,
+            whale_cluster_exhaustion_signal=cluster_exhaustion_signal,
+        )
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Scoring
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
     def _determine_cluster_side(self, state: SymbolClusterState) -> str:
-        buy_activity = sum(r.total_notional for r in state.activity_records if r.side == "buy")
-        sell_activity = sum(r.total_notional for r in state.activity_records if r.side == "sell")
+        buy_activity = sum(
+            record.total_notional
+            for record in state.activity_records
+            if record.side == WhaleTradeSide.BUY.value
+        )
+        sell_activity = sum(
+            record.total_notional
+            for record in state.activity_records
+            if record.side == WhaleTradeSide.SELL.value
+        )
 
         buy_pressure = sum(
-            r.buy_notional for r in state.pressure_records if r.dominant_side == "buy"
-        ) + sum(
-            r.total_notional * 0.5 for r in state.pressure_records if r.dominant_side != "buy"
+            record.buy_notional
+            for record in state.pressure_records
+            if record.dominant_side == WhaleTradeSide.BUY.value
         )
         sell_pressure = sum(
-            r.sell_notional for r in state.pressure_records if r.dominant_side == "sell"
-        ) + sum(
-            r.total_notional * 0.5 for r in state.pressure_records if r.dominant_side != "sell"
+            record.sell_notional
+            for record in state.pressure_records
+            if record.dominant_side == WhaleTradeSide.SELL.value
         )
 
-        buy_score = buy_activity + buy_pressure
-        sell_score = sell_activity + sell_pressure
+        buy_liq_context = sum(
+            record.whale_total_notional
+            for record in state.liquidation_context_records
+            if record.whale_side == WhaleTradeSide.BUY.value
+        )
+        sell_liq_context = sum(
+            record.whale_total_notional
+            for record in state.liquidation_context_records
+            if record.whale_side == WhaleTradeSide.SELL.value
+        )
 
-        return "buy" if buy_score >= sell_score else "sell"
+        buy_score = buy_activity + buy_pressure + buy_liq_context
+        sell_score = sell_activity + sell_pressure + sell_liq_context
 
-    def _calculate_directional_bias(self, state: SymbolClusterState, cluster_side: str) -> float:
-        total_activity = sum(r.total_notional for r in state.activity_records)
-        total_pressure = sum(r.total_notional for r in state.pressure_records)
+        if buy_score >= sell_score:
+            return WhaleTradeSide.BUY.value
+        return WhaleTradeSide.SELL.value
 
-        if total_activity <= 0 and total_pressure <= 0:
+    def _calculate_directional_bias(
+        self,
+        state: SymbolClusterState,
+        cluster_side: str,
+    ) -> float:
+        total_side_notional = 0.0
+        total_other_notional = 0.0
+
+        for record in state.activity_records:
+            if record.side == cluster_side:
+                total_side_notional += record.total_notional
+            else:
+                total_other_notional += record.total_notional
+
+        for record in state.pressure_records:
+            dominant_notional = max(record.buy_notional, record.sell_notional)
+            non_dominant_notional = min(record.buy_notional, record.sell_notional)
+
+            if record.dominant_side == cluster_side:
+                total_side_notional += dominant_notional
+                total_other_notional += non_dominant_notional
+            else:
+                total_side_notional += non_dominant_notional
+                total_other_notional += dominant_notional
+
+        for record in state.liquidation_context_records:
+            if record.whale_side == cluster_side:
+                total_side_notional += record.whale_total_notional
+            else:
+                total_other_notional += record.whale_total_notional
+
+        total = total_side_notional + total_other_notional
+        if total <= 0:
             return 0.0
 
-        activity_same_side = sum(
-            r.total_notional for r in state.activity_records if r.side == cluster_side
-        )
-        pressure_same_side = sum(
-            r.total_notional for r in state.pressure_records if r.dominant_side == cluster_side
-        )
+        return self._clamp_0_1(total_side_notional / total)
 
-        score = (activity_same_side + pressure_same_side) / max(total_activity + total_pressure, 1.0)
-        return self._clamp_0_1(score)
-
-    def _calculate_persistence_score(self, state: SymbolClusterState, current_ts_ms: int) -> float:
+    def _calculate_persistence_score(
+        self,
+        state: SymbolClusterState,
+        current_ts_ms: int,
+    ) -> float:
         first_seen = state.cluster_first_seen_ts_ms
         last_seen = state.cluster_last_seen_ts_ms
 
         if first_seen is None or last_seen is None:
             return 0.0
 
-        active_duration_sec = max((last_seen - first_seen) / 1000.0, 0.0)
-        score = active_duration_sec / max(self.config.analysis_window_sec, 1)
-        return self._clamp_0_1(score)
+        duration_ms = max(0, last_seen - first_seen)
+        duration_sec = duration_ms / 1000.0
+
+        if duration_sec <= 0:
+            return 0.0
+
+        normalized = duration_sec / max(1.0, float(self.config.analysis_window_sec))
+        freshness_penalty = 1.0
+
+        lag_sec = max(0.0, (current_ts_ms - last_seen) / 1000.0)
+        if lag_sec > 0:
+            freshness_penalty = max(
+                0.25,
+                1.0 - lag_sec / max(1.0, float(self.config.analysis_window_sec)),
+            )
+
+        return self._clamp_0_1(normalized * freshness_penalty)
 
     def _calculate_activity_score(self, state: SymbolClusterState) -> float:
         if not state.activity_records:
             return 0.0
 
-        count_score = min(
-            len(state.activity_records) / max(self.config.min_activity_signals * 2, 1),
-            1.0,
-        )
-        notional_score = min(
-            sum(r.total_notional for r in state.activity_records)
-            / max(self.config.min_total_activity_notional * 2, 1.0),
-            1.0,
-        )
+        signal_factor = len(state.activity_records) / max(1, self.config.min_activity_signals)
+        signal_factor = min(1.0, signal_factor)
 
-        return self._clamp_0_1(0.45 * count_score + 0.55 * notional_score)
+        total_notional = sum(record.total_notional for record in state.activity_records)
+        notional_factor = total_notional / max(1.0, self.config.min_total_activity_notional)
+        notional_factor = min(1.0, notional_factor)
 
-    def _calculate_pressure_score(self, state: SymbolClusterState, cluster_side: str) -> float:
+        return self._clamp_0_1(0.45 * signal_factor + 0.55 * notional_factor)
+
+    def _calculate_pressure_score(
+        self,
+        state: SymbolClusterState,
+        cluster_side: str,
+    ) -> float:
         if not state.pressure_records:
             return 0.0
 
-        aligned_pressures = [r for r in state.pressure_records if r.dominant_side == cluster_side]
-        if not aligned_pressures:
+        aligned_records = [
+            record
+            for record in state.pressure_records
+            if record.dominant_side == cluster_side
+        ]
+        if not aligned_records:
             return 0.0
 
-        avg_imbalance = sum(r.imbalance_ratio for r in aligned_pressures) / len(aligned_pressures)
-        aligned_notional = sum(r.total_notional for r in aligned_pressures)
-        total_pressure_notional = sum(r.total_notional for r in state.pressure_records)
+        avg_imbalance = sum(record.imbalance_ratio for record in aligned_records) / len(aligned_records)
+        alignment_ratio = len(aligned_records) / len(state.pressure_records)
 
-        alignment_score = aligned_notional / max(total_pressure_notional, 1.0)
-        return self._clamp_0_1(0.60 * avg_imbalance + 0.40 * alignment_score)
+        return self._clamp_0_1(0.60 * avg_imbalance + 0.40 * alignment_ratio)
 
     def _calculate_liquidation_context_score(
         self,
@@ -693,92 +529,236 @@ class WhaleClusterAnalyzer:
         if not state.liquidation_context_records:
             return 0.0
 
-        supportive_contexts = [
-            r for r in state.liquidation_context_records if r.whale_side == cluster_side
+        aligned_records = [
+            record
+            for record in state.liquidation_context_records
+            if record.whale_side == cluster_side
         ]
-        if not supportive_contexts:
+        if not aligned_records:
             return 0.0
 
-        avg_strength = sum(r.context_strength for r in supportive_contexts) / len(supportive_contexts)
-        notional_factor = min(
-            sum(r.liquidation_total_notional for r in supportive_contexts)
-            / max(self.config.min_total_activity_notional, 1.0),
-            1.0,
+        avg_context_strength = (
+            sum(record.context_strength for record in aligned_records) / len(aligned_records)
         )
+        alignment_ratio = len(aligned_records) / len(state.liquidation_context_records)
 
-        return self._clamp_0_1(0.65 * avg_strength + 0.35 * notional_factor)
+        return self._clamp_0_1(0.70 * avg_context_strength + 0.30 * alignment_ratio)
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # Emission
-    # -------------------------------------------------------------------------
+    # =========================================================================
 
-    async def _emit_analysis_result(self, result: Dict[str, Optional[object]]) -> None:
-        cluster_signal = result.get("whale_cluster_signal")
-        cluster_update_signal = result.get("whale_cluster_update_signal")
-        cluster_exhaustion_signal = result.get("whale_cluster_exhaustion_signal")
+    async def _emit_analysis_result(self, result: WhaleClusterAnalysisResult) -> None:
+        if not self.config.emit_on_bus:
+            return
 
-        if cluster_signal is not None:
+        if result.whale_cluster_signal is not None:
             if self.config.log_signals:
                 self.logger.info(
                     "Whale cluster detected",
                     extra={
-                        "symbol": cluster_signal.symbol,
-                        "cluster_side": cluster_signal.cluster_side,
-                        "cluster_score": cluster_signal.cluster_score,
-                        "continuation_probability": cluster_signal.continuation_probability,
-                        "exhaustion_probability": cluster_signal.exhaustion_probability,
+                        "symbol": result.whale_cluster_signal.symbol,
+                        "cluster_side": result.whale_cluster_signal.cluster_side,
+                        "cluster_score": result.whale_cluster_signal.cluster_score,
+                        "continuation_probability": result.whale_cluster_signal.continuation_probability,
                     },
                 )
-            await self._emit_signal(
+
+            await self._safe_emit(
                 self.config.whale_cluster_event_name,
-                cluster_signal.to_event(),
+                result.whale_cluster_signal.to_event(),
+                source="analytics.whales.whale_cluster_analyzer",
             )
 
-        if cluster_update_signal is not None:
+        if result.whale_cluster_update_signal is not None:
             if self.config.log_signals:
                 self.logger.info(
-                    "Whale cluster updated",
+                    "Whale cluster update emitted",
                     extra={
-                        "symbol": cluster_update_signal.symbol,
-                        "cluster_side": cluster_update_signal.cluster_side,
-                        "cluster_score": cluster_update_signal.cluster_score,
+                        "symbol": result.whale_cluster_update_signal.symbol,
+                        "cluster_side": result.whale_cluster_update_signal.cluster_side,
+                        "cluster_score": result.whale_cluster_update_signal.cluster_score,
                     },
                 )
-            await self._emit_signal(
+
+            await self._safe_emit(
                 self.config.whale_cluster_update_event_name,
-                cluster_update_signal.to_event(),
+                result.whale_cluster_update_signal.to_event(),
+                source="analytics.whales.whale_cluster_analyzer",
             )
 
-        if cluster_exhaustion_signal is not None:
+        if result.whale_cluster_exhaustion_signal is not None:
             if self.config.log_signals:
                 self.logger.info(
-                    "Whale cluster exhaustion detected",
+                    "Whale cluster exhaustion emitted",
                     extra={
-                        "symbol": cluster_exhaustion_signal.symbol,
-                        "cluster_side": cluster_exhaustion_signal.cluster_side,
-                        "exhaustion_probability": cluster_exhaustion_signal.exhaustion_probability,
+                        "symbol": result.whale_cluster_exhaustion_signal.symbol,
+                        "cluster_side": result.whale_cluster_exhaustion_signal.cluster_side,
+                        "exhaustion_probability": result.whale_cluster_exhaustion_signal.exhaustion_probability,
                     },
                 )
-            await self._emit_signal(
+
+            await self._safe_emit(
                 self.config.whale_cluster_exhaustion_event_name,
-                cluster_exhaustion_signal.to_event(),
+                result.whale_cluster_exhaustion_signal.to_event(),
+                source="analytics.whales.whale_cluster_analyzer",
             )
 
-    async def _emit_signal(self, event_name: str, payload: Dict[str, Any]) -> None:
-        if not self.config.emit_on_bus or self.event_bus is None:
+    # =========================================================================
+    # State management
+    # =========================================================================
+
+    def _get_or_create_state(self, symbol: str) -> SymbolClusterState:
+        state = self._states.get(symbol)
+        if state is not None:
+            return state
+
+        state = make_symbol_cluster_state(
+            activity_window_size=self.config.activity_buffer_size,
+            pressure_window_size=self.config.pressure_buffer_size,
+            liquidation_context_window_size=self.config.liquidation_context_buffer_size,
+        )
+        self._states[symbol] = state
+        return state
+
+    def _update_cluster_seen_range(
+        self,
+        state: SymbolClusterState,
+        timestamp_ms: int,
+    ) -> None:
+        if state.cluster_first_seen_ts_ms is None:
+            state.cluster_first_seen_ts_ms = timestamp_ms
+        else:
+            state.cluster_first_seen_ts_ms = min(state.cluster_first_seen_ts_ms, timestamp_ms)
+
+        if state.cluster_last_seen_ts_ms is None:
+            state.cluster_last_seen_ts_ms = timestamp_ms
+        else:
+            state.cluster_last_seen_ts_ms = max(state.cluster_last_seen_ts_ms, timestamp_ms)
+
+    def _prune_symbol_state(
+        self,
+        state: SymbolClusterState,
+        current_ts_ms: int,
+    ) -> None:
+        cutoff_ms = current_ts_ms - self.config.analysis_window_sec * 1000
+
+        while state.activity_records and state.activity_records[0].timestamp_ms < cutoff_ms:
+            state.activity_records.popleft()
+
+        while state.pressure_records and state.pressure_records[0].timestamp_ms < cutoff_ms:
+            state.pressure_records.popleft()
+
+        while (
+            state.liquidation_context_records
+            and state.liquidation_context_records[0].timestamp_ms < cutoff_ms
+        ):
+            state.liquidation_context_records.popleft()
+
+        remaining_timestamps = []
+
+        if state.activity_records:
+            remaining_timestamps.append(state.activity_records[0].timestamp_ms)
+        if state.pressure_records:
+            remaining_timestamps.append(state.pressure_records[0].timestamp_ms)
+        if state.liquidation_context_records:
+            remaining_timestamps.append(state.liquidation_context_records[0].timestamp_ms)
+
+        if remaining_timestamps:
+            state.cluster_first_seen_ts_ms = min(remaining_timestamps)
+            state.cluster_last_seen_ts_ms = max(
+                [
+                    *(record.timestamp_ms for record in state.activity_records),
+                    *(record.timestamp_ms for record in state.pressure_records),
+                    *(record.timestamp_ms for record in state.liquidation_context_records),
+                ]
+            )
+        else:
+            state.cluster_first_seen_ts_ms = None
+            state.cluster_last_seen_ts_ms = None
+
+    # =========================================================================
+    # Cleanup
+    # =========================================================================
+
+    async def cleanup(self) -> None:
+        ttl = self.config.stats_ttl_sec
+        if ttl <= 0:
             return
 
-        try:
-            await self.event_bus.emit(event_name, payload)
-        except Exception:
-            self.logger.exception(
-                "Failed to emit WhaleClusterAnalyzer signal",
-                extra={"event_name": event_name},
+        now_mono = time.monotonic()
+
+        async with self._lock:
+            stale_symbols = [
+                symbol
+                for symbol, state in self._states.items()
+                if (now_mono - state.last_update_ts_monotonic) >= ttl
+            ]
+
+            for symbol in stale_symbols:
+                self._states.pop(symbol, None)
+
+        if stale_symbols:
+            self.logger.info(
+                "Cleaned stale WhaleClusterAnalyzer symbol states",
+                extra={
+                    "removed_symbols_count": len(stale_symbols),
+                    "symbols": stale_symbols,
+                },
             )
 
-    # -------------------------------------------------------------------------
-    # Normalization
-    # -------------------------------------------------------------------------
+    async def _cleanup_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.config.cleanup_interval_sec)
+                await self.cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("Unhandled error in WhaleClusterAnalyzer cleanup loop")
+
+    # =========================================================================
+    # Public state / stats API
+    # =========================================================================
+
+    def get_symbol_state(self, symbol: str) -> Dict[str, Any]:
+        state = self._states.get(symbol)
+        if state is None:
+            return {
+                "symbol": symbol,
+                "exists": False,
+            }
+
+        return {
+            "symbol": symbol,
+            "exists": True,
+            **state.to_dict(),
+        }
+
+    def get_all_states(self) -> Dict[str, Any]:
+        return {
+            symbol: state.to_dict()
+            for symbol, state in self._states.items()
+        }
+
+    async def reset_symbol(self, symbol: str) -> None:
+        async with self._lock:
+            self._states.pop(symbol, None)
+
+        self.logger.info(
+            "Reset WhaleClusterAnalyzer symbol state",
+            extra={"symbol": symbol},
+        )
+
+    async def reset_all(self) -> None:
+        async with self._lock:
+            self._states.clear()
+
+        self.logger.info("Reset all WhaleClusterAnalyzer states")
+
+    # =========================================================================
+    # Normalization helpers
+    # =========================================================================
 
     def _normalize_whale_activity_event(
         self,
@@ -787,8 +767,15 @@ class WhaleClusterAnalyzer:
         try:
             payload = event.get("data", event)
 
-            symbol = self._normalize_symbol(payload.get("symbol"))
-            side = self._normalize_side(payload.get("side"))
+            symbol = self._normalize_symbol(
+                payload.get("symbol")
+                or payload.get("s")
+                or payload.get("instrument")
+            )
+            side = self._normalize_side(
+                payload.get("side")
+                or payload.get("S")
+            )
             trade_count = self._safe_int(payload.get("trade_count"))
             total_notional = self._safe_float(payload.get("total_notional"))
             avg_notional = self._safe_float(payload.get("avg_notional"))
@@ -796,7 +783,17 @@ class WhaleClusterAnalyzer:
             window_sec = self._safe_int(payload.get("window_sec"))
             timestamp_ms = self._extract_timestamp_ms(payload)
 
-            if not symbol or not side or trade_count <= 0 or total_notional <= 0:
+            if symbol is None or side == WhaleTradeSide.UNKNOWN.value:
+                return None
+            if trade_count is None or trade_count <= 0:
+                return None
+            if total_notional is None or total_notional <= 0:
+                return None
+            if avg_notional is None or avg_notional <= 0:
+                return None
+            if max_notional is None or max_notional <= 0:
+                return None
+            if window_sec is None or window_sec <= 0:
                 return None
 
             return WhaleActivityRecord(
@@ -811,7 +808,10 @@ class WhaleClusterAnalyzer:
                 raw_event=event,
             )
         except Exception:
-            self.logger.exception("Failed to normalize whale activity event")
+            self.logger.exception(
+                "Failed to normalize whale activity event",
+                extra={"event": event},
+            )
             return None
 
     def _normalize_whale_pressure_event(
@@ -821,8 +821,16 @@ class WhaleClusterAnalyzer:
         try:
             payload = event.get("data", event)
 
-            symbol = self._normalize_symbol(payload.get("symbol"))
-            dominant_side = self._normalize_side(payload.get("dominant_side"))
+            symbol = self._normalize_symbol(
+                payload.get("symbol")
+                or payload.get("s")
+                or payload.get("instrument")
+            )
+            dominant_side = self._normalize_side(
+                payload.get("dominant_side")
+                or payload.get("side")
+                or payload.get("S")
+            )
             buy_trade_count = self._safe_int(payload.get("buy_trade_count"))
             sell_trade_count = self._safe_int(payload.get("sell_trade_count"))
             buy_notional = self._safe_float(payload.get("buy_notional"))
@@ -833,7 +841,23 @@ class WhaleClusterAnalyzer:
             window_sec = self._safe_int(payload.get("window_sec"))
             timestamp_ms = self._extract_timestamp_ms(payload)
 
-            if not symbol or not dominant_side or total_notional <= 0:
+            if symbol is None or dominant_side == WhaleTradeSide.UNKNOWN.value:
+                return None
+            if buy_trade_count is None or buy_trade_count < 0:
+                return None
+            if sell_trade_count is None or sell_trade_count < 0:
+                return None
+            if buy_notional is None or buy_notional < 0:
+                return None
+            if sell_notional is None or sell_notional < 0:
+                return None
+            if total_notional is None or total_notional <= 0:
+                return None
+            if imbalance_ratio is None or imbalance_ratio < 0:
+                return None
+            if net_flow_notional is None:
+                return None
+            if window_sec is None or window_sec <= 0:
                 return None
 
             return WhalePressureRecord(
@@ -851,7 +875,10 @@ class WhaleClusterAnalyzer:
                 raw_event=event,
             )
         except Exception:
-            self.logger.exception("Failed to normalize whale pressure event")
+            self.logger.exception(
+                "Failed to normalize whale pressure event",
+                extra={"event": event},
+            )
             return None
 
     def _normalize_whale_liquidation_context_event(
@@ -861,17 +888,35 @@ class WhaleClusterAnalyzer:
         try:
             payload = event.get("data", event)
 
-            symbol = self._normalize_symbol(payload.get("symbol"))
+            symbol = self._normalize_symbol(
+                payload.get("symbol")
+                or payload.get("s")
+                or payload.get("instrument")
+            )
             whale_side = self._normalize_side(payload.get("whale_side"))
+            liquidation_side = self._normalize_side(payload.get("liquidation_side"))
             whale_total_notional = self._safe_float(payload.get("whale_total_notional"))
             whale_trade_count = self._safe_int(payload.get("whale_trade_count"))
-            liquidation_side = self._normalize_side(payload.get("liquidation_side"))
             liquidation_total_notional = self._safe_float(payload.get("liquidation_total_notional"))
             liquidation_count = self._safe_int(payload.get("liquidation_count"))
             context_strength = self._safe_float(payload.get("context_strength"))
             timestamp_ms = self._extract_timestamp_ms(payload)
 
-            if not symbol or not whale_side or not liquidation_side:
+            if symbol is None:
+                return None
+            if whale_side == WhaleTradeSide.UNKNOWN.value:
+                return None
+            if liquidation_side == WhaleTradeSide.UNKNOWN.value:
+                return None
+            if whale_total_notional is None or whale_total_notional <= 0:
+                return None
+            if whale_trade_count is None or whale_trade_count <= 0:
+                return None
+            if liquidation_total_notional is None or liquidation_total_notional <= 0:
+                return None
+            if liquidation_count is None or liquidation_count <= 0:
+                return None
+            if context_strength is None or context_strength < 0:
                 return None
 
             return WhaleLiquidationContextRecord(
@@ -882,190 +927,41 @@ class WhaleClusterAnalyzer:
                 liquidation_side=liquidation_side,
                 liquidation_total_notional=liquidation_total_notional,
                 liquidation_count=liquidation_count,
-                context_strength=context_strength,
+                context_strength=self._clamp_0_1(context_strength),
                 timestamp_ms=timestamp_ms,
                 raw_event=event,
             )
         except Exception:
-            self.logger.exception("Failed to normalize whale liquidation context event")
-            return None
-
-    # -------------------------------------------------------------------------
-    # State / housekeeping
-    # -------------------------------------------------------------------------
-
-    def _get_or_create_state(self, symbol: str) -> SymbolClusterState:
-        state = self._states.get(symbol)
-        if state is None:
-            state = SymbolClusterState(
-                activity_records=deque(),
-                pressure_records=deque(),
-                liquidation_context_records=deque(),
+            self.logger.exception(
+                "Failed to normalize whale liquidation context event",
+                extra={"event": event},
             )
-            self._states[symbol] = state
-        return state
-
-    def _update_cluster_seen_range(self, state: SymbolClusterState, timestamp_ms: int) -> None:
-        if state.cluster_first_seen_ts_ms is None:
-            state.cluster_first_seen_ts_ms = timestamp_ms
-        state.cluster_last_seen_ts_ms = timestamp_ms
-
-    def _prune_symbol_state(self, state: SymbolClusterState, current_ts_ms: int) -> None:
-        analysis_from_ms = current_ts_ms - self.config.analysis_window_sec * 1000
-
-        while state.activity_records and state.activity_records[0].timestamp_ms < analysis_from_ms:
-            state.activity_records.popleft()
-
-        while state.pressure_records and state.pressure_records[0].timestamp_ms < analysis_from_ms:
-            state.pressure_records.popleft()
-
-        while (
-            state.liquidation_context_records
-            and state.liquidation_context_records[0].timestamp_ms < analysis_from_ms
-        ):
-            state.liquidation_context_records.popleft()
-
-        if not state.activity_records and not state.pressure_records and not state.liquidation_context_records:
-            state.cluster_first_seen_ts_ms = None
-            state.cluster_last_seen_ts_ms = None
-
-    async def cleanup(self) -> None:
-        ttl = self.config.stats_ttl_sec
-        now = time.monotonic()
-
-        removed_symbols: List[str] = []
-
-        async with self._lock:
-            for symbol, state in list(self._states.items()):
-                if (now - state.last_update_ts_monotonic) > ttl:
-                    del self._states[symbol]
-                    removed_symbols.append(symbol)
-
-        if removed_symbols:
-            self.logger.info(
-                "Cleaned stale WhaleClusterAnalyzer states",
-                extra={
-                    "removed_count": len(removed_symbols),
-                    "symbols": removed_symbols,
-                },
-            )
-
-    async def _cleanup_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self.config.cleanup_interval_sec)
-                await self.cleanup()
-        except asyncio.CancelledError:
-            self.logger.debug("WhaleClusterAnalyzer cleanup loop cancelled")
-            raise
-        except Exception:
-            self.logger.exception("Unexpected error in WhaleClusterAnalyzer cleanup loop")
-
-    # -------------------------------------------------------------------------
-    # Public stats
-    # -------------------------------------------------------------------------
-
-    def get_symbol_state(self, symbol: str) -> Optional[Dict[str, Any]]:
-        state = self._states.get(symbol)
-        if state is None:
             return None
-
-        return {
-            "symbol": symbol,
-            "activity_records": len(state.activity_records),
-            "pressure_records": len(state.pressure_records),
-            "liquidation_context_records": len(state.liquidation_context_records),
-            "total_events_seen": state.total_events_seen,
-            "total_clusters_emitted": state.total_clusters_emitted,
-            "total_cluster_updates_emitted": state.total_cluster_updates_emitted,
-            "total_cluster_exhaustions_emitted": state.total_cluster_exhaustions_emitted,
-            "cluster_first_seen_ts_ms": state.cluster_first_seen_ts_ms,
-            "cluster_last_seen_ts_ms": state.cluster_last_seen_ts_ms,
-        }
-
-    def get_all_states(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            symbol: self.get_symbol_state(symbol) or {}
-            for symbol in self._states
-        }
-
-    async def reset_symbol(self, symbol: str) -> None:
-        async with self._lock:
-            self._states.pop(symbol, None)
-
-        self.logger.info(
-            "Reset symbol state in WhaleClusterAnalyzer",
-            extra={"symbol": symbol},
-        )
-
-    async def reset_all(self) -> None:
-        async with self._lock:
-            self._states.clear()
-
-        self.logger.info("Reset all WhaleClusterAnalyzer states")
-
-    # -------------------------------------------------------------------------
-    # Helpers
-    # -------------------------------------------------------------------------
-
-    def _passes_cooldown(self, last_ts: float, cooldown_sec: float) -> bool:
-        now = time.monotonic()
-        return (now - last_ts) >= cooldown_sec
-
-    def _empty_result(self) -> Dict[str, Optional[object]]:
-        return {
-            "whale_cluster_signal": None,
-            "whale_cluster_update_signal": None,
-            "whale_cluster_exhaustion_signal": None,
-        }
-
-    def _clamp_0_1(self, value: float) -> float:
-        return max(0.0, min(1.0, value))
 
     def _normalize_symbol(self, value: Any) -> Optional[str]:
-        if value is None:
+        text = self._safe_str(value)
+        if text is None:
             return None
-        result = str(value).strip().upper()
-        return result or None
+        return text.upper()
 
-    def _normalize_side(self, value: Any) -> Optional[str]:
-        if value is None:
-            return None
+    def _normalize_side(self, value: Any) -> str:
+        if isinstance(value, str):
+            side = value.strip().lower()
 
-        side = str(value).strip().lower()
-        mapping = {
-            "buy": "buy",
-            "bid": "buy",
-            "b": "buy",
-            "sell": "sell",
-            "ask": "sell",
-            "s": "sell",
-        }
-        return mapping.get(side)
+            if side in {"buy", "bid", "long"}:
+                return WhaleTradeSide.BUY.value
+            if side in {"sell", "ask", "short"}:
+                return WhaleTradeSide.SELL.value
 
-    def _safe_float(self, value: Any) -> float:
-        if value is None:
-            return 0.0
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _safe_int(self, value: Any) -> int:
-        if value is None:
-            return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+        return WhaleTradeSide.UNKNOWN.value
 
     def _extract_timestamp_ms(self, payload: Dict[str, Any]) -> int:
         raw_ts = (
             payload.get("timestamp_ms")
-            or payload.get("ts")
             or payload.get("timestamp")
+            or payload.get("ts")
             or payload.get("T")
-            or payload.get("time")
+            or payload.get("E")
         )
 
         if raw_ts is None:
@@ -1076,21 +972,53 @@ class WhaleClusterAnalyzer:
                 raw_ts = raw_ts.replace(tzinfo=timezone.utc)
             return int(raw_ts.timestamp() * 1000)
 
+        if isinstance(raw_ts, (int, float)):
+            if raw_ts < 10_000_000_000:
+                return int(raw_ts * 1000)
+            return int(raw_ts)
+
         if isinstance(raw_ts, str):
+            raw_ts = raw_ts.strip()
+
             try:
                 dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return int(dt.timestamp() * 1000)
-            except ValueError:
+            except Exception:
                 pass
 
+            try:
+                numeric = float(raw_ts)
+                if numeric < 10_000_000_000:
+                    return int(numeric * 1000)
+                return int(numeric)
+            except Exception:
+                pass
+
+        return int(time.time() * 1000)
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
         try:
-            ts = float(raw_ts)
+            result = float(value)
+            if result != result:
+                return None
+            return result
         except (TypeError, ValueError):
-            return int(time.time() * 1000)
+            return None
 
-        if ts < 10_000_000_000:
-            ts *= 1000.0
+    def _safe_int(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
-        return int(ts)
+    def _safe_str(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None

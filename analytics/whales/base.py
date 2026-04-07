@@ -208,3 +208,37 @@ class BaseWhaleComponent(ABC):
                 "Unhandled exception while cancelling background task",
                 extra={"component": self.component_name},
             )
+
+    @staticmethod
+    def _passes_cooldown(last_ts: float, cooldown_sec: float) -> bool:
+        if cooldown_sec <= 0:
+            return True
+        return (asyncio.get_event_loop().time() - last_ts) >= cooldown_sec
+
+    @staticmethod
+    def _clamp_0_1(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+
+class BaseWhaleAnalyzerComponent(BaseWhaleComponent):
+    """
+    Семантичний базовий клас для фасадного analyzer-рівня.
+
+    Функціонально майже не відрізняється від BaseWhaleComponent,
+    але дозволяє:
+    - явно відділити orchestration/facade layer від low-level компонентів
+    - залишити cleaner API в analyzer.py та __init__.py
+    - у майбутньому додати analyzer-specific helpers без змін інших класів
+    """
+
+    def __init__(
+        self,
+        component_name: str = "analyzer",
+        event_bus: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+    ) -> None:
+        super().__init__(
+            component_name=component_name,
+            event_bus=event_bus,
+            scheduler=scheduler,
+        )
