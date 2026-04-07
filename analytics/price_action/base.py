@@ -6,7 +6,18 @@ import inspect
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Generic, Mapping, MutableMapping, Optional, Sequence, Set, TypeVar
+from typing import (
+    Any,
+    Awaitable,
+    Dict,
+    Generic,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    TypeVar,
+)
 
 from core.logger import get_logger
 from analytics.price_action.models import Candle
@@ -151,7 +162,6 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             return value.astimezone(timezone.utc)
 
         if isinstance(value, (int, float)):
-            # Heuristic: timestamps above 1e12 are treated as milliseconds.
             if value > 1_000_000_000_000:
                 return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
             return datetime.fromtimestamp(value, tz=timezone.utc)
@@ -176,6 +186,13 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         if not suffix:
             return self.config.event_namespace
         return f"{self.config.event_namespace}.{suffix}"
+
+    async def _await_emit_result(self, result: Awaitable[Any]) -> Any:
+        return await result
+
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
 
     def _emit_event(
         self,
@@ -216,9 +233,8 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             result = emit_fn(event_name, dict(payload), source=source_name, **kwargs)
 
             if inspect.isawaitable(result):
-                task = asyncio.create_task(result)
-                self._pending_tasks.add(task)
-                task.add_done_callback(self._pending_tasks.discard)
+                task = asyncio.create_task(self._await_emit_result(result))
+                self._track_task(task)
         except Exception:
             self.logger.exception(
                 "Failed to emit event",
@@ -251,7 +267,10 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
     # ------------------------------------------------------------------
 
     def _serialize_config(self) -> Dict[str, Any]:
-        return self._safe_serialize(self.config)
+        serialized = self._safe_serialize(self.config)
+        if isinstance(serialized, dict):
+            return serialized
+        return {"value": serialized}
 
     def _safe_serialize(self, value: Any) -> Any:
         if value is None:

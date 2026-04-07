@@ -3,11 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable
 
 from .enums import CascadeSeverity, LiquidationSide
-from .models import CascadeDetectionResult, LiquidationBufferSnapshot, LiquidationEvent
-from .utils import ensure_utc, utc_now
+from .models import CascadeDetectionResult, LiquidationEvent
+from .utils import utc_now
 
 
 @dataclass(slots=True)

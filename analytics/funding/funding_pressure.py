@@ -4,12 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.logger import get_logger
-
 from .enums import (
     FundingBias,
     FundingPressureDirection,
     FundingPressureLevel,
-    FundingRegime,
     FundingTimeframe,
 )
 from .models import (

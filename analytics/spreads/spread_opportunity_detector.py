@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from .config import CrossExchangeSpreadConfig
-from .enums import InstrumentType, OpportunityStatus, SpreadType
+from .enums import OpportunityStatus, SpreadType
 from .models import ArbitrageOpportunity, QuoteSnapshot, SpreadSnapshot
 from .spread_costs import (
     SpreadCostBreakdown,

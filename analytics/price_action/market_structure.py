@@ -10,7 +10,6 @@ from analytics.price_action.enums import MarketBias, StructureEventType, Structu
 from analytics.price_action.models import (
     Candle,
     MarketStructureState,
-    MultiTimeframeAlignment,
     StructureEvent,
     StructureLayerState,
     SwingPoint,

@@ -272,21 +272,17 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         return updated_gaps, new_events
 
     def _detect_gap_for_layer(
-        self,
-        *,
-        c1: Candle,
-        c2: Candle,
-        c3: Candle,
-        layer: StructureLayer,
+            self,
+            *,
+            c1: Candle,
+            c2: Candle,
+            c3: Candle,
+            layer: StructureLayer,
     ) -> Tuple[Optional[FairValueGap], List[FVGEvent]]:
         events: List[FVGEvent] = []
 
         if c2.body_ratio < self.config.min_impulse_body_ratio:
             return None, events
-
-        direction: Optional[FVGDirection] = None
-        upper_bound: float
-        lower_bound: float
 
         # Bullish FVG: high(c1) < low(c3)
         if c1.high < c3.low:

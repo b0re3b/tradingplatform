@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Iterable
 
 from .base import BaseSpoofingModule
 from .config import SpoofingConfig
 from .enums import (
-    LiquidityEventType,
     SpoofingComponent,
     SpoofingStatus,
 )

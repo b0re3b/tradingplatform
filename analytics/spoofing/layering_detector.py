@@ -649,9 +649,9 @@ class LayeringDetector(BaseSpoofingDetector):
     # -------------------------------------------------------------------------
 
     def _is_relevant_wall(
-        self,
-        wall: TrackedWall,
-        current_mid_price: float | None = None,
+            self,
+            wall: TrackedWall,
+            current_mid_price: float | None = None,
     ) -> bool:
         if wall.max_size <= 0 or wall.price <= 0:
             return False
@@ -659,13 +659,13 @@ class LayeringDetector(BaseSpoofingDetector):
         if wall.price * wall.max_size < self.config.wall_detection.min_wall_size_abs:
             return False
 
-        if wall.state not in {
-            OrderbookWallState.ACTIVE,
-            OrderbookWallState.WEAKENING,
-            OrderbookWallState.PULLED,
-            OrderbookWallState.EXPIRED,
-            OrderbookWallState.FILLED,
-        }:
+        if (
+                wall.state != OrderbookWallState.ACTIVE
+                and wall.state != OrderbookWallState.WEAKENING
+                and wall.state != OrderbookWallState.PULLED
+                and wall.state != OrderbookWallState.EXPIRED
+                and wall.state != OrderbookWallState.FILLED
+        ):
             return False
 
         if current_mid_price is not None and current_mid_price > 0:
@@ -674,7 +674,6 @@ class LayeringDetector(BaseSpoofingDetector):
                 return False
 
         return True
-
     def _sort_walls_for_side(
         self,
         walls: list[TrackedWall],
@@ -695,16 +694,19 @@ class LayeringDetector(BaseSpoofingDetector):
         return strongest.wall_id
 
     def _resolve_cluster_reference_mid(
-        self,
-        cluster: LayeringCluster,
+            self,
+            cluster: LayeringCluster,
     ) -> float | None:
-        mids = [
-            wall.mid_price_at_creation
-            for wall in cluster.walls
-            if wall.mid_price_at_creation is not None and wall.mid_price_at_creation > 0
-        ]
+        mids: list[float] = []
+
+        for wall in cluster.walls:
+            mid = wall.mid_price_at_creation
+            if mid is not None and mid > 0:
+                mids.append(mid)
+
         if not mids:
             return None
+
         return mean(mids)
 
     def _normalize_total_notional(self, total_notional: float) -> float:

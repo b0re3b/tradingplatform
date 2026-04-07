@@ -291,11 +291,11 @@ class BaseOrderFlowAnalyzer(ABC):
         return None
 
     def normalize_trade(
-        self,
-        raw_trade: Any,
-        *,
-        default_symbol: Optional[str] = None,
-        default_exchange: Optional[str] = None,
+            self,
+            raw_trade: Any,
+            *,
+            default_symbol: Optional[str] = None,
+            default_exchange: Optional[str] = None,
     ) -> Optional[NormalizedTrade]:
         if raw_trade is None:
             return None
@@ -310,11 +310,14 @@ class BaseOrderFlowAnalyzer(ABC):
         if not symbol:
             return None
 
-        price = raw_trade.get("price", raw_trade.get("p"))
-        quantity = raw_trade.get("quantity", raw_trade.get("qty", raw_trade.get("q")))
-        timestamp = raw_trade.get("timestamp", raw_trade.get("ts", raw_trade.get("T", time.time())))
+        raw_price = raw_trade.get("price", raw_trade.get("p"))
+        raw_quantity = raw_trade.get("quantity", raw_trade.get("qty", raw_trade.get("q")))
+        raw_timestamp = raw_trade.get("timestamp", raw_trade.get("ts", raw_trade.get("T", time.time())))
         trade_id = raw_trade.get("trade_id", raw_trade.get("id"))
         exchange = raw_trade.get("exchange", default_exchange)
+
+        if raw_price is None or raw_quantity is None or raw_timestamp is None:
+            return None
 
         side = self._extract_trade_side(raw_trade)
         is_aggressive = bool(
@@ -322,12 +325,19 @@ class BaseOrderFlowAnalyzer(ABC):
         )
 
         try:
+            price = float(raw_price)
+            quantity = float(raw_quantity)
+            timestamp = float(raw_timestamp)
+        except (TypeError, ValueError):
+            return None
+
+        try:
             return NormalizedTrade.create(
                 symbol=str(symbol).upper(),
                 side=side,
-                price=float(price),
-                quantity=float(quantity),
-                timestamp=float(timestamp),
+                price=price,
+                quantity=quantity,
+                timestamp=timestamp,
                 trade_id=str(trade_id) if trade_id is not None else None,
                 exchange=str(exchange) if exchange is not None else None,
                 is_aggressive=is_aggressive,
@@ -337,11 +347,11 @@ class BaseOrderFlowAnalyzer(ABC):
             return None
 
     def normalize_orderbook_snapshot(
-        self,
-        raw_snapshot: Any,
-        *,
-        default_symbol: Optional[str] = None,
-        default_exchange: Optional[str] = None,
+            self,
+            raw_snapshot: Any,
+            *,
+            default_symbol: Optional[str] = None,
+            default_exchange: Optional[str] = None,
     ) -> Optional[OrderbookSnapshot]:
         if raw_snapshot is None:
             return None
@@ -367,13 +377,27 @@ class BaseOrderFlowAnalyzer(ABC):
         if not bids or not asks:
             return None
 
+        raw_timestamp = raw_snapshot.get("timestamp")
+        if raw_timestamp is None:
+            raw_timestamp = raw_snapshot.get("ts")
+        if raw_timestamp is None:
+            raw_timestamp = time.time()
+
+        try:
+            timestamp = float(raw_timestamp)
+        except (TypeError, ValueError):
+            return None
+
+        exchange = raw_snapshot.get("exchange", default_exchange)
+        sequence_id = raw_snapshot.get("sequence_id", raw_snapshot.get("u"))
+
         return OrderbookSnapshot(
             symbol=str(symbol).upper(),
             bids=bids,
             asks=asks,
-            timestamp=float(raw_snapshot.get("timestamp", raw_snapshot.get("ts", time.time()))),
-            exchange=raw_snapshot.get("exchange", default_exchange),
-            sequence_id=raw_snapshot.get("sequence_id", raw_snapshot.get("u")),
+            timestamp=timestamp,
+            exchange=str(exchange) if exchange is not None else None,
+            sequence_id=str(sequence_id) if sequence_id is not None else None,
             raw=raw_snapshot,
         )
 

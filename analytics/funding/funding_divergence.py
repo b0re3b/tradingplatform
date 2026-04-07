@@ -80,45 +80,18 @@ class FundingDivergenceDetector:
     # ------------------------------------------------------------------
 
     def detect(
-        self,
-        snapshot: FundingSnapshot,
-        statistics: FundingStatistics | None = None,
-        price_change_pct: float | None = None,
-        oi_change_pct: float | None = None,
-        cvd_change: float | None = None,
-        long_liquidations: float | None = None,
-        short_liquidations: float | None = None,
-        timeframe: FundingTimeframe | None = None,
-        extra_metadata: dict[str, Any] | None = None,
+            self,
+            snapshot: FundingSnapshot,
+            statistics: FundingStatistics | None = None,
+            price_change_pct: float | None = None,
+            oi_change_pct: float | None = None,
+            cvd_change: float | None = None,
+            long_liquidations: float | None = None,
+            short_liquidations: float | None = None,
+            timeframe: FundingTimeframe | None = None,
+            extra_metadata: dict[str, Any] | None = None,
     ) -> FundingDivergenceEvent | None:
-        """
-        Пошук найбільш релевантної funding-divergence події.
 
-        Parameters
-        ----------
-        snapshot:
-            Поточний funding snapshot.
-        statistics:
-            Funding statistics для percentile/zscore context.
-        price_change_pct:
-            Відносна зміна ціни за вікно аналізу.
-        oi_change_pct:
-            Відносна зміна open interest за вікно аналізу.
-        cvd_change:
-            Зміна cumulative volume delta.
-        long_liquidations:
-            Обсяг long liquidations.
-        short_liquidations:
-            Обсяг short liquidations.
-        timeframe:
-            Таймфрейм аналізу.
-        extra_metadata:
-            Додаткові metadata.
-
-        Returns
-        -------
-        FundingDivergenceEvent | None
-        """
         if abs(snapshot.funding_rate) < self.config.min_funding_for_divergence:
             return None
 
@@ -157,10 +130,15 @@ class FundingDivergenceDetector:
             )
             return None
 
-        tf = timeframe or (
-            statistics.timeframe if statistics is not None else self.config.default_timeframe
-        )
+        # ✅ FIX: явне звуження типу timeframe
+        if timeframe is not None:
+            tf: FundingTimeframe = timeframe
+        elif statistics is not None:
+            tf = statistics.timeframe
+        else:
+            tf = self.config.default_timeframe
 
+        # ✅ FIX: безпечний metadata
         metadata: dict[str, Any] = {
             "funding_sign": snapshot.funding_sign,
             "funding_abs": abs(snapshot.funding_rate),
@@ -178,7 +156,7 @@ class FundingDivergenceDetector:
                 }
             )
 
-        if extra_metadata:
+        if extra_metadata is not None and isinstance(extra_metadata, dict):
             metadata.update(extra_metadata)
 
         event = FundingDivergenceEvent(

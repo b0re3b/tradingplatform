@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
 from dataclasses import asdict
 from datetime import datetime, timedelta
-from decimal import Decimal
 from typing import Any, Awaitable, Callable, Protocol
 
 from core.logger import get_logger
-
 from .config import CascadeDetectorConfig
-from .enums import CascadeSeverity, LiquidationSide, LiquidationStatus
+from .enums import LiquidationSide, LiquidationStatus
 from .metrics import LiquidationMetrics
 from .models import (
     CascadeDetectionResult,

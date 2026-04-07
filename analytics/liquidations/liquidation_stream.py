@@ -6,12 +6,11 @@ import hashlib
 import time
 from collections import deque
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Protocol
 
 from core.logger import get_logger
-
 from .config import LiquidationStreamConfig
 from .enums import LiquidationEventType, LiquidationSide
 from .metrics import LiquidationMetrics

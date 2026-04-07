@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from decimal import Decimal
 
 from .config import BaseSpreadConfig, CrossExchangeSpreadConfig, SpotFuturesSpreadConfig
 from .enums import SpreadSignalType, SpreadType
 from .models import ArbitrageOpportunity, SpreadSignal, SpreadSnapshot
 from .spread_regime_detector import SpreadRegimeDetector
-
 
 DECIMAL_ZERO = Decimal("0")
 DECIMAL_ONE = Decimal("1")

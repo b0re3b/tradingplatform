@@ -4,7 +4,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, Optional
 
 from analytics.whales.enums import (
     LargeTradeTriggerType,

@@ -72,12 +72,12 @@ class FundingFlipDetector:
     # ------------------------------------------------------------------
 
     def detect(
-        self,
-        current_snapshot: FundingSnapshot,
-        previous_snapshot: FundingSnapshot | None,
-        statistics: FundingStatistics | None = None,
-        timeframe: FundingTimeframe | None = None,
-        extra_metadata: dict[str, Any] | None = None,
+            self,
+            current_snapshot: FundingSnapshot,
+            previous_snapshot: FundingSnapshot | None,
+            statistics: FundingStatistics | None = None,
+            timeframe: FundingTimeframe | None = None,
+            extra_metadata: dict[str, Any] | None = None,
     ) -> FundingFlipEvent | None:
         """
         Визначає, чи відбувся значущий funding flip.
@@ -144,9 +144,12 @@ class FundingFlipDetector:
             )
             return None
 
-        tf = timeframe or (
-            statistics.timeframe if statistics is not None else self.config.default_timeframe
-        )
+        if timeframe is not None:
+            tf: FundingTimeframe = timeframe
+        elif statistics is not None:
+            tf = statistics.timeframe
+        else:
+            tf = self.config.default_timeframe
 
         metadata: dict[str, Any] = {
             "previous_sign": previous_snapshot.funding_sign,
@@ -166,7 +169,7 @@ class FundingFlipDetector:
                 }
             )
 
-        if extra_metadata:
+        if extra_metadata is not None and isinstance(extra_metadata, dict):
             metadata.update(extra_metadata)
 
         event = FundingFlipEvent(

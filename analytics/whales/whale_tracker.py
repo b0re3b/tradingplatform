@@ -14,7 +14,6 @@ from analytics.whales.models import (
     WhaleActivitySignal,
     WhaleLiquidationContextSignal,
     WhalePressureSignal,
-    WhalePressureType,
     WhaleTradeRecord,
     WhaleTrackerResult,
     SymbolTrackerState,

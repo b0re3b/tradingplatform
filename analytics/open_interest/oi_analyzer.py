@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from core.logger import get_logger
-
 from .config import OIAnalyzerConfig
-from .enums import OIAnomalyType, OIEventType, OIDivergenceType, OIRegime
+from .enums import OIAnomalyType, OIEventType, OIRegime
 from .models import (
     OIAnalysisResult,
-    OIAnomalyResult,
     OIMarketContext,
     OISnapshot,
     OIState,
@@ -752,18 +750,22 @@ class OIAnalyzer:
         return state
 
     def _get_or_create_context(
-        self,
-        key: tuple[str, str],
-        timestamp: float,
+            self,
+            key: tuple[str, str],
+            timestamp: float,
     ) -> OIMarketContext:
         state = self._get_or_create_state(key)
-        if state.last_context is None:
-            state.last_context = OIMarketContext(
+
+        context = state.last_context
+        if context is None:
+            context = OIMarketContext(
                 symbol=key[1],
                 exchange=key[0],
                 timestamp=timestamp,
             )
-        return state.last_context
+            state.last_context = context
+
+        return context
 
     def _get_context_for_key(
         self,

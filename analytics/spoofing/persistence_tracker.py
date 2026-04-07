@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Iterable
 
 from .base import BaseSpoofingTracker

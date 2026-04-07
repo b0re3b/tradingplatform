@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import median
 from typing import Any, Deque
 
 from core.logger import get_logger
-
 from .enums import (
     FundingEventType,
     FundingTimeframe,
@@ -871,6 +870,12 @@ class FundingAnalyzer:
         event_time = self._parse_datetime(event_time_raw) if event_time_raw is not None else self._utc_now()
         received_at = self._parse_datetime(received_at_raw) if received_at_raw is not None else self._utc_now()
 
+        raw_metadata = payload.get("metadata")
+
+        metadata: dict[str, Any] = (
+            raw_metadata if isinstance(raw_metadata, dict) else {}
+        )
+
         return FundingSnapshot(
             symbol=symbol,
             exchange=exchange,
@@ -883,7 +888,7 @@ class FundingAnalyzer:
             next_funding_time=next_funding_time,
             event_time=event_time,
             received_at=received_at,
-            metadata=dict(payload.get("metadata", {})),
+            metadata=metadata,
         )
 
     def _extract_payload(self, event: Any) -> dict[str, Any]:

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass, field, asdict
 
 from .enums import (
     OrderFlowMetricType,
@@ -44,18 +43,26 @@ class NormalizedTrade:
         is_aggressive: bool = False,
         raw: Optional[dict[str, Any]] = None,
     ) -> "NormalizedTrade":
-        side_enum = (
-            side if isinstance(side, OrderFlowSide) else OrderFlowSide(str(side).lower())
-            if str(side).lower() in {item.value for item in OrderFlowSide}
-            else OrderFlowSide.UNKNOWN
-        )
-        notional = float(price) * float(quantity)
+        if isinstance(side, OrderFlowSide):
+            side_enum = side
+        else:
+            side_str = str(side).lower()
+            allowed_values = {item.value for item in OrderFlowSide}
+            side_enum = (
+                OrderFlowSide(side_str)
+                if side_str in allowed_values
+                else OrderFlowSide.UNKNOWN
+            )
+
+        price_f = float(price)
+        quantity_f = float(quantity)
+        notional = price_f * quantity_f
 
         return cls(
             symbol=str(symbol).upper(),
             side=side_enum,
-            price=float(price),
-            quantity=float(quantity),
+            price=price_f,
+            quantity=quantity_f,
             notional=notional,
             timestamp=float(timestamp),
             trade_id=trade_id,
@@ -63,6 +70,20 @@ class NormalizedTrade:
             is_aggressive=bool(is_aggressive),
             raw=raw,
         )
+
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+
+def _safe_float(value: object) -> float | None:
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(slots=True)
@@ -76,18 +97,26 @@ class OrderbookLevel:
             return None
 
         if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-            try:
-                return cls(price=float(raw[0]), size=float(raw[1]))
-            except (TypeError, ValueError):
+            price = _safe_float(raw[0])
+            size = _safe_float(raw[1])
+
+            if price is None or size is None:
                 return None
 
+            return cls(price=price, size=size)
+
         if isinstance(raw, dict):
-            price = raw.get("price")
-            size = raw.get("size", raw.get("quantity", raw.get("qty")))
-            try:
-                return cls(price=float(price), size=float(size))
-            except (TypeError, ValueError):
+            raw_dict: dict[object, object] = raw
+
+            price = _safe_float(raw_dict.get("price"))
+            size = _safe_float(
+                raw_dict.get("size", raw_dict.get("quantity", raw_dict.get("qty")))
+            )
+
+            if price is None or size is None:
                 return None
+
+            return cls(price=price, size=size)
 
         return None
 
@@ -112,15 +141,23 @@ class OrderbookSnapshot:
 
     @property
     def spread(self) -> Optional[float]:
-        if self.best_bid is None or self.best_ask is None:
+        best_bid = self.best_bid
+        best_ask = self.best_ask
+
+        if best_bid is None or best_ask is None:
             return None
-        return self.best_ask - self.best_bid
+
+        return best_ask - best_bid
 
     @property
     def mid_price(self) -> Optional[float]:
-        if self.best_bid is None or self.best_ask is None:
+        best_bid = self.best_bid
+        best_ask = self.best_ask
+
+        if best_bid is None or best_ask is None:
             return None
-        return (self.best_bid + self.best_ask) / 2.0
+
+        return (best_bid + best_ask) / 2.0
 
 
 # ---------------------------------------------------------------------
@@ -281,14 +318,8 @@ class OrderbookImbalanceStats(BaseOrderFlowStats):
 
 
 def stats_to_dict(stats: BaseOrderFlowStats) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in vars(stats).items()
-    }
+    return asdict(stats)
 
 
 def signal_to_dict(signal: OrderFlowSignal) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in vars(signal).items()
-    }
+    return asdict(signal)
