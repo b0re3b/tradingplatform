@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from math import sqrt
 from typing import Iterable, Sequence
 
 from .enums import InstrumentType, QuoteValidity, SpreadDirection, SpreadRegime
 from .models import QuoteSnapshot, RollingStats
+
 
 DECIMAL_ZERO = Decimal("0")
 DECIMAL_ONE = Decimal("1")
@@ -16,18 +17,26 @@ DECIMAL_10_000 = Decimal("10000")
 DEFAULT_QUANT = Decimal("0.00000001")
 
 
+# ============================================================
+# Decimal helpers
+# ============================================================
+
 def to_decimal(value: object, default: Decimal | None = None) -> Decimal | None:
     if value is None:
         return default
     if isinstance(value, Decimal):
         return value
+
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return default
 
 
-def quantize_decimal(value: Decimal | None, quant: Decimal = DEFAULT_QUANT) -> Decimal | None:
+def quantize_decimal(
+    value: Decimal | None,
+    quant: Decimal = DEFAULT_QUANT,
+) -> Decimal | None:
     if value is None:
         return None
     return value.quantize(quant)
@@ -45,13 +54,23 @@ def safe_div(
     return numerator / denominator
 
 
-def midpoint(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+# ============================================================
+# Basic market math
+# ============================================================
+
+def midpoint(
+    bid: Decimal | None,
+    ask: Decimal | None,
+) -> Decimal | None:
     if bid is None or ask is None:
         return None
     return (bid + ask) / Decimal("2")
 
 
-def spread_abs(value_a: Decimal | None, value_b: Decimal | None) -> Decimal | None:
+def spread_abs(
+    value_a: Decimal | None,
+    value_b: Decimal | None,
+) -> Decimal | None:
     if value_a is None or value_b is None:
         return None
     return value_a - value_b
@@ -103,6 +122,10 @@ def funding_adjusted_spread(
     return raw_spread - (notional * funding_rate)
 
 
+# ============================================================
+# Spread interpretation
+# ============================================================
+
 def infer_direction(value: Decimal | None) -> SpreadDirection:
     if value is None:
         return SpreadDirection.FLAT
@@ -122,16 +145,21 @@ def infer_regime(
     if zscore is None:
         return SpreadRegime.NORMAL
 
-    abs_z = abs(zscore)
+    abs_zscore = abs(zscore)
 
-    if abs_z >= extreme_threshold:
+    if abs_zscore >= extreme_threshold:
         return SpreadRegime.EXTREME
-    if abs_z >= elevated_threshold:
+    if abs_zscore >= elevated_threshold:
         return SpreadRegime.ELEVATED
-    if abs_z <= compressed_threshold:
+    if abs_zscore <= compressed_threshold:
         return SpreadRegime.COMPRESSED
+
     return SpreadRegime.NORMAL
 
+
+# ============================================================
+# Normalization helpers
+# ============================================================
 
 def normalize_symbol(symbol: str) -> str:
     return symbol.replace("-", "").replace("/", "").replace("_", "").upper().strip()
@@ -147,15 +175,21 @@ def infer_instrument_type(raw_value: str | None) -> InstrumentType:
 
     value = raw_value.strip().lower()
 
-    if value in {"spot"}:
+    if value == "spot":
         return InstrumentType.SPOT
+
     if value in {"perp", "perpetual", "swap"}:
         return InstrumentType.PERPETUAL
+
     if value in {"future", "futures", "delivery"}:
         return InstrumentType.FUTURES
 
     return InstrumentType.UNKNOWN
 
+
+# ============================================================
+# Quote validation / timing helpers
+# ============================================================
 
 def quote_age_ms(
     quote: QuoteSnapshot,
@@ -199,9 +233,13 @@ def aligned_quotes(
     quote_b: QuoteSnapshot,
     max_age_diff_ms: int,
 ) -> bool:
-    diff = abs(int((quote_a.timestamp - quote_b.timestamp).total_seconds() * 1000))
-    return diff <= max_age_diff_ms
+    diff_ms = abs(int((quote_a.timestamp - quote_b.timestamp).total_seconds() * 1000))
+    return diff_ms <= max_age_diff_ms
 
+
+# ============================================================
+# Statistical helpers
+# ============================================================
 
 def decimal_mean(values: Sequence[Decimal]) -> Decimal | None:
     if not values:
@@ -209,11 +247,15 @@ def decimal_mean(values: Sequence[Decimal]) -> Decimal | None:
     return sum(values, DECIMAL_ZERO) / Decimal(len(values))
 
 
-def decimal_std(values: Sequence[Decimal], mean_value: Decimal | None = None) -> Decimal | None:
+def decimal_std(
+    values: Sequence[Decimal],
+    mean_value: Decimal | None = None,
+) -> Decimal | None:
     if not values:
         return None
+
     if len(values) < 2:
-        return Decimal("0")
+        return DECIMAL_ZERO
 
     mean_val = mean_value if mean_value is not None else decimal_mean(values)
     if mean_val is None:
@@ -230,8 +272,10 @@ def compute_zscore(
 ) -> Decimal | None:
     if current_value is None or mean_value is None or std_value is None:
         return None
+
     if std_value == DECIMAL_ZERO:
-        return Decimal("0")
+        return DECIMAL_ZERO
+
     return (current_value - mean_value) / std_value
 
 
@@ -242,10 +286,14 @@ def ema_next(
 ) -> Decimal:
     if previous_ema is None:
         return value
-    return (alpha * value) + ((Decimal("1") - alpha) * previous_ema)
+
+    return (alpha * value) + ((DECIMAL_ONE - alpha) * previous_ema)
 
 
-def percentile_rank(value: Decimal, values: Sequence[Decimal]) -> Decimal | None:
+def percentile_rank(
+    value: Decimal,
+    values: Sequence[Decimal],
+) -> Decimal | None:
     if not values:
         return None
 
@@ -263,8 +311,8 @@ def build_rolling_stats(
     mean_val = decimal_mean(values)
     std_val = decimal_std(values, mean_val)
     last_val = values[-1]
-    z_val = compute_zscore(last_val, mean_val, std_val)
-    rank = percentile_rank(last_val, values)
+    zscore_val = compute_zscore(last_val, mean_val, std_val)
+    percentile_val = percentile_rank(last_val, values)
 
     return RollingStats(
         count=len(values),
@@ -274,20 +322,28 @@ def build_rolling_stats(
         max_value=max(values),
         ema=ema_value,
         last_value=last_val,
-        zscore=z_val,
-        percentile_rank=rank,
+        zscore=zscore_val,
+        percentile_rank=percentile_val,
     )
 
+
+# ============================================================
+# Rolling window
+# ============================================================
 
 class RollingDecimalWindow:
     """
     Легка rolling-window структура для Decimal-значень.
-    Добре підходить для spread history, z-score, mean reversion сигналів.
+    Добре підходить для історії spread, z-score та mean reversion логіки.
     """
 
     __slots__ = ("_values", "_ema", "_alpha")
 
-    def __init__(self, maxlen: int, ema_alpha: Decimal = Decimal("0.2")) -> None:
+    def __init__(
+        self,
+        maxlen: int,
+        ema_alpha: Decimal = Decimal("0.2"),
+    ) -> None:
         if maxlen <= 0:
             raise ValueError("maxlen must be > 0")
 
@@ -301,6 +357,10 @@ class RollingDecimalWindow:
     def append(self, value: Decimal) -> None:
         self._values.append(value)
         self._ema = ema_next(value, self._ema, self._alpha)
+
+    def extend(self, values: Iterable[Decimal]) -> None:
+        for value in values:
+            self.append(value)
 
     def clear(self) -> None:
         self._values.clear()
@@ -325,43 +385,3 @@ class RollingDecimalWindow:
 
     def stats(self) -> RollingStats:
         return build_rolling_stats(self.values(), ema_value=self._ema)
-
-
-def estimate_fee_cost(
-    price: Decimal | None,
-    quantity: Decimal | None,
-    fee_rate: Decimal | None,
-) -> Decimal:
-    if price is None or quantity is None or fee_rate is None:
-        return DECIMAL_ZERO
-    if price <= DECIMAL_ZERO or quantity <= DECIMAL_ZERO or fee_rate < DECIMAL_ZERO:
-        return DECIMAL_ZERO
-    return price * quantity * fee_rate
-
-
-def estimate_simple_slippage(
-    quantity: Decimal | None,
-    top_book_size: Decimal | None,
-    max_slippage_bps: Decimal = Decimal("5"),
-) -> Decimal:
-    if quantity is None or top_book_size is None:
-        return DECIMAL_ZERO
-    if quantity <= DECIMAL_ZERO or top_book_size <= DECIMAL_ZERO:
-        return DECIMAL_ZERO
-
-    fill_ratio = quantity / top_book_size
-
-    if fill_ratio <= Decimal("1"):
-        return max_slippage_bps * fill_ratio / DECIMAL_10_000
-
-    return max_slippage_bps * fill_ratio / DECIMAL_10_000
-
-
-def net_edge_after_costs(
-    gross_edge: Decimal | None,
-    fees: Decimal | None = None,
-    slippage: Decimal | None = None,
-) -> Decimal | None:
-    if gross_edge is None:
-        return None
-    return gross_edge - (fees or DECIMAL_ZERO) - (slippage or DECIMAL_ZERO)

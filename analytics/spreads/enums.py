@@ -32,6 +32,14 @@ class SpreadDirection(str, Enum):
     FLAT = "flat"
 
 
+class SpreadRegime(str, Enum):
+    NORMAL = "normal"
+    ELEVATED = "elevated"
+    EXTREME = "extreme"
+    COMPRESSED = "compressed"
+    DISLOCATED = "dislocated"
+
+
 class OpportunityStatus(str, Enum):
     ACTIVE = "active"
     EXPIRED = "expired"
@@ -52,11 +60,3 @@ class PricingSource(str, Enum):
     LAST = "last"
     MARK = "mark"
     INDEX = "index"
-
-
-class SpreadRegime(str, Enum):
-    NORMAL = "normal"
-    ELEVATED = "elevated"
-    EXTREME = "extreme"
-    COMPRESSED = "compressed"
-    DISLOCATED = "dislocated"
