@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any
 
 from strategy.base import ContextAwareComponent, NamedEntityMixin, PrioritizedMixin
 from strategy.config import StrategyConfig
