@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Deque, TypeVar
 
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
@@ -12,6 +15,23 @@ from core.scheduler import Scheduler
 from analytics.liquidations.enums import CascadeDirection, CascadeSeverity
 from analytics.liquidations.models import CascadeDetectionResult
 from analytics.liquidations.utils import clamp_float, ensure_utc, normalize_symbol, utc_now
+
+
+# ---------------------------------------------------------------------------
+# Generic helper — замінює три майже ідентичні _remember_* методи
+# ---------------------------------------------------------------------------
+
+_T = TypeVar("_T")
+
+
+def _remember(buf: Deque[_T], item: _T) -> None:
+    """Append item to a bounded deque (maxlen enforced by deque itself)."""
+    buf.append(item)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -150,6 +170,11 @@ class SqueezeReversalStrategyConfig:
             raise ValueError("strategy score weights sum must be > 0")
 
 
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+
 @dataclass(slots=True)
 class SqueezeReversalSignal:
     strategy_name: str
@@ -186,6 +211,35 @@ class SqueezeReversalSignal:
     source_event_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy_name": self.strategy_name,
+            "signal_type": self.signal_type,
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "side": self.side,
+            "confidence": self.confidence,
+            "score": self.score,
+            "generated_at": self.generated_at.isoformat(),
+            "detected_at": self.detected_at.isoformat(),
+            "reason": self.reason,
+            "source_topic": self.source_topic,
+            "severity": self.severity,
+            "cascade_direction": self.cascade_direction,
+            "liquidation_side": self.liquidation_side,
+            "event_count": self.event_count,
+            "total_notional_usd": str(self.total_notional_usd),
+            "intensity_score": self.intensity_score,
+            "continuation_bias": self.continuation_bias,
+            "exhaustion_bias": self.exhaustion_bias,
+            "price_range_pct": self.price_range_pct,
+            "pending_started_at": self.pending_started_at.isoformat() if self.pending_started_at else None,
+            "pending_confirmed_at": self.pending_confirmed_at.isoformat() if self.pending_confirmed_at else None,
+            "correlation_id": self.correlation_id,
+            "source_event_id": self.source_event_id,
+            "metadata": self.metadata,
+        }
+
 
 @dataclass(slots=True)
 class StrategyRejection:
@@ -197,6 +251,18 @@ class StrategyRejection:
     correlation_id: str | None = None
     source_event_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "rejected_at": self.rejected_at.isoformat(),
+            "reason": self.reason,
+            "source_topic": self.source_topic,
+            "correlation_id": self.correlation_id,
+            "source_event_id": self.source_event_id,
+            "details": self.details,
+        }
 
 
 @dataclass(slots=True)
@@ -216,6 +282,16 @@ class PendingReversalCandidate:
     cluster_signature: str
     cancelled: bool = False
     cancel_reason: str | None = None
+
+    # FIX: зберігаємо detected_at на момент створення candidate,
+    # щоб cancel_if_newer_detected_at порівнював саме з цим значенням,
+    # а не з мутованим state.last_detected_at, який оновлюється тільки
+    # після remember_signal — тобто вже після підтвердження попереднього сигналу.
+    # Без цього нові exhaustion-events, що не стали сигналами, не скасовують pending.
+    candidate_detected_at: datetime = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.candidate_detected_at = ensure_utc(self.result.detected_at)
 
     def is_ready(self, now: datetime) -> bool:
         return ensure_utc(now) >= self.confirm_after
@@ -241,8 +317,20 @@ class SymbolSqueezeStrategyState:
 
     pending: PendingReversalCandidate | None = None
 
+    # FIX: окремо трекаємо найсвіжіший detected_at з усіх exhaustion-events
+    # (незалежно від того, чи вони стали сигналом).
+    # Це дозволяє cancel_if_newer_detected_at коректно скасовувати pending,
+    # навіть якщо новий event не пройшов фільтри і не оновив last_detected_at.
+    latest_seen_detected_at: datetime | None = None
+
     def is_in_cooldown(self, now: datetime) -> bool:
         return self.cooldown_until is not None and ensure_utc(now) < self.cooldown_until
+
+    def update_latest_seen(self, detected_at: datetime) -> None:
+        """Оновлюється при кожному вхідному exhaustion-event, незалежно від фільтрів."""
+        ts = ensure_utc(detected_at)
+        if self.latest_seen_detected_at is None or ts > self.latest_seen_detected_at:
+            self.latest_seen_detected_at = ts
 
     def remember_signal(
         self,
@@ -302,6 +390,11 @@ class SqueezeReversalStrategyStats:
     last_error: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Main strategy class
+# ---------------------------------------------------------------------------
+
+
 class SqueezeReversalStrategy:
     """
     Reversal strategy поверх analytics.liquidation.exhaustion_detected.
@@ -330,11 +423,15 @@ class SqueezeReversalStrategy:
 
         self.config.validate()
 
+        if event_bus is None:
+            raise ValueError("event_bus is required")
+
         self.logger = get_logger(
             __name__,
             service_name=self.service_name,
+            event_type="strategy",
+            strategies=self.config.strategy_name,
             component="strategy.liquidations.squeeze_reversal_strategy",
-            strategy=self.config.strategy_name,
         )
 
         self._running = False
@@ -343,9 +440,22 @@ class SqueezeReversalStrategy:
         self._pending_scan_job_id: str | None = None
 
         self._states: dict[tuple[str, str], SymbolSqueezeStrategyState] = {}
-        self._recent_signals: list[SqueezeReversalSignal] = []
-        self._recent_rejections: list[StrategyRejection] = []
-        self._recent_pending: list[dict[str, Any]] = []
+
+        # FIX: окремий set ключів станів з активним pending —
+        # щоб _process_pending_candidates не робив list(self._states.values())
+        # при кожному тіку, що O(N) по всіх трекованих символах.
+        self._pending_keys: set[tuple[str, str]] = set()
+
+        # FIX: deque з maxlen замість list + ручного зрізу
+        self._recent_signals: Deque[SqueezeReversalSignal] = deque(
+            maxlen=self.config.recent_signals_limit
+        )
+        self._recent_rejections: Deque[StrategyRejection] = deque(
+            maxlen=self.config.recent_rejections_limit
+        )
+        self._recent_pending: Deque[dict[str, Any]] = deque(
+            maxlen=self.config.recent_pending_limit
+        )
 
         self._stats = SqueezeReversalStrategyStats()
 
@@ -449,6 +559,10 @@ class SqueezeReversalStrategy:
             state = self._get_or_create_state(result.exchange, result.symbol)
             now = utc_now()
 
+            # FIX: оновлюємо latest_seen до фільтрів, щоб cancel_if_newer_detected_at
+            # враховував усі вхідні events, а не тільки ті, що стали сигналами.
+            state.update_latest_seen(result.detected_at)
+
             rejection_reason = self._get_rejection_reason(
                 result=result,
                 state=state,
@@ -476,6 +590,9 @@ class SqueezeReversalStrategy:
                 bus_event=bus_event,
                 pending_started_at=None,
                 pending_confirmed_at=utc_now(),
+                # FIX: передаємо оригінальний source_event_id явно,
+                # щоб він потрапив у поле сигналу, а не тільки в headers
+                source_event_id=bus_event.event_id,
             )
             await self._emit_signal(signal=signal, bus_event=bus_event)
 
@@ -489,8 +606,9 @@ class SqueezeReversalStrategy:
                 detected_at=result.detected_at,
             )
             state.pending = None
+            self._pending_keys.discard(self._state_key(result.exchange, result.symbol))
 
-            self._remember_signal(signal)
+            _remember(self._recent_signals, signal)
 
             self._stats.emitted_signals += 1
             self._stats.last_signal_at = signal.generated_at
@@ -678,9 +796,13 @@ class SqueezeReversalStrategy:
         )
 
         state.pending = candidate
+        key = self._state_key(result.exchange, result.symbol)
+        self._pending_keys.add(key)
+
         self._stats.pending_created += 1
 
-        self._remember_pending(
+        _remember(
+            self._recent_pending,
             {
                 "exchange": candidate.exchange,
                 "symbol": candidate.symbol,
@@ -695,7 +817,7 @@ class SqueezeReversalStrategy:
                 "total_notional_usd": str(result.total_notional_usd),
                 "source_event_id": bus_event.event_id,
                 "correlation_id": bus_event.correlation_id,
-            }
+            },
         )
 
         self.logger.info(
@@ -715,7 +837,7 @@ class SqueezeReversalStrategy:
         )
 
         if self.config.publish_pending_events:
-            await self.event_bus.emit(
+            await self._emit_event(
                 self.config.publish_topic_pending_created,
                 {
                     "strategy_name": self.config.strategy_name,
@@ -732,7 +854,6 @@ class SqueezeReversalStrategy:
                     "exhaustion_bias": result.exhaustion_bias,
                 },
                 priority=self.config.pending_priority,
-                source=self.config.strategy_name,
                 correlation_id=bus_event.correlation_id or bus_event.event_id,
                 headers={
                     "strategy": self.config.strategy_name,
@@ -748,17 +869,27 @@ class SqueezeReversalStrategy:
 
         now = utc_now()
 
-        for state in list(self._states.values()):
+        # FIX: ітеруємо тільки по ключах з активним pending (не по всіх _states),
+        # щоб уникнути O(N) по всіх трекованих символах на кожному тіку.
+        for key in list(self._pending_keys):
+            state = self._states.get(key)
+            if state is None:
+                self._pending_keys.discard(key)
+                continue
+
             candidate = state.pending
             if candidate is None:
+                self._pending_keys.discard(key)
                 continue
 
             if candidate.cancelled:
                 state.pending = None
+                self._pending_keys.discard(key)
                 continue
 
             if candidate.is_expired(now):
                 await self._expire_pending_candidate(state=state, candidate=candidate)
+                self._pending_keys.discard(key)
                 continue
 
             if not candidate.is_ready(now):
@@ -768,47 +899,47 @@ class SqueezeReversalStrategy:
             if age_seconds < self.config.min_pending_age_seconds:
                 continue
 
-            if self.config.cancel_if_newer_detected_at and state.last_detected_at is not None:
-                if ensure_utc(state.last_detected_at) > ensure_utc(candidate.result.detected_at):
+            # FIX: порівнюємо з latest_seen_detected_at, а не з last_detected_at.
+            # last_detected_at оновлюється тільки після remember_signal (тобто після
+            # підтвердження сигналу), тому новий exhaustion-event що не пройшов фільтри
+            # не скасував би pending. latest_seen_detected_at оновлюється при кожному
+            # вхідному event ще до фільтрів.
+            if self.config.cancel_if_newer_detected_at and state.latest_seen_detected_at is not None:
+                if state.latest_seen_detected_at > candidate.candidate_detected_at:
                     await self._expire_pending_candidate(
                         state=state,
                         candidate=candidate,
                         reason="newer_detected_at_exists",
                     )
+                    self._pending_keys.discard(key)
                     continue
 
+            # FIX: source_event_id береться з candidate (оригінальний event_id),
+            # а не з synthetic_event, який має свій новий event_id.
+            # Synthetic event потрібен лише для сумісності інтерфейсу _build_signal,
+            # але source_event_id передаємо явно, щоб він коректно потрапив у сигнал.
+            synthetic_event = Event(
+                topic=candidate.source_topic,
+                payload=candidate.result,
+                priority=EventPriority.NORMAL,
+                source=self.config.strategy_name,
+                correlation_id=candidate.correlation_id,
+                headers={"source_event_id": candidate.source_event_id}
+                if candidate.source_event_id
+                else {},
+            )
             signal = self._build_signal(
                 result=candidate.result,
-                bus_event=Event(
-                    topic=candidate.source_topic,
-                    payload=candidate.result,
-                    priority=EventPriority.NORMAL,
-                    source=self.config.strategy_name,
-                    correlation_id=candidate.correlation_id,
-                    headers={"source_event_id": candidate.source_event_id}
-                    if candidate.source_event_id
-                    else {},
-                ),
+                bus_event=synthetic_event,
                 pending_started_at=candidate.created_at,
                 pending_confirmed_at=ensure_utc(now),
+                source_event_id=candidate.source_event_id,  # оригінальний event_id
             )
 
-            await self.event_bus.emit(
-                self.config.publish_topic_signal_generated,
-                signal,
-                priority=self.config.signal_priority,
-                source=self.config.strategy_name,
-                correlation_id=candidate.correlation_id or candidate.source_event_id,
-                headers={
-                    "strategy": self.config.strategy_name,
-                    "signal_type": self.config.signal_type,
-                    "exchange": signal.exchange,
-                    "symbol": signal.symbol,
-                    "side": signal.side,
-                    "source_event_id": candidate.source_event_id,
-                    "source_topic": candidate.source_topic,
-                    "pending_confirmation": "true",
-                },
+            await self._emit_signal(
+                signal=signal,
+                bus_event=synthetic_event,
+                pending_confirmation=True,
             )
 
             state.remember_signal(
@@ -820,8 +951,9 @@ class SqueezeReversalStrategy:
                 detected_at=candidate.result.detected_at,
             )
             state.pending = None
+            self._pending_keys.discard(key)
 
-            self._remember_signal(signal)
+            _remember(self._recent_signals, signal)
 
             self._stats.emitted_signals += 1
             self._stats.pending_confirmed += 1
@@ -868,7 +1000,7 @@ class SqueezeReversalStrategy:
         )
 
         if self.config.publish_pending_events:
-            await self.event_bus.emit(
+            await self._emit_event(
                 self.config.publish_topic_pending_expired,
                 {
                     "strategy_name": self.config.strategy_name,
@@ -881,7 +1013,6 @@ class SqueezeReversalStrategy:
                     "source_event_id": candidate.source_event_id,
                 },
                 priority=self.config.pending_priority,
-                source=self.config.strategy_name,
                 correlation_id=candidate.correlation_id or candidate.source_event_id,
                 headers={
                     "strategy": self.config.strategy_name,
@@ -902,6 +1033,9 @@ class SqueezeReversalStrategy:
         bus_event: Event,
         pending_started_at: datetime | None,
         pending_confirmed_at: datetime | None,
+        # FIX: явний параметр для оригінального source_event_id,
+        # бо bus_event може бути synthetic (з новим event_id)
+        source_event_id: str | None = None,
     ) -> SqueezeReversalSignal:
         trade_side = self._direction_to_trade_side(result.direction)
         generated_at = utc_now()
@@ -969,7 +1103,9 @@ class SqueezeReversalStrategy:
             pending_started_at=pending_started_at,
             pending_confirmed_at=pending_confirmed_at,
             correlation_id=bus_event.correlation_id,
-            source_event_id=bus_event.event_id,
+            # FIX: використовуємо явно переданий source_event_id
+            # (може відрізнятись від bus_event.event_id, якщо bus_event — synthetic)
+            source_event_id=source_event_id if source_event_id is not None else bus_event.event_id,
             metadata=metadata,
         )
 
@@ -1011,13 +1147,83 @@ class SqueezeReversalStrategy:
             return "SHORT"
         return "FLAT"
 
+    # FIX: cluster signature через SHA-256 хеш замість конкатенації через "|".
+    # Конкатенація крихка — якщо exchange або symbol містять "|", можлива колізія.
+    # json.dumps дає стабільну серіалізацію, hashlib дає фіксовану довжину і без колізій.
     def _build_cluster_signature(self, result: CascadeDetectionResult) -> str:
         cluster = result.cluster
-        return (
-            f"{result.exchange.lower()}|{result.symbol.upper()}|"
-            f"{result.direction.value}|{result.side.value}|"
-            f"{cluster.start_time.isoformat()}|{cluster.end_time.isoformat()}|"
-            f"{cluster.event_count}|{cluster.total_notional_usd}|{result.detected_at.isoformat()}"
+        parts = {
+            "exchange": result.exchange.lower(),
+            "symbol": result.symbol.upper(),
+            "direction": result.direction.value,
+            "side": result.side.value,
+            "start_time": cluster.start_time.isoformat(),
+            "end_time": cluster.end_time.isoformat(),
+            "event_count": cluster.event_count,
+            "total_notional_usd": str(cluster.total_notional_usd),
+            "detected_at": result.detected_at.isoformat(),
+        }
+        raw = json.dumps(parts, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    async def _emit_event(
+        self,
+        topic: str,
+        payload: Any,
+        *,
+        priority: EventPriority,
+        correlation_id: str | None,
+        headers: dict[str, Any] | None = None,
+    ) -> bool:
+        """Emit through core.EventBus with consistent source/error handling."""
+        try:
+            return await self.event_bus.emit(
+                topic,
+                payload,
+                priority=priority,
+                source=self.config.strategy_name,
+                correlation_id=correlation_id,
+                headers=headers or {},
+            )
+        except RuntimeError as exc:
+            self._stats.last_error_at = utc_now()
+            self._stats.last_error = repr(exc)
+            self.logger.exception(
+                "EventBus emit failed: bus is probably not started.",
+                extra={
+                    "event_type": "strategy_emit_error",
+                    "topic": topic,
+                    "correlation_id": correlation_id,
+                    "error": repr(exc),
+                },
+            )
+            return False
+
+    async def _emit_signal(
+        self,
+        *,
+        signal: SqueezeReversalSignal,
+        bus_event: Event,
+        pending_confirmation: bool = False,
+    ) -> bool:
+        headers = {
+            "strategy": self.config.strategy_name,
+            "signal_type": self.config.signal_type,
+            "exchange": signal.exchange,
+            "symbol": signal.symbol,
+            "side": signal.side,
+            "source_event_id": signal.source_event_id,  # вже містить оригінальний id
+            "source_topic": bus_event.topic,
+        }
+        if pending_confirmation:
+            headers["pending_confirmation"] = "true"
+
+        return await self._emit_event(
+            self.config.publish_topic_signal_generated,
+            signal,
+            priority=self.config.signal_priority,
+            correlation_id=bus_event.correlation_id or bus_event.event_id,
+            headers=headers,
         )
 
     # ------------------------------------------------------------------
@@ -1054,7 +1260,7 @@ class SqueezeReversalStrategy:
             },
         )
 
-        self._remember_rejection(rejection)
+        _remember(self._recent_rejections, rejection)
 
         self.logger.debug(
             "Squeeze reversal result rejected by strategy filters.",
@@ -1071,11 +1277,10 @@ class SqueezeReversalStrategy:
         )
 
         if self.config.publish_rejected_events:
-            await self.event_bus.emit(
+            await self._emit_event(
                 self.config.publish_topic_signal_rejected,
                 rejection,
                 priority=self.config.rejection_priority,
-                source=self.config.strategy_name,
                 correlation_id=bus_event.correlation_id or bus_event.event_id,
                 headers={
                     "strategy": self.config.strategy_name,
@@ -1087,27 +1292,16 @@ class SqueezeReversalStrategy:
                 },
             )
 
-    def _remember_signal(self, signal: SqueezeReversalSignal) -> None:
-        self._recent_signals.append(signal)
-        if len(self._recent_signals) > self.config.recent_signals_limit:
-            self._recent_signals = self._recent_signals[-self.config.recent_signals_limit :]
-
-    def _remember_rejection(self, rejection: StrategyRejection) -> None:
-        self._recent_rejections.append(rejection)
-        if len(self._recent_rejections) > self.config.recent_rejections_limit:
-            self._recent_rejections = self._recent_rejections[-self.config.recent_rejections_limit :]
-
-    def _remember_pending(self, item: dict[str, Any]) -> None:
-        self._recent_pending.append(item)
-        if len(self._recent_pending) > self.config.recent_pending_limit:
-            self._recent_pending = self._recent_pending[-self.config.recent_pending_limit :]
-
     # ------------------------------------------------------------------
-    # State / diagnostics
+    # State / helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _state_key(exchange: str, symbol: str) -> tuple[str, str]:
+        return (exchange.lower(), normalize_symbol(symbol))
 
     def _get_or_create_state(self, exchange: str, symbol: str) -> SymbolSqueezeStrategyState:
-        key = (exchange.lower(), normalize_symbol(symbol))
+        key = self._state_key(exchange, symbol)
         state = self._states.get(key)
         if state is None:
             state = SymbolSqueezeStrategyState(
@@ -1116,6 +1310,10 @@ class SqueezeReversalStrategy:
             )
             self._states[key] = state
         return state
+
+    # ------------------------------------------------------------------
+    # Public query API
+    # ------------------------------------------------------------------
 
     def get_recent_signals(
         self,
@@ -1184,7 +1382,7 @@ class SqueezeReversalStrategy:
         return result
 
     def get_symbol_state_snapshot(self, exchange: str, symbol: str) -> dict[str, Any]:
-        key = (exchange.lower(), normalize_symbol(symbol))
+        key = self._state_key(exchange, symbol)
         state = self._states.get(key)
 
         if state is None:
@@ -1218,6 +1416,7 @@ class SqueezeReversalStrategy:
             "cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None,
             "last_signal_side": state.last_signal_side,
             "last_detected_at": state.last_detected_at.isoformat() if state.last_detected_at else None,
+            "latest_seen_detected_at": state.latest_seen_detected_at.isoformat() if state.latest_seen_detected_at else None,
             "last_cluster_signature": state.last_cluster_signature,
             "last_signal_score": state.last_signal_score,
             "total_signals_emitted": state.total_signals_emitted,
@@ -1279,6 +1478,7 @@ class SqueezeReversalStrategy:
             "filter_skips": self._stats.filter_skips,
             "invalid_payload_skips": self._stats.invalid_payload_skips,
             "tracked_symbols": len(self._states),
+            "active_pending": len(self._pending_keys),
             "recent_signals": len(self._recent_signals),
             "recent_rejections": len(self._recent_rejections),
             "recent_pending": len(self._recent_pending),
@@ -1333,11 +1533,10 @@ class SqueezeReversalStrategy:
             "pending": self.get_recent_pending(limit=10),
         }
 
-        await self.event_bus.emit(
+        await self._emit_event(
             self.config.diagnostics_topic,
             snapshot,
             priority=self.config.diagnostics_priority,
-            source=self.config.strategy_name,
             correlation_id=None,
             headers={
                 "strategy": self.config.strategy_name,

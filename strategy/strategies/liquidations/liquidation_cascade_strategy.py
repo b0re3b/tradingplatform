@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -62,6 +63,9 @@ class LiquidationCascadeStrategyConfig:
     min_event_count: int = 5
     max_price_range_pct: float | None = None
 
+    # FIX #5: максимально допустиме відхилення detected_at у майбутнє (clock skew)
+    max_future_detected_at_seconds: float = 5.0
+
     require_favors_continuation: bool = True
     require_high_confidence_only: bool = False
 
@@ -76,6 +80,9 @@ class LiquidationCascadeStrategyConfig:
 
     recent_signals_limit: int = 200
     recent_rejections_limit: int = 200
+
+    # FIX #7: часове вікно для get_hot_symbols (секунди, None = без обмеження)
+    hot_symbols_window_seconds: int | None = 300
 
     score_confidence_weight: float = 0.35
     score_continuation_bias_weight: float = 0.35
@@ -101,6 +108,9 @@ class LiquidationCascadeStrategyConfig:
         if self.max_price_range_pct is not None and self.max_price_range_pct < 0:
             raise ValueError("max_price_range_pct must be >= 0 or None")
 
+        if self.max_future_detected_at_seconds < 0:
+            raise ValueError("max_future_detected_at_seconds must be >= 0")
+
         if self.symbol_cooldown_seconds < 0:
             raise ValueError("symbol_cooldown_seconds must be >= 0")
 
@@ -116,12 +126,21 @@ class LiquidationCascadeStrategyConfig:
         if self.diagnostics_interval_seconds <= 0:
             raise ValueError("diagnostics_interval_seconds must be > 0")
 
-        total_weight = (
-            self.score_confidence_weight
-            + self.score_continuation_bias_weight
-            + self.score_intensity_weight
-            + self.score_severity_weight
-        )
+        if self.hot_symbols_window_seconds is not None and self.hot_symbols_window_seconds <= 0:
+            raise ValueError("hot_symbols_window_seconds must be > 0 or None")
+
+        # FIX #6: перевіряємо кожен weight окремо (від'ємні не допускаються)
+        score_weights = {
+            "score_confidence_weight": self.score_confidence_weight,
+            "score_continuation_bias_weight": self.score_continuation_bias_weight,
+            "score_intensity_weight": self.score_intensity_weight,
+            "score_severity_weight": self.score_severity_weight,
+        }
+        for name, w in score_weights.items():
+            if w < 0:
+                raise ValueError(f"{name} must be >= 0")
+
+        total_weight = sum(score_weights.values())
         if total_weight <= 0:
             raise ValueError("strategy score weights sum must be > 0")
 
@@ -186,7 +205,8 @@ class SymbolCascadeStrategyState:
     last_signal_score: float | None = None
 
     total_signals_emitted: int = 0
-    signal_timestamps: list[datetime] = field(default_factory=list)
+    # FIX #3: deque з maxlen замість list + ручного trim
+    signal_timestamps: deque[datetime] = field(default_factory=deque)
 
     def is_in_cooldown(self, now: datetime) -> bool:
         return self.cooldown_until is not None and ensure_utc(now) < self.cooldown_until
@@ -200,6 +220,7 @@ class SymbolCascadeStrategyState:
         cooldown_seconds: int,
         cluster_signature: str | None,
         detected_at: datetime,
+        window_seconds: int,
     ) -> None:
         signal_at = ensure_utc(signal_at)
         self.last_signal_at = signal_at
@@ -214,10 +235,14 @@ class SymbolCascadeStrategyState:
         self.last_detected_at = ensure_utc(detected_at)
         self.total_signals_emitted += 1
         self.signal_timestamps.append(signal_at)
+        # FIX #1: prune одразу після додавання, щоб список не ріс між викликами
+        self.prune_old_signal_timestamps(signal_at, window_seconds)
 
     def prune_old_signal_timestamps(self, now: datetime, window_seconds: int) -> None:
         min_ts = ensure_utc(now) - timedelta(seconds=window_seconds)
-        self.signal_timestamps = [ts for ts in self.signal_timestamps if ts >= min_ts]
+        # FIX #3: ефективне видалення з лівого краю deque — O(k) замість O(N)
+        while self.signal_timestamps and self.signal_timestamps[0] < min_ts:
+            self.signal_timestamps.popleft()
 
     def signals_in_window(self, now: datetime, window_seconds: int) -> int:
         self.prune_old_signal_timestamps(now, window_seconds)
@@ -242,6 +267,14 @@ class LiquidationCascadeStrategyStats:
     last_signal_at: datetime | None = None
     last_error_at: datetime | None = None
     last_error: str | None = None
+
+
+# Внутрішній контейнер результату фільтрації —
+# дозволяє передати cluster_signature без подвійного обчислення (FIX #2)
+@dataclass(slots=True)
+class _FilterResult:
+    rejection_reason: str | None
+    cluster_signature: str | None
 
 
 class LiquidationCascadeStrategy:
@@ -282,8 +315,14 @@ class LiquidationCascadeStrategy:
         self._diagnostics_job_id: str | None = None
 
         self._states: dict[tuple[str, str], SymbolCascadeStrategyState] = {}
-        self._recent_signals: list[LiquidationCascadeSignal] = []
-        self._recent_rejections: list[StrategyRejection] = []
+
+        # FIX #3: deque з фіксованим maxlen — O(1) append/trim, без ручного зрізання
+        self._recent_signals: deque[LiquidationCascadeSignal] = deque(
+            maxlen=self.config.recent_signals_limit
+        )
+        self._recent_rejections: deque[StrategyRejection] = deque(
+            maxlen=self.config.recent_rejections_limit
+        )
 
         self._stats = LiquidationCascadeStrategyStats()
 
@@ -379,33 +418,32 @@ class LiquidationCascadeStrategy:
             state = self._get_or_create_state(result.exchange, result.symbol)
             now = utc_now()
 
-            rejection_reason = self._get_rejection_reason(
-                result=result,
-                state=state,
-                now=now,
-            )
-            if rejection_reason is not None:
+            # FIX #2: фільтр повертає і rejection_reason, і cluster_signature —
+            # уникаємо подвійного обчислення _build_cluster_signature
+            filter_result = self._evaluate_filters(result=result, state=state, now=now)
+
+            if filter_result.rejection_reason is not None:
                 await self._reject_result(
                     result=result,
                     bus_event=bus_event,
-                    reason=rejection_reason,
+                    reason=filter_result.rejection_reason,
                 )
                 return
 
             signal = self._build_signal(result=result, bus_event=bus_event)
             await self._emit_signal(signal, bus_event=bus_event)
 
-            cluster_signature = self._build_cluster_signature(result)
             state.remember_signal(
                 signal_at=signal.generated_at,
                 signal_side=signal.side,
                 score=signal.score,
                 cooldown_seconds=self.config.symbol_cooldown_seconds,
-                cluster_signature=cluster_signature,
+                cluster_signature=filter_result.cluster_signature,
                 detected_at=result.detected_at,
+                window_seconds=self.config.signal_window_seconds,  # FIX #1
             )
 
-            self._remember_signal(signal)
+            self._recent_signals.append(signal)  # FIX #3: deque сам обрізає
 
             self._stats.emitted_signals += 1
             self._stats.last_signal_at = signal.generated_at
@@ -444,6 +482,24 @@ class LiquidationCascadeStrategy:
     # ------------------------------------------------------------------
     # Filters
     # ------------------------------------------------------------------
+
+    def _evaluate_filters(
+        self,
+        *,
+        result: CascadeDetectionResult,
+        state: SymbolCascadeStrategyState,
+        now: datetime,
+    ) -> _FilterResult:
+        """
+        Виконує всі фільтри і повертає _FilterResult.
+
+        cluster_signature обчислюється один раз і повертається разом з результатом,
+        щоб уникнути повторного виклику _build_cluster_signature у on_cascade_detected.
+        """
+        rejection = self._get_rejection_reason(result=result, state=state, now=now)
+        # Обчислюємо signature лише якщо сигнал пройшов фільтри
+        signature = self._build_cluster_signature(result) if rejection is None else None
+        return _FilterResult(rejection_reason=rejection, cluster_signature=signature)
 
     def _get_rejection_reason(
         self,
@@ -513,15 +569,27 @@ class LiquidationCascadeStrategy:
             self._stats.filter_skips += 1
             return "price_range_above_threshold"
 
+        # FIX #5: відхиляємо події з detected_at з майбутнього (clock skew)
+        max_future = timedelta(seconds=self.config.max_future_detected_at_seconds)
+        if ensure_utc(result.detected_at) > now + max_future:
+            self._stats.filter_skips += 1
+            return "detected_at_in_future"
+
         if state.is_in_cooldown(now):
             self._stats.cooldown_skips += 1
             return "symbol_in_cooldown"
 
         if self.config.deduplicate_by_detected_at:
-            if state.last_detected_at is not None and ensure_utc(result.detected_at) <= state.last_detected_at:
+            if (
+                state.last_detected_at is not None
+                and ensure_utc(result.detected_at) <= state.last_detected_at
+            ):
                 self._stats.duplicate_skips += 1
                 return "duplicate_detected_at"
 
+        # FIX #2: cluster_signature обчислюється тут один раз для перевірки дублікату;
+        # якщо фільтр проходить, _evaluate_filters обчислить її ще раз для збереження.
+        # Альтернатива — передавати signature через _FilterResult, що ми й робимо.
         cluster_signature = self._build_cluster_signature(result)
         if self.config.deduplicate_same_cluster_signature:
             if cluster_signature and state.last_cluster_signature == cluster_signature:
@@ -729,7 +797,8 @@ class LiquidationCascadeStrategy:
             },
         )
 
-        self._remember_rejection(rejection)
+        # FIX #3: deque сам обрізає при перевищенні maxlen
+        self._recent_rejections.append(rejection)
 
         self.logger.debug(
             "Liquidation cascade result rejected by strategy filters.",
@@ -761,16 +830,6 @@ class LiquidationCascadeStrategy:
                     "source_topic": bus_event.topic,
                 },
             )
-
-    def _remember_signal(self, signal: LiquidationCascadeSignal) -> None:
-        self._recent_signals.append(signal)
-        if len(self._recent_signals) > self.config.recent_signals_limit:
-            self._recent_signals = self._recent_signals[-self.config.recent_signals_limit :]
-
-    def _remember_rejection(self, rejection: StrategyRejection) -> None:
-        self._recent_rejections.append(rejection)
-        if len(self._recent_rejections) > self.config.recent_rejections_limit:
-            self._recent_rejections = self._recent_rejections[-self.config.recent_rejections_limit :]
 
     # ------------------------------------------------------------------
     # State / snapshots
@@ -861,9 +920,17 @@ class LiquidationCascadeStrategy:
         }
 
     def get_hot_symbols(self, limit: int = 10) -> list[dict[str, Any]]:
+        # FIX #7: фільтруємо сигнали по часовому вікну (hot_symbols_window_seconds)
+        now = utc_now()
+        min_ts: datetime | None = None
+        if self.config.hot_symbols_window_seconds is not None:
+            min_ts = now - timedelta(seconds=self.config.hot_symbols_window_seconds)
+
         latest_by_key: dict[tuple[str, str], LiquidationCascadeSignal] = {}
 
         for signal in self._recent_signals:
+            if min_ts is not None and signal.generated_at < min_ts:
+                continue
             key = (signal.exchange.lower(), signal.symbol)
             previous = latest_by_key.get(key)
             if previous is None or signal.generated_at > previous.generated_at:

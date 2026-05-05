@@ -4,10 +4,13 @@ import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 
 # =============================================================================
@@ -27,15 +30,28 @@ def ensure_utc(dt: datetime | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def serialize_for_event(value: Any) -> Any:
+    """Convert common non-JSON-safe values before putting them into EventBus payloads."""
+    if isinstance(value, datetime):
+        return ensure_utc(value).isoformat() if ensure_utc(value) else None
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(k): serialize_for_event(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [serialize_for_event(item) for item in value]
+    return value
+
+
 # =============================================================================
 # Enums / Dataclasses
 # =============================================================================
 
 
 class FundingSetupStatus(str, Enum):
-    """
-    Поточний життєвий цикл funding setup в strategy layer.
-    """
+    """Поточний життєвий цикл funding setup в strategy layer."""
 
     IDLE = "idle"
     SETUP_DETECTED = "setup_detected"
@@ -46,9 +62,7 @@ class FundingSetupStatus(str, Enum):
 
 
 class FundingStrategyDirection(str, Enum):
-    """
-    Напрямок очікуваного трейду.
-    """
+    """Напрямок очікуваного трейду."""
 
     LONG = "long"
     SHORT = "short"
@@ -60,12 +74,10 @@ class BaseFundingStrategyConfig:
     """
     Базовий конфіг для funding strategy layer.
 
-    Це спільний набір налаштувань для будь-якої funding-стратегії:
-    - TTL setup
-    - cooldown
-    - freshness checks
-    - timeouts для lock
-    - базова політика повторного emit
+    Узгоджено з core:
+    - EventBus priority/header/correlation support
+    - Scheduler-compatible cleanup
+    - validate() як у core.config-style dataclass configs
     """
 
     setup_ttl_sec: float = 15 * 60.0
@@ -85,21 +97,41 @@ class BaseFundingStrategyConfig:
 
     strategy_namespace: str = "strategy.funding.base"
     source_name: str = "funding_strategy_base"
+    service_name: str = "funding_strategy_base"
+
+    setup_priority: EventPriority = EventPriority.NORMAL
+    confirmation_priority: EventPriority = EventPriority.HIGH
+    invalidation_priority: EventPriority = EventPriority.NORMAL
+    expiration_priority: EventPriority = EventPriority.LOW
+
+    enable_scheduler_cleanup: bool = True
+    cleanup_interval_sec: float = 30.0
+    cleanup_job_timeout_sec: float = 10.0
+
+    def validate(self) -> None:
+        if self.setup_ttl_sec <= 0:
+            raise ValueError("setup_ttl_sec must be > 0")
+        if self.cooldown_sec < 0:
+            raise ValueError("cooldown_sec must be >= 0")
+        if self.event_stale_after_sec <= 0:
+            raise ValueError("event_stale_after_sec must be > 0")
+        if self.state_lock_timeout_sec <= 0:
+            raise ValueError("state_lock_timeout_sec must be > 0")
+        if not self.strategy_namespace.strip():
+            raise ValueError("strategy_namespace must not be empty")
+        if not self.source_name.strip():
+            raise ValueError("source_name must not be empty")
+        if not self.service_name.strip():
+            raise ValueError("service_name must not be empty")
+        if self.cleanup_interval_sec <= 0:
+            raise ValueError("cleanup_interval_sec must be > 0")
+        if self.cleanup_job_timeout_sec <= 0:
+            raise ValueError("cleanup_job_timeout_sec must be > 0")
 
 
 @dataclass(slots=True)
 class FundingStrategyState:
-    """
-    Локальний strategy-state по конкретному symbol/exchange.
-
-    Тут зберігається:
-    - поточний статус setup
-    - напрям
-    - score/confidence
-    - час створення / підтвердження / інвалідації
-    - останні funding analytics events/state
-    - довільні metadata / reasons
-    """
+    """Локальний strategy-state по конкретному symbol/exchange."""
 
     symbol: str
     exchange: str
@@ -192,7 +224,7 @@ class FundingStrategyState:
             ),
             "last_emit_time": self.last_emit_time.isoformat() if self.last_emit_time else None,
             "emit_count": self.emit_count,
-            "metadata": dict(self.metadata),
+            "metadata": serialize_for_event(dict(self.metadata)),
         }
 
 
@@ -205,77 +237,155 @@ class BaseFundingStrategy(ABC):
     """
     Базовий клас для strategy/funding/*.
 
-    Відповідальність:
-    - тримати локальний state по symbol/exchange
-    - дати helper-методи для setup lifecycle
-    - забезпечити уніфікований emit strategy events у EventBus
-    - прибрати дублювання між funding strategies
-
-    НЕ відповідає за конкретну торгову логіку.
-    Вся конкретна логіка живе в дочірніх класах.
+    Відповідність core:
+    - typed EventBus / Subscription / EventPriority
+    - lifecycle start / stop / restart + backward-compatible register()
+    - subscriptions зберігаються і коректно unsubscribe-яться
+    - Scheduler cleanup optional
+    - get_logger(__name__, event_type="strategy", strategies=...)
+    - EventBus.emit з priority / source / correlation_id / headers
     """
 
     def __init__(
         self,
-        event_bus: Any,
+        event_bus: EventBus,
         config: BaseFundingStrategyConfig | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
+        if event_bus is None:
+            raise ValueError("event_bus is required")
+
         self.event_bus = event_bus
         self.config = config or BaseFundingStrategyConfig()
-        self.logger = get_logger(__name__)
+        self.config.validate()
+        self.scheduler = scheduler
+
+        self.logger = get_logger(
+            __name__,
+            service_name=self.config.service_name,
+            event_type="strategy",
+            strategies=self.config.source_name,
+        )
 
         self._states: dict[str, FundingStrategyState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._subscriptions: list[Subscription] = []
+        self._cleanup_job_id: str | None = None
         self._registered: bool = False
+        self._running: bool = False
+        self._stopping: bool = False
 
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
 
+    async def start(self) -> None:
+        if self._running:
+            self.logger.warning("Funding strategy already running | strategy=%s", self.strategy_name)
+            return
+
+        self._running = True
+        self._stopping = False
+        self.register()
+        self._register_scheduler_jobs()
+
+        self.logger.info(
+            "Funding strategy started | strategy=%s namespace=%s subscriptions=%s",
+            self.strategy_name,
+            self.config.strategy_namespace,
+            len(self._subscriptions),
+        )
+
+    async def stop(self) -> None:
+        if not self._running and not self._registered:
+            return
+
+        self._stopping = True
+        self._running = False
+
+        self.unregister()
+        self._unregister_scheduler_jobs()
+
+        self.logger.info(
+            "Funding strategy stopped | strategy=%s states=%s",
+            self.strategy_name,
+            len(self._states),
+        )
+        self._stopping = False
+
+    async def restart(self) -> None:
+        await self.stop()
+        await self.start()
+
     def register(self) -> None:
-        """
-        Реєстрація підписок дочірнього класу.
-        """
+        """Backward-compatible sync registration API."""
         if self._registered:
             self.logger.warning("%s already registered", self.__class__.__name__)
             return
 
+        before_ids = self._snapshot_event_bus_subscription_ids()
         self.register_subscriptions()
+        self._capture_new_event_bus_subscriptions(before_ids)
         self._registered = True
 
         self.logger.info(
-            "%s registered successfully: namespace=%s",
+            "%s registered successfully | namespace=%s subscriptions=%s",
             self.__class__.__name__,
             self.config.strategy_namespace,
+            len(self._subscriptions),
         )
+
+    def unregister(self) -> None:
+        if not self._registered and not self._subscriptions:
+            return
+
+        for subscription in list(self._subscriptions):
+            try:
+                self.event_bus.unsubscribe(subscription)
+            except ValueError:
+                pass
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsubscribe funding strategy handler | strategy=%s pattern=%s",
+                    self.strategy_name,
+                    getattr(subscription, "pattern", "unknown"),
+                )
+
+        self._subscriptions.clear()
+        self._registered = False
+
+    def subscribe(
+        self,
+        pattern: str,
+        handler: Any,
+        *,
+        name: str | None = None,
+    ) -> Subscription:
+        """Preferred subscription helper for child classes."""
+        subscription = self.event_bus.subscribe(
+            pattern,
+            handler,
+            name=name or f"{self.strategy_name}.{getattr(handler, '__name__', 'handler')}",
+        )
+        if subscription not in self._subscriptions:
+            self._subscriptions.append(subscription)
+        return subscription
 
     @abstractmethod
     def register_subscriptions(self) -> None:
-        """
-        Тут дочірній клас має викликати event_bus.subscribe(...).
-        """
+        """Дочірній клас має підписатися через self.subscribe(...)."""
         raise NotImplementedError
 
     @property
     @abstractmethod
     def strategy_name(self) -> str:
-        """
-        Коротка canonical назва стратегії.
-        Наприклад:
-        - funding_extreme_reversal
-        - funding_divergence
-        """
         raise NotImplementedError
 
     # -------------------------------------------------------------------------
     # State access
     # -------------------------------------------------------------------------
 
-    def get_state(
-        self,
-        symbol: str,
-        exchange: str = "unknown",
-    ) -> FundingStrategyState:
+    def get_state(self, symbol: str, exchange: str = "unknown") -> FundingStrategyState:
         key = self._make_key(symbol, exchange)
         state = self._states.get(key)
 
@@ -301,11 +411,6 @@ class BaseFundingStrategy(ABC):
         exchange: str = "unknown",
         preserve_cooldown: bool = True,
     ) -> FundingStrategyState:
-        """
-        Повний reset state для символу.
-
-        Може бути корисно після hard invalidation, manual reset або restart recovery.
-        """
         previous = self.get_state(symbol, exchange)
         cooldown_until = previous.cooldown_until if preserve_cooldown else None
 
@@ -314,7 +419,11 @@ class BaseFundingStrategy(ABC):
             exchange=exchange,
             strategy_name=self.strategy_name,
             cooldown_until=cooldown_until,
-            status=FundingSetupStatus.COOLDOWN if cooldown_until and cooldown_until > utc_now() else FundingSetupStatus.IDLE,
+            status=(
+                FundingSetupStatus.COOLDOWN
+                if cooldown_until and cooldown_until > utc_now()
+                else FundingSetupStatus.IDLE
+            ),
         )
 
         new_state.last_regime = previous.last_regime
@@ -331,14 +440,7 @@ class BaseFundingStrategy(ABC):
     # Locking
     # -------------------------------------------------------------------------
 
-    async def acquire_symbol_lock(
-        self,
-        symbol: str,
-        exchange: str = "unknown",
-    ) -> asyncio.Lock | None:
-        """
-        Helper для дочірніх стратегій, щоб серіалізувати оновлення стану по символу.
-        """
+    async def acquire_symbol_lock(self, symbol: str, exchange: str = "unknown") -> asyncio.Lock | None:
         key = self._make_key(symbol, exchange)
         lock = self._locks.setdefault(key, asyncio.Lock())
 
@@ -346,12 +448,15 @@ class BaseFundingStrategy(ABC):
             await asyncio.wait_for(lock.acquire(), timeout=self.config.state_lock_timeout_sec)
             return lock
         except asyncio.TimeoutError:
-            self.logger.warning(
-                "%s lock timeout: strategy=%s symbol=%s exchange=%s",
-                self.__class__.__name__,
+            get_logger(
+                __name__,
+                event_type="strategy",
+                strategies=self.strategy_name,
+                symbol=str(symbol).upper().strip(),
+                exchange=str(exchange).lower().strip(),
+            ).warning(
+                "Funding strategy lock timeout | strategy=%s",
                 self.strategy_name,
-                symbol,
-                exchange,
             )
             return None
 
@@ -396,13 +501,17 @@ class BaseFundingStrategy(ABC):
         state.setup_event_time = ensure_utc(event_time) or now
         state.expires_at = now + timedelta(seconds=ttl)
         state.cooldown_until = None
-        state.metadata = dict(metadata or {})
+        state.metadata = serialize_for_event(dict(metadata or {}))
 
-        self.logger.debug(
-            "%s setup detected: symbol=%s exchange=%s type=%s direction=%s score=%.4f confidence=%.4f",
+        get_logger(
+            __name__,
+            event_type="strategy",
+            strategies=self.strategy_name,
+            symbol=state.symbol,
+            exchange=state.exchange,
+        ).debug(
+            "%s setup detected | type=%s direction=%s score=%.4f confidence=%.4f",
             self.strategy_name,
-            state.symbol,
-            state.exchange,
             setup_type,
             direction.value,
             state.score,
@@ -448,13 +557,17 @@ class BaseFundingStrategy(ABC):
                     state.tags.append(tag)
 
         if metadata:
-            state.metadata.update(metadata)
+            state.metadata.update(serialize_for_event(metadata))
 
-        self.logger.debug(
-            "%s setup confirmed: symbol=%s exchange=%s type=%s direction=%s score=%.4f confidence=%.4f",
+        get_logger(
+            __name__,
+            event_type="strategy",
+            strategies=self.strategy_name,
+            symbol=state.symbol,
+            exchange=state.exchange,
+        ).debug(
+            "%s setup confirmed | type=%s direction=%s score=%.4f confidence=%.4f",
             self.strategy_name,
-            state.symbol,
-            state.exchange,
             state.setup_type,
             state.direction.value,
             state.score,
@@ -481,17 +594,21 @@ class BaseFundingStrategy(ABC):
             state.reasons.append(reason)
 
         if metadata:
-            state.metadata.update(metadata)
+            state.metadata.update(serialize_for_event(metadata))
 
         if cooldown:
             state.cooldown_until = now + timedelta(seconds=self.config.cooldown_sec)
             state.status = FundingSetupStatus.COOLDOWN
 
-        self.logger.debug(
-            "%s setup invalidated: symbol=%s exchange=%s type=%s reason=%s cooldown=%s",
+        get_logger(
+            __name__,
+            event_type="strategy",
+            strategies=self.strategy_name,
+            symbol=state.symbol,
+            exchange=state.exchange,
+        ).debug(
+            "%s setup invalidated | type=%s reason=%s cooldown=%s",
             self.strategy_name,
-            state.symbol,
-            state.exchange,
             state.setup_type,
             reason,
             cooldown,
@@ -519,11 +636,15 @@ class BaseFundingStrategy(ABC):
             state.cooldown_until = now + timedelta(seconds=self.config.cooldown_sec)
             state.status = FundingSetupStatus.COOLDOWN
 
-        self.logger.debug(
-            "%s setup expired: symbol=%s exchange=%s type=%s cooldown=%s",
+        get_logger(
+            __name__,
+            event_type="strategy",
+            strategies=self.strategy_name,
+            symbol=state.symbol,
+            exchange=state.exchange,
+        ).debug(
+            "%s setup expired | type=%s cooldown=%s",
             self.strategy_name,
-            state.symbol,
-            state.exchange,
             state.setup_type,
             cooldown,
         )
@@ -550,13 +671,7 @@ class BaseFundingStrategy(ABC):
 
         return state
 
-    def set_idle(
-        self,
-        state: FundingStrategyState,
-    ) -> FundingStrategyState:
-        """
-        М'який перехід в idle зі збереженням останніх analytics-посилань.
-        """
+    def set_idle(self, state: FundingStrategyState) -> FundingStrategyState:
         preserved_regime = state.last_regime
         preserved_pressure = state.last_pressure
         preserved_extreme = state.last_extreme
@@ -615,6 +730,17 @@ class BaseFundingStrategy(ABC):
         }:
             self.set_expired(state)
 
+    async def cleanup_expired_states(self, *, emit_events: bool = True) -> int:
+        expired_count = 0
+        for state in list(self._states.values()):
+            previous_status = state.status
+            self._expire_state_if_needed(state)
+            if previous_status != state.status and state.status == FundingSetupStatus.COOLDOWN:
+                expired_count += 1
+                if emit_events and self.config.emit_expiration_events:
+                    await self.emit_expired(state, extra_payload={"trigger": "scheduler_cleanup"})
+        return expired_count
+
     # -------------------------------------------------------------------------
     # Analytics attachment helpers
     # -------------------------------------------------------------------------
@@ -648,11 +774,11 @@ class BaseFundingStrategy(ABC):
     # -------------------------------------------------------------------------
 
     def extract_payload(self, event: Any) -> dict[str, Any]:
-        """
-        Уніфіковане витягування payload з event bus event або plain dict.
-        """
         if event is None:
             return {}
+
+        if isinstance(event, Event):
+            return event.payload if isinstance(event.payload, dict) else {}
 
         if isinstance(event, dict):
             if isinstance(event.get("payload"), dict):
@@ -671,27 +797,23 @@ class BaseFundingStrategy(ABC):
 
         return {}
 
-    def extract_symbol_exchange(
-        self,
-        payload: dict[str, Any],
-    ) -> tuple[str, str]:
+    def extract_symbol_exchange(self, payload: dict[str, Any]) -> tuple[str, str]:
         symbol = str(payload.get("symbol", "")).upper().strip()
         exchange = str(payload.get("exchange", "unknown")).lower().strip()
         return symbol, exchange
 
-    def extract_event_time(
-        self,
-        payload: dict[str, Any],
-    ) -> datetime | None:
-        """
-        Підтримує datetime або ISO string.
-        """
+    def extract_event_time(self, payload: dict[str, Any]) -> datetime | None:
         raw = payload.get("event_time") or payload.get("timestamp") or payload.get("ts")
         if raw is None:
             return None
 
         if isinstance(raw, datetime):
             return ensure_utc(raw)
+
+        if isinstance(raw, (int, float)):
+            # Accept seconds or milliseconds timestamps.
+            timestamp = float(raw) / 1000.0 if raw > 10_000_000_000 else float(raw)
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
         if isinstance(raw, str):
             try:
@@ -701,19 +823,13 @@ class BaseFundingStrategy(ABC):
 
         return None
 
-    def event_age_seconds(
-        self,
-        event_time: datetime | None,
-    ) -> float | None:
+    def event_age_seconds(self, event_time: datetime | None) -> float | None:
         event_time = ensure_utc(event_time)
         if event_time is None:
             return None
         return max(0.0, (utc_now() - event_time).total_seconds())
 
-    def is_stale_event(
-        self,
-        event_time: datetime | None,
-    ) -> bool:
+    def is_stale_event(self, event_time: datetime | None) -> bool:
         age = self.event_age_seconds(event_time)
         if age is None:
             return False
@@ -729,18 +845,7 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
-        if not self.config.emit_setup_events:
-            return
-
-        payload = self.build_base_signal_payload(
-            state=state,
-            event_kind="setup",
-            extra_payload=extra_payload,
-        )
-        await self._emit(
-            event_name=f"{self.config.strategy_namespace}.setup",
-            payload=payload,
-        )
+        await self.emit_setup(state, extra_payload=extra_payload)
 
     async def emit_confirmation_event(
         self,
@@ -748,18 +853,7 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
-        if not self.config.emit_confirmation_events:
-            return
-
-        payload = self.build_base_signal_payload(
-            state=state,
-            event_kind="confirmed",
-            extra_payload=extra_payload,
-        )
-        await self._emit(
-            event_name=f"{self.config.strategy_namespace}.confirmed",
-            payload=payload,
-        )
+        await self.emit_confirmed(state, extra_payload=extra_payload)
 
     async def emit_invalidation_event(
         self,
@@ -767,18 +861,7 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
-        if not self.config.emit_invalidation_events:
-            return
-
-        payload = self.build_base_signal_payload(
-            state=state,
-            event_kind="invalidated",
-            extra_payload=extra_payload,
-        )
-        await self._emit(
-            event_name=f"{self.config.strategy_namespace}.invalidated",
-            payload=payload,
-        )
+        await self.emit_invalidated(state, extra_payload=extra_payload)
 
     async def emit_expiration_event(
         self,
@@ -786,18 +869,7 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
-        if not self.config.emit_expiration_events:
-            return
-
-        payload = self.build_base_signal_payload(
-            state=state,
-            event_kind="expired",
-            extra_payload=extra_payload,
-        )
-        await self._emit(
-            event_name=f"{self.config.strategy_namespace}.expired",
-            payload=payload,
-        )
+        await self.emit_expired(state, extra_payload=extra_payload)
 
     def build_base_signal_payload(
         self,
@@ -810,6 +882,7 @@ class BaseFundingStrategy(ABC):
             "symbol": state.symbol,
             "exchange": state.exchange,
             "strategy": self.strategy_name,
+            "strategy_name": self.strategy_name,
             "event_kind": event_kind,
             "status": state.status.value,
             "direction": state.direction.value,
@@ -820,7 +893,7 @@ class BaseFundingStrategy(ABC):
             "reasons": list(state.reasons),
             "tags": list(state.tags),
             "event_time": utc_now().isoformat(),
-            "metadata": dict(state.metadata),
+            "metadata": serialize_for_event(dict(state.metadata)),
         }
 
         if self.config.attach_full_state_on_emit:
@@ -831,36 +904,69 @@ class BaseFundingStrategy(ABC):
             payload["funding_context"] = funding_context
 
         if extra_payload:
-            payload.update(extra_payload)
+            payload.update(serialize_for_event(extra_payload))
 
-        return payload
+        return serialize_for_event(payload)
 
     async def _emit(
         self,
         *,
         event_name: str,
         payload: dict[str, Any],
-    ) -> None:
+        priority: EventPriority | None = None,
+        correlation_id: str | None = None,
+        headers: dict[str, Any] | None = None,
+    ) -> bool:
+        event_kind = str(payload.get("event_kind", "unknown"))
+        resolved_priority = priority or self._priority_for_event_kind(event_kind)
+        symbol = str(payload.get("symbol", "")).upper().strip()
+        exchange = str(payload.get("exchange", "unknown")).lower().strip()
+        resolved_correlation_id = correlation_id or str(
+            payload.get("correlation_id")
+            or payload.get("source_event_id")
+            or f"{self.strategy_name}:{exchange}:{symbol}:{event_kind}:{payload.get('event_time', '')}"
+        )
+        resolved_headers = {
+            "strategy": self.strategy_name,
+            "strategy_namespace": self.config.strategy_namespace,
+            "event_kind": event_kind,
+            "symbol": symbol,
+            "exchange": exchange,
+        }
+        if headers:
+            resolved_headers.update(serialize_for_event(headers))
+
         try:
-            await self.event_bus.emit(
+            accepted = await self.event_bus.emit(
                 event_name,
-                payload,
+                serialize_for_event(payload),
+                priority=resolved_priority,
                 source=self.config.source_name,
+                correlation_id=resolved_correlation_id,
+                headers=resolved_headers,
             )
 
-            symbol = str(payload.get("symbol", "")).upper().strip()
-            exchange = str(payload.get("exchange", "unknown")).lower().strip()
             state = self._states.get(self._make_key(symbol, exchange))
             if state is not None:
                 state.last_emit_time = utc_now()
                 state.emit_count += 1
 
-        except Exception:
+            return accepted
+
+        except RuntimeError:
             self.logger.exception(
-                "Failed to emit strategy event: strategy=%s event_name=%s",
+                "EventBus rejected funding strategy event | strategy=%s event_name=%s",
                 self.strategy_name,
                 event_name,
             )
+            return False
+        except Exception:
+            self.logger.exception(
+                "Failed to emit funding strategy event | strategy=%s event_name=%s",
+                self.strategy_name,
+                event_name,
+            )
+            return False
 
     # -------------------------------------------------------------------------
     # Score / direction / key helpers
@@ -891,15 +997,7 @@ class BaseFundingStrategy(ABC):
     # Protected composition helpers
     # -------------------------------------------------------------------------
 
-    def _build_funding_context(
-        self,
-        state: FundingStrategyState,
-    ) -> dict[str, Any]:
-        """
-        Формує компактний funding context для emit payload.
-        Працює максимально обережно через getattr, щоб не падати
-        на різних типах funding events/state.
-        """
+    def _build_funding_context(self, state: FundingStrategyState) -> dict[str, Any]:
         context: dict[str, Any] = {}
 
         regime = state.last_regime
@@ -910,85 +1008,98 @@ class BaseFundingStrategy(ABC):
 
         pressure = state.last_pressure
         if pressure is not None:
-            context["pressure_direction"] = getattr(
-                getattr(pressure, "direction", None),
-                "value",
-                None,
-            )
-            context["pressure_level"] = getattr(
-                getattr(pressure, "level", None),
-                "value",
-                None,
-            )
+            context["pressure_direction"] = getattr(getattr(pressure, "direction", None), "value", None)
+            context["pressure_level"] = getattr(getattr(pressure, "level", None), "value", None)
             context["pressure_score"] = getattr(pressure, "pressure_score", None)
             context["squeeze_probability"] = getattr(pressure, "squeeze_probability", None)
-            context["mean_reversion_probability"] = getattr(
-                pressure,
-                "mean_reversion_probability",
-                None,
-            )
+            context["mean_reversion_probability"] = getattr(pressure, "mean_reversion_probability", None)
 
         extreme = state.last_extreme
         if extreme is not None:
-            context["extreme_type"] = getattr(
-                getattr(extreme, "extreme_type", None),
-                "value",
-                None,
-            )
+            context["extreme_type"] = getattr(getattr(extreme, "extreme_type", None), "value", None)
             context["extreme_severity"] = getattr(extreme, "severity", None)
             context["is_reversal_risk"] = getattr(extreme, "is_reversal_risk", None)
             context["is_squeeze_risk"] = getattr(extreme, "is_squeeze_risk", None)
 
         divergence = state.last_divergence
         if divergence is not None:
-            context["divergence_type"] = getattr(
-                getattr(divergence, "divergence_type", None),
-                "value",
-                None,
-            )
+            context["divergence_type"] = getattr(getattr(divergence, "divergence_type", None), "value", None)
             context["divergence_confidence"] = getattr(divergence, "confidence", None)
 
         flip = state.last_flip
         if flip is not None:
-            context["flip_type"] = getattr(
-                getattr(flip, "flip_type", None),
-                "value",
-                None,
-            )
+            context["flip_type"] = getattr(getattr(flip, "flip_type", None), "value", None)
             context["flip_confidence"] = getattr(flip, "confidence", None)
 
-        return {k: v for k, v in context.items() if v is not None}
+        return serialize_for_event({k: v for k, v in context.items() if v is not None})
+
+    def _priority_for_event_kind(self, event_kind: str) -> EventPriority:
+        if event_kind == "confirmed":
+            return self.config.confirmation_priority
+        if event_kind == "invalidated":
+            return self.config.invalidation_priority
+        if event_kind == "expired":
+            return self.config.expiration_priority
+        return self.config.setup_priority
+
+    def _snapshot_event_bus_subscription_ids(self) -> set[int]:
+        subscriptions = getattr(self.event_bus, "_subscriptions", None)
+        if not isinstance(subscriptions, list):
+            return set()
+        return {id(item) for item in subscriptions}
+
+    def _capture_new_event_bus_subscriptions(self, before_ids: set[int]) -> None:
+        subscriptions = getattr(self.event_bus, "_subscriptions", None)
+        if not isinstance(subscriptions, list):
+            return
+        for subscription in subscriptions:
+            if id(subscription) not in before_ids and subscription not in self._subscriptions:
+                self._subscriptions.append(subscription)
+
+    def _register_scheduler_jobs(self) -> None:
+        if self.scheduler is None or not self.config.enable_scheduler_cleanup:
+            return
+        if self._cleanup_job_id is not None:
+            return
+
+        self._cleanup_job_id = self.scheduler.add_interval_job(
+            name=f"{self.strategy_name}:cleanup_expired_states",
+            func=self.cleanup_expired_states,
+            interval=self.config.cleanup_interval_sec,
+            kwargs={"emit_events": True},
+            run_immediately=False,
+            max_retries=1,
+            retry_delay=1.0,
+            timeout=self.config.cleanup_job_timeout_sec,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    def _unregister_scheduler_jobs(self) -> None:
+        if self.scheduler is None or self._cleanup_job_id is None:
+            self._cleanup_job_id = None
+            return
+        try:
+            self.scheduler.remove_job(self._cleanup_job_id)
+        except KeyError:
+            pass
+        finally:
+            self._cleanup_job_id = None
 
     # -------------------------------------------------------------------------
     # Optional hooks for descendants
     # -------------------------------------------------------------------------
 
-    def on_before_setup_emit(
-        self,
-        state: FundingStrategyState,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
+    def on_before_setup_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
-    def on_before_confirmation_emit(
-        self,
-        state: FundingStrategyState,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
+    def on_before_confirmation_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
-    def on_before_invalidation_emit(
-        self,
-        state: FundingStrategyState,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
+    def on_before_invalidation_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
-    def on_before_expiration_emit(
-        self,
-        state: FundingStrategyState,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
+    def on_before_expiration_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
         return payload
 
     # -------------------------------------------------------------------------
@@ -1001,17 +1112,19 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
+        if not self.config.emit_setup_events:
+            return
         payload = self.build_base_signal_payload(
             state=state,
             event_kind="setup",
             extra_payload=extra_payload,
         )
         payload = self.on_before_setup_emit(state, payload)
-        if self.config.emit_setup_events:
-            await self._emit(
-                event_name=f"{self.config.strategy_namespace}.setup",
-                payload=payload,
-            )
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.setup",
+            payload=payload,
+            priority=self.config.setup_priority,
+        )
 
     async def emit_confirmed(
         self,
@@ -1019,17 +1132,19 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
+        if not self.config.emit_confirmation_events:
+            return
         payload = self.build_base_signal_payload(
             state=state,
             event_kind="confirmed",
             extra_payload=extra_payload,
         )
         payload = self.on_before_confirmation_emit(state, payload)
-        if self.config.emit_confirmation_events:
-            await self._emit(
-                event_name=f"{self.config.strategy_namespace}.confirmed",
-                payload=payload,
-            )
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.confirmed",
+            payload=payload,
+            priority=self.config.confirmation_priority,
+        )
 
     async def emit_invalidated(
         self,
@@ -1037,17 +1152,19 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
+        if not self.config.emit_invalidation_events:
+            return
         payload = self.build_base_signal_payload(
             state=state,
             event_kind="invalidated",
             extra_payload=extra_payload,
         )
         payload = self.on_before_invalidation_emit(state, payload)
-        if self.config.emit_invalidation_events:
-            await self._emit(
-                event_name=f"{self.config.strategy_namespace}.invalidated",
-                payload=payload,
-            )
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.invalidated",
+            payload=payload,
+            priority=self.config.invalidation_priority,
+        )
 
     async def emit_expired(
         self,
@@ -1055,14 +1172,16 @@ class BaseFundingStrategy(ABC):
         *,
         extra_payload: dict[str, Any] | None = None,
     ) -> None:
+        if not self.config.emit_expiration_events:
+            return
         payload = self.build_base_signal_payload(
             state=state,
             event_kind="expired",
             extra_payload=extra_payload,
         )
         payload = self.on_before_expiration_emit(state, payload)
-        if self.config.emit_expiration_events:
-            await self._emit(
-                event_name=f"{self.config.strategy_namespace}.expired",
-                payload=payload,
-            )
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.expired",
+            payload=payload,
+            priority=self.config.expiration_priority,
+        )
