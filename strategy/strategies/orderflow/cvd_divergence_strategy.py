@@ -4,33 +4,33 @@ from dataclasses import dataclass
 from typing import Any
 
 from analytics.orderflow import CvdStats, OrderFlowAnalyzer
-from strategy.base import ContextAwareComponent, NamedEntityMixin, PrioritizedMixin
-from strategy.config import StrategyConfig, StrategyDefinitionConfig
-from strategy.enums import (
-    ConfidenceGrade,
+from core.event_bus import EventBus
+
+from ...config import StrategyConfig
+from ...enums import (
     EntryType,
     ExitType,
     MarketRegime,
     SignalOrigin,
-    SignalPriority,
     SignalSide,
     SignalStatus,
-    SignalStrength,
     StrategyCategory,
     Timeframe,
     TriggerType,
     SetupType,
 )
-from strategy.models import (
+from ...models import (
     EntryPlan,
     ExecutionPlanDraft,
     ExitPlan,
     InvalidationPlan,
+    SignalContext,
     StrategyEvaluation,
     StrategySignal,
     TargetPlan,
-    SignalContext,
 )
+
+from .base_orderflow_strategy import OrderflowStrategyBase
 
 
 @dataclass(slots=True)
@@ -56,6 +56,7 @@ class CvdDivergenceThresholds:
     max_entry_offset_pct: float = 0.0015
     default_stop_buffer_pct: float = 0.0035
     default_tp_rr: float = 2.0
+    max_expected_holding_seconds: int = 300
 
     def validate(self) -> None:
         if self.min_abs_price_change_pct < 0:
@@ -80,13 +81,11 @@ class CvdDivergenceThresholds:
             raise ValueError("default_stop_buffer_pct must be > 0")
         if self.default_tp_rr <= 0:
             raise ValueError("default_tp_rr must be > 0")
+        if self.max_expected_holding_seconds <= 0:
+            raise ValueError("max_expected_holding_seconds must be > 0")
 
 
-class CvdDivergenceStrategy(
-    ContextAwareComponent,
-    NamedEntityMixin,
-    PrioritizedMixin,
-):
+class CvdDivergenceStrategy(OrderflowStrategyBase):
     """
     Strategy для пошуку divergence між ціною і CVD.
 
@@ -98,17 +97,14 @@ class CvdDivergenceStrategy(
 
     Джерела даних:
     1. SignalContext.feature_map / context.orderflow
-    2. OrderFlowAnalyzer facade (fallback)
+    2. OrderFlowAnalyzer facade fallback
     3. CvdAnalyzer через facade.get_module("cvd") / facade.cvd
-
-    Стратегія сумісна з поточним strategy package і не створює жорсткої
-    залежності на analytics runtime: якщо facade відсутній, працює лише
-    через SignalContext.
     """
 
     STRATEGY_NAME = "cvd_divergence_strategy"
     CATEGORY = StrategyCategory.ORDERFLOW
     DEFAULT_TIMEFRAME = Timeframe.M1
+
     REQUIRED_FEATURES = {
         "orderflow.cvd.price_change_pct",
         "orderflow.cvd.cvd_change_pct",
@@ -121,30 +117,19 @@ class CvdDivergenceStrategy(
         *,
         orderflow_analyzer: OrderFlowAnalyzer | None = None,
         thresholds: CvdDivergenceThresholds | None = None,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
         logger: Any | None = None,
     ) -> None:
-        super().__init__(config=config, event_bus=event_bus, logger=logger)
-        self.orderflow_analyzer = orderflow_analyzer
+        super().__init__(
+            config=config,
+            orderflow_analyzer=orderflow_analyzer,
+            event_bus=event_bus,
+            logger=logger,
+        )
         self.thresholds = thresholds or CvdDivergenceThresholds()
 
         self.validate_config()
         self.thresholds.validate()
-
-    @property
-    def priority(self) -> int:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None:
-            return strategy_cfg.priority
-        return 100
-
-    @property
-    def strategy_definition(self) -> StrategyDefinitionConfig | None:
-        return self.config.get_strategy(self.STRATEGY_NAME)
-
-    @property
-    def component_name(self) -> str:
-        return self.STRATEGY_NAME
 
     @property
     def supported_regimes(self) -> set[MarketRegime]:
@@ -157,53 +142,13 @@ class CvdDivergenceStrategy(
             MarketRegime.UNKNOWN,
         }
 
-    def is_enabled(self) -> bool:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is None:
-            return True
-        return strategy_cfg.runtime.enabled
-
-    def required_features(self) -> set[str]:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None and strategy_cfg.required_features:
-            return set(strategy_cfg.required_features)
-        return set(self.REQUIRED_FEATURES)
-
     def can_evaluate(self, context: SignalContext) -> bool:
         self.validate_context(context)
 
         if not self.is_enabled():
             return False
 
-        runtime = self.config.runtime
-        strategy_cfg = self.strategy_definition
-
-        allowed_symbols = []
-        if strategy_cfg is not None and strategy_cfg.runtime.symbols:
-            allowed_symbols = strategy_cfg.runtime.symbols
-        elif runtime.symbols:
-            allowed_symbols = runtime.symbols
-
-        if allowed_symbols and context.symbol not in allowed_symbols:
-            return False
-
-        allowed_timeframes = []
-        if strategy_cfg is not None and strategy_cfg.runtime.timeframes:
-            allowed_timeframes = strategy_cfg.runtime.timeframes
-        elif runtime.timeframes:
-            allowed_timeframes = runtime.timeframes
-
-        if allowed_timeframes and context.timeframe not in allowed_timeframes:
-            return False
-
-        regime = context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN
-        allowed_regimes = []
-        if strategy_cfg is not None and strategy_cfg.runtime.allowed_regimes:
-            allowed_regimes = strategy_cfg.runtime.allowed_regimes
-        elif runtime.allowed_regimes:
-            allowed_regimes = runtime.allowed_regimes
-
-        if allowed_regimes and regime not in allowed_regimes and MarketRegime.UNKNOWN not in allowed_regimes:
+        if not self._runtime_allows_context(context):
             return False
 
         stats = self._resolve_cvd_stats(context)
@@ -236,22 +181,29 @@ class CvdDivergenceStrategy(
             evaluation.reasons.append("cvd_stats_unavailable")
             return evaluation
 
-        divergence_side = self._detect_divergence_side(stats)
-        if divergence_side == SignalSide.UNKNOWN:
+        side = self._detect_divergence_side(stats)
+        if side == SignalSide.UNKNOWN:
             evaluation.reasons.append("no_cvd_divergence_detected")
             return evaluation
 
-        score = self._calculate_score(stats, divergence_side)
-        confidence = self._calculate_confidence(stats, divergence_side, context)
-        reasons = self._build_reasons(stats, divergence_side)
-        confirmations = self._build_confirmations(stats, divergence_side, context)
+        score = self._calculate_score(stats, side, context)
+        confidence = self._calculate_confidence(stats, side, context)
+        reasons = self._build_reasons(stats, side)
+        confirmations = self._build_confirmations(stats, side, context)
 
         evaluation.score = score
         evaluation.confidence = confidence
         evaluation.reasons.extend(reasons)
 
-        min_confidence = self._get_min_confidence()
         min_score = self._get_min_score()
+        min_confidence = self._get_min_confidence()
+
+        side_score_threshold = (
+            self.thresholds.bullish_divergence_score_threshold
+            if side == SignalSide.LONG
+            else self.thresholds.bearish_divergence_score_threshold
+        )
+        min_score = max(min_score, side_score_threshold)
 
         if score < min_score:
             evaluation.reasons.append("score_below_threshold")
@@ -264,7 +216,7 @@ class CvdDivergenceStrategy(
         signal = self._build_signal(
             context=context,
             stats=stats,
-            side=divergence_side,
+            side=side,
             score=score,
             confidence=confidence,
             reasons=reasons,
@@ -328,7 +280,7 @@ class CvdDivergenceStrategy(
             )
 
         try:
-            module = facade.get_module("cvd")
+            module = facade.get_module("cvd") if hasattr(facade, "get_module") else None
             if module is not None:
                 result = module.get_latest_stats(context.symbol)
                 if isinstance(result, CvdStats):
@@ -344,9 +296,11 @@ class CvdDivergenceStrategy(
 
     def _build_stats_from_context(self, context: SignalContext) -> CvdStats | None:
         """
-        Відновлює CvdStats з StrategyContext/SignalContext.
+        Відновлює CvdStats з SignalContext.
 
-        Підтримує і feature_map, і context.orderflow словник.
+        Підтримує:
+        - context.orderflow["cvd"]
+        - context.get_feature_snapshot(...)
         """
         symbol = context.symbol
         timestamp = context.timestamp.timestamp()
@@ -406,7 +360,9 @@ class CvdDivergenceStrategy(
     def _extract_orderflow_cvd_payload(self, context: SignalContext) -> dict[str, Any]:
         payload: dict[str, Any] = {}
 
-        raw_orderflow = context.orderflow.get("cvd")
+        orderflow = context.orderflow if isinstance(context.orderflow, dict) else {}
+        raw_orderflow = orderflow.get("cvd")
+
         if isinstance(raw_orderflow, dict):
             payload.update(raw_orderflow)
 
@@ -442,6 +398,7 @@ class CvdDivergenceStrategy(
         for target_name, aliases in feature_aliases.items():
             if target_name in payload:
                 continue
+
             for alias in aliases:
                 snapshot = context.get_feature_snapshot(alias)
                 if snapshot is not None:
@@ -451,7 +408,7 @@ class CvdDivergenceStrategy(
         return payload
 
     # ------------------------------------------------------------------
-    # Core logic
+    # Core divergence logic
     # ------------------------------------------------------------------
 
     def _detect_divergence_side(self, stats: CvdStats) -> SignalSide:
@@ -476,17 +433,42 @@ class CvdDivergenceStrategy(
 
         if bullish_divergence and not bearish_divergence:
             return SignalSide.LONG
+
         if bearish_divergence and not bullish_divergence:
             return SignalSide.SHORT
+
         return SignalSide.UNKNOWN
 
-    def _calculate_score(self, stats: CvdStats, side: SignalSide) -> float:
-        price_component = self._normalize_percent(abs(float(stats.price_change_pct or 0.0)))
-        cvd_component = self._normalize_percent(abs(float(stats.cvd_change_pct or 0.0)))
-        delta_component = min(abs(float(stats.delta_ratio)) / 0.50, 1.0)
-        slope_component = self._normalize_magnitude(abs(float(stats.cvd_slope)))
-        flow_balance_component = max(float(stats.buy_ratio), float(stats.sell_ratio))
-        trades_component = min(float(stats.trades_count) / max(self.thresholds.min_trades_count * 2, 1), 1.0)
+    def _calculate_score(
+        self,
+        stats: CvdStats,
+        side: SignalSide,
+        context: SignalContext,
+    ) -> float:
+        price_component = self._normalize_percent(
+            abs(float(stats.price_change_pct or 0.0)),
+            scale=2.0,
+        )
+        cvd_component = self._normalize_percent(
+            abs(float(stats.cvd_change_pct or 0.0)),
+            scale=2.0,
+        )
+        delta_component = self._normalize_ratio(
+            abs(float(stats.delta_ratio)),
+            scale=0.50,
+        )
+        slope_component = self._normalize_magnitude(
+            abs(float(stats.cvd_slope)),
+            scale=10.0,
+        )
+        flow_balance_component = max(
+            min(float(stats.buy_ratio), 1.0),
+            min(float(stats.sell_ratio), 1.0),
+        )
+        trades_component = min(
+            float(stats.trades_count) / max(self.thresholds.min_trades_count * 2, 1),
+            1.0,
+        )
 
         raw_score = (
             (price_component * 0.18)
@@ -497,12 +479,12 @@ class CvdDivergenceStrategy(
             + (trades_component * 0.10)
         )
 
-        category_weight = self.config.get_category_weight(self.CATEGORY)
-        regime_adjustment = self.config.get_regime_adjustment(MarketRegime.UNKNOWN)
-        strategy_weight = self.config.get_strategy_weight(self.STRATEGY_NAME, default=1.0)
+        weighted_score = raw_score
+        weighted_score *= self._category_weight()
+        weighted_score *= self._regime_adjustment(context)
+        weighted_score *= self._strategy_weight()
 
-        final_score = raw_score * category_weight * regime_adjustment * strategy_weight
-        return max(0.0, final_score)
+        return max(0.0, weighted_score)
 
     def _calculate_confidence(
         self,
@@ -510,13 +492,16 @@ class CvdDivergenceStrategy(
         side: SignalSide,
         context: SignalContext,
     ) -> float:
-        components: list[float] = []
-
-        components.append(min(abs(float(stats.delta_ratio)) / 0.35, 1.0))
-        components.append(self._normalize_percent(abs(float(stats.cvd_change_pct or 0.0))))
-        components.append(self._normalize_percent(abs(float(stats.price_change_pct or 0.0))))
-        components.append(self._normalize_magnitude(abs(float(stats.cvd_slope))))
-        components.append(min(float(stats.trades_count) / max(self.thresholds.min_trades_count * 2, 1), 1.0))
+        components: list[float] = [
+            self._normalize_ratio(abs(float(stats.delta_ratio)), scale=0.35),
+            self._normalize_percent(abs(float(stats.cvd_change_pct or 0.0)), scale=2.0),
+            self._normalize_percent(abs(float(stats.price_change_pct or 0.0)), scale=2.0),
+            self._normalize_magnitude(abs(float(stats.cvd_slope)), scale=10.0),
+            min(
+                float(stats.trades_count) / max(self.thresholds.min_trades_count * 2, 1),
+                1.0,
+            ),
+        ]
 
         if side == SignalSide.LONG:
             components.append(min(max(float(stats.buy_ratio), 0.0), 1.0))
@@ -539,13 +524,16 @@ class CvdDivergenceStrategy(
         if side == SignalSide.LONG:
             reasons.append("price_declining_while_cvd_strengthens")
             reasons.append("bullish_cvd_divergence_detected")
+
             if stats.delta_ratio > 0:
                 reasons.append("positive_delta_ratio_confirmation")
             if stats.cvd_slope > 0:
                 reasons.append("positive_cvd_slope_confirmation")
+
         elif side == SignalSide.SHORT:
             reasons.append("price_rising_while_cvd_weakens")
             reasons.append("bearish_cvd_divergence_detected")
+
             if stats.delta_ratio < 0:
                 reasons.append("negative_delta_ratio_confirmation")
             if stats.cvd_slope < 0:
@@ -569,6 +557,7 @@ class CvdDivergenceStrategy(
                 confirmations.append("buy_flow_dominance")
             if stats.delta_ratio > 0:
                 confirmations.append("positive_volume_delta")
+
         elif side == SignalSide.SHORT:
             if stats.sell_ratio > stats.buy_ratio:
                 confirmations.append("sell_flow_dominance")
@@ -579,7 +568,14 @@ class CvdDivergenceStrategy(
             if context.price.spread_bps <= self.config.filters.max_spread_bps:
                 confirmations.append("spread_filter_ok")
 
+        if context.regime is not None and context.regime.regime in self.supported_regimes:
+            confirmations.append("regime_alignment_ok")
+
         return confirmations
+
+    # ------------------------------------------------------------------
+    # Signal build
+    # ------------------------------------------------------------------
 
     def _build_signal(
         self,
@@ -592,8 +588,6 @@ class CvdDivergenceStrategy(
         reasons: list[str],
         confirmations: list[str],
     ) -> StrategySignal:
-        strength = self._map_strength(confidence)
-        confidence_grade = self._map_confidence_grade(confidence)
         entry_plan = self._build_entry_plan(context, stats, side)
         exit_plan = self._build_exit_plan(context, stats, side, entry_plan)
         invalidation_plan = self._build_invalidation_plan(context, stats, side, entry_plan)
@@ -615,8 +609,8 @@ class CvdDivergenceStrategy(
             timestamp=context.timestamp,
             confidence=confidence,
             score=score,
-            strength=strength,
-            confidence_grade=confidence_grade,
+            strength=self._map_strength(confidence),
+            confidence_grade=self._map_confidence_grade(confidence),
             status=SignalStatus.NEW,
             trigger_type=TriggerType.PRIMARY,
             origin=SignalOrigin.SINGLE_STRATEGY,
@@ -627,7 +621,7 @@ class CvdDivergenceStrategy(
             invalidation_plan=invalidation_plan,
             execution_plan=execution_plan,
             metadata={
-                "source": "cvd_divergence_strategy",
+                "source": self.STRATEGY_NAME,
                 "analytics_metric": "cvd",
                 "uses_orderflow_analyzer_fallback": self.orderflow_analyzer is not None,
                 "cvd_snapshot": {
@@ -657,6 +651,7 @@ class CvdDivergenceStrategy(
             signal.add_source_feature(feature_name)
 
         signal.add_source_feature("orderflow.cvd")
+
         return signal
 
     # ------------------------------------------------------------------
@@ -674,15 +669,14 @@ class CvdDivergenceStrategy(
 
         if ref_price is not None:
             offset = ref_price * self.thresholds.max_entry_offset_pct
+
             if side == SignalSide.LONG:
                 entry_price = ref_price - offset
             elif side == SignalSide.SHORT:
                 entry_price = ref_price + offset
 
         return EntryPlan(
-            entry_type=self.config.builders.default_entry_type
-            if hasattr(self.config.builders, "default_entry_type")
-            else EntryType.MARKET,
+            entry_type=getattr(self.config.builders, "default_entry_type", EntryType.MARKET),
             price=entry_price,
             confirmation_required=False,
             notes=[
@@ -707,26 +701,34 @@ class CvdDivergenceStrategy(
         stop_loss = None
         tp_price = None
 
+        rr = getattr(
+            self.config.builders,
+            "default_rr_ratio",
+            self.thresholds.default_tp_rr,
+        )
+        rr = rr if rr and rr > 0 else self.thresholds.default_tp_rr
+
         if ref_price is not None:
             stop_buffer = ref_price * self.thresholds.default_stop_buffer_pct
-            rr = self.config.builders.default_rr_ratio or self.thresholds.default_tp_rr
 
             if side == SignalSide.LONG:
                 stop_loss = ref_price - stop_buffer
-                risk = ref_price - stop_loss
+                risk = max(ref_price - stop_loss, 0.0)
                 tp_price = ref_price + (risk * rr)
+
             elif side == SignalSide.SHORT:
                 stop_loss = ref_price + stop_buffer
-                risk = stop_loss - ref_price
+                risk = max(stop_loss - ref_price, 0.0)
                 tp_price = ref_price - (risk * rr)
 
         targets: list[TargetPlan] = []
-        if tp_price is not None:
+
+        if tp_price is not None and tp_price > 0:
             targets.append(
                 TargetPlan(
                     price=tp_price,
                     size_fraction=1.0,
-                    rr=self.config.builders.default_rr_ratio,
+                    rr=rr,
                     label="tp1",
                 )
             )
@@ -739,9 +741,13 @@ class CvdDivergenceStrategy(
             ],
             stop_loss=stop_loss,
             take_profit_levels=targets,
-            partial_exit_enabled=self.config.builders.enable_partial_take_profit,
+            partial_exit_enabled=getattr(
+                self.config.builders,
+                "enable_partial_take_profit",
+                True,
+            ),
             metadata={
-                "rr_ratio": self.config.builders.default_rr_ratio,
+                "rr_ratio": rr,
                 "strategy": self.STRATEGY_NAME,
             },
         )
@@ -758,6 +764,7 @@ class CvdDivergenceStrategy(
 
         if ref_price is not None:
             buffer = ref_price * self.thresholds.default_stop_buffer_pct
+
             if side == SignalSide.LONG:
                 invalidation_price = ref_price - buffer
             elif side == SignalSide.SHORT:
@@ -790,7 +797,7 @@ class CvdDivergenceStrategy(
             entry=entry_plan,
             exit=exit_plan,
             invalidation=invalidation_plan,
-            expected_holding_seconds=300,
+            expected_holding_seconds=self.thresholds.max_expected_holding_seconds,
             notes=[
                 "generated_from_cvd_divergence_strategy",
             ],
@@ -799,80 +806,3 @@ class CvdDivergenceStrategy(
                 "strategy_name": self.STRATEGY_NAME,
             },
         )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_reference_price(
-        self,
-        context: SignalContext,
-        stats: CvdStats,
-    ) -> float | None:
-        if context.price is not None:
-            if context.price.mid_price is not None:
-                return context.price.mid_price
-            if context.price.last_price is not None:
-                return context.price.last_price
-        return self._coalesce_float(stats.last_price)
-
-    def _get_min_confidence(self) -> float:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None:
-            return strategy_cfg.runtime.min_confidence
-        return self.config.runtime.min_confidence
-
-    def _get_min_score(self) -> float:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None:
-            return strategy_cfg.runtime.min_score
-        return self.config.runtime.min_score
-
-    def _resolve_priority(self, confidence: float) -> SignalPriority:
-        if confidence >= self.config.confidence.high_threshold:
-            return SignalPriority.HIGH
-        if confidence >= self.config.confidence.low_threshold:
-            return SignalPriority.MEDIUM
-        return SignalPriority.LOW
-
-    def _map_strength(self, confidence: float) -> SignalStrength:
-        if confidence >= self.config.confidence.high_threshold:
-            return SignalStrength.STRONG
-        if confidence >= self.config.confidence.medium_threshold:
-            return SignalStrength.MODERATE
-        if confidence >= self.thresholds.min_strength_for_signal:
-            return SignalStrength.WEAK
-        return SignalStrength.WEAK
-
-    def _map_confidence_grade(self, confidence: float) -> ConfidenceGrade:
-        cfg = self.config.confidence
-        if confidence >= cfg.high_threshold:
-            return ConfidenceGrade.VERY_HIGH
-        if confidence >= cfg.medium_threshold:
-            return ConfidenceGrade.HIGH
-        if confidence >= cfg.low_threshold:
-            return ConfidenceGrade.MEDIUM
-        if confidence >= cfg.very_low_threshold:
-            return ConfidenceGrade.LOW
-        return ConfidenceGrade.VERY_LOW
-
-    @staticmethod
-    def _normalize_percent(value: float) -> float:
-        return max(0.0, min(abs(value) / 2.0, 1.0))
-
-    @staticmethod
-    def _normalize_magnitude(value: float) -> float:
-        if value <= 0:
-            return 0.0
-        return max(0.0, min(value / 10.0, 1.0))
-
-    @staticmethod
-    def _coalesce_float(*values: Any) -> float | None:
-        for value in values:
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None

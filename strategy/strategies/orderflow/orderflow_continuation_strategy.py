@@ -4,19 +4,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from analytics.orderflow import OrderFlowAnalyzer
+from core.event_bus import EventBus
 
-from ...base import ContextAwareComponent, NamedEntityMixin, PrioritizedMixin
-from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...config import StrategyConfig
 from ...enums import (
-    ConfidenceGrade,
     EntryType,
     ExitType,
     MarketRegime,
     SignalOrigin,
-    SignalPriority,
     SignalSide,
     SignalStatus,
-    SignalStrength,
     StrategyCategory,
     Timeframe,
     TriggerType,
@@ -32,6 +29,8 @@ from ...models import (
     StrategySignal,
     TargetPlan,
 )
+
+from .base_orderflow_strategy import OrderflowStrategyBase
 
 
 @dataclass(slots=True)
@@ -134,11 +133,7 @@ class OrderflowContinuationSnapshot:
         return self.trades_count > 0
 
 
-class OrderflowContinuationStrategy(
-    ContextAwareComponent,
-    NamedEntityMixin,
-    PrioritizedMixin,
-):
+class OrderflowContinuationStrategy(OrderflowStrategyBase):
     """
     Strategy continuation по order flow.
 
@@ -174,30 +169,19 @@ class OrderflowContinuationStrategy(
         *,
         orderflow_analyzer: OrderFlowAnalyzer | None = None,
         thresholds: OrderflowContinuationThresholds | None = None,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
         logger: Any | None = None,
     ) -> None:
-        super().__init__(config=config, event_bus=event_bus, logger=logger)
-        self.orderflow_analyzer = orderflow_analyzer
+        super().__init__(
+            config=config,
+            orderflow_analyzer=orderflow_analyzer,
+            event_bus=event_bus,
+            logger=logger,
+        )
         self.thresholds = thresholds or OrderflowContinuationThresholds()
 
         self.validate_config()
         self.thresholds.validate()
-
-    @property
-    def component_name(self) -> str:
-        return self.STRATEGY_NAME
-
-    @property
-    def priority(self) -> int:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None:
-            return strategy_cfg.priority
-        return 100
-
-    @property
-    def strategy_definition(self) -> StrategyDefinitionConfig | None:
-        return self.config.get_strategy(self.STRATEGY_NAME)
 
     @property
     def supported_regimes(self) -> set[MarketRegime]:
@@ -210,37 +194,14 @@ class OrderflowContinuationStrategy(
             MarketRegime.UNKNOWN,
         }
 
-    def is_enabled(self) -> bool:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is None:
-            return True
-        return strategy_cfg.runtime.enabled
-
-    def required_features(self) -> set[str]:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None and strategy_cfg.required_features:
-            return set(strategy_cfg.required_features)
-        return set(self.DEFAULT_REQUIRED_FEATURES)
-
     def can_evaluate(self, context: SignalContext) -> bool:
         self.validate_context(context)
 
         if not self.is_enabled():
             return False
 
-        strategy_cfg = self.strategy_definition
-        runtime_cfg = strategy_cfg.runtime if strategy_cfg is not None else self.config.runtime
-
-        if runtime_cfg.symbols and context.symbol not in runtime_cfg.symbols:
+        if not self._runtime_allows_context(context):
             return False
-
-        if runtime_cfg.timeframes and context.timeframe not in runtime_cfg.timeframes:
-            return False
-
-        regime = context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN
-        if runtime_cfg.allowed_regimes:
-            if regime not in runtime_cfg.allowed_regimes and MarketRegime.UNKNOWN not in runtime_cfg.allowed_regimes:
-                return False
 
         snapshot = self._resolve_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
@@ -345,8 +306,13 @@ class OrderflowContinuationStrategy(
         symbol = context.symbol
 
         orderflow = context.orderflow if isinstance(context.orderflow, dict) else {}
+
         cvd = orderflow.get("cvd", {}) if isinstance(orderflow.get("cvd"), dict) else {}
-        volume_delta = orderflow.get("volume_delta", {}) if isinstance(orderflow.get("volume_delta"), dict) else {}
+        volume_delta = (
+            orderflow.get("volume_delta", {})
+            if isinstance(orderflow.get("volume_delta"), dict)
+            else {}
+        )
         aggressive = (
             orderflow.get("aggressive_trades", {})
             if isinstance(orderflow.get("aggressive_trades"), dict)
@@ -375,15 +341,18 @@ class OrderflowContinuationStrategy(
                 cvd.get("price_change_pct"),
                 0.0,
             ) or 0.0,
-            trades_count=int(self._coalesce_int(
-                self._feature_value(context, "orderflow.trades_count"),
-                self._feature_value(context, "orderflow.cvd.trades_count"),
-                self._feature_value(context, "orderflow.volume_delta.trades_count"),
-                cvd.get("trades_count"),
-                volume_delta.get("trades_count"),
-                aggressive.get("trades_count"),
-                0,
-            ) or 0),
+            trades_count=int(
+                self._coalesce_int(
+                    self._feature_value(context, "orderflow.trades_count"),
+                    self._feature_value(context, "orderflow.cvd.trades_count"),
+                    self._feature_value(context, "orderflow.volume_delta.trades_count"),
+                    cvd.get("trades_count"),
+                    volume_delta.get("trades_count"),
+                    aggressive.get("trades_count"),
+                    0,
+                )
+                or 0
+            ),
             total_volume=self._coalesce_float(
                 self._feature_value(context, "orderflow.total_volume"),
                 self._feature_value(context, "orderflow.cvd.total_volume"),
@@ -448,13 +417,16 @@ class OrderflowContinuationStrategy(
                 aggressive.get("burst_score"),
                 0.0,
             ) or 0.0,
-            aggressive_large_trade_count=int(self._coalesce_int(
-                self._feature_value(context, "orderflow.aggressive_trades.large_trade_count"),
-                self._feature_value(context, "orderflow.aggressive_trades.large_trades_count"),
-                aggressive.get("large_trade_count"),
-                aggressive.get("large_trades_count"),
-                0,
-            ) or 0),
+            aggressive_large_trade_count=int(
+                self._coalesce_int(
+                    self._feature_value(context, "orderflow.aggressive_trades.large_trade_count"),
+                    self._feature_value(context, "orderflow.aggressive_trades.large_trades_count"),
+                    aggressive.get("large_trade_count"),
+                    aggressive.get("large_trades_count"),
+                    0,
+                )
+                or 0
+            ),
             orderbook_imbalance_ratio=self._coalesce_float(
                 self._feature_value(context, "orderflow.orderbook_imbalance.ratio"),
                 self._feature_value(context, "orderflow.orderbook_imbalance.imbalance_ratio"),
@@ -492,12 +464,15 @@ class OrderflowContinuationStrategy(
                 self._read(vd_stats, "price_change_pct"),
                 0.0,
             ) or 0.0,
-            trades_count=int(self._coalesce_int(
-                self._read(cvd_stats, "trades_count"),
-                self._read(vd_stats, "trades_count"),
-                self._read(aggressive_stats, "trades_count"),
-                0,
-            ) or 0),
+            trades_count=int(
+                self._coalesce_int(
+                    self._read(cvd_stats, "trades_count"),
+                    self._read(vd_stats, "trades_count"),
+                    self._read(aggressive_stats, "trades_count"),
+                    0,
+                )
+                or 0
+            ),
             total_volume=self._coalesce_float(
                 self._read(cvd_stats, "total_volume"),
                 self._read(vd_stats, "total_volume"),
@@ -543,31 +518,20 @@ class OrderflowContinuationStrategy(
                 self._read(aggressive_stats, "burst_score"),
                 0.0,
             ) or 0.0,
-            aggressive_large_trade_count=int(self._coalesce_int(
-                self._read(aggressive_stats, "large_trade_count"),
-                self._read(aggressive_stats, "large_trades_count"),
-                0,
-            ) or 0),
+            aggressive_large_trade_count=int(
+                self._coalesce_int(
+                    self._read(aggressive_stats, "large_trade_count"),
+                    self._read(aggressive_stats, "large_trades_count"),
+                    0,
+                )
+                or 0
+            ),
             orderbook_imbalance_ratio=self._coalesce_float(
                 self._read(imbalance_stats, "imbalance_ratio"),
                 self._read(imbalance_stats, "ratio"),
                 0.0,
             ) or 0.0,
         )
-
-    def _safe_get_latest_stats(self, facade: OrderFlowAnalyzer, module_name: str, symbol: str) -> Any:
-        module = getattr(facade, module_name, None)
-        if module is None and hasattr(facade, "get_module"):
-            module = facade.get_module(module_name)
-
-        if module is None:
-            return None
-
-        getter = getattr(module, "get_latest_stats", None)
-        if not callable(getter):
-            return None
-
-        return getter(symbol)
 
     # ------------------------------------------------------------------
     # Continuation logic
@@ -626,10 +590,15 @@ class OrderflowContinuationStrategy(
         cvd_ratio_component = self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.40)
         volume_ratio_component = self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.45)
         aggression_component = (
-            snapshot.aggressive_buy_ratio if side == SignalSide.LONG else snapshot.aggressive_sell_ratio
+            snapshot.aggressive_buy_ratio
+            if side == SignalSide.LONG
+            else snapshot.aggressive_sell_ratio
         )
         imbalance_component = self._normalize_ratio(abs(snapshot.orderbook_imbalance_ratio), scale=0.25)
-        trades_component = min(snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1), 1.0)
+        trades_component = min(
+            snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1),
+            1.0,
+        )
 
         raw_score = (
             (price_component * 0.16)
@@ -660,7 +629,10 @@ class OrderflowContinuationStrategy(
             self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.35),
             self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.35),
             self._normalize_ratio(abs(snapshot.orderbook_imbalance_ratio), scale=0.20),
-            min(snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1), 1.0),
+            min(
+                snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1),
+                1.0,
+            ),
         ]
 
         if side == SignalSide.LONG:
@@ -672,7 +644,8 @@ class OrderflowContinuationStrategy(
             components.append(0.75)
 
         if context.price is not None and context.price.spread_bps is not None:
-            components.append(1.0 if context.price.spread_bps <= self.config.filters.max_spread_bps else 0.30)
+            spread_ok = context.price.spread_bps <= self.config.filters.max_spread_bps
+            components.append(1.0 if spread_ok else 0.30)
 
         confidence = sum(components) / len(components) if components else 0.0
         return max(0.0, min(confidence, 1.0))
@@ -693,8 +666,10 @@ class OrderflowContinuationStrategy(
                     "aggressive_buyers_dominate",
                 ]
             )
+
             if snapshot.orderbook_imbalance_ratio > 0:
                 reasons.append("orderbook_supports_bid_pressure")
+
         elif side == SignalSide.SHORT:
             reasons.extend(
                 [
@@ -704,6 +679,7 @@ class OrderflowContinuationStrategy(
                     "aggressive_sellers_dominate",
                 ]
             )
+
             if snapshot.orderbook_imbalance_ratio < 0:
                 reasons.append("orderbook_supports_ask_pressure")
 
@@ -730,6 +706,7 @@ class OrderflowContinuationStrategy(
                 confirmations.append("positive_volume_delta")
             if snapshot.orderbook_imbalance_ratio > 0:
                 confirmations.append("positive_orderbook_imbalance")
+
         elif side == SignalSide.SHORT:
             if snapshot.cvd_slope < 0:
                 confirmations.append("negative_cvd_slope")
@@ -742,9 +719,8 @@ class OrderflowContinuationStrategy(
             if context.price.spread_bps <= self.config.filters.max_spread_bps:
                 confirmations.append("spread_filter_ok")
 
-        if context.regime is not None:
-            if context.regime.regime in self.supported_regimes:
-                confirmations.append("regime_alignment_ok")
+        if context.regime is not None and context.regime.regime in self.supported_regimes:
+            confirmations.append("regime_alignment_ok")
 
         return confirmations
 
@@ -796,7 +772,7 @@ class OrderflowContinuationStrategy(
             invalidation_plan=invalidation_plan,
             execution_plan=execution_plan,
             metadata={
-                "source": "orderflow_continuation_strategy",
+                "source": self.STRATEGY_NAME,
                 "analytics_fallback_enabled": self.orderflow_analyzer is not None,
                 "orderflow_snapshot": {
                     "price_change_pct": snapshot.price_change_pct,
@@ -849,6 +825,7 @@ class OrderflowContinuationStrategy(
 
         if ref_price is not None:
             offset = ref_price * self.thresholds.preferred_entry_offset_pct
+
             if side == SignalSide.LONG:
                 entry_price = ref_price + offset
             elif side == SignalSide.SHORT:
@@ -882,7 +859,11 @@ class OrderflowContinuationStrategy(
 
         if ref_price is not None:
             stop_buffer = ref_price * self.thresholds.stop_buffer_pct
-            rr_ratio = getattr(self.config.builders, "default_rr_ratio", self.thresholds.fallback_rr_ratio)
+            rr_ratio = getattr(
+                self.config.builders,
+                "default_rr_ratio",
+                self.thresholds.fallback_rr_ratio,
+            )
             rr_ratio = rr_ratio if rr_ratio and rr_ratio > 0 else self.thresholds.fallback_rr_ratio
 
             if side == SignalSide.LONG:
@@ -912,10 +893,18 @@ class OrderflowContinuationStrategy(
             ],
             stop_loss=stop_loss,
             take_profit_levels=tp_levels,
-            partial_exit_enabled=getattr(self.config.builders, "enable_partial_take_profit", True),
+            partial_exit_enabled=getattr(
+                self.config.builders,
+                "enable_partial_take_profit",
+                True,
+            ),
             metadata={
                 "strategy": self.STRATEGY_NAME,
-                "rr_ratio": getattr(self.config.builders, "default_rr_ratio", self.thresholds.fallback_rr_ratio),
+                "rr_ratio": getattr(
+                    self.config.builders,
+                    "default_rr_ratio",
+                    self.thresholds.fallback_rr_ratio,
+                ),
             },
         )
 
@@ -931,6 +920,7 @@ class OrderflowContinuationStrategy(
 
         if ref_price is not None:
             buffer = ref_price * self.thresholds.stop_buffer_pct
+
             if side == SignalSide.LONG:
                 invalidation_price = ref_price - buffer
             elif side == SignalSide.SHORT:
@@ -973,137 +963,3 @@ class OrderflowContinuationStrategy(
                 "timeframe": str(context.timeframe),
             },
         )
-
-    # ------------------------------------------------------------------
-    # Config helpers
-    # ------------------------------------------------------------------
-
-    def _get_min_confidence(self) -> float:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None:
-            return strategy_cfg.runtime.min_confidence
-        return self.config.runtime.min_confidence
-
-    def _get_min_score(self) -> float:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is not None:
-            return strategy_cfg.runtime.min_score
-        return self.config.runtime.min_score
-
-    def _category_weight(self) -> float:
-        try:
-            return float(self.config.weighting.category_weights.get(self.CATEGORY, 1.0))
-        except Exception:
-            return 1.0
-
-    def _strategy_weight(self) -> float:
-        strategy_cfg = self.strategy_definition
-        if strategy_cfg is None:
-            return 1.0
-        try:
-            return float(strategy_cfg.weight)
-        except Exception:
-            return 1.0
-
-    def _regime_adjustment(self, context: SignalContext) -> float:
-        regime = context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN
-        try:
-            return float(self.config.weighting.regime_adjustments.get(regime, 1.0))
-        except Exception:
-            return 1.0
-
-    # ------------------------------------------------------------------
-    # Mapping helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_priority(self, confidence: float) -> SignalPriority:
-        cfg = self.config.confidence
-        if confidence >= cfg.high_threshold:
-            return SignalPriority.HIGH
-        if confidence >= cfg.low_threshold:
-            return SignalPriority.MEDIUM
-        return SignalPriority.LOW
-
-    def _map_strength(self, confidence: float) -> SignalStrength:
-        cfg = self.config.confidence
-        if confidence >= cfg.high_threshold:
-            return SignalStrength.STRONG
-        if confidence >= cfg.medium_threshold:
-            return SignalStrength.MODERATE
-        return SignalStrength.WEAK
-
-    def _map_confidence_grade(self, confidence: float) -> ConfidenceGrade:
-        cfg = self.config.confidence
-        if confidence >= cfg.high_threshold:
-            return ConfidenceGrade.VERY_HIGH
-        if confidence >= cfg.medium_threshold:
-            return ConfidenceGrade.HIGH
-        if confidence >= cfg.low_threshold:
-            return ConfidenceGrade.MEDIUM
-        if confidence >= cfg.very_low_threshold:
-            return ConfidenceGrade.LOW
-        return ConfidenceGrade.VERY_LOW
-
-    # ------------------------------------------------------------------
-    # Generic helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_reference_price(
-        self,
-        context: SignalContext,
-        snapshot: OrderflowContinuationSnapshot,
-    ) -> float | None:
-        if context.price is not None:
-            if context.price.mid_price is not None:
-                return context.price.mid_price
-            if context.price.last_price is not None:
-                return context.price.last_price
-        return snapshot.last_price
-
-    def _feature_value(self, context: SignalContext, name: str) -> Any:
-        snapshot = context.get_feature_snapshot(name)
-        if snapshot is None:
-            return None
-        return snapshot.value
-
-    @staticmethod
-    def _read(obj: Any, key: str, default: Any = None) -> Any:
-        if obj is None:
-            return default
-        if isinstance(obj, dict):
-            return obj.get(key, default)
-        return getattr(obj, key, default)
-
-    @staticmethod
-    def _coalesce_float(*values: Any) -> float | None:
-        for value in values:
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    @staticmethod
-    def _coalesce_int(*values: Any) -> int | None:
-        for value in values:
-            if value is None:
-                continue
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    @staticmethod
-    def _normalize_percent(value: float, scale: float = 1.0) -> float:
-        if scale <= 0:
-            scale = 1.0
-        return max(0.0, min(abs(value) / scale, 1.0))
-
-    @staticmethod
-    def _normalize_ratio(value: float, scale: float = 1.0) -> float:
-        if scale <= 0:
-            scale = 1.0
-        return max(0.0, min(abs(value) / scale, 1.0))
