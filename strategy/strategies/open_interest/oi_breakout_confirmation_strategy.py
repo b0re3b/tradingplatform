@@ -3,28 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.logger import get_logger
-
 from analytics.open_interest.enums import OIDivergenceType, OIRegime
 from analytics.open_interest.models import OIFeatures
-
-from strategy.base import ContextAwareComponent, NamedEntityMixin, PrioritizedMixin
 from strategy.config import StrategyConfig
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import SignalContext, StrategyEvaluation, StrategyMetadata, StrategySignal
 from strategy.enums import (
-    ConfidenceGrade,
     MarketRegime,
     SetupType,
     SignalOrigin,
-    SignalPriority,
     SignalSide,
     SignalStatus,
-    SignalStrength,
     StrategyCategory,
     Timeframe,
     TriggerType,
 )
+from strategy.exceptions import StrategyEvaluationError
+from strategy.models import SignalContext, StrategyEvaluation, StrategyMetadata, StrategySignal
+
+from .base import OpenInterestStrategyBase
 
 
 @dataclass(slots=True)
@@ -42,76 +37,28 @@ class OIBreakoutConfirmationPayload:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
-def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
-    return max(low, min(high, float(value)))
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(value)
-
-
-def _safe_str(value: Any, default: str = "") -> str:
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def _normalize_reasons(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
-    if isinstance(value, tuple):
-        return [str(v).strip() for v in value if str(v).strip()]
-    text = str(value).strip()
-    return [text] if text else []
-
-
-class OIBreakoutConfirmationStrategy(
-    ContextAwareComponent,
-    NamedEntityMixin,
-    PrioritizedMixin,
-):
+class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
     """
     Стратегія підтвердження breakout через поведінку open interest.
 
-    Ідея:
-    - strategy НЕ шукає breakout по price action сама
-    - strategy відповідає на питання:
-      "чи підтверджує open interest, volume, pressure та flow цей breakout?"
-
-    Сильні сценарії:
-    - TREND_CONFIRMATION
-    - LONG_BUILDUP / SHORT_BUILDUP
-    - SQUEEZE_SETUP
-
-    Слабкі / відхиляючі сценарії:
-    - WEAK_BREAKOUT_UP / WEAK_BREAKOUT_DOWN
-    - EXHAUSTION_UP / EXHAUSTION_DOWN
-    - LONG_UNWIND / SHORT_COVERING у невідповідному напрямку
+    Вона не шукає breakout самостійно, а перевіряє, чи підтверджує
+    open interest, volume, pressure та aggressive flow вже наявний breakout context.
     """
 
     STRATEGY_NAME = "oi_breakout_confirmation_strategy"
+    DEFAULT_PRIORITY = 80
 
     REQUIRED_FEATURES: set[str] = {
         "oi.regime.type",
         "oi.regime.confidence",
     }
+
+    MINIMUM_OI_CONTEXT_KEYS: tuple[str, ...] = (
+        "oi.regime.type",
+        "oi.regime.confidence",
+        "oi.features.oi_delta_pct",
+        "oi.features.price_delta_pct",
+    )
 
     LONG_CONFIRMATION_REGIMES: set[OIRegime] = {
         OIRegime.LONG_BUILDUP,
@@ -145,21 +92,8 @@ class OIBreakoutConfirmationStrategy(
         self,
         config: StrategyConfig,
         event_bus: Any | None = None,
-        logger: Any | None = None,
     ) -> None:
-        super().__init__(
-            config=config,
-            event_bus=event_bus,
-            logger=logger or get_logger(__name__, service_name="strategy_oi_breakout_confirmation"),
-        )
-        self.validate_config()
-
-    @property
-    def priority(self) -> int:
-        strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
-        if strategy_cfg is not None:
-            return strategy_cfg.priority
-        return 80
+        super().__init__(config=config, event_bus=event_bus)
 
     @property
     def metadata(self) -> StrategyMetadata:
@@ -174,7 +108,7 @@ class OIBreakoutConfirmationStrategy(
                 "continuation",
                 "pressure",
             ],
-            version="1.0.0",
+            version="1.1.0",
             description=(
                 "Підтверджує breakout/continuation через OI regime, pressure, "
                 "volume, aggressive flow та divergence context."
@@ -191,6 +125,7 @@ class OIBreakoutConfirmationStrategy(
             metadata={
                 "source": "analytics.open_interest",
                 "strategy_type": "confirmation",
+                "base_class": "OpenInterestStrategyBase",
             },
         )
 
@@ -211,44 +146,40 @@ class OIBreakoutConfirmationStrategy(
             )
 
             strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
+
+            runtime_allowed, runtime_reason = self.is_strategy_runtime_allowed(context)
+            if not runtime_allowed:
+                evaluation.reasons.append(runtime_reason or "strategy_runtime_not_allowed")
+                return evaluation
+
             if strategy_cfg is None:
                 evaluation.reasons.append("strategy_config_not_found")
                 return evaluation
 
-            if not strategy_cfg.runtime.enabled:
-                evaluation.reasons.append("strategy_disabled")
-                return evaluation
-
-            if strategy_cfg.runtime.symbols and context.symbol not in strategy_cfg.runtime.symbols:
-                evaluation.reasons.append("symbol_not_enabled_for_strategy")
-                return evaluation
-
-            if strategy_cfg.runtime.timeframes and context.timeframe not in strategy_cfg.runtime.timeframes:
-                evaluation.reasons.append("timeframe_not_enabled_for_strategy")
-                return evaluation
-
-            if not self._context_has_minimum_oi_data(context):
+            if not self.context_has_any_oi_data(context, self.MINIMUM_OI_CONTEXT_KEYS):
                 evaluation.reasons.append("missing_open_interest_context")
                 return evaluation
 
-            if self._has_stale_required_features(context):
+            if self.has_stale_required_features(context):
                 evaluation.reasons.append("required_oi_features_are_stale")
                 return evaluation
 
             payload = self._extract_payload(context)
-            features = self._extract_oi_features(context)
+            features = self.extract_oi_features(context)
+            regime = self.get_market_regime(context)
 
-            evaluation.metadata["oi_payload"] = payload.raw
-            evaluation.metadata["oi_regime"] = payload.regime.value
-            evaluation.metadata["oi_divergence_type"] = payload.divergence_type.value
+            evaluation.metadata.update(
+                {
+                    "oi_payload": payload.raw,
+                    "oi_regime": payload.regime.value,
+                    "oi_divergence_type": payload.divergence_type.value,
+                    "market_regime": regime.value,
+                }
+            )
 
-            regime = context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN
-            if (
-                strategy_cfg.runtime.allowed_regimes
-                and regime not in strategy_cfg.runtime.allowed_regimes
-            ):
-                evaluation.reasons.append("regime_not_allowed")
-                evaluation.metadata["market_regime"] = regime.value
+            regime_allowed, regime_reason = self.is_market_regime_allowed(context)
+            if not regime_allowed:
+                evaluation.reasons.append(regime_reason or "regime_not_allowed")
                 return evaluation
 
             side = self._infer_side(payload=payload, features=features)
@@ -256,14 +187,27 @@ class OIBreakoutConfirmationStrategy(
                 evaluation.reasons.append("breakout_direction_not_confirmed")
                 return evaluation
 
-            blocked_reason = self._check_directional_rejection(side=side, payload=payload, features=features)
+            blocked_reason = self._check_directional_rejection(
+                side=side,
+                payload=payload,
+                features=features,
+            )
             if blocked_reason is not None:
                 evaluation.reasons.append(blocked_reason)
                 return evaluation
 
             setup_type = self._infer_setup_type(payload)
-            score = self._compute_score(context=context, payload=payload, features=features, side=side)
-            confidence = self._compute_confidence(context=context, payload=payload, features=features, side=side)
+            score = self._compute_score(
+                context=context,
+                payload=payload,
+                features=features,
+                side=side,
+            )
+            confidence = self._compute_confidence(
+                payload=payload,
+                features=features,
+                side=side,
+            )
 
             evaluation.score = score
             evaluation.confidence = confidence
@@ -295,100 +239,92 @@ class OIBreakoutConfirmationStrategy(
             evaluation.reasons.append("oi_breakout_confirmation_signal_generated")
             return evaluation
 
+        except StrategyEvaluationError:
+            raise
         except Exception as exc:
+            self.logger.exception(
+                "Strategy evaluation failed | strategy=%s symbol=%s",
+                self.STRATEGY_NAME,
+                getattr(context, "symbol", "UNKNOWN"),
+            )
             raise StrategyEvaluationError(
                 f"{self.STRATEGY_NAME}: failed to evaluate context for "
                 f"{getattr(context, 'symbol', 'UNKNOWN')}: {exc}"
             ) from exc
 
     # ------------------------------------------------------------------
-    # Validation / extraction
+    # Extraction
     # ------------------------------------------------------------------
 
-    def _context_has_minimum_oi_data(self, context: SignalContext) -> bool:
-        if context.open_interest:
-            return True
-
-        keys = (
-            "oi.regime.type",
-            "oi.regime.confidence",
-            "oi.features.oi_delta_pct",
-            "oi.features.price_delta_pct",
-        )
-        return any(context.has_feature(name) for name in keys)
-
-    def _has_stale_required_features(self, context: SignalContext) -> bool:
-        for name in self.REQUIRED_FEATURES:
-            if context.has_feature(name) and context.feature_is_stale(name):
-                return True
-        return False
-
     def _extract_payload(self, context: SignalContext) -> OIBreakoutConfirmationPayload:
+        domain = context.open_interest or {}
         raw: dict[str, Any] = {}
 
-        domain = context.open_interest or {}
+        regime_section = self.extract_domain_section(
+            context,
+            "regime",
+            prefix_nested_keys=True,
+        )
+        divergence_section = self.extract_domain_section(
+            context,
+            "divergence",
+            prefix_nested_keys=True,
+        )
+        raw.update(regime_section)
+        raw.update(divergence_section)
 
-        regime_section = domain.get("regime")
-        if isinstance(regime_section, dict):
-            raw.update({f"regime_{k}": v for k, v in regime_section.items()})
+        self.merge_aliases(
+            raw=raw,
+            domain=domain,
+            aliases={
+                "regime": "regime_type",
+                "regime_type": "regime_type",
+                "oi_regime": "regime_type",
+                "oi_regime_type": "regime_type",
+                "regime_confidence": "regime_confidence",
+                "oi_regime_confidence": "regime_confidence",
+                "regime_score": "regime_score",
+                "oi_regime_score": "regime_score",
+                "reasons": "reasons",
+                "regime_reasons": "reasons",
+                "divergence_type": "divergence_type",
+                "oi_divergence_type": "divergence_type",
+                "divergence_detected": "divergence_detected",
+                "oi_divergence_detected": "divergence_detected",
+                "divergence_confidence": "divergence_confidence",
+                "oi_divergence_confidence": "divergence_confidence",
+                "divergence_score": "divergence_score",
+                "oi_divergence_score": "divergence_score",
+            },
+        )
 
-        divergence_section = domain.get("divergence")
-        if isinstance(divergence_section, dict):
-            raw.update({f"divergence_{k}": v for k, v in divergence_section.items()})
+        self.merge_feature_aliases(
+            raw=raw,
+            context=context,
+            feature_aliases={
+                "oi.regime.type": "regime_type",
+                "oi.regime.confidence": "regime_confidence",
+                "oi.regime.score": "regime_score",
+                "oi.regime.reasons": "reasons",
+                "oi.divergence.type": "divergence_type",
+                "oi.divergence.detected": "divergence_detected",
+                "oi.divergence.confidence": "divergence_confidence",
+                "oi.divergence.score": "divergence_score",
+            },
+        )
 
-        aliases = {
-            "regime": "regime_type",
-            "regime_type": "regime_type",
-            "oi_regime": "regime_type",
-            "oi_regime_type": "regime_type",
-            "regime_confidence": "regime_confidence",
-            "oi_regime_confidence": "regime_confidence",
-            "regime_score": "regime_score",
-            "oi_regime_score": "regime_score",
-            "reasons": "reasons",
-            "regime_reasons": "reasons",
-            "divergence_type": "divergence_type",
-            "oi_divergence_type": "divergence_type",
-            "divergence_detected": "divergence_detected",
-            "oi_divergence_detected": "divergence_detected",
-            "divergence_confidence": "divergence_confidence",
-            "oi_divergence_confidence": "divergence_confidence",
-            "divergence_score": "divergence_score",
-            "oi_divergence_score": "divergence_score",
-        }
+        regime = self.parse_oi_regime(raw.get("regime_type") or raw.get("regime_regime"))
+        regime_confidence = self.clamp(self.safe_float(raw.get("regime_confidence"), 0.0))
+        regime_score = self.clamp(self.safe_float(raw.get("regime_score"), regime_confidence))
 
-        for src, dst in aliases.items():
-            if src in domain and dst not in raw:
-                raw[dst] = domain[src]
-
-        feature_aliases = {
-            "oi.regime.type": "regime_type",
-            "oi.regime.confidence": "regime_confidence",
-            "oi.regime.score": "regime_score",
-            "oi.regime.reasons": "reasons",
-            "oi.divergence.type": "divergence_type",
-            "oi.divergence.detected": "divergence_detected",
-            "oi.divergence.confidence": "divergence_confidence",
-            "oi.divergence.score": "divergence_score",
-        }
-
-        for feature_name, dst_key in feature_aliases.items():
-            if dst_key not in raw and context.has_feature(feature_name):
-                raw[dst_key] = context.get_feature(feature_name)
-
-        regime = self._parse_oi_regime(raw.get("regime_type") or raw.get("regime_regime"))
-        regime_confidence = _clamp(_safe_float(raw.get("regime_confidence"), 0.0))
-        regime_score = _clamp(_safe_float(raw.get("regime_score"), regime_confidence))
-
-        divergence_type = self._parse_divergence_type(raw.get("divergence_type"))
-        divergence_detected = _safe_bool(
+        divergence_type = self.parse_divergence_type(raw.get("divergence_type"))
+        divergence_detected = self.safe_bool(
             raw.get("divergence_detected"),
             default=divergence_type != OIDivergenceType.NONE,
         )
-        divergence_confidence = _clamp(_safe_float(raw.get("divergence_confidence"), 0.0))
-        divergence_score = _clamp(_safe_float(raw.get("divergence_score"), divergence_confidence))
-
-        reasons = _normalize_reasons(raw.get("reasons") or raw.get("regime_reasons"))
+        divergence_confidence = self.clamp(self.safe_float(raw.get("divergence_confidence"), 0.0))
+        divergence_score = self.clamp(self.safe_float(raw.get("divergence_score"), divergence_confidence))
+        reasons = self.normalize_reasons(raw.get("reasons") or raw.get("regime_reasons"))
 
         return OIBreakoutConfirmationPayload(
             regime=regime,
@@ -401,47 +337,6 @@ class OIBreakoutConfirmationStrategy(
             reasons=reasons,
             raw=raw,
         )
-
-    def _extract_oi_features(self, context: SignalContext) -> OIFeatures | None:
-        raw = context.open_interest.get("features") if context.open_interest else None
-        if isinstance(raw, OIFeatures):
-            return raw
-
-        if not isinstance(raw, dict):
-            return None
-
-        try:
-            return OIFeatures(**raw)
-        except Exception:
-            return None
-
-    def _parse_oi_regime(self, value: Any) -> OIRegime:
-        if isinstance(value, OIRegime):
-            return value
-
-        text = _safe_str(value).upper()
-        if not text:
-            return OIRegime.NEUTRAL
-
-        for item in OIRegime:
-            if item.value.upper() == text:
-                return item
-
-        return OIRegime.NEUTRAL
-
-    def _parse_divergence_type(self, value: Any) -> OIDivergenceType:
-        if isinstance(value, OIDivergenceType):
-            return value
-
-        text = _safe_str(value).upper()
-        if not text:
-            return OIDivergenceType.NONE
-
-        for item in OIDivergenceType:
-            if item.value.upper() == text:
-                return item
-
-        return OIDivergenceType.NONE
 
     # ------------------------------------------------------------------
     # Direction / setup
@@ -486,11 +381,18 @@ class OIBreakoutConfirmationStrategy(
 
         return SignalSide.UNKNOWN
 
-    def _infer_setup_type(self, payload: OIBreakoutConfirmationPayload) -> SetupType:
+    @staticmethod
+    def _infer_setup_type(payload: OIBreakoutConfirmationPayload) -> SetupType:
         if payload.regime == OIRegime.SQUEEZE_SETUP:
             return SetupType.SQUEEZE
-        if payload.regime in {OIRegime.LONG_BUILDUP, OIRegime.SHORT_BUILDUP, OIRegime.TREND_CONFIRMATION}:
+
+        if payload.regime in {
+            OIRegime.LONG_BUILDUP,
+            OIRegime.SHORT_BUILDUP,
+            OIRegime.TREND_CONFIRMATION,
+        }:
             return SetupType.CONTINUATION
+
         return SetupType.BREAKOUT
 
     def _check_directional_rejection(
@@ -510,7 +412,7 @@ class OIBreakoutConfirmationStrategy(
             return None
 
         if side == SignalSide.LONG:
-            if features.oi_delta_pct <= 0:
+            if features.oi_delta_pct is None or features.oi_delta_pct <= 0:
                 return "long_breakout_not_supported_by_oi_growth"
             if features.oi_price_efficiency is not None and features.oi_price_efficiency <= 0:
                 return "long_breakout_not_supported_by_oi_price_efficiency"
@@ -518,7 +420,7 @@ class OIBreakoutConfirmationStrategy(
                 return "long_breakout_negative_pressure"
 
         if side == SignalSide.SHORT:
-            if features.oi_delta_pct <= 0:
+            if features.oi_delta_pct is None or features.oi_delta_pct <= 0:
                 return "short_breakout_not_supported_by_oi_growth"
             if features.oi_price_efficiency is not None and features.oi_price_efficiency <= 0:
                 return "short_breakout_not_supported_by_oi_price_efficiency"
@@ -531,16 +433,20 @@ class OIBreakoutConfirmationStrategy(
     # Feature support
     # ------------------------------------------------------------------
 
-    def _positive_breakout_support(self, features: OIFeatures) -> bool:
+    @staticmethod
+    def _positive_breakout_support(features: OIFeatures) -> bool:
         return (
-            features.oi_delta_pct > 0
+            features.oi_delta_pct is not None
+            and features.oi_delta_pct > 0
             and (features.volume_ratio is None or features.volume_ratio >= 1.0)
             and (features.oi_pressure_score is None or features.oi_pressure_score >= 0.15)
         )
 
-    def _negative_breakout_support(self, features: OIFeatures) -> bool:
+    @staticmethod
+    def _negative_breakout_support(features: OIFeatures) -> bool:
         return (
-            features.oi_delta_pct > 0
+            features.oi_delta_pct is not None
+            and features.oi_delta_pct > 0
             and (features.volume_ratio is None or features.volume_ratio >= 1.0)
             and (features.oi_pressure_score is None or features.oi_pressure_score <= -0.15)
         )
@@ -557,23 +463,14 @@ class OIBreakoutConfirmationStrategy(
         features: OIFeatures | None,
         side: SignalSide,
     ) -> float:
-        category_weight = self.config.weighting.category_weights.get(
-            StrategyCategory.OPEN_INTEREST,
-            1.0,
-        )
-        regime = context.regime.regime if context.regime else MarketRegime.UNKNOWN
-        regime_adj = self.config.weighting.regime_adjustments.get(regime, 1.0)
-
-        strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
-        strategy_weight = strategy_cfg.weight if strategy_cfg is not None else 1.0
-
+        regime = self.get_market_regime(context)
         base_score = payload.regime_score if payload.regime_score > 0 else payload.regime_confidence
-        score = base_score * category_weight * regime_adj * strategy_weight
+        score = self.weighted_score(base_score, regime)
 
         if features is not None:
             if features.volume_ratio is not None and features.volume_ratio >= 1.0:
                 score += 0.06
-            if features.oi_delta_pct >= 0.25:
+            if features.oi_delta_pct is not None and features.oi_delta_pct >= 0.25:
                 score += 0.06
             if features.oi_zscore is not None and abs(features.oi_zscore) >= 1.0:
                 score += 0.04
@@ -605,12 +502,11 @@ class OIBreakoutConfirmationStrategy(
         if payload.divergence_detected:
             score -= min(0.15, payload.divergence_score * 0.20)
 
-        return _clamp(score)
+        return self.clamp(score)
 
     def _compute_confidence(
         self,
         *,
-        context: SignalContext,
         payload: OIBreakoutConfirmationPayload,
         features: OIFeatures | None,
         side: SignalSide,
@@ -620,7 +516,7 @@ class OIBreakoutConfirmationStrategy(
         if features is not None:
             if features.volume_ratio is not None and features.volume_ratio >= 1.0:
                 confidence += 0.04
-            if features.oi_delta_pct >= 0.25:
+            if features.oi_delta_pct is not None and features.oi_delta_pct >= 0.25:
                 confidence += 0.04
             if features.oi_ma_fast is not None and features.oi_ma_slow is not None:
                 if features.oi_ma_fast > features.oi_ma_slow:
@@ -638,37 +534,7 @@ class OIBreakoutConfirmationStrategy(
         if payload.divergence_detected:
             confidence -= min(0.12, payload.divergence_confidence * 0.20)
 
-        return _clamp(confidence)
-
-    def _confidence_grade(self, confidence: float) -> ConfidenceGrade:
-        cfg = self.config.confidence
-        if confidence >= cfg.high_threshold:
-            return ConfidenceGrade.VERY_HIGH
-        if confidence >= cfg.medium_threshold:
-            return ConfidenceGrade.HIGH
-        if confidence >= cfg.low_threshold:
-            return ConfidenceGrade.MEDIUM
-        if confidence >= cfg.very_low_threshold:
-            return ConfidenceGrade.LOW
-        return ConfidenceGrade.VERY_LOW
-
-    def _strength_from_score(self, score: float) -> SignalStrength:
-        if score >= 0.90:
-            return SignalStrength.EXTREME
-        if score >= 0.75:
-            return SignalStrength.STRONG
-        if score >= 0.55:
-            return SignalStrength.MODERATE
-        return SignalStrength.WEAK
-
-    def _priority_from_score(self, score: float) -> SignalPriority:
-        if score >= 0.90:
-            return SignalPriority.CRITICAL
-        if score >= 0.75:
-            return SignalPriority.HIGH
-        if score >= 0.50:
-            return SignalPriority.MEDIUM
-        return SignalPriority.LOW
+        return self.clamp(confidence)
 
     # ------------------------------------------------------------------
     # Signal building
@@ -695,13 +561,13 @@ class OIBreakoutConfirmationStrategy(
             timestamp=context.timestamp,
             confidence=confidence,
             score=score,
-            strength=self._strength_from_score(score),
-            confidence_grade=self._confidence_grade(confidence),
+            strength=self.strength_from_score(score),
+            confidence_grade=self.confidence_grade(confidence),
             status=SignalStatus.NEW,
             trigger_type=TriggerType.CONFIRMATION,
             origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self._priority_from_score(score),
-            regime=context.regime.regime if context.regime else MarketRegime.UNKNOWN,
+            priority=self.priority_from_score(score),
+            regime=self.get_market_regime(context),
             metadata={
                 "oi_regime": payload.regime.value,
                 "oi_regime_confidence": payload.regime_confidence,
@@ -718,66 +584,19 @@ class OIBreakoutConfirmationStrategy(
         for reason in payload.reasons:
             signal.add_reason(reason)
 
-        for feature_name in self.REQUIRED_FEATURES:
-            if context.has_feature(feature_name):
-                signal.add_source_feature(feature_name)
+        self.add_required_source_features(signal, context)
 
         if features is not None:
-            self._append_feature_metadata(signal=signal, features=features)
-            self._append_feature_reasons(signal=signal, features=features)
-            for confirmation in self._build_confirmations(side=side, features=features, payload=payload):
+            self.append_oi_feature_metadata(signal, features)
+            self.append_oi_feature_reasons(signal, features)
+            for confirmation in self._build_confirmations(
+                side=side,
+                features=features,
+                payload=payload,
+            ):
                 signal.add_confirmation(confirmation)
 
         return signal
-
-    def _append_feature_reasons(
-        self,
-        *,
-        signal: StrategySignal,
-        features: OIFeatures,
-    ) -> None:
-        if features.oi_delta_pct is not None:
-            signal.add_reason(f"oi_delta_pct:{features.oi_delta_pct:.4f}")
-        if features.price_delta_pct is not None:
-            signal.add_reason(f"price_delta_pct:{features.price_delta_pct:.4f}")
-        if features.volume_ratio is not None:
-            signal.add_reason(f"volume_ratio:{features.volume_ratio:.4f}")
-        if features.oi_pressure_score is not None:
-            signal.add_reason(f"oi_pressure_score:{features.oi_pressure_score:.4f}")
-        if features.oi_price_efficiency is not None:
-            signal.add_reason(f"oi_price_efficiency:{features.oi_price_efficiency:.4f}")
-
-    def _append_feature_metadata(
-        self,
-        *,
-        signal: StrategySignal,
-        features: OIFeatures,
-    ) -> None:
-        signal.metadata.update(
-            {
-                "oi": features.oi,
-                "oi_delta": features.oi_delta,
-                "oi_delta_pct": features.oi_delta_pct,
-                "oi_ma_fast": features.oi_ma_fast,
-                "oi_ma_slow": features.oi_ma_slow,
-                "oi_zscore": features.oi_zscore,
-                "oi_velocity": features.oi_velocity,
-                "oi_acceleration": features.oi_acceleration,
-                "price": features.price,
-                "price_delta": features.price_delta,
-                "price_delta_pct": features.price_delta_pct,
-                "volume": features.volume,
-                "volume_ratio": features.volume_ratio,
-                "funding_rate": features.funding_rate,
-                "liquidation_imbalance": features.liquidation_imbalance,
-                "aggressive_flow_imbalance": features.aggressive_flow_imbalance,
-                "oi_change_per_volume": features.oi_change_per_volume,
-                "oi_price_efficiency": features.oi_price_efficiency,
-                "oi_pressure_score": features.oi_pressure_score,
-                "oi_direction": getattr(features.oi_direction, "value", None),
-                "price_direction": getattr(features.price_direction, "value", None),
-            }
-        )
 
     def _build_confirmations(
         self,
@@ -791,7 +610,7 @@ class OIBreakoutConfirmationStrategy(
         if features.volume_ratio is not None and features.volume_ratio >= 1.0:
             confirmations.append("volume_confirmation")
 
-        if features.oi_delta_pct >= 0.25:
+        if features.oi_delta_pct is not None and features.oi_delta_pct >= 0.25:
             confirmations.append("oi_build_confirmation")
 
         if features.oi_ma_fast is not None and features.oi_ma_slow is not None:
