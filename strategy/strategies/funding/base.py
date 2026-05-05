@@ -247,10 +247,12 @@ class BaseFundingStrategy(ABC):
     """
 
     def __init__(
-        self,
-        event_bus: EventBus,
-        config: BaseFundingStrategyConfig | None = None,
-        scheduler: Scheduler | None = None,
+            self,
+            *,
+            event_bus: EventBus,
+            config: BaseFundingStrategyConfig | None = None,
+            scheduler: Scheduler | None = None,
+            service_name: str | None = None,
     ) -> None:
         if event_bus is None:
             raise ValueError("event_bus is required")

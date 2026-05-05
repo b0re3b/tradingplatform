@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from core.logger import get_logger
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
 
 from analytics.funding.enums import (
     FundingBias,
@@ -37,6 +38,7 @@ class FundingExtremeReversalStrategyConfig(BaseFundingStrategyConfig):
 
     strategy_namespace: str = "strategy.funding.extreme_reversal"
     source_name: str = "funding_extreme_reversal_strategy"
+    service_name: str = "funding_extreme_reversal_strategy"
 
     regime_event_name: str = "analytics.funding.regime"
     pressure_event_name: str = "analytics.funding.pressure"
@@ -71,6 +73,26 @@ class FundingExtremeReversalStrategyConfig(BaseFundingStrategyConfig):
     tag_confirmed_by_release: str = "confirmed_by_release"
 
 
+    def validate(self) -> None:
+        super().validate()
+
+        bounded_fields = {
+            "min_extreme_severity": self.min_extreme_severity,
+            "min_pressure_score": self.min_pressure_score,
+            "min_regime_confidence": self.min_regime_confidence,
+            "min_mean_reversion_probability": self.min_mean_reversion_probability,
+            "min_squeeze_probability": self.min_squeeze_probability,
+            "pressure_release_min_score_drop": self.pressure_release_min_score_drop,
+        }
+        for field_name, value in bounded_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{field_name} must be between 0 and 1")
+
+        if self.confirm_on_pressure_drop_levels < 0:
+            raise ValueError("confirm_on_pressure_drop_levels must be >= 0")
+
+
+
 class FundingExtremeReversalStrategy(BaseFundingStrategy):
     """
     Стратегія contrarian reversal на funding extremes.
@@ -84,17 +106,17 @@ class FundingExtremeReversalStrategy(BaseFundingStrategy):
 
     def __init__(
         self,
-        event_bus: Any,
+        event_bus: EventBus,
         config: FundingExtremeReversalStrategyConfig | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
+        resolved_config = config or FundingExtremeReversalStrategyConfig()
         super().__init__(
             event_bus=event_bus,
-            config=config or FundingExtremeReversalStrategyConfig(),
+            config=resolved_config,
+            scheduler=scheduler,
         )
-        self.config: FundingExtremeReversalStrategyConfig = (
-            config or FundingExtremeReversalStrategyConfig()
-        )
-        self.logger = get_logger(__name__)
+        self.config: FundingExtremeReversalStrategyConfig = resolved_config
 
     @property
     def strategy_name(self) -> str:
@@ -105,10 +127,26 @@ class FundingExtremeReversalStrategy(BaseFundingStrategy):
     # ------------------------------------------------------------------
 
     def register_subscriptions(self) -> None:
-        self.event_bus.subscribe(self.config.regime_event_name, self.on_regime)
-        self.event_bus.subscribe(self.config.pressure_event_name, self.on_pressure)
-        self.event_bus.subscribe(self.config.extreme_event_name, self.on_extreme)
-        self.event_bus.subscribe(self.config.flip_event_name, self.on_flip)
+        self.subscribe(
+            self.config.regime_event_name,
+            self.on_regime,
+            name=f"{self.strategy_name}.on_regime",
+        )
+        self.subscribe(
+            self.config.pressure_event_name,
+            self.on_pressure,
+            name=f"{self.strategy_name}.on_pressure",
+        )
+        self.subscribe(
+            self.config.extreme_event_name,
+            self.on_extreme,
+            name=f"{self.strategy_name}.on_extreme",
+        )
+        self.subscribe(
+            self.config.flip_event_name,
+            self.on_flip,
+            name=f"{self.strategy_name}.on_flip",
+        )
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -922,6 +960,42 @@ class FundingExtremeReversalStrategy(BaseFundingStrategy):
             "event_time": self.extract_event_time(payload),
             "metadata": payload.get("metadata", {}),
         }
+
+
+    def _build_funding_context(self, state: FundingStrategyState) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+
+        regime = state.last_regime
+        if regime is not None:
+            context["regime"] = self._enum_str(self._get_value(regime, "regime"))
+            context["bias"] = self._enum_str(self._get_value(regime, "bias"))
+            context["regime_confidence"] = self._get_value(regime, "confidence")
+
+        pressure = state.last_pressure
+        if pressure is not None:
+            context["pressure_direction"] = self._enum_str(self._get_value(pressure, "direction"))
+            context["pressure_level"] = self._enum_str(self._get_value(pressure, "level"))
+            context["pressure_score"] = self._get_value(pressure, "pressure_score")
+            context["squeeze_probability"] = self._get_value(pressure, "squeeze_probability")
+            context["mean_reversion_probability"] = self._get_value(pressure, "mean_reversion_probability")
+
+        extreme = state.last_extreme
+        if extreme is not None:
+            context["extreme_type"] = self._enum_str(self._get_value(extreme, "extreme_type"))
+            context["extreme_severity"] = self._get_value(extreme, "severity")
+            context["is_reversal_risk"] = self._get_value(extreme, "is_reversal_risk")
+            context["is_squeeze_risk"] = self._get_value(extreme, "is_squeeze_risk")
+            context["funding_rate"] = self._get_value(extreme, "funding_rate")
+
+        flip = state.last_flip
+        if flip is not None:
+            context["flip_type"] = self._enum_str(self._get_value(flip, "flip_type"))
+            context["flip_confidence"] = self._get_value(flip, "confidence")
+            context["previous_rate"] = self._get_value(flip, "previous_rate")
+            context["current_rate"] = self._get_value(flip, "current_rate")
+            context["flip_magnitude"] = self._get_value(flip, "flip_magnitude")
+
+        return {key: value for key, value in context.items() if value is not None}
 
     # ------------------------------------------------------------------
     # Emit hooks
