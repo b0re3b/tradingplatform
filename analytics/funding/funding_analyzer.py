@@ -7,31 +7,16 @@ from datetime import datetime, timezone
 from statistics import median
 from typing import Any, Deque
 
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
-from .enums import (
-    FundingEventType,
-    FundingTimeframe,
-)
-from .funding_divergence import (
-    FundingDivergenceConfig,
-    FundingDivergenceDetector,
-)
-from .funding_extremes import (
-    FundingExtremesConfig,
-    FundingExtremesDetector,
-)
-from .funding_flip_detector import (
-    FundingFlipDetector,
-    FundingFlipDetectorConfig,
-)
-from .funding_pressure import (
-    FundingPressureAnalyzer,
-    FundingPressureConfig,
-)
-from .funding_regime_detector import (
-    FundingRegimeDetector,
-    FundingRegimeDetectorConfig,
-)
+from core.scheduler import Scheduler
+
+from .enums import FundingEventType, FundingTimeframe
+from .funding_divergence import FundingDivergenceConfig, FundingDivergenceDetector
+from .funding_extremes import FundingExtremesConfig, FundingExtremesDetector
+from .funding_flip_detector import FundingFlipDetector, FundingFlipDetectorConfig
+from .funding_pressure import FundingPressureAnalyzer, FundingPressureConfig
+from .funding_regime_detector import FundingRegimeDetector, FundingRegimeDetectorConfig
 from .models import (
     FundingAnalyticsEvent,
     FundingDivergenceEvent,
@@ -49,7 +34,10 @@ from .models import (
 @dataclass(slots=True)
 class FundingAnalyzerConfig:
     """
-    Конфігурація orchestration-рівня funding analyzer.
+    Runtime/orchestration config for analytics.funding.
+
+    This config intentionally owns EventBus topic names and orchestration flags.
+    Pure detector thresholds remain in detector-specific config classes.
     """
 
     history_size: int = 500
@@ -61,6 +49,13 @@ class FundingAnalyzerConfig:
     publish_signal_event: bool = True
 
     state_lock_timeout_sec: float = 3.0
+
+    enable_cleanup_job: bool = True
+    cleanup_interval_sec: float = 60.0
+    cleanup_timeout_sec: float = 5.0
+    stale_context_ttl_sec: float = 60 * 60.0
+    stale_liquidation_ttl_sec: float = 5 * 60.0
+    cleanup_job_name: str = "analytics.funding.cleanup"
 
     funding_event_name: str = "market.funding"
     open_interest_event_name: str = "market.open_interest"
@@ -83,11 +78,25 @@ class FundingAnalyzerConfig:
     signal_on_divergence: bool = True
     signal_on_flip: bool = True
 
+    def __post_init__(self) -> None:
+        if self.history_size <= 0:
+            raise ValueError("history_size must be > 0")
+        if self.state_lock_timeout_sec <= 0:
+            raise ValueError("state_lock_timeout_sec must be > 0")
+        if self.cleanup_interval_sec <= 0:
+            raise ValueError("cleanup_interval_sec must be > 0")
+        if self.cleanup_timeout_sec <= 0:
+            raise ValueError("cleanup_timeout_sec must be > 0")
+        if self.stale_context_ttl_sec <= 0:
+            raise ValueError("stale_context_ttl_sec must be > 0")
+        if self.stale_liquidation_ttl_sec <= 0:
+            raise ValueError("stale_liquidation_ttl_sec must be > 0")
+
 
 @dataclass(slots=True)
 class FundingMarketContext:
     """
-    Локальний кеш зовнішнього контексту, який потрібен для divergence/pressure analysis.
+    Local context cache used by funding divergence/pressure analysis.
     """
 
     latest_open_interest: float | None = None
@@ -103,23 +112,29 @@ class FundingMarketContext:
     short_liquidations: float | None = None
 
     updated_at: datetime | None = None
+    liquidation_updated_at: datetime | None = None
 
 
 class FundingAnalyzer:
     """
-    Центральний orchestration-клас для analytics.funding.
+    Event-driven orchestration module for analytics.funding.
 
-    Відповідальність:
-    - прийом funding та пов'язаних market events
-    - збереження локальної funding history
-    - побудова статистики
-    - виклик детекторів/аналізаторів
-    - публікація normalized analytics events у EventBus
+    Responsibilities:
+    - subscribe to market/context events through EventBus
+    - maintain local funding history and context cache
+    - build funding statistics
+    - call pure funding detectors/analyzers
+    - publish normalized analytics.funding.* events through EventBus
+    - register periodic cleanup through Scheduler, when provided
     """
+
+    SOURCE = "analytics.funding.funding_analyzer"
 
     def __init__(
         self,
-        event_bus: Any,
+        *,
+        event_bus: EventBus,
+        scheduler: Scheduler | None = None,
         config: FundingAnalyzerConfig | None = None,
         regime_detector: FundingRegimeDetector | None = None,
         pressure_analyzer: FundingPressureAnalyzer | None = None,
@@ -128,8 +143,13 @@ class FundingAnalyzer:
         divergence_detector: FundingDivergenceDetector | None = None,
     ) -> None:
         self.event_bus = event_bus
+        self.scheduler = scheduler
         self.config = config or FundingAnalyzerConfig()
-        self.logger = get_logger(__name__)
+
+        self.logger = get_logger(
+            __name__,
+            event_type="funding_analyzer",
+        )
 
         self.regime_detector = regime_detector or FundingRegimeDetector(
             FundingRegimeDetectorConfig(default_timeframe=self.config.default_timeframe)
@@ -160,6 +180,8 @@ class FundingAnalyzer:
         self._latest_divergence_event: dict[str, FundingDivergenceEvent] = {}
 
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._subscriptions: list[Subscription] = []
+        self._cleanup_job_id: str | None = None
         self._registered: bool = False
 
     # ------------------------------------------------------------------
@@ -167,19 +189,83 @@ class FundingAnalyzer:
     # ------------------------------------------------------------------
 
     def register(self) -> None:
+        """
+        Register EventBus subscriptions and Scheduler jobs.
+
+        This method is intentionally sync because EventBus.subscribe() and
+        Scheduler.add_interval_job() are sync APIs in core.
+        """
         if self._registered:
             self.logger.warning("FundingAnalyzer already registered")
             return
 
-        self.event_bus.subscribe(self.config.funding_event_name, self.on_funding)
-        self.event_bus.subscribe(self.config.open_interest_event_name, self.on_open_interest)
-        self.event_bus.subscribe(self.config.candle_event_name, self.on_candle)
-        self.event_bus.subscribe(self.config.trade_event_name, self.on_trade)
-        self.event_bus.subscribe(self.config.cvd_event_name, self.on_cvd_update)
-        self.event_bus.subscribe(self.config.liquidation_event_name, self.on_liquidation)
+        self._subscriptions.extend(
+            [
+                self.event_bus.subscribe(
+                    self.config.funding_event_name,
+                    self.on_funding,
+                    name="funding_analyzer.on_funding",
+                ),
+                self.event_bus.subscribe(
+                    self.config.open_interest_event_name,
+                    self.on_open_interest,
+                    name="funding_analyzer.on_open_interest",
+                ),
+                self.event_bus.subscribe(
+                    self.config.candle_event_name,
+                    self.on_candle,
+                    name="funding_analyzer.on_candle",
+                ),
+                self.event_bus.subscribe(
+                    self.config.trade_event_name,
+                    self.on_trade,
+                    name="funding_analyzer.on_trade",
+                ),
+                self.event_bus.subscribe(
+                    self.config.cvd_event_name,
+                    self.on_cvd_update,
+                    name="funding_analyzer.on_cvd_update",
+                ),
+                self.event_bus.subscribe(
+                    self.config.liquidation_event_name,
+                    self.on_liquidation,
+                    name="funding_analyzer.on_liquidation",
+                ),
+            ]
+        )
 
+        self._register_cleanup_job()
         self._registered = True
-        self.logger.info("FundingAnalyzer registered successfully")
+
+        self.logger.info(
+            "FundingAnalyzer registered | subscriptions=%s cleanup_job=%s",
+            len(self._subscriptions),
+            self._cleanup_job_id,
+        )
+
+    def unregister(self) -> None:
+        """
+        Remove EventBus subscriptions and disable Scheduler cleanup job.
+        """
+        if not self._registered:
+            self.logger.warning("FundingAnalyzer is not registered")
+            return
+
+        for subscription in list(self._subscriptions):
+            self.event_bus.unsubscribe(subscription)
+        self._subscriptions.clear()
+
+        if self.scheduler is not None and self._cleanup_job_id is not None:
+            try:
+                self.scheduler.disable_job(self._cleanup_job_id)
+            except KeyError:
+                self.logger.warning(
+                    "Cleanup job not found during unregister | job_id=%s",
+                    self._cleanup_job_id,
+                )
+
+        self._registered = False
+        self.logger.info("FundingAnalyzer unregistered")
 
     def get_latest_snapshot(
         self,
@@ -219,20 +305,77 @@ class FundingAnalyzer:
     ) -> FundingMarketContext | None:
         return self._market_context.get(self._make_key(symbol, exchange))
 
+    def stats(self) -> dict[str, Any]:
+        return {
+            "registered": self._registered,
+            "subscriptions": len(self._subscriptions),
+            "cleanup_job_id": self._cleanup_job_id,
+            "symbols_tracked": len(self._history),
+            "contexts_tracked": len(self._market_context),
+            "latest_statistics": len(self._latest_statistics),
+            "latest_regime_states": len(self._latest_regime_state),
+            "latest_pressure_states": len(self._latest_pressure_state),
+            "latest_flip_events": len(self._latest_flip_event),
+            "latest_extreme_events": len(self._latest_extreme_event),
+            "latest_divergence_events": len(self._latest_divergence_event),
+        }
+
+    async def cleanup_stale_state(self) -> None:
+        """
+        Scheduler-managed cleanup for stale market context and liquidation context.
+        """
+        now = self._utc_now()
+        removed_contexts = 0
+        cleared_liquidations = 0
+
+        for key, context in list(self._market_context.items()):
+            if context.updated_at is not None:
+                age = (now - context.updated_at).total_seconds()
+                if age >= self.config.stale_context_ttl_sec and key not in self._history:
+                    self._market_context.pop(key, None)
+                    removed_contexts += 1
+                    continue
+
+            if context.liquidation_updated_at is not None:
+                liq_age = (now - context.liquidation_updated_at).total_seconds()
+                if liq_age >= self.config.stale_liquidation_ttl_sec:
+                    context.long_liquidations = None
+                    context.short_liquidations = None
+                    context.liquidation_updated_at = None
+                    cleared_liquidations += 1
+
+        if removed_contexts or cleared_liquidations:
+            self.logger.info(
+                "FundingAnalyzer cleanup completed | removed_contexts=%s cleared_liquidations=%s",
+                removed_contexts,
+                cleared_liquidations,
+            )
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def on_funding(self, event: Any) -> None:
-        payload = self._extract_payload(event)
-        snapshot = self._parse_funding_snapshot(payload)
-        key = self._make_key(snapshot.symbol, snapshot.exchange.value)
+    async def on_funding(self, event: Event) -> None:
+        try:
+            payload = self._extract_payload(event)
+            snapshot = self._parse_funding_snapshot(payload)
+        except Exception:
+            self.logger.exception("Failed to parse funding event")
+            return
 
+        key = self._make_key(snapshot.symbol, snapshot.exchange.value)
         lock = self._locks[key]
+        lock_acquired = False
+
         try:
             await asyncio.wait_for(lock.acquire(), timeout=self.config.state_lock_timeout_sec)
+            lock_acquired = True
         except asyncio.TimeoutError:
-            self.logger.warning("FundingAnalyzer lock timeout for %s", key)
+            self.logger.warning(
+                "FundingAnalyzer lock timeout | key=%s timeout=%s",
+                key,
+                self.config.state_lock_timeout_sec,
+            )
             return
 
         try:
@@ -321,13 +464,14 @@ class FundingAnalyzer:
                 flip_event=flip_event,
                 extreme_event=extreme_event,
                 divergence_event=divergence_event,
+                correlation_id=event.correlation_id,
             )
 
-            await self._publish_regime_event(regime_state)
-            await self._publish_pressure_event(pressure_state)
-            await self._publish_flip_event(flip_event)
-            await self._publish_extreme_event(extreme_event)
-            await self._publish_divergence_event(divergence_event)
+            await self._publish_regime_event(regime_state, event.correlation_id)
+            await self._publish_pressure_event(pressure_state, event.correlation_id)
+            await self._publish_flip_event(flip_event, event.correlation_id)
+            await self._publish_extreme_event(extreme_event, event.correlation_id)
+            await self._publish_divergence_event(divergence_event, event.correlation_id)
             await self._publish_signal_events(
                 snapshot=snapshot,
                 regime_state=regime_state,
@@ -335,46 +479,47 @@ class FundingAnalyzer:
                 flip_event=flip_event,
                 extreme_event=extreme_event,
                 divergence_event=divergence_event,
+                correlation_id=event.correlation_id,
             )
 
         except Exception:
             self.logger.exception(
-                "Failed to process funding event: symbol=%s exchange=%s",
+                "Failed to process funding event | symbol=%s exchange=%s",
                 snapshot.symbol,
                 snapshot.exchange.value,
             )
         finally:
-            lock.release()
+            if lock_acquired:
+                lock.release()
 
-    async def on_open_interest(self, event: Any) -> None:
+    async def on_open_interest(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
             symbol = str(payload["symbol"]).upper().strip()
             exchange = str(payload.get("exchange", "unknown")).lower().strip()
             key = self._make_key(symbol, exchange)
 
-            context = self._market_context[key]
             new_oi = self._to_optional_float(payload.get("open_interest"))
             if new_oi is None:
                 return
 
+            context = self._market_context[key]
             context.previous_open_interest = context.latest_open_interest
             context.latest_open_interest = new_oi
             context.updated_at = self._utc_now()
         except Exception:
             self.logger.exception("Failed to process open interest event")
 
-    async def on_candle(self, event: Any) -> None:
+    async def on_candle(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
             symbol = str(payload["symbol"]).upper().strip()
             exchange = str(payload.get("exchange", "unknown")).lower().strip()
             key = self._make_key(symbol, exchange)
 
-            price = (
-                self._to_optional_float(payload.get("close"))
-                or self._to_optional_float(payload.get("price"))
-            )
+            price = self._to_optional_float(payload.get("close"))
+            if price is None:
+                price = self._to_optional_float(payload.get("price"))
             if price is None:
                 return
 
@@ -385,7 +530,7 @@ class FundingAnalyzer:
         except Exception:
             self.logger.exception("Failed to process candle event")
 
-    async def on_trade(self, event: Any) -> None:
+    async def on_trade(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
             symbol = str(payload["symbol"]).upper().strip()
@@ -403,19 +548,18 @@ class FundingAnalyzer:
         except Exception:
             self.logger.exception("Failed to process trade event")
 
-    async def on_cvd_update(self, event: Any) -> None:
+    async def on_cvd_update(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
-
             inner_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+
             symbol = str(inner_payload["symbol"]).upper().strip()
             exchange = str(inner_payload.get("exchange", "unknown")).lower().strip()
             key = self._make_key(symbol, exchange)
 
-            cvd_value = (
-                self._to_optional_float(inner_payload.get("cvd"))
-                or self._to_optional_float(inner_payload.get("cumulative_volume_delta"))
-            )
+            cvd_value = self._to_optional_float(inner_payload.get("cvd"))
+            if cvd_value is None:
+                cvd_value = self._to_optional_float(inner_payload.get("cumulative_volume_delta"))
             if cvd_value is None:
                 return
 
@@ -426,7 +570,7 @@ class FundingAnalyzer:
         except Exception:
             self.logger.exception("Failed to process CVD update event")
 
-    async def on_liquidation(self, event: Any) -> None:
+    async def on_liquidation(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
             symbol = str(payload["symbol"]).upper().strip()
@@ -442,15 +586,14 @@ class FundingAnalyzer:
             if liquidation_value is None and quantity is not None and price is not None:
                 liquidation_value = quantity * price
 
-            if liquidation_value is None:
-                return
-
             context = self._market_context[key]
-            if side == "long":
-                context.long_liquidations = liquidation_value
-            elif side == "short":
-                context.short_liquidations = liquidation_value
-            else:
+            if liquidation_value is not None:
+                if side == "long":
+                    context.long_liquidations = liquidation_value
+                elif side == "short":
+                    context.short_liquidations = liquidation_value
+
+            if side not in {"long", "short"}:
                 long_liq = self._to_optional_float(payload.get("long_liquidations"))
                 short_liq = self._to_optional_float(payload.get("short_liquidations"))
                 if long_liq is not None:
@@ -459,6 +602,7 @@ class FundingAnalyzer:
                     context.short_liquidations = short_liq
 
             context.updated_at = self._utc_now()
+            context.liquidation_updated_at = context.updated_at
         except Exception:
             self.logger.exception("Failed to process liquidation event")
 
@@ -468,26 +612,27 @@ class FundingAnalyzer:
 
     def _build_statistics(
         self,
+        *,
         symbol: str,
         exchange: str,
         history: Deque[FundingSnapshot],
         timeframe: FundingTimeframe,
     ) -> FundingStatistics:
+        if not history:
+            raise ValueError("history must not be empty")
+
         rates = [item.funding_rate for item in history]
         current_rate = rates[-1]
         mean_rate = sum(rates) / len(rates)
         median_rate = median(rates)
 
         if len(rates) > 1:
-            variance = sum((x - mean_rate) ** 2 for x in rates) / len(rates)
-            std_rate = variance ** 0.5
+            variance = sum((value - mean_rate) ** 2 for value in rates) / len(rates)
+            std_rate = variance**0.5
         else:
             std_rate = 0.0
 
-        zscore = None
-        if std_rate > 0:
-            zscore = (current_rate - mean_rate) / std_rate
-
+        zscore = (current_rate - mean_rate) / std_rate if std_rate > 0 else None
         percentile = self._calc_percentile(rates, current_rate)
 
         return FundingStatistics(
@@ -503,8 +648,8 @@ class FundingAnalyzer:
             zscore=zscore,
             percentile=percentile,
             sample_size=len(rates),
-            window_start=history[0].event_time if history else None,
-            window_end=history[-1].event_time if history else None,
+            window_start=history[0].event_time,
+            window_end=history[-1].event_time,
         )
 
     def _enrich_snapshot(
@@ -523,6 +668,7 @@ class FundingAnalyzer:
 
     async def _publish_updated_event(
         self,
+        *,
         snapshot: FundingSnapshot,
         statistics: FundingStatistics,
         regime_state: FundingRegimeState,
@@ -530,6 +676,7 @@ class FundingAnalyzer:
         flip_event: FundingFlipEvent | None,
         extreme_event: FundingExtremeEvent | None,
         divergence_event: FundingDivergenceEvent | None,
+        correlation_id: str | None,
     ) -> None:
         if not self.config.publish_updated_event:
             return
@@ -549,15 +696,19 @@ class FundingAnalyzer:
                 "divergence_event": divergence_event.to_dict() if divergence_event is not None else None,
             },
             event_time=snapshot.event_time,
-            source="analytics.funding.funding_analyzer",
+            source=self.SOURCE,
         )
-        await self.event_bus.emit(
-            self.config.analytics_updated_event_name,
-            event.to_dict(),
-            source="funding_analyzer",
+        await self._emit_analytics_event(
+            topic=self.config.analytics_updated_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
         )
 
-    async def _publish_regime_event(self, regime_state: FundingRegimeState) -> None:
+    async def _publish_regime_event(
+        self,
+        regime_state: FundingRegimeState,
+        correlation_id: str | None,
+    ) -> None:
         if not regime_state.changed and not self.config.publish_regime_event_on_every_update:
             return
 
@@ -568,15 +719,19 @@ class FundingAnalyzer:
             timeframe=regime_state.timeframe,
             payload=regime_state.to_dict(),
             event_time=regime_state.event_time,
-            source="analytics.funding.funding_analyzer",
+            source=self.SOURCE,
         )
-        await self.event_bus.emit(
-            self.config.analytics_regime_event_name,
-            event.to_dict(),
-            source="funding_analyzer",
+        await self._emit_analytics_event(
+            topic=self.config.analytics_regime_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
         )
 
-    async def _publish_pressure_event(self, pressure_state: FundingPressureState) -> None:
+    async def _publish_pressure_event(
+        self,
+        pressure_state: FundingPressureState,
+        correlation_id: str | None,
+    ) -> None:
         should_emit = (
             self.config.publish_pressure_event_on_every_update
             or self.pressure_analyzer.is_high_pressure(pressure_state)
@@ -591,15 +746,19 @@ class FundingAnalyzer:
             timeframe=pressure_state.timeframe,
             payload=pressure_state.to_dict(),
             event_time=pressure_state.event_time,
-            source="analytics.funding.funding_analyzer",
+            source=self.SOURCE,
         )
-        await self.event_bus.emit(
-            self.config.analytics_pressure_event_name,
-            event.to_dict(),
-            source="funding_analyzer",
+        await self._emit_analytics_event(
+            topic=self.config.analytics_pressure_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
         )
 
-    async def _publish_flip_event(self, flip_event: FundingFlipEvent | None) -> None:
+    async def _publish_flip_event(
+        self,
+        flip_event: FundingFlipEvent | None,
+        correlation_id: str | None,
+    ) -> None:
         if flip_event is None:
             return
 
@@ -610,15 +769,19 @@ class FundingAnalyzer:
             timeframe=flip_event.timeframe,
             payload=flip_event.to_dict(),
             event_time=flip_event.event_time,
-            source="analytics.funding.funding_analyzer",
+            source=self.SOURCE,
         )
-        await self.event_bus.emit(
-            self.config.analytics_flip_event_name,
-            event.to_dict(),
-            source="funding_analyzer",
+        await self._emit_analytics_event(
+            topic=self.config.analytics_flip_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
         )
 
-    async def _publish_extreme_event(self, extreme_event: FundingExtremeEvent | None) -> None:
+    async def _publish_extreme_event(
+        self,
+        extreme_event: FundingExtremeEvent | None,
+        correlation_id: str | None,
+    ) -> None:
         if extreme_event is None:
             return
 
@@ -629,15 +792,19 @@ class FundingAnalyzer:
             timeframe=extreme_event.timeframe,
             payload=extreme_event.to_dict(),
             event_time=extreme_event.event_time,
-            source="analytics.funding.funding_analyzer",
+            source=self.SOURCE,
         )
-        await self.event_bus.emit(
-            self.config.analytics_extreme_event_name,
-            event.to_dict(),
-            source="funding_analyzer",
+        await self._emit_analytics_event(
+            topic=self.config.analytics_extreme_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
         )
 
-    async def _publish_divergence_event(self, divergence_event: FundingDivergenceEvent | None) -> None:
+    async def _publish_divergence_event(
+        self,
+        divergence_event: FundingDivergenceEvent | None,
+        correlation_id: str | None,
+    ) -> None:
         if divergence_event is None:
             return
 
@@ -648,29 +815,88 @@ class FundingAnalyzer:
             timeframe=divergence_event.timeframe,
             payload=divergence_event.to_dict(),
             event_time=divergence_event.event_time,
-            source="analytics.funding.funding_analyzer",
+            source=self.SOURCE,
         )
-        await self.event_bus.emit(
-            self.config.analytics_divergence_event_name,
-            event.to_dict(),
-            source="funding_analyzer",
+        await self._emit_analytics_event(
+            topic=self.config.analytics_divergence_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
         )
 
     async def _publish_signal_events(
         self,
+        *,
         snapshot: FundingSnapshot,
         regime_state: FundingRegimeState,
         pressure_state: FundingPressureState,
         flip_event: FundingFlipEvent | None,
         extreme_event: FundingExtremeEvent | None,
         divergence_event: FundingDivergenceEvent | None,
+        correlation_id: str | None,
     ) -> None:
         if not self.config.publish_signal_event:
             return
 
+        signals = self._build_signals(
+            snapshot=snapshot,
+            regime_state=regime_state,
+            pressure_state=pressure_state,
+            flip_event=flip_event,
+            extreme_event=extreme_event,
+            divergence_event=divergence_event,
+        )
+
+        for signal in signals:
+            event = FundingAnalyticsEvent(
+                event_type=FundingEventType.SIGNAL,
+                symbol=signal.symbol,
+                exchange=signal.exchange,
+                timeframe=signal.timeframe,
+                payload=signal.to_dict(),
+                event_time=signal.event_time,
+                source=self.SOURCE,
+            )
+            await self._emit_analytics_event(
+                topic=self.config.analytics_signal_event_name,
+                payload=event.to_dict(),
+                correlation_id=correlation_id,
+                priority=EventPriority.HIGH,
+            )
+
+    async def _emit_analytics_event(
+        self,
+        *,
+        topic: str,
+        payload: dict[str, Any],
+        correlation_id: str | None,
+        priority: EventPriority = EventPriority.NORMAL,
+    ) -> None:
+        await self.event_bus.emit(
+            topic,
+            payload,
+            priority=priority,
+            source="funding_analyzer",
+            correlation_id=correlation_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Signal builders
+    # ------------------------------------------------------------------
+
+    def _build_signals(
+        self,
+        *,
+        snapshot: FundingSnapshot,
+        regime_state: FundingRegimeState,
+        pressure_state: FundingPressureState,
+        flip_event: FundingFlipEvent | None,
+        extreme_event: FundingExtremeEvent | None,
+        divergence_event: FundingDivergenceEvent | None,
+    ) -> list[FundingSignal]:
         signals: list[FundingSignal] = []
 
         if self.config.signal_on_regime_change and regime_state.changed:
+            previous_regime = regime_state.previous_regime.value if regime_state.previous_regime else "unknown"
             signals.append(
                 FundingSignal(
                     symbol=snapshot.symbol,
@@ -681,11 +907,7 @@ class FundingAnalyzer:
                     regime=regime_state.regime,
                     score=self._regime_signal_score(regime_state),
                     confidence=regime_state.confidence,
-                    description=(
-                        f"Funding regime changed from "
-                        f"{regime_state.previous_regime.value if regime_state.previous_regime else 'unknown'} "
-                        f"to {regime_state.regime.value}"
-                    ),
+                    description=f"Funding regime changed from {previous_regime} to {regime_state.regime.value}",
                     supporting_factors=[
                         f"funding_rate={snapshot.funding_rate:.8f}",
                         f"percentile={regime_state.percentile:.2f}" if regime_state.percentile is not None else "percentile=None",
@@ -697,14 +919,17 @@ class FundingAnalyzer:
             )
 
         if self.config.signal_on_high_pressure and self.pressure_analyzer.is_high_pressure(pressure_state):
+            signal_type = (
+                FundingSignalType.SQUEEZE_WARNING
+                if self.pressure_analyzer.is_squeeze_risk(pressure_state)
+                else FundingSignalType.CROWDING_WARNING
+            )
             signals.append(
                 FundingSignal(
                     symbol=snapshot.symbol,
                     exchange=snapshot.exchange,
                     timeframe=self.config.default_timeframe,
-                    signal_type=FundingSignalType.SQUEEZE_WARNING
-                    if self.pressure_analyzer.is_squeeze_risk(pressure_state)
-                    else FundingSignalType.CROWDING_WARNING,
+                    signal_type=signal_type,
                     bias=pressure_state.bias,
                     regime=regime_state.regime,
                     score=self._pressure_signal_score(pressure_state),
@@ -715,10 +940,8 @@ class FundingAnalyzer:
                     description=self.pressure_analyzer.build_summary(pressure_state),
                     supporting_factors=[
                         f"pressure_score={pressure_state.pressure_score:.4f}",
-                        f"squeeze_probability={pressure_state.squeeze_probability:.4f}"
-                        if pressure_state.squeeze_probability is not None else "squeeze_probability=None",
-                        f"mean_reversion_probability={pressure_state.mean_reversion_probability:.4f}"
-                        if pressure_state.mean_reversion_probability is not None else "mean_reversion_probability=None",
+                        f"squeeze_probability={pressure_state.squeeze_probability:.4f}" if pressure_state.squeeze_probability is not None else "squeeze_probability=None",
+                        f"mean_reversion_probability={pressure_state.mean_reversion_probability:.4f}" if pressure_state.mean_reversion_probability is not None else "mean_reversion_probability=None",
                     ],
                     tags=["funding", "pressure", pressure_state.level.value],
                     event_time=snapshot.event_time,
@@ -753,8 +976,7 @@ class FundingAnalyzer:
                     symbol=snapshot.symbol,
                     exchange=snapshot.exchange,
                     timeframe=self.config.default_timeframe,
-                    signal_type=FundingSignalType.SQUEEZE_WARNING
-                    if extreme_event.is_squeeze_risk else FundingSignalType.REVERSION_SETUP,
+                    signal_type=FundingSignalType.SQUEEZE_WARNING if extreme_event.is_squeeze_risk else FundingSignalType.REVERSION_SETUP,
                     bias=regime_state.bias,
                     regime=regime_state.regime,
                     score=self._extreme_signal_score(extreme_event),
@@ -785,33 +1007,16 @@ class FundingAnalyzer:
                     description=self.divergence_detector.build_summary(divergence_event),
                     supporting_factors=[
                         f"type={divergence_event.divergence_type.value}",
-                        f"price_change_pct={divergence_event.price_change_pct}"
-                        if divergence_event.price_change_pct is not None else "price_change_pct=None",
-                        f"oi_change_pct={divergence_event.oi_change_pct}"
-                        if divergence_event.oi_change_pct is not None else "oi_change_pct=None",
-                        f"cvd_change={divergence_event.cvd_change}"
-                        if divergence_event.cvd_change is not None else "cvd_change=None",
+                        f"price_change_pct={divergence_event.price_change_pct}" if divergence_event.price_change_pct is not None else "price_change_pct=None",
+                        f"oi_change_pct={divergence_event.oi_change_pct}" if divergence_event.oi_change_pct is not None else "oi_change_pct=None",
+                        f"cvd_change={divergence_event.cvd_change}" if divergence_event.cvd_change is not None else "cvd_change=None",
                     ],
                     tags=["funding", "divergence", divergence_event.divergence_type.value],
                     event_time=snapshot.event_time,
                 )
             )
 
-        for signal in signals:
-            event = FundingAnalyticsEvent(
-                event_type=FundingEventType.SIGNAL,
-                symbol=signal.symbol,
-                exchange=signal.exchange,
-                timeframe=signal.timeframe,
-                payload=signal.to_dict(),
-                event_time=signal.event_time,
-                source="analytics.funding.funding_analyzer",
-            )
-            await self.event_bus.emit(
-                self.config.analytics_signal_event_name,
-                event.to_dict(),
-                source="funding_analyzer",
-            )
+        return signals
 
     # ------------------------------------------------------------------
     # Signal score helpers
@@ -853,6 +1058,40 @@ class FundingAnalyzer:
         return 0.0
 
     # ------------------------------------------------------------------
+    # Scheduler
+    # ------------------------------------------------------------------
+
+    def _register_cleanup_job(self) -> None:
+        if not self.config.enable_cleanup_job:
+            return
+
+        if self.scheduler is None:
+            self.logger.info("FundingAnalyzer cleanup job disabled: scheduler not provided")
+            return
+
+        existing_job = self.scheduler.get_job_by_name(self.config.cleanup_job_name)
+        if existing_job is not None:
+            self._cleanup_job_id = existing_job.job_id
+            self.logger.warning(
+                "FundingAnalyzer cleanup job already exists | job_id=%s name=%s",
+                existing_job.job_id,
+                existing_job.name,
+            )
+            return
+
+        self._cleanup_job_id = self.scheduler.add_interval_job(
+            name=self.config.cleanup_job_name,
+            func=self.cleanup_stale_state,
+            interval=self.config.cleanup_interval_sec,
+            timeout=self.config.cleanup_timeout_sec,
+            max_retries=1,
+            retry_delay=1.0,
+            allow_overlap=False,
+            run_immediately=False,
+            enabled=True,
+        )
+
+    # ------------------------------------------------------------------
     # Parsing / utils
     # ------------------------------------------------------------------
 
@@ -860,9 +1099,12 @@ class FundingAnalyzer:
         symbol = str(payload["symbol"]).upper().strip()
         exchange = self._parse_exchange(payload.get("exchange", "unknown"))
 
-        next_funding_time = payload.get("next_funding_time")
-        if next_funding_time is not None:
-            next_funding_time = self._parse_datetime(next_funding_time)
+        next_funding_time_raw = payload.get("next_funding_time")
+        next_funding_time = (
+            self._parse_datetime(next_funding_time_raw)
+            if next_funding_time_raw is not None
+            else None
+        )
 
         event_time_raw = payload.get("event_time") or payload.get("ts") or payload.get("timestamp")
         received_at_raw = payload.get("received_at")
@@ -871,10 +1113,7 @@ class FundingAnalyzer:
         received_at = self._parse_datetime(received_at_raw) if received_at_raw is not None else self._utc_now()
 
         raw_metadata = payload.get("metadata")
-
-        metadata: dict[str, Any] = (
-            raw_metadata if isinstance(raw_metadata, dict) else {}
-        )
+        metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
 
         return FundingSnapshot(
             symbol=symbol,
@@ -891,12 +1130,11 @@ class FundingAnalyzer:
             metadata=metadata,
         )
 
-    def _extract_payload(self, event: Any) -> dict[str, Any]:
-        if isinstance(event, dict):
-            return event
-        if hasattr(event, "payload"):
-            return getattr(event, "payload")
-        raise TypeError(f"Unsupported event type: {type(event)!r}")
+    def _extract_payload(self, event: Event) -> dict[str, Any]:
+        payload = event.payload
+        if not isinstance(payload, dict):
+            raise TypeError(f"Event payload must be dict, got: {type(payload)!r}")
+        return payload
 
     def _make_key(self, symbol: str, exchange: str) -> str:
         return f"{symbol.upper().strip()}::{exchange.lower().strip()}"
@@ -936,7 +1174,10 @@ class FundingAnalyzer:
     def _to_optional_float(self, value: Any) -> float | None:
         if value is None:
             return None
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _calc_percentile(self, values: list[float], current_value: float) -> float | None:
         if not values:
