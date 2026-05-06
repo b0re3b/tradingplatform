@@ -6,6 +6,9 @@ from typing import Any
 
 from analytics.spreads.enums import SpreadRegime, SpreadSignalType, SpreadType
 from analytics.spreads.models import SpreadSignal, SpreadSnapshot
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
 from .base_spread_strategy import (
     BaseSpreadStrategy,
     BaseSpreadStrategyConfig,
@@ -50,14 +53,14 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
     Strategy layer для spot-futures basis / mean reversion setups.
 
     Роль:
-    - слухає spot/futures snapshots
-    - опціонально слухає spread-signal confirmations
+    - слухає analytics.spread.spot_futures.updated
+    - опціонально слухає analytics.spread.signal.generated
     - визначає basis bias:
         - SHORT_BASIS
         - LONG_BASIS
     - веде lifecycle setup-а:
         idle -> pending/open -> reduce -> close/stop
-    - публікує strategy-level intents
+    - публікує strategy-level intents через signal.*
 
     Не відповідає за:
     - розрахунок basis / zscore / funding-adjusted spread
@@ -68,8 +71,8 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
 
     STRATEGY_NAME = "spot_futures_basis"
 
-    SNAPSHOT_EVENT = "spread.spot_futures.updated"
-    SPREAD_SIGNAL_EVENT = "spread.signal.generated"
+    SNAPSHOT_EVENT = "analytics.spread.spot_futures.updated"
+    SPREAD_SIGNAL_EVENT = "analytics.spread.signal.generated"
 
     ACTION_OPEN = "OPEN_BASIS"
     ACTION_REDUCE = "REDUCE_BASIS"
@@ -84,18 +87,20 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
     def __init__(
         self,
         *,
-        event_bus: Any,
+        event_bus: EventBus,
         config: SpotFuturesBasisStrategyConfig | None = None,
-        scheduler: Any | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
         resolved_config = config or SpotFuturesBasisStrategyConfig()
+
         super().__init__(
             event_bus=event_bus,
             config=resolved_config,
             scheduler=scheduler,
             service_name=self.STRATEGY_NAME,
         )
-        self._config = resolved_config
+
+        self._config: SpotFuturesBasisStrategyConfig = resolved_config
 
         self._latest_snapshots: dict[str, SpreadSnapshot] = {}
         self._latest_signals: dict[str, list[SpreadSignal]] = {}
@@ -113,12 +118,21 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                 "mean_reversion_confirmations": 0,
                 "regime_shift_confirmations": 0,
                 "bias_flips": 0,
+                "invalid_payloads": 0,
             }
         )
 
     async def _subscribe_events(self) -> None:
-        await self._subscribe(self.SNAPSHOT_EVENT, self.on_spot_futures_snapshot)
-        await self._subscribe(self.SPREAD_SIGNAL_EVENT, self.on_spread_signal)
+        await self._subscribe_payload(
+            self.SNAPSHOT_EVENT,
+            self.on_spot_futures_snapshot,
+            name="on_spot_futures_snapshot",
+        )
+        await self._subscribe_payload(
+            self.SPREAD_SIGNAL_EVENT,
+            self.on_spread_signal,
+            name="on_spread_signal",
+        )
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -134,6 +148,7 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             "mean_reversion_confirmations": self._stats["mean_reversion_confirmations"],
             "regime_shift_confirmations": self._stats["regime_shift_confirmations"],
             "bias_flips": self._stats["bias_flips"],
+            "invalid_payloads": self._stats["invalid_payloads"],
             "tracked_snapshots": len(self._latest_snapshots),
             "tracked_signal_keys": len(self._latest_signals),
         }
@@ -142,7 +157,13 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if not self.is_running:
             return
 
-        if signal.spread_type != SpreadType.SPOT_FUTURES:
+        if not isinstance(signal, SpreadSignal):
+            self._stats["invalid_payloads"] += 1
+            self._logger.warning(
+                "Invalid payload for spread signal | strategy=%s payload_type=%s",
+                self.STRATEGY_NAME,
+                type(signal).__name__,
+            )
             return
 
         async with self._lock:
@@ -151,6 +172,9 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                 self._stats["spread_signals_received"] += 1
 
                 if self._reject_disabled():
+                    return
+
+                if signal.spread_type != SpreadType.SPOT_FUTURES:
                     return
 
                 if self._reject_stale_signal(signal.timestamp):
@@ -183,6 +207,15 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if not self.is_running:
             return
 
+        if not isinstance(snapshot, SpreadSnapshot):
+            self._stats["invalid_payloads"] += 1
+            self._logger.warning(
+                "Invalid payload for spot/futures snapshot | strategy=%s payload_type=%s",
+                self.STRATEGY_NAME,
+                type(snapshot).__name__,
+            )
+            return
+
         async with self._lock:
             try:
                 self._record_event_received()
@@ -196,21 +229,36 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
 
                 key = self._build_key_from_snapshot(snapshot)
 
-                if self._mark_event_seen(key=f"snapshot|{key}", timestamp=snapshot.timestamp):
+                if self._mark_event_seen(
+                    key=f"snapshot|{key}",
+                    timestamp=snapshot.timestamp,
+                ):
                     return
 
                 self._latest_snapshots[key] = snapshot
 
                 if self._reject_symbol(snapshot.symbol):
-                    await self._reject_snapshot(snapshot, key, "symbol_not_allowed")
+                    await self._reject_snapshot(
+                        snapshot,
+                        key,
+                        "symbol_not_allowed",
+                    )
                     return
 
                 if self._reject_snapshot_exchanges(snapshot):
-                    await self._reject_snapshot(snapshot, key, "exchange_not_allowed")
+                    await self._reject_snapshot(
+                        snapshot,
+                        key,
+                        "exchange_not_allowed",
+                    )
                     return
 
                 if self._reject_stale_snapshot(snapshot.timestamp):
-                    await self._reject_snapshot(snapshot, key, "snapshot_stale")
+                    await self._reject_snapshot(
+                        snapshot,
+                        key,
+                        "snapshot_stale",
+                    )
                     return
 
                 state = self._get_or_create_state(
@@ -244,7 +292,12 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                         )
                     return
 
-                if state.is_active and state.bias is not None and bias is not None and state.bias != bias:
+                if (
+                    state.is_active
+                    and state.bias is not None
+                    and bias is not None
+                    and state.bias != bias
+                ):
                     self._stats["bias_flips"] += 1
                     await self._stop_from_snapshot(
                         snapshot=snapshot,
@@ -257,14 +310,20 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                     if self._should_skip_by_cooldown(key, now=snapshot.timestamp):
                         return
 
+                    confidence = self._resolve_confidence(snapshot, confirmation)
+
                     self._set_state_open(
                         state,
                         bias=bias,
                         reason="open_basis_setup",
                         entry_value=snapshot.spread_bps,
                         entry_zscore=self._extract_zscore(snapshot),
-                        confidence=self._resolve_confidence(snapshot, confirmation),
-                        metadata=self._build_snapshot_metadata(snapshot, confirmation, bias),
+                        confidence=confidence,
+                        metadata=self._build_snapshot_metadata(
+                            snapshot,
+                            confirmation,
+                            bias,
+                        ),
                         now=snapshot.timestamp,
                     )
                     self._stats["opened_setups"] += 1
@@ -276,22 +335,33 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                         exchange_a=snapshot.leg_a_exchange,
                         exchange_b=snapshot.leg_b_exchange,
                         reason="mean_reversion_basis_setup",
-                        confidence=self._resolve_confidence(snapshot, confirmation),
+                        confidence=confidence,
                         spread_type=SpreadType.SPOT_FUTURES.value,
                         timestamp=snapshot.timestamp,
-                        metadata=self._build_open_payload(snapshot, state, confirmation, bias),
+                        metadata=self._build_open_payload(
+                            snapshot,
+                            state,
+                            confirmation,
+                            bias,
+                        ),
                     )
                     return
 
                 if self._should_reduce(snapshot, state):
+                    confidence = self._resolve_confidence(snapshot, confirmation)
+
                     self._set_state_open(
                         state,
                         bias=state.bias,
                         reason="reduce_basis_setup",
                         entry_value=state.entry_value,
                         entry_zscore=state.entry_zscore,
-                        confidence=self._resolve_confidence(snapshot, confirmation),
-                        metadata=self._build_snapshot_metadata(snapshot, confirmation, state.bias),
+                        confidence=confidence,
+                        metadata=self._build_snapshot_metadata(
+                            snapshot,
+                            confirmation,
+                            state.bias,
+                        ),
                         now=snapshot.timestamp,
                     )
                     self._stats["reduced_setups"] += 1
@@ -303,10 +373,14 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                         exchange_a=snapshot.leg_a_exchange,
                         exchange_b=snapshot.leg_b_exchange,
                         reason="basis_reversion_progressed",
-                        confidence=self._resolve_confidence(snapshot, confirmation),
+                        confidence=confidence,
                         spread_type=SpreadType.SPOT_FUTURES.value,
                         timestamp=snapshot.timestamp,
-                        metadata=self._build_reduce_payload(snapshot, state, confirmation),
+                        metadata=self._build_reduce_payload(
+                            snapshot,
+                            state,
+                            confirmation,
+                        ),
                     )
                     return
 
@@ -327,14 +401,20 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                     return
 
                 if self._should_update(snapshot, state, confirmation):
+                    confidence = self._resolve_confidence(snapshot, confirmation)
+
                     self._set_state_open(
                         state,
                         bias=state.bias,
                         reason="update_basis_setup",
                         entry_value=state.entry_value,
                         entry_zscore=state.entry_zscore,
-                        confidence=self._resolve_confidence(snapshot, confirmation),
-                        metadata=self._build_snapshot_metadata(snapshot, confirmation, state.bias),
+                        confidence=confidence,
+                        metadata=self._build_snapshot_metadata(
+                            snapshot,
+                            confirmation,
+                            state.bias,
+                        ),
                         now=snapshot.timestamp,
                     )
                     self._stats["updated_setups"] += 1
@@ -346,10 +426,14 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                         exchange_a=snapshot.leg_a_exchange,
                         exchange_b=snapshot.leg_b_exchange,
                         reason="basis_state_updated",
-                        confidence=self._resolve_confidence(snapshot, confirmation),
+                        confidence=confidence,
                         spread_type=SpreadType.SPOT_FUTURES.value,
                         timestamp=snapshot.timestamp,
-                        metadata=self._build_update_payload(snapshot, state, confirmation),
+                        metadata=self._build_update_payload(
+                            snapshot,
+                            state,
+                            confirmation,
+                        ),
                     )
                     return
 
@@ -387,11 +471,14 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                 return True
 
         if self._config.allowed_futures_exchanges:
-            normalized_allowed_fut = {
+            normalized_allowed_futures = {
                 self._normalize_exchange(item)
                 for item in self._config.allowed_futures_exchanges
             }
-            if self._normalize_exchange(snapshot.leg_b_exchange) not in normalized_allowed_fut:
+            if (
+                self._normalize_exchange(snapshot.leg_b_exchange)
+                not in normalized_allowed_futures
+            ):
                 self._stats["exchange_skips"] += 1
                 return True
 
@@ -423,9 +510,15 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         regime_shift_signal: SpreadSignal | None = None
 
         for signal in reversed(signals):
-            if signal.signal_type == SpreadSignalType.MEAN_REVERSION and mean_reversion_signal is None:
+            if (
+                signal.signal_type == SpreadSignalType.MEAN_REVERSION
+                and mean_reversion_signal is None
+            ):
                 mean_reversion_signal = signal
-            elif signal.signal_type == SpreadSignalType.REGIME_SHIFT and regime_shift_signal is None:
+            elif (
+                signal.signal_type == SpreadSignalType.REGIME_SHIFT
+                and regime_shift_signal is None
+            ):
                 regime_shift_signal = signal
 
             if mean_reversion_signal is not None and regime_shift_signal is not None:
@@ -496,13 +589,16 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if abs(funding_adjusted) < self._config.min_funding_adjusted_edge:
             return False
 
-        if self._config.require_mean_reversion_signal and not confirmation.get("has_mean_reversion_signal"):
+        has_mean_reversion = bool(confirmation.get("has_mean_reversion_signal"))
+        has_regime_shift = bool(confirmation.get("has_regime_shift_signal"))
+
+        if self._config.require_mean_reversion_signal and not has_mean_reversion:
             return False
 
-        if (
-            self._config.require_regime_shift_confirmation
-            and not confirmation.get("has_regime_shift_signal")
-        ):
+        if self._config.require_regime_shift_confirmation and not has_regime_shift:
+            return False
+
+        if has_regime_shift and not self._config.allow_regime_shift_entry:
             return False
 
         confidence = self._resolve_confidence(snapshot, confirmation)
@@ -539,11 +635,7 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             return False
 
         abs_zscore = abs(zscore)
-
-        if abs_zscore <= self._config.reduce_zscore and abs_zscore > self._config.exit_zscore:
-            return True
-
-        return False
+        return self._config.exit_zscore < abs_zscore <= self._config.reduce_zscore
 
     def _should_close(
         self,
@@ -606,10 +698,7 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if old_confidence is None:
             return True
 
-        if abs(new_confidence - old_confidence) >= Decimal("0.05"):
-            return True
-
-        return False
+        return abs(new_confidence - old_confidence) >= Decimal("0.05")
 
     async def _reject_snapshot(
         self,
@@ -624,6 +713,7 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             exchange_b=snapshot.leg_b_exchange,
             bias=None,
         )
+
         self._set_state_closed(
             state,
             status="rejected",
@@ -721,15 +811,23 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             "spread_pct": self._to_decimal_str(snapshot.spread_pct),
             "raw_spread": self._to_decimal_str(snapshot.raw_spread),
             "net_spread": self._to_decimal_str(snapshot.net_spread),
-            "funding_adjusted_spread": self._to_decimal_str(snapshot.funding_adjusted_spread),
+            "funding_adjusted_spread": self._to_decimal_str(
+                snapshot.funding_adjusted_spread
+            ),
             "zscore": self._to_decimal_str(zscore),
             "regime": snapshot.regime.value,
             "leg_a_type": snapshot.leg_a_type.value,
             "leg_b_type": snapshot.leg_b_type.value,
             "snapshot_timestamp": self._safe_isoformat(snapshot.timestamp),
             "snapshot_metadata": dict(snapshot.metadata),
-            "has_mean_reversion_signal": confirmation.get("has_mean_reversion_signal", False),
-            "has_regime_shift_signal": confirmation.get("has_regime_shift_signal", False),
+            "has_mean_reversion_signal": confirmation.get(
+                "has_mean_reversion_signal",
+                False,
+            ),
+            "has_regime_shift_signal": confirmation.get(
+                "has_regime_shift_signal",
+                False,
+            ),
         }
 
     def _build_open_payload(

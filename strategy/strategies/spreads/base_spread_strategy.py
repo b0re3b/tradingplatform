@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
+from core.scheduler import Scheduler
+
+
+PayloadHandler = Callable[[Any], None | Awaitable[None]]
+EventHandler = Callable[[Event], None | Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -28,6 +36,9 @@ class BaseSpreadStrategyConfig:
 
     allowed_symbols: set[str] = field(default_factory=set)
     allowed_exchanges: set[str] = field(default_factory=set)
+
+    cleanup_closed_states_interval_seconds: float = 300.0
+    cleanup_closed_states_older_than_seconds: int = 3_600
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -84,8 +95,9 @@ class BaseSpreadStrategy(ABC):
     Базовий клас для spread strategy components.
 
     Відповідальність:
-    - lifecycle: start / stop
-    - інтеграція з EventBus
+    - lifecycle: register / start / stop
+    - інтеграція з core.event_bus.EventBus
+    - інтеграція з core.scheduler.Scheduler для cleanup-задач
     - logger / lock / stats
     - state management для setup-ів
     - cooldown / dedup
@@ -95,7 +107,7 @@ class BaseSpreadStrategy(ABC):
         - exchange allowlist
         - confidence threshold
         - freshness
-    - publish helpers для strategy-level events
+    - emit helpers для strategy-level events
 
     Не відповідає за:
     - spread analytics
@@ -116,9 +128,9 @@ class BaseSpreadStrategy(ABC):
     def __init__(
         self,
         *,
-        event_bus: Any,
+        event_bus: EventBus,
         config: BaseSpreadStrategyConfig | None = None,
-        scheduler: Any | None = None,
+        scheduler: Scheduler | None = None,
         service_name: str | None = None,
     ) -> None:
         self._event_bus = event_bus
@@ -126,20 +138,33 @@ class BaseSpreadStrategy(ABC):
         self._config = config or BaseSpreadStrategyConfig()
 
         resolved_service_name = service_name or self.STRATEGY_NAME
-        self._logger = get_logger(__name__, service_name=resolved_service_name)
+        self._logger = get_logger(
+            __name__,
+            service_name=resolved_service_name,
+            event_type="strategy.spreads",
+            strategy=self.STRATEGY_NAME,
+        )
 
         self._running = False
+        self._registered = False
         self._lock = asyncio.Lock()
 
         self._states: dict[str, SpreadStrategyState] = {}
         self._last_signal_times: dict[str, datetime] = {}
         self._last_event_times: dict[str, datetime] = {}
 
+        self._subscriptions: list[Subscription] = []
+        self._cleanup_job_id: str | None = None
+
         self._stats: dict[str, int] = self._build_base_stats()
 
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_registered(self) -> bool:
+        return self._registered
 
     @property
     def config(self) -> BaseSpreadStrategyConfig:
@@ -153,6 +178,11 @@ class BaseSpreadStrategy(ABC):
     async def _subscribe_events(self) -> None:
         """
         Конкретна стратегія сама визначає, які події слухати.
+
+        У дочірніх класах слід викликати:
+            await self._subscribe_payload("analytics.spread.*", self.on_payload)
+        або:
+            self._subscribe_event("analytics.spread.*", self.on_event)
         """
         raise NotImplementedError
 
@@ -163,12 +193,70 @@ class BaseSpreadStrategy(ABC):
         """
         raise NotImplementedError
 
+    async def register(self) -> None:
+        """
+        Реєструє EventBus subscriptions і Scheduler jobs.
+
+        Метод idempotent: повторний виклик не створює дублікати підписок.
+        """
+        if self._registered:
+            self._logger.debug(
+                "Spread strategy already registered | strategy=%s",
+                self.STRATEGY_NAME,
+            )
+            return
+
+        await self._subscribe_events()
+        self._register_cleanup_job()
+
+        self._registered = True
+        self._logger.info(
+            "Spread strategy registered | strategy=%s subscriptions=%s cleanup_job_id=%s",
+            self.STRATEGY_NAME,
+            len(self._subscriptions),
+            self._cleanup_job_id,
+        )
+
+    async def unregister(self) -> None:
+        """
+        Знімає EventBus subscriptions, якщо EventBus підтримує unsubscribe().
+        Scheduler job лишається disabled через Scheduler API, якщо job_id відомий.
+        """
+        for subscription in list(self._subscriptions):
+            try:
+                self._event_bus.unsubscribe(subscription)
+            except Exception:
+                self._logger.exception(
+                    "Failed to unsubscribe spread strategy handler | strategy=%s pattern=%s",
+                    self.STRATEGY_NAME,
+                    subscription.pattern,
+                )
+
+        self._subscriptions.clear()
+
+        if self._scheduler is not None and self._cleanup_job_id is not None:
+            try:
+                self._scheduler.disable_job(self._cleanup_job_id)
+            except KeyError:
+                pass
+            except Exception:
+                self._logger.exception(
+                    "Failed to disable spread strategy cleanup job | strategy=%s job_id=%s",
+                    self.STRATEGY_NAME,
+                    self._cleanup_job_id,
+                )
+
+        self._registered = False
+        self._cleanup_job_id = None
+
     async def start(self) -> None:
         if self._running:
             return
 
+        if not self._registered:
+            await self.register()
+
         self._running = True
-        await self._subscribe_events()
 
         self._logger.info(
             "%s started",
@@ -176,17 +264,54 @@ class BaseSpreadStrategy(ABC):
             extra=self._build_start_log_extra(),
         )
 
-    async def stop(self) -> None:
-        if not self._running:
+    async def stop(self, *, unregister: bool = False) -> None:
+        if not self._running and not unregister:
             return
 
         self._running = False
+
+        if unregister:
+            await self.unregister()
 
         self._logger.info(
             "%s stopped",
             self.__class__.__name__,
             extra=self._build_stop_log_extra(),
         )
+
+    def _register_cleanup_job(self) -> None:
+        if self._scheduler is None:
+            return
+
+        if self._cleanup_job_id is not None:
+            return
+
+        interval = self._config.cleanup_closed_states_interval_seconds
+        if interval <= 0:
+            return
+
+        self._cleanup_job_id = self._scheduler.add_interval_job(
+            name=f"{self.STRATEGY_NAME}.cleanup_closed_states",
+            func=self._cleanup_closed_states_job,
+            interval=interval,
+            run_immediately=False,
+            max_retries=1,
+            retry_delay=1.0,
+            timeout=10.0,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    async def _cleanup_closed_states_job(self) -> None:
+        removed = self.cleanup_closed_states(
+            older_than_seconds=self._config.cleanup_closed_states_older_than_seconds,
+        )
+        if removed:
+            self._logger.info(
+                "Closed spread strategy states cleaned | strategy=%s removed=%s",
+                self.STRATEGY_NAME,
+                removed,
+            )
 
     def _build_base_stats(self) -> dict[str, int]:
         return {
@@ -219,6 +344,12 @@ class BaseSpreadStrategy(ABC):
             "max_signal_age_ms": self._config.max_signal_age_ms,
             "allowed_symbols_count": len(self._config.allowed_symbols),
             "allowed_exchanges_count": len(self._config.allowed_exchanges),
+            "cleanup_closed_states_interval_seconds": (
+                self._config.cleanup_closed_states_interval_seconds
+            ),
+            "cleanup_closed_states_older_than_seconds": (
+                self._config.cleanup_closed_states_older_than_seconds
+            ),
         }
 
     def _build_stop_log_extra(self) -> dict[str, Any]:
@@ -227,50 +358,134 @@ class BaseSpreadStrategy(ABC):
             "stats": self._stats.copy(),
             "active_states": sum(1 for state in self._states.values() if state.is_active),
             "total_states": len(self._states),
+            "registered": self._registered,
+            "subscriptions": len(self._subscriptions),
+            "cleanup_job_id": self._cleanup_job_id,
         }
 
     async def _maybe_await(self, value: Any) -> Any:
-        if asyncio.iscoroutine(value) or isinstance(value, asyncio.Future):
+        if inspect.isawaitable(value):
             return await value
         return value
+
+    async def _subscribe_payload(
+        self,
+        event_name: str,
+        handler: PayloadHandler,
+        *,
+        name: str | None = None,
+    ) -> Subscription:
+        """
+        Підписує payload-handler на EventBus topic.
+
+        Core EventBus передає handler-у Event, тому цей метод робить wrapper
+        і передає в бізнес-handler тільки event.payload.
+        """
+        handler_name = name or getattr(handler, "__name__", "payload_handler")
+
+        async def _event_wrapper(event: Event) -> None:
+            try:
+                result = handler(event.payload)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                self._mark_exception(
+                    "Spread strategy payload handler failed",
+                    exc,
+                    topic=event.topic,
+                    event_id=event.event_id,
+                    handler=handler_name,
+                )
+
+        subscription = self._event_bus.subscribe(
+            event_name,
+            _event_wrapper,
+            name=f"{self.STRATEGY_NAME}.{handler_name}",
+        )
+        self._subscriptions.append(subscription)
+        return subscription
+
+    async def _subscribe_event(
+        self,
+        event_name: str,
+        handler: EventHandler,
+        *,
+        name: str | None = None,
+    ) -> Subscription:
+        """
+        Підписує raw Event-handler на EventBus topic.
+        """
+        handler_name = name or getattr(handler, "__name__", "event_handler")
+
+        async def _event_wrapper(event: Event) -> None:
+            try:
+                result = handler(event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                self._mark_exception(
+                    "Spread strategy event handler failed",
+                    exc,
+                    topic=event.topic,
+                    event_id=event.event_id,
+                    handler=handler_name,
+                )
+
+        subscription = self._event_bus.subscribe(
+            event_name,
+            _event_wrapper,
+            name=f"{self.STRATEGY_NAME}.{handler_name}",
+        )
+        self._subscriptions.append(subscription)
+        return subscription
 
     async def _subscribe(
         self,
         event_name: str,
-        handler: Any,
-    ) -> None:
-        subscribe = getattr(self._event_bus, "subscribe", None)
-        if subscribe is None:
-            self._logger.warning(
-                "EventBus does not expose subscribe()",
-                extra={
-                    "strategy": self.STRATEGY_NAME,
-                    "event_name": event_name,
-                },
-            )
-            return
+        handler: PayloadHandler,
+    ) -> Subscription:
+        """
+        Backward-compatible alias для старих дочірніх класів.
 
-        await self._maybe_await(subscribe(event_name, handler))
+        Новий код краще пише явно:
+            await self._subscribe_payload(...)
+        """
+        return await self._subscribe_payload(event_name, handler)
+
+    async def _emit(
+        self,
+        event_name: str,
+        payload: Any,
+        *,
+        priority: EventPriority = EventPriority.NORMAL,
+        correlation_id: str | None = None,
+        headers: dict[str, Any] | None = None,
+    ) -> bool:
+        return await self._event_bus.emit(
+            event_name,
+            payload,
+            priority=priority,
+            source=self.STRATEGY_NAME,
+            correlation_id=correlation_id,
+            headers=headers,
+        )
 
     async def _publish(
         self,
         event_name: str,
         payload: Any,
-    ) -> None:
-        publish = getattr(self._event_bus, "publish", None)
-        if publish is None:
-            self._logger.warning(
-                "EventBus does not expose publish()",
-                extra={
-                    "strategy": self.STRATEGY_NAME,
-                    "event_name": event_name,
-                },
-            )
-            return
+    ) -> bool:
+        """
+        Backward-compatible alias.
 
-        await self._maybe_await(publish(event_name, payload))
+        У core EventBus publish() приймає Event, а не (topic, payload),
+        тому strategy layer має використовувати emit().
+        """
+        return await self._emit(event_name, payload)
 
     def _utcnow(self) -> datetime:
+        # Залишаємо naive UTC datetime, бо analytics models у проєкті
+        # використовують datetime без timezone-aware контракту.
         return datetime.utcnow()
 
     def _normalize_symbol(self, symbol: str | None) -> str:
@@ -562,6 +777,7 @@ class BaseSpreadStrategy(ABC):
         spread_type: str | None = None,
         timestamp: datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        priority: EventPriority = EventPriority.HIGH,
     ) -> dict[str, Any]:
         payload = self._build_strategy_payload(
             action=action,
@@ -575,7 +791,7 @@ class BaseSpreadStrategy(ABC):
             timestamp=timestamp,
             metadata=metadata,
         )
-        await self._publish(event_name, payload)
+        await self._emit(event_name, payload, priority=priority)
         return payload
 
     async def _emit_generated(
@@ -605,6 +821,7 @@ class BaseSpreadStrategy(ABC):
             spread_type=spread_type,
             timestamp=timestamp,
             metadata=metadata,
+            priority=EventPriority.HIGH,
         )
 
     async def _emit_updated(
@@ -634,6 +851,7 @@ class BaseSpreadStrategy(ABC):
             spread_type=spread_type,
             timestamp=timestamp,
             metadata=metadata,
+            priority=EventPriority.NORMAL,
         )
 
     async def _emit_rejected(
@@ -663,6 +881,7 @@ class BaseSpreadStrategy(ABC):
             spread_type=spread_type,
             timestamp=timestamp,
             metadata=metadata,
+            priority=EventPriority.NORMAL,
         )
 
     async def _emit_cancelled(
@@ -692,6 +911,7 @@ class BaseSpreadStrategy(ABC):
             spread_type=spread_type,
             timestamp=timestamp,
             metadata=metadata,
+            priority=EventPriority.NORMAL,
         )
 
     async def _emit_closed(
@@ -721,12 +941,13 @@ class BaseSpreadStrategy(ABC):
             spread_type=spread_type,
             timestamp=timestamp,
             metadata=metadata,
+            priority=EventPriority.NORMAL,
         )
 
     async def _run_safely(
         self,
         operation_name: str,
-        coro: Any,
+        coro: Awaitable[Any],
         **context: Any,
     ) -> Any:
         try:
@@ -802,7 +1023,7 @@ class BaseSpreadStrategy(ABC):
     def cleanup_closed_states(
         self,
         *,
-        older_than_seconds: int = 3600,
+        older_than_seconds: int = 3_600,
         now: datetime | None = None,
     ) -> int:
         current_time = now or self._utcnow()
@@ -826,8 +1047,11 @@ class BaseSpreadStrategy(ABC):
         return {
             **self._stats,
             "running": self._running,
+            "registered": self._registered,
             "strategy": self.STRATEGY_NAME,
             "states_total": len(self._states),
             "states_active": sum(1 for state in self._states.values() if state.is_active),
             "states_closed": sum(1 for state in self._states.values() if state.is_closed),
+            "subscriptions": len(self._subscriptions),
+            "cleanup_job_id": self._cleanup_job_id,
         }

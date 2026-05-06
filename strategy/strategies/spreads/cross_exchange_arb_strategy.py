@@ -5,13 +5,16 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from analytics.spreads.enums import OpportunityStatus, SpreadType
+from analytics.spreads.models import ArbitrageOpportunity, SpreadSnapshot
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
 from .base_spread_strategy import (
     BaseSpreadStrategy,
     BaseSpreadStrategyConfig,
     SpreadStrategyState,
 )
-from analytics.spreads.enums import OpportunityStatus, SpreadType
-from analytics.spreads.models import ArbitrageOpportunity, SpreadSnapshot
 
 
 @dataclass(slots=True)
@@ -19,8 +22,9 @@ class CrossExchangeArbStrategyConfig(BaseSpreadStrategyConfig):
     """
     Конфігурація стратегії cross-exchange arbitrage.
 
-    Це не analytics config.
-    Це rules-layer поверх готових arbitrage opportunities.
+    Це strategy-layer config.
+    Працює поверх готових ArbitrageOpportunity / SpreadSnapshot
+    з analytics.spreads.
     """
 
     entry_min_net_edge: Decimal = Decimal("0")
@@ -43,12 +47,12 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
     Strategy layer для cross-exchange arbitrage.
 
     Роль:
-    - слухає arbitrage opportunities і cross-exchange snapshots
+    - слухає analytics.spread.arbitrage.opportunity
+    - слухає analytics.spread.cross_exchange.updated
     - фільтрує executable setups
     - веде lifecycle strategy-state:
         idle -> pending -> open -> updated -> closed/cancelled/rejected
-    - публікує strategy-level intents:
-        signal.generated / updated / cancelled / closed / rejected
+    - публікує strategy-level intents через signal.*
 
     Не відповідає за:
     - пошук arbitrage можливостей
@@ -59,8 +63,8 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
 
     STRATEGY_NAME = "cross_exchange_arb"
 
-    OPPORTUNITY_EVENT = "spread.arbitrage.opportunity"
-    SNAPSHOT_EVENT = "spread.cross_exchange.updated"
+    OPPORTUNITY_EVENT = "analytics.spread.arbitrage.opportunity"
+    SNAPSHOT_EVENT = "analytics.spread.cross_exchange.updated"
 
     ACTION_OPEN = "OPEN_ARB"
     ACTION_UPDATE = "UPDATE_ARB"
@@ -71,18 +75,20 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
     def __init__(
         self,
         *,
-        event_bus: Any,
+        event_bus: EventBus,
         config: CrossExchangeArbStrategyConfig | None = None,
-        scheduler: Any | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
         resolved_config = config or CrossExchangeArbStrategyConfig()
+
         super().__init__(
             event_bus=event_bus,
             config=resolved_config,
             scheduler=scheduler,
             service_name=self.STRATEGY_NAME,
         )
-        self._config = resolved_config
+
+        self._config: CrossExchangeArbStrategyConfig = resolved_config
 
         self._latest_opportunities: dict[str, ArbitrageOpportunity] = {}
         self._latest_snapshots: dict[str, SpreadSnapshot] = {}
@@ -100,12 +106,21 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                 "persistence_waits": 0,
                 "expired_opportunities": 0,
                 "inactive_opportunities": 0,
+                "invalid_payloads": 0,
             }
         )
 
     async def _subscribe_events(self) -> None:
-        await self._subscribe(self.OPPORTUNITY_EVENT, self.on_arbitrage_opportunity)
-        await self._subscribe(self.SNAPSHOT_EVENT, self.on_cross_exchange_snapshot)
+        await self._subscribe_payload(
+            self.OPPORTUNITY_EVENT,
+            self.on_arbitrage_opportunity,
+            name="on_arbitrage_opportunity",
+        )
+        await self._subscribe_payload(
+            self.SNAPSHOT_EVENT,
+            self.on_cross_exchange_snapshot,
+            name="on_cross_exchange_snapshot",
+        )
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -120,13 +135,26 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             "persistence_waits": self._stats["persistence_waits"],
             "expired_opportunities": self._stats["expired_opportunities"],
             "inactive_opportunities": self._stats["inactive_opportunities"],
+            "invalid_payloads": self._stats["invalid_payloads"],
             "tracked_opportunities": len(self._latest_opportunities),
             "tracked_snapshots": len(self._latest_snapshots),
             "pending_candidates": len(self._pending_since),
         }
 
-    async def on_arbitrage_opportunity(self, opportunity: ArbitrageOpportunity) -> None:
+    async def on_arbitrage_opportunity(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> None:
         if not self.is_running:
+            return
+
+        if not isinstance(opportunity, ArbitrageOpportunity):
+            self._stats["invalid_payloads"] += 1
+            self._logger.warning(
+                "Invalid payload for arbitrage opportunity | strategy=%s payload_type=%s",
+                self.STRATEGY_NAME,
+                type(opportunity).__name__,
+            )
             return
 
         async with self._lock:
@@ -139,7 +167,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
 
                 key = self._build_key_from_opportunity(opportunity)
 
-                if self._mark_event_seen(key=f"opportunity|{key}", timestamp=opportunity.timestamp):
+                if self._mark_event_seen(
+                    key=f"opportunity|{key}",
+                    timestamp=opportunity.timestamp,
+                ):
                     return
 
                 self._latest_opportunities[key] = opportunity
@@ -152,7 +183,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     )
                     return
 
-                if self._reject_exchanges(opportunity.buy_exchange, opportunity.sell_exchange):
+                if self._reject_exchanges(
+                    opportunity.buy_exchange,
+                    opportunity.sell_exchange,
+                ):
                     await self._reject_setup(
                         opportunity=opportunity,
                         key=key,
@@ -214,9 +248,12 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     },
                 )
 
-                if self._config.require_persistence and not self._has_persistence_confirmation(
-                    key=key,
-                    now=opportunity.timestamp,
+                if (
+                    self._config.require_persistence
+                    and not self._has_persistence_confirmation(
+                        key=key,
+                        now=opportunity.timestamp,
+                    )
                 ):
                     self._stats["persistence_waits"] += 1
                     self._set_state_pending(
@@ -230,7 +267,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     return
 
                 if self._should_open(opportunity, state):
-                    if self._should_skip_by_cooldown(key, now=opportunity.timestamp):
+                    if self._should_skip_by_cooldown(
+                        key,
+                        now=opportunity.timestamp,
+                    ):
                         return
 
                     self._set_state_open(
@@ -307,6 +347,15 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         if not self.is_running:
             return
 
+        if not isinstance(snapshot, SpreadSnapshot):
+            self._stats["invalid_payloads"] += 1
+            self._logger.warning(
+                "Invalid payload for cross-exchange snapshot | strategy=%s payload_type=%s",
+                self.STRATEGY_NAME,
+                type(snapshot).__name__,
+            )
+            return
+
         async with self._lock:
             try:
                 self._record_event_received()
@@ -320,7 +369,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
 
                 key = self._build_key_from_snapshot(snapshot)
 
-                if self._mark_event_seen(key=f"snapshot|{key}", timestamp=snapshot.timestamp):
+                if self._mark_event_seen(
+                    key=f"snapshot|{key}",
+                    timestamp=snapshot.timestamp,
+                ):
                     return
 
                 self._latest_snapshots[key] = snapshot
@@ -329,7 +381,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                 if state is None or not state.is_active:
                     return
 
-                if self._config.close_on_stale_snapshot and self._reject_stale_snapshot(snapshot.timestamp):
+                if (
+                    self._config.close_on_stale_snapshot
+                    and self._reject_stale_snapshot(snapshot.timestamp)
+                ):
                     await self._close_from_snapshot(
                         snapshot=snapshot,
                         state=state,
@@ -339,7 +394,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
 
                 if self._config.close_on_snapshot_edge_loss:
                     net_spread = snapshot.net_spread
-                    if net_spread is None or net_spread <= self._config.exit_min_net_edge:
+                    if (
+                        net_spread is None
+                        or net_spread <= self._config.exit_min_net_edge
+                    ):
                         await self._close_from_snapshot(
                             snapshot=snapshot,
                             state=state,
@@ -356,7 +414,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     exchange_b=getattr(snapshot, "leg_b_exchange", None),
                 )
 
-    def _build_key_from_opportunity(self, opportunity: ArbitrageOpportunity) -> str:
+    def _build_key_from_opportunity(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> str:
         return self._build_state_key(
             self._normalize_symbol(opportunity.symbol),
             self._normalize_exchange(opportunity.buy_exchange),
@@ -379,31 +440,48 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             str(instrument_type),
         )
 
-    def _reject_instrument_types(self, opportunity: ArbitrageOpportunity) -> bool:
+    def _reject_instrument_types(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> bool:
         allowed = self._config.allowed_instrument_types
         if not allowed:
             return False
 
         buy_type = opportunity.buy_instrument_type.value
         sell_type = opportunity.sell_instrument_type.value
+
         return buy_type not in allowed or sell_type not in allowed
 
-    def _is_opportunity_active(self, opportunity: ArbitrageOpportunity) -> bool:
+    def _is_opportunity_active(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> bool:
         return opportunity.status == OpportunityStatus.ACTIVE
 
-    def _is_opportunity_expired(self, opportunity: ArbitrageOpportunity) -> bool:
+    def _is_opportunity_expired(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> bool:
         if opportunity.expires_at is None:
             return False
+
         return self._utcnow() >= opportunity.expires_at
 
-    def _is_tradeable(self, opportunity: ArbitrageOpportunity) -> bool:
+    def _is_tradeable(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> bool:
         if not opportunity.is_profitable:
             return False
 
         if opportunity.net_edge <= self._config.entry_min_net_edge:
             return False
 
-        if opportunity.spread_bps is not None and opportunity.spread_bps < self._config.entry_min_bps:
+        if (
+            opportunity.spread_bps is not None
+            and opportunity.spread_bps < self._config.entry_min_bps
+        ):
             return False
 
         return True
@@ -434,10 +512,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         if state.status in {"open", "pending", "closing"}:
             return False
 
-        if not self._is_tradeable(opportunity):
-            return False
-
-        return True
+        return self._is_tradeable(opportunity)
 
     def _should_update(
         self,
@@ -487,7 +562,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         if opportunity.net_edge <= self._config.exit_min_net_edge:
             return True
 
-        if opportunity.confidence is None or opportunity.confidence < self._config.min_confidence:
+        if (
+            opportunity.confidence is None
+            or opportunity.confidence < self._config.min_confidence
+        ):
             return True
 
         return False
@@ -506,6 +584,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             exchange_b=opportunity.sell_exchange,
             bias="arb",
         )
+
         self._set_state_closed(
             state,
             status="rejected",
