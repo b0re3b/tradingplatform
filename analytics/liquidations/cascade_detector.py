@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any
 
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
+from core.scheduler import Scheduler
 from .config import CascadeDetectorConfig
-from .enums import LiquidationSide, LiquidationStatus
+from .enums import LiquidationEventType, LiquidationStatus
 from .metrics import LiquidationMetrics
 from .models import (
     CascadeDetectionResult,
@@ -16,6 +17,7 @@ from .models import (
 from .state import LiquidationState, SymbolLiquidationState
 from .utils import (
     build_cluster_from_events,
+    build_symbol_key,
     clamp_float,
     compute_acceleration_ratio,
     compute_window_stats,
@@ -28,124 +30,128 @@ from .utils import (
 )
 
 
-class EventBusProtocol(Protocol):
-    async def emit(self, topic: str, event: Any) -> None:
-        ...
-
-    async def subscribe(
-        self,
-        topic: str,
-        handler: Callable[[Any], Awaitable[None]],
-    ) -> Any:
-        ...
-
-
-class SchedulerProtocol(Protocol):
-    def add_interval_job(
-        self,
-        func: Any,
-        seconds: int,
-        *,
-        name: str | None = None,
-        enabled: bool = True,
-        run_immediately: bool = False,
-        max_retries: int = 0,
-        timeout: int | None = None,
-        tags: list[str] | None = None,
-    ) -> Any:
-        ...
-
-
 class CascadeDetector:
     """
-    Detector liquidation cascades поверх normalized liquidation events.
+    Analytics detector для liquidation cascades.
 
-    Задачі:
-    - слухати normalized liquidation events із EventBus
-    - брати window подій із LiquidationState
-    - рахувати side dominance / notional burst / acceleration / compaction
-    - виявляти cascade або exhaustion
-    - публікувати analytics signals
+    Відповідальність:
+    - слухає market.liquidation.normalized через core.EventBus;
+    - бере sliding window подій із LiquidationState;
+    - рахує side dominance / notional burst / acceleration / price compaction;
+    - формує CascadeDetectionResult;
+    - публікує analytics.liquidation.* події через EventBus;
+    - реєструє healthcheck/snapshot/cleanup jobs через core.Scheduler.
 
     Цей клас НЕ:
-    - тягне WebSocket
-    - не шукає liquidity zones
-    - не приймає торгових рішень
+    - не читає WebSocket;
+    - не нормалізує raw exchange payload;
+    - не викликає strategy/risk/execution напряму;
+    - не приймає торгових рішень.
     """
-
-    DEFAULT_INPUT_TOPIC = "market.liquidation.normalized"
-    DEFAULT_SNAPSHOT_TOPIC = "analytics.liquidation.detector.snapshot"
 
     def __init__(
         self,
         *,
-        event_bus: EventBusProtocol,
+        event_bus: EventBus,
         config: CascadeDetectorConfig,
         state: LiquidationState,
+        scheduler: Scheduler | None = None,
         metrics: LiquidationMetrics | None = None,
-        scheduler: SchedulerProtocol | None = None,
         service_name: str = "cascade_detector",
     ) -> None:
         self.event_bus = event_bus
+        self.scheduler = scheduler
         self.config = config
         self.state = state
         self.metrics = metrics or LiquidationMetrics()
-        self.scheduler = scheduler
         self.service_name = service_name
 
         self.logger = get_logger(
             __name__,
-            service_name=service_name,
-            component="analytics.liquidations.cascade_detector",
+            event_type="analytics.liquidations.cascade_detector",
         )
 
+        self._registered = False
         self._running = False
+
         self._started_at: datetime | None = None
         self._stopped_at: datetime | None = None
-        self._subscription: Any = None
+
+        self._subscription: Subscription | None = None
 
         self._processed_events = 0
+        self._invalid_payload_skips = 0
         self._cascade_signals_emitted = 0
         self._exhaustion_signals_emitted = 0
         self._cooldown_skips = 0
         self._empty_window_skips = 0
         self._threshold_skips = 0
+
+        self._last_event_at: datetime | None = None
         self._last_signal_at: datetime | None = None
         self._last_error_at: datetime | None = None
         self._last_error: str | None = None
 
         self._latest_signals: list[CascadeDetectionResult] = []
-        self._latest_signals_limit = 200
+        self._latest_signals_limit = self.config.recent_signals_limit
 
         self._healthcheck_job_id: str | None = None
+        self._snapshot_job_id: str | None = None
+        self._cleanup_job_id: str | None = None
 
-    # -------------------------------------------------------------------------
-    # Lifecycle
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Lifecycle / registration
+    # ---------------------------------------------------------------------
+
+    def register(self) -> None:
+        """
+        Реєструє EventBus subscription і Scheduler jobs.
+
+        Для core.EventBus subscribe() є sync-методом, тому тут немає await.
+        """
+        if self._registered:
+            self.logger.warning("CascadeDetector already registered")
+            return
+
+        self._subscription = self.event_bus.subscribe(
+            self.config.input_topic,
+            self.on_liquidation_event,
+            name=f"{self.service_name}.on_liquidation_event",
+        )
+
+        self._register_scheduler_jobs()
+        self._registered = True
+
+        self.logger.info(
+            "CascadeDetector registered",
+            extra={
+                "input_topic": self.config.input_topic,
+                "scheduler_enabled": self.scheduler is not None,
+            },
+        )
 
     async def start(self) -> None:
         if self._running:
-            self.logger.warning("CascadeDetector already running.")
+            self.logger.warning("CascadeDetector already running")
             return
 
         if not self.config.enabled:
-            self.logger.warning("CascadeDetector is disabled by config.")
+            self.logger.warning("CascadeDetector is disabled by config")
             return
+
+        if not self._registered:
+            self.register()
 
         self._running = True
         self._started_at = utc_now()
         self._stopped_at = None
-
-        self._subscription = await self.event_bus.subscribe(
-            self.DEFAULT_INPUT_TOPIC,
-            self.on_liquidation_event,
-        )
-
-        self._register_scheduler_jobs()
+        self._last_error = None
+        self._last_error_at = None
 
         self.logger.info(
-            "CascadeDetector started.",
+            "CascadeDetector started",
             extra={
+                "input_topic": self.config.input_topic,
                 "window_seconds": self.config.window_seconds,
                 "min_events": self.config.min_events,
                 "min_total_notional_usd": str(self.config.min_total_notional_usd),
@@ -161,7 +167,7 @@ class CascadeDetector:
         self._stopped_at = utc_now()
 
         self.logger.info(
-            "CascadeDetector stopped.",
+            "CascadeDetector stopped",
             extra=self.get_stats(),
         )
 
@@ -169,38 +175,59 @@ class CascadeDetector:
         await self.stop()
         await self.start()
 
-    # -------------------------------------------------------------------------
-    # Main event handler
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Main EventBus handler
+    # ---------------------------------------------------------------------
 
-    async def on_liquidation_event(self, event: Any) -> None:
+    async def on_liquidation_event(self, event: Event) -> None:
         """
-        Основний вхід detector-а.
-        Очікує LiquidationEvent.
+        Основний EventBus handler.
+
+        core.EventBus передає envelope Event.
+        LiquidationEvent лежить у event.payload.
         """
         if not self._running:
             return
 
-        if not isinstance(event, LiquidationEvent):
+        payload = event.payload
+
+        if not isinstance(payload, LiquidationEvent):
+            self._invalid_payload_skips += 1
             self.logger.debug(
-                "CascadeDetector received non-LiquidationEvent payload, ignored.",
-                extra={"payload_type": type(event).__name__},
+                "CascadeDetector received non-LiquidationEvent payload",
+                extra={
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                    "payload_type": type(payload).__name__,
+                },
             )
             return
 
+        liquidation_event = payload
+
         try:
             self._processed_events += 1
+            self._last_event_at = ensure_utc(liquidation_event.timestamp)
 
-            symbol_state = self.state.get(event.exchange, event.symbol)
-            if symbol_state is None or not symbol_state.events:
+            symbol_state = self.state.get(
+                liquidation_event.exchange,
+                liquidation_event.symbol,
+            )
+
+            if symbol_state is None or symbol_state.is_empty:
                 self._empty_window_skips += 1
                 return
 
-            if symbol_state.is_in_cooldown(event.timestamp):
+            if symbol_state.is_in_cooldown(liquidation_event.timestamp):
                 self._cooldown_skips += 1
                 return
 
-            result = await self._detect_for_symbol_state(symbol_state, trigger_event=event)
+            result = await self._detect_for_symbol_state(
+                symbol_state,
+                trigger_event=liquidation_event,
+                correlation_id=event.correlation_id,
+            )
+
             if result is None:
                 return
 
@@ -209,22 +236,34 @@ class CascadeDetector:
         except Exception as exc:
             self._last_error_at = utc_now()
             self._last_error = repr(exc)
+
             self.logger.exception(
-                "Unhandled error in CascadeDetector.on_liquidation_event.",
+                "Unhandled error in CascadeDetector.on_liquidation_event",
                 extra={
-                    "exchange": event.exchange,
-                    "symbol": event.symbol,
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                    "exchange": liquidation_event.exchange,
+                    "symbol": liquidation_event.symbol,
                     "error": repr(exc),
                 },
             )
+
+    # ---------------------------------------------------------------------
+    # Detection
+    # ---------------------------------------------------------------------
 
     async def _detect_for_symbol_state(
         self,
         symbol_state: SymbolLiquidationState,
         *,
         trigger_event: LiquidationEvent,
+        correlation_id: str | None = None,
     ) -> CascadeDetectionResult | None:
-        window_events = self._get_window_events(symbol_state, now=trigger_event.timestamp)
+        window_events = self._get_window_events(
+            symbol_state,
+            now=trigger_event.timestamp,
+        )
+
         if not window_events:
             self._empty_window_skips += 1
             return None
@@ -239,7 +278,11 @@ class CascadeDetector:
             self._threshold_skips += 1
             return None
 
-        dominant_side_events = filter_events_by_side(window_events, stats.dominant_side)
+        dominant_side_events = filter_events_by_side(
+            window_events,
+            stats.dominant_side,
+        )
+
         if len(dominant_side_events) < self.config.min_events:
             self._threshold_skips += 1
             return None
@@ -250,7 +293,11 @@ class CascadeDetector:
             else 0.0
         )
 
-        intensity_score = self._compute_intensity_score(stats, acceleration_ratio=acceleration_ratio)
+        intensity_score = self._compute_intensity_score(
+            stats,
+            acceleration_ratio=acceleration_ratio,
+        )
+
         severity = infer_severity(
             intensity_score=intensity_score,
             low_threshold=self.config.low_severity_threshold,
@@ -265,11 +312,12 @@ class CascadeDetector:
             side=stats.dominant_side,
             events=dominant_side_events,
             severity=severity,
+            status=LiquidationStatus.CONFIRMED,
+            source=self.service_name,
         )
+
         if cluster is None:
             return None
-
-        cluster.status = LiquidationStatus.CONFIRMED
 
         continuation_bias = self._compute_continuation_bias(
             stats=stats,
@@ -302,9 +350,13 @@ class CascadeDetector:
             price_range_pct=stats.price_range_pct,
             severity=severity,
             status=LiquidationStatus.CONFIRMED,
+            correlation_id=correlation_id or trigger_event.correlation_id,
+            source=self.service_name,
             metadata={
+                "trigger_event_id": trigger_event.event_id,
                 "trigger_event_timestamp": trigger_event.timestamp.isoformat(),
                 "side_imbalance_ratio": stats.side_imbalance_ratio,
+                "event_imbalance_ratio": stats.event_imbalance_ratio,
                 "dominant_side": stats.dominant_side.value,
                 "acceleration_ratio": acceleration_ratio,
                 "long_events": stats.long_events,
@@ -314,15 +366,17 @@ class CascadeDetector:
             },
         )
 
-        cooldown_until = result.detected_at + timedelta(seconds=self.config.cooldown_seconds)
+        cooldown_until = result.detected_at + timedelta(
+            seconds=self.config.cooldown_seconds,
+        )
         symbol_state.set_cascade_detected(result.detected_at, cooldown_until)
 
         self._remember_signal(result)
         return result
 
-    # -------------------------------------------------------------------------
-    # Window helpers
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Window / thresholds
+    # ---------------------------------------------------------------------
 
     def _get_window_events(
         self,
@@ -331,7 +385,10 @@ class CascadeDetector:
         now: datetime,
     ) -> list[LiquidationEvent]:
         min_ts = ensure_utc(now) - timedelta(seconds=self.config.window_seconds)
-        return prune_events_older_than(list(symbol_state.events), min_timestamp=min_ts)
+        return prune_events_older_than(
+            list(symbol_state.events),
+            min_timestamp=min_ts,
+        )
 
     def _passes_base_thresholds(self, stats: LiquidationWindowStats) -> bool:
         if stats.total_events < self.config.min_events:
@@ -340,7 +397,7 @@ class CascadeDetector:
         if stats.total_notional_usd < self.config.min_total_notional_usd:
             return False
 
-        if stats.dominant_side == LiquidationSide.UNKNOWN:
+        if not stats.dominant_side.is_known:
             return False
 
         if stats.side_imbalance_ratio < self.config.min_side_imbalance_ratio:
@@ -352,9 +409,9 @@ class CascadeDetector:
 
         return True
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Scoring
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     def _compute_intensity_score(
         self,
@@ -362,9 +419,6 @@ class CascadeDetector:
         *,
         acceleration_ratio: float,
     ) -> float:
-        """
-        Композитний intensity score [0..1].
-        """
         notional_score = normalize_score(
             float(stats.total_notional_usd),
             float(self.config.min_total_notional_usd) * 3.0,
@@ -372,14 +426,14 @@ class CascadeDetector:
 
         imbalance_score = clamp_float(stats.side_imbalance_ratio)
 
-        continuation_signal = 0.0
         if self.config.price_compaction_enabled:
-            if self.config.max_price_range_pct <= 0:
-                continuation_signal = 0.0
-            else:
-                continuation_signal = clamp_float(
-                    1.0 - (stats.price_range_pct / max(self.config.max_price_range_pct, 1e-9))
+            continuation_signal = clamp_float(
+                1.0
+                - (
+                    stats.price_range_pct
+                    / max(self.config.max_price_range_pct, 1e-9)
                 )
+            )
         else:
             continuation_signal = 0.5
 
@@ -416,8 +470,8 @@ class CascadeDetector:
         acceleration_ratio: float,
     ) -> float:
         imbalance_component = clamp_float(stats.side_imbalance_ratio)
-        acceleration_component = 0.0
 
+        acceleration_component = 0.0
         if self.config.acceleration_enabled:
             acceleration_component = normalize_score(
                 acceleration_ratio,
@@ -430,7 +484,11 @@ class CascadeDetector:
                 1.0 - (stats.price_range_pct / self.config.max_price_range_pct)
             )
 
-        result = (imbalance_component * 0.45) + (acceleration_component * 0.35) + (compaction_component * 0.20)
+        result = (
+            imbalance_component * 0.45
+            + acceleration_component * 0.35
+            + compaction_component * 0.20
+        )
         return clamp_float(result)
 
     def _compute_exhaustion_bias(
@@ -439,12 +497,6 @@ class CascadeDetector:
         stats: LiquidationWindowStats,
         acceleration_ratio: float,
     ) -> float:
-        """
-        Exhaustion bias:
-        - великий notional burst уже є
-        - acceleration слабка або знижується
-        - price range розширений сильніше, ніж очікується для компактного каскаду
-        """
         burst_component = normalize_score(
             float(stats.total_notional_usd),
             float(self.config.min_total_notional_usd) * 4.0,
@@ -453,7 +505,8 @@ class CascadeDetector:
         weak_acceleration_component = 0.0
         if self.config.acceleration_enabled:
             weak_acceleration_component = clamp_float(
-                1.0 - normalize_score(
+                1.0
+                - normalize_score(
                     acceleration_ratio,
                     max(self.config.min_acceleration_ratio, 1.0),
                 )
@@ -500,19 +553,32 @@ class CascadeDetector:
         )
         return clamp_float(result)
 
-    # -------------------------------------------------------------------------
-    # Emit / signal handling
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Event publishing
+    # ---------------------------------------------------------------------
 
     async def _emit_detection_result(self, result: CascadeDetectionResult) -> None:
-        await self.event_bus.emit(self.config.publish_topic_detected, result)
-        self.metrics.observe_cascade(result)
+        accepted = await self.event_bus.emit(
+            self.config.publish_topic_detected,
+            result,
+            priority=EventPriority.HIGH,
+            source=self.service_name,
+            correlation_id=result.correlation_id,
+            headers={
+                "exchange": result.exchange,
+                "symbol": result.symbol,
+                "event_type": LiquidationEventType.CASCADE.value,
+                "severity": result.severity.value,
+            },
+        )
 
-        self._cascade_signals_emitted += 1
-        self._last_signal_at = result.detected_at
+        if accepted:
+            self.metrics.observe_cascade(result)
+            self._cascade_signals_emitted += 1
+            self._last_signal_at = result.detected_at
 
         self.logger.info(
-            "Liquidation cascade detected.",
+            "Liquidation cascade detected",
             extra={
                 "exchange": result.exchange,
                 "symbol": result.symbol,
@@ -529,30 +595,88 @@ class CascadeDetector:
         )
 
         if result.favors_exhaustion:
-            await self.event_bus.emit(self.config.publish_topic_exhaustion, result)
-            self.metrics.observe_exhaustion(result)
-            self._exhaustion_signals_emitted += 1
+            exhaustion_accepted = await self.event_bus.emit(
+                self.config.publish_topic_exhaustion,
+                result,
+                priority=EventPriority.HIGH,
+                source=self.service_name,
+                correlation_id=result.correlation_id,
+                headers={
+                    "exchange": result.exchange,
+                    "symbol": result.symbol,
+                    "event_type": LiquidationEventType.EXHAUSTION.value,
+                    "severity": result.severity.value,
+                },
+            )
+
+            if exhaustion_accepted:
+                self.metrics.observe_exhaustion(result)
+                self._exhaustion_signals_emitted += 1
+
+    async def emit_runtime_snapshot(
+        self,
+        topic: str | None = None,
+    ) -> bool:
+        snapshot = {
+            "service": self.service_name,
+            "running": self._running,
+            "stats": self.get_stats(),
+            "health": self.get_health(),
+            "latest_signals": [
+                item.to_dict(serialize=True)
+                for item in self.get_recent_signals(limit=25)
+            ],
+            "emitted_at": utc_now().isoformat(),
+        }
+
+        return await self.event_bus.emit(
+            topic or self.config.publish_topic_snapshot,
+            snapshot,
+            priority=EventPriority.LOW,
+            source=self.service_name,
+            headers={
+                "event_type": LiquidationEventType.SNAPSHOT.value,
+            },
+        )
+
+    async def emit_health(self) -> bool:
+        health = self.get_health()
+
+        return await self.event_bus.emit(
+            self.config.publish_topic_health,
+            health,
+            priority=EventPriority.LOW,
+            source=self.service_name,
+            headers={
+                "event_type": LiquidationEventType.HEALTH.value,
+            },
+        )
+
+    # ---------------------------------------------------------------------
+    # Signal memory / query API
+    # ---------------------------------------------------------------------
 
     def _remember_signal(self, result: CascadeDetectionResult) -> None:
         self._latest_signals.append(result)
+
         if len(self._latest_signals) > self._latest_signals_limit:
             self._latest_signals = self._latest_signals[-self._latest_signals_limit :]
 
-    # -------------------------------------------------------------------------
-    # Feature methods
-    # -------------------------------------------------------------------------
+    async def detect_now(
+        self,
+        exchange: str,
+        symbol: str,
+    ) -> CascadeDetectionResult | None:
+        symbol_state = self.state.get(exchange, symbol)
 
-    async def detect_now(self, exchange: str, symbol: str) -> CascadeDetectionResult | None:
-        """
-        Форсований manual detect для конкретного символу.
-        Корисно для debug/admin/API.
-        """
-        symbol_state = self.state.get(exchange.lower(), symbol.upper())
-        if symbol_state is None or not symbol_state.events:
+        if symbol_state is None or symbol_state.is_empty:
             return None
 
         trigger_event = symbol_state.events[-1]
-        result = await self._detect_for_symbol_state(symbol_state, trigger_event=trigger_event)
+        result = await self._detect_for_symbol_state(
+            symbol_state,
+            trigger_event=trigger_event,
+        )
 
         if result is not None:
             await self._emit_detection_result(result)
@@ -566,16 +690,29 @@ class CascadeDetector:
         exchange: str | None = None,
         limit: int = 50,
     ) -> list[CascadeDetectionResult]:
-        target_symbol = symbol.upper() if symbol else None
-        target_exchange = exchange.lower() if exchange else None
+        if limit <= 0:
+            return []
+
+        target_exchange: str | None = None
+        target_symbol: str | None = None
+
+        if exchange is not None and symbol is not None:
+            target_exchange, target_symbol = build_symbol_key(exchange, symbol)
+        elif exchange is not None:
+            target_exchange = exchange.strip().lower()
+        elif symbol is not None:
+            target_symbol = symbol.strip().upper().replace("-", "").replace("/", "")
 
         result: list[CascadeDetectionResult] = []
+
         for signal in reversed(self._latest_signals):
-            if target_symbol and signal.symbol != target_symbol:
-                continue
             if target_exchange and signal.exchange != target_exchange:
                 continue
+            if target_symbol and signal.symbol != target_symbol:
+                continue
+
             result.append(signal)
+
             if len(result) >= limit:
                 break
 
@@ -586,23 +723,20 @@ class CascadeDetector:
         exchange: str,
         symbol: str,
     ) -> CascadeDetectionResult | None:
-        target_exchange = exchange.lower()
-        target_symbol = symbol.upper()
-
-        for signal in reversed(self._latest_signals):
-            if signal.exchange == target_exchange and signal.symbol == target_symbol:
-                return signal
-        return None
+        signals = self.get_recent_signals(
+            exchange=exchange,
+            symbol=symbol,
+            limit=1,
+        )
+        return signals[0] if signals else None
 
     def get_hot_symbols(self, limit: int = 10) -> list[dict[str, Any]]:
-        """
-        Топ символів за силою останніх cascade signals.
-        """
         latest_by_key: dict[tuple[str, str], CascadeDetectionResult] = {}
 
         for signal in self._latest_signals:
-            key = (signal.exchange, signal.symbol)
+            key = signal.symbol_key
             previous = latest_by_key.get(key)
+
             if previous is None or signal.detected_at > previous.detected_at:
                 latest_by_key[key] = signal
 
@@ -628,128 +762,159 @@ class CascadeDetector:
             ),
             reverse=True,
         )
-        return rows[:limit]
 
-    def get_symbol_diagnostic(self, exchange: str, symbol: str) -> dict[str, Any]:
-        """
-        Детальна діагностика по символу:
-        - buffer snapshot
-        - window stats
-        - cooldown
-        - last signal
-        """
-        exchange = exchange.lower()
-        symbol = symbol.upper()
-        symbol_state = self.state.get(exchange, symbol)
+        return rows[: max(0, limit)]
+
+    def get_symbol_diagnostic(
+        self,
+        exchange: str,
+        symbol: str,
+    ) -> dict[str, Any]:
+        normalized_exchange, normalized_symbol = build_symbol_key(exchange, symbol)
+        symbol_state = self.state.get(normalized_exchange, normalized_symbol)
 
         if symbol_state is None:
             return {
-                "exchange": exchange,
-                "symbol": symbol,
+                "exchange": normalized_exchange,
+                "symbol": normalized_symbol,
                 "exists": False,
             }
 
         now = utc_now()
         window_events = self._get_window_events(symbol_state, now=now)
-        stats = compute_window_stats(exchange=exchange, symbol=symbol, events=window_events)
-        last_signal = self.get_symbol_last_signal(exchange, symbol)
+
+        stats = compute_window_stats(
+            exchange=normalized_exchange,
+            symbol=normalized_symbol,
+            events=window_events,
+        )
+
+        last_signal = self.get_symbol_last_signal(
+            normalized_exchange,
+            normalized_symbol,
+        )
 
         return {
-            "exchange": exchange,
-            "symbol": symbol,
+            "exchange": normalized_exchange,
+            "symbol": normalized_symbol,
             "exists": True,
-            "buffer_snapshot": asdict(symbol_state.snapshot()),
-            "window_stats": {
-                "total_events": stats.total_events,
-                "long_events": stats.long_events,
-                "short_events": stats.short_events,
-                "total_notional_usd": str(stats.total_notional_usd),
-                "long_notional_usd": str(stats.long_notional_usd),
-                "short_notional_usd": str(stats.short_notional_usd),
-                "dominant_side": stats.dominant_side.value,
-                "side_imbalance_ratio": stats.side_imbalance_ratio,
-                "price_range_pct": stats.price_range_pct,
-                "window_start": stats.window_start.isoformat(),
-                "window_end": stats.window_end.isoformat(),
-            },
+            "buffer_snapshot": symbol_state.snapshot().to_dict(serialize=True),
+            "window_stats": stats.to_dict(serialize=True),
             "cooldown_active": symbol_state.is_in_cooldown(now),
-            "last_signal": asdict(last_signal) if last_signal else None,
+            "last_signal": (
+                last_signal.to_dict(serialize=True)
+                if last_signal is not None
+                else None
+            ),
         }
 
-    async def emit_runtime_snapshot(
-        self,
-        topic: str = DEFAULT_SNAPSHOT_TOPIC,
-    ) -> None:
-        snapshot = {
-            "service": self.service_name,
-            "running": self._running,
-            "stats": self.get_stats(),
-            "health": self.get_health(),
-            "latest_signals": [asdict(item) for item in self.get_recent_signals(limit=25)],
-            "emitted_at": utc_now().isoformat(),
-        }
-        await self.event_bus.emit(topic, snapshot)
-
-    # -------------------------------------------------------------------------
-    # Scheduler / health
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Scheduler jobs
+    # ---------------------------------------------------------------------
 
     def _register_scheduler_jobs(self) -> None:
         if self.scheduler is None:
             return
 
-        try:
-            job = self.scheduler.add_interval_job(
-                self._scheduled_healthcheck,
-                seconds=15,
-                name="cascade_detector_healthcheck",
-                enabled=True,
+        if self._healthcheck_job_id is None:
+            self._healthcheck_job_id = self.scheduler.add_interval_job(
+                name=self.config.healthcheck_job_name,
+                func=self._scheduled_healthcheck,
+                interval=self.config.healthcheck_interval_seconds,
                 run_immediately=False,
-                max_retries=0,
-                timeout=5,
-                tags=["liquidations", "cascade_detector", "healthcheck"],
+                max_retries=self.config.scheduler_job_max_retries,
+                retry_delay=self.config.scheduler_job_retry_delay_seconds,
+                timeout=self.config.scheduler_job_timeout_seconds,
+                allow_overlap=False,
+                enabled=True,
             )
-            self._healthcheck_job_id = getattr(job, "job_id", None)
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to register scheduler jobs for CascadeDetector.",
-                extra={"error": repr(exc)},
+
+        if self._snapshot_job_id is None:
+            self._snapshot_job_id = self.scheduler.add_interval_job(
+                name=self.config.snapshot_job_name,
+                func=self._scheduled_snapshot,
+                interval=self.config.snapshot_interval_seconds,
+                run_immediately=False,
+                max_retries=self.config.scheduler_job_max_retries,
+                retry_delay=self.config.scheduler_job_retry_delay_seconds,
+                timeout=self.config.scheduler_job_timeout_seconds,
+                allow_overlap=False,
+                enabled=True,
+            )
+
+        if self._cleanup_job_id is None:
+            self._cleanup_job_id = self.scheduler.add_interval_job(
+                name=self.config.cleanup_job_name,
+                func=self._scheduled_cleanup,
+                interval=self.config.cleanup_interval_seconds,
+                run_immediately=False,
+                max_retries=self.config.scheduler_job_max_retries,
+                retry_delay=self.config.scheduler_job_retry_delay_seconds,
+                timeout=self.config.scheduler_job_timeout_seconds,
+                allow_overlap=False,
+                enabled=True,
             )
 
     async def _scheduled_healthcheck(self) -> None:
         health = self.get_health()
+        await self.emit_health()
+
         if health["status"] != "healthy":
-            self.logger.warning("CascadeDetector health degraded.", extra=health)
+            self.logger.warning(
+                "CascadeDetector health degraded",
+                extra=health,
+            )
+
+    async def _scheduled_snapshot(self) -> None:
+        await self.emit_runtime_snapshot()
+
+    async def _scheduled_cleanup(self) -> None:
+        """
+        Cleanup тут не чистить LiquidationState — це відповідальність stream/state cleanup.
+        Тут чистимо тільки локальний buffer latest signals.
+        """
+        if len(self._latest_signals) > self._latest_signals_limit:
+            self._latest_signals = self._latest_signals[-self._latest_signals_limit :]
+
+    # ---------------------------------------------------------------------
+    # Health / stats
+    # ---------------------------------------------------------------------
 
     def get_health(self) -> dict[str, Any]:
         status = "healthy"
+
         if not self._running:
             status = "stopped"
         elif self._last_error is not None:
             status = "degraded"
 
         seconds_since_last_signal = (
-            (utc_now() - self._last_signal_at).total_seconds()
+            (utc_now() - ensure_utc(self._last_signal_at)).total_seconds()
             if self._last_signal_at
+            else None
+        )
+
+        seconds_since_last_event = (
+            (utc_now() - ensure_utc(self._last_event_at)).total_seconds()
+            if self._last_event_at
             else None
         )
 
         return {
             "status": status,
             "running": self._running,
+            "registered": self._registered,
+            "last_event_at": self._last_event_at.isoformat() if self._last_event_at else None,
             "last_signal_at": self._last_signal_at.isoformat() if self._last_signal_at else None,
+            "seconds_since_last_event": seconds_since_last_event,
             "seconds_since_last_signal": seconds_since_last_signal,
             "last_error": self._last_error,
             "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
         }
 
-    # -------------------------------------------------------------------------
-    # Stats
-    # -------------------------------------------------------------------------
-
     def get_stats(self) -> dict[str, Any]:
         uptime_seconds = (
-            max(0.0, (utc_now() - self._started_at).total_seconds())
+            max(0.0, (utc_now() - ensure_utc(self._started_at)).total_seconds())
             if self._started_at
             else 0.0
         )
@@ -757,16 +922,32 @@ class CascadeDetector:
         return {
             "service_name": self.service_name,
             "running": self._running,
+            "registered": self._registered,
+            "input_topic": self.config.input_topic,
             "uptime_seconds": uptime_seconds,
             "processed_events": self._processed_events,
+            "invalid_payload_skips": self._invalid_payload_skips,
             "cascade_signals_emitted": self._cascade_signals_emitted,
             "exhaustion_signals_emitted": self._exhaustion_signals_emitted,
             "cooldown_skips": self._cooldown_skips,
             "empty_window_skips": self._empty_window_skips,
             "threshold_skips": self._threshold_skips,
-            "tracked_symbols": len(self.state.symbols),
+            "tracked_symbols": self.state.symbols_count,
             "latest_signals_buffered": len(self._latest_signals),
+            "latest_signals_limit": self._latest_signals_limit,
+            "last_event_at": self._last_event_at.isoformat() if self._last_event_at else None,
             "last_signal_at": self._last_signal_at.isoformat() if self._last_signal_at else None,
             "last_error": self._last_error,
             "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
+            "healthcheck_job_id": self._healthcheck_job_id,
+            "snapshot_job_id": self._snapshot_job_id,
+            "cleanup_job_id": self._cleanup_job_id,
         }
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def is_registered(self) -> bool:
+        return self._registered

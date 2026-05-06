@@ -5,12 +5,13 @@ import contextlib
 import hashlib
 import time
 from collections import deque
-from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Protocol
 
+from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
+from core.scheduler import Scheduler
 from .config import LiquidationStreamConfig
 from .enums import LiquidationEventType, LiquidationSide
 from .metrics import LiquidationMetrics
@@ -25,37 +26,14 @@ from .utils import (
 )
 
 
-class EventBusProtocol(Protocol):
-    async def emit(self, topic: str, event: Any) -> None:
-        ...
-
-
-class SchedulerProtocol(Protocol):
-    def add_interval_job(
-        self,
-        func: Any,
-        seconds: int,
-        *,
-        name: str | None = None,
-        enabled: bool = True,
-        run_immediately: bool = False,
-        max_retries: int = 0,
-        timeout: int | None = None,
-        tags: list[str] | None = None,
-    ) -> Any:
-        ...
-
-    async def run_job_now(self, job_id: str) -> None:
-        ...
-
-
 class LiquidationExchangeAdapterProtocol(Protocol):
     """
-    Абстракція адаптера біржі для liquidation stream.
+    Абстракція біржового адаптера для liquidation stream.
 
-    Очікується, що exchange adapter:
-    - уміє стартувати liquidation feed
-    - уміє віддавати сирі liquidation payload-и через async iterator / queue / callback
+    Adapter відповідає лише за transport/exchange-specific частину:
+    - connect liquidation feed;
+    - disconnect liquidation feed;
+    - отримання raw liquidation payload.
     """
 
     @property
@@ -76,138 +54,187 @@ class LiquidationStream:
     """
     Ingestion + normalization + publish layer для liquidation events.
 
-    Задачі:
-    - отримання сирих liquidation payload-ів від біржі
-    - нормалізація до LiquidationEvent
-    - фільтрація stale / invalid / duplicate payload-ів
-    - збереження у liquidation state
-    - оновлення runtime metrics
-    - публікація подій в EventBus
+    Відповідальність:
+    - отримує raw liquidation payload-и від exchange adapter;
+    - нормалізує payload у LiquidationEvent;
+    - фільтрує invalid/stale/duplicate events;
+    - оновлює LiquidationState;
+    - оновлює LiquidationMetrics;
+    - публікує market.liquidation.* події через core.EventBus;
+    - реєструє health/snapshot/cleanup jobs через core.Scheduler.
 
     Цей клас НЕ:
-    - будує liquidity zones
-    - не шукає stop clusters
-    - не робить cascade detection
-    - не приймає торгові рішення
+    - не робить cascade detection;
+    - не приймає торгових рішень;
+    - не викликає strategy/risk/execution напряму;
+    - не дублює core EventBus/Scheduler/logger.
     """
-
-    DEFAULT_HEALTH_DEGRADATION_SECONDS = 15
-    DEFAULT_RECENT_FINGERPRINTS_SIZE = 10_000
-    DEFAULT_RECENT_LARGE_EVENTS_SIZE = 500
 
     def __init__(
         self,
         *,
-        event_bus: EventBusProtocol,
+        event_bus: EventBus,
         exchange_adapter: LiquidationExchangeAdapterProtocol,
         config: LiquidationStreamConfig,
+        scheduler: Scheduler | None = None,
         state: LiquidationState | None = None,
         metrics: LiquidationMetrics | None = None,
-        scheduler: SchedulerProtocol | None = None,
         service_name: str = "liquidation_stream",
     ) -> None:
         self.event_bus = event_bus
+        self.scheduler = scheduler
         self.exchange_adapter = exchange_adapter
         self.config = config
-        self.scheduler = scheduler
         self.service_name = service_name
+
+        self.state = state or LiquidationState(
+            max_events_per_symbol=self.config.max_buffer_size_per_symbol,
+        )
+        self.metrics = metrics or LiquidationMetrics()
 
         self.logger = get_logger(
             __name__,
-            service_name=service_name,
-            component="analytics.liquidations.stream",
-            exchange=getattr(exchange_adapter, "name", "unknown"),
+            event_type="analytics.liquidations.stream",
+            exchange=self.exchange_name,
         )
-
-        self.state = state or LiquidationState(
-            max_events_per_symbol=self.config.max_buffer_size_per_symbol
-        )
-
-        self.metrics = metrics or LiquidationMetrics()
 
         self._running = False
+        self._registered = False
         self._connected = False
+
         self._consumer_task: asyncio.Task[None] | None = None
+
         self._started_at: datetime | None = None
         self._stopped_at: datetime | None = None
         self._last_message_at: datetime | None = None
         self._last_event_at: datetime | None = None
         self._last_error_at: datetime | None = None
         self._last_error: str | None = None
+        self._last_reconnect_at: datetime | None = None
 
         self._processed_messages = 0
         self._processed_events = 0
         self._dropped_invalid = 0
         self._dropped_stale = 0
         self._dropped_duplicates = 0
+
         self._published_raw = 0
         self._published_normalized = 0
         self._published_large = 0
+        self._published_health = 0
+        self._published_snapshots = 0
 
         self._recent_payload_fingerprints: deque[str] = deque(
-            maxlen=self.DEFAULT_RECENT_FINGERPRINTS_SIZE
+            maxlen=self.config.recent_payload_fingerprints_size,
         )
         self._recent_payload_fingerprint_set: set[str] = set()
 
         self._recent_large_events: deque[LiquidationEvent] = deque(
-            maxlen=self.DEFAULT_RECENT_LARGE_EVENTS_SIZE
+            maxlen=self.config.recent_large_events_size,
         )
 
         self._healthcheck_job_id: str | None = None
+        self._snapshot_job_id: str | None = None
+        self._cleanup_job_id: str | None = None
 
-    # -------------------------------------------------------------------------
-    # Lifecycle
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Lifecycle / registration
+    # ---------------------------------------------------------------------
 
-    async def start(self) -> None:
-        if self._running:
-            self.logger.warning("LiquidationStream already running.")
+    def register(self) -> None:
+        """
+        Реєструє Scheduler jobs.
+
+        LiquidationStream не підписується на EventBus, бо це ingestion source.
+        Він тільки публікує market.liquidation.* події.
+        """
+        if self._registered:
+            self.logger.warning("LiquidationStream already registered")
             return
 
+        self._register_scheduler_jobs()
+        self._registered = True
+
         self.logger.info(
-            "Starting LiquidationStream.",
+            "LiquidationStream registered",
             extra={
                 "exchange": self.exchange_name,
-                "symbols": self.config.symbols,
-                "enabled": self.config.enabled,
+                "scheduler_enabled": self.scheduler is not None,
             },
         )
 
-        if not self.config.enabled:
-            self.logger.warning("LiquidationStream is disabled by config.")
+    async def start(self) -> None:
+        if self._running:
+            self.logger.warning("LiquidationStream already running")
             return
+
+        if not self.config.enabled:
+            self.logger.warning(
+                "LiquidationStream is disabled by config",
+                extra={"exchange": self.exchange_name},
+            )
+            return
+
+        if not self._registered:
+            self.register()
 
         self._running = True
         self._started_at = utc_now()
         self._stopped_at = None
-
-        await self._connect()
-
-        self._consumer_task = asyncio.create_task(
-            self._consume_loop(),
-            name=f"liquidation-stream:{self.exchange_name}",
-        )
-
-        self._register_scheduler_jobs()
+        self._last_error = None
+        self._last_error_at = None
 
         self.logger.info(
-            "LiquidationStream started.",
+            "Starting LiquidationStream",
             extra={
                 "exchange": self.exchange_name,
-                "symbols_count": len(self.config.symbols),
+                "symbols": self.config.symbols,
             },
         )
+
+        try:
+            await self._connect()
+
+            self._consumer_task = asyncio.create_task(
+                self._consume_loop(),
+                name=f"liquidation-stream:{self.exchange_name}",
+            )
+
+            self.logger.info(
+                "LiquidationStream started",
+                extra={
+                    "exchange": self.exchange_name,
+                    "symbols_count": len(self.config.symbols),
+                },
+            )
+
+        except Exception as exc:
+            self._running = False
+            self._last_error = repr(exc)
+            self._last_error_at = utc_now()
+
+            self.logger.exception(
+                "Failed to start LiquidationStream",
+                extra={
+                    "exchange": self.exchange_name,
+                    "error": repr(exc),
+                },
+            )
+            raise
 
     async def stop(self) -> None:
         if not self._running:
             return
 
-        self.logger.info("Stopping LiquidationStream.", extra={"exchange": self.exchange_name})
+        self.logger.info(
+            "Stopping LiquidationStream",
+            extra={"exchange": self.exchange_name},
+        )
 
         self._running = False
         self._stopped_at = utc_now()
 
-        if self._consumer_task:
+        if self._consumer_task is not None:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._consumer_task
@@ -216,24 +243,28 @@ class LiquidationStream:
         await self._disconnect()
 
         self.logger.info(
-            "LiquidationStream stopped.",
+            "LiquidationStream stopped",
             extra=self.get_stats(),
         )
 
     async def restart(self) -> None:
-        self.logger.info("Restarting LiquidationStream.", extra={"exchange": self.exchange_name})
+        self.logger.warning(
+            "Restarting LiquidationStream",
+            extra={"exchange": self.exchange_name},
+        )
         await self.stop()
         await self.start()
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Connection management
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     async def _connect(self) -> None:
         await self.exchange_adapter.connect_liquidations(self.config.symbols)
         self._connected = True
+
         self.logger.info(
-            "Connected liquidation feed.",
+            "Connected liquidation feed",
             extra={
                 "exchange": self.exchange_name,
                 "symbols": self.config.symbols,
@@ -241,22 +272,59 @@ class LiquidationStream:
         )
 
     async def _disconnect(self) -> None:
-        with contextlib.suppress(Exception):
+        try:
             await self.exchange_adapter.disconnect_liquidations()
-        self._connected = False
-        self.logger.info("Disconnected liquidation feed.", extra={"exchange": self.exchange_name})
+        except Exception as exc:
+            self.logger.warning(
+                "Error during liquidation feed disconnect",
+                extra={
+                    "exchange": self.exchange_name,
+                    "error": repr(exc),
+                },
+            )
+        finally:
+            self._connected = False
+
+        self.logger.info(
+            "Disconnected liquidation feed",
+            extra={"exchange": self.exchange_name},
+        )
 
     async def reconnect(self) -> None:
-        self.logger.warning("Manual reconnect requested.", extra={"exchange": self.exchange_name})
+        now = utc_now()
+
+        if self._last_reconnect_at is not None:
+            elapsed = (now - self._last_reconnect_at).total_seconds()
+            if elapsed < self.config.reconnect_cooldown_seconds:
+                self.logger.warning(
+                    "Reconnect skipped due to cooldown",
+                    extra={
+                        "exchange": self.exchange_name,
+                        "elapsed_seconds": elapsed,
+                        "cooldown_seconds": self.config.reconnect_cooldown_seconds,
+                    },
+                )
+                return
+
+        self._last_reconnect_at = now
+
+        self.logger.warning(
+            "Reconnecting liquidation feed",
+            extra={"exchange": self.exchange_name},
+        )
+
         await self._disconnect()
         await self._connect()
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Main consumer loop
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     async def _consume_loop(self) -> None:
-        self.logger.info("Liquidation consumer loop started.", extra={"exchange": self.exchange_name})
+        self.logger.info(
+            "Liquidation consumer loop started",
+            extra={"exchange": self.exchange_name},
+        )
 
         while self._running:
             try:
@@ -266,7 +334,7 @@ class LiquidationStream:
                 self.metrics.observe_latency_ms(latency_ms)
 
                 if payload is None:
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(self.config.consumer_idle_sleep_seconds)
                     continue
 
                 self._processed_messages += 1
@@ -276,61 +344,79 @@ class LiquidationStream:
 
             except asyncio.CancelledError:
                 raise
+
             except Exception as exc:
-                self._last_error_at = utc_now()
                 self._last_error = repr(exc)
+                self._last_error_at = utc_now()
 
                 self.logger.exception(
-                    "Unhandled error in liquidation consume loop.",
+                    "Unhandled error in liquidation consume loop",
                     extra={
                         "exchange": self.exchange_name,
                         "error": repr(exc),
                     },
                 )
-                await asyncio.sleep(1.0)
 
-        self.logger.info("Liquidation consumer loop exited.", extra={"exchange": self.exchange_name})
+                await asyncio.sleep(self.config.consumer_error_sleep_seconds)
 
-    # -------------------------------------------------------------------------
+        self.logger.info(
+            "Liquidation consumer loop exited",
+            extra={"exchange": self.exchange_name},
+        )
+
+    # ---------------------------------------------------------------------
     # Raw payload handling
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     async def handle_raw_message(self, payload: dict[str, Any]) -> LiquidationEvent | None:
         """
-        Приймає сирий payload, валідовує, дедуплікує, нормалізує, оновлює state і публікує події.
+        Приймає raw payload, дедуплікує, нормалізує, оновлює state/metrics
+        і публікує EventBus події.
         """
         fingerprint = self._make_payload_fingerprint(payload)
-        if self._is_duplicate_payload_fingerprint(fingerprint):
-            self._dropped_duplicates += 1
-            self.logger.debug(
-                "Duplicate liquidation payload dropped.",
-                extra={"exchange": self.exchange_name, "fingerprint": fingerprint},
-            )
-            return None
 
-        self._remember_payload_fingerprint(fingerprint)
+        if self.config.deduplication_enabled:
+            if self._is_duplicate_payload_fingerprint(fingerprint):
+                self._dropped_duplicates += 1
+                self.logger.debug(
+                    "Duplicate liquidation payload dropped",
+                    extra={
+                        "exchange": self.exchange_name,
+                        "fingerprint": fingerprint,
+                    },
+                )
+                return None
+
+            self._remember_payload_fingerprint(fingerprint)
 
         if self.config.emit_raw_events:
-            await self._publish_raw_payload(payload)
+            await self._publish_raw_payload(payload, fingerprint=fingerprint)
 
-        event = self.normalize_event(payload)
+        event = self.normalize_event(payload, raw_payload_hash=fingerprint)
         if event is None:
             self._dropped_invalid += 1
-            self.metrics.total_invalid_events += 1
+            self.metrics.observe_invalid_event(exchange=self.exchange_name)
             return None
 
         if not event.is_valid:
             self._dropped_invalid += 1
-            self.metrics.observe_event(event, is_valid=False, is_stale=False, is_large=False)
+            self.metrics.observe_event(
+                event,
+                is_valid=False,
+                is_stale=False,
+                is_large=False,
+            )
             self.logger.debug(
-                "Invalid liquidation event dropped.",
+                "Invalid liquidation event dropped",
                 extra={
-                    "exchange": self.exchange_name,
+                    "exchange": event.exchange,
                     "symbol": event.symbol,
                     "side": event.side.value,
                 },
             )
             return None
+
+        is_large = event.is_large_at(self.config.large_liquidation_threshold_usd)
 
         if is_stale_event(
             event,
@@ -341,12 +427,13 @@ class LiquidationStream:
                 event,
                 is_valid=True,
                 is_stale=True,
-                is_large=event.notional_usd >= self.config.large_liquidation_threshold_usd,
+                is_large=is_large,
             )
+
             self.logger.debug(
-                "Stale liquidation event dropped.",
+                "Stale liquidation event dropped",
                 extra={
-                    "exchange": self.exchange_name,
+                    "exchange": event.exchange,
                     "symbol": event.symbol,
                     "event_ts": event.timestamp.isoformat(),
                 },
@@ -354,10 +441,10 @@ class LiquidationStream:
             return None
 
         symbol_state = self.state.add_event(event)
-        self._processed_events += 1
-        self._last_event_at = event.timestamp
 
-        is_large = event.notional_usd >= self.config.large_liquidation_threshold_usd
+        self._processed_events += 1
+        self._last_event_at = ensure_utc(event.timestamp)
+
         self.metrics.observe_event(
             event,
             is_valid=True,
@@ -372,7 +459,7 @@ class LiquidationStream:
             await self.publish_large_event(event)
 
         self.logger.debug(
-            "Liquidation event processed.",
+            "Liquidation event processed",
             extra={
                 "exchange": event.exchange,
                 "symbol": event.symbol,
@@ -380,19 +467,23 @@ class LiquidationStream:
                 "price": str(event.price),
                 "quantity": str(event.quantity),
                 "notional_usd": str(event.notional_usd),
-                "buffered_events": len(symbol_state.events),
+                "buffered_events": symbol_state.total_buffered_events,
             },
         )
 
         return event
 
-    def normalize_event(self, payload: dict[str, Any]) -> LiquidationEvent | None:
+    def normalize_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        raw_payload_hash: str | None = None,
+    ) -> LiquidationEvent | None:
         """
-        Нормалізація сирого payload у LiquidationEvent.
+        Нормалізує raw exchange payload у LiquidationEvent.
 
-        Тут закладений максимально tolerant parsing.
-        Якщо формат біржі відрізняється, краще виносити це в exchange adapter,
-        але цей метод теж має вміти пережити різні payload-структури.
+        Exchange-specific parsing бажано поступово переносити в exchange adapter,
+        але stream лишається tolerant до різних payload-структур.
         """
         try:
             exchange = self._extract_exchange(payload)
@@ -400,17 +491,15 @@ class LiquidationStream:
             side = self._extract_side(payload)
             price = self._extract_price(payload)
             quantity = self._extract_quantity(payload)
-            notional_usd = self._extract_notional(payload, price=price, quantity=quantity)
+            notional_usd = self._extract_notional(
+                payload,
+                price=price,
+                quantity=quantity,
+            )
             timestamp = self._extract_timestamp(payload)
 
             if not exchange or not symbol or price <= 0 or quantity <= 0 or notional_usd <= 0:
                 return None
-
-            metadata = {
-                "raw_type": payload.get("type"),
-                "raw_event": payload.get("event"),
-                "source_payload_keys": sorted(payload.keys()),
-            }
 
             event = LiquidationEvent(
                 exchange=exchange,
@@ -423,15 +512,26 @@ class LiquidationStream:
                 event_type=LiquidationEventType.NORMALIZED,
                 trade_id=self._extract_trade_id(payload),
                 order_id=self._extract_order_id(payload),
-                source="liquidation_stream",
-                metadata=metadata,
+                event_id=self._extract_event_id(payload),
+                correlation_id=self._extract_correlation_id(payload),
+                source=self.service_name,
+                raw_payload_hash=raw_payload_hash,
+                metadata={
+                    "raw_type": payload.get("type"),
+                    "raw_event": payload.get("event"),
+                    "source_payload_keys": sorted(payload.keys()),
+                    "exchange_adapter": self.exchange_name,
+                },
             )
 
             return event
 
         except Exception as exc:
+            self._last_error = repr(exc)
+            self._last_error_at = utc_now()
+
             self.logger.exception(
-                "Failed to normalize liquidation payload.",
+                "Failed to normalize liquidation payload",
                 extra={
                     "exchange": self.exchange_name,
                     "error": repr(exc),
@@ -440,33 +540,137 @@ class LiquidationStream:
             )
             return None
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Event publishing
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
-    async def publish_event(self, event: LiquidationEvent) -> None:
-        await self.event_bus.emit(self.config.publish_topic_normalized, event)
-        self._published_normalized += 1
+    async def publish_event(self, event: LiquidationEvent) -> bool:
+        accepted = await self.event_bus.emit(
+            self.config.publish_topic_normalized,
+            event,
+            priority=EventPriority.NORMAL,
+            source=self.service_name,
+            correlation_id=event.correlation_id,
+            headers={
+                "exchange": event.exchange,
+                "symbol": event.symbol,
+                "event_type": event.event_type.value,
+            },
+        )
 
-    async def publish_large_event(self, event: LiquidationEvent) -> None:
-        await self.event_bus.emit(self.config.publish_topic_large, event)
-        self._published_large += 1
+        if accepted:
+            self._published_normalized += 1
 
-    async def _publish_raw_payload(self, payload: dict[str, Any]) -> None:
+        return accepted
+
+    async def publish_large_event(self, event: LiquidationEvent) -> bool:
+        accepted = await self.event_bus.emit(
+            self.config.publish_topic_large,
+            event,
+            priority=EventPriority.HIGH,
+            source=self.service_name,
+            correlation_id=event.correlation_id,
+            headers={
+                "exchange": event.exchange,
+                "symbol": event.symbol,
+                "event_type": LiquidationEventType.LARGE.value,
+            },
+        )
+
+        if accepted:
+            self._published_large += 1
+
+        return accepted
+
+    async def _publish_raw_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        fingerprint: str,
+    ) -> bool:
         raw_event = {
             "exchange": self.exchange_name,
             "received_at": utc_now().isoformat(),
+            "fingerprint": fingerprint,
             "payload": payload,
         }
-        await self.event_bus.emit(self.config.publish_topic_raw, raw_event)
-        self._published_raw += 1
 
-    # -------------------------------------------------------------------------
+        accepted = await self.event_bus.emit(
+            self.config.publish_topic_raw,
+            raw_event,
+            priority=EventPriority.LOW,
+            source=self.service_name,
+            headers={
+                "exchange": self.exchange_name,
+                "event_type": LiquidationEventType.RAW.value,
+            },
+        )
+
+        if accepted:
+            self._published_raw += 1
+
+        return accepted
+
+    async def emit_runtime_snapshot(
+        self,
+        topic: str | None = None,
+    ) -> bool:
+        snapshot = {
+            "service": self.service_name,
+            "exchange": self.exchange_name,
+            "health": self.estimate_ingestion_health(),
+            "stats": self.get_stats(),
+            "metrics": self.metrics.to_dict(serialize=True),
+            "state": [item.to_dict(serialize=True) for item in self.state.snapshots()],
+            "emitted_at": utc_now().isoformat(),
+        }
+
+        accepted = await self.event_bus.emit(
+            topic or self.config.publish_topic_snapshot,
+            snapshot,
+            priority=EventPriority.LOW,
+            source=self.service_name,
+            headers={
+                "exchange": self.exchange_name,
+                "event_type": LiquidationEventType.SNAPSHOT.value,
+            },
+        )
+
+        if accepted:
+            self._published_snapshots += 1
+
+        return accepted
+
+    async def emit_health(self) -> bool:
+        health = self.estimate_ingestion_health()
+
+        accepted = await self.event_bus.emit(
+            self.config.publish_topic_health,
+            health,
+            priority=EventPriority.LOW,
+            source=self.service_name,
+            headers={
+                "exchange": self.exchange_name,
+                "event_type": LiquidationEventType.HEALTH.value,
+            },
+        )
+
+        if accepted:
+            self._published_health += 1
+
+        return accepted
+
+    # ---------------------------------------------------------------------
     # Extraction helpers
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     def _extract_exchange(self, payload: dict[str, Any]) -> str:
-        value = payload.get("exchange") or getattr(self.exchange_adapter, "name", None) or "unknown"
+        value = (
+            payload.get("exchange")
+            or payload.get("ex")
+            or getattr(self.exchange_adapter, "name", None)
+            or "unknown"
+        )
         return str(value).strip().lower()
 
     def _extract_symbol(self, payload: dict[str, Any]) -> str:
@@ -478,46 +682,27 @@ class LiquidationStream:
             or payload.get("instId")
             or payload.get("pair")
         )
+
         if raw_symbol is None:
             return ""
+
         return normalize_symbol(str(raw_symbol))
 
     def _extract_side(self, payload: dict[str, Any]) -> LiquidationSide:
+        nested_order = payload.get("o") or payload.get("order") or {}
+
         raw_side = (
             payload.get("side")
             or payload.get("S")
             or payload.get("positionSide")
             or payload.get("liquidation_side")
             or payload.get("direction")
+            or nested_order.get("side")
+            or nested_order.get("S")
+            or nested_order.get("positionSide")
         )
 
-        if raw_side is None:
-            nested_order = payload.get("o") or payload.get("order") or {}
-            raw_side = (
-                nested_order.get("side")
-                or nested_order.get("S")
-                or nested_order.get("positionSide")
-            )
-
-        side = str(raw_side).strip().lower() if raw_side is not None else ""
-
-        # Логіка для liquidation semantics:
-        # liquidation of longs -> ринок тиснуть вниз
-        # liquidation of shorts -> ринок виносить вгору
-        if side in {"long", "buy_long", "longs"}:
-            return LiquidationSide.LONG
-        if side in {"short", "sell_short", "shorts"}:
-            return LiquidationSide.SHORT
-
-        # Біржі часто дають order side, а не position side:
-        # SELL liquidation order зазвичай означає ліквідацію long
-        # BUY liquidation order зазвичай означає ліквідацію short
-        if side in {"sell", "ask"}:
-            return LiquidationSide.LONG
-        if side in {"buy", "bid"}:
-            return LiquidationSide.SHORT
-
-        return LiquidationSide.UNKNOWN
+        return LiquidationSide.from_raw(raw_side)
 
     def _extract_price(self, payload: dict[str, Any]) -> Decimal:
         nested_order = payload.get("o") or payload.get("order") or {}
@@ -599,12 +784,12 @@ class LiquidationStream:
             return ensure_utc(raw_ts)
 
         if isinstance(raw_ts, (int, float)):
-            # евристика: якщо timestamp дуже великий, це мс
             if raw_ts > 10_000_000_000:
                 return datetime.fromtimestamp(raw_ts / 1000.0, tz=timezone.utc)
             return datetime.fromtimestamp(raw_ts, tz=timezone.utc)
 
         raw_ts_str = str(raw_ts).strip()
+
         if raw_ts_str.isdigit():
             ts_int = int(raw_ts_str)
             if ts_int > 10_000_000_000:
@@ -618,6 +803,7 @@ class LiquidationStream:
 
     def _extract_trade_id(self, payload: dict[str, Any]) -> str | None:
         nested_order = payload.get("o") or payload.get("order") or {}
+
         value = (
             payload.get("trade_id")
             or payload.get("tradeId")
@@ -630,6 +816,7 @@ class LiquidationStream:
 
     def _extract_order_id(self, payload: dict[str, Any]) -> str | None:
         nested_order = payload.get("o") or payload.get("order") or {}
+
         value = (
             payload.get("order_id")
             or payload.get("orderId")
@@ -640,9 +827,27 @@ class LiquidationStream:
         )
         return str(value) if value is not None else None
 
-    # -------------------------------------------------------------------------
-    # Feature methods
-    # -------------------------------------------------------------------------
+    def _extract_event_id(self, payload: dict[str, Any]) -> str | None:
+        value = (
+            payload.get("event_id")
+            or payload.get("eventId")
+            or payload.get("e")
+            or payload.get("id")
+        )
+        return str(value) if value is not None else None
+
+    def _extract_correlation_id(self, payload: dict[str, Any]) -> str | None:
+        value = (
+            payload.get("correlation_id")
+            or payload.get("correlationId")
+            or payload.get("trace_id")
+            or payload.get("traceId")
+        )
+        return str(value) if value is not None else None
+
+    # ---------------------------------------------------------------------
+    # Feature / query methods
+    # ---------------------------------------------------------------------
 
     def get_recent_events(
         self,
@@ -652,28 +857,12 @@ class LiquidationStream:
         side: LiquidationSide | None = None,
         limit: int = 100,
     ) -> list[LiquidationEvent]:
-        """
-        Повертає останні liquidation events із локального state.
-        """
-        items: list[LiquidationEvent] = []
-
-        target_symbol = normalize_symbol(symbol) if symbol else None
-        target_exchange = exchange.lower() if exchange else None
-
-        for (state_exchange, state_symbol), symbol_state in self.state.symbols.items():
-            if target_exchange and state_exchange != target_exchange:
-                continue
-            if target_symbol and state_symbol != target_symbol:
-                continue
-
-            for event in reversed(symbol_state.events):
-                if side and event.side != side:
-                    continue
-                items.append(event)
-                if len(items) >= limit:
-                    return items
-
-        return items
+        return self.state.get_recent_events(
+            exchange=exchange,
+            symbol=symbol,
+            side=side,
+            limit=limit,
+        )
 
     def get_recent_large_events(
         self,
@@ -682,63 +871,35 @@ class LiquidationStream:
         side: LiquidationSide | None = None,
         limit: int = 50,
     ) -> list[LiquidationEvent]:
-        """
-        Повертає останні великі liquidation events.
-        Корисно для dashboard / debug / strategies context.
-        """
+        if limit <= 0:
+            return []
+
         target_symbol = normalize_symbol(symbol) if symbol else None
         result: list[LiquidationEvent] = []
 
         for event in reversed(self._recent_large_events):
             if target_symbol and event.symbol != target_symbol:
                 continue
-            if side and event.side != side:
+            if side is not None and event.side is not side:
                 continue
+
             result.append(event)
+
             if len(result) >= limit:
                 break
 
         return result
 
     def get_symbol_pressure_snapshot(self, symbol: str) -> dict[str, Any]:
-        """
-        Дає швидкий snapshot тиску по символу:
-        - скільки long/short liquidations у буфері
-        - яка сторона домінує
-        - останній event
-        """
         normalized_symbol = normalize_symbol(symbol)
-        snapshots: list[dict[str, Any]] = []
 
-        for (exchange, state_symbol), symbol_state in self.state.symbols.items():
+        snapshots: list[dict[str, Any]] = []
+        for (_, state_symbol), symbol_state in self.state.symbols.items():
             if state_symbol != normalized_symbol:
                 continue
 
-            dominant_side = "unknown"
-            if symbol_state.long_events_count > symbol_state.short_events_count:
-                dominant_side = LiquidationSide.LONG.value
-            elif symbol_state.short_events_count > symbol_state.long_events_count:
-                dominant_side = LiquidationSide.SHORT.value
-
-            snapshots.append(
-                {
-                    "exchange": exchange,
-                    "symbol": state_symbol,
-                    "buffered_events": len(symbol_state.events),
-                    "long_events_count": symbol_state.long_events_count,
-                    "short_events_count": symbol_state.short_events_count,
-                    "dominant_side": dominant_side,
-                    "last_event_at": symbol_state.last_event_at.isoformat()
-                    if symbol_state.last_event_at
-                    else None,
-                    "last_cascade_at": symbol_state.last_cascade_at.isoformat()
-                    if symbol_state.last_cascade_at
-                    else None,
-                    "cooldown_until": symbol_state.cooldown_until.isoformat()
-                    if symbol_state.cooldown_until
-                    else None,
-                }
-            )
+            snapshot = symbol_state.snapshot()
+            snapshots.append(snapshot.to_dict(serialize=True))
 
         return {
             "symbol": normalized_symbol,
@@ -747,53 +908,128 @@ class LiquidationStream:
         }
 
     def get_top_symbols_by_liquidation_flow(self, limit: int = 10) -> list[dict[str, Any]]:
-        """
-        Дає топ символів за кількістю buffered liquidation events.
-        Корисно для dashboard / alerting.
-        """
         rows: list[dict[str, Any]] = []
 
-        for (exchange, symbol), symbol_state in self.state.symbols.items():
+        for symbol_state in self.state.symbols.values():
             rows.append(
                 {
-                    "exchange": exchange,
-                    "symbol": symbol,
-                    "buffered_events": len(symbol_state.events),
+                    "exchange": symbol_state.exchange,
+                    "symbol": symbol_state.symbol,
+                    "buffered_events": symbol_state.total_buffered_events,
                     "long_events_count": symbol_state.long_events_count,
                     "short_events_count": symbol_state.short_events_count,
-                    "last_event_at": symbol_state.last_event_at.isoformat()
-                    if symbol_state.last_event_at
-                    else None,
+                    "last_event_at": (
+                        symbol_state.last_event_at.isoformat()
+                        if symbol_state.last_event_at
+                        else None
+                    ),
                 }
             )
 
         rows.sort(key=lambda row: row["buffered_events"], reverse=True)
-        return rows[:limit]
+        return rows[: max(0, limit)]
+
+    async def flush_state_for_symbol(
+        self,
+        symbol: str,
+        exchange: str | None = None,
+    ) -> int:
+        normalized_symbol = normalize_symbol(symbol)
+        removed = 0
+
+        keys_to_remove: list[tuple[str, str]] = []
+
+        for (state_exchange, state_symbol), symbol_state in self.state.symbols.items():
+            if state_symbol != normalized_symbol:
+                continue
+
+            if exchange is not None and state_exchange != exchange.strip().lower():
+                continue
+
+            symbol_state.clear()
+            keys_to_remove.append((state_exchange, state_symbol))
+            removed += 1
+
+        for key in keys_to_remove:
+            self.state.remove(*key)
+
+        self.logger.info(
+            "Flushed liquidation state for symbol",
+            extra={
+                "symbol": normalized_symbol,
+                "exchange": exchange,
+                "removed_states": removed,
+            },
+        )
+
+        return removed
+
+    async def replay_events_to_bus(
+        self,
+        *,
+        symbol: str | None = None,
+        exchange: str | None = None,
+        limit: int = 100,
+        include_large_topic: bool = False,
+    ) -> int:
+        events = self.get_recent_events(
+            symbol=symbol,
+            exchange=exchange,
+            limit=limit,
+        )
+
+        published = 0
+
+        for event in reversed(events):
+            if await self.publish_event(event):
+                published += 1
+
+            if (
+                include_large_topic
+                and event.is_large_at(self.config.large_liquidation_threshold_usd)
+            ):
+                await self.publish_large_event(event)
+
+        self.logger.info(
+            "Replayed liquidation events to EventBus",
+            extra={
+                "symbol": symbol,
+                "exchange": exchange,
+                "limit": limit,
+                "published": published,
+                "include_large_topic": include_large_topic,
+            },
+        )
+
+        return published
+
+    # ---------------------------------------------------------------------
+    # Health / stats
+    # ---------------------------------------------------------------------
 
     def estimate_ingestion_health(self) -> dict[str, Any]:
-        """
-        Оцінка стану ingestion pipeline.
-        """
         now = utc_now()
+
         seconds_since_last_message = (
-            (now - self._last_message_at).total_seconds()
+            (now - ensure_utc(self._last_message_at)).total_seconds()
             if self._last_message_at
             else None
         )
         seconds_since_last_event = (
-            (now - self._last_event_at).total_seconds()
+            (now - ensure_utc(self._last_event_at)).total_seconds()
             if self._last_event_at
             else None
         )
 
         status = "healthy"
+
         if not self._running:
             status = "stopped"
         elif not self._connected:
             status = "disconnected"
         elif (
             seconds_since_last_message is not None
-            and seconds_since_last_message > self.DEFAULT_HEALTH_DEGRADATION_SECONDS
+            and seconds_since_last_message > self.config.healthcheck_interval_seconds
         ):
             status = "degraded"
 
@@ -806,104 +1042,170 @@ class LiquidationStream:
             "seconds_since_last_event": seconds_since_last_event,
             "last_error": self._last_error,
             "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
+            "last_reconnect_at": (
+                self._last_reconnect_at.isoformat()
+                if self._last_reconnect_at
+                else None
+            ),
         }
 
-    async def flush_state_for_symbol(self, symbol: str, exchange: str | None = None) -> int:
-        """
-        Очищає state по конкретному символу.
-        Корисно для reset/debug/reload.
-        """
-        normalized_symbol = normalize_symbol(symbol)
-        removed = 0
-
-        keys_to_remove: list[tuple[str, str]] = []
-        for (state_exchange, state_symbol), symbol_state in self.state.symbols.items():
-            if state_symbol != normalized_symbol:
-                continue
-            if exchange and state_exchange != exchange.lower():
-                continue
-
-            symbol_state.clear()
-            keys_to_remove.append((state_exchange, state_symbol))
-            removed += 1
-
-        for key in keys_to_remove:
-            self.state.remove(*key)
-
-        self.logger.info(
-            "Flushed liquidation state for symbol.",
-            extra={
-                "symbol": normalized_symbol,
-                "exchange": exchange,
-                "removed_states": removed,
-            },
+    def get_stats(self) -> dict[str, Any]:
+        uptime_seconds = (
+            max(0.0, (utc_now() - ensure_utc(self._started_at)).total_seconds())
+            if self._started_at
+            else 0.0
         )
-        return removed
 
-    async def replay_events_to_bus(
-        self,
-        *,
-        symbol: str | None = None,
-        limit: int = 100,
-        include_large_topic: bool = False,
-    ) -> int:
-        """
-        Повторно публікує останні liquidation events в EventBus.
-        Дуже зручно для:
-        - recovery після restart detector-а
-        - локального backfill для downstream consumers
-        """
-        events = self.get_recent_events(symbol=symbol, limit=limit)
-        published = 0
-
-        for event in reversed(events):
-            await self.publish_event(event)
-            published += 1
-
-            if include_large_topic and event.notional_usd >= self.config.large_liquidation_threshold_usd:
-                await self.publish_large_event(event)
-
-        self.logger.info(
-            "Replayed liquidation events to EventBus.",
-            extra={
-                "symbol": symbol,
-                "limit": limit,
-                "published": published,
-                "include_large_topic": include_large_topic,
-            },
-        )
-        return published
-
-    async def emit_runtime_snapshot(self, topic: str = "analytics.liquidation.stream.snapshot") -> None:
-        """
-        Публікує поточний runtime snapshot у EventBus.
-        Дуже корисно для dashboard / monitoring / admin tools.
-        """
-        snapshot = {
-            "service": self.service_name,
+        return {
+            "service_name": self.service_name,
             "exchange": self.exchange_name,
-            "health": self.estimate_ingestion_health(),
-            "stats": self.get_stats(),
-            "metrics": asdict(self.metrics.snapshot()),
-            "state": [asdict(item) for item in self.state.snapshots()],
-            "emitted_at": utc_now().isoformat(),
+            "running": self._running,
+            "registered": self._registered,
+            "connected": self._connected,
+            "symbols": list(self.config.symbols),
+            "uptime_seconds": uptime_seconds,
+            "processed_messages": self._processed_messages,
+            "processed_events": self._processed_events,
+            "dropped_invalid": self._dropped_invalid,
+            "dropped_stale": self._dropped_stale,
+            "dropped_duplicates": self._dropped_duplicates,
+            "published_raw": self._published_raw,
+            "published_normalized": self._published_normalized,
+            "published_large": self._published_large,
+            "published_health": self._published_health,
+            "published_snapshots": self._published_snapshots,
+            "last_message_at": (
+                self._last_message_at.isoformat()
+                if self._last_message_at
+                else None
+            ),
+            "last_event_at": (
+                self._last_event_at.isoformat()
+                if self._last_event_at
+                else None
+            ),
+            "last_error": self._last_error,
+            "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
+            "tracked_symbols": self.state.symbols_count,
+            "state_total_buffered_events": self.state.total_buffered_events,
+            "state_total_events_seen": self.state.total_events_seen,
+            "large_events_buffered": len(self._recent_large_events),
+            "healthcheck_job_id": self._healthcheck_job_id,
+            "snapshot_job_id": self._snapshot_job_id,
+            "cleanup_job_id": self._cleanup_job_id,
         }
-        await self.event_bus.emit(topic, snapshot)
 
-    # -------------------------------------------------------------------------
+    def get_health(self) -> dict[str, Any]:
+        return self.estimate_ingestion_health()
+
+    # ---------------------------------------------------------------------
+    # Scheduler jobs
+    # ---------------------------------------------------------------------
+
+    def _register_scheduler_jobs(self) -> None:
+        if self.scheduler is None:
+            return
+
+        if self._healthcheck_job_id is None:
+            self._healthcheck_job_id = self.scheduler.add_interval_job(
+                name=f"{self.config.healthcheck_job_name}:{self.exchange_name}",
+                func=self._scheduled_healthcheck,
+                interval=self.config.healthcheck_interval_seconds,
+                run_immediately=False,
+                max_retries=self.config.scheduler_job_max_retries,
+                retry_delay=self.config.scheduler_job_retry_delay_seconds,
+                timeout=self.config.scheduler_job_timeout_seconds,
+                allow_overlap=False,
+                enabled=True,
+            )
+
+        if self._snapshot_job_id is None:
+            self._snapshot_job_id = self.scheduler.add_interval_job(
+                name=f"{self.config.snapshot_job_name}:{self.exchange_name}",
+                func=self._scheduled_snapshot,
+                interval=self.config.snapshot_interval_seconds,
+                run_immediately=False,
+                max_retries=self.config.scheduler_job_max_retries,
+                retry_delay=self.config.scheduler_job_retry_delay_seconds,
+                timeout=self.config.scheduler_job_timeout_seconds,
+                allow_overlap=False,
+                enabled=True,
+            )
+
+        if self._cleanup_job_id is None:
+            self._cleanup_job_id = self.scheduler.add_interval_job(
+                name=f"{self.config.cleanup_job_name}:{self.exchange_name}",
+                func=self._scheduled_cleanup,
+                interval=self.config.cleanup_interval_seconds,
+                run_immediately=False,
+                max_retries=self.config.scheduler_job_max_retries,
+                retry_delay=self.config.scheduler_job_retry_delay_seconds,
+                timeout=self.config.scheduler_job_timeout_seconds,
+                allow_overlap=False,
+                enabled=True,
+            )
+
+    async def _scheduled_healthcheck(self) -> None:
+        health = self.estimate_ingestion_health()
+        await self.emit_health()
+
+        if health["status"] == "degraded":
+            self.logger.warning(
+                "LiquidationStream health degraded",
+                extra=health,
+            )
+
+            if self.config.reconnect_on_health_degraded and self._running:
+                await self.reconnect()
+
+        elif health["status"] in {"disconnected", "stopped"}:
+            self.logger.warning(
+                "LiquidationStream health warning",
+                extra=health,
+            )
+
+    async def _scheduled_snapshot(self) -> None:
+        await self.emit_runtime_snapshot()
+
+    async def _scheduled_cleanup(self) -> None:
+        min_timestamp = utc_now() - timedelta(
+            seconds=max(
+                self.config.stale_event_threshold_seconds,
+                int(self.config.cleanup_interval_seconds),
+            )
+        )
+
+        removed_events = self.state.prune_before(min_timestamp)
+        removed_empty_states = self.state.remove_empty()
+
+        if removed_events or removed_empty_states:
+            self.logger.info(
+                "LiquidationStream cleanup completed",
+                extra={
+                    "exchange": self.exchange_name,
+                    "removed_events": removed_events,
+                    "removed_empty_states": removed_empty_states,
+                },
+            )
+
+    # ---------------------------------------------------------------------
     # Dedup helpers
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     def _make_payload_fingerprint(self, payload: dict[str, Any]) -> str:
+        nested_order = payload.get("o") or payload.get("order") or {}
+
         stable_parts = [
+            str(payload.get("exchange") or self.exchange_name),
             str(payload.get("symbol") or payload.get("s") or payload.get("instId") or ""),
-            str(payload.get("side") or payload.get("S") or ""),
+            str(payload.get("side") or payload.get("S") or nested_order.get("side") or ""),
             str(payload.get("price") or payload.get("p") or payload.get("ap") or ""),
             str(payload.get("quantity") or payload.get("qty") or payload.get("q") or ""),
             str(payload.get("timestamp") or payload.get("ts") or payload.get("T") or ""),
-            str(payload.get("tradeId") or payload.get("t") or ""),
-            str(payload.get("orderId") or payload.get("i") or ""),
+            str(payload.get("tradeId") or payload.get("t") or nested_order.get("tradeId") or ""),
+            str(payload.get("orderId") or payload.get("i") or nested_order.get("orderId") or ""),
         ]
+
         raw = "|".join(stable_parts)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -918,81 +1220,13 @@ class LiquidationStream:
         self._recent_payload_fingerprints.append(fingerprint)
         self._recent_payload_fingerprint_set.add(fingerprint)
 
-    # -------------------------------------------------------------------------
-    # Scheduler / health
-    # -------------------------------------------------------------------------
-
-    def _register_scheduler_jobs(self) -> None:
-        if self.scheduler is None:
-            return
-
-        try:
-            job = self.scheduler.add_interval_job(
-                self._scheduled_healthcheck,
-                seconds=10,
-                name=f"liquidation_stream_healthcheck:{self.exchange_name}",
-                enabled=True,
-                run_immediately=False,
-                max_retries=0,
-                timeout=5,
-                tags=["liquidations", "healthcheck", self.exchange_name],
-            )
-            self._healthcheck_job_id = getattr(job, "job_id", None)
-        except Exception as exc:
-            self.logger.exception(
-                "Failed to register scheduler jobs for LiquidationStream.",
-                extra={"error": repr(exc), "exchange": self.exchange_name},
-            )
-
-    async def _scheduled_healthcheck(self) -> None:
-        health = self.estimate_ingestion_health()
-
-        if health["status"] == "degraded":
-            self.logger.warning(
-                "LiquidationStream health degraded.",
-                extra=health,
-            )
-
-    # -------------------------------------------------------------------------
-    # Stats / diagnostics
-    # -------------------------------------------------------------------------
-
-    def get_stats(self) -> dict[str, Any]:
-        uptime_seconds = (
-            max(0.0, (utc_now() - self._started_at).total_seconds())
-            if self._started_at
-            else 0.0
-        )
-
-        return {
-            "service_name": self.service_name,
-            "exchange": self.exchange_name,
-            "running": self._running,
-            "connected": self._connected,
-            "symbols": list(self.config.symbols),
-            "uptime_seconds": uptime_seconds,
-            "processed_messages": self._processed_messages,
-            "processed_events": self._processed_events,
-            "dropped_invalid": self._dropped_invalid,
-            "dropped_stale": self._dropped_stale,
-            "dropped_duplicates": self._dropped_duplicates,
-            "published_raw": self._published_raw,
-            "published_normalized": self._published_normalized,
-            "published_large": self._published_large,
-            "last_message_at": self._last_message_at.isoformat() if self._last_message_at else None,
-            "last_event_at": self._last_event_at.isoformat() if self._last_event_at else None,
-            "last_error": self._last_error,
-            "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
-            "tracked_symbols": len(self.state.symbols),
-            "large_events_buffered": len(self._recent_large_events),
-        }
-
-    def get_health(self) -> dict[str, Any]:
-        return self.estimate_ingestion_health()
+    # ---------------------------------------------------------------------
+    # Properties / internals
+    # ---------------------------------------------------------------------
 
     @property
     def exchange_name(self) -> str:
-        return str(getattr(self.exchange_adapter, "name", "unknown")).lower()
+        return str(getattr(self.exchange_adapter, "name", "unknown")).strip().lower()
 
     @property
     def is_running(self) -> bool:
@@ -1001,10 +1235,6 @@ class LiquidationStream:
     @property
     def is_connected(self) -> bool:
         return self._connected
-
-    # -------------------------------------------------------------------------
-    # Internals
-    # -------------------------------------------------------------------------
 
     def _safe_payload_preview(self, payload: dict[str, Any], max_len: int = 1000) -> str:
         text = repr(payload)

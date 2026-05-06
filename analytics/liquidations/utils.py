@@ -4,15 +4,25 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Sequence
 
-from .enums import CascadeDirection, CascadeSeverity, LiquidationSide
-from .models import LiquidationCluster, LiquidationEvent, LiquidationWindowStats
+from .enums import CascadeDirection, CascadeSeverity, LiquidationSide, LiquidationStatus
+from .models import (
+    DECIMAL_ZERO,
+    LiquidationCluster,
+    LiquidationEvent,
+    LiquidationWindowStats,
+)
 
 
-DECIMAL_ZERO = Decimal("0")
 DECIMAL_ONE = Decimal("1")
 
 
 def utc_now() -> datetime:
+    """
+    Поточний UTC datetime.
+
+    Це pure helper. Для production runtime він не створює side effects,
+    тому може використовуватись у models/state/detectors.
+    """
     return datetime.now(timezone.utc)
 
 
@@ -27,7 +37,10 @@ def ensure_utc(dt: datetime) -> datetime:
 
 def safe_decimal(value: object, default: Decimal = DECIMAL_ZERO) -> Decimal:
     """
-    Безпечне приведення до Decimal.
+    Безпечне приведення значення до Decimal.
+
+    Не кидає exception назовні, бо використовується на ingestion-рівні,
+    де raw exchange payload може бути нестабільним.
     """
     if value is None:
         return default
@@ -41,18 +54,36 @@ def safe_decimal(value: object, default: Decimal = DECIMAL_ZERO) -> Decimal:
         return default
 
 
+def normalize_exchange(exchange: str) -> str:
+    """
+    Нормалізація exchange name до єдиного вигляду.
+    """
+    return exchange.strip().lower()
+
+
 def normalize_symbol(symbol: str) -> str:
     """
     Нормалізація symbol до єдиного вигляду.
+
+    Приклади:
+    - BTC-USDT -> BTCUSDT
+    - BTC/USDT -> BTCUSDT
+    - btcusdt  -> BTCUSDT
     """
     return symbol.strip().upper().replace("-", "").replace("/", "")
 
 
 def build_symbol_key(exchange: str, symbol: str) -> tuple[str, str]:
-    return exchange.strip().lower(), normalize_symbol(symbol)
+    """
+    Єдиний ключ для state/metrics/cache.
+    """
+    return normalize_exchange(exchange), normalize_symbol(symbol)
 
 
 def side_to_direction(side: LiquidationSide) -> CascadeDirection:
+    """
+    Перетворює liquidation side у напрям очікуваного pressure/cascade.
+    """
     return CascadeDirection.from_side(side)
 
 
@@ -64,17 +95,61 @@ def prune_events_older_than(
     Повертає лише події, що новіші або рівні min_timestamp.
     """
     min_timestamp = ensure_utc(min_timestamp)
-    return [event for event in events if ensure_utc(event.timestamp) >= min_timestamp]
+    return [
+        event
+        for event in events
+        if ensure_utc(event.timestamp) >= min_timestamp
+    ]
+
+
+def prune_events_by_window(
+    events: Sequence[LiquidationEvent],
+    *,
+    now: datetime,
+    window_seconds: int | float,
+) -> list[LiquidationEvent]:
+    """
+    Повертає events у межах sliding window.
+    """
+    if window_seconds <= 0:
+        return []
+
+    min_timestamp = ensure_utc(now) - timedelta(seconds=float(window_seconds))
+    return prune_events_older_than(events, min_timestamp=min_timestamp)
 
 
 def filter_events_by_side(
     events: Iterable[LiquidationEvent],
     side: LiquidationSide,
 ) -> list[LiquidationEvent]:
-    return [event for event in events if event.side == side]
+    """
+    Фільтрує liquidation events за стороною.
+    """
+    return [event for event in events if event.side is side]
+
+
+def filter_valid_events(
+    events: Iterable[LiquidationEvent],
+) -> list[LiquidationEvent]:
+    """
+    Повертає тільки валідні liquidation events.
+    """
+    return [event for event in events if event.is_valid]
+
+
+def sort_events_by_timestamp(
+    events: Sequence[LiquidationEvent],
+) -> list[LiquidationEvent]:
+    """
+    Сортує events за UTC timestamp.
+    """
+    return sorted(events, key=lambda event: ensure_utc(event.timestamp))
 
 
 def sum_notional(events: Iterable[LiquidationEvent]) -> Decimal:
+    """
+    Сума notional_usd по events.
+    """
     total = DECIMAL_ZERO
     for event in events:
         total += event.notional_usd
@@ -82,10 +157,35 @@ def sum_notional(events: Iterable[LiquidationEvent]) -> Decimal:
 
 
 def sum_quantity(events: Iterable[LiquidationEvent]) -> Decimal:
+    """
+    Сума quantity по events.
+    """
     total = DECIMAL_ZERO
     for event in events:
         total += event.quantity
     return total
+
+
+def compute_weighted_average_price(
+    events: Sequence[LiquidationEvent],
+) -> Decimal:
+    """
+    Рахує weighted average price за quantity.
+
+    Якщо quantity нульова або список порожній — повертає 0.
+    """
+    if not events:
+        return DECIMAL_ZERO
+
+    total_quantity = sum_quantity(events)
+    if total_quantity <= DECIMAL_ZERO:
+        return DECIMAL_ZERO
+
+    numerator = DECIMAL_ZERO
+    for event in events:
+        numerator += event.price * event.quantity
+
+    return numerator / total_quantity
 
 
 def compute_window_stats(
@@ -94,22 +194,24 @@ def compute_window_stats(
     events: Sequence[LiquidationEvent],
 ) -> LiquidationWindowStats:
     """
-    Агрегує статистику для поточного sliding window.
+    Агрегує статистику для поточного liquidation sliding window.
     """
+    normalized_exchange, normalized_symbol = build_symbol_key(exchange, symbol)
+
     if not events:
         now = utc_now()
         return LiquidationWindowStats(
-            exchange=exchange,
-            symbol=symbol,
+            exchange=normalized_exchange,
+            symbol=normalized_symbol,
             window_start=now,
             window_end=now,
         )
 
-    sorted_events = sorted(events, key=lambda event: ensure_utc(event.timestamp))
+    sorted_events = sort_events_by_timestamp(events)
 
     stats = LiquidationWindowStats(
-        exchange=exchange,
-        symbol=symbol,
+        exchange=normalized_exchange,
+        symbol=normalized_symbol,
         window_start=ensure_utc(sorted_events[0].timestamp),
         window_end=ensure_utc(sorted_events[-1].timestamp),
     )
@@ -121,15 +223,16 @@ def compute_window_stats(
         stats.total_events += 1
         stats.total_notional_usd += event.notional_usd
 
-        if event.side == LiquidationSide.LONG:
+        if event.side is LiquidationSide.LONG:
             stats.long_events += 1
             stats.long_notional_usd += event.notional_usd
-        elif event.side == LiquidationSide.SHORT:
+        elif event.side is LiquidationSide.SHORT:
             stats.short_events += 1
             stats.short_notional_usd += event.notional_usd
 
         if min_price is None or event.price < min_price:
             min_price = event.price
+
         if max_price is None or event.price > max_price:
             max_price = event.price
 
@@ -148,7 +251,7 @@ def split_events_in_halves(
         return [], []
 
     midpoint = len(events) // 2
-    if midpoint == 0:
+    if midpoint <= 0:
         return list(events), []
 
     return list(events[:midpoint]), list(events[midpoint:])
@@ -156,20 +259,35 @@ def split_events_in_halves(
 
 def compute_acceleration_ratio(events: Sequence[LiquidationEvent]) -> float:
     """
-    Порівнює силу другої половини window з першою.
+    Порівнює notional другої половини window з першою.
+
+    Значення:
+    - 0.0: немає активності;
+    - 1.0: друга половина така сама за notional, як перша;
+    - >1.0: прискорення liquidation flow.
     """
-    first_half, second_half = split_events_in_halves(events)
+    if not events:
+        return 0.0
+
+    sorted_events = sort_events_by_timestamp(events)
+    first_half, second_half = split_events_in_halves(sorted_events)
 
     first_notional = sum_notional(first_half)
     second_notional = sum_notional(second_half)
 
-    if first_notional <= 0:
-        return float(second_notional) if second_notional > 0 else 0.0
+    if first_notional <= DECIMAL_ZERO:
+        return float(second_notional) if second_notional > DECIMAL_ZERO else 0.0
 
     return float(second_notional / first_notional)
 
 
 def clamp_float(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
+    """
+    Обмежує float у заданому діапазоні.
+    """
+    if min_value > max_value:
+        raise ValueError("min_value must be <= max_value")
+
     return max(min_value, min(max_value, value))
 
 
@@ -191,22 +309,32 @@ def infer_severity(
 ) -> CascadeSeverity:
     """
     Перетворює intensity score у дискретний severity-рівень.
+
+    Використовує той самий порядок threshold-ів, що й CascadeDetectorConfig.
     """
-    if intensity_score >= extreme_threshold:
-        return CascadeSeverity.EXTREME
-    if intensity_score >= high_threshold:
-        return CascadeSeverity.HIGH
-    if intensity_score >= medium_threshold:
-        return CascadeSeverity.MEDIUM
-    if intensity_score >= low_threshold:
-        return CascadeSeverity.LOW
-    return CascadeSeverity.LOW
+    return CascadeSeverity.from_score(
+        intensity_score,
+        low_threshold=low_threshold,
+        medium_threshold=medium_threshold,
+        high_threshold=high_threshold,
+        extreme_threshold=extreme_threshold,
+    )
 
 
-def is_stale_event(event: LiquidationEvent, stale_after_seconds: int, now: datetime | None = None) -> bool:
-    now = ensure_utc(now or utc_now())
+def is_stale_event(
+    event: LiquidationEvent,
+    stale_after_seconds: int | float,
+    now: datetime | None = None,
+) -> bool:
+    """
+    Перевіряє, чи liquidation event застарів.
+    """
+    if stale_after_seconds <= 0:
+        return False
+
+    current_time = ensure_utc(now or utc_now())
     event_ts = ensure_utc(event.timestamp)
-    return (now - event_ts) > timedelta(seconds=stale_after_seconds)
+    return (current_time - event_ts) > timedelta(seconds=float(stale_after_seconds))
 
 
 def build_cluster_from_events(
@@ -215,31 +343,37 @@ def build_cluster_from_events(
     side: LiquidationSide,
     events: Sequence[LiquidationEvent],
     severity: CascadeSeverity = CascadeSeverity.LOW,
+    status: LiquidationStatus = LiquidationStatus.CANDIDATE,
+    cluster_id: str | None = None,
+    source: str | None = "cascade_detector",
 ) -> LiquidationCluster | None:
     """
     Будує LiquidationCluster із набору подій однієї домінантної сторони.
+
+    Функція не визначає, чи є cascade підтвердженим.
+    Вона тільки агрегує події у cluster model.
     """
     if not events:
         return None
 
-    sorted_events = sorted(events, key=lambda event: ensure_utc(event.timestamp))
+    if not side.is_known:
+        return None
+
+    sorted_events = sort_events_by_timestamp(events)
     prices = [event.price for event in sorted_events]
 
     total_notional_usd = sum_notional(sorted_events)
     total_quantity = sum_quantity(sorted_events)
+    avg_price = compute_weighted_average_price(sorted_events)
 
-    weighted_price_numerator = DECIMAL_ZERO
-    for event in sorted_events:
-        weighted_price_numerator += event.price * event.quantity
-
-    if total_quantity > 0:
-        avg_price = weighted_price_numerator / total_quantity
-    else:
+    if avg_price <= DECIMAL_ZERO:
         avg_price = sorted_events[-1].price
 
+    normalized_exchange, normalized_symbol = build_symbol_key(exchange, symbol)
+
     return LiquidationCluster(
-        exchange=exchange,
-        symbol=symbol,
+        exchange=normalized_exchange,
+        symbol=normalized_symbol,
         side=side,
         start_time=ensure_utc(sorted_events[0].timestamp),
         end_time=ensure_utc(sorted_events[-1].timestamp),
@@ -251,4 +385,21 @@ def build_cluster_from_events(
         max_price=max(prices),
         direction=side_to_direction(side),
         severity=severity,
+        status=status,
+        cluster_id=cluster_id,
+        source=source,
+        metadata={
+            "first_event_id": sorted_events[0].event_id,
+            "last_event_id": sorted_events[-1].event_id,
+            "trade_ids": [
+                event.trade_id
+                for event in sorted_events
+                if event.trade_id is not None
+            ],
+            "order_ids": [
+                event.order_id
+                for event in sorted_events
+                if event.order_id is not None
+            ],
+        },
     )
