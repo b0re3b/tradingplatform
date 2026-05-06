@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
 from analytics.spoofing import (
     SpoofingPattern,
     SpoofingSeverity,
@@ -25,9 +28,9 @@ class FakeLiquidityTrapStrategyConfig(BaseSpoofingStrategyConfig):
     Конфіг для fake liquidity trap strategy.
 
     Логіка:
-    - приймаємо тільки дуже специфічні сигнали fake liquidity / fake absorption
-    - хочемо бачити короткий lifetime, low fill, high pull, вже наявну реакцію ринку
-    - торгуємо continuation / trap unwind після зникнення фейкової ліквідності
+    - приймаємо тільки дуже специфічні сигнали fake liquidity / fake absorption;
+    - хочемо бачити короткий lifetime, low fill, high pull, вже наявну реакцію ринку;
+    - торгуємо continuation / trap unwind після зникнення фейкової ліквідності.
     """
 
     # accepted signals
@@ -78,14 +81,13 @@ class FakeLiquidityTrapStrategyConfig(BaseSpoofingStrategyConfig):
 
 class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
     """
-    Strategy:
-    trade fake-liquidity trap continuation.
+    Strategy: trade fake-liquidity trap continuation.
 
     Типова інтерпретація:
-    - ASK fake liquidity vanished -> market can rip up -> LONG
-    - BID fake liquidity vanished -> market can flush down -> SHORT
+    - ASK fake liquidity vanished -> market can rip up -> LONG;
+    - BID fake liquidity vanished -> market can flush down -> SHORT.
 
-    Це не просто "spoofing reversal", а більш вузький сценарій:
+    Це не просто spoofing reversal, а більш вузький сценарій:
     натовп повірив у ліквідність / тиск, ліквідність зникла, ринок рухається
     в протилежний бік, і ми хочемо забрати continuation цього move.
     """
@@ -95,11 +97,13 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
     def __init__(
         self,
         *,
-        event_bus,
+        event_bus: EventBus,
+        scheduler: Scheduler | None = None,
         config: FakeLiquidityTrapStrategyConfig | None = None,
     ) -> None:
         super().__init__(
             event_bus=event_bus,
+            scheduler=scheduler,
             config=config or FakeLiquidityTrapStrategyConfig(),
         )
         self.config: FakeLiquidityTrapStrategyConfig
@@ -177,7 +181,7 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
                 return False
 
         # Додатковий quality gate:
-        # якщо реакція ще слабка, хочемо хоча б fast pull
+        # якщо реакція ще слабка, хочемо хоча б fast pull.
         if price_reaction_bps < self.config.min_price_reaction_bps:
             if not is_fast_pull:
                 return False
@@ -221,10 +225,19 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
         setup.metadata["allow_retest_entry"] = self.config.allow_retest_entry
         setup.metadata["pull_ratio"] = self._feature_float(signal.features, "pull_ratio")
         setup.metadata["fill_ratio"] = self._feature_float(signal.features, "fill_ratio")
-        setup.metadata["price_reaction_bps"] = self._feature_float(signal.features, "price_reaction_bps")
+        setup.metadata["price_reaction_bps"] = self._feature_float(
+            signal.features,
+            "price_reaction_bps",
+        )
         setup.metadata["lifetime_ms"] = self._feature_float(signal.features, "lifetime_ms")
-        setup.metadata["is_fake_liquidity"] = self._feature_bool(signal.features, "is_fake_liquidity")
-        setup.metadata["has_market_reaction"] = self._feature_bool(signal.features, "has_market_reaction")
+        setup.metadata["is_fake_liquidity"] = self._feature_bool(
+            signal.features,
+            "is_fake_liquidity",
+        )
+        setup.metadata["has_market_reaction"] = self._feature_bool(
+            signal.features,
+            "has_market_reaction",
+        )
         setup.metadata["is_fast_pull"] = self._feature_bool(signal.features, "is_fast_pull")
 
         if self.config.keep_source_wall_reference:
@@ -295,8 +308,8 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
     ) -> float:
         """
         TP для trap strategy:
-        - базовий RR
-        - optional scaling від сили reaction
+        - базовий RR;
+        - optional scaling від сили reaction.
         """
         base_tp = super().compute_take_profit_price(
             signal=signal,
@@ -309,12 +322,15 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
         price_reaction_bps = abs(self._feature_float(signal.features, "price_reaction_bps"))
         if price_reaction_bps <= 0:
             fallback_ratio = self.config.take_profit_bps_trap / 10_000.0
+
             if direction == StrategyDirection.LONG:
                 fallback_tp = entry_price * (1.0 + fallback_ratio)
                 return max(base_tp, fallback_tp)
+
             if direction == StrategyDirection.SHORT:
                 fallback_tp = entry_price * (1.0 - fallback_ratio)
                 return min(base_tp, fallback_tp)
+
             return base_tp
 
         target_bps = price_reaction_bps * self.config.trap_tp_multiplier
@@ -322,6 +338,7 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
         target_bps = min(self.config.max_take_profit_bps, target_bps)
 
         target_ratio = target_bps / 10_000.0
+
         if direction == StrategyDirection.LONG:
             reaction_tp = entry_price * (1.0 + target_ratio)
             return max(base_tp, reaction_tp)
@@ -357,7 +374,10 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
             signal.features,
             "price_reaction_bps",
         )
-        setup.metadata["updated_lifetime_ms"] = self._feature_float(signal.features, "lifetime_ms")
+        setup.metadata["updated_lifetime_ms"] = self._feature_float(
+            signal.features,
+            "lifetime_ms",
+        )
 
     def should_invalidate_from_signal_update(
         self,
@@ -414,9 +434,9 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
         Trap-specific confirmation.
 
         Ми хочемо:
-        - вже наявний рух у бік trap unwind
-        - бажано, щоб ціна не просто торкнула reference, а пішла за entry zone
-        - fake-liquidity semantics мають залишатись валідними
+        - вже наявний рух у бік trap unwind;
+        - бажано, щоб ціна не просто торкнула reference, а пішла за entry zone;
+        - fake-liquidity semantics мають залишатись валідними.
         """
         if setup.status != SetupStatus.PENDING:
             return False
@@ -455,9 +475,14 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
 
         if pull_ratio < self.config.min_pull_ratio:
             return False
+
         if fill_ratio > self.config.max_fill_ratio:
             return False
-        if self.config.require_market_reaction and price_reaction_bps < self.config.min_price_reaction_bps:
+
+        if (
+            self.config.require_market_reaction
+            and price_reaction_bps < self.config.min_price_reaction_bps
+        ):
             return False
 
         setup.status = SetupStatus.CONFIRMED
@@ -467,6 +492,7 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
         setup.metadata["confirmation_required_bps"] = required_bps
 
         self._stats["setups_confirmed"] += 1
+
         self.log_info(
             "Fake liquidity trap setup confirmed",
             setup_id=setup.setup_id,
@@ -486,8 +512,8 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
     ) -> bool:
         """
         Trigger logic:
-        - confirmed continuation
-        - або retest logic, якщо увімкнено
+        - confirmed continuation;
+        - або retest logic, якщо увімкнено.
         """
         if setup.status != SetupStatus.CONFIRMED:
             return False
@@ -502,7 +528,6 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
             return False
 
         if setup.direction == StrategyDirection.LONG:
-            # або ціна тримається вище entry, або зробила м'який ретест і знову зверху
             return current_price >= min(setup.entry_price, retest_price or setup.entry_price)
 
         if setup.direction == StrategyDirection.SHORT:
@@ -518,8 +543,8 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
     ) -> bool:
         """
         Invalidation:
-        - deep re-entry у trap zone
-        - adverse move
+        - deep re-entry у trap zone;
+        - adverse move.
         """
         adverse_bps = self._compute_adverse_move_bps(
             setup=setup,
@@ -583,25 +608,3 @@ class FakeLiquidityTrapStrategy(BaseSpoofingStrategy):
             base = "fake liquidity trap"
 
         return f"{base}; pattern={signal.pattern.value}; type={signal.spoofing_type.value}"
-
-    def _feature_float(self, features, name: str, default: float = 0.0) -> float:
-        if features is None:
-            return default
-        try:
-            value = getattr(features, name, default)
-            if value is None:
-                return default
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _feature_bool(self, features, name: str, default: bool = False) -> bool:
-        if features is None:
-            return default
-        try:
-            value = getattr(features, name, default)
-            if value is None:
-                return default
-            return bool(value)
-        except Exception:
-            return default

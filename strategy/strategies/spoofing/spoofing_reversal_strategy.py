@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
 from analytics.spoofing import (
     SpoofingPattern,
     SpoofingSeverity,
@@ -25,8 +28,8 @@ class SpoofingReversalStrategyConfig(BaseSpoofingStrategyConfig):
     Конфіг для reversal-стратегії поверх spoofing-сигналів.
 
     Ідея:
-    - торгуємо реверс після зняття фейкового тиску
-    - prefer signal-и з вираженим price reaction / pull / pressure flip
+    - торгуємо реверс після зняття фейкового тиску;
+    - prefer signal-и з вираженим price reaction / pull / pressure flip.
     """
 
     # accepted patterns / types
@@ -73,18 +76,17 @@ class SpoofingReversalStrategyConfig(BaseSpoofingStrategyConfig):
 
 class SpoofingReversalStrategy(BaseSpoofingStrategy):
     """
-    Concrete strategy:
-    reversal after spoofing pressure removal.
+    Concrete strategy: reversal after spoofing pressure removal.
 
     Типові кейси:
-    - ASK spoof wall disappears -> LONG
-    - BID spoof wall disappears -> SHORT
+    - ASK spoof wall disappears -> LONG;
+    - BID spoof wall disappears -> SHORT.
 
     Підтримувані джерела:
-    - ORDER_PULL / PULL_AND_REVERSAL
-    - FLIP_PRESSURE / PRESSURE_BLUFF
-    - LAYERING / MULTI_LEVEL_LAYERING
-    - COMPOSITE spoofing signals
+    - ORDER_PULL / PULL_AND_REVERSAL;
+    - FLIP_PRESSURE / PRESSURE_BLUFF;
+    - LAYERING / MULTI_LEVEL_LAYERING;
+    - COMPOSITE spoofing signals.
     """
 
     strategy_name = "spoofing_reversal_strategy"
@@ -92,11 +94,13 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
     def __init__(
         self,
         *,
-        event_bus,
+        event_bus: EventBus,
+        scheduler: Scheduler | None = None,
         config: SpoofingReversalStrategyConfig | None = None,
     ) -> None:
         super().__init__(
             event_bus=event_bus,
+            scheduler=scheduler,
             config=config or SpoofingReversalStrategyConfig(),
         )
         self.config: SpoofingReversalStrategyConfig
@@ -139,10 +143,7 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         ):
             return True
 
-        if (
-            self.config.allow_composite
-            and spoofing_type == SpoofingType.COMPOSITE
-        ):
+        if self.config.allow_composite and spoofing_type == SpoofingType.COMPOSITE:
             return True
 
         return False
@@ -162,7 +163,6 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
 
         features = signal.features
         if features is None:
-            # для reversal ми хочемо хоча б мінімальний feature context
             return False
 
         price_reaction_bps = abs(self._feature_float(features, "price_reaction_bps"))
@@ -173,7 +173,7 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         layering_score = self._feature_float(features, "layering_score")
 
         if price_reaction_bps < self.config.min_price_reaction_bps:
-            # для деяких setup-ів достатньо сильного pull/flip навіть без великої реакції
+            # Для деяких setup-ів достатньо сильного pull/flip навіть без великої реакції.
             if not (
                 pull_ratio >= self.config.min_pull_ratio
                 or pressure_flip_strength > 0.0
@@ -211,7 +211,6 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         if setup is None:
             return None
 
-        # для reversal-логіки можемо ще раз переперевірити pricing
         direction = setup.direction
         reference_price = setup.reference_price
 
@@ -227,14 +226,20 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
 
         setup.metadata["reversal_reason"] = self._build_reversal_reason(signal)
         setup.metadata["reversal_mode"] = "post_spoof_reversal"
-        setup.metadata["price_reaction_bps"] = self._feature_float(signal.features, "price_reaction_bps")
+        setup.metadata["price_reaction_bps"] = self._feature_float(
+            signal.features,
+            "price_reaction_bps",
+        )
         setup.metadata["pull_ratio"] = self._feature_float(signal.features, "pull_ratio")
         setup.metadata["fill_ratio"] = self._feature_float(signal.features, "fill_ratio")
         setup.metadata["pressure_flip_strength"] = self._feature_float(
             signal.features,
             "pressure_flip_strength",
         )
-        setup.metadata["layering_score"] = self._feature_float(signal.features, "layering_score")
+        setup.metadata["layering_score"] = self._feature_float(
+            signal.features,
+            "layering_score",
+        )
 
         if self.config.keep_reference_to_source_wall:
             setup.metadata["wall_id"] = signal.wall_id
@@ -255,7 +260,10 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
 
         if features is not None:
             setup.metadata["is_fast_pull"] = self._feature_bool(features, "is_fast_pull")
-            setup.metadata["is_fake_liquidity"] = self._feature_bool(features, "is_fake_liquidity")
+            setup.metadata["is_fake_liquidity"] = self._feature_bool(
+                features,
+                "is_fake_liquidity",
+            )
             setup.metadata["is_layering"] = self._feature_bool(features, "is_layering")
 
     # -------------------------------------------------------------------------
@@ -311,8 +319,8 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
     ) -> float:
         """
         TP:
-        1. базово через RR
-        2. optional: масштабуємо від фактичної price reaction
+        1. базово через RR;
+        2. optional: масштабуємо від фактичної price reaction.
         """
         base_tp = super().compute_take_profit_price(
             signal=signal,
@@ -334,6 +342,7 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         target_bps = min(self.config.max_take_profit_bps, target_bps)
 
         target_ratio = target_bps / 10_000.0
+
         if direction == StrategyDirection.LONG:
             reaction_tp = entry_price * (1.0 + target_ratio)
         elif direction == StrategyDirection.SHORT:
@@ -341,11 +350,13 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         else:
             reaction_tp = entry_price
 
-        # беремо дальшу ціль, щоб не "обрізати" reversal
+        # Беремо дальшу ціль, щоб не "обрізати" reversal.
         if direction == StrategyDirection.LONG:
             return max(base_tp, reaction_tp)
+
         if direction == StrategyDirection.SHORT:
             return min(base_tp, reaction_tp)
+
         return base_tp
 
     # -------------------------------------------------------------------------
@@ -358,16 +369,14 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         """
         super().apply_signal_update(setup=setup, signal=signal)
 
-        # trailing-like improvement of TP if реакція посилилась
         if setup.status in {SetupStatus.PENDING, SetupStatus.CONFIRMED}:
-            updated_tp = self.compute_take_profit_price(
+            setup.take_profit_price = self.compute_take_profit_price(
                 signal=signal,
                 direction=setup.direction,
                 entry_price=setup.entry_price,
                 stop_price=setup.stop_price,
                 reference_price=setup.reference_price,
             )
-            setup.take_profit_price = updated_tp
 
         setup.metadata["updated_price_reaction_bps"] = self._feature_float(
             signal.features,
@@ -405,7 +414,7 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         if fill_ratio > max(self.config.max_fill_ratio, 0.45):
             return True
 
-        # якщо це pressure bluff, але немає реакції ринку — reversal слабкий
+        # Якщо це pressure bluff, але немає реакції ринку — reversal слабкий.
         if signal.pattern == SpoofingPattern.PRESSURE_BLUFF:
             price_reaction_bps = abs(self._feature_float(features, "price_reaction_bps"))
             if self.config.require_reaction_for_pressure_bluff:
@@ -429,9 +438,9 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         Reversal-specific confirmation.
 
         Ідея:
-        - ціна має зміститись у напрямку reversal
-        - для HIGH/CRITICAL severity можна вимагати трохи менший рух
-        - optional: ціна має перейти reference_price в правильний бік
+        - ціна має зміститись у напрямку reversal;
+        - для HIGH/CRITICAL severity можна вимагати трохи менший рух;
+        - optional: ціна має перейти reference_price в правильний бік.
         """
         if setup.status != SetupStatus.PENDING:
             return False
@@ -467,10 +476,12 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         if not passed:
             return False
 
-        # додаткове підтвердження по features
         price_reaction_bps = abs(self._feature_float(signal.features, "price_reaction_bps"))
         pull_ratio = self._feature_float(signal.features, "pull_ratio")
-        pressure_flip_strength = self._feature_float(signal.features, "pressure_flip_strength")
+        pressure_flip_strength = self._feature_float(
+            signal.features,
+            "pressure_flip_strength",
+        )
 
         if (
             price_reaction_bps <= 0
@@ -486,6 +497,7 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         setup.metadata["confirmation_required_bps"] = required_bps
 
         self._stats["setups_confirmed"] += 1
+
         self.log_info(
             "Reversal setup confirmed",
             setup_id=setup.setup_id,
@@ -534,10 +546,12 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
         if adverse_bps >= self.config.max_adverse_move_bps_reversal:
             return True
 
-        # більш жорстка логіка: якщо confirmed setup повернувся через reference zone
+        # Більш жорстка логіка:
+        # якщо confirmed setup повернувся через reference zone.
         if setup.status == SetupStatus.CONFIRMED:
             if setup.direction == StrategyDirection.LONG and current_price < setup.reference_price:
                 return True
+
             if setup.direction == StrategyDirection.SHORT and current_price > setup.reference_price:
                 return True
 
@@ -559,25 +573,3 @@ class SpoofingReversalStrategy(BaseSpoofingStrategy):
             base = "spoofing reversal"
 
         return f"{base}; pattern={signal.pattern.value}; type={signal.spoofing_type.value}"
-
-    def _feature_float(self, features, name: str, default: float = 0.0) -> float:
-        if features is None:
-            return default
-        try:
-            value = getattr(features, name, default)
-            if value is None:
-                return default
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _feature_bool(self, features, name: str, default: bool = False) -> bool:
-        if features is None:
-            return default
-        try:
-            value = getattr(features, name, default)
-            if value is None:
-                return default
-            return bool(value)
-        except Exception:
-            return default

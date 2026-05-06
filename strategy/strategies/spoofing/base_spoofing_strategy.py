@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
+from core.event_bus import EventBus, Subscription
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 from analytics.spoofing import (
     SpoofingFeatures,
@@ -23,6 +25,7 @@ class SetupStatus(str, Enum):
     """
     Стан setup-а в lifecycle strategy-рівня.
     """
+
     PENDING = "pending"
     CONFIRMED = "confirmed"
     TRIGGERED = "triggered"
@@ -36,6 +39,7 @@ class StrategyDirection(str, Enum):
     """
     Напрямок торгової ідеї.
     """
+
     LONG = "long"
     SHORT = "short"
     FLAT = "flat"
@@ -45,8 +49,6 @@ class StrategyDirection(str, Enum):
 class BaseSpoofingStrategyConfig:
     """
     Базовий конфіг для spoofing-стратегій.
-
-    Його можна наслідувати або використовувати напряму як base config.
     """
 
     enabled: bool = True
@@ -56,6 +58,7 @@ class BaseSpoofingStrategyConfig:
     spoofing_updated_topic: str = "analytics.spoofing.updated"
     market_trade_topic: str = "market.trade"
     market_orderbook_topic: str = "market.orderbook"
+
     strategy_signal_topic: str = "signal.generated"
     strategy_setup_topic: str = "strategy.spoofing.setup_created"
     strategy_update_topic: str = "strategy.spoofing.setup_updated"
@@ -81,7 +84,7 @@ class BaseSpoofingStrategyConfig:
     min_confirmation_move_bps: float = 1.0
     max_adverse_move_bps: float = 2.5
 
-    # risk-ish defaults (strategy-side only, not full risk manager)
+    # risk-ish defaults, not full RiskManager responsibility
     default_entry_offset_bps: float = 0.0
     default_stop_buffer_bps: float = 3.0
     default_take_profit_bps: float = 6.0
@@ -95,6 +98,9 @@ class BaseSpoofingStrategyConfig:
 
     # cleanup
     cleanup_interval_ms: int = 2_000
+    cleanup_timeout_sec: float = 1.0
+    cleanup_max_retries: int = 1
+    cleanup_retry_delay_sec: float = 0.5
 
 
 @dataclass(slots=True)
@@ -160,16 +166,16 @@ class BaseSpoofingStrategy(ABC):
     Базовий клас для всіх strategy/strategies/spoofing/* стратегій.
 
     Призначення:
-    - слухати spoofing analytics events
-    - створювати setup-и на основі SpoofingSignal
-    - трекати lifecycle setup-ів
-    - підтверджувати / інвалідовувати / експайрити setup-и
-    - публікувати normalized strategy signal у strategy layer
+    - слухати spoofing analytics events;
+    - створювати setup-и на основі SpoofingSignal;
+    - трекати lifecycle setup-ів;
+    - підтверджувати / інвалідовувати / експайрити setup-и;
+    - публікувати normalized strategy signal у strategy layer.
 
     Важливо:
-    - цей клас НЕ займається spoofing detection.
-    - він працює поверх уже готових SpoofingSignal від analytics.spoofing.
-    - конкретні rules для entry/filtering підтверджуються у subclass.
+    - цей клас НЕ займається spoofing detection;
+    - він працює поверх уже готових SpoofingSignal від analytics.spoofing;
+    - конкретні rules для entry/filtering визначаються у subclass.
     """
 
     strategy_name: str = "base_spoofing_strategy"
@@ -177,14 +183,19 @@ class BaseSpoofingStrategy(ABC):
     def __init__(
         self,
         *,
-        event_bus: Any | None,
+        event_bus: EventBus | None,
         config: BaseSpoofingStrategyConfig | None = None,
+        scheduler: Scheduler | None = None,
     ) -> None:
         self.event_bus = event_bus
+        self.scheduler = scheduler
         self.config = config or BaseSpoofingStrategyConfig()
+
         self.logger = get_logger(
             __name__,
             service_name=f"strategy.spoofing.{self.strategy_name}",
+            event_type="strategy",
+            strategy=self.strategy_name,
         )
 
         self._active_setups_by_id: dict[str, SpoofingTradeSetup] = {}
@@ -195,6 +206,10 @@ class BaseSpoofingStrategy(ABC):
         self._latest_price_by_symbol: dict[str, float] = {}
         self._latest_trade_ts_by_symbol: dict[str, datetime] = {}
 
+        self._registered: bool = False
+        self._subscriptions: list[Subscription] = []
+
+        self._cleanup_job_id: str | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._is_running: bool = False
 
@@ -210,6 +225,7 @@ class BaseSpoofingStrategy(ABC):
             "duplicate_signals": 0,
             "cooldown_blocks": 0,
             "errors": 0,
+            "emit_failures": 0,
         }
 
     # -------------------------------------------------------------------------
@@ -218,26 +234,42 @@ class BaseSpoofingStrategy(ABC):
 
     def register(self) -> None:
         """
-        Підписка на EventBus.
+        Підписка на core EventBus.
+
+        Idempotent: повторний виклик не створює дублікати subscriptions.
         """
+        if self._registered:
+            self.log_debug("register skipped: already registered")
+            return
+
         if self.event_bus is None:
             self.log_warning("register skipped: event_bus is None")
             return
 
-        self.event_bus.subscribe(
-            self.config.spoofing_detected_topic,
-            self.on_spoofing_detected,
+        self._subscriptions.append(
+            self.event_bus.subscribe(
+                self.config.spoofing_detected_topic,
+                self.on_spoofing_detected,
+                name=f"{self.strategy_name}.on_spoofing_detected",
+            )
         )
-        self.event_bus.subscribe(
-            self.config.spoofing_updated_topic,
-            self.on_spoofing_updated,
+        self._subscriptions.append(
+            self.event_bus.subscribe(
+                self.config.spoofing_updated_topic,
+                self.on_spoofing_updated,
+                name=f"{self.strategy_name}.on_spoofing_updated",
+            )
         )
-        self.event_bus.subscribe(
-            self.config.market_trade_topic,
-            self.on_market_trade,
+        self._subscriptions.append(
+            self.event_bus.subscribe(
+                self.config.market_trade_topic,
+                self.on_market_trade,
+                name=f"{self.strategy_name}.on_market_trade",
+            )
         )
 
-        self._is_running = True
+        self._registered = True
+
         self.log_info(
             "Strategy registered",
             strategy_name=self.strategy_name,
@@ -246,25 +278,90 @@ class BaseSpoofingStrategy(ABC):
             market_trade_topic=self.config.market_trade_topic,
         )
 
+    def unregister(self) -> None:
+        """
+        Знімає subscriptions з core EventBus.
+        """
+        if not self._registered:
+            return
+
+        if self.event_bus is not None:
+            for subscription in self._subscriptions:
+                try:
+                    self.event_bus.unsubscribe(subscription)
+                except Exception:
+                    self.log_exception(
+                        "Failed to unsubscribe strategy handler",
+                        strategy_name=self.strategy_name,
+                    )
+
+        self._subscriptions.clear()
+        self._registered = False
+
+        self.log_info("Strategy unregistered", strategy_name=self.strategy_name)
+
     async def start(self) -> None:
         """
-        Опціональний async lifecycle.
+        Async lifecycle.
+
+        Subscriptions йдуть через core EventBus.
+        Periodic cleanup запускається через core Scheduler, якщо scheduler переданий.
+        Якщо Scheduler не передано, використовується fallback asyncio task.
         """
         if self._is_running:
             return
 
-        self.register()
+        if not self._registered:
+            self.register()
+
+        self._is_running = True
 
         if self.config.cleanup_interval_ms > 0:
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            interval_sec = max(self.config.cleanup_interval_ms / 1000.0, 0.25)
+
+            if self.scheduler is not None:
+                self._cleanup_job_id = self.scheduler.add_interval_job(
+                    name=f"{self.strategy_name}.cleanup",
+                    func=self.run_cleanup_once,
+                    interval=interval_sec,
+                    run_immediately=False,
+                    max_retries=self.config.cleanup_max_retries,
+                    retry_delay=self.config.cleanup_retry_delay_sec,
+                    timeout=self.config.cleanup_timeout_sec,
+                    allow_overlap=False,
+                    enabled=True,
+                )
+            else:
+                self.log_warning(
+                    "Scheduler is None; using fallback cleanup task",
+                    strategy_name=self.strategy_name,
+                )
+                self._cleanup_task = asyncio.create_task(
+                    self._cleanup_loop(),
+                    name=f"{self.strategy_name}-cleanup-loop",
+                )
 
         self.log_info("Strategy started", strategy_name=self.strategy_name)
 
     async def stop(self) -> None:
         """
-        Акуратно зупиняє фонову cleanup-loop.
+        Акуратно зупиняє runtime lifecycle.
         """
         self._is_running = False
+
+        if self.scheduler is not None and self._cleanup_job_id is not None:
+            try:
+                self.scheduler.remove_job(self._cleanup_job_id)
+            except KeyError:
+                pass
+            except Exception:
+                self.log_exception(
+                    "Failed to remove cleanup scheduler job",
+                    strategy_name=self.strategy_name,
+                    cleanup_job_id=self._cleanup_job_id,
+                )
+            finally:
+                self._cleanup_job_id = None
 
         if self._cleanup_task is not None:
             self._cleanup_task.cancel()
@@ -272,7 +369,10 @@ class BaseSpoofingStrategy(ABC):
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
-            self._cleanup_task = None
+            finally:
+                self._cleanup_task = None
+
+        self.unregister()
 
         self.log_info("Strategy stopped", strategy_name=self.strategy_name)
 
@@ -382,11 +482,10 @@ class BaseSpoofingStrategy(ABC):
                 if confirmed:
                     await self._emit_strategy_signal(setup)
 
-        except Exception as exc:
+        except Exception:
             self._stats["errors"] += 1
-            self.log_error(
+            self.log_exception(
                 "Failed to handle spoofing detected event",
-                error=str(exc),
                 signal_id=getattr(signal, "signal_id", None),
                 symbol=getattr(signal, "symbol", None),
             )
@@ -395,10 +494,6 @@ class BaseSpoofingStrategy(ABC):
     async def on_spoofing_updated(self, event: Any) -> None:
         """
         Обробка updated spoofing signal.
-
-        Базово:
-        - оновлюємо setup, якщо він уже існує
-        - можемо підтвердити / інвалідовувати по нових даних
         """
         if not self.config.process_updates_for_existing_signal:
             return
@@ -427,18 +522,20 @@ class BaseSpoofingStrategy(ABC):
                 return
 
             if setup.status == SetupStatus.PENDING:
-                latest_price = self._latest_price_by_symbol.get(setup.symbol, setup.reference_price)
+                latest_price = self._latest_price_by_symbol.get(
+                    setup.symbol,
+                    setup.reference_price,
+                )
                 if self.confirm_setup(setup=setup, current_price=latest_price, signal=signal):
                     await self._emit_strategy_signal(setup)
 
             if self.config.publish_setup_events and self.config.publish_debug_updates:
                 await self._publish_setup_updated(setup, reason="signal_update")
 
-        except Exception as exc:
+        except Exception:
             self._stats["errors"] += 1
-            self.log_error(
+            self.log_exception(
                 "Failed to handle spoofing updated event",
-                error=str(exc),
                 signal_id=signal.signal_id,
                 symbol=signal.symbol,
             )
@@ -510,16 +607,9 @@ class BaseSpoofingStrategy(ABC):
 
     @abstractmethod
     def supports_pattern(self, signal: SpoofingSignal) -> bool:
-        """
-        Чи підтримує ця strategy конкретний spoofing pattern/signal.
-        """
         raise NotImplementedError
 
     def accepts_signal(self, signal: SpoofingSignal) -> bool:
-        """
-        Базовий фільтр.
-        Subclass може розширити.
-        """
         if signal.score < self.config.min_score:
             return False
         if signal.confidence < self.config.min_confidence:
@@ -531,10 +621,6 @@ class BaseSpoofingStrategy(ABC):
         return True
 
     def build_setup(self, signal: SpoofingSignal) -> SpoofingTradeSetup | None:
-        """
-        Базова побудова setup-а.
-        Subclass може перевизначити повністю або частково.
-        """
         direction = self.resolve_direction(signal)
         if direction == StrategyDirection.FLAT:
             return None
@@ -591,18 +677,9 @@ class BaseSpoofingStrategy(ABC):
         return setup
 
     def enrich_setup(self, setup: SpoofingTradeSetup, signal: SpoofingSignal) -> None:
-        """
-        Hook для subclass:
-        - додаткові поля metadata
-        - custom thresholds
-        - trap zone / confirmation zone
-        """
         return None
 
     def apply_signal_update(self, *, setup: SpoofingTradeSetup, signal: SpoofingSignal) -> None:
-        """
-        Hook для оновлення setup-а на основі нового spoofing update.
-        """
         setup.score = max(setup.score, signal.score)
         setup.confidence = max(setup.confidence, signal.confidence)
         setup.severity = self._max_severity(setup.severity, signal.severity)
@@ -615,9 +692,6 @@ class BaseSpoofingStrategy(ABC):
         setup: SpoofingTradeSetup,
         signal: SpoofingSignal,
     ) -> bool:
-        """
-        Hook: можна invalidate setup, якщо апдейт сигналу став слабким.
-        """
         return False
 
     def confirm_setup(
@@ -627,11 +701,6 @@ class BaseSpoofingStrategy(ABC):
         current_price: float,
         signal: SpoofingSignal,
     ) -> bool:
-        """
-        Базове підтвердження:
-        - LONG: ціна змістилась вгору від reference_price на min_confirmation_move_bps
-        - SHORT: ціна змістилась вниз від reference_price на min_confirmation_move_bps
-        """
         if setup.status != SetupStatus.PENDING:
             return False
 
@@ -672,10 +741,6 @@ class BaseSpoofingStrategy(ABC):
         setup: SpoofingTradeSetup,
         current_price: float,
     ) -> bool:
-        """
-        Базово: як тільки setup confirmed, можна trigger.
-        Subclass може ускладнити.
-        """
         return setup.status == SetupStatus.CONFIRMED
 
     def should_invalidate_on_price(
@@ -684,9 +749,6 @@ class BaseSpoofingStrategy(ABC):
         setup: SpoofingTradeSetup,
         current_price: float,
     ) -> bool:
-        """
-        Базова логіка invalidation по adverse move.
-        """
         adverse_bps = self._compute_adverse_move_bps(
             setup=setup,
             current_price=current_price,
@@ -698,11 +760,6 @@ class BaseSpoofingStrategy(ABC):
     # -------------------------------------------------------------------------
 
     def resolve_direction(self, signal: SpoofingSignal) -> StrategyDirection:
-        """
-        Базове правило:
-        - ASK spoof/fake pressure -> LONG
-        - BID spoof/fake support -> SHORT
-        """
         if signal.side == SpoofingSide.ASK:
             return StrategyDirection.LONG
         if signal.side == SpoofingSide.BID:
@@ -710,9 +767,6 @@ class BaseSpoofingStrategy(ABC):
         return StrategyDirection.FLAT
 
     def resolve_reference_price(self, signal: SpoofingSignal) -> float:
-        """
-        Бере найкращу доступну reference price.
-        """
         if signal.price_level and signal.price_level > 0:
             return float(signal.price_level)
 
@@ -728,9 +782,6 @@ class BaseSpoofingStrategy(ABC):
         direction: StrategyDirection,
         reference_price: float,
     ) -> float:
-        """
-        Простий entry від reference price з optional offset.
-        """
         offset = self.config.default_entry_offset_bps / 10_000.0
         if direction == StrategyDirection.LONG:
             return reference_price * (1.0 + offset)
@@ -744,9 +795,6 @@ class BaseSpoofingStrategy(ABC):
         direction: StrategyDirection,
         reference_price: float,
     ) -> float:
-        """
-        Базовий stop через buffer від reference price.
-        """
         buffer_ratio = self.config.default_stop_buffer_bps / 10_000.0
         if direction == StrategyDirection.LONG:
             return reference_price * (1.0 - buffer_ratio)
@@ -763,9 +811,6 @@ class BaseSpoofingStrategy(ABC):
         stop_price: float,
         reference_price: float,
     ) -> float:
-        """
-        TP через RR multiplier.
-        """
         risk = abs(entry_price - stop_price)
         if risk <= 0:
             fallback_ratio = self.config.default_take_profit_bps / 10_000.0
@@ -798,6 +843,7 @@ class BaseSpoofingStrategy(ABC):
     def get_active_setups_for_symbol(self, symbol: str) -> list[SpoofingTradeSetup]:
         setup_ids = self._setup_ids_by_symbol.get(symbol, set())
         setups: list[SpoofingTradeSetup] = []
+
         for setup_id in setup_ids:
             setup = self._active_setups_by_id.get(setup_id)
             if setup is None:
@@ -827,11 +873,12 @@ class BaseSpoofingStrategy(ABC):
         return setup is not None and setup.is_active
 
     def _can_create_more_setups_for_symbol(self, symbol: str) -> bool:
+        active = self.get_active_setups_for_symbol(symbol)
+
         if self.config.allow_multiple_setups_same_symbol:
-            active = self.get_active_setups_for_symbol(symbol)
             return len(active) < self.config.max_active_setups_per_symbol
 
-        return len(self.get_active_setups_for_symbol(symbol)) == 0
+        return len(active) == 0
 
     def build_setup_id(self, signal: SpoofingSignal) -> str:
         return f"{self.strategy_name}:{signal.signal_id}"
@@ -859,6 +906,7 @@ class BaseSpoofingStrategy(ABC):
         setup.metadata["expire_reason"] = reason
 
         self._stats["setups_expired"] += 1
+
         self.log_info(
             "Setup expired",
             setup_id=setup.setup_id,
@@ -884,10 +932,12 @@ class BaseSpoofingStrategy(ABC):
         setup.status = SetupStatus.INVALIDATED
         setup.invalidated_at = self.now()
         setup.metadata["invalidation_reason"] = reason
+
         if metadata:
             setup.metadata.update(metadata)
 
         self._stats["setups_invalidated"] += 1
+
         self.log_info(
             "Setup invalidated",
             setup_id=setup.setup_id,
@@ -918,6 +968,7 @@ class BaseSpoofingStrategy(ABC):
             symbol=setup.symbol,
             reason=reason,
         )
+
         self._remove_setup(setup)
 
     # -------------------------------------------------------------------------
@@ -925,9 +976,6 @@ class BaseSpoofingStrategy(ABC):
     # -------------------------------------------------------------------------
 
     async def _emit_strategy_signal(self, setup: SpoofingTradeSetup) -> None:
-        """
-        Публікує strategy-level signal.generated.
-        """
         if setup.is_terminal:
             return
 
@@ -938,12 +986,13 @@ class BaseSpoofingStrategy(ABC):
 
         payload = self.build_strategy_signal_payload(setup)
 
-        await self.emit_event(
+        emitted = await self.emit_event(
             self.config.strategy_signal_topic,
             payload,
         )
 
-        self._stats["signals_emitted"] += 1
+        if emitted:
+            self._stats["signals_emitted"] += 1
 
         self.log_info(
             "Strategy signal emitted",
@@ -954,14 +1003,12 @@ class BaseSpoofingStrategy(ABC):
             entry_price=setup.entry_price,
             stop_price=setup.stop_price,
             take_profit_price=setup.take_profit_price,
+            emitted=emitted,
         )
 
         self._remove_setup(setup)
 
     def build_strategy_signal_payload(self, setup: SpoofingTradeSetup) -> dict[str, Any]:
-        """
-        Універсальний payload для strategy engine / risk manager.
-        """
         return {
             "strategy": self.strategy_name,
             "strategy_type": "spoofing",
@@ -992,8 +1039,8 @@ class BaseSpoofingStrategy(ABC):
     # publishing helpers
     # -------------------------------------------------------------------------
 
-    async def _publish_setup_created(self, setup: SpoofingTradeSetup) -> None:
-        await self.emit_event(
+    async def _publish_setup_created(self, setup: SpoofingTradeSetup) -> bool:
+        return await self.emit_event(
             self.config.strategy_setup_topic,
             {
                 "strategy": self.strategy_name,
@@ -1002,8 +1049,8 @@ class BaseSpoofingStrategy(ABC):
             },
         )
 
-    async def _publish_setup_updated(self, setup: SpoofingTradeSetup, *, reason: str) -> None:
-        await self.emit_event(
+    async def _publish_setup_updated(self, setup: SpoofingTradeSetup, *, reason: str) -> bool:
+        return await self.emit_event(
             self.config.strategy_update_topic,
             {
                 "strategy": self.strategy_name,
@@ -1013,8 +1060,8 @@ class BaseSpoofingStrategy(ABC):
             },
         )
 
-    async def _publish_setup_invalidated(self, setup: SpoofingTradeSetup, *, reason: str) -> None:
-        await self.emit_event(
+    async def _publish_setup_invalidated(self, setup: SpoofingTradeSetup, *, reason: str) -> bool:
+        return await self.emit_event(
             self.config.strategy_invalidation_topic,
             {
                 "strategy": self.strategy_name,
@@ -1024,8 +1071,8 @@ class BaseSpoofingStrategy(ABC):
             },
         )
 
-    async def _publish_setup_expired(self, setup: SpoofingTradeSetup, *, reason: str) -> None:
-        await self.emit_event(
+    async def _publish_setup_expired(self, setup: SpoofingTradeSetup, *, reason: str) -> bool:
+        return await self.emit_event(
             self.config.strategy_expired_topic,
             {
                 "strategy": self.strategy_name,
@@ -1035,34 +1082,47 @@ class BaseSpoofingStrategy(ABC):
             },
         )
 
-    async def emit_event(self, topic: str, payload: dict[str, Any]) -> None:
+    async def emit_event(self, topic: str, payload: dict[str, Any]) -> bool:
         """
-        Уніфікований emit для різних реалізацій EventBus.
+        Уніфікований emit через core EventBus.
         """
         if self.event_bus is None:
-            return
+            self._stats["emit_failures"] += 1
+            self.log_warning("emit skipped: event_bus is None", topic=topic)
+            return False
 
-        emit = getattr(self.event_bus, "emit", None)
-        if emit is None:
-            self.log_warning("EventBus has no emit() method", topic=topic)
-            return
+        try:
+            accepted = await self.event_bus.emit(
+                topic,
+                payload,
+                source=self.strategy_name,
+            )
 
-        result = emit(
-            topic,
-            payload,
-            source=self.strategy_name,
-        )
-        if asyncio.iscoroutine(result):
-            await result
+            if accepted is False:
+                self._stats["emit_failures"] += 1
+                self.log_warning(
+                    "EventBus rejected event",
+                    topic=topic,
+                    strategy_name=self.strategy_name,
+                )
+                return False
+
+            return True
+
+        except Exception:
+            self._stats["emit_failures"] += 1
+            self.log_exception(
+                "Failed to emit event",
+                topic=topic,
+                strategy_name=self.strategy_name,
+            )
+            raise
 
     # -------------------------------------------------------------------------
     # rebuild / extraction
     # -------------------------------------------------------------------------
 
     def rebuild_minimal_signal_from_setup(self, setup: SpoofingTradeSetup) -> SpoofingSignal:
-        """
-        Мінімальний SpoofingSignal для confirm hooks, якщо у нас лише setup.
-        """
         return SpoofingSignal(
             signal_id=setup.source_signal_id,
             symbol=setup.symbol,
@@ -1085,14 +1145,6 @@ class BaseSpoofingStrategy(ABC):
         )
 
     def _extract_spoofing_signal(self, event: Any) -> SpoofingSignal | None:
-        """
-        Дістає SpoofingSignal з event або payload.
-
-        Підтримує:
-        - event.payload = SpoofingSignal
-        - event.payload = {"signal": SpoofingSignal}
-        - event = SpoofingSignal
-        """
         if isinstance(event, SpoofingSignal):
             return event
 
@@ -1121,56 +1173,71 @@ class BaseSpoofingStrategy(ABC):
     def _is_cooldown_active(self, signal: SpoofingSignal) -> bool:
         key = self._cooldown_key(signal)
         expires_at = self._cooldowns.get(key)
+
         if expires_at is None:
             return False
+
         return self.now() < expires_at
 
     def _set_cooldown(self, signal: SpoofingSignal) -> None:
         key = self._cooldown_key(signal)
         self._cooldowns[key] = self.now() + timedelta(
-            milliseconds=self.config.cooldown_ms_same_symbol_pattern
+            milliseconds=self.config.cooldown_ms_same_symbol_pattern,
         )
 
     def _cleanup_cooldowns(self) -> None:
         now = self.now()
         expired_keys = [key for key, dt in self._cooldowns.items() if dt <= now]
+
         for key in expired_keys:
             self._cooldowns.pop(key, None)
 
     # -------------------------------------------------------------------------
-    # cleanup loop
+    # cleanup
     # -------------------------------------------------------------------------
+
+    async def run_cleanup_once(self) -> None:
+        """
+        Один cleanup tick.
+
+        Саме цей метод викликає core Scheduler.
+        """
+        try:
+            now = self.now()
+            self._cleanup_cooldowns()
+
+            for setup in list(self._active_setups_by_id.values()):
+                if setup.is_terminal:
+                    self._remove_setup(setup)
+                    continue
+
+                if self.is_setup_expired(setup, now=now):
+                    await self.expire_setup(setup, reason="ttl_expired_cleanup")
+
+        except Exception:
+            self._stats["errors"] += 1
+            self.log_exception(
+                "Cleanup tick failed",
+                strategy_name=self.strategy_name,
+            )
+            raise
 
     async def _cleanup_loop(self) -> None:
         """
-        Періодично чистить cooldowns і протухлі setup-и.
+        Fallback cleanup-loop для standalone/test режиму.
+
+        У production краще передавати core Scheduler.
         """
         interval_sec = max(self.config.cleanup_interval_ms / 1000.0, 0.25)
 
         while self._is_running:
             try:
-                now = self.now()
-                self._cleanup_cooldowns()
-
-                for setup in list(self._active_setups_by_id.values()):
-                    if setup.is_terminal:
-                        self._remove_setup(setup)
-                        continue
-
-                    if self.is_setup_expired(setup, now=now):
-                        await self.expire_setup(setup, reason="ttl_expired_cleanup")
-
+                await self.run_cleanup_once()
                 await asyncio.sleep(interval_sec)
 
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                self._stats["errors"] += 1
-                self.log_error(
-                    "Cleanup loop failed",
-                    error=str(exc),
-                    strategy_name=self.strategy_name,
-                )
+            except Exception:
                 await asyncio.sleep(interval_sec)
 
     # -------------------------------------------------------------------------
@@ -1238,6 +1305,7 @@ class BaseSpoofingStrategy(ABC):
     def _serialize_features(self, features: SpoofingFeatures | None) -> dict[str, Any] | None:
         if features is None:
             return None
+
         try:
             return asdict(features)
         except Exception:
@@ -1250,14 +1318,16 @@ class BaseSpoofingStrategy(ABC):
         fallback: datetime,
     ) -> datetime:
         payload = getattr(event, "payload", None)
-        candidates = []
+        candidates: list[Any] = []
 
         if isinstance(payload, dict):
-            candidates.extend([
-                payload.get("timestamp"),
-                payload.get("ts"),
-                payload.get("event_time"),
-            ])
+            candidates.extend(
+                [
+                    payload.get("timestamp"),
+                    payload.get("ts"),
+                    payload.get("event_time"),
+                ]
+            )
 
         candidates.append(getattr(event, "timestamp", None))
 
@@ -1276,7 +1346,6 @@ class BaseSpoofingStrategy(ABC):
             return self.ensure_utc(value)
 
         if isinstance(value, (int, float)):
-            # heuristic: ms vs sec
             if value > 10_000_000_000:
                 return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
             return datetime.fromtimestamp(value, tz=timezone.utc)
@@ -1328,10 +1397,56 @@ class BaseSpoofingStrategy(ABC):
         return {
             "strategy_name": self.strategy_name,
             "is_running": self._is_running,
+            "registered": self._registered,
             "active_setups": len(self._active_setups_by_id),
             "cooldowns": len(self._cooldowns),
+            "cleanup_job_id": self._cleanup_job_id,
+            "has_fallback_cleanup_task": self._cleanup_task is not None,
             **self._stats,
         }
+
+    # -------------------------------------------------------------------------
+    # feature helpers
+    # -------------------------------------------------------------------------
+
+    def _feature_float(
+        self,
+        features: SpoofingFeatures | dict[str, Any] | None,
+        name: str,
+        default: float = 0.0,
+    ) -> float:
+        if features is None:
+            return default
+
+        if isinstance(features, dict):
+            return self._safe_float(features.get(name), default)
+
+        return self._safe_float(getattr(features, name, default), default)
+
+    def _feature_bool(
+        self,
+        features: SpoofingFeatures | dict[str, Any] | None,
+        name: str,
+        default: bool = False,
+    ) -> bool:
+        if features is None:
+            return default
+
+        if isinstance(features, dict):
+            value = features.get(name, default)
+        else:
+            value = getattr(features, name, default)
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, (int, float)):
+            return bool(value)
+
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        return default
 
     # -------------------------------------------------------------------------
     # logging helpers
@@ -1348,3 +1463,6 @@ class BaseSpoofingStrategy(ABC):
 
     def log_error(self, message: str, **kwargs: Any) -> None:
         self.logger.error(message, extra=kwargs)
+
+    def log_exception(self, message: str, **kwargs: Any) -> None:
+        self.logger.exception(message, extra=kwargs)
