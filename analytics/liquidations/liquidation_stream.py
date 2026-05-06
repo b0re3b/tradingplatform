@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from typing import Any, Protocol
 from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
+
 from .config import LiquidationStreamConfig
 from .enums import LiquidationEventType, LiquidationSide
 from .metrics import LiquidationMetrics
@@ -28,12 +30,12 @@ from .utils import (
 
 class LiquidationExchangeAdapterProtocol(Protocol):
     """
-    Абстракція біржового адаптера для liquidation stream.
+    Exchange adapter contract for liquidation stream ingestion.
 
-    Adapter відповідає лише за transport/exchange-specific частину:
+    Adapter відповідає тільки за exchange-specific transport:
     - connect liquidation feed;
     - disconnect liquidation feed;
-    - отримання raw liquidation payload.
+    - receive raw liquidation payload.
     """
 
     @property
@@ -52,22 +54,23 @@ class LiquidationExchangeAdapterProtocol(Protocol):
 
 class LiquidationStream:
     """
-    Ingestion + normalization + publish layer для liquidation events.
+    Production ingestion + normalization + EventBus publishing layer
+    for liquidation events.
 
     Відповідальність:
     - отримує raw liquidation payload-и від exchange adapter;
     - нормалізує payload у LiquidationEvent;
     - фільтрує invalid/stale/duplicate events;
-    - оновлює LiquidationState;
+    - оновлює shared LiquidationState;
     - оновлює LiquidationMetrics;
     - публікує market.liquidation.* події через core.EventBus;
     - реєструє health/snapshot/cleanup jobs через core.Scheduler.
 
     Цей клас НЕ:
     - не робить cascade detection;
-    - не приймає торгових рішень;
+    - не приймає trading decisions;
     - не викликає strategy/risk/execution напряму;
-    - не дублює core EventBus/Scheduler/logger.
+    - не дублює EventBus/Scheduler/logger.
     """
 
     def __init__(
@@ -98,11 +101,21 @@ class LiquidationStream:
             exchange=self.exchange_name,
         )
 
+        if state is None:
+            self.logger.warning(
+                "LiquidationStream initialized without shared LiquidationState. "
+                "For production, pass the same LiquidationState instance to "
+                "LiquidationStream and CascadeDetector.",
+                extra={"exchange": self.exchange_name},
+            )
+
         self._running = False
         self._registered = False
         self._connected = False
+        self._closed = False
 
         self._consumer_task: asyncio.Task[None] | None = None
+        self._reconnect_lock = asyncio.Lock()
 
         self._started_at: datetime | None = None
         self._stopped_at: datetime | None = None
@@ -125,21 +138,21 @@ class LiquidationStream:
         self._published_snapshots = 0
 
         self._recent_payload_fingerprints: deque[str] = deque(
-            maxlen=self.config.recent_payload_fingerprints_size,
+            maxlen=max(1, self.config.recent_payload_fingerprints_size),
         )
         self._recent_payload_fingerprint_set: set[str] = set()
 
         self._recent_large_events: deque[LiquidationEvent] = deque(
-            maxlen=self.config.recent_large_events_size,
+            maxlen=max(1, self.config.recent_large_events_size),
         )
 
         self._healthcheck_job_id: str | None = None
         self._snapshot_job_id: str | None = None
         self._cleanup_job_id: str | None = None
 
-    # ---------------------------------------------------------------------
-    # Lifecycle / registration
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def register(self) -> None:
         """
@@ -149,8 +162,14 @@ class LiquidationStream:
         Він тільки публікує market.liquidation.* події.
         """
         if self._registered:
-            self.logger.warning("LiquidationStream already registered")
+            self.logger.warning(
+                "LiquidationStream already registered",
+                extra={"exchange": self.exchange_name},
+            )
             return
+
+        if self._closed:
+            raise RuntimeError("Cannot register closed LiquidationStream")
 
         self._register_scheduler_jobs()
         self._registered = True
@@ -163,9 +182,32 @@ class LiquidationStream:
             },
         )
 
+    async def unregister(self) -> None:
+        """
+        Видаляє scheduler jobs, створені цим stream.
+
+        Корисно для tests, hot reload, graceful shutdown container-а.
+        """
+        if not self._registered:
+            return
+
+        await self._remove_scheduler_jobs()
+        self._registered = False
+
+        self.logger.info(
+            "LiquidationStream unregistered",
+            extra={"exchange": self.exchange_name},
+        )
+
     async def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot start closed LiquidationStream")
+
         if self._running:
-            self.logger.warning("LiquidationStream already running")
+            self.logger.warning(
+                "LiquidationStream already running",
+                extra={"exchange": self.exchange_name},
+            )
             return
 
         if not self.config.enabled:
@@ -213,6 +255,9 @@ class LiquidationStream:
             self._last_error = repr(exc)
             self._last_error_at = utc_now()
 
+            with contextlib.suppress(Exception):
+                await self._disconnect()
+
             self.logger.exception(
                 "Failed to start LiquidationStream",
                 extra={
@@ -223,7 +268,7 @@ class LiquidationStream:
             raise
 
     async def stop(self) -> None:
-        if not self._running:
+        if not self._running and self._consumer_task is None and not self._connected:
             return
 
         self.logger.info(
@@ -247,6 +292,24 @@ class LiquidationStream:
             extra=self.get_stats(),
         )
 
+    async def close(self) -> None:
+        """
+        Повний shutdown: stop + unregister.
+
+        Використовуй у bootstrap/container graceful shutdown.
+        """
+        if self._closed:
+            return
+
+        await self.stop()
+        await self.unregister()
+        self._closed = True
+
+        self.logger.info(
+            "LiquidationStream closed",
+            extra={"exchange": self.exchange_name},
+        )
+
     async def restart(self) -> None:
         self.logger.warning(
             "Restarting LiquidationStream",
@@ -255,11 +318,14 @@ class LiquidationStream:
         await self.stop()
         await self.start()
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Connection management
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def _connect(self) -> None:
+        if self._connected:
+            return
+
         await self.exchange_adapter.connect_liquidations(self.config.symbols)
         self._connected = True
 
@@ -272,9 +338,15 @@ class LiquidationStream:
         )
 
     async def _disconnect(self) -> None:
+        if not self._connected:
+            return
+
         try:
             await self.exchange_adapter.disconnect_liquidations()
         except Exception as exc:
+            self._last_error = repr(exc)
+            self._last_error_at = utc_now()
+
             self.logger.warning(
                 "Error during liquidation feed disconnect",
                 extra={
@@ -291,34 +363,42 @@ class LiquidationStream:
         )
 
     async def reconnect(self) -> None:
-        now = utc_now()
+        if not self._running:
+            self.logger.warning(
+                "Reconnect skipped because stream is not running",
+                extra={"exchange": self.exchange_name},
+            )
+            return
 
-        if self._last_reconnect_at is not None:
-            elapsed = (now - self._last_reconnect_at).total_seconds()
-            if elapsed < self.config.reconnect_cooldown_seconds:
-                self.logger.warning(
-                    "Reconnect skipped due to cooldown",
-                    extra={
-                        "exchange": self.exchange_name,
-                        "elapsed_seconds": elapsed,
-                        "cooldown_seconds": self.config.reconnect_cooldown_seconds,
-                    },
-                )
-                return
+        async with self._reconnect_lock:
+            now = utc_now()
 
-        self._last_reconnect_at = now
+            if self._last_reconnect_at is not None:
+                elapsed = (now - self._last_reconnect_at).total_seconds()
+                if elapsed < self.config.reconnect_cooldown_seconds:
+                    self.logger.warning(
+                        "Reconnect skipped due to cooldown",
+                        extra={
+                            "exchange": self.exchange_name,
+                            "elapsed_seconds": elapsed,
+                            "cooldown_seconds": self.config.reconnect_cooldown_seconds,
+                        },
+                    )
+                    return
 
-        self.logger.warning(
-            "Reconnecting liquidation feed",
-            extra={"exchange": self.exchange_name},
-        )
+            self._last_reconnect_at = now
 
-        await self._disconnect()
-        await self._connect()
+            self.logger.warning(
+                "Reconnecting liquidation feed",
+                extra={"exchange": self.exchange_name},
+            )
 
-    # ---------------------------------------------------------------------
+            await self._disconnect()
+            await self._connect()
+
+    # ------------------------------------------------------------------
     # Main consumer loop
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def _consume_loop(self) -> None:
         self.logger.info(
@@ -339,6 +419,18 @@ class LiquidationStream:
 
                 self._processed_messages += 1
                 self._last_message_at = utc_now()
+
+                if not isinstance(payload, dict):
+                    self._dropped_invalid += 1
+                    self.metrics.observe_invalid_event(exchange=self.exchange_name)
+                    self.logger.debug(
+                        "Non-dict liquidation payload dropped",
+                        extra={
+                            "exchange": self.exchange_name,
+                            "payload_type": type(payload).__name__,
+                        },
+                    )
+                    continue
 
                 await self.handle_raw_message(payload)
 
@@ -364,11 +456,14 @@ class LiquidationStream:
             extra={"exchange": self.exchange_name},
         )
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Raw payload handling
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    async def handle_raw_message(self, payload: dict[str, Any]) -> LiquidationEvent | None:
+    async def handle_raw_message(
+        self,
+        payload: dict[str, Any],
+    ) -> LiquidationEvent | None:
         """
         Приймає raw payload, дедуплікує, нормалізує, оновлює state/metrics
         і публікує EventBus події.
@@ -429,7 +524,6 @@ class LiquidationStream:
                 is_stale=True,
                 is_large=is_large,
             )
-
             self.logger.debug(
                 "Stale liquidation event dropped",
                 extra={
@@ -467,7 +561,7 @@ class LiquidationStream:
                 "price": str(event.price),
                 "quantity": str(event.quantity),
                 "notional_usd": str(event.notional_usd),
-                "buffered_events": symbol_state.total_buffered_events,
+                "buffered_events": getattr(symbol_state, "total_buffered_events", None),
             },
         )
 
@@ -482,8 +576,18 @@ class LiquidationStream:
         """
         Нормалізує raw exchange payload у LiquidationEvent.
 
-        Exchange-specific parsing бажано поступово переносити в exchange adapter,
-        але stream лишається tolerant до різних payload-структур.
+        Підтримує flat payload та nested payload-и типу Binance forceOrder:
+        {
+            "e": "forceOrder",
+            "E": 123456789,
+            "o": {
+                "s": "BTCUSDT",
+                "S": "SELL",
+                "p": "65000",
+                "q": "0.1",
+                "T": 123456789
+            }
+        }
         """
         try:
             exchange = self._extract_exchange(payload)
@@ -498,10 +602,17 @@ class LiquidationStream:
             )
             timestamp = self._extract_timestamp(payload)
 
-            if not exchange or not symbol or price <= 0 or quantity <= 0 or notional_usd <= 0:
+            if (
+                not exchange
+                or not symbol
+                or not side.is_known
+                or price <= 0
+                or quantity <= 0
+                or notional_usd <= 0
+            ):
                 return None
 
-            event = LiquidationEvent(
+            return LiquidationEvent(
                 exchange=exchange,
                 symbol=symbol,
                 side=side,
@@ -517,14 +628,12 @@ class LiquidationStream:
                 source=self.service_name,
                 raw_payload_hash=raw_payload_hash,
                 metadata={
-                    "raw_type": payload.get("type"),
-                    "raw_event": payload.get("event"),
-                    "source_payload_keys": sorted(payload.keys()),
+                    "raw_type": payload.get("type") or payload.get("e"),
+                    "raw_event": payload.get("event") or payload.get("e"),
+                    "source_payload_keys": sorted(str(key) for key in payload.keys()),
                     "exchange_adapter": self.exchange_name,
                 },
             )
-
-            return event
 
         except Exception as exc:
             self._last_error = repr(exc)
@@ -540,9 +649,9 @@ class LiquidationStream:
             )
             return None
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Event publishing
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     async def publish_event(self, event: LiquidationEvent) -> bool:
         accepted = await self.event_bus.emit(
@@ -611,10 +720,7 @@ class LiquidationStream:
 
         return accepted
 
-    async def emit_runtime_snapshot(
-        self,
-        topic: str | None = None,
-    ) -> bool:
+    async def emit_runtime_snapshot(self, topic: str | None = None) -> bool:
         snapshot = {
             "service": self.service_name,
             "exchange": self.exchange_name,
@@ -660,27 +766,44 @@ class LiquidationStream:
 
         return accepted
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Extraction helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+
+    def _nested_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        nested = payload.get("o") or payload.get("order") or payload.get("data") or {}
+        return nested if isinstance(nested, dict) else {}
+
+    def _pick(self, payload: dict[str, Any], *keys: str) -> Any:
+        nested_order = self._nested_order(payload)
+
+        for key in keys:
+            if key in payload and payload[key] not in (None, ""):
+                return payload[key]
+
+        for key in keys:
+            if key in nested_order and nested_order[key] not in (None, ""):
+                return nested_order[key]
+
+        return None
 
     def _extract_exchange(self, payload: dict[str, Any]) -> str:
         value = (
-            payload.get("exchange")
-            or payload.get("ex")
+            self._pick(payload, "exchange", "ex", "exchangeName")
             or getattr(self.exchange_adapter, "name", None)
             or "unknown"
         )
         return str(value).strip().lower()
 
     def _extract_symbol(self, payload: dict[str, Any]) -> str:
-        raw_symbol = (
-            payload.get("symbol")
-            or payload.get("s")
-            or payload.get("market")
-            or payload.get("instrument")
-            or payload.get("instId")
-            or payload.get("pair")
+        raw_symbol = self._pick(
+            payload,
+            "symbol",
+            "s",
+            "market",
+            "instrument",
+            "instId",
+            "pair",
         )
 
         if raw_symbol is None:
@@ -689,49 +812,40 @@ class LiquidationStream:
         return normalize_symbol(str(raw_symbol))
 
     def _extract_side(self, payload: dict[str, Any]) -> LiquidationSide:
-        nested_order = payload.get("o") or payload.get("order") or {}
-
-        raw_side = (
-            payload.get("side")
-            or payload.get("S")
-            or payload.get("positionSide")
-            or payload.get("liquidation_side")
-            or payload.get("direction")
-            or nested_order.get("side")
-            or nested_order.get("S")
-            or nested_order.get("positionSide")
+        raw_side = self._pick(
+            payload,
+            "side",
+            "S",
+            "positionSide",
+            "liquidation_side",
+            "liquidationSide",
+            "direction",
         )
-
         return LiquidationSide.from_raw(raw_side)
 
     def _extract_price(self, payload: dict[str, Any]) -> Decimal:
-        nested_order = payload.get("o") or payload.get("order") or {}
-
-        value = (
-            payload.get("price")
-            or payload.get("p")
-            or payload.get("ap")
-            or payload.get("fillPrice")
-            or payload.get("avgPrice")
-            or nested_order.get("price")
-            or nested_order.get("p")
-            or nested_order.get("ap")
+        value = self._pick(
+            payload,
+            "price",
+            "p",
+            "ap",
+            "fillPrice",
+            "avgPrice",
+            "averagePrice",
+            "px",
         )
         return safe_decimal(value)
 
     def _extract_quantity(self, payload: dict[str, Any]) -> Decimal:
-        nested_order = payload.get("o") or payload.get("order") or {}
-
-        value = (
-            payload.get("quantity")
-            or payload.get("qty")
-            or payload.get("q")
-            or payload.get("size")
-            or payload.get("amount")
-            or nested_order.get("quantity")
-            or nested_order.get("qty")
-            or nested_order.get("q")
-            or nested_order.get("size")
+        value = self._pick(
+            payload,
+            "quantity",
+            "qty",
+            "q",
+            "size",
+            "amount",
+            "volume",
+            "sz",
         )
         return safe_decimal(value)
 
@@ -742,15 +856,14 @@ class LiquidationStream:
         price: Decimal,
         quantity: Decimal,
     ) -> Decimal:
-        nested_order = payload.get("o") or payload.get("order") or {}
-
-        value = (
-            payload.get("notional_usd")
-            or payload.get("notional")
-            or payload.get("usdValue")
-            or payload.get("value")
-            or nested_order.get("notional")
-            or nested_order.get("value")
+        value = self._pick(
+            payload,
+            "notional_usd",
+            "notionalUsd",
+            "notional",
+            "usdValue",
+            "value",
+            "v",
         )
 
         notional = safe_decimal(value)
@@ -763,18 +876,15 @@ class LiquidationStream:
         return Decimal("0")
 
     def _extract_timestamp(self, payload: dict[str, Any]) -> datetime:
-        nested_order = payload.get("o") or payload.get("order") or {}
-
-        raw_ts = (
-            payload.get("timestamp")
-            or payload.get("ts")
-            or payload.get("T")
-            or payload.get("time")
-            or payload.get("updatedAt")
-            or nested_order.get("timestamp")
-            or nested_order.get("ts")
-            or nested_order.get("T")
-            or nested_order.get("time")
+        raw_ts = self._pick(
+            payload,
+            "timestamp",
+            "ts",
+            "T",
+            "E",
+            "time",
+            "updatedAt",
+            "createdAt",
         )
 
         if raw_ts is None:
@@ -784,70 +894,73 @@ class LiquidationStream:
             return ensure_utc(raw_ts)
 
         if isinstance(raw_ts, (int, float)):
-            if raw_ts > 10_000_000_000:
-                return datetime.fromtimestamp(raw_ts / 1000.0, tz=timezone.utc)
-            return datetime.fromtimestamp(raw_ts, tz=timezone.utc)
+            return self._timestamp_from_number(float(raw_ts))
 
         raw_ts_str = str(raw_ts).strip()
 
         if raw_ts_str.isdigit():
-            ts_int = int(raw_ts_str)
-            if ts_int > 10_000_000_000:
-                return datetime.fromtimestamp(ts_int / 1000.0, tz=timezone.utc)
-            return datetime.fromtimestamp(ts_int, tz=timezone.utc)
+            return self._timestamp_from_number(float(raw_ts_str))
 
         try:
             return ensure_utc(datetime.fromisoformat(raw_ts_str.replace("Z", "+00:00")))
         except Exception:
             return utc_now()
 
-    def _extract_trade_id(self, payload: dict[str, Any]) -> str | None:
-        nested_order = payload.get("o") or payload.get("order") or {}
+    def _timestamp_from_number(self, value: float) -> datetime:
+        if value > 10_000_000_000_000:
+            return datetime.fromtimestamp(value / 1_000_000.0, tz=timezone.utc)
 
-        value = (
-            payload.get("trade_id")
-            or payload.get("tradeId")
-            or payload.get("t")
-            or nested_order.get("trade_id")
-            or nested_order.get("tradeId")
-            or nested_order.get("t")
+        if value > 10_000_000_000:
+            return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
+
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+
+    def _extract_trade_id(self, payload: dict[str, Any]) -> str | None:
+        value = self._pick(
+            payload,
+            "trade_id",
+            "tradeId",
+            "t",
+            "execId",
+            "executionId",
         )
         return str(value) if value is not None else None
 
     def _extract_order_id(self, payload: dict[str, Any]) -> str | None:
-        nested_order = payload.get("o") or payload.get("order") or {}
-
-        value = (
-            payload.get("order_id")
-            or payload.get("orderId")
-            or payload.get("i")
-            or nested_order.get("order_id")
-            or nested_order.get("orderId")
-            or nested_order.get("i")
+        value = self._pick(
+            payload,
+            "order_id",
+            "orderId",
+            "i",
+            "ordId",
+            "orderLinkId",
         )
         return str(value) if value is not None else None
 
     def _extract_event_id(self, payload: dict[str, Any]) -> str | None:
-        value = (
-            payload.get("event_id")
-            or payload.get("eventId")
-            or payload.get("e")
-            or payload.get("id")
+        value = self._pick(
+            payload,
+            "event_id",
+            "eventId",
+            "e",
+            "id",
+            "messageId",
         )
         return str(value) if value is not None else None
 
     def _extract_correlation_id(self, payload: dict[str, Any]) -> str | None:
-        value = (
-            payload.get("correlation_id")
-            or payload.get("correlationId")
-            or payload.get("trace_id")
-            or payload.get("traceId")
+        value = self._pick(
+            payload,
+            "correlation_id",
+            "correlationId",
+            "trace_id",
+            "traceId",
         )
         return str(value) if value is not None else None
 
-    # ---------------------------------------------------------------------
-    # Feature / query methods
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Query methods
+    # ------------------------------------------------------------------
 
     def get_recent_events(
         self,
@@ -861,7 +974,7 @@ class LiquidationStream:
             exchange=exchange,
             symbol=symbol,
             side=side,
-            limit=limit,
+            limit=max(0, limit),
         )
 
     def get_recent_large_events(
@@ -878,7 +991,7 @@ class LiquidationStream:
         result: list[LiquidationEvent] = []
 
         for event in reversed(self._recent_large_events):
-            if target_symbol and event.symbol != target_symbol:
+            if target_symbol and event.normalized_symbol != target_symbol:
                 continue
             if side is not None and event.side is not side:
                 continue
@@ -907,7 +1020,10 @@ class LiquidationStream:
             "total_exchanges": len(snapshots),
         }
 
-    def get_top_symbols_by_liquidation_flow(self, limit: int = 10) -> list[dict[str, Any]]:
+    def get_top_symbols_by_liquidation_flow(
+        self,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
 
         for symbol_state in self.state.symbols.values():
@@ -935,15 +1051,16 @@ class LiquidationStream:
         exchange: str | None = None,
     ) -> int:
         normalized_symbol = normalize_symbol(symbol)
-        removed = 0
+        normalized_exchange = exchange.strip().lower() if exchange else None
 
+        removed = 0
         keys_to_remove: list[tuple[str, str]] = []
 
-        for (state_exchange, state_symbol), symbol_state in self.state.symbols.items():
+        for (state_exchange, state_symbol), symbol_state in list(self.state.symbols.items()):
             if state_symbol != normalized_symbol:
                 continue
 
-            if exchange is not None and state_exchange != exchange.strip().lower():
+            if normalized_exchange is not None and state_exchange != normalized_exchange:
                 continue
 
             symbol_state.clear()
@@ -957,7 +1074,7 @@ class LiquidationStream:
             "Flushed liquidation state for symbol",
             extra={
                 "symbol": normalized_symbol,
-                "exchange": exchange,
+                "exchange": normalized_exchange,
                 "removed_states": removed,
             },
         )
@@ -975,7 +1092,7 @@ class LiquidationStream:
         events = self.get_recent_events(
             symbol=symbol,
             exchange=exchange,
-            limit=limit,
+            limit=max(0, limit),
         )
 
         published = 0
@@ -1003,9 +1120,9 @@ class LiquidationStream:
 
         return published
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Health / stats
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def estimate_ingestion_health(self) -> dict[str, Any]:
         now = utc_now()
@@ -1041,7 +1158,11 @@ class LiquidationStream:
             "seconds_since_last_message": seconds_since_last_message,
             "seconds_since_last_event": seconds_since_last_event,
             "last_error": self._last_error,
-            "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
+            "last_error_at": (
+                self._last_error_at.isoformat()
+                if self._last_error_at
+                else None
+            ),
             "last_reconnect_at": (
                 self._last_reconnect_at.isoformat()
                 if self._last_reconnect_at
@@ -1062,6 +1183,7 @@ class LiquidationStream:
             "running": self._running,
             "registered": self._registered,
             "connected": self._connected,
+            "closed": self._closed,
             "symbols": list(self.config.symbols),
             "uptime_seconds": uptime_seconds,
             "processed_messages": self._processed_messages,
@@ -1085,7 +1207,11 @@ class LiquidationStream:
                 else None
             ),
             "last_error": self._last_error,
-            "last_error_at": self._last_error_at.isoformat() if self._last_error_at else None,
+            "last_error_at": (
+                self._last_error_at.isoformat()
+                if self._last_error_at
+                else None
+            ),
             "tracked_symbols": self.state.symbols_count,
             "state_total_buffered_events": self.state.total_buffered_events,
             "state_total_events_seen": self.state.total_events_seen,
@@ -1098,9 +1224,9 @@ class LiquidationStream:
     def get_health(self) -> dict[str, Any]:
         return self.estimate_ingestion_health()
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Scheduler jobs
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _register_scheduler_jobs(self) -> None:
         if self.scheduler is None:
@@ -1145,6 +1271,39 @@ class LiquidationStream:
                 enabled=True,
             )
 
+    async def _remove_scheduler_jobs(self) -> None:
+        if self.scheduler is None:
+            self._healthcheck_job_id = None
+            self._snapshot_job_id = None
+            self._cleanup_job_id = None
+            return
+
+        for job_id in (
+            self._healthcheck_job_id,
+            self._snapshot_job_id,
+            self._cleanup_job_id,
+        ):
+            if job_id is None:
+                continue
+
+            try:
+                result = self.scheduler.remove_job(job_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to remove LiquidationStream scheduler job",
+                    extra={
+                        "exchange": self.exchange_name,
+                        "job_id": job_id,
+                        "error": repr(exc),
+                    },
+                )
+
+        self._healthcheck_job_id = None
+        self._snapshot_job_id = None
+        self._cleanup_job_id = None
+
     async def _scheduled_healthcheck(self) -> None:
         health = self.estimate_ingestion_health()
         await self.emit_health()
@@ -1188,22 +1347,31 @@ class LiquidationStream:
                 },
             )
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Dedup helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _make_payload_fingerprint(self, payload: dict[str, Any]) -> str:
-        nested_order = payload.get("o") or payload.get("order") or {}
+        """
+        Stable fingerprint for deduplication.
 
+        Важливо: враховує як flat payload, так і nested order payload.
+        """
         stable_parts = [
-            str(payload.get("exchange") or self.exchange_name),
-            str(payload.get("symbol") or payload.get("s") or payload.get("instId") or ""),
-            str(payload.get("side") or payload.get("S") or nested_order.get("side") or ""),
-            str(payload.get("price") or payload.get("p") or payload.get("ap") or ""),
-            str(payload.get("quantity") or payload.get("qty") or payload.get("q") or ""),
-            str(payload.get("timestamp") or payload.get("ts") or payload.get("T") or ""),
-            str(payload.get("tradeId") or payload.get("t") or nested_order.get("tradeId") or ""),
-            str(payload.get("orderId") or payload.get("i") or nested_order.get("orderId") or ""),
+            str(self._extract_exchange(payload)),
+            str(self._extract_symbol(payload)),
+            str(self._extract_side(payload).value),
+            str(self._extract_price(payload)),
+            str(self._extract_quantity(payload)),
+            str(self._extract_notional(
+                payload,
+                price=self._extract_price(payload),
+                quantity=self._extract_quantity(payload),
+            )),
+            str(self._extract_timestamp(payload).timestamp()),
+            str(self._extract_trade_id(payload) or ""),
+            str(self._extract_order_id(payload) or ""),
+            str(self._extract_event_id(payload) or ""),
         ]
 
         raw = "|".join(stable_parts)
@@ -1220,9 +1388,9 @@ class LiquidationStream:
         self._recent_payload_fingerprints.append(fingerprint)
         self._recent_payload_fingerprint_set.add(fingerprint)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Properties / internals
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     @property
     def exchange_name(self) -> str:
@@ -1236,7 +1404,15 @@ class LiquidationStream:
     def is_connected(self) -> bool:
         return self._connected
 
-    def _safe_payload_preview(self, payload: dict[str, Any], max_len: int = 1000) -> str:
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def _safe_payload_preview(
+        self,
+        payload: dict[str, Any],
+        max_len: int = 1000,
+    ) -> str:
         text = repr(payload)
         if len(text) <= max_len:
             return text
