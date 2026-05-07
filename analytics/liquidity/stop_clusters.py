@@ -2,19 +2,35 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Sequence, cast
+from typing import Any, Sequence
 
 from core.logger import get_logger
 
 from .config import LiquidityConfig
-from .enums import LiquidityLevelType, LiquiditySide, SweepStatus
+from .enums import LiquidityLevelType, LiquiditySide
 from .models import EqualLevel, LiquidityLevel, StopCluster
 from .scoring import LiquidityScorer
-from .utils import clamp, merge_price_ranges, midpoint, pct_distance
+from .utils import (
+    clamp,
+    get_candle_close,
+    get_candle_high,
+    get_candle_low,
+    get_candle_volume,
+    get_first_value,
+    merge_price_ranges,
+    midpoint,
+    pct_distance,
+    safe_float,
+    safe_mean,
+)
 
 
 @dataclass(slots=True)
 class OrderbookLevel:
+    """
+    Нормалізований orderbook level для stop-cluster enhancement.
+    """
+
     price: float
     size: float
     side: str  # "bid" | "ask"
@@ -23,15 +39,21 @@ class OrderbookLevel:
 @dataclass(slots=True)
 class StopClusterCandidate:
     """
-    Внутрішня модель для формування stop cluster.
+    Внутрішня модель-кандидат для формування StopCluster.
+
+    Це не публічна модель і не event payload.
+    Використовується тільки всередині StopClustersDetector.
     """
 
     symbol: str
     timeframe: str
     side: LiquiditySide
+
     low_price: float
     high_price: float
+
     source_levels: list[LiquidityLevel] = field(default_factory=list)
+
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -41,6 +63,16 @@ class StopClusterCandidate:
     time_decay_factor: float = 1.0
     partial_sweep_factor: float = 1.0
 
+    def __post_init__(self) -> None:
+        if self.low_price > self.high_price:
+            self.low_price, self.high_price = self.high_price, self.low_price
+
+        self.volume_score = clamp(self.volume_score, 0.0, 1.0)
+        self.orderbook_score = clamp(self.orderbook_score, 0.0, 1.0)
+        self.compression_score = clamp(self.compression_score, 0.0, 1.0)
+        self.time_decay_factor = clamp(self.time_decay_factor, 0.0, 1.0)
+        self.partial_sweep_factor = clamp(self.partial_sweep_factor, 0.0, 1.0)
+
     @property
     def center_price(self) -> float:
         return midpoint(self.low_price, self.high_price)
@@ -48,31 +80,52 @@ class StopClusterCandidate:
     def width(self) -> float:
         return max(0.0, self.high_price - self.low_price)
 
+    def overlaps(self, other: "StopClusterCandidate") -> bool:
+        return not (
+            self.high_price < other.low_price
+            or other.high_price < self.low_price
+        )
+
 
 class StopClustersDetector:
     """
-    Детектор stop clusters.
+    Production-ready detector stop/liquidity clusters.
 
-    Підтримує:
-    - partial sweep awareness
-    - volume-aware density
-    - orderbook-aware enhancement
-    - range compression factor
-    - time decay
+    Відповідальність:
+    - перетворити liquidity levels у stop-cluster candidates;
+    - врахувати partial sweep;
+    - підсилити density через volume/orderbook/compression;
+    - застосувати time decay;
+    - merge/deduplicate candidates;
+    - повернути scored StopCluster.
+
+    Архітектурні правила:
+    - не приймає EventBus;
+    - не приймає Scheduler;
+    - не публікує події;
+    - не керує lifecycle;
+    - використовується LiquidityMap як чистий domain detector.
     """
 
     def __init__(
         self,
         config: LiquidityConfig,
         scorer: LiquidityScorer | None = None,
-        event_bus: Any | None = None,
     ) -> None:
         self._config = config
         self._config.validate()
 
         self._scorer = scorer or LiquidityScorer(config=config)
-        self._event_bus = event_bus
-        self._logger = get_logger(__name__, service_name="liquidity")
+
+        self._logger = get_logger(
+            __name__,
+            service_name="analytics_liquidity",
+            event_type="stop_clusters_detector",
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def detect_from_levels(
         self,
@@ -83,32 +136,73 @@ class StopClustersDetector:
         candles: Sequence[Any] | None = None,
         orderbook: dict[str, Sequence[Any]] | None = None,
     ) -> list[StopCluster]:
-        if not levels:
+        """
+        Будує stop clusters з liquidity levels.
+
+        Parameters
+        ----------
+        symbol:
+            Торговий символ.
+        timeframe:
+            Таймфрейм.
+        levels:
+            LiquidityLevel / EqualLevel / external liquidity levels.
+        current_price:
+            Поточна ціна для proximity scoring.
+        candles:
+            Опціональні candles для volume/compression enhancement.
+        orderbook:
+            Опціональний orderbook для wall/size enhancement.
+
+        Returns
+        -------
+        list[StopCluster]
+            Scored, merged і deduplicated stop clusters.
+        """
+        if not self._config.enabled:
+            self._logger.debug(
+                "Stop cluster detection skipped: liquidity module disabled",
+                extra={"symbol": symbol, "timeframe": timeframe},
+            )
+            return []
+
+        if not symbol or not timeframe:
+            raise ValueError("symbol and timeframe are required")
+
+        current_price = safe_float(current_price)
+        if current_price <= 0:
+            raise ValueError("current_price must be > 0")
+
+        levels_list = list(levels)
+        if not levels_list:
             return []
 
         candidates = self._build_candidates(
             symbol=symbol,
             timeframe=timeframe,
-            levels=levels,
-            candles=candles,
+            levels=levels_list,
+            candles=list(candles or []),
             orderbook=orderbook,
         )
+
         if not candidates:
             return []
 
         merged_candidates = self._merge_candidates(candidates)
+
         clusters = self._build_clusters(
             candidates=merged_candidates,
             current_price=current_price,
         )
-        clusters.sort(key=lambda c: c.center_price)
+
+        clusters.sort(key=lambda cluster: (cluster.side.value, cluster.center_price))
 
         self._logger.info(
             "Stop clusters detected",
             extra={
                 "symbol": symbol,
                 "timeframe": timeframe,
-                "input_levels": len(levels),
+                "input_levels": len(levels_list),
                 "candidates": len(candidates),
                 "merged_candidates": len(merged_candidates),
                 "clusters": len(clusters),
@@ -126,10 +220,13 @@ class StopClustersDetector:
         candles: Sequence[Any] | None = None,
         orderbook: dict[str, Sequence[Any]] | None = None,
     ) -> list[StopCluster]:
+        """
+        Зручний wrapper для EqualLevel sequence.
+        """
         return self.detect_from_levels(
             symbol=symbol,
             timeframe=timeframe,
-            levels=equal_levels,
+            levels=list(equal_levels),
             current_price=current_price,
             candles=candles,
             orderbook=orderbook,
@@ -139,6 +236,11 @@ class StopClustersDetector:
         self,
         levels: Sequence[LiquidityLevel],
     ) -> list[tuple[float, float]]:
+        """
+        Повертає сирі price zones без scoring.
+
+        Корисно для dashboard/debug/strategy pre-filter.
+        """
         ranges: list[tuple[float, float]] = []
 
         for level in levels:
@@ -147,6 +249,7 @@ class StopClustersDetector:
                 timeframe=level.timeframe,
                 level=level,
             )
+
             if candidate is None:
                 continue
 
@@ -157,18 +260,22 @@ class StopClustersDetector:
             merge_distance_pct=self._config.cluster_merge_distance_pct,
         )
 
+    # ------------------------------------------------------------------
+    # Candidate building
+    # ------------------------------------------------------------------
+
     def _build_candidates(
         self,
         symbol: str,
         timeframe: str,
         levels: Sequence[LiquidityLevel],
-        candles: Sequence[Any] | None,
+        candles: Sequence[Any],
         orderbook: dict[str, Sequence[Any]] | None,
     ) -> list[StopClusterCandidate]:
         candidates: list[StopClusterCandidate] = []
 
         for level in levels:
-            if not level.is_active() and level.sweep_status != SweepStatus.PARTIALLY_SWEPT:
+            if not self._should_use_level(level):
                 continue
 
             candidate = self._level_to_candidate(
@@ -176,28 +283,60 @@ class StopClustersDetector:
                 timeframe=timeframe,
                 level=level,
             )
+
             if candidate is None:
                 continue
 
             candidate.partial_sweep_factor = self._calculate_partial_sweep_factor(level)
-            candidate.volume_score = self._calculate_volume_score(
-                level=level,
-                candles=candles,
-            )
-            candidate.orderbook_score = self._calculate_orderbook_score(
-                candidate=candidate,
-                orderbook=orderbook,
-            )
-            candidate.compression_score = self._calculate_compression_score(
-                level=level,
-                candles=candles,
-            )
-            candidate.time_decay_factor = self._calculate_time_decay_factor(level)
 
-            candidate = self._apply_candidate_adjustments(candidate)
-            candidates.append(candidate)
+            if self._config.use_volume_in_scoring:
+                candidate.volume_score = self._calculate_volume_score(
+                    level=level,
+                    candles=candles,
+                )
+
+            if self._config.use_orderbook_in_stop_clusters:
+                candidate.orderbook_score = self._calculate_orderbook_score(
+                    candidate=candidate,
+                    orderbook=orderbook,
+                )
+
+            if self._config.use_reaction_strength_in_scoring:
+                candidate.compression_score = self._calculate_compression_score(
+                    level=level,
+                    candles=candles,
+                )
+
+            if self._config.use_time_decay:
+                candidate.time_decay_factor = self._calculate_time_decay_factor(level)
+
+            candidates.append(self._apply_candidate_adjustments(candidate))
 
         return candidates
+
+    def _should_use_level(self, level: LiquidityLevel) -> bool:
+        """
+        Вирішує, чи можна використовувати рівень як source для stop cluster.
+        """
+        if level.price <= 0:
+            return False
+
+        if level.is_swept():
+            return False
+
+        if not level.is_active() and not level.is_partially_swept():
+            return False
+
+        return level.level_type in {
+            LiquidityLevelType.EQUAL_HIGHS,
+            LiquidityLevelType.EQUAL_LOWS,
+            LiquidityLevelType.SWING_HIGH,
+            LiquidityLevelType.SWING_LOW,
+            LiquidityLevelType.RANGE_HIGH,
+            LiquidityLevelType.RANGE_LOW,
+            LiquidityLevelType.ORDERBOOK_WALL,
+            LiquidityLevelType.LIQUIDATION_ZONE,
+        }
 
     def _level_to_candidate(
         self,
@@ -207,37 +346,44 @@ class StopClustersDetector:
     ) -> StopClusterCandidate | None:
         padding_pct = self._resolve_padding_pct(level)
 
-        if level.level_type in {
-            LiquidityLevelType.EQUAL_HIGHS,
-            LiquidityLevelType.SWING_HIGH,
-            LiquidityLevelType.RANGE_HIGH,
-        }:
+        side = self._resolve_candidate_side(level)
+        if side == LiquiditySide.UNKNOWN:
+            return None
+
+        if side == LiquiditySide.BUY_SIDE:
             low_price = level.price
             high_price = level.price * (1.0 + padding_pct)
-            side = LiquiditySide.BUY_SIDE
 
-        elif level.level_type in {
-            LiquidityLevelType.EQUAL_LOWS,
-            LiquidityLevelType.SWING_LOW,
-            LiquidityLevelType.RANGE_LOW,
-        }:
+        elif side == LiquiditySide.SELL_SIDE:
             low_price = level.price * (1.0 - padding_pct)
             high_price = level.price
-            side = LiquiditySide.SELL_SIDE
 
         else:
-            return None
+            low_price = level.price * (1.0 - padding_pct)
+            high_price = level.price * (1.0 + padding_pct)
 
         return StopClusterCandidate(
             symbol=symbol,
             timeframe=timeframe,
             side=side,
-            low_price=min(low_price, high_price),
-            high_price=max(low_price, high_price),
+            low_price=low_price,
+            high_price=high_price,
             source_levels=[level],
-            created_at=level.first_seen_at,
-            updated_at=level.last_seen_at,
+            created_at=self._normalize_timestamp(level.first_seen_at),
+            updated_at=self._normalize_timestamp(level.last_seen_at),
         )
+
+    def _resolve_candidate_side(self, level: LiquidityLevel) -> LiquiditySide:
+        if level.side in {
+            LiquiditySide.BUY_SIDE,
+            LiquiditySide.SELL_SIDE,
+            LiquiditySide.BOTH,
+        }:
+            if level.side == LiquiditySide.BOTH:
+                return level.level_type.infer_side()
+            return level.side
+
+        return level.level_type.infer_side()
 
     def _resolve_padding_pct(self, level: LiquidityLevel) -> float:
         base_padding = self._config.stop_cluster_padding_pct
@@ -246,56 +392,83 @@ class StopClustersDetector:
         scale = 0.75 + 0.50 * confidence
         padding = base_padding * scale
 
+        if level.is_partially_swept():
+            padding *= 1.15
+
         return max(padding, base_padding * 0.5)
 
+    # ------------------------------------------------------------------
+    # Candidate enhancement
+    # ------------------------------------------------------------------
+
     def _calculate_partial_sweep_factor(self, level: LiquidityLevel) -> float:
-        if level.sweep_status == SweepStatus.PARTIALLY_SWEPT:
-            return 0.82
-        if level.sweep_status == SweepStatus.SWEPT:
+        if not self._config.use_partial_sweep_penalty:
+            return 1.0
+
+        if level.is_swept():
             return 0.45
+
+        if level.is_partially_swept():
+            return 0.82
+
         return 1.0
 
     def _calculate_volume_score(
         self,
         level: LiquidityLevel,
-        candles: Sequence[Any] | None,
+        candles: Sequence[Any],
     ) -> float:
-        if not candles or len(candles) < 5:
+        if len(candles) < 5:
             return 0.0
 
-        tolerance_raw = level.metadata.get("tolerance_pct", 0.0)
-        tolerance_value = self._safe_float(tolerance_raw, default=0.0)
+        tolerance_value = safe_float(
+            level.metadata.get("tolerance_pct"),
+            default=self._config.equal_level_tolerance_pct,
+        )
 
-        window = self._find_candles_near_level(
+        tolerance_pct = max(
+            tolerance_value,
+            self._config.equal_level_tolerance_pct,
+        ) * 2.0
+
+        nearby_candles = self._find_candles_near_level(
             candles=candles,
             level_price=level.price,
-            tolerance_pct=max(tolerance_value, self._config.equal_level_tolerance_pct) * 2.0,
+            tolerance_pct=tolerance_pct,
         )
-        if not window:
+
+        if not nearby_candles:
             return 0.0
 
-        near_volumes: list[float] = []
-        for candle in window:
-            volume = self._get_candle_volume(candle)
-            if volume is not None:
-                near_volumes.append(volume)
+        near_volumes = [
+            volume
+            for volume in (
+                safe_float(get_candle_volume(candle), default=0.0)
+                for candle in nearby_candles
+            )
+            if volume > 0
+        ]
 
-        all_volumes: list[float] = []
-        for candle in candles:
-            volume = self._get_candle_volume(candle)
-            if volume is not None:
-                all_volumes.append(volume)
+        all_volumes = [
+            volume
+            for volume in (
+                safe_float(get_candle_volume(candle), default=0.0)
+                for candle in candles
+            )
+            if volume > 0
+        ]
 
         if not near_volumes or not all_volumes:
             return 0.0
 
-        avg_near = sum(near_volumes) / len(near_volumes)
-        avg_all = sum(all_volumes) / len(all_volumes)
+        avg_near = safe_mean(near_volumes)
+        avg_all = safe_mean(all_volumes)
+
         if avg_all <= 0:
             return 0.0
 
-        ratio = avg_near / avg_all
-        return clamp((ratio - 1.0) / 1.5, 0.0, 1.0)
+        volume_ratio = avg_near / avg_all
+        return clamp((volume_ratio - 1.0) / 1.5, 0.0, 1.0)
 
     def _calculate_orderbook_score(
         self,
@@ -306,25 +479,36 @@ class StopClustersDetector:
             return 0.0
 
         if candidate.side == LiquiditySide.BUY_SIDE:
-            relevant_levels = self._parse_orderbook_levels(orderbook.get("asks", []), side="ask")
+            relevant_levels = self._parse_orderbook_levels(
+                orderbook.get("asks", []),
+                side="ask",
+            )
+        elif candidate.side == LiquiditySide.SELL_SIDE:
+            relevant_levels = self._parse_orderbook_levels(
+                orderbook.get("bids", []),
+                side="bid",
+            )
         else:
-            relevant_levels = self._parse_orderbook_levels(orderbook.get("bids", []), side="bid")
+            relevant_levels = [
+                *self._parse_orderbook_levels(orderbook.get("bids", []), side="bid"),
+                *self._parse_orderbook_levels(orderbook.get("asks", []), side="ask"),
+            ]
 
         if not relevant_levels:
             return 0.0
 
-        nearby_sizes: list[float] = []
-        all_sizes: list[float] = []
+        all_sizes = [level.size for level in relevant_levels if level.size > 0]
+        nearby_sizes = [
+            level.size
+            for level in relevant_levels
+            if level.size > 0
+            and candidate.low_price <= level.price <= candidate.high_price
+        ]
 
-        for level in relevant_levels:
-            all_sizes.append(level.size)
-            if candidate.low_price <= level.price <= candidate.high_price:
-                nearby_sizes.append(level.size)
-
-        if not nearby_sizes or not all_sizes:
+        if not all_sizes or not nearby_sizes:
             return 0.0
 
-        avg_all = sum(all_sizes) / len(all_sizes)
+        avg_all = safe_mean(all_sizes)
         max_nearby = max(nearby_sizes)
 
         if avg_all <= 0:
@@ -336,43 +520,51 @@ class StopClustersDetector:
     def _calculate_compression_score(
         self,
         level: LiquidityLevel,
-        candles: Sequence[Any] | None,
+        candles: Sequence[Any],
     ) -> float:
-        if not candles or len(candles) < 10:
+        if len(candles) < 10:
             return 0.0
 
-        pivot_indexes = self._extract_int_list(level.metadata.get("pivot_indexes"))
+        pivot_indexes = self._extract_int_list(
+            level.metadata.get("pivot_indexes")
+        )
+
         if not pivot_indexes:
             return 0.0
 
-        last_idx = max(pivot_indexes)
-        if last_idx < 5:
+        last_index = max(pivot_indexes)
+        if last_index < 5:
             return 0.0
 
-        lookback_slice = candles[max(0, last_idx - 5):last_idx]
+        lookback_slice = candles[max(0, last_index - 5) : last_index]
+
         if len(lookback_slice) < 4:
             return 0.0
 
-        ranges: list[float] = []
-        for candle in lookback_slice:
-            high = self._get_candle_high(candle)
-            low = self._get_candle_low(candle)
-            close = self._get_candle_close(candle)
-            if close <= 0:
-                continue
-            ranges.append((high - low) / close)
+        ranges_pct: list[float] = []
 
-        if len(ranges) < 3:
+        for candle in lookback_slice:
+            high = get_candle_high(candle)
+            low = get_candle_low(candle)
+            close = get_candle_close(candle)
+
+            if close <= 0 or high < low:
+                continue
+
+            ranges_pct.append((high - low) / abs(close))
+
+        if len(ranges_pct) < 3:
             return 0.0
 
-        first_half = ranges[: len(ranges) // 2]
-        second_half = ranges[len(ranges) // 2 :]
+        midpoint_index = len(ranges_pct) // 2
+        first_half = ranges_pct[:midpoint_index]
+        second_half = ranges_pct[midpoint_index:]
 
         if not first_half or not second_half:
             return 0.0
 
-        avg_first = sum(first_half) / len(first_half)
-        avg_second = sum(second_half) / len(second_half)
+        avg_first = safe_mean(first_half)
+        avg_second = safe_mean(second_half)
 
         if avg_first <= 0:
             return 0.0
@@ -381,22 +573,23 @@ class StopClustersDetector:
         return clamp(compression_ratio, 0.0, 1.0)
 
     def _calculate_time_decay_factor(self, level: LiquidityLevel) -> float:
-        anchor = level.last_seen_at or level.first_seen_at
+        anchor = self._normalize_timestamp(level.last_seen_at or level.first_seen_at)
+
         if anchor is None:
             return 1.0
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        if anchor.tzinfo is not None:
-            anchor = anchor.astimezone(timezone.utc).replace(tzinfo=None)
-
+        now = datetime.now(timezone.utc)
         age_hours = max((now - anchor).total_seconds(), 0.0) / 3600.0
 
         if age_hours <= 6:
             return 1.0
+
         if age_hours <= 24:
             return 0.95
+
         if age_hours <= 72:
             return 0.88
+
         if age_hours <= 168:
             return 0.78
 
@@ -410,18 +603,24 @@ class StopClustersDetector:
         high_price = candidate.high_price
 
         if candidate.partial_sweep_factor < 1.0:
-            extra_width = candidate.width() * (1.0 - candidate.partial_sweep_factor) * 0.75
+            extra_width = candidate.width() * (
+                1.0 - candidate.partial_sweep_factor
+            ) * 0.75
+
             if candidate.side == LiquiditySide.BUY_SIDE:
                 high_price += extra_width
             elif candidate.side == LiquiditySide.SELL_SIDE:
                 low_price -= extra_width
+            else:
+                low_price -= extra_width
+                high_price += extra_width
 
         return StopClusterCandidate(
             symbol=candidate.symbol,
             timeframe=candidate.timeframe,
             side=candidate.side,
-            low_price=min(low_price, high_price),
-            high_price=max(low_price, high_price),
+            low_price=low_price,
+            high_price=high_price,
             source_levels=list(candidate.source_levels),
             created_at=candidate.created_at,
             updated_at=candidate.updated_at,
@@ -432,17 +631,30 @@ class StopClustersDetector:
             partial_sweep_factor=candidate.partial_sweep_factor,
         )
 
+    # ------------------------------------------------------------------
+    # Merge candidates
+    # ------------------------------------------------------------------
+
     def _merge_candidates(
         self,
         candidates: Sequence[StopClusterCandidate],
     ) -> list[StopClusterCandidate]:
-        buy_candidates = [c for c in candidates if c.side == LiquiditySide.BUY_SIDE]
-        sell_candidates = [c for c in candidates if c.side == LiquiditySide.SELL_SIDE]
+        grouped: dict[LiquiditySide, list[StopClusterCandidate]] = {
+            LiquiditySide.BUY_SIDE: [],
+            LiquiditySide.SELL_SIDE: [],
+            LiquiditySide.BOTH: [],
+            LiquiditySide.UNKNOWN: [],
+        }
 
-        merged_buy = self._merge_candidates_by_side(buy_candidates)
-        merged_sell = self._merge_candidates_by_side(sell_candidates)
+        for candidate in candidates:
+            grouped.setdefault(candidate.side, []).append(candidate)
 
-        return merged_buy + merged_sell
+        merged: list[StopClusterCandidate] = []
+
+        for side_candidates in grouped.values():
+            merged.extend(self._merge_candidates_by_side(side_candidates))
+
+        return merged
 
     def _merge_candidates_by_side(
         self,
@@ -451,7 +663,11 @@ class StopClustersDetector:
         if not candidates:
             return []
 
-        sorted_candidates = sorted(candidates, key=lambda c: c.low_price)
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda candidate: candidate.low_price,
+        )
+
         merged: list[StopClusterCandidate] = [sorted_candidates[0]]
 
         for candidate in sorted_candidates[1:]:
@@ -472,7 +688,7 @@ class StopClustersDetector:
         if left.side != right.side:
             return False
 
-        if right.low_price <= left.high_price:
+        if left.overlaps(right):
             return True
 
         gap = right.low_price - left.high_price
@@ -486,15 +702,9 @@ class StopClustersDetector:
         left: StopClusterCandidate,
         right: StopClusterCandidate,
     ) -> StopClusterCandidate:
-        created_at = left.created_at
-        if created_at is None or (right.created_at is not None and right.created_at < created_at):
-            created_at = right.created_at
-
-        updated_at = left.updated_at
-        if updated_at is None or (right.updated_at is not None and right.updated_at > updated_at):
-            updated_at = right.updated_at
-
-        merged_sources = [*left.source_levels, *right.source_levels]
+        source_levels = self._deduplicate_source_levels(
+            [*left.source_levels, *right.source_levels]
+        )
 
         return StopClusterCandidate(
             symbol=left.symbol,
@@ -502,15 +712,22 @@ class StopClustersDetector:
             side=left.side,
             low_price=min(left.low_price, right.low_price),
             high_price=max(left.high_price, right.high_price),
-            source_levels=merged_sources,
-            created_at=created_at,
-            updated_at=updated_at,
+            source_levels=source_levels,
+            created_at=self._min_datetime(left.created_at, right.created_at),
+            updated_at=self._max_datetime(left.updated_at, right.updated_at),
             volume_score=max(left.volume_score, right.volume_score),
             orderbook_score=max(left.orderbook_score, right.orderbook_score),
             compression_score=max(left.compression_score, right.compression_score),
             time_decay_factor=min(left.time_decay_factor, right.time_decay_factor),
-            partial_sweep_factor=min(left.partial_sweep_factor, right.partial_sweep_factor),
+            partial_sweep_factor=min(
+                left.partial_sweep_factor,
+                right.partial_sweep_factor,
+            ),
         )
+
+    # ------------------------------------------------------------------
+    # Build final clusters
+    # ------------------------------------------------------------------
 
     def _build_clusters(
         self,
@@ -537,7 +754,9 @@ class StopClustersDetector:
         candidate: StopClusterCandidate,
         current_price: float,
     ) -> StopCluster:
-        base_density = self._scorer.estimate_stop_density(candidate.source_levels)
+        base_density = self._scorer.estimate_stop_density(
+            candidate.source_levels
+        )
 
         enhanced_density = self._enhance_density(
             base_density=base_density,
@@ -548,8 +767,14 @@ class StopClustersDetector:
             time_decay_factor=candidate.time_decay_factor,
         )
 
-        touches_count = sum(max(level.touches_count, 1) for level in candidate.source_levels)
-        dominant_level_type = self._resolve_dominant_level_type(candidate.source_levels)
+        touches_count = sum(
+            max(level.touches_count, 1)
+            for level in candidate.source_levels
+        )
+
+        dominant_level_type = self._resolve_dominant_level_type(
+            candidate.source_levels
+        )
 
         cluster = StopCluster(
             symbol=candidate.symbol,
@@ -566,9 +791,17 @@ class StopClustersDetector:
             updated_at=candidate.updated_at,
             source_levels=list(candidate.source_levels),
             metadata={
+                "detector": self.__class__.__name__,
                 "source_count": len(candidate.source_levels),
-                "source_prices": [level.price for level in candidate.source_levels],
-                "source_confidences": [level.confidence for level in candidate.source_levels],
+                "source_keys": [level.key for level in candidate.source_levels],
+                "source_prices": [
+                    level.price
+                    for level in candidate.source_levels
+                ],
+                "source_confidences": [
+                    level.confidence
+                    for level in candidate.source_levels
+                ],
                 "volume_score": candidate.volume_score,
                 "orderbook_score": candidate.orderbook_score,
                 "compression_score": candidate.compression_score,
@@ -592,7 +825,9 @@ class StopClustersDetector:
         )
 
         cluster.confidence = final_score
-        cluster.strength = self._scorer.classify_cluster_strength(cluster.confidence)
+        cluster.strength = self._scorer.classify_cluster_strength(
+            cluster.confidence
+        )
 
         return cluster
 
@@ -605,7 +840,7 @@ class StopClustersDetector:
         partial_sweep_factor: float,
         time_decay_factor: float,
     ) -> float:
-        density = base_density
+        density = clamp(base_density, 0.0, 1.0)
 
         density += 0.18 * clamp(volume_score, 0.0, 1.0)
         density += 0.22 * clamp(orderbook_score, 0.0, 1.0)
@@ -625,7 +860,7 @@ class StopClustersDetector:
         partial_sweep_factor: float,
         time_decay_factor: float,
     ) -> float:
-        score = base_score
+        score = clamp(base_score, 0.0, 1.0)
 
         score += 0.10 * clamp(volume_score, 0.0, 1.0)
         score += 0.14 * clamp(orderbook_score, 0.0, 1.0)
@@ -636,6 +871,10 @@ class StopClustersDetector:
 
         return clamp(score, 0.0, 1.0)
 
+    # ------------------------------------------------------------------
+    # Deduplication / classification
+    # ------------------------------------------------------------------
+
     def _resolve_dominant_level_type(
         self,
         source_levels: Sequence[LiquidityLevel],
@@ -643,16 +882,19 @@ class StopClustersDetector:
         if not source_levels:
             return LiquidityLevelType.STOP_CLUSTER
 
-        priority = [
+        priority = (
             LiquidityLevelType.EQUAL_HIGHS,
             LiquidityLevelType.EQUAL_LOWS,
             LiquidityLevelType.SWING_HIGH,
             LiquidityLevelType.SWING_LOW,
             LiquidityLevelType.RANGE_HIGH,
             LiquidityLevelType.RANGE_LOW,
-        ]
+            LiquidityLevelType.ORDERBOOK_WALL,
+            LiquidityLevelType.LIQUIDATION_ZONE,
+        )
 
         type_counts: dict[LiquidityLevelType, int] = {}
+
         for level in source_levels:
             type_counts[level.level_type] = type_counts.get(level.level_type, 0) + 1
 
@@ -671,23 +913,27 @@ class StopClustersDetector:
 
         sorted_clusters = sorted(
             clusters,
-            key=lambda c: (c.side.value, c.center_price),
+            key=lambda cluster: (
+                cluster.side.value,
+                cluster.center_price,
+            ),
         )
 
         result: list[StopCluster] = [sorted_clusters[0]]
 
         for cluster in sorted_clusters[1:]:
-            prev = result[-1]
+            previous = result[-1]
 
-            if cluster.side != prev.side:
+            if cluster.side != previous.side:
                 result.append(cluster)
                 continue
 
-            if self._clusters_are_near(prev, cluster):
-                if cluster.confidence > prev.confidence:
+            if self._clusters_are_near(previous, cluster):
+                if self._is_better_cluster(cluster, previous):
                     result[-1] = cluster
-            else:
-                result.append(cluster)
+                continue
+
+            result.append(cluster)
 
         return result
 
@@ -699,7 +945,47 @@ class StopClustersDetector:
         if left.overlaps(right):
             return True
 
-        return pct_distance(left.center_price, right.center_price) <= self._config.cluster_merge_distance_pct
+        return (
+            pct_distance(left.center_price, right.center_price)
+            <= self._config.cluster_merge_distance_pct
+        )
+
+    def _is_better_cluster(
+        self,
+        candidate: StopCluster,
+        current: StopCluster,
+    ) -> bool:
+        candidate_score = (
+            candidate.confidence,
+            candidate.estimated_stop_density,
+            candidate.touches_count,
+            -candidate.width_pct(),
+        )
+        current_score = (
+            current.confidence,
+            current.estimated_stop_density,
+            current.touches_count,
+            -current.width_pct(),
+        )
+
+        return candidate_score > current_score
+
+    def _deduplicate_source_levels(
+        self,
+        levels: Sequence[LiquidityLevel],
+    ) -> list[LiquidityLevel]:
+        result: dict[str, LiquidityLevel] = {}
+
+        for level in levels:
+            existing = result.get(level.key)
+            if existing is None or level.confidence > existing.confidence:
+                result[level.key] = level
+
+        return list(result.values())
+
+    # ------------------------------------------------------------------
+    # Candle / orderbook helpers
+    # ------------------------------------------------------------------
 
     def _find_candles_near_level(
         self,
@@ -710,8 +996,8 @@ class StopClustersDetector:
         result: list[Any] = []
 
         for candle in candles:
-            high = self._get_candle_high(candle)
-            low = self._get_candle_low(candle)
+            high = get_candle_high(candle)
+            low = get_candle_low(candle)
 
             if low <= level_price <= high:
                 result.append(candle)
@@ -734,30 +1020,13 @@ class StopClustersDetector:
         parsed: list[OrderbookLevel] = []
 
         for item in levels:
-            raw_price: Any | None
-            raw_size: Any | None
+            price = self._extract_orderbook_price(item)
+            size = self._extract_orderbook_size(item)
 
-            if isinstance(item, dict):
-                raw_price = item.get("price")
-                raw_size = item.get("size")
-                if raw_size is None:
-                    raw_size = item.get("qty")
-                if raw_size is None:
-                    raw_size = item.get("quantity")
-            elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                raw_price = item[0]
-                raw_size = item[1]
-            else:
-                raw_price = getattr(item, "price", None)
-                raw_size = getattr(item, "size", None)
-
-            if raw_price is None or raw_size is None:
+            if price is None or size is None:
                 continue
 
-            try:
-                price = float(cast(object, raw_price))
-                size = float(cast(object, raw_size))
-            except (TypeError, ValueError):
+            if price <= 0 or size <= 0:
                 continue
 
             parsed.append(
@@ -770,57 +1039,93 @@ class StopClustersDetector:
 
         return parsed
 
+    def _extract_orderbook_price(self, item: Any) -> float | None:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            value = item[0]
+        else:
+            value = get_first_value(
+                item,
+                ("price", "p", "px"),
+            )
+
+        price = safe_float(value, default=0.0)
+        return price if price > 0 else None
+
+    def _extract_orderbook_size(self, item: Any) -> float | None:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            value = item[1]
+        else:
+            value = get_first_value(
+                item,
+                ("size", "qty", "quantity", "q", "amount"),
+            )
+
+        size = safe_float(value, default=0.0)
+        return size if size > 0 else None
+
     def _extract_int_list(self, value: Any) -> list[int]:
         if not isinstance(value, (list, tuple)):
             return []
 
         result: list[int] = []
+
         for item in value:
             if isinstance(item, bool):
                 continue
+
             if isinstance(item, int):
                 result.append(item)
-            elif isinstance(item, float) and item.is_integer():
+                continue
+
+            if isinstance(item, float) and item.is_integer():
                 result.append(int(item))
 
         return result
 
-    def _safe_float(self, value: Any, default: float = 0.0) -> float:
-        if value is None:
-            return default
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
+    # ------------------------------------------------------------------
+    # Datetime helpers
+    # ------------------------------------------------------------------
 
-    def _get_candle_value(self, candle: Any, field: str, default: Any = None) -> Any:
-        if isinstance(candle, dict):
-            return candle.get(field, default)
-        return getattr(candle, field, default)
-
-    def _get_candle_high(self, candle: Any) -> float:
-        value = self._get_candle_value(candle, "high")
-        if value is None:
-            raise ValueError("Candle must contain 'high'")
-        return float(value)
-
-    def _get_candle_low(self, candle: Any) -> float:
-        value = self._get_candle_value(candle, "low")
-        if value is None:
-            raise ValueError("Candle must contain 'low'")
-        return float(value)
-
-    def _get_candle_close(self, candle: Any) -> float:
-        value = self._get_candle_value(candle, "close")
-        if value is None:
-            raise ValueError("Candle must contain 'close'")
-        return float(value)
-
-    def _get_candle_volume(self, candle: Any) -> float | None:
-        value = self._get_candle_value(candle, "volume")
+    def _normalize_timestamp(
+        self,
+        value: datetime | None,
+    ) -> datetime | None:
         if value is None:
             return None
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
+
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+
+        return value.astimezone(timezone.utc)
+
+    def _min_datetime(
+        self,
+        left: datetime | None,
+        right: datetime | None,
+    ) -> datetime | None:
+        left = self._normalize_timestamp(left)
+        right = self._normalize_timestamp(right)
+
+        if left is None:
+            return right
+
+        if right is None:
+            return left
+
+        return min(left, right)
+
+    def _max_datetime(
+        self,
+        left: datetime | None,
+        right: datetime | None,
+    ) -> datetime | None:
+        left = self._normalize_timestamp(left)
+        right = self._normalize_timestamp(right)
+
+        if left is None:
+            return right
+
+        if right is None:
+            return left
+
+        return max(left, right)
