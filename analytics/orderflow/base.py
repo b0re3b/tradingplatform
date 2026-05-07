@@ -4,10 +4,11 @@ import asyncio
 import inspect
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
-from core.event_bus import Event, EventBus
+from core.event_bus import Event, EventBus, Subscription
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 from .config import BaseOrderFlowSubConfig
 from .enums import (
@@ -21,25 +22,28 @@ from .models import (
     NormalizedTrade,
     OrderFlowSignal,
     OrderFlowUpdate,
-    OrderbookLevel,
     OrderbookSnapshot,
     signal_to_dict,
-    stats_to_dict,
+    update_to_dict,
 )
 
 
 class BaseOrderFlowAnalyzer(ABC):
     """
-    Базовий клас для всіх analyzers пакета analytics.orderflow.
+    Base class for all analytics.orderflow analyzers.
 
-    Відповідальність:
-    - lifecycle start/stop
-    - subscribe/unsubscribe до EventBus
-    - загальні метрики
-    - throttling сигналів
-    - emit update/signal подій
-    - базові helper-и для extraction/normalization
-    - інтеграція з scheduler
+    Responsibilities:
+    - EventBus subscription lifecycle via register()/stop()
+    - Scheduler-based health and cleanup jobs
+    - shared metrics
+    - signal throttling
+    - update/signal EventBus publishing
+    - common extraction and normalization helpers
+
+    Concrete analyzers should implement:
+    - process_symbol()
+    - get_latest_stats()
+    - _handle_event()
     """
 
     def __init__(
@@ -49,8 +53,8 @@ class BaseOrderFlowAnalyzer(ABC):
         config: BaseOrderFlowSubConfig,
         metric_type: OrderFlowMetricType,
         source_type: OrderFlowSourceType,
-        scheduler: Optional[Any] = None,
-        source_topic_patterns: Optional[list[str]] = None,
+        scheduler: Scheduler | None = None,
+        source_topic_patterns: list[str] | tuple[str, ...] | None = None,
         component_module: str = "orderflow",
     ) -> None:
         self._event_bus = event_bus
@@ -58,37 +62,53 @@ class BaseOrderFlowAnalyzer(ABC):
         self._config = config
         self._metric_type = metric_type
         self._source_type = source_type
-        self._source_topic_patterns = source_topic_patterns or []
+        self._source_topic_patterns = list(source_topic_patterns or ())
 
         self._logger = get_logger(
             __name__,
             service_name=self._config.source_name,
             component="analytics",
             module=component_module,
+            metric=self._metric_type.value,
+            source_type=self._source_type.value,
         )
 
-        self._subscriptions: list[Any] = []
+        self._subscriptions: list[Subscription] = []
         self._running = False
         self._lock = asyncio.Lock()
 
-        self._health_job_id: Optional[str] = None
-        self._cleanup_job_id: Optional[str] = None
+        self._health_job_id: str | None = None
+        self._cleanup_job_id: str | None = None
 
         self._last_signal_ts_by_symbol: dict[str, float] = {}
         self._metrics: dict[str, Any] = self._build_initial_metrics()
+
+        self._validate_config()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
+    def register(self) -> None:
+        """
+        Register analyzer subscriptions and scheduler jobs.
+
+        This is the standard lifecycle entrypoint used by the project.
+        start() is kept as a compatibility alias.
+        """
         if self._running:
-            self._logger.warning("%s already started", self.__class__.__name__)
+            self._logger.warning("%s already registered", self.__class__.__name__)
             return
 
         if not self._config.enabled:
             self._logger.warning("%s is disabled by config", self.__class__.__name__)
             return
+
+        if not self._source_topic_patterns:
+            self._logger.warning(
+                "%s has no source topic patterns; no EventBus subscriptions created",
+                self.__class__.__name__,
+            )
 
         for pattern in self._source_topic_patterns:
             subscription = self._event_bus.subscribe(
@@ -102,25 +122,34 @@ class BaseOrderFlowAnalyzer(ABC):
         self._running = True
 
         self._logger.info(
-            "%s started | metric=%s source_type=%s patterns=%s",
+            "%s registered | metric=%s source_type=%s patterns=%s",
             self.__class__.__name__,
             self._metric_type.value,
             self._source_type.value,
             self._source_topic_patterns,
         )
 
+    def start(self) -> None:
+        """
+        Backward-compatible alias.
+
+        New modules should call register().
+        """
+        self.register()
+
     def stop(self) -> None:
         if not self._running:
             self._logger.warning("%s already stopped", self.__class__.__name__)
             return
 
-        for sub in self._subscriptions:
+        for subscription in list(self._subscriptions):
             try:
-                self._event_bus.unsubscribe(sub)
+                self._event_bus.unsubscribe(subscription)
             except Exception:
                 self._logger.exception(
-                    "Failed to unsubscribe handler | analyzer=%s",
+                    "Failed to unsubscribe handler | analyzer=%s pattern=%s",
                     self.__class__.__name__,
+                    getattr(subscription, "pattern", None),
                 )
 
         self._subscriptions.clear()
@@ -138,11 +167,11 @@ class BaseOrderFlowAnalyzer(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def process_symbol(self, symbol: str) -> Optional[BaseOrderFlowStats]:
+    async def process_symbol(self, symbol: str) -> BaseOrderFlowStats | None:
         raise NotImplementedError
 
     @abstractmethod
-    def get_latest_stats(self, symbol: str) -> Optional[BaseOrderFlowStats]:
+    def get_latest_stats(self, symbol: str) -> BaseOrderFlowStats | None:
         raise NotImplementedError
 
     @abstractmethod
@@ -158,6 +187,7 @@ class BaseOrderFlowAnalyzer(ABC):
             "running": self._running,
             "metric": self._metric_type.value,
             "source_type": self._source_type.value,
+            "source_topic_patterns": list(self._source_topic_patterns),
             "config": {
                 "enabled": self._config.enabled,
                 "emit_updates": self._config.emit_updates,
@@ -165,13 +195,20 @@ class BaseOrderFlowAnalyzer(ABC):
                 "min_signal_interval_sec": self._config.min_signal_interval_sec,
                 "health_log_interval_sec": self._config.health_log_interval_sec,
                 "cleanup_interval_sec": self._config.cleanup_interval_sec,
+                "scheduler_job_timeout_sec": self._config.scheduler_job_timeout_sec,
+                "scheduler_job_retry_delay_sec": self._config.scheduler_job_retry_delay_sec,
+                "scheduler_job_max_retries": self._config.scheduler_job_max_retries,
                 "source_name": self._config.source_name,
                 "update_topic": self._config.update_topic,
                 "signal_topic": self._config.signal_topic,
-                "symbol_allowlist": sorted(self._config.symbol_allowlist)
-                if self._config.symbol_allowlist
-                else None,
+                "publish_priority": self._config.publish_priority.name,
+                "symbol_allowlist": (
+                    sorted(self._config.symbol_allowlist)
+                    if self._config.symbol_allowlist
+                    else None
+                ),
             },
+            "subscriptions": len(self._subscriptions),
             "health_job_id": self._health_job_id,
             "cleanup_job_id": self._cleanup_job_id,
             "metrics": {
@@ -180,9 +217,29 @@ class BaseOrderFlowAnalyzer(ABC):
                 "updates_emitted": self._metrics["updates_emitted"],
                 "skipped": self._metrics["skipped"],
                 "errors": self._metrics["errors"],
+                "emit_errors": self._metrics["emit_errors"],
                 "symbols": dict(self._metrics["symbols"]),
             },
         }
+
+    def log_health(self) -> None:
+        snapshot = self.stats()
+        self._logger.info(
+            "%s health | running=%s subscriptions=%s metrics=%s",
+            self.__class__.__name__,
+            snapshot["running"],
+            snapshot["subscriptions"],
+            snapshot["metrics"],
+        )
+
+    async def cleanup(self) -> None:
+        """
+        Hook for stale state cleanup.
+
+        Concrete analyzers can override this method. It is scheduled through
+        core.scheduler.Scheduler.add_interval_job().
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Shared emitters
@@ -196,15 +253,17 @@ class BaseOrderFlowAnalyzer(ABC):
             symbol=stats.symbol,
             metric=self._metric_type,
             source_type=self._source_type,
-            stats=stats_to_dict(stats),
+            stats=stats.to_dict(),
         )
 
-        await self._safe_emit(
+        emitted = await self._safe_emit(
             topic=self._config.update_topic,
-            payload=signal_or_update_payload(update),
+            payload=update_to_dict(update),
             source=self._config.source_name,
         )
-        self._inc_metric("updates_emitted", stats.symbol)
+
+        if emitted:
+            self._inc_metric("updates_emitted", stats.symbol)
 
     async def emit_signal(self, signal: OrderFlowSignal) -> None:
         if not self._config.emit_signals:
@@ -214,14 +273,15 @@ class BaseOrderFlowAnalyzer(ABC):
             self._inc_metric("skipped", signal.symbol)
             return
 
-        await self._safe_emit(
+        emitted = await self._safe_emit(
             topic=self._config.signal_topic,
-            payload=signal_or_update_payload(signal),
+            payload=signal_to_dict(signal),
             source=self._config.source_name,
         )
 
-        self._last_signal_ts_by_symbol[signal.symbol] = time.time()
-        self._inc_metric("signals_emitted", signal.symbol)
+        if emitted:
+            self._last_signal_ts_by_symbol[signal.symbol] = time.time()
+            self._inc_metric("signals_emitted", signal.symbol)
 
     def build_signal(
         self,
@@ -231,77 +291,75 @@ class BaseOrderFlowAnalyzer(ABC):
         side: OrderFlowSide,
         strength: float,
         reason: str,
-        context: Optional[dict[str, Any]] = None,
+        context: dict[str, Any] | None = None,
     ) -> OrderFlowSignal:
         return OrderFlowSignal(
-            symbol=symbol,
+            symbol=str(symbol).upper(),
             metric=self._metric_type,
             signal_type=signal_type,
             side=side,
-            strength=max(0.0, min(float(strength), 1.0)),
+            strength=strength,
             reason=reason,
             context=context or {},
         )
 
     # ------------------------------------------------------------------
-    # Shared helpers
+    # Shared event helpers
     # ------------------------------------------------------------------
 
-    def should_process_symbol(self, symbol: Optional[str]) -> bool:
+    def should_process_symbol(self, symbol: str | None) -> bool:
         if not symbol:
             return False
 
-        normalized = str(symbol).upper()
-        allowlist = self._config.symbol_allowlist
+        return self._config.should_process_symbol(symbol)
 
-        if allowlist and normalized not in allowlist:
-            return False
-
-        return True
-
-    def extract_symbol_from_event(self, event: Event) -> Optional[str]:
+    def extract_symbol_from_event(self, event: Event) -> str | None:
         payload = getattr(event, "payload", None)
 
-        if isinstance(payload, dict):
-            symbol = payload.get("symbol") or payload.get("s")
-            if symbol:
-                return str(symbol).upper()
-
-            data = payload.get("data")
-            if isinstance(data, dict):
-                symbol = data.get("symbol") or data.get("s")
-                if symbol:
-                    return str(symbol).upper()
+        symbol = self._extract_symbol_from_payload(payload)
+        if symbol:
+            return symbol
 
         symbol = getattr(event, "symbol", None)
         if symbol:
-            return str(symbol).upper()
+            return str(symbol).strip().upper()
 
         return None
 
-    def extract_exchange_from_event(self, event: Event) -> Optional[str]:
+    def extract_exchange_from_event(self, event: Event) -> str | None:
         payload = getattr(event, "payload", None)
+
         if isinstance(payload, dict):
             exchange = payload.get("exchange")
             if exchange:
                 return str(exchange)
+
             data = payload.get("data")
             if isinstance(data, dict) and data.get("exchange"):
                 return str(data["exchange"])
+
         return None
 
+    def extract_payload_data(self, event: Event) -> Any:
+        payload = getattr(event, "payload", None)
+
+        if isinstance(payload, dict) and "data" in payload:
+            return payload["data"]
+
+        return payload
+
     def normalize_trade(
-            self,
-            raw_trade: Any,
-            *,
-            default_symbol: Optional[str] = None,
-            default_exchange: Optional[str] = None,
-    ) -> Optional[NormalizedTrade]:
+        self,
+        raw_trade: Any,
+        *,
+        default_symbol: str | None = None,
+        default_exchange: str | None = None,
+    ) -> NormalizedTrade | None:
         if raw_trade is None:
             return None
 
         if isinstance(raw_trade, NormalizedTrade):
-            return raw_trade
+            return raw_trade if raw_trade.is_valid else None
 
         if not isinstance(raw_trade, dict):
             return None
@@ -312,32 +370,28 @@ class BaseOrderFlowAnalyzer(ABC):
 
         raw_price = raw_trade.get("price", raw_trade.get("p"))
         raw_quantity = raw_trade.get("quantity", raw_trade.get("qty", raw_trade.get("q")))
-        raw_timestamp = raw_trade.get("timestamp", raw_trade.get("ts", raw_trade.get("T", time.time())))
-        trade_id = raw_trade.get("trade_id", raw_trade.get("id"))
-        exchange = raw_trade.get("exchange", default_exchange)
+        raw_timestamp = raw_trade.get(
+            "timestamp",
+            raw_trade.get("ts", raw_trade.get("T", time.time())),
+        )
 
         if raw_price is None or raw_quantity is None or raw_timestamp is None:
             return None
 
         side = self._extract_trade_side(raw_trade)
+        trade_id = raw_trade.get("trade_id", raw_trade.get("id"))
+        exchange = raw_trade.get("exchange", default_exchange)
         is_aggressive = bool(
             raw_trade.get("is_aggressive", raw_trade.get("aggressive", False))
         )
 
         try:
-            price = float(raw_price)
-            quantity = float(raw_quantity)
-            timestamp = float(raw_timestamp)
-        except (TypeError, ValueError):
-            return None
-
-        try:
-            return NormalizedTrade.create(
+            trade = NormalizedTrade.create(
                 symbol=str(symbol).upper(),
                 side=side,
-                price=price,
-                quantity=quantity,
-                timestamp=timestamp,
+                price=float(raw_price),
+                quantity=float(raw_quantity),
+                timestamp=float(raw_timestamp),
                 trade_id=str(trade_id) if trade_id is not None else None,
                 exchange=str(exchange) if exchange is not None else None,
                 is_aggressive=is_aggressive,
@@ -346,18 +400,20 @@ class BaseOrderFlowAnalyzer(ABC):
         except (TypeError, ValueError):
             return None
 
+        return trade if trade.is_valid else None
+
     def normalize_orderbook_snapshot(
-            self,
-            raw_snapshot: Any,
-            *,
-            default_symbol: Optional[str] = None,
-            default_exchange: Optional[str] = None,
-    ) -> Optional[OrderbookSnapshot]:
+        self,
+        raw_snapshot: Any,
+        *,
+        default_symbol: str | None = None,
+        default_exchange: str | None = None,
+    ) -> OrderbookSnapshot | None:
         if raw_snapshot is None:
             return None
 
         if isinstance(raw_snapshot, OrderbookSnapshot):
-            return raw_snapshot
+            return raw_snapshot if raw_snapshot.is_valid else None
 
         if not isinstance(raw_snapshot, dict):
             return None
@@ -366,76 +422,83 @@ class BaseOrderFlowAnalyzer(ABC):
         if not symbol:
             return None
 
-        bids_raw = raw_snapshot.get("bids", [])
-        asks_raw = raw_snapshot.get("asks", [])
+        bids_raw = raw_snapshot.get("bids", raw_snapshot.get("b", []))
+        asks_raw = raw_snapshot.get("asks", raw_snapshot.get("a", []))
+
         if not isinstance(bids_raw, list) or not isinstance(asks_raw, list):
-            return None
-
-        bids = [level for item in bids_raw if (level := OrderbookLevel.from_raw(item)) is not None]
-        asks = [level for item in asks_raw if (level := OrderbookLevel.from_raw(item)) is not None]
-
-        if not bids or not asks:
             return None
 
         raw_timestamp = raw_snapshot.get("timestamp")
         if raw_timestamp is None:
             raw_timestamp = raw_snapshot.get("ts")
         if raw_timestamp is None:
+            raw_timestamp = raw_snapshot.get("T")
+        if raw_timestamp is None:
             raw_timestamp = time.time()
-
-        try:
-            timestamp = float(raw_timestamp)
-        except (TypeError, ValueError):
-            return None
 
         exchange = raw_snapshot.get("exchange", default_exchange)
         sequence_id = raw_snapshot.get("sequence_id", raw_snapshot.get("u"))
 
-        return OrderbookSnapshot(
-            symbol=str(symbol).upper(),
-            bids=bids,
-            asks=asks,
-            timestamp=timestamp,
-            exchange=str(exchange) if exchange is not None else None,
-            sequence_id=str(sequence_id) if sequence_id is not None else None,
-            raw=raw_snapshot,
-        )
+        try:
+            snapshot = OrderbookSnapshot.create(
+                symbol=str(symbol).upper(),
+                bids=bids_raw,
+                asks=asks_raw,
+                timestamp=float(raw_timestamp),
+                exchange=str(exchange) if exchange is not None else None,
+                sequence_id=str(sequence_id) if sequence_id is not None else None,
+                raw=raw_snapshot,
+            )
+        except (TypeError, ValueError):
+            return None
+
+        return snapshot if snapshot.is_valid else None
 
     def make_trade_key(self, trade: NormalizedTrade) -> str:
         if trade.trade_id:
             return f"{trade.symbol}:{trade.exchange or ''}:{trade.trade_id}"
+
         return (
             f"{trade.symbol}:{trade.exchange or ''}:{trade.timestamp:.9f}:"
             f"{trade.price:.12f}:{trade.quantity:.12f}:{trade.side.value}"
         )
 
-    def log_health(self) -> None:
-        snapshot = self.stats()
-        self._logger.info(
-            "%s health | metrics=%s",
-            self.__class__.__name__,
-            snapshot["metrics"],
-        )
-
-    async def cleanup(self) -> None:
-        """
-        Hook для cleanup старого стану.
-        За замовчуванням нічого не робить.
-        """
-        return
-
     # ------------------------------------------------------------------
     # Shared internals
     # ------------------------------------------------------------------
 
+    def _validate_config(self) -> None:
+        try:
+            self._config.validate()
+        except Exception:
+            self._logger.exception(
+                "Invalid analyzer config | analyzer=%s",
+                self.__class__.__name__,
+            )
+            raise
+
+    def _extract_symbol_from_payload(self, payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+
+        symbol = payload.get("symbol") or payload.get("s")
+        if symbol:
+            return str(symbol).strip().upper()
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            symbol = data.get("symbol") or data.get("s")
+            if symbol:
+                return str(symbol).strip().upper()
+
+        return None
+
     def _extract_trade_side(self, raw_trade: dict[str, Any]) -> OrderFlowSide:
         side = raw_trade.get("side")
-        if isinstance(side, str):
-            side_value = side.lower()
-            if side_value == OrderFlowSide.BUY.value:
-                return OrderFlowSide.BUY
-            if side_value == OrderFlowSide.SELL.value:
-                return OrderFlowSide.SELL
+        if side is not None:
+            side_enum = OrderFlowSide.from_value(side)
+            if side_enum.is_known:
+                return side_enum
 
         # Binance-style maker flag:
         # m=False => buyer aggressive => buy
@@ -452,18 +515,47 @@ class BaseOrderFlowAnalyzer(ABC):
 
     def _can_emit_signal(self, symbol: str) -> bool:
         now = time.time()
-        last_ts = self._last_signal_ts_by_symbol.get(symbol, 0.0)
+        normalized_symbol = str(symbol).upper()
+        last_ts = self._last_signal_ts_by_symbol.get(normalized_symbol, 0.0)
         return (now - last_ts) >= float(self._config.min_signal_interval_sec)
 
-    async def _safe_emit(self, *, topic: str, payload: dict[str, Any], source: str) -> None:
-        await self._event_bus.emit(
-            topic,
-            payload,
-            priority=self._config.publish_priority,
-            source=source,
-        )
+    async def _safe_emit(
+        self,
+        *,
+        topic: str,
+        payload: dict[str, Any],
+        source: str,
+    ) -> bool:
+        if not topic:
+            self._logger.warning(
+                "Emit skipped because topic is empty | analyzer=%s",
+                self.__class__.__name__,
+            )
+            self._inc_metric("emit_errors")
+            return False
 
-    def _inc_metric(self, key: str, symbol: Optional[str] = None, amount: int = 1) -> None:
+        try:
+            return await self._event_bus.emit(
+                topic,
+                payload,
+                priority=self._config.publish_priority,
+                source=source,
+            )
+        except Exception:
+            self._inc_metric("emit_errors")
+            self._logger.exception(
+                "Failed to emit EventBus event | analyzer=%s topic=%s",
+                self.__class__.__name__,
+                topic,
+            )
+            return False
+
+    def _inc_metric(
+        self,
+        key: str,
+        symbol: str | None = None,
+        amount: int = 1,
+    ) -> None:
         if key not in self._metrics:
             self._metrics[key] = 0
 
@@ -479,8 +571,10 @@ class BaseOrderFlowAnalyzer(ABC):
                     "updates_emitted": 0,
                     "skipped": 0,
                     "errors": 0,
+                    "emit_errors": 0,
                 },
             )
+
             if key in symbol_metrics:
                 symbol_metrics[key] += amount
 
@@ -491,78 +585,66 @@ class BaseOrderFlowAnalyzer(ABC):
             "updates_emitted": 0,
             "skipped": 0,
             "errors": 0,
+            "emit_errors": 0,
             "symbols": {},
         }
+
+    # ------------------------------------------------------------------
+    # Scheduler integration
+    # ------------------------------------------------------------------
 
     def _register_scheduler_jobs(self) -> None:
         if self._scheduler is None:
             return
 
-        add_interval_job = getattr(self._scheduler, "add_interval_job", None)
-        if add_interval_job is None:
-            self._logger.warning(
-                "Scheduler does not support add_interval_job | analyzer=%s",
-                self.__class__.__name__,
-            )
-            return
+        self._health_job_id = self._scheduler.add_interval_job(
+            name=f"analytics.orderflow.{self._config.source_name}.health",
+            func=self._safe_health_job,
+            interval=float(self._config.health_log_interval_sec),
+            max_retries=int(self._config.scheduler_job_max_retries),
+            retry_delay=float(self._config.scheduler_job_retry_delay_sec),
+            timeout=float(self._config.scheduler_job_timeout_sec),
+            allow_overlap=False,
+            enabled=True,
+        )
 
-        try:
-            self._health_job_id = add_interval_job(
-                func=self._safe_health_job,
-                seconds=float(self._config.health_log_interval_sec),
-                name=f"{self.__class__.__name__}.health",
-                timeout_seconds=float(self._config.scheduler_job_timeout_sec),
-                retry_delay_seconds=float(self._config.scheduler_job_retry_delay_sec),
-                max_retries=int(self._config.scheduler_job_max_retries),
-            )
-        except TypeError:
-            try:
-                self._health_job_id = add_interval_job(
-                    self._safe_health_job,
-                    self._config.health_log_interval_sec,
-                    name=f"{self.__class__.__name__}.health",
-                )
-            except Exception:
-                self._logger.exception("Failed to register health job")
+        self._cleanup_job_id = self._scheduler.add_interval_job(
+            name=f"analytics.orderflow.{self._config.source_name}.cleanup",
+            func=self._safe_cleanup_job,
+            interval=float(self._config.cleanup_interval_sec),
+            max_retries=int(self._config.scheduler_job_max_retries),
+            retry_delay=float(self._config.scheduler_job_retry_delay_sec),
+            timeout=float(self._config.scheduler_job_timeout_sec),
+            allow_overlap=False,
+            enabled=True,
+        )
 
-        try:
-            self._cleanup_job_id = add_interval_job(
-                func=self._safe_cleanup_job,
-                seconds=float(self._config.cleanup_interval_sec),
-                name=f"{self.__class__.__name__}.cleanup",
-                timeout_seconds=float(self._config.scheduler_job_timeout_sec),
-                retry_delay_seconds=float(self._config.scheduler_job_retry_delay_sec),
-                max_retries=int(self._config.scheduler_job_max_retries),
-            )
-        except TypeError:
-            try:
-                self._cleanup_job_id = add_interval_job(
-                    self._safe_cleanup_job,
-                    self._config.cleanup_interval_sec,
-                    name=f"{self.__class__.__name__}.cleanup",
-                )
-            except Exception:
-                self._logger.exception("Failed to register cleanup job")
+        self._logger.info(
+            "Scheduler jobs registered | analyzer=%s health_job_id=%s cleanup_job_id=%s",
+            self.__class__.__name__,
+            self._health_job_id,
+            self._cleanup_job_id,
+        )
 
     def _disable_scheduler_jobs(self) -> None:
         if self._scheduler is None:
             return
-
-        disable_job = getattr(self._scheduler, "disable_job", None)
-        remove_job = getattr(self._scheduler, "remove_job", None)
 
         for job_id in (self._health_job_id, self._cleanup_job_id):
             if not job_id:
                 continue
 
             try:
-                if disable_job is not None:
-                    disable_job(job_id)
-                elif remove_job is not None:
-                    remove_job(job_id)
+                self._scheduler.disable_job(job_id)
+            except KeyError:
+                self._logger.warning(
+                    "Scheduler job already missing | analyzer=%s job_id=%s",
+                    self.__class__.__name__,
+                    job_id,
+                )
             except Exception:
                 self._logger.exception(
-                    "Failed to disable/remove scheduler job | analyzer=%s job_id=%s",
+                    "Failed to disable scheduler job | analyzer=%s job_id=%s",
                     self.__class__.__name__,
                     job_id,
                 )
@@ -576,6 +658,7 @@ class BaseOrderFlowAnalyzer(ABC):
             if inspect.isawaitable(result):
                 await result
         except Exception:
+            self._inc_metric("errors")
             self._logger.exception(
                 "Cleanup job failed | analyzer=%s",
                 self.__class__.__name__,
@@ -583,30 +666,12 @@ class BaseOrderFlowAnalyzer(ABC):
 
     async def _safe_health_job(self) -> None:
         try:
-            self.log_health()
+            result = self.log_health()
+            if inspect.isawaitable(result):
+                await result
         except Exception:
+            self._inc_metric("errors")
             self._logger.exception(
                 "Health job failed | analyzer=%s",
                 self.__class__.__name__,
             )
-
-
-def signal_or_update_payload(obj: OrderFlowSignal | OrderFlowUpdate) -> dict[str, Any]:
-    if isinstance(obj, OrderFlowSignal):
-        payload = signal_to_dict(obj)
-    else:
-        payload = {
-            "symbol": obj.symbol,
-            "metric": obj.metric.value,
-            "source_type": obj.source_type.value,
-            "stats": obj.stats,
-            "timestamp": obj.timestamp,
-        }
-
-    # enum -> str для чистого JSON payload
-    for key in ("metric", "signal_type", "side", "source_type"):
-        value = payload.get(key)
-        if hasattr(value, "value"):
-            payload[key] = value.value
-
-    return payload
