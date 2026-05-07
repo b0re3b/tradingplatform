@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
+from core.scheduler import Scheduler
+
 from .config import OIAnalyzerConfig
-from .enums import OIAnomalyType, OIEventType, OIRegime
+from .enums import OIAnomalyType, OIEventType, OIMarketEventType, OIRegime
 from .models import (
     OIAnalysisResult,
+    OIFeatures,
     OIMarketContext,
     OISnapshot,
     OIState,
@@ -24,8 +29,10 @@ from .oi_regime_detector import OIRegimeDetector
 @dataclass(slots=True)
 class OIInstrumentBuffers:
     """
-    Історія по конкретному (exchange, symbol).
-    Усі значення зберігаються у хронологічному порядку.
+    Rolling history for one (exchange, symbol) instrument.
+
+    All series are stored in chronological order:
+    oldest -> newest.
     """
 
     oi_values: deque[float]
@@ -37,7 +44,7 @@ class OIInstrumentBuffers:
     volume_values: deque[float]
     volume_timestamps: deque[float]
 
-    feature_history: deque[Any]
+    feature_history: deque[OIFeatures]
 
     def append_oi(self, oi: float, timestamp: float) -> None:
         self.oi_values.append(float(oi))
@@ -54,74 +61,179 @@ class OIInstrumentBuffers:
 
 class OIAnalyzer:
     """
-    Orchestration layer для Open Interest analytics.
+    Event-driven orchestration layer for Open Interest analytics.
 
-    Відповідальність:
-    - слухати market events
-    - підтримувати state/history
-    - будувати OI features
-    - визначати regime
-    - визначати divergence
-    - визначати anomalies
-    - публікувати analytics.oi.* події в EventBus
+    Responsibilities:
+    - subscribe to market.* and analytics.orderflow.* events
+    - maintain per-instrument context/state/history
+    - build OI features
+    - detect regimes, divergences, and anomalies
+    - emit analytics.oi.* events through EventBus
+    - schedule cleanup/metrics jobs through Scheduler
+
+    This class is infrastructure-aware and is the only Open Interest analytics
+    class that should depend on core.EventBus / core.Scheduler.
     """
 
     def __init__(
         self,
-        event_bus: Any,
+        *,
+        event_bus: EventBus,
+        scheduler: Scheduler | None = None,
         config: OIAnalyzerConfig | None = None,
     ) -> None:
         self.event_bus = event_bus
+        self.scheduler = scheduler
         self.config = config or OIAnalyzerConfig()
-        self.logger = get_logger(__name__, service_name="oi_analyzer")
+
+        self.logger = get_logger(
+            __name__,
+            service_name=self.config.source_name,
+            event_type="analytics_open_interest",
+        )
 
         self.feature_builder = OIFeatureBuilder(self.config)
         self.regime_detector = OIRegimeDetector(self.config)
         self.divergence_detector = OIDivergenceDetector(self.config)
         self.anomaly_detector = OIAnomalyDetector(self.config)
 
-        history_size = self.config.windows.history_size
+        self._history_size = self.config.windows.history_size
 
         self._buffers: dict[tuple[str, str], OIInstrumentBuffers] = {}
         self._states: dict[tuple[str, str], OIState] = {}
-
         self._cooldowns: dict[tuple[str, str, str], float] = {}
-
         self._last_context_ts: dict[tuple[str, str], float] = {}
-        self._last_cleanup_ts: float = 0.0
 
-        self._history_size = history_size
+        self._subscriptions: list[Subscription] = []
+        self._cleanup_job_id: str | None = None
+        self._metrics_job_id: str | None = None
 
-        self._subscribed = False
+        self._registered = False
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Lifecycle / registration
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def register(self) -> None:
         """
-        Реєструє підписки на EventBus.
+        Register EventBus subscriptions and optional Scheduler jobs.
+
+        EventBus and Scheduler lifecycles are managed by the application
+        bootstrap/container, not by this class.
         """
-        if self._subscribed:
+        if self._registered:
+            self.logger.warning("OIAnalyzer already registered")
             return
 
-        self.event_bus.subscribe("market.open_interest", self.on_open_interest)
-        self.event_bus.subscribe("market.candle", self.on_candle)
-        self.event_bus.subscribe("market.trade", self.on_trade)
-        self.event_bus.subscribe("market.funding", self.on_funding)
-        self.event_bus.subscribe("market.liquidation", self.on_liquidation)
+        self._subscriptions.extend(
+            [
+                self.event_bus.subscribe(
+                    OIMarketEventType.OPEN_INTEREST.topic,
+                    self.on_open_interest,
+                    name="oi_analyzer.on_open_interest",
+                ),
+                self.event_bus.subscribe(
+                    OIMarketEventType.CANDLE.topic,
+                    self.on_candle,
+                    name="oi_analyzer.on_candle",
+                ),
+                self.event_bus.subscribe(
+                    OIMarketEventType.TRADE.topic,
+                    self.on_trade,
+                    name="oi_analyzer.on_trade",
+                ),
+                self.event_bus.subscribe(
+                    OIMarketEventType.FUNDING.topic,
+                    self.on_funding,
+                    name="oi_analyzer.on_funding",
+                ),
+                self.event_bus.subscribe(
+                    OIMarketEventType.LIQUIDATION.topic,
+                    self.on_liquidation,
+                    name="oi_analyzer.on_liquidation",
+                ),
+                self.event_bus.subscribe(
+                    OIMarketEventType.ORDERFLOW_UPDATED.topic,
+                    self.on_orderflow_update,
+                    name="oi_analyzer.on_orderflow_update",
+                ),
+            ]
+        )
 
-        # Опціонально підтягуємо orderflow context, якщо він є в системі
-        self.event_bus.subscribe("analytics.orderflow.updated", self.on_orderflow_update)
+        self._register_scheduler_jobs()
 
-        self._subscribed = True
-        self.logger.info("OIAnalyzer registered event subscriptions")
+        self._registered = True
+        self.logger.info(
+            "OIAnalyzer registered | subscriptions=%s scheduler_enabled=%s",
+            len(self._subscriptions),
+            self.scheduler is not None,
+        )
 
-    # -------------------------------------------------------------------------
+    def unregister(self) -> None:
+        """
+        Remove EventBus subscriptions.
+
+        Scheduler jobs are disabled if Scheduler is available. The Scheduler
+        remains owned by the application container.
+        """
+        for subscription in self._subscriptions:
+            self.event_bus.unsubscribe(subscription)
+
+        self._subscriptions.clear()
+
+        if self.scheduler is not None:
+            for job_id in (self._cleanup_job_id, self._metrics_job_id):
+                if job_id is not None and self.scheduler.get_job(job_id) is not None:
+                    self.scheduler.disable_job(job_id)
+
+        self._cleanup_job_id = None
+        self._metrics_job_id = None
+        self._registered = False
+
+        self.logger.info("OIAnalyzer unregistered")
+
+    def _register_scheduler_jobs(self) -> None:
+        if self.scheduler is None:
+            if (
+                self.config.maintenance.enable_periodic_cleanup
+                or self.config.maintenance.enable_metrics_emit
+            ):
+                self.logger.warning(
+                    "OIAnalyzer maintenance jobs are enabled but scheduler is not provided"
+                )
+            return
+
+        maintenance = self.config.maintenance
+
+        if maintenance.enable_periodic_cleanup:
+            self._cleanup_job_id = self.scheduler.add_interval_job(
+                name=maintenance.cleanup_job_name,
+                func=self.cleanup_stale_state,
+                interval=maintenance.cleanup_interval_sec,
+                run_immediately=False,
+                timeout=maintenance.cleanup_job_timeout_sec,
+                max_retries=1,
+                retry_delay=1.0,
+                allow_overlap=False,
+            )
+
+        if maintenance.enable_metrics_emit:
+            self._metrics_job_id = self.scheduler.add_interval_job(
+                name=maintenance.metrics_job_name,
+                func=self.emit_metrics,
+                interval=maintenance.metrics_interval_sec,
+                run_immediately=False,
+                timeout=maintenance.metrics_job_timeout_sec,
+                max_retries=1,
+                retry_delay=1.0,
+                allow_overlap=False,
+            )
+
+    # ------------------------------------------------------------------
     # Event handlers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    async def on_open_interest(self, event: Any) -> None:
+    async def on_open_interest(self, event: Event) -> None:
         if not self.config.enabled:
             return
 
@@ -132,10 +244,6 @@ class OIAnalyzer:
                 return
 
             key = snapshot.key
-            now_ts = self._now()
-
-            self._maybe_cleanup_stale_state(now_ts)
-
             buffers = self._get_or_create_buffers(key)
             state = self._get_or_create_state(key)
 
@@ -143,12 +251,13 @@ class OIAnalyzer:
 
             context = self._get_context_for_key(key)
             if self.config.require_price_context and context is None:
-                self.logger.debug(
-                    "Skipping OI analysis because price context is required but missing",
-                    extra={"exchange": snapshot.exchange, "symbol": snapshot.symbol},
-                )
                 state.last_snapshot = snapshot
                 state.touch(snapshot.timestamp)
+
+                self.logger.debug(
+                    "Skipping OI analysis: price context is required but missing",
+                    extra={"exchange": snapshot.exchange, "symbol": snapshot.symbol},
+                )
                 return
 
             features = self.feature_builder.build_from_raw_inputs(
@@ -181,6 +290,12 @@ class OIAnalyzer:
                 metadata={
                     "feature_history_size": len(buffers.feature_history),
                     "oi_history_size": len(buffers.oi_values),
+                    "price_history_size": len(buffers.price_values),
+                    "volume_history_size": len(buffers.volume_values),
+                    "source_event_id": event.event_id,
+                    "source_topic": event.topic,
+                    "source": event.source,
+                    "correlation_id": event.correlation_id,
                 },
             )
 
@@ -188,106 +303,39 @@ class OIAnalyzer:
 
             state.last_snapshot = snapshot
             state.last_features = features
-            state.last_analysis = analysis_result if self.config.store_full_analysis else None
+            state.last_analysis = (
+                analysis_result if self.config.store_full_analysis else None
+            )
             state.last_regime = regime_result.regime
             state.touch(snapshot.timestamp)
 
-            if self.config.emit_updates:
-                await self._emit_oi_updated(analysis_result)
-
-            if (
-                self.config.emit_regime_changes
-                and regime_result.regime != previous_regime
-                and self._cooldown_passed(
-                    key,
-                    "regime_change",
-                    self.config.cooldowns.regime_change_cooldown_sec,
-                    snapshot.timestamp,
-                )
-            ):
-                await self._emit_regime_changed(
-                    key=key,
-                    timestamp=snapshot.timestamp,
-                    previous_regime=previous_regime,
-                    analysis=analysis_result,
-                )
-
-            if (
-                self.config.emit_divergences
-                and divergence_result is not None
-                and divergence_result.detected
-                and self._cooldown_passed(
-                    key,
-                    "divergence",
-                    self.config.cooldowns.divergence_event_cooldown_sec,
-                    snapshot.timestamp,
-                )
-            ):
-                await self._emit_divergence_detected(analysis_result)
-
-            if (
-                self.config.emit_anomalies
-                and anomaly_result is not None
-                and anomaly_result.detected
-                and self._cooldown_passed(
-                    key,
-                    "anomaly",
-                    self.config.cooldowns.anomaly_event_cooldown_sec,
-                    snapshot.timestamp,
-                )
-            ):
-                await self._emit_anomaly_detected(analysis_result)
-
-            if (
-                self.config.emit_squeeze_events
-                and regime_result.regime == OIRegime.SQUEEZE_SETUP
-                and self._cooldown_passed(
-                    key,
-                    "squeeze_setup",
-                    self.config.cooldowns.squeeze_event_cooldown_sec,
-                    snapshot.timestamp,
-                )
-            ):
-                await self._emit_squeeze_setup(analysis_result)
-
-            if (
-                self.config.emit_capitulation_events
-                and (
-                    regime_result.regime == OIRegime.CAPITULATION
-                    or (
-                        anomaly_result is not None
-                        and anomaly_result.detected
-                        and anomaly_result.anomaly_type
-                        in {
-                            OIAnomalyType.LIQUIDATION_DRIVEN_OI_DROP,
-                            OIAnomalyType.SUDDEN_DELEVERAGING,
-                            OIAnomalyType.OI_COLLAPSE,
-                        }
-                    )
-                )
-                and self._cooldown_passed(
-                    key,
-                    "capitulation",
-                    self.config.cooldowns.capitulation_event_cooldown_sec,
-                    snapshot.timestamp,
-                )
-            ):
-                await self._emit_capitulation_detected(analysis_result)
+            await self._emit_analysis_events(
+                key=key,
+                previous_regime=previous_regime,
+                analysis=analysis_result,
+                correlation_id=event.correlation_id,
+            )
 
         except Exception as exc:
             self.logger.exception(
                 "Failed to process market.open_interest event",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
 
-    async def on_candle(self, event: Any) -> None:
+    async def on_candle(self, event: Event) -> None:
+        if not self.config.enabled:
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
             if key is None:
                 return
 
-            exchange, symbol = key
             timestamp = self._extract_timestamp(payload)
             close_price = self._extract_float(
                 payload,
@@ -298,34 +346,24 @@ class OIAnalyzer:
             )
             volume = self._extract_float(payload, "volume", "v", "base_volume")
 
-            if close_price is not None:
-                buffers = self._get_or_create_buffers(key)
-                buffers.append_price(close_price, timestamp)
-
-            if volume is not None:
-                buffers = self._get_or_create_buffers(key)
-                buffers.append_volume(volume, timestamp)
-
-            context = self._get_or_create_context(key, timestamp)
-            context.price = close_price if close_price is not None else context.price
-            context.volume = volume if volume is not None else context.volume
-
-            previous_price = None
             buffers = self._get_or_create_buffers(key)
-            if len(buffers.price_values) >= 2:
-                previous_price = float(buffers.price_values[-2])
+            context = self._get_or_create_context(key, timestamp)
 
-            if close_price is not None and previous_price is not None:
-                context.price_delta = close_price - previous_price
-                if previous_price != 0:
-                    context.price_delta_pct = ((close_price - previous_price) / abs(previous_price)) * 100.0
+            if close_price is not None:
+                buffers.append_price(close_price, timestamp)
+                self._update_price_context(
+                    context=context,
+                    buffers=buffers,
+                    price=close_price,
+                )
 
-            volume_ma = self.feature_builder.compute_moving_average(
-                list(buffers.volume_values),
-                self.config.windows.volume_window,
-            )
-            context.volume_ma = volume_ma
-            context.volume_ratio = self.feature_builder.compute_volume_ratio(volume, volume_ma)
+            if volume is not None and volume >= 0:
+                buffers.append_volume(volume, timestamp)
+                self._update_volume_context(
+                    context=context,
+                    buffers=buffers,
+                    volume=volume,
+                )
 
             context.timestamp = timestamp
             self._last_context_ts[key] = timestamp
@@ -333,16 +371,23 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to process market.candle event",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
 
-    async def on_trade(self, event: Any) -> None:
+    async def on_trade(self, event: Event) -> None:
         """
-        Trade event може слугувати fallback-джерелом для:
+        Trade event can provide fallback context for:
         - last price
-        - агресивного buy/sell flow
-        - опціонально volume
+        - aggressive buy/sell flow
+        - volume
         """
+        if not self.config.enabled:
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
@@ -359,31 +404,24 @@ class OIAnalyzer:
 
             if price is not None:
                 buffers.append_price(price, timestamp)
-                previous_price = float(buffers.price_values[-2]) if len(buffers.price_values) >= 2 else None
-
-                context.price = price
-                if previous_price is not None:
-                    context.price_delta = price - previous_price
-                    if previous_price != 0:
-                        context.price_delta_pct = ((price - previous_price) / abs(previous_price)) * 100.0
+                self._update_price_context(
+                    context=context,
+                    buffers=buffers,
+                    price=price,
+                )
 
             if qty is not None and qty >= 0:
                 buffers.append_volume(qty, timestamp)
-                context.volume = qty
-
-                volume_ma = self.feature_builder.compute_moving_average(
-                    list(buffers.volume_values),
-                    self.config.windows.volume_window,
+                self._update_volume_context(
+                    context=context,
+                    buffers=buffers,
+                    volume=qty,
                 )
-                context.volume_ma = volume_ma
-                context.volume_ratio = self.feature_builder.compute_volume_ratio(qty, volume_ma)
-
-            if qty is not None and side:
-                normalized_side = side.lower().strip()
-                if normalized_side in {"buy", "bid", "long"}:
-                    context.aggressive_buy_volume = float(qty)
-                elif normalized_side in {"sell", "ask", "short"}:
-                    context.aggressive_sell_volume = float(qty)
+                self._update_aggressive_flow_context(
+                    context=context,
+                    side=side,
+                    qty=qty,
+                )
 
             context.timestamp = timestamp
             self._last_context_ts[key] = timestamp
@@ -391,10 +429,17 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to process market.trade event",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
 
-    async def on_funding(self, event: Any) -> None:
+    async def on_funding(self, event: Event) -> None:
+        if not self.config.enabled:
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
@@ -419,10 +464,17 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to process market.funding event",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
 
-    async def on_liquidation(self, event: Any) -> None:
+    async def on_liquidation(self, event: Event) -> None:
+        if not self.config.enabled:
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
@@ -444,7 +496,6 @@ class OIAnalyzer:
                 "liquidated_shorts",
             )
 
-            # fallback: інколи приходить одна liquidation event з side + qty
             side = self._extract_str(payload, "side")
             qty = self._extract_float(payload, "qty", "quantity", "size", "volume")
 
@@ -455,7 +506,7 @@ class OIAnalyzer:
             if short_liq is not None:
                 context.short_liquidations = short_liq
 
-            if qty is not None and side:
+            if qty is not None and qty >= 0 and side:
                 normalized_side = side.lower().strip()
                 if normalized_side in {"long", "buy"}:
                     context.long_liquidations = qty
@@ -468,10 +519,17 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to process market.liquidation event",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
 
-    async def on_orderflow_update(self, event: Any) -> None:
+    async def on_orderflow_update(self, event: Event) -> None:
+        if not self.config.enabled:
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
@@ -506,32 +564,145 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to process analytics.orderflow.updated event",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Scheduled maintenance jobs
+    # ------------------------------------------------------------------
+
+    async def cleanup_stale_state(self) -> None:
+        """
+        Scheduled cleanup job.
+
+        This should be run by core.scheduler.Scheduler.add_interval_job().
+        """
+        now_ts = self._now()
+        stale_after = self.config.stale_state_cleanup_after_sec
+        keys_to_delete: list[tuple[str, str]] = []
+
+        for key, state in list(self._states.items()):
+            if state.is_stale(now_ts, stale_after):
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            self._states.pop(key, None)
+            self._buffers.pop(key, None)
+            self._last_context_ts.pop(key, None)
+
+            cooldown_keys = [cd_key for cd_key in self._cooldowns if cd_key[:2] == key]
+            for cooldown_key in cooldown_keys:
+                self._cooldowns.pop(cooldown_key, None)
+
+        if keys_to_delete:
+            self.logger.info(
+                "Cleaned stale OI state | removed_count=%s",
+                len(keys_to_delete),
+            )
+
+            await self._emit(
+                OIEventType.STATE_CLEANED.topic,
+                {
+                    "timestamp": now_ts,
+                    "removed_count": len(keys_to_delete),
+                    "removed_keys": [
+                        {"exchange": exchange, "symbol": symbol}
+                        for exchange, symbol in keys_to_delete
+                    ],
+                },
+                priority=EventPriority.LOW,
+            )
+
+    async def emit_metrics(self) -> None:
+        """
+        Scheduled metrics job.
+
+        This should be run by core.scheduler.Scheduler.add_interval_job().
+        """
+        await self._emit(
+            OIEventType.METRICS.topic,
+            self.stats(),
+            priority=EventPriority.LOW,
+        )
+
+    async def emit_health(self) -> None:
+        await self._emit(
+            OIEventType.HEALTH.topic,
+            {
+                "timestamp": self._now(),
+                "registered": self._registered,
+                "enabled": self.config.enabled,
+                "states": len(self._states),
+                "buffers": len(self._buffers),
+                "subscriptions": len(self._subscriptions),
+                "scheduler_available": self.scheduler is not None,
+                "cleanup_job_id": self._cleanup_job_id,
+                "metrics_job_id": self._metrics_job_id,
+            },
+            priority=EventPriority.LOW,
+        )
+
+    # ------------------------------------------------------------------
     # Public helpers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def get_state(self, exchange: str, symbol: str) -> OIState | None:
         return self._states.get(self._normalize_key(exchange, symbol))
 
-    def get_last_analysis(self, exchange: str, symbol: str) -> OIAnalysisResult | None:
+    def get_last_analysis(
+        self,
+        exchange: str,
+        symbol: str,
+    ) -> OIAnalysisResult | None:
         state = self.get_state(exchange, symbol)
         if state is None:
             return None
         return state.last_analysis
 
-    def get_feature_history(self, exchange: str, symbol: str) -> list[Any]:
+    def get_feature_history(
+        self,
+        exchange: str,
+        symbol: str,
+    ) -> list[OIFeatures]:
         key = self._normalize_key(exchange, symbol)
         buffers = self._buffers.get(key)
         if buffers is None:
             return []
         return list(buffers.feature_history)
 
-    # -------------------------------------------------------------------------
-    # Internal analytics flow helpers
-    # -------------------------------------------------------------------------
+    def stats(self) -> dict[str, Any]:
+        return {
+            "timestamp": self._now(),
+            "registered": self._registered,
+            "enabled": self.config.enabled,
+            "states": len(self._states),
+            "buffers": len(self._buffers),
+            "cooldowns": len(self._cooldowns),
+            "subscriptions": len(self._subscriptions),
+            "history_size": self._history_size,
+            "cleanup_job_registered": self._cleanup_job_id is not None,
+            "metrics_job_registered": self._metrics_job_id is not None,
+            "instruments": [
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "oi_history_size": len(buffers.oi_values),
+                    "price_history_size": len(buffers.price_values),
+                    "volume_history_size": len(buffers.volume_values),
+                    "feature_history_size": len(buffers.feature_history),
+                    "has_state": (exchange, symbol) in self._states,
+                }
+                for (exchange, symbol), buffers in self._buffers.items()
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # Analytics flow helpers
+    # ------------------------------------------------------------------
 
     def _detect_divergence_if_possible(
         self,
@@ -550,190 +721,308 @@ class OIAnalyzer:
             )
             return None
 
-    async def _emit_oi_updated(self, analysis: OIAnalysisResult) -> None:
-        payload = self._analysis_payload(analysis)
+    async def _emit_analysis_events(
+        self,
+        *,
+        key: tuple[str, str],
+        previous_regime: OIRegime,
+        analysis: OIAnalysisResult,
+        correlation_id: str | None,
+    ) -> None:
+        if self.config.emit_updates:
+            await self._emit_oi_updated(
+                analysis,
+                correlation_id=correlation_id,
+            )
+
+        if (
+            self.config.emit_regime_changes
+            and analysis.regime.regime != previous_regime
+            and self._cooldown_passed(
+                key,
+                "regime_change",
+                self.config.cooldowns.regime_change_cooldown_sec,
+                analysis.timestamp,
+            )
+        ):
+            await self._emit_regime_changed(
+                previous_regime=previous_regime,
+                analysis=analysis,
+                correlation_id=correlation_id,
+            )
+
+        if (
+            self.config.emit_divergences
+            and analysis.divergence is not None
+            and analysis.divergence.detected
+            and self._cooldown_passed(
+                key,
+                "divergence",
+                self.config.cooldowns.divergence_event_cooldown_sec,
+                analysis.timestamp,
+            )
+        ):
+            await self._emit_divergence_detected(
+                analysis,
+                correlation_id=correlation_id,
+            )
+
+        if (
+            self.config.emit_anomalies
+            and analysis.anomaly is not None
+            and analysis.anomaly.detected
+            and self._cooldown_passed(
+                key,
+                "anomaly",
+                self.config.cooldowns.anomaly_event_cooldown_sec,
+                analysis.timestamp,
+            )
+        ):
+            await self._emit_anomaly_detected(
+                analysis,
+                correlation_id=correlation_id,
+            )
+
+        if (
+            self.config.emit_squeeze_events
+            and analysis.regime.regime == OIRegime.SQUEEZE_SETUP
+            and self._cooldown_passed(
+                key,
+                "squeeze_setup",
+                self.config.cooldowns.squeeze_event_cooldown_sec,
+                analysis.timestamp,
+            )
+        ):
+            await self._emit_squeeze_setup(
+                analysis,
+                correlation_id=correlation_id,
+            )
+
+        if (
+            self.config.emit_capitulation_events
+            and self._is_capitulation_event(analysis)
+            and self._cooldown_passed(
+                key,
+                "capitulation",
+                self.config.cooldowns.capitulation_event_cooldown_sec,
+                analysis.timestamp,
+            )
+        ):
+            await self._emit_capitulation_detected(
+                analysis,
+                correlation_id=correlation_id,
+            )
+
+    @staticmethod
+    def _is_capitulation_event(analysis: OIAnalysisResult) -> bool:
+        if analysis.regime.regime == OIRegime.CAPITULATION:
+            return True
+
+        if analysis.anomaly is None or not analysis.anomaly.detected:
+            return False
+
+        return analysis.anomaly.anomaly_type in {
+            OIAnomalyType.LIQUIDATION_DRIVEN_OI_DROP,
+            OIAnomalyType.SUDDEN_DELEVERAGING,
+            OIAnomalyType.OI_COLLAPSE,
+        }
+
+    # ------------------------------------------------------------------
+    # Emit helpers
+    # ------------------------------------------------------------------
+
+    async def _emit_oi_updated(
+        self,
+        analysis: OIAnalysisResult,
+        *,
+        correlation_id: str | None,
+    ) -> None:
         await self._emit(
-            OIEventType.UPDATED.value,
-            payload,
-            source="oi_analyzer",
+            OIEventType.UPDATED.topic,
+            self._analysis_payload(analysis),
+            priority=EventPriority.NORMAL,
+            correlation_id=correlation_id,
         )
 
     async def _emit_regime_changed(
         self,
         *,
-        key: tuple[str, str],
-        timestamp: float,
         previous_regime: OIRegime,
         analysis: OIAnalysisResult,
+        correlation_id: str | None,
     ) -> None:
-        payload = {
-            "symbol": analysis.symbol,
-            "exchange": analysis.exchange,
-            "timestamp": timestamp,
-            "previous_regime": previous_regime.value,
-            "new_regime": analysis.regime.regime.value,
-            "confidence": analysis.regime.confidence,
-            "score": analysis.regime.score,
-            "reasons": list(analysis.regime.reasons),
-            "features": analysis.features.to_dict(),
-        }
         await self._emit(
-            OIEventType.REGIME_CHANGED.value,
-            payload,
-            source="oi_analyzer",
+            OIEventType.REGIME_CHANGED.topic,
+            {
+                "symbol": analysis.symbol,
+                "exchange": analysis.exchange,
+                "timestamp": analysis.timestamp,
+                "previous_regime": previous_regime.value,
+                "new_regime": analysis.regime.regime.value,
+                "confidence": analysis.regime.confidence,
+                "score": analysis.regime.score,
+                "reasons": list(analysis.regime.reasons),
+                "features": analysis.features.to_dict(),
+            },
+            priority=EventPriority.HIGH,
+            correlation_id=correlation_id,
         )
 
-    async def _emit_divergence_detected(self, analysis: OIAnalysisResult) -> None:
-        divergence = analysis.divergence
-        if divergence is None:
+    async def _emit_divergence_detected(
+        self,
+        analysis: OIAnalysisResult,
+        *,
+        correlation_id: str | None,
+    ) -> None:
+        if analysis.divergence is None:
             return
 
-        payload = {
-            "symbol": analysis.symbol,
-            "exchange": analysis.exchange,
-            "timestamp": analysis.timestamp,
-            "divergence_type": divergence.divergence_type.value,
-            "confidence": divergence.confidence,
-            "score": divergence.score,
-            "window_size": divergence.window_size,
-            "reasons": list(divergence.reasons),
-            "regime": analysis.regime.regime.value,
-            "features": analysis.features.to_dict(),
-        }
         await self._emit(
-            OIEventType.DIVERGENCE_DETECTED.value,
-            payload,
-            source="oi_analyzer",
+            OIEventType.DIVERGENCE_DETECTED.topic,
+            {
+                "symbol": analysis.symbol,
+                "exchange": analysis.exchange,
+                "timestamp": analysis.timestamp,
+                "divergence_type": analysis.divergence.divergence_type.value,
+                "confidence": analysis.divergence.confidence,
+                "score": analysis.divergence.score,
+                "window_size": analysis.divergence.window_size,
+                "reasons": list(analysis.divergence.reasons),
+                "regime": analysis.regime.regime.value,
+                "features": analysis.features.to_dict(),
+            },
+            priority=EventPriority.HIGH,
+            correlation_id=correlation_id,
         )
 
-    async def _emit_anomaly_detected(self, analysis: OIAnalysisResult) -> None:
-        anomaly = analysis.anomaly
-        if anomaly is None:
+    async def _emit_anomaly_detected(
+        self,
+        analysis: OIAnalysisResult,
+        *,
+        correlation_id: str | None,
+    ) -> None:
+        if analysis.anomaly is None:
             return
 
-        payload = {
-            "symbol": analysis.symbol,
-            "exchange": analysis.exchange,
-            "timestamp": analysis.timestamp,
-            "anomaly_type": anomaly.anomaly_type.value,
-            "strength": anomaly.strength.value,
-            "confidence": anomaly.confidence,
-            "score": anomaly.score,
-            "reasons": list(anomaly.reasons),
-            "regime": analysis.regime.regime.value,
-            "features": analysis.features.to_dict(),
-        }
         await self._emit(
-            OIEventType.ANOMALY_DETECTED.value,
-            payload,
-            source="oi_analyzer",
+            OIEventType.ANOMALY_DETECTED.topic,
+            {
+                "symbol": analysis.symbol,
+                "exchange": analysis.exchange,
+                "timestamp": analysis.timestamp,
+                "anomaly_type": analysis.anomaly.anomaly_type.value,
+                "strength": analysis.anomaly.strength.value,
+                "confidence": analysis.anomaly.confidence,
+                "score": analysis.anomaly.score,
+                "reasons": list(analysis.anomaly.reasons),
+                "regime": analysis.regime.regime.value,
+                "features": analysis.features.to_dict(),
+            },
+            priority=EventPriority.HIGH,
+            correlation_id=correlation_id,
         )
 
-    async def _emit_squeeze_setup(self, analysis: OIAnalysisResult) -> None:
-        payload = {
-            "symbol": analysis.symbol,
-            "exchange": analysis.exchange,
-            "timestamp": analysis.timestamp,
-            "regime": analysis.regime.regime.value,
-            "confidence": analysis.regime.confidence,
-            "score": analysis.regime.score,
-            "reasons": list(analysis.regime.reasons),
-            "features": analysis.features.to_dict(),
-        }
+    async def _emit_squeeze_setup(
+        self,
+        analysis: OIAnalysisResult,
+        *,
+        correlation_id: str | None,
+    ) -> None:
         await self._emit(
-            OIEventType.SQUEEZE_SETUP.value,
-            payload,
-            source="oi_analyzer",
+            OIEventType.SQUEEZE_SETUP.topic,
+            {
+                "symbol": analysis.symbol,
+                "exchange": analysis.exchange,
+                "timestamp": analysis.timestamp,
+                "regime": analysis.regime.regime.value,
+                "confidence": analysis.regime.confidence,
+                "score": analysis.regime.score,
+                "reasons": list(analysis.regime.reasons),
+                "features": analysis.features.to_dict(),
+            },
+            priority=EventPriority.HIGH,
+            correlation_id=correlation_id,
         )
 
-    async def _emit_capitulation_detected(self, analysis: OIAnalysisResult) -> None:
+    async def _emit_capitulation_detected(
+        self,
+        analysis: OIAnalysisResult,
+        *,
+        correlation_id: str | None,
+    ) -> None:
         anomaly_type = (
             analysis.anomaly.anomaly_type.value
             if analysis.anomaly is not None and analysis.anomaly.detected
             else None
         )
 
-        payload = {
-            "symbol": analysis.symbol,
-            "exchange": analysis.exchange,
-            "timestamp": analysis.timestamp,
-            "regime": analysis.regime.regime.value,
-            "regime_confidence": analysis.regime.confidence,
-            "anomaly_type": anomaly_type,
-            "features": analysis.features.to_dict(),
-            "reasons": self._collect_capitulation_reasons(analysis),
-        }
         await self._emit(
-            OIEventType.CAPITULATION_DETECTED.value,
-            payload,
-            source="oi_analyzer",
+            OIEventType.CAPITULATION_DETECTED.topic,
+            {
+                "symbol": analysis.symbol,
+                "exchange": analysis.exchange,
+                "timestamp": analysis.timestamp,
+                "regime": analysis.regime.regime.value,
+                "regime_confidence": analysis.regime.confidence,
+                "anomaly_type": anomaly_type,
+                "features": analysis.features.to_dict(),
+                "reasons": self._collect_capitulation_reasons(analysis),
+            },
+            priority=EventPriority.CRITICAL,
+            correlation_id=correlation_id,
         )
 
     async def _emit(
         self,
-        event_name: str,
+        topic: str,
         payload: dict[str, Any],
         *,
-        source: str,
-    ) -> None:
-        await self.event_bus.emit(
-            event_name,
+        priority: EventPriority = EventPriority.NORMAL,
+        correlation_id: str | None = None,
+    ) -> bool:
+        return await self.event_bus.emit(
+            topic,
             payload,
-            source=source,
+            priority=priority,
+            source=self.config.source_name,
+            correlation_id=correlation_id,
         )
 
     def _analysis_payload(self, analysis: OIAnalysisResult) -> dict[str, Any]:
-        return {
-            "symbol": analysis.symbol,
-            "exchange": analysis.exchange,
-            "timestamp": analysis.timestamp,
-            "snapshot": analysis.snapshot.to_dict(),
-            "context": analysis.context.to_dict(),
-            "features": analysis.features.to_dict(),
-            "regime": analysis.regime.to_dict(),
-            "divergence": analysis.divergence.to_dict() if analysis.divergence else None,
-            "anomaly": analysis.anomaly.to_dict() if analysis.anomaly else None,
-            "metadata": dict(analysis.metadata),
-        }
+        return analysis.to_dict()
 
-    def _collect_capitulation_reasons(self, analysis: OIAnalysisResult) -> list[str]:
+    @staticmethod
+    def _collect_capitulation_reasons(analysis: OIAnalysisResult) -> list[str]:
         reasons: list[str] = []
-
         reasons.extend(analysis.regime.reasons)
 
         if analysis.anomaly is not None:
             reasons.extend(analysis.anomaly.reasons)
 
-        # дедуплікація зі збереженням порядку
-        seen: set[str] = set()
-        unique_reasons: list[str] = []
-        for item in reasons:
-            if item not in seen:
-                seen.add(item)
-                unique_reasons.append(item)
+        return list(dict.fromkeys(reasons))
 
-        return unique_reasons
-
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Context / state / buffers
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _get_or_create_buffers(
         self,
         key: tuple[str, str],
     ) -> OIInstrumentBuffers:
         buffers = self._buffers.get(key)
-        if buffers is None:
-            buffers = OIInstrumentBuffers(
-                oi_values=deque(maxlen=self._history_size),
-                oi_timestamps=deque(maxlen=self._history_size),
-                price_values=deque(maxlen=self._history_size),
-                price_timestamps=deque(maxlen=self._history_size),
-                volume_values=deque(maxlen=self._history_size),
-                volume_timestamps=deque(maxlen=self._history_size),
-                feature_history=deque(maxlen=self._history_size),
-            )
-            self._buffers[key] = buffers
+        if buffers is not None:
+            return buffers
+
+        buffers = OIInstrumentBuffers(
+            oi_values=deque(maxlen=self._history_size),
+            oi_timestamps=deque(maxlen=self._history_size),
+            price_values=deque(maxlen=self._history_size),
+            price_timestamps=deque(maxlen=self._history_size),
+            volume_values=deque(maxlen=self._history_size),
+            volume_timestamps=deque(maxlen=self._history_size),
+            feature_history=deque(maxlen=self._history_size),
+        )
+        self._buffers[key] = buffers
         return buffers
 
     def _get_or_create_state(
@@ -741,31 +1030,31 @@ class OIAnalyzer:
         key: tuple[str, str],
     ) -> OIState:
         state = self._states.get(key)
-        if state is None:
-            state = OIState(
-                exchange=key[0],
-                symbol=key[1],
-            )
-            self._states[key] = state
+        if state is not None:
+            return state
+
+        state = OIState(
+            exchange=key[0],
+            symbol=key[1],
+        )
+        self._states[key] = state
         return state
 
     def _get_or_create_context(
-            self,
-            key: tuple[str, str],
-            timestamp: float,
+        self,
+        key: tuple[str, str],
+        timestamp: float,
     ) -> OIMarketContext:
         state = self._get_or_create_state(key)
 
-        context = state.last_context
-        if context is None:
-            context = OIMarketContext(
+        if state.last_context is None:
+            state.last_context = OIMarketContext(
                 symbol=key[1],
                 exchange=key[0],
                 timestamp=timestamp,
             )
-            state.last_context = context
 
-        return context
+        return state.last_context
 
     def _get_context_for_key(
         self,
@@ -775,52 +1064,21 @@ class OIAnalyzer:
         if state is None or state.last_context is None:
             return None
 
-        last_ts = self._last_context_ts.get(key)
-        if last_ts is None:
-            return state.last_context
-
-        if (self._now() - last_ts) > self.config.stale_context_after_sec:
+        if state.last_context.is_stale(
+            self._now(),
+            self.config.stale_context_after_sec,
+        ):
             return None
 
         return state.last_context
 
-    def _build_empty_context(self, snapshot: OISnapshot) -> OIMarketContext:
+    @staticmethod
+    def _build_empty_context(snapshot: OISnapshot) -> OIMarketContext:
         return OIMarketContext(
             symbol=snapshot.symbol,
             exchange=snapshot.exchange,
             timestamp=snapshot.timestamp,
         )
-
-    def _maybe_cleanup_stale_state(self, now_ts: float) -> None:
-        if (now_ts - self._last_cleanup_ts) < 30.0:
-            return
-
-        stale_after = self.config.stale_state_cleanup_after_sec
-        keys_to_delete: list[tuple[str, str]] = []
-
-        for key, state in self._states.items():
-            if state.last_update_ts is None:
-                continue
-            if (now_ts - state.last_update_ts) > stale_after:
-                keys_to_delete.append(key)
-
-        for key in keys_to_delete:
-            self._states.pop(key, None)
-            self._buffers.pop(key, None)
-
-            cooldown_keys = [cd_key for cd_key in self._cooldowns if cd_key[:2] == key]
-            for cd_key in cooldown_keys:
-                self._cooldowns.pop(cd_key, None)
-
-            self._last_context_ts.pop(key, None)
-
-        if keys_to_delete:
-            self.logger.info(
-                "Cleaned stale OI state",
-                extra={"removed_count": len(keys_to_delete)},
-            )
-
-        self._last_cleanup_ts = now_ts
 
     def _cooldown_passed(
         self,
@@ -829,16 +1087,79 @@ class OIAnalyzer:
         cooldown_sec: float,
         now_ts: float,
     ) -> bool:
-        cd_key = (key[0], key[1], event_kind)
-        last_ts = self._cooldowns.get(cd_key)
+        cooldown_key = (key[0], key[1], event_kind)
+        last_ts = self._cooldowns.get(cooldown_key)
+
         if last_ts is None or (now_ts - last_ts) >= cooldown_sec:
-            self._cooldowns[cd_key] = now_ts
+            self._cooldowns[cooldown_key] = now_ts
             return True
+
         return False
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Context update helpers
+    # ------------------------------------------------------------------
+
+    def _update_price_context(
+        self,
+        *,
+        context: OIMarketContext,
+        buffers: OIInstrumentBuffers,
+        price: float,
+    ) -> None:
+        previous_price = (
+            float(buffers.price_values[-2])
+            if len(buffers.price_values) >= 2
+            else None
+        )
+
+        context.price = price
+
+        if previous_price is not None:
+            context.price_delta = price - previous_price
+            if abs(previous_price) > 1e-12:
+                context.price_delta_pct = (
+                    (price - previous_price) / abs(previous_price)
+                ) * 100.0
+
+    def _update_volume_context(
+        self,
+        *,
+        context: OIMarketContext,
+        buffers: OIInstrumentBuffers,
+        volume: float,
+    ) -> None:
+        context.volume = volume
+
+        volume_ma = self.feature_builder.compute_moving_average(
+            list(buffers.volume_values),
+            self.config.windows.volume_window,
+        )
+        context.volume_ma = volume_ma
+        context.volume_ratio = self.feature_builder.compute_volume_ratio(
+            volume,
+            volume_ma,
+        )
+
+    @staticmethod
+    def _update_aggressive_flow_context(
+        *,
+        context: OIMarketContext,
+        side: str | None,
+        qty: float,
+    ) -> None:
+        if not side:
+            return
+
+        normalized_side = side.lower().strip()
+        if normalized_side in {"buy", "bid", "long"}:
+            context.aggressive_buy_volume = qty
+        elif normalized_side in {"sell", "ask", "short"}:
+            context.aggressive_sell_volume = qty
+
+    # ------------------------------------------------------------------
     # Parsing / normalization
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _parse_open_interest_payload(
         self,
@@ -872,10 +1193,13 @@ class OIAnalyzer:
             oi=oi,
         )
 
-    def _extract_payload(self, event: Any) -> Mapping[str, Any]:
-        payload = getattr(event, "payload", event)
+    @staticmethod
+    def _extract_payload(event: Event | Mapping[str, Any]) -> Mapping[str, Any]:
+        payload = event.payload if isinstance(event, Event) else event
+
         if isinstance(payload, Mapping):
             return payload
+
         raise ValueError("Event payload must be a mapping-like object")
 
     def _extract_key_from_payload(
@@ -892,11 +1216,15 @@ class OIAnalyzer:
 
     def _normalize_key(self, exchange: str, symbol: str) -> tuple[str, str]:
         normalized_exchange = exchange.lower().strip()
-        normalized_symbol = symbol.upper().strip() if self.config.normalize_symbol else symbol.strip()
+        normalized_symbol = (
+            symbol.upper().strip()
+            if self.config.normalize_symbol
+            else symbol.strip()
+        )
         return normalized_exchange, normalized_symbol
 
     def _extract_timestamp(self, payload: Mapping[str, Any]) -> float:
-        ts = self._extract_float(
+        timestamp = self._extract_float(
             payload,
             "timestamp",
             "ts",
@@ -904,38 +1232,49 @@ class OIAnalyzer:
             "event_time",
             "T",
         )
-        if ts is None:
+
+        if timestamp is None:
             return self._now()
 
-        # Якщо timestamp виглядає як milliseconds
-        if ts > 10_000_000_000:
-            return ts / 1000.0
-        return ts
+        if timestamp > 10_000_000_000:
+            return timestamp / 1000.0
 
+        return timestamp
+
+    @staticmethod
     def _extract_float(
-        self,
         payload: Mapping[str, Any],
         *keys: str,
     ) -> float | None:
         for key in keys:
-            if key in payload and payload[key] is not None:
-                try:
-                    return float(payload[key])
-                except (TypeError, ValueError):
-                    continue
+            if key not in payload or payload[key] is None:
+                continue
+
+            try:
+                value = float(payload[key])
+            except (TypeError, ValueError):
+                continue
+
+            if math.isfinite(value):
+                return value
+
         return None
 
+    @staticmethod
     def _extract_str(
-        self,
         payload: Mapping[str, Any],
         *keys: str,
     ) -> str | None:
         for key in keys:
-            if key in payload and payload[key] is not None:
-                value = str(payload[key]).strip()
-                if value:
-                    return value
+            if key not in payload or payload[key] is None:
+                continue
+
+            value = str(payload[key]).strip()
+            if value:
+                return value
+
         return None
 
-    def _now(self) -> float:
+    @staticmethod
+    def _now() -> float:
         return time.time()

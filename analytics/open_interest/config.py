@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass(slots=True)
 class OIThresholds:
     """
     Порогові значення для класифікації режимів, дивергенцій та аномалій.
-    Всі значення підібрані як дефолтні стартові і можуть бути
-    відкалібровані під конкретну біржу / таймфрейм / інструмент.
+
+    Значення є стартовими дефолтами і мають калібруватися під:
+    - біржу
+    - symbol
+    - таймфрейм
+    - тип ринку
     """
 
     min_oi_change_pct: float = 0.25
@@ -41,20 +46,68 @@ class OIThresholds:
     def validate(self) -> None:
         if self.min_oi_change_pct < 0:
             raise ValueError("min_oi_change_pct must be >= 0")
+
         if self.min_price_change_pct < 0:
             raise ValueError("min_price_change_pct must be >= 0")
+
         if self.volume_confirmation_ratio <= 0:
             raise ValueError("volume_confirmation_ratio must be > 0")
-        if self.divergence_min_confidence < 0 or self.divergence_min_confidence > 1:
+
+        if self.aggressive_flow_confirmation < 0:
+            raise ValueError("aggressive_flow_confirmation must be >= 0")
+
+        if self.funding_extreme_positive < 0:
+            raise ValueError("funding_extreme_positive must be >= 0")
+
+        if self.funding_extreme_negative > 0:
+            raise ValueError("funding_extreme_negative must be <= 0")
+
+        if self.divergence_min_price_move_pct < 0:
+            raise ValueError("divergence_min_price_move_pct must be >= 0")
+
+        if self.divergence_max_oi_response_pct < 0:
+            raise ValueError("divergence_max_oi_response_pct must be >= 0")
+
+        if not 0 <= self.divergence_min_confidence <= 1:
             raise ValueError("divergence_min_confidence must be in [0, 1]")
+
         if self.anomaly_zscore_threshold <= 0:
             raise ValueError("anomaly_zscore_threshold must be > 0")
+
         if self.extreme_anomaly_zscore_threshold < self.anomaly_zscore_threshold:
             raise ValueError(
                 "extreme_anomaly_zscore_threshold must be >= anomaly_zscore_threshold"
             )
+
         if self.overheated_zscore_threshold <= 0:
             raise ValueError("overheated_zscore_threshold must be > 0")
+
+        if self.capitulation_price_move_pct < 0:
+            raise ValueError("capitulation_price_move_pct must be >= 0")
+
+        if self.capitulation_oi_drop_pct < 0:
+            raise ValueError("capitulation_oi_drop_pct must be >= 0")
+
+        if self.deleveraging_oi_drop_pct < 0:
+            raise ValueError("deleveraging_oi_drop_pct must be >= 0")
+
+        if self.squeeze_funding_abs_threshold < 0:
+            raise ValueError("squeeze_funding_abs_threshold must be >= 0")
+
+        if self.squeeze_oi_build_pct < 0:
+            raise ValueError("squeeze_oi_build_pct must be >= 0")
+
+        if self.pressure_score_trend_threshold < 0:
+            raise ValueError("pressure_score_trend_threshold must be >= 0")
+
+        if self.pressure_score_exhaustion_threshold < 0:
+            raise ValueError("pressure_score_exhaustion_threshold must be >= 0")
+
+        if self.pressure_score_exhaustion_threshold < self.pressure_score_trend_threshold:
+            raise ValueError(
+                "pressure_score_exhaustion_threshold must be >= "
+                "pressure_score_trend_threshold"
+            )
 
 
 @dataclass(slots=True)
@@ -74,26 +127,39 @@ class OIWindows:
     def validate(self) -> None:
         if self.history_size < 20:
             raise ValueError("history_size must be >= 20")
+
         if self.fast_window < 2:
             raise ValueError("fast_window must be >= 2")
+
         if self.slow_window <= self.fast_window:
             raise ValueError("slow_window must be > fast_window")
+
         if self.zscore_window < self.fast_window:
             raise ValueError("zscore_window must be >= fast_window")
+
         if self.divergence_window < 5:
             raise ValueError("divergence_window must be >= 5")
+
         if self.pressure_window < 3:
             raise ValueError("pressure_window must be >= 3")
+
         if self.volume_window < 2:
             raise ValueError("volume_window must be >= 2")
+
         if self.history_size < self.slow_window:
             raise ValueError("history_size must be >= slow_window")
+
+        if self.history_size < self.zscore_window:
+            raise ValueError("history_size must be >= zscore_window")
+
+        if self.history_size < self.divergence_window:
+            raise ValueError("history_size must be >= divergence_window")
 
 
 @dataclass(slots=True)
 class OICooldowns:
     """
-    Антиспам/дедуплікація подій.
+    Антиспам / дедуплікація high-level OI events.
     """
 
     regime_change_cooldown_sec: float = 10.0
@@ -116,12 +182,62 @@ class OICooldowns:
 
 
 @dataclass(slots=True)
+class OIMaintenanceConfig:
+    """
+    Scheduler-related налаштування для OIAnalyzer.
+
+    Цей конфіг не запускає Scheduler напряму.
+    Він лише описує, які periodic jobs має зареєструвати OIAnalyzer
+    через core.scheduler.Scheduler.add_interval_job().
+    """
+
+    enable_periodic_cleanup: bool = True
+    cleanup_interval_sec: float = 60.0
+
+    enable_metrics_emit: bool = True
+    metrics_interval_sec: float = 30.0
+
+    cleanup_job_name: str = "analytics.open_interest.cleanup_stale_state"
+    metrics_job_name: str = "analytics.open_interest.emit_metrics"
+
+    cleanup_job_timeout_sec: float | None = 10.0
+    metrics_job_timeout_sec: float | None = 5.0
+
+    def validate(self) -> None:
+        if self.cleanup_interval_sec <= 0:
+            raise ValueError("cleanup_interval_sec must be > 0")
+
+        if self.metrics_interval_sec <= 0:
+            raise ValueError("metrics_interval_sec must be > 0")
+
+        if not self.cleanup_job_name.strip():
+            raise ValueError("cleanup_job_name must not be empty")
+
+        if not self.metrics_job_name.strip():
+            raise ValueError("metrics_job_name must not be empty")
+
+        if self.cleanup_job_timeout_sec is not None and self.cleanup_job_timeout_sec <= 0:
+            raise ValueError("cleanup_job_timeout_sec must be > 0 when provided")
+
+        if self.metrics_job_timeout_sec is not None and self.metrics_job_timeout_sec <= 0:
+            raise ValueError("metrics_job_timeout_sec must be > 0 when provided")
+
+
+@dataclass(slots=True)
 class OIAnalyzerConfig:
     """
-    Головний конфіг OI-модуля.
+    Головний конфіг Open Interest analytics-модуля.
+
+    Runtime-залежності не зберігаються тут:
+    - EventBus передається в OIAnalyzer через constructor dependency injection.
+    - Scheduler передається в OIAnalyzer через constructor dependency injection.
+    - Logger створюється в OIAnalyzer через core.logger.get_logger().
     """
 
     enabled: bool = True
+
+    source_name: str = "oi_analyzer"
+
     emit_updates: bool = True
     emit_regime_changes: bool = True
     emit_divergences: bool = True
@@ -142,15 +258,21 @@ class OIAnalyzerConfig:
     thresholds: OIThresholds = field(default_factory=OIThresholds)
     windows: OIWindows = field(default_factory=OIWindows)
     cooldowns: OICooldowns = field(default_factory=OICooldowns)
+    maintenance: OIMaintenanceConfig = field(default_factory=OIMaintenanceConfig)
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> None:
+        if not self.source_name.strip():
+            raise ValueError("source_name must not be empty")
+
         if self.stale_context_after_sec <= 0:
             raise ValueError("stale_context_after_sec must be > 0")
+
         if self.stale_state_cleanup_after_sec <= 0:
             raise ValueError("stale_state_cleanup_after_sec must be > 0")
+
         if self.stale_state_cleanup_after_sec < self.stale_context_after_sec:
             raise ValueError(
                 "stale_state_cleanup_after_sec must be >= stale_context_after_sec"
@@ -159,42 +281,38 @@ class OIAnalyzerConfig:
         self.thresholds.validate()
         self.windows.validate()
         self.cooldowns.validate()
+        self.maintenance.validate()
 
     @classmethod
-    def from_dict(cls, data: dict) -> "OIAnalyzerConfig":
+    def from_dict(cls, data: dict[str, Any] | None) -> "OIAnalyzerConfig":
         """
-        Зручно для інтеграції з AppConfig / YAML / env-based config.
-        """
-        data = dict(data or {})
+        Зручний factory для інтеграції з AppConfig / YAML / JSON / env-based config.
 
-        thresholds = OIThresholds(**data.pop("thresholds", {}))
-        windows = OIWindows(**data.pop("windows", {}))
-        cooldowns = OICooldowns(**data.pop("cooldowns", {}))
+        Очікуваний формат:
+
+        {
+            "enabled": true,
+            "source_name": "oi_analyzer",
+            "thresholds": {...},
+            "windows": {...},
+            "cooldowns": {...},
+            "maintenance": {...}
+        }
+        """
+        raw = dict(data or {})
+
+        thresholds = OIThresholds(**dict(raw.pop("thresholds", {}) or {}))
+        windows = OIWindows(**dict(raw.pop("windows", {}) or {}))
+        cooldowns = OICooldowns(**dict(raw.pop("cooldowns", {}) or {}))
+        maintenance = OIMaintenanceConfig(**dict(raw.pop("maintenance", {}) or {}))
 
         return cls(
             thresholds=thresholds,
             windows=windows,
             cooldowns=cooldowns,
-            **data,
+            maintenance=maintenance,
+            **raw,
         )
 
-    def to_dict(self) -> dict:
-        return {
-            "enabled": self.enabled,
-            "emit_updates": self.emit_updates,
-            "emit_regime_changes": self.emit_regime_changes,
-            "emit_divergences": self.emit_divergences,
-            "emit_anomalies": self.emit_anomalies,
-            "emit_squeeze_events": self.emit_squeeze_events,
-            "emit_capitulation_events": self.emit_capitulation_events,
-            "require_price_context": self.require_price_context,
-            "require_volume_confirmation": self.require_volume_confirmation,
-            "require_funding_for_squeeze": self.require_funding_for_squeeze,
-            "normalize_symbol": self.normalize_symbol,
-            "store_full_analysis": self.store_full_analysis,
-            "stale_context_after_sec": self.stale_context_after_sec,
-            "stale_state_cleanup_after_sec": self.stale_state_cleanup_after_sec,
-            "thresholds": self.thresholds.__dict__,
-            "windows": self.windows.__dict__,
-            "cooldowns": self.cooldowns.__dict__,
-        }
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
