@@ -136,10 +136,12 @@ class CrossExchangeArbStrategyConfig(BaseSpreadStrategyConfig):
     allowed_instrument_types: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseSpreadStrategyConfig.__post_init__(self)
+
         self.allowed_instrument_types = _normalize_instrument_type_set(
             self.allowed_instrument_types
         )
+
         self.validate_cross_exchange()
 
     def validate_cross_exchange(self) -> None:

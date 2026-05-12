@@ -121,7 +121,7 @@ class SpotFuturesBasisStrategyConfig(BaseSpreadStrategyConfig):
     allowed_futures_exchanges: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseSpreadStrategyConfig.__post_init__(self)
 
         self.allowed_regimes = _normalize_regime_set(self.allowed_regimes)
         self.allowed_spot_exchanges = _normalize_exchange_set(self.allowed_spot_exchanges)
