@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
+
+from core.event_bus import Event, EventBus
+from core.scheduler import Scheduler
 
 from analytics.price_action.base import BasePriceActionConfig, BasePriceActionModule
 from analytics.price_action.enums import (
@@ -20,6 +23,7 @@ from analytics.price_action.models import (
     SupportResistanceLevel,
     SupportResistanceState,
     SwingPoint,
+    clamp_unit,
 )
 
 
@@ -44,8 +48,12 @@ class SupportResistanceConfig(BasePriceActionConfig):
     decay_broken_levels: bool = False
 
     emit_events: bool = True
-    event_namespace: str = "price_action.support_resistance"
+    event_namespace: str = "analytics.price_action.support_resistance"
     publish_snapshots: bool = False
+
+    subscribe_market_structure_swings: bool = True
+    swing_high_topic: str = "analytics.price_action.market_structure.swing_high"
+    swing_low_topic: str = "analytics.price_action.market_structure.swing_low"
 
     def validate(self) -> None:
         super().validate()
@@ -73,18 +81,24 @@ class SupportResistanceConfig(BasePriceActionConfig):
         if self.rejection_wick_ratio_threshold < 0:
             raise ValueError("rejection_wick_ratio_threshold must be >= 0")
 
+        if self.subscribe_market_structure_swings:
+            if not self.swing_high_topic:
+                raise ValueError("swing_high_topic must not be empty")
+            if not self.swing_low_topic:
+                raise ValueError("swing_low_topic must not be empty")
+
 
 class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
     """
-    Stateful support / resistance analyzer.
+    Event-driven support / resistance analyzer.
 
-    Features
-    --------
-    - builds zones from swing highs / lows
-    - clusters nearby levels into shared zones
-    - tracks touches / rejections / breakouts / retests / flips
-    - separates internal and external structure layers
-    - integrates with EventBus
+    Responsibilities:
+    - listen to market.candle / market.candles
+    - listen to analytics.price_action.market_structure.swing_high
+    - listen to analytics.price_action.market_structure.swing_low
+    - build support/resistance zones from swing points
+    - track touches, rejections, breakouts, retests and flips
+    - publish analytics.price_action.support_resistance.* events
     """
 
     def __init__(
@@ -92,17 +106,21 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         symbol: str,
         timeframe: str,
         *,
-        event_bus: Optional[Any] = None,
-        config: Optional[SupportResistanceConfig] = None,
+        event_bus: EventBus,
+        scheduler: Scheduler | None = None,
+        config: SupportResistanceConfig | None = None,
     ) -> None:
         resolved_config = config or SupportResistanceConfig()
+
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
             event_bus=event_bus,
+            scheduler=scheduler,
             config=resolved_config,
-            service_name="price_action.support_resistance",
+            service_name="analytics.price_action.support_resistance",
         )
+
         self.config: SupportResistanceConfig = resolved_config
 
         self._candles: Deque[Candle] = deque(maxlen=self.config.max_candles)
@@ -111,13 +129,13 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         self._events: Deque[SupportResistanceEvent] = deque(maxlen=self.config.max_events)
 
         self._processed_swings: set[str] = set()
-        self._processed_touch_keys: set[Tuple[str, int]] = set()
-        self._processed_break_keys: set[Tuple[str, int]] = set()
-        self._processed_retest_keys: set[Tuple[str, int]] = set()
-        self._processed_rejection_keys: set[Tuple[str, int]] = set()
-        self._processed_flip_keys: set[Tuple[str, int]] = set()
+        self._processed_touch_keys: set[tuple[str, int]] = set()
+        self._processed_break_keys: set[tuple[str, int]] = set()
+        self._processed_retest_keys: set[tuple[str, int]] = set()
+        self._processed_rejection_keys: set[tuple[str, int]] = set()
+        self._processed_flip_keys: set[tuple[str, int]] = set()
 
-        self._global_candle_index: int = 0
+        self._global_candle_index = 0
 
         self._state = SupportResistanceState(
             symbol=self.symbol,
@@ -134,7 +152,98 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         )
 
     # -------------------------------------------------------------------------
-    # Public API
+    # Registration / EventBus handlers
+    # -------------------------------------------------------------------------
+
+    def register(self) -> None:
+        super().register()
+
+        if self.config.subscribe_market_structure_swings:
+            self._subscribe(
+                self.config.swing_high_topic,
+                self.on_swing_event,
+                name=f"{self.module_name}.on_swing_high_event",
+            )
+            self._subscribe(
+                self.config.swing_low_topic,
+                self.on_swing_event,
+                name=f"{self.module_name}.on_swing_low_event",
+            )
+
+    async def on_candle_event(self, event: Event) -> None:
+        candles = self._extract_candles_payload(event)
+        if not candles:
+            self.logger.warning(
+                "SupportResistanceAnalyzer received empty candle payload",
+                extra={"topic": event.topic, "event_id": event.event_id},
+            )
+            return
+
+        result = self.add_candles(candles)
+        await self._publish_update_result(result, correlation_id=event.correlation_id)
+
+    async def on_candles_event(self, event: Event) -> None:
+        candles = self._extract_candles_payload(event)
+        if not candles:
+            self.logger.warning(
+                "SupportResistanceAnalyzer received empty candles payload",
+                extra={"topic": event.topic, "event_id": event.event_id},
+            )
+            return
+
+        result = self.add_candles(candles)
+        await self._publish_update_result(result, correlation_id=event.correlation_id)
+
+    async def on_swing_event(self, event: Event) -> None:
+        if not isinstance(event.payload, Mapping):
+            self.logger.warning(
+                "SupportResistanceAnalyzer received invalid swing payload",
+                extra={"topic": event.topic, "event_id": event.event_id},
+            )
+            return
+
+        result = self.add_swings([event.payload])
+        await self._publish_update_result(result, correlation_id=event.correlation_id)
+
+    async def _publish_update_result(
+        self,
+        result: Mapping[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
+        for event_payload in result.get("new_events", []):
+            if not isinstance(event_payload, Mapping):
+                continue
+
+            event_type = event_payload.get("event_type")
+            if not event_type:
+                continue
+
+            await self._emit_event(
+                self._build_event_name(str(event_type)),
+                event_payload,
+                source=self.module_name,
+                correlation_id=correlation_id,
+            )
+
+        await self._emit_event(
+            self._build_event_name("updated"),
+            {
+                "symbol": self.symbol,
+                "timeframe": self.timeframe,
+                "state": result.get("state"),
+                "updated_levels_count": len(result.get("updated_levels", [])),
+                "new_events_count": len(result.get("new_events", [])),
+            },
+            source=self.module_name,
+            correlation_id=correlation_id,
+        )
+
+        if self.config.publish_snapshots:
+            await self.publish_snapshot(correlation_id=correlation_id)
+
+    # -------------------------------------------------------------------------
+    # Public sync domain API
     # -------------------------------------------------------------------------
 
     def reset(self) -> None:
@@ -164,32 +273,32 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
     def get_state(self) -> SupportResistanceState:
         return self._state
 
-    def get_levels(self, layer: Optional[StructureLayer] = None) -> List[SupportResistanceLevel]:
+    def get_levels(self, layer: StructureLayer | None = None) -> list[SupportResistanceLevel]:
         if layer == StructureLayer.INTERNAL:
             return list(self._internal_levels)
         if layer == StructureLayer.EXTERNAL:
             return list(self._external_levels)
         return [*self._internal_levels, *self._external_levels]
 
-    def get_events(self) -> List[SupportResistanceEvent]:
+    def get_events(self) -> list[SupportResistanceEvent]:
         return list(self._events)
 
     def update(
         self,
         *,
-        candles: Optional[Sequence[Mapping[str, Any]]] = None,
-        swings: Optional[Sequence[SwingPoint | Mapping[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+        candles: Sequence[Mapping[str, Any]] | None = None,
+        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return self.add_data(candles=candles, swings=swings)
 
     def add_data(
         self,
         *,
-        candles: Optional[Sequence[Mapping[str, Any]]] = None,
-        swings: Optional[Sequence[SwingPoint | Mapping[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        new_events: List[SupportResistanceEvent] = []
-        updated_levels: List[SupportResistanceLevel] = []
+        candles: Sequence[Mapping[str, Any]] | None = None,
+        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        new_events: list[SupportResistanceEvent] = []
+        updated_levels: list[SupportResistanceLevel] = []
 
         if swings:
             levels_from_swings, events_from_swings = self._ingest_swings(swings)
@@ -201,9 +310,6 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
             new_events.extend(events_from_candles)
 
         self._refresh_state()
-
-        if self.config.publish_snapshots:
-            self._publish_snapshot()
 
         self.logger.debug(
             "Support/resistance updated",
@@ -222,16 +328,16 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
             "new_events": [self._event_to_dict(event) for event in new_events],
         }
 
-    def add_candle(self, candle: Mapping[str, Any]) -> Dict[str, Any]:
+    def add_candle(self, candle: Mapping[str, Any]) -> dict[str, Any]:
         return self.add_data(candles=[candle])
 
-    def add_candles(self, candles: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    def add_candles(self, candles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         return self.add_data(candles=candles)
 
-    def add_swings(self, swings: Sequence[SwingPoint | Mapping[str, Any]]) -> Dict[str, Any]:
+    def add_swings(self, swings: Sequence[SwingPoint | Mapping[str, Any]]) -> dict[str, Any]:
         return self.add_data(swings=swings)
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         return self._snapshot_envelope(
             state=self._state,
             metadata={
@@ -251,9 +357,9 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
     def _ingest_swings(
         self,
         swings: Sequence[SwingPoint | Mapping[str, Any]],
-    ) -> Tuple[List[SupportResistanceLevel], List[SupportResistanceEvent]]:
-        updated_levels: List[SupportResistanceLevel] = []
-        new_events: List[SupportResistanceEvent] = []
+    ) -> tuple[list[SupportResistanceLevel], list[SupportResistanceEvent]]:
+        updated_levels: list[SupportResistanceLevel] = []
+        new_events: list[SupportResistanceEvent] = []
 
         for raw in swings:
             swing = self._parse_swing(raw)
@@ -277,7 +383,12 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
             )
 
             if existing is not None:
-                self._merge_swing_into_level(existing, swing, upper_bound=upper_bound, lower_bound=lower_bound)
+                self._merge_swing_into_level(
+                    existing,
+                    swing,
+                    upper_bound=upper_bound,
+                    lower_bound=lower_bound,
+                )
                 updated_levels.append(existing)
 
                 event = self._create_event(
@@ -285,7 +396,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                     level=existing,
                     timestamp=swing.timestamp,
                     reference_price=swing.price,
-                    confidence=min(1.0, existing.strength),
+                    confidence=existing.strength,
                     metadata={
                         "merged_swing_id": swing.swing_id,
                         "source_count": existing.source_count,
@@ -301,7 +412,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                 price=level_price,
                 upper_bound=upper_bound,
                 lower_bound=lower_bound,
-                strength=max(0.0, min(1.0, swing.strength)),
+                strength=clamp_unit(swing.strength),
                 status=LevelStatus.ACTIVE,
                 created_at=swing.timestamp,
                 updated_at=swing.timestamp,
@@ -352,7 +463,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
             candle_high=float(raw.get("candle_high", raw.get("high", 0.0))),
             candle_low=float(raw.get("candle_low", raw.get("low", 0.0))),
             candle_close=float(raw.get("candle_close", raw.get("close", 0.0))),
-            strength=float(raw.get("strength", 0.0)),
+            strength=clamp_unit(float(raw.get("strength", 0.0))),
             is_confirmed=bool(raw.get("is_confirmed", True)),
             metadata=dict(raw.get("metadata", {})),
         )
@@ -378,17 +489,17 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         level.lower_bound = min(level.lower_bound, lower_bound)
         level.updated_at = swing.timestamp
 
-        avg_strength = sum([level.strength, max(0.0, min(1.0, swing.strength))]) / 2.0
+        avg_strength = (level.strength + clamp_unit(swing.strength)) / 2.0
         source_bonus = min(0.25, 0.03 * max(0, level.source_count - 1))
-        level.strength = max(0.0, min(1.0, avg_strength + source_bonus))
+        level.strength = clamp_unit(avg_strength + source_bonus)
         level.metadata["validated"] = level.touch_count >= self.config.min_touches_for_validation
 
     # -------------------------------------------------------------------------
     # Candles ingestion
     # -------------------------------------------------------------------------
 
-    def _ingest_candles(self, candles: Sequence[Mapping[str, Any]]) -> List[SupportResistanceEvent]:
-        new_events: List[SupportResistanceEvent] = []
+    def _ingest_candles(self, candles: Sequence[Mapping[str, Any]]) -> list[SupportResistanceEvent]:
+        new_events: list[SupportResistanceEvent] = []
 
         for raw in candles:
             candle = self._parse_candle(raw, index=self._global_candle_index)
@@ -411,17 +522,17 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         self,
         level: SupportResistanceLevel,
         candle: Candle,
-    ) -> List[SupportResistanceEvent]:
-        events: List[SupportResistanceEvent] = []
+    ) -> list[SupportResistanceEvent]:
+        events: list[SupportResistanceEvent] = []
 
         if level.status == LevelStatus.INACTIVE:
             return events
 
-        touched = self._is_level_touched(level, candle)
-        if touched:
+        if self._is_level_touched(level, candle):
             touch_key = (level.level_id, candle.index)
             if touch_key not in self._processed_touch_keys:
                 self._processed_touch_keys.add(touch_key)
+
                 level.touch_count += 1
                 level.last_tested_at = candle.timestamp
                 level.updated_at = candle.timestamp
@@ -433,16 +544,16 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                         level=level,
                         timestamp=candle.timestamp,
                         reference_price=candle.close,
-                        confidence=min(1.0, level.strength),
+                        confidence=level.strength,
                         metadata={"candle_index": candle.index},
                     )
                 )
 
-        rejected = self._is_rejection(level, candle)
-        if rejected:
+        if self._is_rejection(level, candle):
             reject_key = (level.level_id, candle.index)
             if reject_key not in self._processed_rejection_keys:
                 self._processed_rejection_keys.add(reject_key)
+
                 level.rejection_count += 1
                 level.last_rejected_at = candle.timestamp
                 level.updated_at = candle.timestamp
@@ -458,8 +569,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                     )
                 )
 
-        broken = self._is_broken(level, candle)
-        if broken:
+        if self._is_broken(level, candle):
             break_key = (level.level_id, candle.index)
             if break_key not in self._processed_break_keys:
                 self._processed_break_keys.add(break_key)
@@ -471,18 +581,19 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                 level.last_broken_at = candle.timestamp
                 level.updated_at = candle.timestamp
 
-                break_event = self._create_event(
-                    event_type=SREventType.LEVEL_BROKEN,
-                    level=level,
-                    timestamp=candle.timestamp,
-                    reference_price=candle.close,
-                    confidence=self._break_confidence(level, candle),
-                    metadata={
-                        "candle_index": candle.index,
-                        "old_level_type": old_type.value,
-                    },
+                events.append(
+                    self._create_event(
+                        event_type=SREventType.LEVEL_BROKEN,
+                        level=level,
+                        timestamp=candle.timestamp,
+                        reference_price=candle.close,
+                        confidence=self._break_confidence(level, candle),
+                        metadata={
+                            "candle_index": candle.index,
+                            "old_level_type": old_type.value,
+                        },
+                    )
                 )
-                events.append(break_event)
 
                 if self.config.allow_flip_on_break:
                     flipped = self._flip_level(level, timestamp=candle.timestamp)
@@ -496,7 +607,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                                 level=level,
                                 timestamp=candle.timestamp,
                                 reference_price=candle.close,
-                                confidence=min(1.0, level.strength),
+                                confidence=level.strength,
                                 metadata={
                                     "candle_index": candle.index,
                                     "new_level_type": level.level_type.value,
@@ -504,11 +615,11 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                             )
                         )
 
-        retested = self._is_retested_after_break(level, candle)
-        if retested:
+        if self._is_retested_after_break(level, candle):
             retest_key = (level.level_id, candle.index)
             if retest_key not in self._processed_retest_keys:
                 self._processed_retest_keys.add(retest_key)
+
                 level.retest_count += 1
                 level.last_retested_at = candle.timestamp
                 level.updated_at = candle.timestamp
@@ -519,7 +630,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                         level=level,
                         timestamp=candle.timestamp,
                         reference_price=candle.close,
-                        confidence=min(1.0, level.strength),
+                        confidence=level.strength,
                         metadata={"candle_index": candle.index},
                     )
                 )
@@ -558,10 +669,18 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
 
         if level.level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
             breakout_price = level.upper_bound * (1.0 + threshold)
-            return candle.close > breakout_price if self.config.require_close_break else candle.high > breakout_price
+            return (
+                candle.close > breakout_price
+                if self.config.require_close_break
+                else candle.high > breakout_price
+            )
 
         breakout_price = level.lower_bound * (1.0 - threshold)
-        return candle.close < breakout_price if self.config.require_close_break else candle.low < breakout_price
+        return (
+            candle.close < breakout_price
+            if self.config.require_close_break
+            else candle.low < breakout_price
+        )
 
     def _is_retested_after_break(self, level: SupportResistanceLevel, candle: Candle) -> bool:
         if level.status != LevelStatus.BROKEN:
@@ -618,12 +737,17 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         broken_levels = [x for x in levels if x.status == LevelStatus.BROKEN]
 
         state.total_levels = len(levels)
-        state.active_supports = len([x for x in active_levels if x.level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}])
-        state.active_resistances = len([x for x in active_levels if x.level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}])
+        state.active_supports = len(
+            [x for x in active_levels if x.level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}]
+        )
+        state.active_resistances = len(
+            [x for x in active_levels if x.level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}]
+        )
         state.active_flip_supports = len([x for x in active_levels if x.level_type == LevelType.FLIP_SUPPORT])
         state.active_flip_resistances = len([x for x in active_levels if x.level_type == LevelType.FLIP_RESISTANCE])
 
         current_price = self._state.last_price
+
         state.strongest_support = self._strongest_level(
             levels,
             types={LevelType.SUPPORT, LevelType.FLIP_SUPPORT},
@@ -656,7 +780,7 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
     # Helpers
     # -------------------------------------------------------------------------
 
-    def _build_zone_bounds(self, *, price: float, layer: StructureLayer) -> Tuple[float, float]:
+    def _build_zone_bounds(self, *, price: float, layer: StructureLayer) -> tuple[float, float]:
         half_width_pct = (
             self.config.internal_zone_half_width_pct
             if layer == StructureLayer.INTERNAL
@@ -684,22 +808,24 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         layer: StructureLayer,
         level_type: LevelType,
         price: float,
-    ) -> Optional[SupportResistanceLevel]:
+    ) -> SupportResistanceLevel | None:
         candidates = [
             x for x in self._levels_for_layer(layer)
             if x.level_type == level_type and x.status != LevelStatus.INACTIVE
         ]
+
         if not candidates:
             return None
 
         threshold_pct = self._merge_distance_pct(layer)
 
-        best: Optional[SupportResistanceLevel] = None
+        best: SupportResistanceLevel | None = None
         best_distance = float("inf")
 
         for level in candidates:
             if level.price <= 0:
                 continue
+
             distance_pct = abs(price - level.price) / level.price
             if distance_pct <= threshold_pct and distance_pct < best_distance:
                 best = level
@@ -707,13 +833,14 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
 
         return best
 
-    def _bars_since_timestamp(self, timestamp: Any) -> Optional[int]:
+    def _bars_since_timestamp(self, timestamp: Any) -> int | None:
         candles = list(self._candles)
         if not candles:
             return None
 
         last_index = candles[-1].index
         matching = None
+
         for candle in reversed(candles):
             if candle.timestamp == timestamp:
                 matching = candle.index
@@ -729,24 +856,33 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         levels: Sequence[SupportResistanceLevel],
         *,
         types: set[LevelType],
-    ) -> Optional[SupportResistanceLevel]:
-        candidates = [x for x in levels if x.level_type in types and x.status != LevelStatus.INACTIVE]
+    ) -> SupportResistanceLevel | None:
+        candidates = [
+            x for x in levels
+            if x.level_type in types and x.status != LevelStatus.INACTIVE
+        ]
+
         if not candidates:
             return None
+
         return max(candidates, key=lambda x: (x.strength, x.touch_count, x.source_count))
 
     def _nearest_level(
         self,
         levels: Sequence[SupportResistanceLevel],
         *,
-        current_price: Optional[float],
+        current_price: float | None,
         below_or_equal: bool,
         types: set[LevelType],
-    ) -> Optional[SupportResistanceLevel]:
+    ) -> SupportResistanceLevel | None:
         if current_price is None:
             return None
 
-        candidates = [x for x in levels if x.level_type in types and x.status != LevelStatus.INACTIVE]
+        candidates = [
+            x for x in levels
+            if x.level_type in types and x.status != LevelStatus.INACTIVE
+        ]
+
         if below_or_equal:
             candidates = [x for x in candidates if x.price <= current_price]
         else:
@@ -764,12 +900,12 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
             else candle.lower_wick_ratio
         )
         raw = (level.strength + min(1.0, wick_ratio)) / 2.0
-        return max(0.0, min(1.0, raw))
+        return clamp_unit(raw)
 
     def _break_confidence(self, level: SupportResistanceLevel, candle: Candle) -> float:
         move_pct = abs(candle.close - level.price) / max(level.price, 1e-9)
         raw = (level.strength + candle.body_ratio + min(1.0, move_pct * 100.0)) / 3.0
-        return max(0.0, min(1.0, raw))
+        return clamp_unit(raw)
 
     def _create_event(
         self,
@@ -777,9 +913,9 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         event_type: SREventType,
         level: SupportResistanceLevel,
         timestamp: Any,
-        reference_price: Optional[float],
+        reference_price: float | None,
         confidence: float,
-        metadata: Optional[Mapping[str, Any]] = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> SupportResistanceEvent:
         event = SupportResistanceEvent(
             event_id=uuid4().hex,
@@ -791,20 +927,21 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
             level_id=level.level_id,
             level_type=level.level_type,
             price=level.price,
-            confidence=max(0.0, min(1.0, confidence)),
+            confidence=clamp_unit(confidence),
             reference_price=reference_price,
             metadata=dict(metadata or {}),
         )
         self._events.append(event)
-        self._emit_event(
-            self._build_event_name(event.event_type.value),
-            self._event_to_dict(event),
-            source="support_resistance_analyzer",
-        )
         return event
 
-    def _level_to_dict(self, level: SupportResistanceLevel) -> Dict[str, Any]:
+    def _level_to_dict(self, level: SupportResistanceLevel) -> dict[str, Any]:
         return self._safe_serialize(level)
 
-    def _event_to_dict(self, event: SupportResistanceEvent) -> Dict[str, Any]:
+    def _event_to_dict(self, event: SupportResistanceEvent) -> dict[str, Any]:
         return self._safe_serialize(event)
+
+
+__all__ = [
+    "SupportResistanceConfig",
+    "SupportResistanceAnalyzer",
+]

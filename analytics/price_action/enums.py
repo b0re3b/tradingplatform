@@ -1,15 +1,95 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import TypeVar
+
+
+EnumT = TypeVar("EnumT", bound="PriceActionEnum")
 
 
 class PriceActionEnum(str, Enum):
     """
     Base string enum for all price action domain enums.
+
+    This class is intentionally infrastructure-free:
+    - no EventBus dependency
+    - no Scheduler dependency
+    - no logger dependency
+    - no Config dependency
+
+    Enums are pure domain contracts used by:
+    - analytics.price_action.models
+    - analytics.price_action analyzers
+    - strategy modules consuming analytics.price_action.* events
     """
 
     def __str__(self) -> str:
         return self.value
+
+    @classmethod
+    def values(cls) -> tuple[str, ...]:
+        """
+        Return all raw string values for validation, schemas and UI filters.
+        """
+        return tuple(member.value for member in cls)
+
+    @classmethod
+    def has_value(cls, value: object) -> bool:
+        """
+        Check whether a raw value belongs to the enum.
+        """
+        return any(member.value == value for member in cls)
+
+    @classmethod
+    def from_value(cls: type[EnumT], value: str | EnumT, *, default: EnumT | None = None) -> EnumT:
+        """
+        Safely coerce a raw value into the enum.
+
+        Args:
+            value: Raw string value or already-existing enum member.
+            default: Optional fallback when coercion fails.
+
+        Raises:
+            ValueError: If value is invalid and default is not provided.
+        """
+        if isinstance(value, cls):
+            return value
+
+        try:
+            return cls(str(value))
+        except ValueError:
+            if default is not None:
+                return default
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Shared analyzer/module enums
+# ---------------------------------------------------------------------------
+
+class PriceActionModuleType(PriceActionEnum):
+    """
+    Logical module identifiers used by the future PriceActionAnalyzer facade.
+    """
+
+    MARKET_STRUCTURE = "market_structure"
+    SUPPORT_RESISTANCE = "support_resistance"
+    LIQUIDITY_LEVELS = "liquidity_levels"
+    FAIR_VALUE_GAP = "fair_value_gap"
+    TREND = "trend"
+
+
+class PriceActionSnapshotType(PriceActionEnum):
+    """
+    Common snapshot/update event types shared by price action modules.
+
+    Concrete EventBus topics should still be namespaced as:
+        analytics.price_action.<module>.<event>
+    """
+
+    SNAPSHOT = "snapshot"
+    UPDATED = "updated"
+    RESET = "reset"
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +246,8 @@ class TrendEventType(PriceActionEnum):
 
 __all__ = [
     "PriceActionEnum",
+    "PriceActionModuleType",
+    "PriceActionSnapshotType",
     "SwingType",
     "StructureLayer",
     "MarketBias",
