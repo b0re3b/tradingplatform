@@ -327,6 +327,28 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
     # ------------------------------------------------------------------
     # Scheduler jobs
     # ------------------------------------------------------------------
+    def _cleanup_orphan_windows(self) -> int:
+        """
+        Видаляє rolling windows, для яких більше немає актуального latest snapshot.
+
+        Важливо:
+        - _spread_windows не мають власного timestamp;
+        - тому TTL для них застосовується опосередковано через _latest_snapshots;
+        - якщо snapshot був видалений як stale, відповідне rolling window
+          теж не повинно залишатися активним.
+        """
+        if not self._spread_windows:
+            return 0
+
+        active_snapshot_keys = set(self._latest_snapshots.keys())
+
+        removed = 0
+        for key in list(self._spread_windows.keys()):
+            if key not in active_snapshot_keys:
+                self._spread_windows.pop(key, None)
+                removed += 1
+
+        return removed
 
     async def cleanup_stale_state(self) -> None:
         """
@@ -345,7 +367,10 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             removed_futures = self._cleanup_quote_cache(self._futures_quotes, now=now, ttl=ttl)
             removed_funding = self._cleanup_funding_cache(now=now, ttl=ttl)
             removed_snapshots = self._cleanup_snapshot_cache(now=now, ttl=ttl)
-            removed_windows = self._enforce_window_cache_limit()
+
+            removed_orphan_windows = self._cleanup_orphan_windows()
+            removed_limit_windows = self._enforce_window_cache_limit()
+            removed_windows = removed_orphan_windows + removed_limit_windows
 
             self._stats["cleanup_runs"] += 1
             self._stats["cleanup_removed_quotes"] += removed_spot + removed_futures
@@ -355,12 +380,15 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
             if removed_spot or removed_futures or removed_funding or removed_snapshots or removed_windows:
                 self._logger.debug(
-                    "Spot/futures cleanup completed | spot=%s futures=%s funding=%s snapshots=%s windows=%s",
+                    "Spot/futures cleanup completed | spot=%s futures=%s funding=%s "
+                    "snapshots=%s windows=%s orphan_windows=%s limit_windows=%s",
                     removed_spot,
                     removed_futures,
                     removed_funding,
                     removed_snapshots,
                     removed_windows,
+                    removed_orphan_windows,
+                    removed_limit_windows,
                 )
 
     async def emit_heartbeat(self) -> None:

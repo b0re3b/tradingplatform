@@ -215,8 +215,12 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
     allowed_futures_exchanges: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
-        self.allowed_spot_exchanges = _normalize_exchange_set(self.allowed_spot_exchanges)
-        self.allowed_futures_exchanges = _normalize_exchange_set(self.allowed_futures_exchanges)
+        self.allowed_spot_exchanges = _normalize_exchange_set(
+            self.allowed_spot_exchanges
+        )
+        self.allowed_futures_exchanges = _normalize_exchange_set(
+            self.allowed_futures_exchanges
+        )
 
         if self.default_spot_exchange:
             self.default_spot_exchange = self.default_spot_exchange.strip().lower()
@@ -224,9 +228,13 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         if self.default_futures_exchange:
             self.default_futures_exchange = self.default_futures_exchange.strip().lower()
 
-        super().__post_init__()
+        # Не використовуємо super().__post_init__() у dataclass(slots=True)
+        # inheritance, бо zero-argument super() може падати з:
+        # TypeError: super(type, obj): obj must be an instance or subtype of type
+        BaseSpreadConfig.__post_init__(self)
 
         self._validate_topic("snapshot_event_topic", self.snapshot_event_topic)
+
         _validate_positive_decimal(
             "mean_reversion_zscore_threshold",
             self.mean_reversion_zscore_threshold,
@@ -248,7 +256,10 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
 
     def is_futures_exchange_allowed(self, exchange: str) -> bool:
         normalized = exchange.strip().lower()
-        return not self.allowed_futures_exchanges or normalized in self.allowed_futures_exchanges
+        return (
+            not self.allowed_futures_exchanges
+            or normalized in self.allowed_futures_exchanges
+        )
 
 
 # ============================================================
@@ -302,15 +313,21 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
             raise ValueError("allowed_instrument_types must not be empty")
 
         if InstrumentType.UNKNOWN in self.allowed_instrument_types:
-            raise ValueError("allowed_instrument_types must not include InstrumentType.UNKNOWN")
+            raise ValueError(
+                "allowed_instrument_types must not include InstrumentType.UNKNOWN"
+            )
 
-        super().__post_init__()
+        # Не використовуємо super().__post_init__() у dataclass(slots=True)
+        # inheritance, бо zero-argument super() може падати з:
+        # TypeError: super(type, obj): obj must be an instance or subtype of type
+        BaseSpreadConfig.__post_init__(self)
 
         self._validate_topic("snapshot_event_topic", self.snapshot_event_topic)
         self._validate_topic("opportunity_event_topic", self.opportunity_event_topic)
 
         _validate_positive_decimal("arbitrage_min_bps", self.arbitrage_min_bps)
         _validate_positive_decimal("default_trade_size", self.default_trade_size)
+
         _validate_non_negative_decimal("slippage_max_bps", self.slippage_max_bps)
         _validate_non_negative_decimal("safety_buffer_bps", self.safety_buffer_bps)
         _validate_non_negative_decimal("default_taker_fee_rate", self.default_taker_fee_rate)
@@ -333,10 +350,16 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
             raise ValueError("min_trade_size must be <= max_trade_size")
 
         if self.default_trade_size is not None:
-            if self.min_trade_size is not None and self.default_trade_size < self.min_trade_size:
+            if (
+                self.min_trade_size is not None
+                and self.default_trade_size < self.min_trade_size
+            ):
                 raise ValueError("default_trade_size must be >= min_trade_size")
 
-            if self.max_trade_size is not None and self.default_trade_size > self.max_trade_size:
+            if (
+                self.max_trade_size is not None
+                and self.default_trade_size > self.max_trade_size
+            ):
                 raise ValueError("default_trade_size must be <= max_trade_size")
 
     def is_exchange_preferred(self, exchange: str) -> bool:
