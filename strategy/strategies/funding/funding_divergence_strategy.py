@@ -120,7 +120,7 @@ class FundingDivergenceStrategyConfig(BaseFundingStrategyConfig):
     tag_confirmed_by_signal: str = "confirmed_by_funding_signal"
 
     def validate(self) -> None:
-        super().validate()
+        BaseFundingStrategyConfig.validate(self)
 
         bounded_fields = {
             "min_divergence_confidence": self.min_divergence_confidence,
@@ -142,12 +142,12 @@ class FundingDivergenceStrategyConfig(BaseFundingStrategyConfig):
             raise ValueError("confirm_on_pressure_drop_levels must be >= 0")
 
         for attr in (
-            "score_weight_divergence",
-            "score_weight_pressure",
-            "score_weight_regime",
-            "score_weight_alignment",
-            "score_weight_extreme_alignment",
-            "score_weight_signal_alignment",
+                "score_weight_divergence",
+                "score_weight_pressure",
+                "score_weight_regime",
+                "score_weight_alignment",
+                "score_weight_extreme_alignment",
+                "score_weight_signal_alignment",
         ):
             value = getattr(self, attr)
             if value < 0.0:
@@ -318,6 +318,17 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
+    def _is_opposite_divergence_direction_for_state(
+            self,
+            state: FundingStrategyState,
+            divergence_event: Any,
+    ) -> bool:
+        direction = self._derive_direction_from_divergence(divergence_event)
+        return (
+                direction != FundingStrategyDirection.NEUTRAL
+                and state.direction != FundingStrategyDirection.NEUTRAL
+                and direction != state.direction
+        )
 
     async def on_regime(self, event: Event) -> None:
         payload = self.extract_payload(event)
@@ -485,20 +496,75 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                 )
                 return
 
-            if state.is_active() and self._is_opposite_divergence_for_state(state, divergence_event):
-                self.set_invalidated(
-                    state,
-                    reason="opposite_divergence_invalidated_setup",
-                    cooldown=True,
-                    metadata={"invalidation_source": "divergence"},
-                )
-                await self.emit_invalidated(
-                    state,
-                    extra_payload={"trigger": "divergence", "correlation_id": event.correlation_id},
-                )
+            current_direction = self._derive_direction_from_divergence(divergence_event)
+            if current_direction == FundingStrategyDirection.NEUTRAL:
                 return
 
-            if self._can_create_setup_from_divergence(state=state, divergence_event=divergence_event):
+            # ------------------------------------------------------------------
+            # Active setup handling must happen BEFORE setup creation.
+            #
+            # Production rule:
+            # - aligned repeat divergence confirms an active setup;
+            # - opposite divergence invalidates if enabled;
+            # - opposite divergence is ignored if invalidation is disabled;
+            # - active setup is never silently flipped LONG -> SHORT or SHORT -> LONG.
+            # ------------------------------------------------------------------
+            if state.is_active():
+                if self._is_opposite_divergence_direction_for_state(state, divergence_event):
+                    if self.config.invalidate_on_opposite_divergence:
+                        self.set_invalidated(
+                            state,
+                            reason="opposite_divergence_invalidated_setup",
+                            cooldown=True,
+                            metadata={"invalidation_source": "divergence"},
+                        )
+                        await self.emit_invalidated(
+                            state,
+                            extra_payload={
+                                "trigger": "divergence",
+                                "correlation_id": event.correlation_id,
+                            },
+                        )
+                    return
+
+                if self._can_confirm_by_repeat_divergence(
+                        state=state,
+                        previous_divergence=previous_divergence,
+                        current_divergence=divergence_event,
+                ):
+                    self.set_confirmed(
+                        state,
+                        score=self._compute_confirmation_score_from_repeat_divergence(
+                            state=state,
+                            divergence_event=divergence_event,
+                        ),
+                        confidence=self._compute_confirmation_confidence_from_repeat_divergence(
+                            state=state,
+                            divergence_event=divergence_event,
+                        ),
+                        reason="repeat_divergence_confirmed_setup",
+                        tags=[self.config.tag_confirmed_by_repeat],
+                        event_time=event_time,
+                        metadata={"confirmation_source": "repeat_divergence"},
+                    )
+                    await self.emit_confirmed(
+                        state,
+                        extra_payload={
+                            "trigger": "repeat_divergence",
+                            "correlation_id": event.correlation_id,
+                        },
+                    )
+                    return
+
+                # Active setup exists, divergence is aligned, but not strong/valid enough
+                # to confirm. Do not refresh setup repeatedly because that hides lifecycle
+                # transitions and can extend TTL without a confirmation event.
+                return
+
+            if self._can_create_setup_from_divergence(
+                    state=state,
+                    divergence_event=divergence_event,
+            ):
                 setup_candidate = self._build_setup_from_divergence(
                     state=state,
                     divergence_event=divergence_event,
@@ -511,34 +577,11 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     )
                     await self.emit_setup(
                         state,
-                        extra_payload={"trigger": "divergence", "correlation_id": event.correlation_id},
+                        extra_payload={
+                            "trigger": "divergence",
+                            "correlation_id": event.correlation_id,
+                        },
                     )
-                    return
-
-            if self._can_confirm_by_repeat_divergence(
-                state=state,
-                previous_divergence=previous_divergence,
-                current_divergence=divergence_event,
-            ):
-                self.set_confirmed(
-                    state,
-                    score=self._compute_confirmation_score_from_repeat_divergence(
-                        state=state,
-                        divergence_event=divergence_event,
-                    ),
-                    confidence=self._compute_confirmation_confidence_from_repeat_divergence(
-                        state=state,
-                        divergence_event=divergence_event,
-                    ),
-                    reason="repeat_divergence_confirmed_setup",
-                    tags=[self.config.tag_confirmed_by_repeat],
-                    event_time=event_time,
-                    metadata={"confirmation_source": "repeat_divergence"},
-                )
-                await self.emit_confirmed(
-                    state,
-                    extra_payload={"trigger": "repeat_divergence", "correlation_id": event.correlation_id},
-                )
 
         except Exception:
             self.logger.exception(
@@ -904,11 +947,14 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             return bias in {FundingBias.SHORT_BIAS.value, FundingBias.OVERCROWDED_SHORTS.value, FundingBias.SQUEEZE_RISK_SHORTS.value}
         return False
 
-    def _is_opposite_divergence_for_state(self, state: FundingStrategyState, divergence_event: Any) -> bool:
+    def _is_opposite_divergence_for_state(
+            self,
+            state: FundingStrategyState,
+            divergence_event: Any,
+    ) -> bool:
         if not self.config.invalidate_on_opposite_divergence:
             return False
-        direction = self._derive_direction_from_divergence(divergence_event)
-        return direction != FundingStrategyDirection.NEUTRAL and direction != state.direction
+        return self._is_opposite_divergence_direction_for_state(state, divergence_event)
 
     def _should_invalidate_by_signal(self, state: FundingStrategyState, signal: Any) -> bool:
         if not self.config.invalidate_on_opposite_signal:

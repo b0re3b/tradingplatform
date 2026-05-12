@@ -101,7 +101,7 @@ class FundingExtremeReversalStrategyConfig(BaseFundingStrategyConfig):
     tag_atomic_context: str = "atomic_funding_context"
 
     def validate(self) -> None:
-        super().validate()
+        BaseFundingStrategyConfig.validate(self)
 
         bounded_fields = {
             "min_extreme_severity": self.min_extreme_severity,
