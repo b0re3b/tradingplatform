@@ -341,10 +341,21 @@ class OrderFlowUpdate:
 class OrderFlowSignal:
     """
     Generic signal payload emitted to analytics.orderflow.*.signal topics.
+
+    Keep this payload contract aligned with OrderFlowUpdate:
+    - symbol: normalized market symbol
+    - metric: metric that produced the signal
+    - source_type: source data category used by the analyzer
+    - signal_type: bullish/bearish/neutral/info
+    - side: buy/sell/unknown semantic side
+    - strength: normalized confidence/strength in [0.0, 1.0]
+    - reason: machine-readable reason for downstream strategy/risk modules
+    - context: JSON-friendly analyzer-specific metadata
     """
 
     symbol: str
     metric: OrderFlowMetricType
+    source_type: OrderFlowSourceType
     signal_type: OrderFlowSignalType
     side: OrderFlowSide
     strength: float
@@ -354,7 +365,23 @@ class OrderFlowSignal:
 
     def __post_init__(self) -> None:
         self.symbol = _normalize_symbol(self.symbol)
+
+        if not isinstance(self.metric, OrderFlowMetricType):
+            self.metric = OrderFlowMetricType(str(self.metric))
+
+        if not isinstance(self.source_type, OrderFlowSourceType):
+            self.source_type = OrderFlowSourceType(str(self.source_type))
+
+        if not isinstance(self.signal_type, OrderFlowSignalType):
+            self.signal_type = OrderFlowSignalType(str(self.signal_type))
+
+        if not isinstance(self.side, OrderFlowSide):
+            self.side = OrderFlowSide.from_value(self.side)
+
         self.strength = max(0.0, min(float(self.strength), 1.0))
+
+        if self.context is None:
+            self.context = {}
 
     @property
     def is_directional(self) -> bool:

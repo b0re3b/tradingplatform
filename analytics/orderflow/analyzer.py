@@ -46,7 +46,7 @@ class OrderFlowAnalyzer:
         trades_cache: Any,
         orderbook_cache: Any,
         config: OrderFlowConfig | None = None,
-        scheduler: Scheduler | None = None,
+        scheduler: Scheduler,
         trades_topic_patterns: list[str] | tuple[str, ...] | None = None,
         orderbook_topic_patterns: list[str] | tuple[str, ...] | None = None,
     ) -> None:
@@ -73,7 +73,7 @@ class OrderFlowAnalyzer:
             __name__,
             service_name="orderflow",
             component="analytics",
-            module="orderflow",
+            component_module="orderflow",
             event_type="orderflow_facade",
         )
 

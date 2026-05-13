@@ -239,39 +239,125 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             return None
 
     def _extract_snapshot_from_cache_result(
-        self,
-        result: Any,
-        symbol: str,
+            self,
+            result: Any,
+            symbol: str,
     ) -> OrderbookSnapshot | None:
+        """
+        Extract and normalize OrderbookSnapshot from cache result.
+
+        Supported cache result shapes:
+        - OrderbookSnapshot
+        - {"data": OrderbookSnapshot}
+        - raw orderbook dict
+        - {"data": raw orderbook dict}
+
+        The analyzer must accept already-normalized models from the data/cache
+        layer, but still enforce symbol matching and valid bid/ask levels.
+        """
         if result is None:
             return None
 
+        normalized_symbol = str(symbol).strip().upper()
+
         if isinstance(result, OrderbookSnapshot):
-            return result if result.is_valid else None
+            return self._normalize_snapshot_model(
+                result,
+                expected_symbol=normalized_symbol,
+            )
 
         if not isinstance(result, dict):
             return None
 
         data = result.get("data")
-        if isinstance(data, OrderbookSnapshot):
-            return data if data.is_valid else None
 
-        if isinstance(data, dict):
-            snapshot = self.normalize_orderbook_snapshot(
+        if isinstance(data, OrderbookSnapshot):
+            snapshot = self._normalize_snapshot_model(
                 data,
-                default_symbol=symbol,
+                expected_symbol=normalized_symbol,
             )
             if snapshot is not None:
                 return snapshot
 
+        if isinstance(data, dict):
+            snapshot = self.normalize_orderbook_snapshot(
+                data,
+                default_symbol=normalized_symbol,
+            )
+            if snapshot is not None:
+                return self._normalize_snapshot_model(
+                    snapshot,
+                    expected_symbol=normalized_symbol,
+                )
+
         snapshot = self.normalize_orderbook_snapshot(
             result,
-            default_symbol=symbol,
+            default_symbol=normalized_symbol,
         )
         if snapshot is not None:
-            return snapshot
+            return self._normalize_snapshot_model(
+                snapshot,
+                expected_symbol=normalized_symbol,
+            )
 
         return None
+
+    def _normalize_snapshot_model(
+            self,
+            snapshot: OrderbookSnapshot,
+            *,
+            expected_symbol: str,
+    ) -> OrderbookSnapshot | None:
+        """
+        Validate and normalize an OrderbookSnapshot model returned by cache.
+
+        This protects the analyzer from:
+        - lower-case symbols;
+        - snapshots for another symbol;
+        - invalid or unsorted levels;
+        - empty bid/ask sides after filtering.
+        """
+        snapshot_symbol = str(snapshot.symbol).strip().upper()
+        if not snapshot_symbol:
+            return None
+
+        if snapshot_symbol != expected_symbol:
+            self._logger.debug(
+                "Orderbook snapshot symbol mismatch skipped | expected=%s actual=%s",
+                expected_symbol,
+                snapshot_symbol,
+            )
+            return None
+
+        if snapshot.timestamp <= 0:
+            return None
+
+        valid_bids = [
+            level
+            for level in snapshot.bids
+            if isinstance(level, OrderbookLevel) and level.is_valid
+        ]
+        valid_asks = [
+            level
+            for level in snapshot.asks
+            if isinstance(level, OrderbookLevel) and level.is_valid
+        ]
+
+        if not valid_bids or not valid_asks:
+            return None
+
+        valid_bids.sort(key=lambda item: item.price, reverse=True)
+        valid_asks.sort(key=lambda item: item.price)
+
+        return OrderbookSnapshot(
+            symbol=snapshot_symbol,
+            bids=valid_bids,
+            asks=valid_asks,
+            timestamp=float(snapshot.timestamp),
+            exchange=snapshot.exchange,
+            sequence_id=snapshot.sequence_id,
+            raw=snapshot.raw,
+        )
 
     # ------------------------------------------------------------------
     # Core calculations

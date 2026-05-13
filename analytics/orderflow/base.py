@@ -53,7 +53,7 @@ class BaseOrderFlowAnalyzer(ABC):
         config: BaseOrderFlowSubConfig,
         metric_type: OrderFlowMetricType,
         source_type: OrderFlowSourceType,
-        scheduler: Scheduler | None = None,
+        scheduler: Scheduler ,
         source_topic_patterns: list[str] | tuple[str, ...] | None = None,
         component_module: str = "orderflow",
     ) -> None:
@@ -68,7 +68,7 @@ class BaseOrderFlowAnalyzer(ABC):
             __name__,
             service_name=self._config.source_name,
             component="analytics",
-            module=component_module,
+            component_module=component_module,
             metric=self._metric_type.value,
             source_type=self._source_type.value,
         )
@@ -284,25 +284,25 @@ class BaseOrderFlowAnalyzer(ABC):
             self._inc_metric("signals_emitted", signal.symbol)
 
     def build_signal(
-        self,
-        *,
-        symbol: str,
-        signal_type: OrderFlowSignalType,
-        side: OrderFlowSide,
-        strength: float,
-        reason: str,
-        context: dict[str, Any] | None = None,
+            self,
+            *,
+            symbol: str,
+            signal_type: OrderFlowSignalType,
+            side: OrderFlowSide,
+            strength: float,
+            reason: str,
+            context: dict[str, Any] | None = None,
     ) -> OrderFlowSignal:
         return OrderFlowSignal(
-            symbol=str(symbol).upper(),
+            symbol=str(symbol).strip().upper(),
             metric=self._metric_type,
+            source_type=self._source_type,
             signal_type=signal_type,
             side=side,
-            strength=strength,
+            strength=max(0.0, min(1.0, float(strength))),
             reason=reason,
             context=context or {},
         )
-
     # ------------------------------------------------------------------
     # Shared event helpers
     # ------------------------------------------------------------------
@@ -628,23 +628,23 @@ class BaseOrderFlowAnalyzer(ABC):
 
     def _disable_scheduler_jobs(self) -> None:
         if self._scheduler is None:
+            self._health_job_id = None
+            self._cleanup_job_id = None
             return
 
         for job_id in (self._health_job_id, self._cleanup_job_id):
-            if not job_id:
+            if job_id is None:
                 continue
 
             try:
-                self._scheduler.disable_job(job_id)
-            except KeyError:
-                self._logger.warning(
-                    "Scheduler job already missing | analyzer=%s job_id=%s",
-                    self.__class__.__name__,
-                    job_id,
-                )
+                remove_job = getattr(self._scheduler, "remove_job", None)
+                if callable(remove_job):
+                    remove_job(job_id)
+                else:
+                    self._scheduler.disable_job(job_id)
             except Exception:
                 self._logger.exception(
-                    "Failed to disable scheduler job | analyzer=%s job_id=%s",
+                    "Failed to cleanup scheduler job | analyzer=%s job_id=%s",
                     self.__class__.__name__,
                     job_id,
                 )

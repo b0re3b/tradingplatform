@@ -363,7 +363,7 @@ class CvdConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
-        super().validate()
+        BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
 
@@ -463,7 +463,7 @@ class VolumeDeltaConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
-        super().validate()
+        BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
 
@@ -551,7 +551,7 @@ class AggressiveTradesConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
-        super().validate()
+        BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
 
@@ -634,7 +634,7 @@ class OrderbookImbalanceConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
-        super().validate()
+        BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
 
