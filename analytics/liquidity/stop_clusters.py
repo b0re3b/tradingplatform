@@ -89,8 +89,12 @@ class StopClusterCandidate:
         self.compression_score = clamp(self.compression_score, 0.0, 1.0)
         self.time_decay_factor = clamp(self.time_decay_factor, 0.0, 1.0)
         self.partial_sweep_factor = clamp(self.partial_sweep_factor, 0.0, 1.0)
+
         self.swept_source_count = max(0, int(self.swept_source_count))
-        self.partially_swept_source_count = max(0, int(self.partially_swept_source_count))
+        self.partially_swept_source_count = max(
+            0,
+            int(self.partially_swept_source_count),
+        )
 
     @property
     def center_price(self) -> float:
@@ -106,7 +110,18 @@ class StopClusterCandidate:
         )
 
     def is_swept(self) -> bool:
-        return self.swept_at is not None or self.swept_source_count > 0
+        """
+        Swept-context candidate.
+
+        Partial sweep також вважається swept-context для downstream reversal logic.
+        Це не означає, що cluster повністю invalidated; це означає, що він має
+        sweep/reversal context.
+        """
+        return (
+            self.swept_at is not None
+            or self.swept_source_count > 0
+            or self.partially_swept_source_count > 0
+        )
 
 
 class StopClustersDetector:
@@ -395,8 +410,12 @@ class StopClustersDetector:
             low_price = level.price * (1.0 - padding_pct)
             high_price = level.price * (1.0 + padding_pct)
 
-        swept_at = self._normalize_timestamp(level.swept_at) if level.swept_at else None
-        invalidated_at = self._normalize_timestamp(level.invalidated_at) if level.invalidated_at else None
+        swept_at = self._resolve_level_sweep_timestamp(level)
+        invalidated_at = (
+            self._normalize_timestamp(level.invalidated_at)
+            if level.invalidated_at
+            else None
+        )
 
         return StopClusterCandidate(
             symbol=symbol,
@@ -414,16 +433,22 @@ class StopClustersDetector:
         )
 
     def _resolve_candidate_side(self, level: LiquidityLevel) -> LiquiditySide:
-        if level.side in {
+        if level.side in {LiquiditySide.BUY_SIDE, LiquiditySide.SELL_SIDE}:
+            return level.side
+
+        if level.side == LiquiditySide.BOTH:
+            return LiquiditySide.BOTH
+
+        inferred_side = level.level_type.infer_side()
+
+        if inferred_side in {
             LiquiditySide.BUY_SIDE,
             LiquiditySide.SELL_SIDE,
             LiquiditySide.BOTH,
         }:
-            if level.side == LiquiditySide.BOTH:
-                return level.level_type.infer_side()
-            return level.side
+            return inferred_side
 
-        return level.level_type.infer_side()
+        return LiquiditySide.UNKNOWN
 
     def _resolve_padding_pct(self, level: LiquidityLevel) -> float:
         base_padding = self._config.stop_cluster_padding_pct
@@ -438,6 +463,32 @@ class StopClustersDetector:
             padding *= 1.15
 
         return max(padding, base_padding * 0.5)
+
+    # ------------------------------------------------------------------
+    # Sweep helpers
+    # ------------------------------------------------------------------
+
+    def _level_is_sweep_affected(self, level: LiquidityLevel) -> bool:
+        return level.is_swept() or level.is_partially_swept()
+
+    def _resolve_level_sweep_timestamp(
+        self,
+        level: LiquidityLevel,
+    ) -> datetime | None:
+        """
+        Повертає timestamp sweep-контексту.
+
+        Якщо level має sweep_status, але swept_at не заповнений,
+        використовує last_seen_at / first_seen_at як fallback.
+        """
+        if not self._level_is_sweep_affected(level):
+            return None
+
+        return (
+            self._normalize_timestamp(level.swept_at)
+            or self._normalize_timestamp(level.last_seen_at)
+            or self._normalize_timestamp(level.first_seen_at)
+        )
 
     # ------------------------------------------------------------------
     # Candidate enhancement
@@ -752,6 +803,17 @@ class StopClustersDetector:
             [*left.source_levels, *right.source_levels]
         )
 
+        swept_at = self._max_datetime(left.swept_at, right.swept_at)
+
+        if swept_at is None:
+            swept_timestamps = [
+                self._resolve_level_sweep_timestamp(level)
+                for level in source_levels
+                if self._level_is_sweep_affected(level)
+            ]
+            swept_timestamps = [ts for ts in swept_timestamps if ts is not None]
+            swept_at = max(swept_timestamps) if swept_timestamps else None
+
         return StopClusterCandidate(
             symbol=left.symbol,
             timeframe=left.timeframe,
@@ -761,7 +823,7 @@ class StopClustersDetector:
             source_levels=source_levels,
             created_at=self._min_datetime(left.created_at, right.created_at),
             updated_at=self._max_datetime(left.updated_at, right.updated_at),
-            swept_at=self._max_datetime(left.swept_at, right.swept_at),
+            swept_at=swept_at,
             invalidated_at=self._max_datetime(left.invalidated_at, right.invalidated_at),
             volume_score=max(left.volume_score, right.volume_score),
             orderbook_score=max(left.orderbook_score, right.orderbook_score),
@@ -771,10 +833,9 @@ class StopClustersDetector:
                 left.partial_sweep_factor,
                 right.partial_sweep_factor,
             ),
-            swept_source_count=left.swept_source_count + right.swept_source_count,
-            partially_swept_source_count=(
-                left.partially_swept_source_count
-                + right.partially_swept_source_count
+            swept_source_count=sum(1 for level in source_levels if level.is_swept()),
+            partially_swept_source_count=sum(
+                1 for level in source_levels if level.is_partially_swept()
             ),
         )
 
@@ -832,6 +893,13 @@ class StopClustersDetector:
             candidate.source_levels
         )
 
+        swept_source_count = sum(
+            1 for level in candidate.source_levels if level.is_swept()
+        )
+        partially_swept_source_count = sum(
+            1 for level in candidate.source_levels if level.is_partially_swept()
+        )
+
         cluster = StopCluster(
             symbol=candidate.symbol,
             timeframe=candidate.timeframe,
@@ -865,8 +933,8 @@ class StopClustersDetector:
                 "compression_score": candidate.compression_score,
                 "time_decay_factor": candidate.time_decay_factor,
                 "partial_sweep_factor": candidate.partial_sweep_factor,
-                "swept_source_count": candidate.swept_source_count,
-                "partially_swept_source_count": candidate.partially_swept_source_count,
+                "swept_source_count": swept_source_count,
+                "partially_swept_source_count": partially_swept_source_count,
                 "is_swept_cluster": candidate.is_swept(),
             },
         )
@@ -1037,14 +1105,58 @@ class StopClustersDetector:
         self,
         levels: Sequence[LiquidityLevel],
     ) -> list[LiquidityLevel]:
+        """
+        Deduplicate source levels without losing swept / partially swept context.
+
+        Важливо:
+        - level.key не містить sweep_status/status;
+        - тому active і swept level на тій самій ціні мають однаковий key;
+        - для reversal strategies swept/partial swept source важливіший за active
+          source з вищим confidence.
+        """
         result: dict[str, LiquidityLevel] = {}
 
         for level in levels:
             existing = result.get(level.key)
-            if existing is None or level.confidence > existing.confidence:
+
+            if existing is None:
+                result[level.key] = level
+                continue
+
+            if self._source_level_rank(level) > self._source_level_rank(existing):
                 result[level.key] = level
 
         return list(result.values())
+
+    def _source_level_rank(self, level: LiquidityLevel) -> tuple[int, int, float, int, int]:
+        """
+        Ranking для deduplication source levels.
+
+        Пріоритет:
+        1. swept рівень;
+        2. partially swept рівень;
+        3. active рівень;
+        4. explicit swept_at;
+        5. confidence;
+        6. touches_count;
+        7. reaction_count.
+        """
+        if level.is_swept():
+            sweep_rank = 3
+        elif level.is_partially_swept():
+            sweep_rank = 2
+        elif level.is_active():
+            sweep_rank = 1
+        else:
+            sweep_rank = 0
+
+        return (
+            sweep_rank,
+            1 if level.swept_at is not None else 0,
+            clamp(level.confidence, 0.0, 1.0),
+            max(level.touches_count, 0),
+            max(level.reaction_count, 0),
+        )
 
     # ------------------------------------------------------------------
     # Candle / orderbook helpers

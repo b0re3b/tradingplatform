@@ -250,7 +250,7 @@ class EqualLevel(LiquidityLevel):
     pivot_indexes: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        LiquidityLevel.__post_init__(self)
 
         self.tolerance_pct = max(0.0, _safe_float(self.tolerance_pct))
 
@@ -296,7 +296,8 @@ class EqualLevel(LiquidityLevel):
         return self.cluster_low <= price <= self.cluster_high
 
     def to_event_payload(self) -> dict[str, Any]:
-        payload = super().to_event_payload()
+        payload = LiquidityLevel.to_event_payload(self)
+
         payload.update(
             {
                 "tolerance_pct": self.tolerance_pct,

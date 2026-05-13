@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+from dataclasses import dataclass, fields
 from .config import LiquidityConfig
 from .enums import (
     ClusterStrength,
@@ -59,7 +58,10 @@ class LiquidityScoringWeights:
     def validate(self) -> None:
         errors: list[str] = []
 
-        for field_name, value in self.__dict__.items():
+        for field_info in fields(self):
+            field_name = field_info.name
+            value = getattr(self, field_name)
+
             if value < 0:
                 errors.append(f"{field_name} must be >= 0")
 
