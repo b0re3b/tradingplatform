@@ -45,11 +45,27 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
     Stop-hunt reversal strategy.
 
     LONG:
-        sell-side liquidity swept below current price -> reversal up
+        sell-side liquidity was swept below current price and price reclaimed upward.
 
     SHORT:
-        buy-side liquidity swept above current price -> reversal down
+        buy-side liquidity was swept above current price and price rejected downward.
+
+    Important:
+    - unswept clusters are NOT enough to create a stop-hunt reversal signal;
+    - at least one swept/partially swept level or swept cluster is required;
+    - active clusters may support the setup, but they are not primary sweep evidence.
     """
+
+    MIN_EDGE: float = 0.15
+
+    HIGH_PRIORITY_SCORE: float = 1.75
+    HIGH_PRIORITY_CONFIDENCE: float = 0.85
+    CRITICAL_PRIORITY_SCORE: float = 2.15
+    CRITICAL_PRIORITY_CONFIDENCE: float = 0.90
+
+    FALLBACK_STOP_PCT: float = 0.0045
+    LONG_STOP_OFFSET: float = 0.9985
+    SHORT_STOP_OFFSET: float = 1.0015
 
     @property
     def strategy_name(self) -> str:
@@ -62,7 +78,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             self.log_debug(
                 "StopHuntReversalStrategy skipped: disabled",
                 symbol=context.symbol,
-                timeframe=str(context.timeframe),
+                timeframe=self._value(context.timeframe),
             )
             return None
 
@@ -71,7 +87,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             self.log_debug(
                 "StopHuntReversalStrategy skipped: liquidity snapshot not found",
                 symbol=context.symbol,
-                timeframe=str(context.timeframe),
+                timeframe=self._value(context.timeframe),
             )
             return None
 
@@ -79,43 +95,60 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             return None
 
         current_price = self._resolve_current_price(context, snapshot)
-        if current_price is None or current_price <= 0:
+        if current_price is None:
             self.log_warning(
                 "StopHuntReversalStrategy skipped: current price unavailable",
                 symbol=context.symbol,
-                timeframe=str(context.timeframe),
+                timeframe=self._value(context.timeframe),
             )
             return None
 
-        filters = self._run_pre_filters(context, snapshot, current_price)
+        filters = self._run_pre_filters(
+            context=context,
+            snapshot=snapshot,
+            current_price=current_price,
+        )
         if any(result.blocked for result in filters):
             self.log_debug(
                 "StopHuntReversalStrategy blocked by filters",
                 symbol=context.symbol,
-                timeframe=str(snapshot.timeframe),
-                filters=[f"{f.name}:{f.decision.value}" for f in filters],
+                timeframe=self._value(snapshot.timeframe),
+                filters=[f"{item.name}:{item.decision.value}" for item in filters],
             )
             return None
 
-        candidate = self._find_reversal_candidate(snapshot, current_price)
+        candidate = self._find_reversal_candidate(
+            snapshot=snapshot,
+            current_price=current_price,
+        )
         if candidate is None:
             self.log_debug(
-                "StopHuntReversalStrategy skipped: no stop-hunt reversal candidate",
+                "StopHuntReversalStrategy skipped: no valid swept liquidity evidence",
                 symbol=context.symbol,
-                timeframe=str(snapshot.timeframe),
+                timeframe=self._value(snapshot.timeframe),
             )
             return None
 
-        side = candidate["side"]
-        confidence = self._compute_confidence(snapshot, current_price, candidate)
-        score = self._compute_score(snapshot, current_price, candidate, confidence)
+        side: SignalSide = candidate["side"]
+
+        confidence = self._compute_confidence(
+            snapshot=snapshot,
+            current_price=current_price,
+            candidate=candidate,
+        )
+        score = self._compute_score(
+            snapshot=snapshot,
+            current_price=current_price,
+            candidate=candidate,
+            confidence=confidence,
+        )
 
         runtime = self._runtime
         if confidence < runtime.min_confidence or score < runtime.min_score:
             self.log_debug(
                 "StopHuntReversalStrategy skipped: below thresholds",
                 symbol=context.symbol,
-                timeframe=str(snapshot.timeframe),
+                timeframe=self._value(snapshot.timeframe),
                 confidence=confidence,
                 score=score,
                 min_confidence=runtime.min_confidence,
@@ -168,8 +201,14 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> dict[str, Any] | None:
-        sell_side = self._find_sell_side_stop_hunt(snapshot, current_price)
-        buy_side = self._find_buy_side_stop_hunt(snapshot, current_price)
+        sell_side = self._find_sell_side_stop_hunt(
+            snapshot=snapshot,
+            current_price=current_price,
+        )
+        buy_side = self._find_buy_side_stop_hunt(
+            snapshot=snapshot,
+            current_price=current_price,
+        )
 
         if sell_side is None and buy_side is None:
             return None
@@ -185,58 +224,82 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> dict[str, Any] | None:
-        level_candidates = [
+        """
+        LONG reversal after sell-side liquidity sweep.
+
+        Requires actual swept evidence:
+        - swept/partially swept sell-side level below current price, or
+        - swept sell-side cluster below current price.
+        """
+        swept_levels = [
             level
             for level in snapshot.equal_levels
             if level.side == LiquiditySide.SELL_SIDE
             and level.price < current_price
+            and self._is_valid_swept_level(level)
         ]
-        cluster_candidates = [
+
+        swept_clusters = [
             cluster
-            for cluster in snapshot.stop_clusters
+            for cluster in self._swept_clusters(snapshot)
             if cluster.side == LiquiditySide.SELL_SIDE
             and cluster.center_price < current_price
         ]
 
-        swept_levels = [
-            level
-            for level in level_candidates
-            if level.sweep_status in {SweepStatus.SWEPT, SweepStatus.PARTIALLY_SWEPT}
-        ]
-
-        if not swept_levels and not cluster_candidates:
+        if not swept_levels and not swept_clusters:
             return None
 
-        level = self._pick_best_level(swept_levels or level_candidates, current_price)
-        cluster = self._pick_best_cluster(cluster_candidates, current_price)
+        level = self._pick_best_level(swept_levels, current_price)
+        swept_cluster = self._pick_best_cluster(swept_clusters, current_price)
 
-        if level is None and cluster is None:
+        evidence = self._pick_best_evidence(
+            level=level,
+            cluster=swept_cluster,
+            current_price=current_price,
+        )
+        if evidence is None:
             return None
 
-        reference = level if level is not None else cluster
-        reference_price = self._reference_price(reference)
+        reference_price = self._reference_price(evidence)
 
         level_score = self._level_reversal_score(level, current_price)
-        cluster_score = self._cluster_reversal_score(cluster, current_price)
+        cluster_score = self._cluster_reversal_score(swept_cluster, current_price)
         reclaim_score = self._reclaim_score_from_reference(
             current_price=current_price,
             reference_price=reference_price,
             side=SignalSide.LONG,
         )
-        pressure_bonus = max(-snapshot.liquidity_pressure_score, 0.0) * 0.20
-        bias_penalty = 0.08 if snapshot.bias == LiquidityBias.DOWN else 0.0
 
-        edge = max(level_score, cluster_score) + reclaim_score + pressure_bonus - bias_penalty
-        if edge <= 0.15:
+        pressure_bonus = max(-snapshot.liquidity_pressure_score, 0.0) * 0.20
+        anti_bias_bonus = 0.30 if snapshot.bias == LiquidityBias.DOWN else 0.0
+
+        edge = max(level_score, cluster_score) + reclaim_score + pressure_bonus + anti_bias_bonus
+        if edge <= self.MIN_EDGE:
             return None
+
+        target = self._nearest_opposite_target(
+            snapshot=snapshot,
+            current_price=current_price,
+            side=SignalSide.LONG,
+        )
 
         return {
             "direction": "sell_side_stop_hunt",
             "side": SignalSide.LONG,
             "hunted_level": level,
-            "support_cluster": cluster,
-            "target": self._nearest_opposite_target(snapshot, SignalSide.LONG),
+            "swept_cluster": swept_cluster,
+            "support_cluster": swept_cluster,
+            "resistance_cluster": None,
+            "evidence": evidence,
+            "evidence_type": self._evidence_type(evidence),
+            "reference_price": reference_price,
+            "target": target,
             "edge": max(0.0, edge),
+            "has_swept_level": level is not None,
+            "has_swept_cluster": swept_cluster is not None,
+            "reclaim_score": reclaim_score,
+            "pressure_bonus": pressure_bonus,
+            "anti_bias_bonus": anti_bias_bonus,
         }
 
     def _find_buy_side_stop_hunt(
@@ -244,59 +307,103 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> dict[str, Any] | None:
-        level_candidates = [
+        """
+        SHORT reversal after buy-side liquidity sweep.
+
+        Requires actual swept evidence:
+        - swept/partially swept buy-side level above current price, or
+        - swept buy-side cluster above current price.
+        """
+        swept_levels = [
             level
             for level in snapshot.equal_levels
             if level.side == LiquiditySide.BUY_SIDE
             and level.price > current_price
+            and self._is_valid_swept_level(level)
         ]
-        cluster_candidates = [
+
+        swept_clusters = [
             cluster
-            for cluster in snapshot.stop_clusters
+            for cluster in self._swept_clusters(snapshot)
             if cluster.side == LiquiditySide.BUY_SIDE
             and cluster.center_price > current_price
         ]
 
-        swept_levels = [
-            level
-            for level in level_candidates
-            if level.sweep_status in {SweepStatus.SWEPT, SweepStatus.PARTIALLY_SWEPT}
-        ]
-
-        if not swept_levels and not cluster_candidates:
+        if not swept_levels and not swept_clusters:
             return None
 
-        level = self._pick_best_level(swept_levels or level_candidates, current_price)
-        cluster = self._pick_best_cluster(cluster_candidates, current_price)
+        level = self._pick_best_level(swept_levels, current_price)
+        swept_cluster = self._pick_best_cluster(swept_clusters, current_price)
 
-        if level is None and cluster is None:
+        evidence = self._pick_best_evidence(
+            level=level,
+            cluster=swept_cluster,
+            current_price=current_price,
+        )
+        if evidence is None:
             return None
 
-        reference = level if level is not None else cluster
-        reference_price = self._reference_price(reference)
+        reference_price = self._reference_price(evidence)
 
         level_score = self._level_reversal_score(level, current_price)
-        cluster_score = self._cluster_reversal_score(cluster, current_price)
+        cluster_score = self._cluster_reversal_score(swept_cluster, current_price)
         reclaim_score = self._reclaim_score_from_reference(
             current_price=current_price,
             reference_price=reference_price,
             side=SignalSide.SHORT,
         )
-        pressure_bonus = max(snapshot.liquidity_pressure_score, 0.0) * 0.20
-        bias_penalty = 0.08 if snapshot.bias == LiquidityBias.UP else 0.0
 
-        edge = max(level_score, cluster_score) + reclaim_score + pressure_bonus - bias_penalty
-        if edge <= 0.15:
+        pressure_bonus = max(snapshot.liquidity_pressure_score, 0.0) * 0.20
+        anti_bias_bonus = 0.30 if snapshot.bias == LiquidityBias.UP else 0.0
+
+        edge = max(level_score, cluster_score) + reclaim_score + pressure_bonus + anti_bias_bonus
+        if edge <= self.MIN_EDGE:
             return None
+
+        target = self._nearest_opposite_target(
+            snapshot=snapshot,
+            current_price=current_price,
+            side=SignalSide.SHORT,
+        )
 
         return {
             "direction": "buy_side_stop_hunt",
             "side": SignalSide.SHORT,
             "hunted_level": level,
-            "resistance_cluster": cluster,
-            "target": self._nearest_opposite_target(snapshot, SignalSide.SHORT),
+            "swept_cluster": swept_cluster,
+            "support_cluster": None,
+            "resistance_cluster": swept_cluster,
+            "evidence": evidence,
+            "evidence_type": self._evidence_type(evidence),
+            "reference_price": reference_price,
+            "target": target,
             "edge": max(0.0, edge),
+            "has_swept_level": level is not None,
+            "has_swept_cluster": swept_cluster is not None,
+            "reclaim_score": reclaim_score,
+            "pressure_bonus": pressure_bonus,
+            "anti_bias_bonus": anti_bias_bonus,
         }
+
+    def _is_valid_swept_level(self, level: EqualLevel | LiquidityLevel) -> bool:
+        if level.is_invalidated() or level.is_expired():
+            return False
+
+        return level.sweep_status in {
+            SweepStatus.SWEPT,
+            SweepStatus.PARTIALLY_SWEPT,
+        }
+
+    def _swept_clusters(self, snapshot: LiquidityMapSnapshot) -> list[StopCluster]:
+        """
+        Prefer snapshot helper if available. Fallback to direct filtering.
+        """
+        getter = getattr(snapshot, "get_swept_clusters", None)
+        if callable(getter):
+            clusters = getter()
+            return list(clusters)
+
+        return [cluster for cluster in snapshot.stop_clusters if cluster.is_swept()]
 
     def _pick_best_level(
         self,
@@ -306,36 +413,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         if not levels:
             return None
 
-        def score(level: EqualLevel | LiquidityLevel) -> float:
-            distance_bonus = self._distance_bonus(level.price, current_price)
-
-            sweep_bonus = 0.0
-            if level.sweep_status == SweepStatus.SWEPT:
-                sweep_bonus = 0.18
-            elif level.sweep_status == SweepStatus.PARTIALLY_SWEPT:
-                sweep_bonus = 0.10
-
-            touches_bonus = min(level.touches_count / 6.0, 1.0) * 0.20
-            reaction_bonus = min(level.reaction_count / 4.0, 1.0) * 0.15
-            confidence_bonus = min(max(level.confidence, 0.0), 1.0) * 0.35
-
-            type_bonus = 0.0
-            if level.level_type in {
-                LiquidityLevelType.EQUAL_HIGHS,
-                LiquidityLevelType.EQUAL_LOWS,
-            }:
-                type_bonus = 0.12
-
-            return (
-                confidence_bonus
-                + touches_bonus
-                + reaction_bonus
-                + distance_bonus
-                + sweep_bonus
-                + type_bonus
-            )
-
-        return max(levels, key=score)
+        return max(levels, key=lambda level: self._level_reversal_score(level, current_price))
 
     def _pick_best_cluster(
         self,
@@ -345,42 +423,28 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         if not clusters:
             return None
 
-        def score(cluster: StopCluster) -> float:
-            strength_value = getattr(cluster.strength, "value", str(cluster.strength))
+        return max(
+            clusters,
+            key=lambda cluster: self._cluster_reversal_score(cluster, current_price),
+        )
 
-            strength_bonus = 0.0
-            if strength_value == "medium":
-                strength_bonus = 0.06
-            elif strength_value == "high":
-                strength_bonus = 0.12
-            elif strength_value == "extreme":
-                strength_bonus = 0.18
+    def _pick_best_evidence(
+        self,
+        level: EqualLevel | LiquidityLevel | None,
+        cluster: StopCluster | None,
+        current_price: float,
+    ) -> EqualLevel | LiquidityLevel | StopCluster | None:
+        if level is None and cluster is None:
+            return None
+        if level is None:
+            return cluster
+        if cluster is None:
+            return level
 
-            return (
-                self._distance_bonus(cluster.center_price, current_price)
-                + min(max(cluster.confidence, 0.0), 1.0) * 0.45
-                + min(max(cluster.estimated_stop_density, 0.0), 1.0) * 0.25
-                + min(cluster.touches_count / 6.0, 1.0) * 0.15
-                + strength_bonus
-            )
+        level_score = self._level_reversal_score(level, current_price)
+        cluster_score = self._cluster_reversal_score(cluster, current_price)
 
-        return max(clusters, key=score)
-
-    def _distance_bonus(self, level_price: float, current_price: float) -> float:
-        if current_price <= 0 or level_price <= 0:
-            return 0.0
-
-        distance_pct = abs(level_price - current_price) / current_price
-
-        if distance_pct <= 0.0015:
-            return 0.22
-        if distance_pct <= 0.0040:
-            return 0.18
-        if distance_pct <= 0.0100:
-            return 0.12
-        if distance_pct <= 0.0200:
-            return 0.06
-        return 0.0
+        return level if level_score >= cluster_score else cluster
 
     def _level_reversal_score(
         self,
@@ -390,7 +454,10 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         if level is None:
             return 0.0
 
-        score = min(max(level.confidence, 0.0), 1.0) * 0.45
+        if not self._is_valid_swept_level(level):
+            return 0.0
+
+        score = self._clamp01(level.confidence) * 0.45
         score += min(level.touches_count / 6.0, 1.0) * 0.15
         score += min(level.reaction_count / 4.0, 1.0) * 0.10
         score += self._distance_bonus(level.price, current_price)
@@ -416,8 +483,11 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         if cluster is None:
             return 0.0
 
-        score = min(max(cluster.confidence, 0.0), 1.0) * 0.40
-        score += min(max(cluster.estimated_stop_density, 0.0), 1.0) * 0.20
+        if not cluster.is_swept():
+            return 0.0
+
+        score = self._clamp01(cluster.confidence) * 0.40
+        score += self._clamp01(cluster.estimated_stop_density) * 0.20
         score += min(cluster.touches_count / 6.0, 1.0) * 0.10
         score += self._distance_bonus(cluster.center_price, current_price)
 
@@ -430,6 +500,23 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             score += 0.15
 
         return score
+
+    def _distance_bonus(self, level_price: float, current_price: float) -> float:
+        if current_price <= 0 or level_price <= 0:
+            return 0.0
+
+        distance_pct = abs(level_price - current_price) / current_price
+
+        if distance_pct <= 0.0015:
+            return 0.22
+        if distance_pct <= 0.0040:
+            return 0.18
+        if distance_pct <= 0.0100:
+            return 0.12
+        if distance_pct <= 0.0200:
+            return 0.06
+
+        return 0.0
 
     def _reclaim_score_from_reference(
         self,
@@ -455,16 +542,70 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             return 0.16
         if reclaim_pct <= 0.0060:
             return 0.22
+
         return 0.12
 
     def _nearest_opposite_target(
         self,
         snapshot: LiquidityMapSnapshot,
+        current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
         if side == SignalSide.LONG:
-            return snapshot.nearest_above_level
-        return snapshot.nearest_below_level
+            candidates = [
+                snapshot.nearest_above_level,
+                snapshot.strongest_cluster_above,
+                *self._collect_directional_targets(snapshot, current_price, side),
+            ]
+            valid = [
+                item
+                for item in candidates
+                if item is not None and self._reference_price(item) > current_price
+            ]
+            return min(valid, key=self._reference_price) if valid else None
+
+        if side == SignalSide.SHORT:
+            candidates = [
+                snapshot.nearest_below_level,
+                snapshot.strongest_cluster_below,
+                *self._collect_directional_targets(snapshot, current_price, side),
+            ]
+            valid = [
+                item
+                for item in candidates
+                if item is not None and self._reference_price(item) < current_price
+            ]
+            return max(valid, key=self._reference_price) if valid else None
+
+        return None
+
+    def _collect_directional_targets(
+        self,
+        snapshot: LiquidityMapSnapshot,
+        current_price: float,
+        side: SignalSide,
+    ) -> list[LiquidityLevel | StopCluster]:
+        candidates: list[LiquidityLevel | StopCluster] = []
+
+        if side == SignalSide.LONG:
+            candidates.extend(
+                level for level in snapshot.active_levels if level.price > current_price
+            )
+            candidates.extend(
+                cluster for cluster in snapshot.stop_clusters if cluster.center_price > current_price
+            )
+            candidates.sort(key=self._reference_price)
+
+        elif side == SignalSide.SHORT:
+            candidates.extend(
+                level for level in snapshot.active_levels if level.price < current_price
+            )
+            candidates.extend(
+                cluster for cluster in snapshot.stop_clusters if cluster.center_price < current_price
+            )
+            candidates.sort(key=self._reference_price, reverse=True)
+
+        return candidates
 
     def _compute_confidence(
         self,
@@ -476,8 +617,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         edge = float(candidate["edge"])
 
         hunted_level = candidate.get("hunted_level")
-        support_cluster = candidate.get("support_cluster")
-        resistance_cluster = candidate.get("resistance_cluster")
+        swept_cluster = candidate.get("swept_cluster")
         target = candidate.get("target")
 
         confidence = min(edge, 1.0) * 0.55
@@ -485,22 +625,20 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         if hunted_level is not None:
             confidence += self._level_reversal_score(hunted_level, current_price) * 0.20
 
-        cluster = support_cluster if support_cluster is not None else resistance_cluster
-        if cluster is not None:
-            confidence += self._cluster_reversal_score(cluster, current_price) * 0.15
+        if swept_cluster is not None:
+            confidence += self._cluster_reversal_score(swept_cluster, current_price) * 0.15
 
         if target is not None:
             confidence += self._target_quality_bonus(target, current_price) * 0.10
 
         confidence += self._reversal_zone_bonus(snapshot.zones, side, current_price)
 
-        if snapshot.signal is not None:
-            if side == SignalSide.LONG and snapshot.signal.bias == LiquidityBias.DOWN:
-                confidence += 0.05
-            elif side == SignalSide.SHORT and snapshot.signal.bias == LiquidityBias.UP:
-                confidence += 0.05
+        if side == SignalSide.LONG and snapshot.bias == LiquidityBias.DOWN:
+            confidence += 0.05
+        elif side == SignalSide.SHORT and snapshot.bias == LiquidityBias.UP:
+            confidence += 0.05
 
-        return max(0.0, min(confidence, 1.0))
+        return self._clamp01(confidence)
 
     def _compute_score(
         self,
@@ -548,9 +686,9 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             bonus += 0.03
 
         if isinstance(target, StopCluster):
-            bonus += 0.05 * min(max(target.confidence, 0.0), 1.0)
+            bonus += 0.05 * self._clamp01(target.confidence)
         elif isinstance(target, LiquidityLevel):
-            bonus += 0.04 * min(max(target.confidence, 0.0), 1.0)
+            bonus += 0.04 * self._clamp01(target.confidence)
 
         return bonus
 
@@ -578,6 +716,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             return 0.70
         if distance_pct <= 0.040:
             return 0.35
+
         return 0.10
 
     def _reversal_zone_bonus(
@@ -608,7 +747,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             return 0.0
 
         best = max(relevant, key=lambda zone: zone.score)
-        return 0.05 * min(max(best.score, 0.0), 1.0)
+        return 0.05 * self._clamp01(best.score)
 
     def _build_signal(
         self,
@@ -622,15 +761,11 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         filters: list[FilterResult],
     ) -> StrategySignal:
         hunted_level = candidate.get("hunted_level")
-        support_cluster = candidate.get("support_cluster")
-        resistance_cluster = candidate.get("resistance_cluster")
+        swept_cluster = candidate.get("swept_cluster")
         target = candidate.get("target")
+        evidence = candidate.get("evidence")
 
-        invalidation_anchor = (
-            hunted_level or support_cluster
-            if side == SignalSide.LONG
-            else hunted_level or resistance_cluster
-        )
+        invalidation_anchor = evidence
 
         entry_plan = self._build_entry_plan(
             side=side,
@@ -657,11 +792,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             invalidation_plan=invalidation_plan,
         )
 
-        priority = SignalPriority.MEDIUM
-        if score >= 1.75 or confidence >= 0.85:
-            priority = SignalPriority.HIGH
-        if score >= 2.15 and confidence >= 0.90:
-            priority = SignalPriority.CRITICAL
+        priority = self._resolve_priority(score=score, confidence=confidence)
 
         signal = StrategySignal(
             symbol=context.symbol,
@@ -683,7 +814,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             exit_plan=exit_plan,
             invalidation_plan=invalidation_plan,
             execution_plan=execution_plan,
-            regime=context.regime.regime if context.regime is not None else self._unknown_regime(),
+            regime=self._resolve_regime(context),
             metadata={
                 "snapshot_timestamp": snapshot.timestamp.isoformat(),
                 "snapshot_timeframe": snapshot.timeframe,
@@ -692,39 +823,53 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
                 "above_liquidity_score": snapshot.above_liquidity_score,
                 "below_liquidity_score": snapshot.below_liquidity_score,
                 "liquidity_pressure_score": snapshot.liquidity_pressure_score,
-                "sweep_risk_up": snapshot.signal.sweep_risk_up
-                if snapshot.signal is not None
-                else None,
-                "sweep_risk_down": snapshot.signal.sweep_risk_down
-                if snapshot.signal is not None
-                else None,
+                "sweep_risk_up": self._snapshot_signal_metric(snapshot, "sweep_risk_up"),
+                "sweep_risk_down": self._snapshot_signal_metric(snapshot, "sweep_risk_down"),
                 "direction": candidate["direction"],
+                "evidence_type": candidate.get("evidence_type"),
+                "reference_price": candidate.get("reference_price"),
+                "has_swept_level": candidate.get("has_swept_level", False),
+                "has_swept_cluster": candidate.get("has_swept_cluster", False),
+                "reclaim_score": candidate.get("reclaim_score"),
+                "pressure_bonus": candidate.get("pressure_bonus"),
+                "anti_bias_bonus": candidate.get("anti_bias_bonus"),
+                "hunted_level_price": hunted_level.price if hunted_level is not None else None,
+                "hunted_level_sweep_status": (
+                    hunted_level.sweep_status.value if hunted_level is not None else None
+                ),
+                "swept_cluster_center_price": (
+                    swept_cluster.center_price if swept_cluster is not None else None
+                ),
+                "target_price": self._reference_price(target),
                 "strategy_weight": self.config.get_strategy_weight(
                     self.strategy_name,
                     default=1.0,
                 ),
+                "strategy_semantics": "stop_hunt_reversal",
             },
         )
 
         signal.add_reason(self._build_primary_reason(candidate, current_price))
         signal.add_reason(self._build_target_reason(target))
-        signal.add_reason(f"Liquidity pressure score = {snapshot.liquidity_pressure_score:.3f}")
+        signal.add_reason(
+            f"Liquidity pressure score = {snapshot.liquidity_pressure_score:.3f}"
+        )
 
         if snapshot.signal is not None and snapshot.signal.explanation:
             signal.add_reason(snapshot.signal.explanation)
 
         for confirmation in self._build_confirmations(
-            snapshot,
-            candidate,
-            current_price,
+            snapshot=snapshot,
+            candidate=candidate,
+            current_price=current_price,
         ):
             signal.add_confirmation(confirmation)
 
         signal.add_source_feature("liquidity_map_snapshot")
         signal.add_source_feature("liquidity")
         signal.add_source_feature("liquidity.stop_hunt")
-        signal.add_source_feature("liquidity.equal_levels")
-        signal.add_source_feature("liquidity.stop_clusters")
+        signal.add_source_feature("liquidity.swept_level")
+        signal.add_source_feature("liquidity.swept_cluster")
 
         for filter_result in filters:
             signal.add_filter_result(filter_result)
@@ -738,10 +883,12 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         current_price: float,
         target: LiquidityLevel | StopCluster | None,
     ) -> EntryPlan:
-        notes = ["Enter after stop-hunt reversal thesis is active"]
+        notes = ["Enter after confirmed stop-hunt reversal evidence"]
 
         if target is not None:
-            notes.append(f"Primary target liquidity at {self._reference_price(target):.6f}")
+            notes.append(
+                f"Primary target liquidity at {self._reference_price(target):.6f}"
+            )
 
         entry_type = self.config.builders.default_entry_type or EntryType.MARKET
 
@@ -771,9 +918,11 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             tp_levels.append(
                 TargetPlan(
                     price=primary_target_price,
-                    size_fraction=0.70
-                    if self.config.builders.enable_partial_take_profit
-                    else 1.0,
+                    size_fraction=(
+                        0.70
+                        if self.config.builders.enable_partial_take_profit
+                        else 1.0
+                    ),
                     rr=self._compute_rr(
                         current_price=current_price,
                         stop_price=stop_price,
@@ -786,9 +935,9 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             )
 
         secondary_target = self._find_extended_target(
-            snapshot,
-            current_price,
-            side,
+            snapshot=snapshot,
+            current_price=current_price,
+            side=side,
             exclude=target,
         )
         secondary_price = (
@@ -894,10 +1043,10 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
     ) -> str:
         side: SignalSide = candidate["side"]
         hunted_level = candidate.get("hunted_level")
-        cluster = candidate.get("support_cluster") or candidate.get("resistance_cluster")
+        swept_cluster = candidate.get("swept_cluster")
         edge = float(candidate["edge"])
 
-        parts = [f"Stop-hunt reversal edge = {edge:.3f}"]
+        parts = [f"stop_hunt_edge={edge:.3f}"]
 
         if hunted_level is not None:
             parts.append(
@@ -905,10 +1054,11 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
                 f"({hunted_level.level_type.value}, {hunted_level.sweep_status.value})"
             )
 
-        if cluster is not None:
+        if swept_cluster is not None:
             parts.append(
-                f"cluster={cluster.center_price:.6f} "
-                f"(conf={cluster.confidence:.3f}, density={cluster.estimated_stop_density:.3f})"
+                f"swept_cluster={swept_cluster.center_price:.6f} "
+                f"(conf={swept_cluster.confidence:.3f}, "
+                f"density={swept_cluster.estimated_stop_density:.3f})"
             )
 
         parts.append(f"current_price={current_price:.6f}")
@@ -923,7 +1073,10 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
 
     def _build_target_reason(self, target: LiquidityLevel | StopCluster | None) -> str:
         if target is None:
-            return "No explicit reversal target found; signal based on reclaimed liquidity structure"
+            return (
+                "No explicit reversal target found; signal based on reclaimed "
+                "swept liquidity structure"
+            )
 
         if isinstance(target, StopCluster):
             return (
@@ -947,7 +1100,7 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
 
         side: SignalSide = candidate["side"]
         hunted_level = candidate.get("hunted_level")
-        cluster = candidate.get("support_cluster") or candidate.get("resistance_cluster")
+        swept_cluster = candidate.get("swept_cluster")
         target = candidate.get("target")
 
         if hunted_level is not None:
@@ -962,27 +1115,31 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             }:
                 confirmations.append("Equal highs/lows structure involved in stop hunt")
 
-        if cluster is not None and cluster.confidence >= 0.65:
-            confirmations.append("Strong nearby stop cluster supports reversal thesis")
+        if swept_cluster is not None:
+            confirmations.append("Swept stop cluster confirms stop-hunt evidence")
+
+            if swept_cluster.confidence >= 0.65:
+                confirmations.append("High-confidence swept cluster supports reversal thesis")
 
         if side == SignalSide.LONG:
             if snapshot.bias == LiquidityBias.DOWN:
                 confirmations.append("Counter-bias reversal setup after sell-side sweep")
 
             if self._has_high_quality_zone(
-                snapshot.zones,
-                LiquiditySide.BUY_SIDE,
-                current_price,
+                zones=snapshot.zones,
+                side=LiquiditySide.BUY_SIDE,
+                current_price=current_price,
             ):
                 confirmations.append("High-quality buy-side target zone ahead")
-        else:
+
+        elif side == SignalSide.SHORT:
             if snapshot.bias == LiquidityBias.UP:
                 confirmations.append("Counter-bias reversal setup after buy-side sweep")
 
             if self._has_high_quality_zone(
-                snapshot.zones,
-                LiquiditySide.SELL_SIDE,
-                current_price,
+                zones=snapshot.zones,
+                side=LiquiditySide.SELL_SIDE,
+                current_price=current_price,
             ):
                 confirmations.append("High-quality sell-side target zone ahead")
 
@@ -1026,17 +1183,16 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             if invalidation_anchor is not None
             else None
         )
-        fallback_pct = 0.0045
 
         if side == SignalSide.LONG:
-            if anchor_price is not None and anchor_price < current_price:
-                return anchor_price * 0.9985
-            return current_price * (1.0 - fallback_pct)
+            if anchor_price is not None and 0 < anchor_price < current_price:
+                return anchor_price * self.LONG_STOP_OFFSET
+            return current_price * (1.0 - self.FALLBACK_STOP_PCT)
 
         if side == SignalSide.SHORT:
             if anchor_price is not None and anchor_price > current_price:
-                return anchor_price * 1.0015
-            return current_price * (1.0 + fallback_pct)
+                return anchor_price * self.SHORT_STOP_OFFSET
+            return current_price * (1.0 + self.FALLBACK_STOP_PCT)
 
         return None
 
@@ -1047,17 +1203,11 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
         side: SignalSide,
         exclude: LiquidityLevel | StopCluster | None = None,
     ) -> LiquidityLevel | StopCluster | None:
-        candidates: list[LiquidityLevel | StopCluster] = []
-
-        if side == SignalSide.LONG:
-            candidates.extend(level for level in snapshot.active_levels if level.price > current_price)
-            candidates.extend(cluster for cluster in snapshot.stop_clusters if cluster.center_price > current_price)
-            candidates.sort(key=self._reference_price)
-
-        elif side == SignalSide.SHORT:
-            candidates.extend(level for level in snapshot.active_levels if level.price < current_price)
-            candidates.extend(cluster for cluster in snapshot.stop_clusters if cluster.center_price < current_price)
-            candidates.sort(key=self._reference_price, reverse=True)
+        candidates = self._collect_directional_targets(
+            snapshot=snapshot,
+            current_price=current_price,
+            side=side,
+        )
 
         if exclude is not None:
             exclude_price = self._reference_price(exclude)
@@ -1091,6 +1241,58 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
 
         return reward / risk
 
+    def _resolve_priority(self, score: float, confidence: float) -> SignalPriority:
+        if (
+            score >= self.CRITICAL_PRIORITY_SCORE
+            and confidence >= self.CRITICAL_PRIORITY_CONFIDENCE
+        ):
+            return SignalPriority.CRITICAL
+
+        if score >= self.HIGH_PRIORITY_SCORE or confidence >= self.HIGH_PRIORITY_CONFIDENCE:
+            return SignalPriority.HIGH
+
+        return SignalPriority.MEDIUM
+
+    def _resolve_regime(self, context: StrategyContext):
+        if context.regime is not None:
+            return context.regime.regime
+
+        metadata = getattr(context, "metadata", None)
+        regime = getattr(metadata, "regime", None)
+        if regime is not None:
+            return regime
+
+        return self._unknown_regime()
+
+    def _snapshot_signal_metric(
+        self,
+        snapshot: LiquidityMapSnapshot,
+        attr_name: str,
+    ) -> float | None:
+        if snapshot.signal is not None:
+            value = getattr(snapshot.signal, attr_name, None)
+            if value is not None:
+                return self._clamp01(value)
+
+        metadata = getattr(snapshot, "metadata", None) or {}
+        value = metadata.get(attr_name)
+        if value is not None:
+            return self._clamp01(value)
+
+        return None
+
+    def _evidence_type(
+        self,
+        evidence: EqualLevel | LiquidityLevel | StopCluster | None,
+    ) -> str | None:
+        if evidence is None:
+            return None
+
+        if isinstance(evidence, StopCluster):
+            return "swept_cluster"
+
+        return "swept_level"
+
     def _reference_price(self, item: LiquidityLevel | StopCluster | None) -> float:
         if item is None:
             return 0.0
@@ -1099,6 +1301,15 @@ class StopHuntReversalStrategy(BaseLiquidityStrategy):
             return float(item.center_price)
 
         return float(item.price)
+
+    @staticmethod
+    def _clamp01(value: Any) -> float:
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        return max(0.0, min(resolved, 1.0))
 
     def _unknown_regime(self):
         from strategy.enums import MarketRegime

@@ -42,80 +42,61 @@ from strategy.models import (
 )
 from strategy.strategies.liquidity.base_liquidity_strategy import BaseLiquidityStrategy
 
+
 # ---------------------------------------------------------------------------
-# Proximity thresholds
+# Candidate thresholds
 # ---------------------------------------------------------------------------
 
-# Максимальне перевищення рівня над поточною ціною для LONG-кандидата (0.3%)
 _LONG_CANDIDATE_MAX_OVERSHOOT: float = 1.003
-
-# Максимальне заниження рівня під поточною ціною для SHORT-кандидата (0.3%)
 _SHORT_CANDIDATE_MIN_UNDERSHOOT: float = 0.997
 
 # ---------------------------------------------------------------------------
 # Stop-price offsets
 # ---------------------------------------------------------------------------
 
-# Зсув стоп-ціни нижче anchor для LONG (0.15%)
 _LONG_STOP_OFFSET: float = 0.9985
-
-# Зсув стоп-ціни вище anchor для SHORT (0.15%)
 _SHORT_STOP_OFFSET: float = 1.0015
-
-# Fallback відстань стопу від поточної ціни (0.4%)
 _FALLBACK_STOP_PCT: float = 0.0040
 
 # ---------------------------------------------------------------------------
-# Edge weight constants  (raw score, NOT a probability → max > 1.0 is fine)
+# Edge weights
 # ---------------------------------------------------------------------------
 
-_EDGE_W_CONFIDENCE: float = 0.40
-_EDGE_W_TOUCHES: float = 0.20
-_EDGE_W_REACTIONS: float = 0.12
-_EDGE_W_COMPACTNESS_TIGHT: float = 0.16    # width_pct <= 0.08%
-_EDGE_W_COMPACTNESS_MED: float = 0.10      # width_pct <= 0.15%
-_EDGE_W_COMPACTNESS_WIDE: float = 0.05     # width_pct <= 0.30%
-_EDGE_W_DISTANCE_VERY_CLOSE: float = 0.22  # dist <= 0.15%
-_EDGE_W_DISTANCE_CLOSE: float = 0.18       # dist <= 0.40%
-_EDGE_W_DISTANCE_MED: float = 0.12         # dist <= 1.00%
-_EDGE_W_DISTANCE_FAR: float = 0.06         # dist <= 2.00%
-_EDGE_W_SWEEP_NOT: float = 0.10
-_EDGE_W_SWEEP_PARTIAL: float = 0.14
-_EDGE_W_SWEEP_FULL: float = 0.18
+_EDGE_W_CONFIDENCE: float = 0.42
+_EDGE_W_TOUCHES: float = 0.22
+_EDGE_W_REACTIONS: float = 0.14
+_EDGE_W_COMPACTNESS_TIGHT: float = 0.16
+_EDGE_W_COMPACTNESS_MED: float = 0.10
+_EDGE_W_COMPACTNESS_WIDE: float = 0.05
+_EDGE_W_DISTANCE_VERY_CLOSE: float = 0.20
+_EDGE_W_DISTANCE_CLOSE: float = 0.17
+_EDGE_W_DISTANCE_MED: float = 0.11
+_EDGE_W_DISTANCE_FAR: float = 0.05
 _EDGE_W_DIRECTIONAL: float = 0.10
 
-# Normalisation denominators
 _TOUCHES_NORM: float = 6.0
 _REACTIONS_NORM: float = 4.0
 
-# Compactness thresholds (as fraction of price)
 _COMPACTNESS_TIGHT_PCT: float = 0.0008
 _COMPACTNESS_MED_PCT: float = 0.0015
 _COMPACTNESS_WIDE_PCT: float = 0.0030
 
-# Distance thresholds (as fraction of price)
 _DIST_VERY_CLOSE_PCT: float = 0.0015
 _DIST_CLOSE_PCT: float = 0.0040
 _DIST_MED_PCT: float = 0.0100
 _DIST_FAR_PCT: float = 0.0200
-
-# ---------------------------------------------------------------------------
-# Signal priority thresholds
-# ---------------------------------------------------------------------------
 
 _PRIORITY_HIGH_SCORE: float = 1.70
 _PRIORITY_HIGH_CONFIDENCE: float = 0.84
 _PRIORITY_CRITICAL_SCORE: float = 2.10
 _PRIORITY_CRITICAL_CONFIDENCE: float = 0.90
 
-# ---------------------------------------------------------------------------
-# Typed candidate container
-# ---------------------------------------------------------------------------
 
-
-@dataclass
+@dataclass(slots=True)
 class _EqualLevelCandidate:
-    """Внутрішній контейнер для кандидата на сигнал."""
+    """
+    Внутрішній контейнер для equal highs/lows setup candidate.
+    """
 
     side: SignalSide
     level: EqualLevel
@@ -123,30 +104,24 @@ class _EqualLevelCandidate:
     target: LiquidityLevel | StopCluster | None = field(default=None)
 
 
-# ---------------------------------------------------------------------------
-# Strategy
-# ---------------------------------------------------------------------------
-
-
 class EqualHighLowStrategy(BaseLiquidityStrategy):
     """
-    Strategy для торгівлі від equal highs / equal lows.
+    Strategy для реакції від equal highs / equal lows.
 
-    Логіка:
-    - бере LiquidityMapSnapshot з StrategyContext;
-    - шукає найкращий equal highs / equal lows candidate;
-    - LONG від sell-side equal lows;
-    - SHORT від buy-side equal highs;
-    - формує StrategySignal без прямого execution.
+    Semantics:
+    - LONG: реакція від sell-side equal lows;
+    - SHORT: реакція від buy-side equal highs;
+    - swept / partially swept levels за замовчуванням не використовуються,
+      бо це зона відповідальності StopHuntReversalStrategy;
+    - invalidated / expired рівні не можуть створювати сигнал;
+    - strategy не виконує угоди напряму, а лише формує StrategySignal.
     """
+
+    ALLOW_SWEPT_EQUAL_LEVELS: bool = False
 
     @property
     def strategy_name(self) -> str:
         return "equal_high_low_strategy"
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
 
     def evaluate(self, context: StrategyContext) -> StrategySignal | None:
         self.validate_context(context)
@@ -155,7 +130,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             self.log_debug(
                 "EqualHighLowStrategy skipped: disabled",
                 symbol=context.symbol,
-                timeframe=str(context.timeframe),
+                timeframe=self._value(context.timeframe),
             )
             return None
 
@@ -164,7 +139,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             self.log_debug(
                 "EqualHighLowStrategy skipped: liquidity snapshot not found",
                 symbol=context.symbol,
-                timeframe=str(context.timeframe),
+                timeframe=self._value(context.timeframe),
             )
             return None
 
@@ -172,42 +147,58 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             return None
 
         current_price = self._resolve_current_price(context, snapshot)
-        if current_price is None or current_price <= 0:
+        if current_price is None:
             self.log_warning(
                 "EqualHighLowStrategy skipped: current price unavailable",
                 symbol=context.symbol,
-                timeframe=str(context.timeframe),
+                timeframe=self._value(context.timeframe),
             )
             return None
 
-        filters = self._run_pre_filters(context, snapshot, current_price)
+        filters = self._run_pre_filters(
+            context=context,
+            snapshot=snapshot,
+            current_price=current_price,
+        )
         if any(result.blocked for result in filters):
             self.log_debug(
                 "EqualHighLowStrategy blocked by filters",
                 symbol=context.symbol,
-                timeframe=str(snapshot.timeframe),
-                filters=[f"{f.name}:{f.decision.value}" for f in filters],
+                timeframe=self._value(snapshot.timeframe),
+                filters=[f"{item.name}:{item.decision.value}" for item in filters],
             )
             return None
 
-        candidate = self._find_best_equal_level_candidate(snapshot, current_price)
+        candidate = self._find_best_equal_level_candidate(
+            snapshot=snapshot,
+            current_price=current_price,
+        )
         if candidate is None:
             self.log_debug(
                 "EqualHighLowStrategy skipped: no valid equal highs/lows candidate",
                 symbol=context.symbol,
-                timeframe=str(snapshot.timeframe),
+                timeframe=self._value(snapshot.timeframe),
             )
             return None
 
-        confidence = self._compute_confidence(snapshot, current_price, candidate)
-        score = self._compute_score(snapshot, current_price, candidate, confidence)
+        confidence = self._compute_confidence(
+            snapshot=snapshot,
+            current_price=current_price,
+            candidate=candidate,
+        )
+        score = self._compute_score(
+            snapshot=snapshot,
+            current_price=current_price,
+            candidate=candidate,
+            confidence=confidence,
+        )
 
         runtime = self._runtime
         if confidence < runtime.min_confidence or score < runtime.min_score:
             self.log_debug(
                 "EqualHighLowStrategy skipped: below thresholds",
                 symbol=context.symbol,
-                timeframe=str(snapshot.timeframe),
+                timeframe=self._value(snapshot.timeframe),
                 confidence=confidence,
                 score=score,
                 min_confidence=runtime.min_confidence,
@@ -243,7 +234,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         )
 
     # ------------------------------------------------------------------
-    # Pre-filters
+    # Filters
     # ------------------------------------------------------------------
 
     def _run_pre_filters(
@@ -258,12 +249,18 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             current_price=current_price,
         )
 
-        if not snapshot.equal_levels:
+        valid_equal_levels = [
+            level
+            for level in snapshot.equal_levels
+            if self._is_valid_equal_reaction_level(level)
+        ]
+
+        if not valid_equal_levels:
             results.append(
                 FilterResult(
                     name="equal_levels_presence",
                     decision=FilterDecision.BLOCK,
-                    reason="Liquidity snapshot has no equal highs/lows",
+                    reason="Liquidity snapshot has no valid active equal highs/lows",
                 )
             )
         else:
@@ -271,7 +268,10 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
                 FilterResult(
                     name="equal_levels_presence",
                     decision=FilterDecision.PASS,
-                    reason="Liquidity snapshot contains equal highs/lows",
+                    reason=(
+                        "Liquidity snapshot contains valid active equal highs/lows: "
+                        f"{len(valid_equal_levels)}"
+                    ),
                 )
             )
 
@@ -289,18 +289,29 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         long_levels = [
             level
             for level in snapshot.equal_levels
-            if level.side == LiquiditySide.SELL_SIDE
+            if self._is_valid_equal_reaction_level(level)
+            and level.side == LiquiditySide.SELL_SIDE
             and level.price <= current_price * _LONG_CANDIDATE_MAX_OVERSHOOT
         ]
+
         short_levels = [
             level
             for level in snapshot.equal_levels
-            if level.side == LiquiditySide.BUY_SIDE
+            if self._is_valid_equal_reaction_level(level)
+            and level.side == LiquiditySide.BUY_SIDE
             and level.price >= current_price * _SHORT_CANDIDATE_MIN_UNDERSHOOT
         ]
 
-        best_long = self._pick_best_equal_level(long_levels, current_price, SignalSide.LONG)
-        best_short = self._pick_best_equal_level(short_levels, current_price, SignalSide.SHORT)
+        best_long = self._pick_best_equal_level(
+            levels=long_levels,
+            current_price=current_price,
+            side=SignalSide.LONG,
+        )
+        best_short = self._pick_best_equal_level(
+            levels=short_levels,
+            current_price=current_price,
+            side=SignalSide.SHORT,
+        )
 
         if best_long is None and best_short is None:
             return None
@@ -320,25 +331,50 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         ranked: list[_EqualLevelCandidate] = []
 
         for level in levels:
-            if level.level_type not in {
-                LiquidityLevelType.EQUAL_HIGHS,
-                LiquidityLevelType.EQUAL_LOWS,
-            }:
-                continue
-
-            edge = self._equal_level_edge(level, current_price, side)
+            edge = self._equal_level_edge(
+                level=level,
+                current_price=current_price,
+                side=side,
+            )
             if edge <= 0:
                 continue
 
-            ranked.append(_EqualLevelCandidate(side=side, level=level, edge=edge))
+            ranked.append(
+                _EqualLevelCandidate(
+                    side=side,
+                    level=level,
+                    edge=edge,
+                )
+            )
 
         if not ranked:
             return None
 
-        return max(ranked, key=lambda c: c.edge)
+        return max(ranked, key=lambda candidate: candidate.edge)
+
+    def _is_valid_equal_reaction_level(self, level: EqualLevel) -> bool:
+        if level.level_type not in {
+            LiquidityLevelType.EQUAL_HIGHS,
+            LiquidityLevelType.EQUAL_LOWS,
+        }:
+            return False
+
+        if level.price <= 0:
+            return False
+
+        if level.is_invalidated() or level.is_expired():
+            return False
+
+        if not self.ALLOW_SWEPT_EQUAL_LEVELS and level.sweep_status in {
+            SweepStatus.SWEPT,
+            SweepStatus.PARTIALLY_SWEPT,
+        }:
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
-    # Edge / confidence / score
+    # Edge / score
     # ------------------------------------------------------------------
 
     def _equal_level_edge(
@@ -347,21 +383,16 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         current_price: float,
         side: SignalSide,
     ) -> float:
-        """
-        Зважена raw-оцінка якості рівня (НЕ імовірність; теоретичний максимум > 1.0).
-        Складові та їхні максимальні внески задокументовані константами _EDGE_W_*.
-        """
         if current_price <= 0 or level.price <= 0:
             return 0.0
 
         distance_pct = abs(level.price - current_price) / current_price
 
-        confidence_part = min(max(level.confidence, 0.0), 1.0) * _EDGE_W_CONFIDENCE
+        confidence_part = self._clamp01(level.confidence) * _EDGE_W_CONFIDENCE
         touches_part = min(level.touches_count / _TOUCHES_NORM, 1.0) * _EDGE_W_TOUCHES
         reactions_part = min(level.reaction_count / _REACTIONS_NORM, 1.0) * _EDGE_W_REACTIONS
         compactness_part = self._compactness_score(level)
         distance_part = self._distance_score_edge(distance_pct)
-        sweep_part = self._sweep_score(level.sweep_status)
         directional_part = self._directional_score(level.side, side)
 
         return (
@@ -370,21 +401,25 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             + reactions_part
             + compactness_part
             + distance_part
-            + sweep_part
             + directional_part
         )
 
     def _compactness_score(self, level: EqualLevel) -> float:
+        if level.price <= 0:
+            return 0.0
+
         if level.cluster_low is None or level.cluster_high is None:
             return 0.0
 
         width_pct = abs(level.cluster_high - level.cluster_low) / level.price
+
         if width_pct <= _COMPACTNESS_TIGHT_PCT:
             return _EDGE_W_COMPACTNESS_TIGHT
         if width_pct <= _COMPACTNESS_MED_PCT:
             return _EDGE_W_COMPACTNESS_MED
         if width_pct <= _COMPACTNESS_WIDE_PCT:
             return _EDGE_W_COMPACTNESS_WIDE
+
         return 0.0
 
     def _distance_score_edge(self, distance_pct: float) -> float:
@@ -396,22 +431,20 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             return _EDGE_W_DISTANCE_MED
         if distance_pct <= _DIST_FAR_PCT:
             return _EDGE_W_DISTANCE_FAR
+
         return 0.0
 
-    def _sweep_score(self, sweep_status: SweepStatus) -> float:
-        if sweep_status == SweepStatus.NOT_SWEPT:
-            return _EDGE_W_SWEEP_NOT
-        if sweep_status == SweepStatus.PARTIALLY_SWEPT:
-            return _EDGE_W_SWEEP_PARTIAL
-        if sweep_status == SweepStatus.SWEPT:
-            return _EDGE_W_SWEEP_FULL
-        return 0.0
-
-    def _directional_score(self, level_side: LiquiditySide, signal_side: SignalSide) -> float:
+    def _directional_score(
+        self,
+        level_side: LiquiditySide,
+        signal_side: SignalSide,
+    ) -> float:
         if signal_side == SignalSide.LONG and level_side == LiquiditySide.SELL_SIDE:
             return _EDGE_W_DIRECTIONAL
+
         if signal_side == SignalSide.SHORT and level_side == LiquiditySide.BUY_SIDE:
             return _EDGE_W_DIRECTIONAL
+
         return 0.0
 
     def _compute_confidence(
@@ -423,24 +456,23 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         level = candidate.level
         side = candidate.side
 
-        confidence = min(candidate.edge, 1.0) * 0.62
-        confidence += min(max(level.confidence, 0.0), 1.0) * 0.18
+        confidence = min(candidate.edge, 1.0) * 0.64
+        confidence += self._clamp01(level.confidence) * 0.18
         confidence += min(level.touches_count / _TOUCHES_NORM, 1.0) * 0.08
         confidence += min(level.reaction_count / _REACTIONS_NORM, 1.0) * 0.05
-
-        if level.sweep_status == SweepStatus.SWEPT:
-            confidence += 0.06
-        elif level.sweep_status == SweepStatus.PARTIALLY_SWEPT:
-            confidence += 0.04
 
         if side == SignalSide.LONG and snapshot.bias == LiquidityBias.DOWN:
             confidence += 0.04
         elif side == SignalSide.SHORT and snapshot.bias == LiquidityBias.UP:
             confidence += 0.04
 
-        confidence += self._zone_bonus(snapshot.zones, side, current_price)
+        confidence += self._zone_bonus(
+            zones=snapshot.zones,
+            side=side,
+            current_price=current_price,
+        )
 
-        return max(0.0, min(confidence, 1.0))
+        return self._clamp01(confidence)
 
     def _compute_score(
         self,
@@ -455,7 +487,10 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         elif candidate.side == SignalSide.SHORT and snapshot.bias == LiquidityBias.UP:
             anti_bias_bonus = 0.25
 
-        structure_distance_score = self._level_distance_score(candidate.level, current_price)
+        structure_distance_score = self._level_distance_score(
+            level=candidate.level,
+            current_price=current_price,
+        )
 
         return max(
             0.0,
@@ -466,7 +501,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         )
 
     # ------------------------------------------------------------------
-    # Helpers: scoring sub-components
+    # Helpers
     # ------------------------------------------------------------------
 
     def _zone_bonus(
@@ -497,7 +532,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             return 0.0
 
         best = max(relevant, key=lambda zone: zone.score)
-        return 0.05 * min(max(best.score, 0.0), 1.0)
+        return 0.05 * self._clamp01(best.score)
 
     def _level_distance_score(
         self,
@@ -519,6 +554,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             return 0.65
         if distance_pct <= 0.040:
             return 0.30
+
         return 0.08
 
     # ------------------------------------------------------------------
@@ -538,8 +574,12 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         level = candidate.level
         side = candidate.side
 
-        target = self._find_target(snapshot, current_price, side, anchor_level=level)
-        # Зберігаємо знайдений target у кандидаті для подальшого використання
+        target = self._find_target(
+            snapshot=snapshot,
+            current_price=current_price,
+            side=side,
+            anchor_level=level,
+        )
         candidate.target = target
 
         entry_plan = self._build_entry_plan(
@@ -567,7 +607,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             invalidation_plan=invalidation_plan,
         )
 
-        priority = self._resolve_priority(score, confidence)
+        priority = self._resolve_priority(score=score, confidence=confidence)
 
         signal = StrategySignal(
             symbol=context.symbol,
@@ -589,7 +629,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             exit_plan=exit_plan,
             invalidation_plan=invalidation_plan,
             execution_plan=execution_plan,
-            regime=context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN,
+            regime=self._resolve_regime(context),
             metadata={
                 "snapshot_timestamp": snapshot.timestamp.isoformat(),
                 "snapshot_timeframe": snapshot.timeframe,
@@ -605,33 +645,47 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
                 "touches_count": level.touches_count,
                 "reaction_count": level.reaction_count,
                 "sweep_status": level.sweep_status.value,
+                "edge": candidate.edge,
+                "target_price": self._reference_price(target),
+                "target_type": self._target_type(target),
                 "strategy_weight": self.config.get_strategy_weight(
                     self.strategy_name,
                     default=1.0,
                 ),
+                "strategy_semantics": "equal_high_low_reaction",
+                "uses_swept_equal_levels": self.ALLOW_SWEPT_EQUAL_LEVELS,
             },
         )
 
-        signal.add_reason(self._build_primary_reason(level, side, current_price))
+        signal.add_reason(
+            self._build_primary_reason(
+                level=level,
+                side=side,
+                current_price=current_price,
+            )
+        )
         signal.add_reason(self._build_target_reason(target))
-        signal.add_reason(f"Liquidity pressure score = {snapshot.liquidity_pressure_score:.3f}")
+        signal.add_reason(
+            f"Liquidity pressure score = {snapshot.liquidity_pressure_score:.3f}"
+        )
 
         if snapshot.signal is not None and getattr(snapshot.signal, "explanation", None):
-            signal.add_reason(snapshot.signal.explanation)
-
+            explanation = snapshot.signal.explanation if snapshot.signal is not None else None
+            if explanation:
+                signal.add_reason(explanation)
         for confirmation in self._build_confirmations(
-            snapshot,
-            level,
-            side,
-            current_price,
-            target,
+            snapshot=snapshot,
+            level=level,
+            side=side,
+            current_price=current_price,
+            target=target,
         ):
             signal.add_confirmation(confirmation)
 
         signal.add_source_feature("liquidity_map_snapshot")
-        signal.add_source_feature("liquidity.equal_levels")
         signal.add_source_feature("liquidity")
-        signal.add_source_feature("liquidity.equal_high_low")
+        signal.add_source_feature("liquidity.equal_levels")
+        signal.add_source_feature("liquidity.equal_high_low_reaction")
 
         for filter_result in filters:
             signal.add_filter_result(filter_result)
@@ -643,12 +697,14 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
     def _resolve_priority(score: float, confidence: float) -> SignalPriority:
         if score >= _PRIORITY_CRITICAL_SCORE and confidence >= _PRIORITY_CRITICAL_CONFIDENCE:
             return SignalPriority.CRITICAL
+
         if score >= _PRIORITY_HIGH_SCORE or confidence >= _PRIORITY_HIGH_CONFIDENCE:
             return SignalPriority.HIGH
+
         return SignalPriority.MEDIUM
 
     # ------------------------------------------------------------------
-    # Target search  (єдиний приватний хелпер замість двох дублікатів)
+    # Target search
     # ------------------------------------------------------------------
 
     def _collect_directional_candidates(
@@ -657,16 +713,32 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         current_price: float,
         side: SignalSide,
     ) -> list[LiquidityLevel | StopCluster]:
-        """Збирає та сортує кандидати-цілі у напрямку сигналу."""
         candidates: list[LiquidityLevel | StopCluster] = []
 
         if side == SignalSide.LONG:
-            candidates.extend(lvl for lvl in snapshot.active_levels if lvl.price > current_price)
-            candidates.extend(cl for cl in snapshot.stop_clusters if cl.center_price > current_price)
+            candidates.extend(
+                level
+                for level in snapshot.active_levels
+                if level.price > current_price
+            )
+            candidates.extend(
+                cluster
+                for cluster in snapshot.stop_clusters
+                if cluster.center_price > current_price and not cluster.is_swept()
+            )
             candidates.sort(key=self._reference_price)
+
         elif side == SignalSide.SHORT:
-            candidates.extend(lvl for lvl in snapshot.active_levels if lvl.price < current_price)
-            candidates.extend(cl for cl in snapshot.stop_clusters if cl.center_price < current_price)
+            candidates.extend(
+                level
+                for level in snapshot.active_levels
+                if level.price < current_price
+            )
+            candidates.extend(
+                cluster
+                for cluster in snapshot.stop_clusters
+                if cluster.center_price < current_price and not cluster.is_swept()
+            )
             candidates.sort(key=self._reference_price, reverse=True)
 
         return candidates
@@ -678,13 +750,19 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         side: SignalSide,
         anchor_level: EqualLevel,
     ) -> LiquidityLevel | StopCluster | None:
-        candidates = self._collect_directional_candidates(snapshot, current_price, side)
+        candidates = self._collect_directional_candidates(
+            snapshot=snapshot,
+            current_price=current_price,
+            side=side,
+        )
+
         anchor_price = anchor_level.price
         filtered = [
             item
             for item in candidates
             if abs(self._reference_price(item) - anchor_price) > 1e-12
         ]
+
         return filtered[0] if filtered else None
 
     def _find_extended_target(
@@ -694,7 +772,11 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         side: SignalSide,
         exclude: LiquidityLevel | StopCluster | None = None,
     ) -> LiquidityLevel | StopCluster | None:
-        candidates = self._collect_directional_candidates(snapshot, current_price, side)
+        candidates = self._collect_directional_candidates(
+            snapshot=snapshot,
+            current_price=current_price,
+            side=side,
+        )
 
         if exclude is not None:
             exclude_price = self._reference_price(exclude)
@@ -716,10 +798,12 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         current_price: float,
         target: LiquidityLevel | StopCluster | None,
     ) -> EntryPlan:
-        notes = ["Enter from equal highs/lows structure reaction"]
+        notes = ["Enter from active equal highs/lows structure reaction"]
 
         if target is not None:
-            notes.append(f"Primary target liquidity at {self._reference_price(target):.6f}")
+            notes.append(
+                f"Primary target liquidity at {self._reference_price(target):.6f}"
+            )
 
         entry_type = self.config.builders.default_entry_type or EntryType.MARKET
 
@@ -741,7 +825,11 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         anchor_level: EqualLevel,
         snapshot: LiquidityMapSnapshot,
     ) -> ExitPlan:
-        stop_price = self._resolve_stop_price(side, current_price, anchor_level)
+        stop_price = self._resolve_stop_price(
+            side=side,
+            current_price=current_price,
+            anchor_level=anchor_level,
+        )
         tp_levels: list[TargetPlan] = []
 
         primary_target_price = self._reference_price(target) if target is not None else None
@@ -749,9 +837,11 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             tp_levels.append(
                 TargetPlan(
                     price=primary_target_price,
-                    size_fraction=0.70
-                    if self.config.builders.enable_partial_take_profit
-                    else 1.0,
+                    size_fraction=(
+                        0.70
+                        if self.config.builders.enable_partial_take_profit
+                        else 1.0
+                    ),
                     rr=self._compute_rr(
                         current_price=current_price,
                         stop_price=stop_price,
@@ -764,9 +854,9 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             )
 
         secondary_target = self._find_extended_target(
-            snapshot,
-            current_price,
-            side,
+            snapshot=snapshot,
+            current_price=current_price,
+            side=side,
             exclude=target,
         )
         secondary_price = (
@@ -815,7 +905,11 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         current_price: float,
         anchor_level: EqualLevel,
     ) -> InvalidationPlan:
-        price = self._resolve_stop_price(side, current_price, anchor_level)
+        price = self._resolve_stop_price(
+            side=side,
+            current_price=current_price,
+            anchor_level=anchor_level,
+        )
 
         reason = None
         if self.config.builders.require_invalidation:
@@ -866,7 +960,7 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         )
 
     # ------------------------------------------------------------------
-    # Reason / confirmation builders
+    # Reasons / confirmations
     # ------------------------------------------------------------------
 
     def _build_primary_reason(
@@ -880,15 +974,22 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
             if side == SignalSide.LONG
             else "Equal highs reaction -> short setup"
         )
+
         return (
-            f"{prefix}: level={level.price:.6f}, current_price={current_price:.6f}, "
-            f"confidence={level.confidence:.3f}, touches={level.touches_count}, "
-            f"reactions={level.reaction_count}, sweep_status={level.sweep_status.value}"
+            f"{prefix}: level={level.price:.6f}, "
+            f"current_price={current_price:.6f}, "
+            f"confidence={level.confidence:.3f}, "
+            f"touches={level.touches_count}, "
+            f"reactions={level.reaction_count}, "
+            f"sweep_status={level.sweep_status.value}"
         )
 
     def _build_target_reason(self, target: LiquidityLevel | StopCluster | None) -> str:
         if target is None:
-            return "No explicit target found; signal based on equal highs/lows structure quality"
+            return (
+                "No explicit target found; signal based on active equal highs/lows "
+                "structure quality"
+            )
 
         if isinstance(target, StopCluster):
             return (
@@ -918,20 +1019,29 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         if level.reaction_count >= 2:
             confirmations.append("Repeated reactions confirm structure validity")
 
-        if level.sweep_status == SweepStatus.SWEPT:
-            confirmations.append("Equal level has been swept")
-        elif level.sweep_status == SweepStatus.PARTIALLY_SWEPT:
-            confirmations.append("Equal level has been partially swept")
+        if level.sweep_status == SweepStatus.NOT_SWEPT:
+            confirmations.append("Equal level is still unswept and structurally active")
 
         if side == SignalSide.LONG:
             if snapshot.bias == LiquidityBias.DOWN:
                 confirmations.append("Counter-bias long setup from equal lows")
-            if self._has_high_quality_zone(snapshot.zones, LiquiditySide.BUY_SIDE, current_price):
+
+            if self._has_high_quality_zone(
+                zones=snapshot.zones,
+                side=LiquiditySide.BUY_SIDE,
+                current_price=current_price,
+            ):
                 confirmations.append("High-quality buy-side zone ahead")
-        else:
+
+        elif side == SignalSide.SHORT:
             if snapshot.bias == LiquidityBias.UP:
                 confirmations.append("Counter-bias short setup from equal highs")
-            if self._has_high_quality_zone(snapshot.zones, LiquiditySide.SELL_SIDE, current_price):
+
+            if self._has_high_quality_zone(
+                zones=snapshot.zones,
+                side=LiquiditySide.SELL_SIDE,
+                current_price=current_price,
+            ):
                 confirmations.append("High-quality sell-side zone ahead")
 
         if target is not None:
@@ -948,12 +1058,16 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
         for zone in zones:
             if zone.side not in {side, LiquiditySide.BOTH}:
                 continue
+
             if side == LiquiditySide.BUY_SIDE and zone.center_price <= current_price:
                 continue
+
             if side == LiquiditySide.SELL_SIDE and zone.center_price >= current_price:
                 continue
+
             if zone.score >= 0.65:
                 return True
+
         return False
 
     # ------------------------------------------------------------------
@@ -1005,9 +1119,59 @@ class EqualHighLowStrategy(BaseLiquidityStrategy):
 
         return reward / risk
 
+    def _resolve_regime(self, context: StrategyContext) -> MarketRegime:
+        if context.regime is not None and context.regime.regime is not None:
+            regime = context.regime.regime
+            if isinstance(regime, MarketRegime):
+                return regime
+
+            try:
+                return MarketRegime(regime)
+            except (TypeError, ValueError):
+                return MarketRegime.UNKNOWN
+
+        metadata = getattr(context, "metadata", None)
+        metadata_regime = getattr(metadata, "regime", None)
+
+        if isinstance(metadata_regime, MarketRegime):
+            return metadata_regime
+
+        if metadata_regime is not None:
+            try:
+                return MarketRegime(metadata_regime)
+            except (TypeError, ValueError):
+                return MarketRegime.UNKNOWN
+
+        return MarketRegime.UNKNOWN
+
+    def _target_type(self, target: LiquidityLevel | StopCluster | None) -> str | None:
+        if target is None:
+            return None
+
+        if isinstance(target, StopCluster):
+            return "stop_cluster"
+
+        return target.level_type.value
+
     def _reference_price(self, item: LiquidityLevel | StopCluster | None) -> float:
         if item is None:
             return 0.0
+
         if isinstance(item, StopCluster):
             return float(item.center_price)
+
         return float(item.price)
+
+    @staticmethod
+    def _clamp01(value: Any) -> float:
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        return max(0.0, min(resolved, 1.0))
+
+    def _unknown_regime(self):
+        from strategy.enums import MarketRegime
+
+        return MarketRegime.UNKNOWN
