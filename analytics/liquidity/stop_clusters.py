@@ -35,6 +35,10 @@ class OrderbookLevel:
     size: float
     side: str  # "bid" | "ask"
 
+    def __post_init__(self) -> None:
+        self.price = safe_float(self.price)
+        self.size = safe_float(self.size)
+
 
 @dataclass(slots=True)
 class StopClusterCandidate:
@@ -43,6 +47,11 @@ class StopClusterCandidate:
 
     Це не публічна модель і не event payload.
     Використовується тільки всередині StopClustersDetector.
+
+    Важливо:
+    - swept_at переноситься із source LiquidityLevel у StopCluster;
+    - partially/fully swept source levels знижують density/confidence, але не губляться;
+    - це дає strategy-шару змогу відрізнити swept cluster від звичайного cluster.
     """
 
     symbol: str
@@ -56,6 +65,8 @@ class StopClusterCandidate:
 
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    swept_at: datetime | None = None
+    invalidated_at: datetime | None = None
 
     volume_score: float = 0.0
     orderbook_score: float = 0.0
@@ -63,7 +74,13 @@ class StopClusterCandidate:
     time_decay_factor: float = 1.0
     partial_sweep_factor: float = 1.0
 
+    swept_source_count: int = 0
+    partially_swept_source_count: int = 0
+
     def __post_init__(self) -> None:
+        self.low_price = safe_float(self.low_price)
+        self.high_price = safe_float(self.high_price)
+
         if self.low_price > self.high_price:
             self.low_price, self.high_price = self.high_price, self.low_price
 
@@ -72,6 +89,8 @@ class StopClusterCandidate:
         self.compression_score = clamp(self.compression_score, 0.0, 1.0)
         self.time_decay_factor = clamp(self.time_decay_factor, 0.0, 1.0)
         self.partial_sweep_factor = clamp(self.partial_sweep_factor, 0.0, 1.0)
+        self.swept_source_count = max(0, int(self.swept_source_count))
+        self.partially_swept_source_count = max(0, int(self.partially_swept_source_count))
 
     @property
     def center_price(self) -> float:
@@ -86,6 +105,9 @@ class StopClusterCandidate:
             or other.high_price < self.low_price
         )
 
+    def is_swept(self) -> bool:
+        return self.swept_at is not None or self.swept_source_count > 0
+
 
 class StopClustersDetector:
     """
@@ -93,7 +115,7 @@ class StopClustersDetector:
 
     Відповідальність:
     - перетворити liquidity levels у stop-cluster candidates;
-    - врахувати partial sweep;
+    - врахувати partial/full sweep;
     - підсилити density через volume/orderbook/compression;
     - застосувати time decay;
     - merge/deduplicate candidates;
@@ -138,21 +160,6 @@ class StopClustersDetector:
     ) -> list[StopCluster]:
         """
         Будує stop clusters з liquidity levels.
-
-        Parameters
-        ----------
-        symbol:
-            Торговий символ.
-        timeframe:
-            Таймфрейм.
-        levels:
-            LiquidityLevel / EqualLevel / external liquidity levels.
-        current_price:
-            Поточна ціна для proximity scoring.
-        candles:
-            Опціональні candles для volume/compression enhancement.
-        orderbook:
-            Опціональний orderbook для wall/size enhancement.
 
         Returns
         -------
@@ -206,6 +213,7 @@ class StopClustersDetector:
                 "candidates": len(candidates),
                 "merged_candidates": len(merged_candidates),
                 "clusters": len(clusters),
+                "swept_clusters": sum(1 for cluster in clusters if cluster.is_swept()),
             },
         )
 
@@ -244,6 +252,9 @@ class StopClustersDetector:
         ranges: list[tuple[float, float]] = []
 
         for level in levels:
+            if not self._should_use_level(level):
+                continue
+
             candidate = self._level_to_candidate(
                 symbol=level.symbol,
                 timeframe=level.timeframe,
@@ -317,14 +328,19 @@ class StopClustersDetector:
     def _should_use_level(self, level: LiquidityLevel) -> bool:
         """
         Вирішує, чи можна використовувати рівень як source для stop cluster.
+
+        Invalidated/expired рівні не використовуються.
+        Fully/partially swept рівні можна використовувати, але вони переносять
+        swept_at у StopCluster і знижують confidence/density через sweep factor.
+        Це потрібно для коректної stop-hunt reversal логіки в strategy layer.
         """
         if level.price <= 0:
             return False
 
-        if level.is_swept():
+        if self._level_is_invalidated_or_expired(level):
             return False
 
-        if not level.is_active() and not level.is_partially_swept():
+        if not level.is_active() and not level.is_partially_swept() and not level.is_swept():
             return False
 
         return level.level_type in {
@@ -337,6 +353,23 @@ class StopClustersDetector:
             LiquidityLevelType.ORDERBOOK_WALL,
             LiquidityLevelType.LIQUIDATION_ZONE,
         }
+
+    def _level_is_invalidated_or_expired(self, level: LiquidityLevel) -> bool:
+        if getattr(level, "invalidated_at", None) is not None:
+            return True
+
+        if getattr(level, "expired_at", None) is not None:
+            return True
+
+        is_invalidated = getattr(level, "is_invalidated", None)
+        if callable(is_invalidated) and is_invalidated():
+            return True
+
+        is_expired = getattr(level, "is_expired", None)
+        if callable(is_expired) and is_expired():
+            return True
+
+        return False
 
     def _level_to_candidate(
         self,
@@ -362,6 +395,9 @@ class StopClustersDetector:
             low_price = level.price * (1.0 - padding_pct)
             high_price = level.price * (1.0 + padding_pct)
 
+        swept_at = self._normalize_timestamp(level.swept_at) if level.swept_at else None
+        invalidated_at = self._normalize_timestamp(level.invalidated_at) if level.invalidated_at else None
+
         return StopClusterCandidate(
             symbol=symbol,
             timeframe=timeframe,
@@ -371,6 +407,10 @@ class StopClustersDetector:
             source_levels=[level],
             created_at=self._normalize_timestamp(level.first_seen_at),
             updated_at=self._normalize_timestamp(level.last_seen_at),
+            swept_at=swept_at,
+            invalidated_at=invalidated_at,
+            swept_source_count=1 if level.is_swept() else 0,
+            partially_swept_source_count=1 if level.is_partially_swept() else 0,
         )
 
     def _resolve_candidate_side(self, level: LiquidityLevel) -> LiquiditySide:
@@ -392,7 +432,9 @@ class StopClustersDetector:
         scale = 0.75 + 0.50 * confidence
         padding = base_padding * scale
 
-        if level.is_partially_swept():
+        if level.is_swept():
+            padding *= 1.25
+        elif level.is_partially_swept():
             padding *= 1.15
 
         return max(padding, base_padding * 0.5)
@@ -406,7 +448,7 @@ class StopClustersDetector:
             return 1.0
 
         if level.is_swept():
-            return 0.45
+            return 0.55
 
         if level.is_partially_swept():
             return 0.82
@@ -624,11 +666,15 @@ class StopClustersDetector:
             source_levels=list(candidate.source_levels),
             created_at=candidate.created_at,
             updated_at=candidate.updated_at,
+            swept_at=candidate.swept_at,
+            invalidated_at=candidate.invalidated_at,
             volume_score=candidate.volume_score,
             orderbook_score=candidate.orderbook_score,
             compression_score=candidate.compression_score,
             time_decay_factor=candidate.time_decay_factor,
             partial_sweep_factor=candidate.partial_sweep_factor,
+            swept_source_count=candidate.swept_source_count,
+            partially_swept_source_count=candidate.partially_swept_source_count,
         )
 
     # ------------------------------------------------------------------
@@ -715,6 +761,8 @@ class StopClustersDetector:
             source_levels=source_levels,
             created_at=self._min_datetime(left.created_at, right.created_at),
             updated_at=self._max_datetime(left.updated_at, right.updated_at),
+            swept_at=self._max_datetime(left.swept_at, right.swept_at),
+            invalidated_at=self._max_datetime(left.invalidated_at, right.invalidated_at),
             volume_score=max(left.volume_score, right.volume_score),
             orderbook_score=max(left.orderbook_score, right.orderbook_score),
             compression_score=max(left.compression_score, right.compression_score),
@@ -722,6 +770,11 @@ class StopClustersDetector:
             partial_sweep_factor=min(
                 left.partial_sweep_factor,
                 right.partial_sweep_factor,
+            ),
+            swept_source_count=left.swept_source_count + right.swept_source_count,
+            partially_swept_source_count=(
+                left.partially_swept_source_count
+                + right.partially_swept_source_count
             ),
         )
 
@@ -743,7 +796,10 @@ class StopClustersDetector:
             )
 
             if cluster.confidence < self._config.min_confidence:
-                continue
+                # Keep genuinely swept clusters if they are close enough and not zero-quality,
+                # because stop-hunt reversal strategies may need them as context.
+                if not cluster.is_swept() or cluster.confidence <= 0.0:
+                    continue
 
             clusters.append(cluster)
 
@@ -789,6 +845,8 @@ class StopClustersDetector:
             source_level_type=dominant_level_type,
             created_at=candidate.created_at,
             updated_at=candidate.updated_at,
+            swept_at=candidate.swept_at,
+            invalidated_at=candidate.invalidated_at,
             source_levels=list(candidate.source_levels),
             metadata={
                 "detector": self.__class__.__name__,
@@ -807,6 +865,9 @@ class StopClustersDetector:
                 "compression_score": candidate.compression_score,
                 "time_decay_factor": candidate.time_decay_factor,
                 "partial_sweep_factor": candidate.partial_sweep_factor,
+                "swept_source_count": candidate.swept_source_count,
+                "partially_swept_source_count": candidate.partially_swept_source_count,
+                "is_swept_cluster": candidate.is_swept(),
             },
         )
 
@@ -956,12 +1017,14 @@ class StopClustersDetector:
         current: StopCluster,
     ) -> bool:
         candidate_score = (
+            1 if candidate.is_swept() else 0,
             candidate.confidence,
             candidate.estimated_stop_density,
             candidate.touches_count,
             -candidate.width_pct(),
         )
         current_score = (
+            1 if current.is_swept() else 0,
             current.confidence,
             current.estimated_stop_density,
             current.touches_count,

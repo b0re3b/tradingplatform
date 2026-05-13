@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .enums import (
@@ -12,6 +12,38 @@ from .enums import (
     LiquidityStatus,
     SweepStatus,
 )
+
+
+def _utcnow() -> datetime:
+    """
+    Timezone-aware UTC timestamp for model state transitions.
+
+    The models module intentionally stays free of core dependencies:
+    no EventBus, no Scheduler, no logger, no IO.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp01(value: Any) -> float:
+    return max(0.0, min(_safe_float(value), 1.0))
+
+
+def _clamp_signed(value: Any) -> float:
+    """
+    Clamp signed scores to [-1.0, 1.0].
+
+    Used for liquidity_pressure_score where direction must be preserved:
+    - positive: upside / buy-side pressure depending on LiquidityMap semantics;
+    - negative: downside / sell-side pressure depending on LiquidityMap semantics.
+    """
+    return max(-1.0, min(_safe_float(value), 1.0))
 
 
 @dataclass(slots=True)
@@ -57,9 +89,10 @@ class LiquidityLevel:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.confidence = self._clamp01(self.confidence)
-        self.touches_count = max(0, self.touches_count)
-        self.reaction_count = max(0, self.reaction_count)
+        self.price = _safe_float(self.price)
+        self.confidence = _clamp01(self.confidence)
+        self.touches_count = max(0, int(self.touches_count))
+        self.reaction_count = max(0, int(self.reaction_count))
 
     @property
     def key(self) -> str:
@@ -85,11 +118,20 @@ class LiquidityLevel:
     def is_active(self) -> bool:
         return self.status == LiquidityStatus.ACTIVE
 
+    def is_weak(self) -> bool:
+        return self.status == LiquidityStatus.WEAK
+
     def is_swept(self) -> bool:
         return self.sweep_status == SweepStatus.SWEPT
 
     def is_partially_swept(self) -> bool:
         return self.sweep_status == SweepStatus.PARTIALLY_SWEPT
+
+    def is_invalidated(self) -> bool:
+        return self.status == LiquidityStatus.INVALIDATED
+
+    def is_expired(self) -> bool:
+        return self.status == LiquidityStatus.EXPIRED
 
     def is_terminal(self) -> bool:
         return self.status in {
@@ -99,43 +141,62 @@ class LiquidityLevel:
         }
 
     def mark_swept(self, swept_at: datetime | None = None) -> None:
+        event_ts = swept_at or _utcnow()
         self.sweep_status = SweepStatus.SWEPT
         self.status = LiquidityStatus.SWEPT
-        self.swept_at = swept_at
+        self.swept_at = event_ts
+        self.last_seen_at = event_ts
+
+        if self.first_seen_at is None:
+            self.first_seen_at = event_ts
 
     def mark_partially_swept(self, swept_at: datetime | None = None) -> None:
+        event_ts = swept_at or _utcnow()
         self.sweep_status = SweepStatus.PARTIALLY_SWEPT
+
         if self.status != LiquidityStatus.INVALIDATED:
             self.status = LiquidityStatus.ACTIVE
-        self.swept_at = swept_at
+
+        self.swept_at = event_ts
+        self.last_seen_at = event_ts
+
+        if self.first_seen_at is None:
+            self.first_seen_at = event_ts
 
     def mark_invalidated(self, invalidated_at: datetime | None = None) -> None:
+        event_ts = invalidated_at or _utcnow()
         self.status = LiquidityStatus.INVALIDATED
-        self.invalidated_at = invalidated_at
+        self.invalidated_at = event_ts
+        self.last_seen_at = event_ts
 
     def mark_expired(self, expired_at: datetime | None = None) -> None:
+        event_ts = expired_at or _utcnow()
         self.status = LiquidityStatus.EXPIRED
-        self.expired_at = expired_at
+        self.expired_at = event_ts
+        self.last_seen_at = event_ts
 
     def mark_weak(self) -> None:
         if not self.is_terminal():
             self.status = LiquidityStatus.WEAK
 
     def touch(self, seen_at: datetime | None = None) -> None:
+        event_ts = seen_at or _utcnow()
         self.touches_count += 1
-        self.last_seen_at = seen_at or self.last_seen_at
+        self.last_seen_at = event_ts
 
         if self.first_seen_at is None:
-            self.first_seen_at = self.last_seen_at
+            self.first_seen_at = event_ts
 
     def register_reaction(self, seen_at: datetime | None = None) -> None:
+        event_ts = seen_at or _utcnow()
         self.reaction_count += 1
-        self.last_seen_at = seen_at or self.last_seen_at
+        self.last_seen_at = event_ts
 
         if self.first_seen_at is None:
-            self.first_seen_at = self.last_seen_at
+            self.first_seen_at = event_ts
 
     def distance_pct(self, current_price: float) -> float:
+        current_price = _safe_float(current_price)
         if current_price == 0:
             return 0.0
         return abs(self.price - current_price) / abs(current_price)
@@ -161,12 +222,10 @@ class LiquidityLevel:
             "invalidated_at": self.invalidated_at.isoformat() if self.invalidated_at else None,
             "expired_at": self.expired_at.isoformat() if self.expired_at else None,
             "source": self.source,
+            "is_active": self.is_active(),
+            "is_terminal": self.is_terminal(),
             "metadata": dict(self.metadata),
         }
-
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(float(value), 1.0))
 
 
 @dataclass(slots=True)
@@ -193,22 +252,30 @@ class EqualLevel(LiquidityLevel):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        self.tolerance_pct = max(0.0, float(self.tolerance_pct))
+        self.tolerance_pct = max(0.0, _safe_float(self.tolerance_pct))
 
         if self.cluster_low is None:
             self.cluster_low = self.price
+        else:
+            self.cluster_low = _safe_float(self.cluster_low)
 
         if self.cluster_high is None:
             self.cluster_high = self.price
+        else:
+            self.cluster_high = _safe_float(self.cluster_high)
 
         if self.cluster_low > self.cluster_high:
             self.cluster_low, self.cluster_high = self.cluster_high, self.cluster_low
 
         if not self.level_prices:
             self.level_prices = [self.price]
+        else:
+            self.level_prices = [_safe_float(price) for price in self.level_prices]
 
         if self.touches_count <= 0:
             self.touches_count = len(self.level_prices)
+
+        self.pivot_indexes = [max(0, int(index)) for index in self.pivot_indexes]
 
     @property
     def cluster_width(self) -> float:
@@ -223,6 +290,7 @@ class EqualLevel(LiquidityLevel):
         return (self.cluster_low + self.cluster_high) / 2.0
 
     def contains_price(self, price: float) -> bool:
+        price = _safe_float(price)
         if self.cluster_low is None or self.cluster_high is None:
             return self.price == price
         return self.cluster_low <= price <= self.cluster_high
@@ -235,6 +303,7 @@ class EqualLevel(LiquidityLevel):
                 "cluster_low": self.cluster_low,
                 "cluster_high": self.cluster_high,
                 "cluster_width": self.cluster_width,
+                "cluster_midpoint": self.cluster_midpoint,
                 "level_prices": list(self.level_prices),
                 "pivot_indexes": list(self.pivot_indexes),
             }
@@ -252,6 +321,8 @@ class StopCluster:
     - swing highs / lows;
     - range boundaries;
     - external levels, якщо вони передані в LiquidityMap.
+
+    Це чиста domain-модель. Вона не має EventBus, Scheduler, logger або IO.
     """
 
     symbol: str
@@ -277,13 +348,19 @@ class StopCluster:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.low_price = _safe_float(self.low_price)
+        self.high_price = _safe_float(self.high_price)
+        self.center_price = _safe_float(self.center_price)
+
         if self.low_price > self.high_price:
             self.low_price, self.high_price = self.high_price, self.low_price
 
-        self.center_price = self.center_price or self._midpoint(self.low_price, self.high_price)
-        self.confidence = self._clamp01(self.confidence)
-        self.estimated_stop_density = self._clamp01(self.estimated_stop_density)
-        self.touches_count = max(0, self.touches_count)
+        if self.center_price <= 0:
+            self.center_price = self._midpoint(self.low_price, self.high_price)
+
+        self.confidence = _clamp01(self.confidence)
+        self.estimated_stop_density = _clamp01(self.estimated_stop_density)
+        self.touches_count = max(0, int(self.touches_count))
 
     @property
     def key(self) -> str:
@@ -303,6 +380,18 @@ class StopCluster:
     def is_sell_side(self) -> bool:
         return self.side == LiquiditySide.SELL_SIDE
 
+    def is_swept(self) -> bool:
+        return self.swept_at is not None
+
+    def is_invalidated(self) -> bool:
+        return self.invalidated_at is not None
+
+    def is_active(self) -> bool:
+        return not self.is_invalidated()
+
+    def is_terminal(self) -> bool:
+        return self.is_invalidated()
+
     def width(self) -> float:
         return max(0.0, self.high_price - self.low_price)
 
@@ -312,6 +401,7 @@ class StopCluster:
         return self.width() / abs(self.center_price)
 
     def contains_price(self, price: float) -> bool:
+        price = _safe_float(price)
         return self.low_price <= price <= self.high_price
 
     def overlaps(self, other: StopCluster) -> bool:
@@ -321,15 +411,20 @@ class StopCluster:
         )
 
     def distance_pct(self, current_price: float) -> float:
+        current_price = _safe_float(current_price)
         if current_price == 0:
             return 0.0
         return abs(self.center_price - current_price) / abs(current_price)
 
     def mark_invalidated(self, invalidated_at: datetime | None = None) -> None:
-        self.invalidated_at = invalidated_at
+        event_ts = invalidated_at or _utcnow()
+        self.invalidated_at = event_ts
+        self.updated_at = event_ts
 
     def mark_swept(self, swept_at: datetime | None = None) -> None:
-        self.swept_at = swept_at
+        event_ts = swept_at or _utcnow()
+        self.swept_at = event_ts
+        self.updated_at = event_ts
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
@@ -350,6 +445,9 @@ class StopCluster:
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "invalidated_at": self.invalidated_at.isoformat() if self.invalidated_at else None,
             "swept_at": self.swept_at.isoformat() if self.swept_at else None,
+            "is_active": self.is_active(),
+            "is_swept": self.is_swept(),
+            "is_terminal": self.is_terminal(),
             "source_levels_count": len(self.source_levels),
             "source_levels": [
                 level.to_event_payload()
@@ -361,10 +459,6 @@ class StopCluster:
     @staticmethod
     def _midpoint(low: float, high: float) -> float:
         return (low + high) / 2.0
-
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(float(value), 1.0))
 
 
 @dataclass(slots=True)
@@ -391,10 +485,13 @@ class LiquidityZone:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.low_price = _safe_float(self.low_price)
+        self.high_price = _safe_float(self.high_price)
+
         if self.low_price > self.high_price:
             self.low_price, self.high_price = self.high_price, self.low_price
 
-        self.score = max(0.0, min(float(self.score), 1.0))
+        self.score = _clamp01(self.score)
 
     @property
     def center_price(self) -> float:
@@ -409,9 +506,11 @@ class LiquidityZone:
         return self.width() / abs(self.center_price)
 
     def contains_price(self, price: float) -> bool:
+        price = _safe_float(price)
         return self.low_price <= price <= self.high_price
 
     def distance_pct(self, current_price: float) -> float:
+        current_price = _safe_float(current_price)
         if current_price == 0:
             return 0.0
         return abs(self.center_price - current_price) / abs(current_price)
@@ -462,11 +561,11 @@ class LiquiditySignal:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.sweep_risk_up = self._clamp01(self.sweep_risk_up)
-        self.sweep_risk_down = self._clamp01(self.sweep_risk_down)
-        self.magnet_score_up = self._clamp01(self.magnet_score_up)
-        self.magnet_score_down = self._clamp01(self.magnet_score_down)
-        self.confidence = self._clamp01(self.confidence)
+        self.sweep_risk_up = _clamp01(self.sweep_risk_up)
+        self.sweep_risk_down = _clamp01(self.sweep_risk_down)
+        self.magnet_score_up = _clamp01(self.magnet_score_up)
+        self.magnet_score_down = _clamp01(self.magnet_score_down)
+        self.confidence = _clamp01(self.confidence)
 
     @property
     def is_directional(self) -> bool:
@@ -500,10 +599,6 @@ class LiquiditySignal:
         if value is None:
             return None
         return value.to_event_payload()
-
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(float(value), 1.0))
 
 
 @dataclass(slots=True)
@@ -542,9 +637,14 @@ class LiquidityMapSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.above_liquidity_score = self._clamp01(self.above_liquidity_score)
-        self.below_liquidity_score = self._clamp01(self.below_liquidity_score)
-        self.liquidity_pressure_score = self._clamp01(self.liquidity_pressure_score)
+        self.current_price = _safe_float(self.current_price)
+        self.above_liquidity_score = _clamp01(self.above_liquidity_score)
+        self.below_liquidity_score = _clamp01(self.below_liquidity_score)
+
+        # Important: this score is intentionally signed.
+        # Do NOT clamp it to [0, 1], otherwise short/downside pressure
+        # is lost before strategy layer consumes the snapshot.
+        self.liquidity_pressure_score = _clamp_signed(self.liquidity_pressure_score)
 
     def has_levels(self) -> bool:
         return bool(
@@ -557,33 +657,66 @@ class LiquidityMapSnapshot:
     def get_active_levels(self) -> list[LiquidityLevel]:
         return [level for level in self.active_levels if level.is_active()]
 
-    def get_buy_side_levels(self) -> list[LiquidityLevel]:
+    def get_terminal_levels(self) -> list[LiquidityLevel]:
+        return [level for level in self.active_levels if level.is_terminal()]
+
+    def get_buy_side_levels(self, *, active_only: bool = True) -> list[LiquidityLevel]:
+        levels = self.get_active_levels() if active_only else list(self.active_levels)
+        return [level for level in levels if level.side == LiquiditySide.BUY_SIDE]
+
+    def get_sell_side_levels(self, *, active_only: bool = True) -> list[LiquidityLevel]:
+        levels = self.get_active_levels() if active_only else list(self.active_levels)
+        return [level for level in levels if level.side == LiquiditySide.SELL_SIDE]
+
+    def get_equal_levels(self, *, active_only: bool = False) -> list[EqualLevel]:
+        if not active_only:
+            return list(self.equal_levels)
+        return [level for level in self.equal_levels if level.is_active()]
+
+    def get_buy_side_equal_levels(self, *, active_only: bool = False) -> list[EqualLevel]:
         return [
             level
-            for level in self.active_levels
+            for level in self.get_equal_levels(active_only=active_only)
             if level.side == LiquiditySide.BUY_SIDE
         ]
 
-    def get_sell_side_levels(self) -> list[LiquidityLevel]:
+    def get_sell_side_equal_levels(self, *, active_only: bool = False) -> list[EqualLevel]:
         return [
             level
-            for level in self.active_levels
+            for level in self.get_equal_levels(active_only=active_only)
             if level.side == LiquiditySide.SELL_SIDE
         ]
 
-    def get_buy_side_clusters(self) -> list[StopCluster]:
-        return [
-            cluster
-            for cluster in self.stop_clusters
-            if cluster.side == LiquiditySide.BUY_SIDE
-        ]
+    def get_active_clusters(self) -> list[StopCluster]:
+        return [cluster for cluster in self.stop_clusters if cluster.is_active()]
 
-    def get_sell_side_clusters(self) -> list[StopCluster]:
-        return [
-            cluster
-            for cluster in self.stop_clusters
-            if cluster.side == LiquiditySide.SELL_SIDE
-        ]
+    def get_swept_clusters(self) -> list[StopCluster]:
+        return [cluster for cluster in self.stop_clusters if cluster.is_swept()]
+
+    def get_buy_side_clusters(self, *, active_only: bool = True) -> list[StopCluster]:
+        clusters = self.get_active_clusters() if active_only else list(self.stop_clusters)
+        return [cluster for cluster in clusters if cluster.side == LiquiditySide.BUY_SIDE]
+
+    def get_sell_side_clusters(self, *, active_only: bool = True) -> list[StopCluster]:
+        clusters = self.get_active_clusters() if active_only else list(self.stop_clusters)
+        return [cluster for cluster in clusters if cluster.side == LiquiditySide.SELL_SIDE]
+
+    def get_nearest_directional_liquidity(
+        self,
+        side: LiquiditySide,
+    ) -> LiquidityLevel | StopCluster | None:
+        if side == LiquiditySide.BUY_SIDE:
+            return self.nearest_above_level
+        if side == LiquiditySide.SELL_SIDE:
+            return self.nearest_below_level
+        return None
+
+    def get_strongest_directional_cluster(self, side: LiquiditySide) -> StopCluster | None:
+        if side == LiquiditySide.BUY_SIDE:
+            return self.strongest_cluster_above
+        if side == LiquiditySide.SELL_SIDE:
+            return self.strongest_cluster_below
+        return None
 
     def to_event_payload(self) -> dict[str, Any]:
         """
@@ -629,6 +762,8 @@ class LiquidityMapSnapshot:
                 "equal_levels_count": len(self.equal_levels),
                 "stop_clusters_count": len(self.stop_clusters),
                 "zones_count": len(self.zones),
+                "active_clusters_count": len(self.get_active_clusters()),
+                "swept_clusters_count": len(self.get_swept_clusters()),
             },
         }
 
@@ -645,7 +780,3 @@ class LiquidityMapSnapshot:
         if value is None:
             return None
         return value.to_event_payload()
-
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return max(0.0, min(float(value), 1.0))

@@ -36,6 +36,11 @@ class LiquidityMapFeatures:
     Внутрішня структура проміжних ознак liquidity landscape.
 
     Не є event payload і не має залежностей від EventBus/Scheduler.
+
+    Semantics:
+    - pressure_score > 0 means upside / buy-side liquidity pressure is stronger;
+    - pressure_score < 0 means downside / sell-side liquidity pressure is stronger;
+    - pressure_score == 0 means balanced liquidity pressure.
     """
 
     above_levels: list[LiquidityLevel]
@@ -80,7 +85,7 @@ class LiquidityMap:
     - побудувати stop clusters;
     - об'єднати додаткові liquidity levels/clusters;
     - побудувати liquidity zones;
-    - розрахувати sweep risk, magnet score, pressure, bias;
+    - розрахувати sweep risk, magnet score, signed pressure, bias;
     - сформувати LiquiditySignal;
     - повернути LiquidityMapSnapshot.
 
@@ -159,12 +164,15 @@ class LiquidityMap:
             current_price=current_price,
         )
 
-        active_levels = self._merge_levels(
+        merged_levels = self._merge_levels(
             equal_levels=equal_levels,
             extra_levels=extra_levels,
         )
 
-        active_levels = self._limit_levels(active_levels)
+        # active_levels in snapshot must really represent active tradable/visible
+        # liquidity. Swept/invalidated/expired levels remain available via equal_levels
+        # for reversal strategies, but should not inflate the live liquidity map.
+        active_levels = self._limit_levels(self._filter_active_levels(merged_levels))
 
         stop_clusters = self._stop_detector.detect_from_levels(
             symbol=symbol,
@@ -182,20 +190,20 @@ class LiquidityMap:
                 current_price=current_price,
             )
 
-        stop_clusters = self._limit_clusters(stop_clusters)
+        active_clusters = self._limit_clusters(self._filter_active_clusters(stop_clusters))
 
         zones = self._build_liquidity_zones(
             symbol=symbol,
             timeframe=timeframe,
             current_price=current_price,
             levels=active_levels,
-            clusters=stop_clusters,
+            clusters=active_clusters,
         )
 
         features = self._extract_features(
             current_price=current_price,
             levels=active_levels,
-            clusters=stop_clusters,
+            clusters=active_clusters,
         )
 
         signal = self._build_signal(
@@ -211,8 +219,8 @@ class LiquidityMap:
             timestamp=snapshot_ts,
             current_price=current_price,
             active_levels=active_levels,
-            equal_levels=equal_levels,
-            stop_clusters=stop_clusters,
+            equal_levels=list(equal_levels),
+            stop_clusters=active_clusters,
             zones=zones,
             nearest_above_level=features.nearest_above_level,
             nearest_below_level=features.nearest_below_level,
@@ -226,13 +234,15 @@ class LiquidityMap:
             metadata={
                 "builder": self.__class__.__name__,
                 "levels_count": len(active_levels),
+                "raw_merged_levels_count": len(merged_levels),
                 "equal_levels_count": len(equal_levels),
-                "stop_clusters_count": len(stop_clusters),
+                "stop_clusters_count": len(active_clusters),
                 "zones_count": len(zones),
                 "sweep_risk_up": features.sweep_risk_up,
                 "sweep_risk_down": features.sweep_risk_down,
                 "magnet_score_up": features.magnet_score_up,
                 "magnet_score_down": features.magnet_score_down,
+                "pressure_score_semantics": "positive=upside_buy_side, negative=downside_sell_side",
                 "orderbook_present": orderbook is not None,
                 "extra_levels_count": len(extra_levels or []),
                 "extra_clusters_count": len(extra_clusters or []),
@@ -247,7 +257,7 @@ class LiquidityMap:
                 "current_price": current_price,
                 "levels_count": len(active_levels),
                 "equal_levels_count": len(equal_levels),
-                "clusters_count": len(stop_clusters),
+                "clusters_count": len(active_clusters),
                 "zones_count": len(zones),
                 "bias": snapshot.bias.value,
                 "above_liquidity_score": snapshot.above_liquidity_score,
@@ -279,27 +289,27 @@ class LiquidityMap:
 
         snapshot_ts = self._normalize_timestamp(timestamp) or datetime.now(timezone.utc)
 
-        active_levels = self._limit_levels(list(levels))
+        active_levels = self._limit_levels(self._filter_active_levels(list(levels)))
 
         stop_clusters = self._merge_clusters(
             primary=list(clusters),
             extra=[],
             current_price=current_price,
         )
-        stop_clusters = self._limit_clusters(stop_clusters)
+        active_clusters = self._limit_clusters(self._filter_active_clusters(stop_clusters))
 
         zones = self._build_liquidity_zones(
             symbol=symbol,
             timeframe=timeframe,
             current_price=current_price,
             levels=active_levels,
-            clusters=stop_clusters,
+            clusters=active_clusters,
         )
 
         features = self._extract_features(
             current_price=current_price,
             levels=active_levels,
-            clusters=stop_clusters,
+            clusters=active_clusters,
         )
 
         signal = self._build_signal(
@@ -316,7 +326,7 @@ class LiquidityMap:
             current_price=current_price,
             active_levels=active_levels,
             equal_levels=list(equal_levels or []),
-            stop_clusters=stop_clusters,
+            stop_clusters=active_clusters,
             zones=zones,
             nearest_above_level=features.nearest_above_level,
             nearest_below_level=features.nearest_below_level,
@@ -332,17 +342,18 @@ class LiquidityMap:
                 "from_components": True,
                 "levels_count": len(active_levels),
                 "equal_levels_count": len(equal_levels or []),
-                "stop_clusters_count": len(stop_clusters),
+                "stop_clusters_count": len(active_clusters),
                 "zones_count": len(zones),
                 "sweep_risk_up": features.sweep_risk_up,
                 "sweep_risk_down": features.sweep_risk_down,
                 "magnet_score_up": features.magnet_score_up,
                 "magnet_score_down": features.magnet_score_down,
+                "pressure_score_semantics": "positive=upside_buy_side, negative=downside_sell_side",
             },
         )
 
     # ------------------------------------------------------------------
-    # Merge levels / clusters
+    # Merge / filtering
     # ------------------------------------------------------------------
 
     def _merge_levels(
@@ -386,6 +397,26 @@ class LiquidityMap:
         deduplicated.sort(key=lambda level: level.price)
         return deduplicated
 
+    def _filter_active_levels(
+        self,
+        levels: Sequence[LiquidityLevel],
+    ) -> list[LiquidityLevel]:
+        return [
+            level
+            for level in levels
+            if level.price > 0 and level.is_active()
+        ]
+
+    def _filter_active_clusters(
+        self,
+        clusters: Sequence[StopCluster],
+    ) -> list[StopCluster]:
+        return [
+            cluster
+            for cluster in clusters
+            if cluster.center_price > 0 and cluster.is_active()
+        ]
+
     def _find_duplicate_level_index(
         self,
         levels: list[LiquidityLevel],
@@ -410,16 +441,16 @@ class LiquidityMap:
         current: LiquidityLevel,
     ) -> bool:
         candidate_score = (
+            1 if candidate.is_active() else 0,
             candidate.confidence,
             candidate.touches_count,
             candidate.reaction_count,
-            1 if candidate.is_active() else 0,
         )
         current_score = (
+            1 if current.is_active() else 0,
             current.confidence,
             current.touches_count,
             current.reaction_count,
-            1 if current.is_active() else 0,
         )
         return candidate_score > current_score
 
@@ -516,12 +547,16 @@ class LiquidityMap:
             ),
             created_at=self._min_datetime(left.created_at, right.created_at),
             updated_at=self._max_datetime(left.updated_at, right.updated_at),
+            invalidated_at=self._max_datetime(left.invalidated_at, right.invalidated_at),
+            swept_at=self._max_datetime(left.swept_at, right.swept_at),
             source_levels=source_levels,
             metadata={
                 "merged": True,
                 "left_metadata": dict(left.metadata),
                 "right_metadata": dict(right.metadata),
                 "source_count": len(source_levels),
+                "left_key": left.key,
+                "right_key": right.key,
             },
         )
 
@@ -834,50 +869,53 @@ class LiquidityMap:
         levels: Sequence[LiquidityLevel],
         clusters: Sequence[StopCluster],
     ) -> LiquidityMapFeatures:
+        active_levels = self._filter_active_levels(levels)
+        active_clusters = self._filter_active_clusters(clusters)
+
         above_levels = [
             level
-            for level in levels
+            for level in active_levels
             if level.price > current_price
         ]
 
         below_levels = [
             level
-            for level in levels
+            for level in active_levels
             if level.price < current_price
         ]
 
         above_clusters = [
             cluster
-            for cluster in clusters
+            for cluster in active_clusters
             if cluster.center_price > current_price
         ]
 
         below_clusters = [
             cluster
-            for cluster in clusters
+            for cluster in active_clusters
             if cluster.center_price < current_price
         ]
 
         nearest_above_level = self._find_nearest_above(
             current_price=current_price,
-            levels=levels,
-            clusters=clusters,
+            levels=active_levels,
+            clusters=active_clusters,
         )
 
         nearest_below_level = self._find_nearest_below(
             current_price=current_price,
-            levels=levels,
-            clusters=clusters,
+            levels=active_levels,
+            clusters=active_clusters,
         )
 
         strongest_cluster_above = self._find_strongest_cluster_above(
             current_price=current_price,
-            clusters=clusters,
+            clusters=active_clusters,
         )
 
         strongest_cluster_below = self._find_strongest_cluster_below(
             current_price=current_price,
-            clusters=clusters,
+            clusters=active_clusters,
         )
 
         above_liquidity_score = self._calculate_side_liquidity_score(
@@ -927,7 +965,8 @@ class LiquidityMap:
             sweep_risk_down=sweep_risk_down,
         )
 
-        bias = self._scorer.infer_bias_from_scores(
+        bias = self._infer_bias_from_pressure(
+            pressure_score=pressure_score,
             above_liquidity_score=above_liquidity_score,
             below_liquidity_score=below_liquidity_score,
         )
@@ -960,13 +999,13 @@ class LiquidityMap:
         candidates: list[LiquidityLevel | StopCluster] = [
             level
             for level in levels
-            if level.price > current_price
+            if level.price > current_price and level.is_active()
         ]
 
         candidates.extend(
             cluster
             for cluster in clusters
-            if cluster.center_price > current_price
+            if cluster.center_price > current_price and cluster.is_active()
         )
 
         if not candidates:
@@ -986,13 +1025,13 @@ class LiquidityMap:
         candidates: list[LiquidityLevel | StopCluster] = [
             level
             for level in levels
-            if level.price < current_price
+            if level.price < current_price and level.is_active()
         ]
 
         candidates.extend(
             cluster
             for cluster in clusters
-            if cluster.center_price < current_price
+            if cluster.center_price < current_price and cluster.is_active()
         )
 
         if not candidates:
@@ -1011,13 +1050,20 @@ class LiquidityMap:
         candidates = [
             cluster
             for cluster in clusters
-            if cluster.center_price > current_price
+            if cluster.center_price > current_price and cluster.is_active()
         ]
 
         if not candidates:
             return None
 
-        return max(candidates, key=lambda cluster: cluster.confidence)
+        return max(
+            candidates,
+            key=lambda cluster: (
+                cluster.confidence,
+                cluster.estimated_stop_density,
+                cluster.touches_count,
+            ),
+        )
 
     def _find_strongest_cluster_below(
         self,
@@ -1027,13 +1073,20 @@ class LiquidityMap:
         candidates = [
             cluster
             for cluster in clusters
-            if cluster.center_price < current_price
+            if cluster.center_price < current_price and cluster.is_active()
         ]
 
         if not candidates:
             return None
 
-        return max(candidates, key=lambda cluster: cluster.confidence)
+        return max(
+            candidates,
+            key=lambda cluster: (
+                cluster.confidence,
+                cluster.estimated_stop_density,
+                cluster.touches_count,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Scores
@@ -1061,9 +1114,14 @@ class LiquidityMap:
                 1.0,
             )
 
+            swept_penalty = 0.15 if cluster.is_swept() else 0.0
+
             cluster_scores.append(
                 clamp(
-                    0.70 * cluster.confidence + 0.30 * proximity,
+                    0.65 * cluster.confidence
+                    + 0.25 * cluster.estimated_stop_density
+                    + 0.10 * proximity
+                    - swept_penalty,
                     0.0,
                     1.0,
                 )
@@ -1131,12 +1189,12 @@ class LiquidityMap:
             )
 
         cluster_component = max(
-            [cluster.confidence for cluster in clusters],
+            [cluster.confidence for cluster in clusters if cluster.is_active()],
             default=0.0,
         )
 
         level_component = max(
-            [level.confidence for level in levels],
+            [level.confidence for level in levels if level.is_active()],
             default=0.0,
         )
 
@@ -1160,6 +1218,9 @@ class LiquidityMap:
         components: list[float] = []
 
         for level in levels:
+            if not level.is_active():
+                continue
+
             distance_score = 1.0 - clamp(
                 pct_distance(level.price, current_price) / 0.025,
                 0.0,
@@ -1175,6 +1236,9 @@ class LiquidityMap:
             )
 
         for cluster in clusters:
+            if not cluster.is_active():
+                continue
+
             distance_score = 1.0 - clamp(
                 pct_distance(cluster.center_price, current_price) / 0.025,
                 0.0,
@@ -1209,6 +1273,12 @@ class LiquidityMap:
         sweep_risk_up: float,
         sweep_risk_down: float,
     ) -> float:
+        """
+        Signed aggregate pressure score.
+
+        Positive value means upside / buy-side liquidity pull is stronger.
+        Negative value means downside / sell-side liquidity pull is stronger.
+        """
         upward = (
             0.45 * above_liquidity_score
             + 0.30 * magnet_score_up
@@ -1222,6 +1292,26 @@ class LiquidityMap:
         )
 
         return clamp(upward - downward, -1.0, 1.0)
+
+    def _infer_bias_from_pressure(
+        self,
+        pressure_score: float,
+        above_liquidity_score: float,
+        below_liquidity_score: float,
+    ) -> LiquidityBias:
+        """
+        Infer bias from signed pressure first, with score delta as fallback.
+        """
+        if pressure_score >= 0.08:
+            return LiquidityBias.UP
+
+        if pressure_score <= -0.08:
+            return LiquidityBias.DOWN
+
+        return self._scorer.infer_bias_from_scores(
+            above_liquidity_score=above_liquidity_score,
+            below_liquidity_score=below_liquidity_score,
+        )
 
     # ------------------------------------------------------------------
     # Signal
@@ -1254,6 +1344,7 @@ class LiquidityMap:
                 "above_liquidity_score": features.above_liquidity_score,
                 "below_liquidity_score": features.below_liquidity_score,
                 "pressure_score": features.pressure_score,
+                "pressure_score_semantics": "positive=upside_buy_side, negative=downside_sell_side",
                 "strongest_cluster_above_confidence": (
                     features.strongest_cluster_above.confidence
                     if features.strongest_cluster_above
@@ -1264,6 +1355,10 @@ class LiquidityMap:
                     if features.strongest_cluster_below
                     else 0.0
                 ),
+                "above_levels_count": len(features.above_levels),
+                "below_levels_count": len(features.below_levels),
+                "above_clusters_count": len(features.above_clusters),
+                "below_clusters_count": len(features.below_clusters),
             },
         )
 
@@ -1271,10 +1366,9 @@ class LiquidityMap:
         self,
         features: LiquidityMapFeatures,
     ) -> float:
-        if features.bias == LiquidityBias.NEUTRAL:
-            return clamp(abs(features.pressure_score), 0.0, 1.0)
+        directional_strength = abs(features.pressure_score)
 
-        directional_strength = abs(
+        side_score_delta = abs(
             features.above_liquidity_score - features.below_liquidity_score
         )
 
@@ -1289,9 +1383,10 @@ class LiquidityMap:
         )
 
         return clamp(
-            0.45 * directional_strength
-            + 0.30 * sweep_strength
-            + 0.25 * magnet_strength,
+            0.35 * directional_strength
+            + 0.25 * side_score_delta
+            + 0.20 * sweep_strength
+            + 0.20 * magnet_strength,
             0.0,
             1.0,
         )
@@ -1308,6 +1403,11 @@ class LiquidityMap:
             parts.append("sell-side liquidity below price looks stronger")
         else:
             parts.append("liquidity is relatively balanced")
+
+        if features.pressure_score > 0:
+            parts.append(f"signed pressure is upside: {features.pressure_score:.3f}")
+        elif features.pressure_score < 0:
+            parts.append(f"signed pressure is downside: {features.pressure_score:.3f}")
 
         if features.sweep_risk_up > 0.65:
             parts.append("elevated upside sweep risk")
