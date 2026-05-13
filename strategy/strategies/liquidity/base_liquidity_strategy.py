@@ -10,27 +10,14 @@ from core.event_bus import EventBus
 from core.logger import get_logger
 
 from analytics.liquidity.models import LiquidityMapSnapshot
-from strategy.base import (
-    ContextAwareComponent,
-    EventEmitterMixin,
-    NamedEntityMixin,
-    PrioritizedMixin,
-    StrategyComponent,
-)
+from strategy.base import StrategyComponent
 from strategy.config import StrategyConfig, StrategyDefinitionConfig
 from strategy.context import StrategyContext
 from strategy.enums import FilterDecision, StrategyCategory
 from strategy.models import FilterResult, StrategySignal
 
 
-class BaseLiquidityStrategy(
-    StrategyComponent,
-    ContextAwareComponent,
-    EventEmitterMixin,
-    NamedEntityMixin,
-    PrioritizedMixin,
-    ABC,
-):
+class BaseLiquidityStrategy(StrategyComponent, ABC):
     """
     Base class для всіх liquidity strategies.
 

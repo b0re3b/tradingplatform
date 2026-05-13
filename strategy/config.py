@@ -1,3 +1,5 @@
+# trading_system/strategy/config.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -17,7 +19,9 @@ class StrategyRuntimeConfig:
     enabled: bool = True
     symbols: list[str] = field(default_factory=list)
     timeframes: list[Timeframe] = field(default_factory=lambda: [Timeframe.M1])
-    allowed_regimes: list[MarketRegime] = field(default_factory=lambda: [MarketRegime.UNKNOWN])
+    allowed_regimes: list[MarketRegime] = field(
+        default_factory=lambda: [MarketRegime.UNKNOWN]
+    )
     cooldown_seconds: int = 0
     max_signal_age_seconds: int = 30
     min_confidence: float = 0.5
@@ -25,11 +29,50 @@ class StrategyRuntimeConfig:
 
     def validate(self) -> None:
         if not 0.0 <= self.min_confidence <= 1.0:
-            raise StrategyConfigError("min_confidence must be between 0.0 and 1.0")
+            raise StrategyConfigError(
+                "StrategyRuntimeConfig.min_confidence must be between 0.0 and 1.0"
+            )
+
+        if self.min_score < 0:
+            raise StrategyConfigError("StrategyRuntimeConfig.min_score must be >= 0")
+
         if self.cooldown_seconds < 0:
-            raise StrategyConfigError("cooldown_seconds must be >= 0")
+            raise StrategyConfigError(
+                "StrategyRuntimeConfig.cooldown_seconds must be >= 0"
+            )
+
         if self.max_signal_age_seconds <= 0:
-            raise StrategyConfigError("max_signal_age_seconds must be > 0")
+            raise StrategyConfigError(
+                "StrategyRuntimeConfig.max_signal_age_seconds must be > 0"
+            )
+
+        if any(not symbol.strip() for symbol in self.symbols):
+            raise StrategyConfigError(
+                "StrategyRuntimeConfig.symbols cannot contain empty symbols"
+            )
+
+        if not self.timeframes:
+            raise StrategyConfigError(
+                "StrategyRuntimeConfig.timeframes cannot be empty"
+            )
+
+        if not self.allowed_regimes:
+            raise StrategyConfigError(
+                "StrategyRuntimeConfig.allowed_regimes cannot be empty"
+            )
+
+    def allows_symbol(self, symbol: str) -> bool:
+        if not self.symbols:
+            return True
+        return symbol in self.symbols
+
+    def allows_timeframe(self, timeframe: Timeframe) -> bool:
+        return timeframe in self.timeframes
+
+    def allows_regime(self, regime: MarketRegime) -> bool:
+        if MarketRegime.UNKNOWN in self.allowed_regimes:
+            return True
+        return regime in self.allowed_regimes
 
 
 @dataclass(slots=True)
@@ -45,9 +88,30 @@ class StrategyDefinitionConfig:
 
     def validate(self) -> None:
         if not self.name.strip():
-            raise StrategyConfigError("StrategyDefinitionConfig.name cannot be empty")
+            raise StrategyConfigError(
+                "StrategyDefinitionConfig.name cannot be empty"
+            )
+
         if self.weight < 0:
-            raise StrategyConfigError("StrategyDefinitionConfig.weight must be >= 0")
+            raise StrategyConfigError(
+                "StrategyDefinitionConfig.weight must be >= 0"
+            )
+
+        if self.priority < 0:
+            raise StrategyConfigError(
+                "StrategyDefinitionConfig.priority must be >= 0"
+            )
+
+        if any(not feature.strip() for feature in self.required_features):
+            raise StrategyConfigError(
+                f"StrategyDefinitionConfig.required_features for '{self.name}' cannot contain empty names"
+            )
+
+        if any(not tag.strip() for tag in self.tags):
+            raise StrategyConfigError(
+                f"StrategyDefinitionConfig.tags for '{self.name}' cannot contain empty tags"
+            )
+
         self.runtime.validate()
 
 
@@ -61,7 +125,23 @@ class RoutingConfig:
 
     def validate(self) -> None:
         if self.stale_feature_threshold_seconds <= 0:
-            raise StrategyConfigError("stale_feature_threshold_seconds must be > 0")
+            raise StrategyConfigError(
+                "RoutingConfig.stale_feature_threshold_seconds must be > 0"
+            )
+
+        for event_name, categories in self.event_to_categories.items():
+            if not event_name.strip():
+                raise StrategyConfigError(
+                    "RoutingConfig.event_to_categories cannot contain empty event names"
+                )
+
+            if not categories:
+                raise StrategyConfigError(
+                    f"RoutingConfig.event_to_categories['{event_name}'] cannot be empty"
+                )
+
+    def categories_for_event(self, event_name: str) -> list[StrategyCategory]:
+        return self.event_to_categories.get(event_name, [])
 
 
 @dataclass(slots=True)
@@ -76,17 +156,34 @@ class ConfluenceConfig:
 
     def validate(self) -> None:
         if self.min_agreement_count < 1:
-            raise StrategyConfigError("min_agreement_count must be >= 1")
+            raise StrategyConfigError(
+                "ConfluenceConfig.min_agreement_count must be >= 1"
+            )
+
         if not 0.0 <= self.min_confidence <= 1.0:
-            raise StrategyConfigError("ConfluenceConfig.min_confidence must be between 0.0 and 1.0")
+            raise StrategyConfigError(
+                "ConfluenceConfig.min_confidence must be between 0.0 and 1.0"
+            )
+
         if self.min_score < 0:
-            raise StrategyConfigError("ConfluenceConfig.min_score must be >= 0")
+            raise StrategyConfigError(
+                "ConfluenceConfig.min_score must be >= 0"
+            )
+
         if self.conflict_penalty < 0:
-            raise StrategyConfigError("conflict_penalty must be >= 0")
+            raise StrategyConfigError(
+                "ConfluenceConfig.conflict_penalty must be >= 0"
+            )
+
         if self.confirmation_bonus < 0:
-            raise StrategyConfigError("confirmation_bonus must be >= 0")
+            raise StrategyConfigError(
+                "ConfluenceConfig.confirmation_bonus must be >= 0"
+            )
+
         if self.max_strategies_per_side < 1:
-            raise StrategyConfigError("max_strategies_per_side must be >= 1")
+            raise StrategyConfigError(
+                "ConfluenceConfig.max_strategies_per_side must be >= 1"
+            )
 
 
 @dataclass(slots=True)
@@ -103,10 +200,24 @@ class ConfidenceConfig:
             self.medium_threshold,
             self.high_threshold,
         ]
+
         if any(not 0.0 <= value <= 1.0 for value in values):
-            raise StrategyConfigError("All confidence thresholds must be between 0.0 and 1.0")
+            raise StrategyConfigError(
+                "ConfidenceConfig thresholds must be between 0.0 and 1.0"
+            )
+
         if values != sorted(values):
-            raise StrategyConfigError("Confidence thresholds must be non-decreasing")
+            raise StrategyConfigError(
+                "ConfidenceConfig thresholds must be non-decreasing"
+            )
+
+    def grade_bounds(self) -> tuple[float, float, float, float]:
+        return (
+            self.very_low_threshold,
+            self.low_threshold,
+            self.medium_threshold,
+            self.high_threshold,
+        )
 
 
 @dataclass(slots=True)
@@ -144,11 +255,15 @@ class WeightingConfig:
     def validate(self) -> None:
         for category, value in self.category_weights.items():
             if value < 0:
-                raise StrategyConfigError(f"Category weight must be >= 0 for {category}")
+                raise StrategyConfigError(
+                    f"WeightingConfig.category_weights[{category}] must be >= 0"
+                )
 
         for regime, value in self.regime_adjustments.items():
             if value < 0:
-                raise StrategyConfigError(f"Regime adjustment must be >= 0 for {regime}")
+                raise StrategyConfigError(
+                    f"WeightingConfig.regime_adjustments[{regime}] must be >= 0"
+                )
 
 
 @dataclass(slots=True)
@@ -160,9 +275,19 @@ class VotingConfig:
 
     def validate(self) -> None:
         if self.min_confirmations < 0:
-            raise StrategyConfigError("min_confirmations must be >= 0")
+            raise StrategyConfigError(
+                "VotingConfig.min_confirmations must be >= 0"
+            )
+
         if self.min_total_votes < 1:
-            raise StrategyConfigError("min_total_votes must be >= 1")
+            raise StrategyConfigError(
+                "VotingConfig.min_total_votes must be >= 1"
+            )
+
+        if self.min_confirmations > self.min_total_votes:
+            raise StrategyConfigError(
+                "VotingConfig.min_confirmations cannot be greater than min_total_votes"
+            )
 
 
 @dataclass(slots=True)
@@ -173,7 +298,9 @@ class ConflictConfig:
 
     def validate(self) -> None:
         if not 0.0 <= self.max_total_penalty <= 10.0:
-            raise StrategyConfigError("max_total_penalty must be between 0.0 and 10.0")
+            raise StrategyConfigError(
+                "ConflictConfig.max_total_penalty must be between 0.0 and 10.0"
+            )
 
 
 @dataclass(slots=True)
@@ -193,11 +320,24 @@ class FilterConfig:
 
     def validate(self) -> None:
         if self.max_spread_bps < 0:
-            raise StrategyConfigError("max_spread_bps must be >= 0")
+            raise StrategyConfigError(
+                "FilterConfig.max_spread_bps must be >= 0"
+            )
+
         if not 0.0 <= self.min_liquidity_score <= 1.0:
-            raise StrategyConfigError("min_liquidity_score must be between 0.0 and 1.0")
+            raise StrategyConfigError(
+                "FilterConfig.min_liquidity_score must be between 0.0 and 1.0"
+            )
+
         if self.max_volatility_zscore < 0:
-            raise StrategyConfigError("max_volatility_zscore must be >= 0")
+            raise StrategyConfigError(
+                "FilterConfig.max_volatility_zscore must be >= 0"
+            )
+
+        if not -1.0 <= self.min_funding_alignment <= 1.0:
+            raise StrategyConfigError(
+                "FilterConfig.min_funding_alignment must be between -1.0 and 1.0"
+            )
 
 
 @dataclass(slots=True)
@@ -210,12 +350,30 @@ class BuilderConfig:
 
     def validate(self) -> None:
         if self.default_rr_ratio <= 0:
-            raise StrategyConfigError("default_rr_ratio must be > 0")
+            raise StrategyConfigError(
+                "BuilderConfig.default_rr_ratio must be > 0"
+            )
+
         if not self.default_partial_tp_levels:
-            raise StrategyConfigError("default_partial_tp_levels cannot be empty")
+            raise StrategyConfigError(
+                "BuilderConfig.default_partial_tp_levels cannot be empty"
+            )
+
+        if any(level <= 0 for level in self.default_partial_tp_levels):
+            raise StrategyConfigError(
+                "BuilderConfig.default_partial_tp_levels must contain only positive values"
+            )
+
         total = sum(self.default_partial_tp_levels)
         if total <= 0:
-            raise StrategyConfigError("sum(default_partial_tp_levels) must be > 0")
+            raise StrategyConfigError(
+                "sum(BuilderConfig.default_partial_tp_levels) must be > 0"
+            )
+
+        if total > 1.0:
+            raise StrategyConfigError(
+                "sum(BuilderConfig.default_partial_tp_levels) cannot be greater than 1.0"
+            )
 
 
 @dataclass(slots=True)
@@ -241,25 +399,60 @@ class PortfolioCoordinatorConfig:
 
     def validate(self) -> None:
         if self.max_signals_per_symbol < 1:
-            raise StrategyConfigError("max_signals_per_symbol must be >= 1")
+            raise StrategyConfigError(
+                "PortfolioCoordinatorConfig.max_signals_per_symbol must be >= 1"
+            )
+
         if self.symbol_cooldown_seconds < 0:
-            raise StrategyConfigError("symbol_cooldown_seconds must be >= 0")
+            raise StrategyConfigError(
+                "PortfolioCoordinatorConfig.symbol_cooldown_seconds must be >= 0"
+            )
+
         if self.side_cooldown_seconds < 0:
-            raise StrategyConfigError("side_cooldown_seconds must be >= 0")
+            raise StrategyConfigError(
+                "PortfolioCoordinatorConfig.side_cooldown_seconds must be >= 0"
+            )
+
         if self.repeated_signal_suppression_seconds < 0:
-            raise StrategyConfigError("repeated_signal_suppression_seconds must be >= 0")
+            raise StrategyConfigError(
+                "PortfolioCoordinatorConfig.repeated_signal_suppression_seconds must be >= 0"
+            )
+
         if self.volatility_throttle_threshold < 0:
-            raise StrategyConfigError("volatility_throttle_threshold must be >= 0")
+            raise StrategyConfigError(
+                "PortfolioCoordinatorConfig.volatility_throttle_threshold must be >= 0"
+            )
+
         if self.high_volatility_max_signals_per_symbol < 1:
-            raise StrategyConfigError("high_volatility_max_signals_per_symbol must be >= 1")
+            raise StrategyConfigError(
+                "PortfolioCoordinatorConfig.high_volatility_max_signals_per_symbol must be >= 1"
+            )
 
         for category, value in self.max_signals_per_category.items():
             if value < 1:
-                raise StrategyConfigError(f"max_signals_per_category[{category}] must be >= 1")
+                raise StrategyConfigError(
+                    f"PortfolioCoordinatorConfig.max_signals_per_category[{category}] must be >= 1"
+                )
+
+        for strategy_name, priority in self.priority_overrides.items():
+            if not strategy_name.strip():
+                raise StrategyConfigError(
+                    "PortfolioCoordinatorConfig.priority_overrides cannot contain empty strategy names"
+                )
+            if priority < 0:
+                raise StrategyConfigError(
+                    f"PortfolioCoordinatorConfig.priority_overrides[{strategy_name}] must be >= 0"
+                )
 
         for bucket_name, value in self.exposure_bucket_limits.items():
+            if not bucket_name.strip():
+                raise StrategyConfigError(
+                    "PortfolioCoordinatorConfig.exposure_bucket_limits cannot contain empty bucket names"
+                )
             if value < 1:
-                raise StrategyConfigError(f"exposure_bucket_limits[{bucket_name}] must be >= 1")
+                raise StrategyConfigError(
+                    f"PortfolioCoordinatorConfig.exposure_bucket_limits[{bucket_name}] must be >= 1"
+                )
 
 
 @dataclass(slots=True)
@@ -269,13 +462,26 @@ class FeatureFreshnessConfig:
 
     def validate(self) -> None:
         if self.default_ttl_seconds <= 0:
-            raise StrategyConfigError("default_ttl_seconds must be > 0")
+            raise StrategyConfigError(
+                "FeatureFreshnessConfig.default_ttl_seconds must be > 0"
+            )
+
         for feature_name, ttl in self.per_feature_ttl_seconds.items():
+            if not feature_name.strip():
+                raise StrategyConfigError(
+                    "FeatureFreshnessConfig.per_feature_ttl_seconds cannot contain empty feature names"
+                )
+
             if ttl <= 0:
-                raise StrategyConfigError(f"TTL must be > 0 for feature '{feature_name}'")
+                raise StrategyConfigError(
+                    f"FeatureFreshnessConfig.per_feature_ttl_seconds['{feature_name}'] must be > 0"
+                )
 
     def get_ttl(self, feature_name: str) -> int:
-        return self.per_feature_ttl_seconds.get(feature_name, self.default_ttl_seconds)
+        return self.per_feature_ttl_seconds.get(
+            feature_name,
+            self.default_ttl_seconds,
+        )
 
 
 @dataclass(slots=True)
@@ -283,6 +489,17 @@ class PresetConfig:
     mode: PresetMode = PresetMode.INTRADAY
     enabled_strategy_names: list[str] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if any(not name.strip() for name in self.enabled_strategy_names):
+            raise StrategyConfigError(
+                "PresetConfig.enabled_strategy_names cannot contain empty strategy names"
+            )
+
+    def is_strategy_allowed(self, name: str) -> bool:
+        if not self.enabled_strategy_names:
+            return True
+        return name in self.enabled_strategy_names
 
 
 @dataclass(slots=True)
@@ -314,22 +531,47 @@ class StrategyConfig:
         self.builders.validate()
         self.freshness.validate()
         self.portfolio.validate()
+        self.preset.validate()
 
         for strategy_name, strategy_cfg in self.strategies.items():
+            if not strategy_name.strip():
+                raise StrategyConfigError(
+                    "StrategyConfig.strategies cannot contain empty keys"
+                )
+
             if strategy_name != strategy_cfg.name:
                 raise StrategyConfigError(
                     f"Strategy config key '{strategy_name}' does not match embedded name '{strategy_cfg.name}'"
                 )
+
             strategy_cfg.validate()
 
     def get_strategy(self, name: str) -> StrategyDefinitionConfig | None:
         return self.strategies.get(name)
 
-    def is_strategy_enabled(self, name: str) -> bool:
+    def require_strategy(self, name: str) -> StrategyDefinitionConfig:
         strategy = self.get_strategy(name)
         if strategy is None:
-            return False
+            raise StrategyConfigError(f"Strategy '{name}' is not configured")
+        return strategy
+
+    def is_strategy_configured(self, name: str) -> bool:
+        return name in self.strategies
+
+    def is_strategy_enabled(self, name: str, default: bool = True) -> bool:
+        strategy = self.get_strategy(name)
+        if strategy is None:
+            return default
         return strategy.runtime.enabled
+
+    def is_strategy_allowed_by_preset(self, name: str) -> bool:
+        return self.preset.is_strategy_allowed(name)
+
+    def get_strategy_runtime(self, name: str) -> StrategyRuntimeConfig:
+        strategy = self.get_strategy(name)
+        if strategy is None:
+            return self.runtime
+        return strategy.runtime
 
     def get_strategy_weight(self, name: str, default: float = 1.0) -> float:
         strategy = self.get_strategy(name)
@@ -337,8 +579,69 @@ class StrategyConfig:
             return default
         return strategy.weight
 
+    def get_strategy_priority(self, name: str, default: int = 100) -> int:
+        strategy = self.get_strategy(name)
+        if strategy is None:
+            return default
+        return strategy.priority
+
+    def get_strategy_required_features(self, name: str) -> set[str]:
+        strategy = self.get_strategy(name)
+        if strategy is None:
+            return set()
+        return set(strategy.required_features)
+
     def get_category_weight(self, category: StrategyCategory) -> float:
         return self.weighting.category_weights.get(category, 1.0)
 
     def get_regime_adjustment(self, regime: MarketRegime) -> float:
         return self.weighting.regime_adjustments.get(regime, 1.0)
+
+    def get_feature_ttl(self, feature_name: str) -> int:
+        return self.freshness.get_ttl(feature_name)
+
+    def add_strategy(self, strategy: StrategyDefinitionConfig) -> None:
+        strategy.validate()
+
+        if strategy.name in self.strategies:
+            raise StrategyConfigError(
+                f"Strategy '{strategy.name}' is already configured"
+            )
+
+        self.strategies[strategy.name] = strategy
+
+    def upsert_strategy(self, strategy: StrategyDefinitionConfig) -> None:
+        strategy.validate()
+        self.strategies[strategy.name] = strategy
+
+    def remove_strategy(self, name: str) -> StrategyDefinitionConfig | None:
+        return self.strategies.pop(name, None)
+
+    def enabled_strategy_names(self) -> list[str]:
+        return [
+            name
+            for name, strategy in self.strategies.items()
+            if strategy.runtime.enabled and self.preset.is_strategy_allowed(name)
+        ]
+
+    def strategies_by_category(
+        self,
+        category: StrategyCategory,
+        *,
+        enabled_only: bool = False,
+    ) -> list[StrategyDefinitionConfig]:
+        strategies = [
+            strategy
+            for strategy in self.strategies.values()
+            if strategy.category == category
+        ]
+
+        if enabled_only:
+            strategies = [
+                strategy
+                for strategy in strategies
+                if strategy.runtime.enabled
+                and self.preset.is_strategy_allowed(strategy.name)
+            ]
+
+        return sorted(strategies, key=lambda item: item.priority)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .enums import (
@@ -27,7 +27,28 @@ from .exceptions import ValidationError
 
 
 def utcnow() -> datetime:
-    return datetime.utcnow()
+    """
+    Return timezone-aware UTC datetime.
+
+    Важливо для:
+    - EventBus timestamps;
+    - PostgreSQL;
+    - dashboard;
+    - backtesting;
+    - коректного порівняння часу між модулями.
+    """
+    return datetime.now(timezone.utc)
+
+
+def ensure_aware_utc(value: datetime) -> datetime:
+    """
+    Normalize datetime to timezone-aware UTC.
+
+    Якщо datetime naive — трактуємо його як UTC.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -46,6 +67,9 @@ class FeatureSnapshot:
     freshness_seconds: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+
     def validate(self) -> None:
         if not self.name.strip():
             raise ValidationError("FeatureSnapshot.name cannot be empty")
@@ -55,10 +79,12 @@ class FeatureSnapshot:
             raise ValidationError("FeatureSnapshot.confidence must be between 0.0 and 1.0")
         if self.normalized_value is not None and not -1.0 <= self.normalized_value <= 1.0:
             raise ValidationError("FeatureSnapshot.normalized_value must be between -1.0 and 1.0")
+        if self.freshness_seconds is not None and self.freshness_seconds <= 0:
+            raise ValidationError("FeatureSnapshot.freshness_seconds must be > 0")
 
     def age_seconds(self, now: datetime | None = None) -> float:
-        current = now or utcnow()
-        return (current - self.timestamp).total_seconds()
+        current = ensure_aware_utc(now or utcnow())
+        return max(0.0, (current - self.timestamp).total_seconds())
 
     def freshness_status(self, now: datetime | None = None) -> FreshnessStatus:
         if self.freshness_seconds is None:
@@ -74,7 +100,10 @@ class FeatureSnapshot:
         return FreshnessStatus.EXPIRED
 
     def is_stale(self, now: datetime | None = None) -> bool:
-        return self.freshness_status(now) in {FreshnessStatus.STALE, FreshnessStatus.EXPIRED}
+        return self.freshness_status(now) in {
+            FreshnessStatus.STALE,
+            FreshnessStatus.EXPIRED,
+        }
 
     def is_expired(self, now: datetime | None = None) -> bool:
         return self.freshness_status(now) == FreshnessStatus.EXPIRED
@@ -96,6 +125,8 @@ class StrategyMetadata:
     def validate(self) -> None:
         if not self.strategy_name.strip():
             raise ValidationError("StrategyMetadata.strategy_name cannot be empty")
+        if not self.version.strip():
+            raise ValidationError("StrategyMetadata.version cannot be empty")
 
 
 @dataclass(slots=True)
@@ -166,6 +197,7 @@ class ExitPlan:
             raise ValidationError("ExitPlan.trailing_distance must be > 0")
         if self.max_holding_seconds is not None and self.max_holding_seconds <= 0:
             raise ValidationError("ExitPlan.max_holding_seconds must be > 0")
+
         for target in self.take_profit_levels:
             target.validate()
 
@@ -273,6 +305,16 @@ class StrategySignal:
     regime: MarketRegime = MarketRegime.UNKNOWN
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+        self.confidence = clamp(self.confidence, 0.0, 1.0)
+
+        if self.strength == SignalStrength.WEAK:
+            self.strength = confidence_to_strength(self.confidence)
+
+        if self.confidence_grade == ConfidenceGrade.VERY_LOW:
+            self.confidence_grade = confidence_to_grade(self.confidence)
+
     def validate(self) -> None:
         if not self.symbol.strip():
             raise ValidationError("StrategySignal.symbol cannot be empty")
@@ -302,6 +344,10 @@ class StrategySignal:
     @property
     def is_short(self) -> bool:
         return self.side == SignalSide.SHORT
+
+    @property
+    def is_flat(self) -> bool:
+        return self.side == SignalSide.FLAT
 
     @property
     def is_directional(self) -> bool:
@@ -355,6 +401,12 @@ class StrategySignal:
     def to_expired(self) -> None:
         self.status = SignalStatus.EXPIRED
 
+    def to_executed(self) -> None:
+        self.status = SignalStatus.EXECUTED
+
+    def to_failed(self) -> None:
+        self.status = SignalStatus.FAILED
+
 
 @dataclass(slots=True)
 class RawStrategySignal:
@@ -385,14 +437,22 @@ class TradeIdea:
     expires_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.created_at = ensure_aware_utc(self.created_at)
+        if self.expires_at is not None:
+            self.expires_at = ensure_aware_utc(self.expires_at)
+
     def validate(self) -> None:
         self.signal.validate()
         self.execution_plan.validate()
 
+        if self.expires_at is not None and self.expires_at <= self.created_at:
+            raise ValidationError("TradeIdea.expires_at must be after created_at")
+
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
             return False
-        current = now or utcnow()
+        current = ensure_aware_utc(now or utcnow())
         return current >= self.expires_at
 
 
@@ -407,6 +467,10 @@ class StrategyEvaluation:
     confidence: float = 0.0
     reasons: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+        self.confidence = clamp(self.confidence, 0.0, 1.0)
 
     def validate(self) -> None:
         if not self.strategy_name.strip():
@@ -434,6 +498,16 @@ class ConfluenceResult:
     conflicts: list[ConflictRecord] = field(default_factory=list)
     accepted: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+        self.confidence = clamp(self.confidence, 0.0, 1.0)
+
+        if self.confidence_grade == ConfidenceGrade.VERY_LOW:
+            self.confidence_grade = confidence_to_grade(self.confidence)
+
+        if self.strength == SignalStrength.WEAK:
+            self.strength = confidence_to_strength(self.confidence)
 
     def validate(self) -> None:
         if not self.symbol.strip():
@@ -472,6 +546,20 @@ class PortfolioSnapshot:
         if self.active_signals < 0:
             raise ValidationError("PortfolioSnapshot.active_signals must be >= 0")
 
+        for symbol, exposure in self.symbol_exposure.items():
+            if not symbol.strip():
+                raise ValidationError("PortfolioSnapshot.symbol_exposure contains empty symbol")
+            if exposure < 0:
+                raise ValidationError(f"PortfolioSnapshot.symbol_exposure[{symbol}] must be >= 0")
+
+        for strategy_name, exposure in self.strategy_exposure.items():
+            if not strategy_name.strip():
+                raise ValidationError("PortfolioSnapshot.strategy_exposure contains empty strategy name")
+            if exposure < 0:
+                raise ValidationError(
+                    f"PortfolioSnapshot.strategy_exposure[{strategy_name}] must be >= 0"
+                )
+
 
 @dataclass(slots=True)
 class RegimeSnapshot:
@@ -481,6 +569,10 @@ class RegimeSnapshot:
     timestamp: datetime = field(default_factory=utcnow)
     reasons: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+        self.confidence = clamp(self.confidence, 0.0, 1.0)
 
     def validate(self) -> None:
         if not self.symbol.strip():
@@ -501,9 +593,13 @@ class PriceSnapshot:
     timestamp: datetime = field(default_factory=utcnow)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+
     def validate(self) -> None:
         if not self.symbol.strip():
             raise ValidationError("PriceSnapshot.symbol cannot be empty")
+
         for field_name, value in {
             "last_price": self.last_price,
             "bid": self.bid,
@@ -513,6 +609,10 @@ class PriceSnapshot:
         }.items():
             if value is not None and value <= 0:
                 raise ValidationError(f"PriceSnapshot.{field_name} must be > 0")
+
+        if self.bid is not None and self.ask is not None and self.bid > self.ask:
+            raise ValidationError("PriceSnapshot.bid cannot be greater than ask")
+
         if self.spread_bps is not None and self.spread_bps < 0:
             raise ValidationError("PriceSnapshot.spread_bps must be >= 0")
 
@@ -525,6 +625,13 @@ class PriceSnapshot:
 
 @dataclass(slots=True)
 class SignalContext:
+    """
+    Read-only market/analytics context consumed by strategies.
+
+    Strategy should read this context and return StrategyEvaluation.
+    Strategy should not call analytics/risk/execution modules directly.
+    """
+
     symbol: str
     timestamp: datetime
     timeframe: Timeframe = Timeframe.M1
@@ -546,17 +653,56 @@ class SignalContext:
     freshness_map: dict[str, float] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.timestamp = ensure_aware_utc(self.timestamp)
+
     def validate(self) -> None:
         if not self.symbol.strip():
             raise ValidationError("SignalContext.symbol cannot be empty")
+
         if self.price is not None:
             self.price.validate()
+            if self.price.symbol != self.symbol:
+                raise ValidationError("SignalContext.price.symbol must match context.symbol")
+
         if self.regime is not None:
             self.regime.validate()
+            if self.regime.symbol != self.symbol:
+                raise ValidationError("SignalContext.regime.symbol must match context.symbol")
+
         if self.portfolio is not None:
             self.portfolio.validate()
-        for feature in self.feature_map.values():
+
+        for feature_name, feature in self.feature_map.items():
+            if feature_name != feature.name:
+                raise ValidationError(
+                    f"SignalContext.feature_map key '{feature_name}' does not match feature.name '{feature.name}'"
+                )
+            if feature.symbol != self.symbol:
+                raise ValidationError(
+                    f"FeatureSnapshot.symbol must match context.symbol for feature '{feature_name}'"
+                )
             feature.validate()
+
+        for feature_name, ttl in self.freshness_map.items():
+            if not feature_name.strip():
+                raise ValidationError("SignalContext.freshness_map contains empty feature name")
+            if ttl <= 0:
+                raise ValidationError(
+                    f"SignalContext.freshness_map[{feature_name}] must be > 0"
+                )
+
+    @property
+    def current_regime(self) -> MarketRegime:
+        if self.regime is None:
+            return MarketRegime.UNKNOWN
+        return self.regime.regime
+
+    @property
+    def mid_price(self) -> float | None:
+        if self.price is None:
+            return None
+        return self.price.mid_price
 
     def has_feature(self, name: str) -> bool:
         return name in self.feature_map
@@ -570,27 +716,63 @@ class SignalContext:
             return default
         return snapshot.value
 
-    def get_normalized_feature(self, name: str, default: float | None = None) -> float | None:
+    def get_normalized_feature(
+        self,
+        name: str,
+        default: float | None = None,
+    ) -> float | None:
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return default
-        return snapshot.normalized_value if snapshot.normalized_value is not None else default
+        return (
+            snapshot.normalized_value
+            if snapshot.normalized_value is not None
+            else default
+        )
 
     def feature_age_seconds(self, name: str) -> float | None:
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return None
-        return (self.timestamp - snapshot.timestamp).total_seconds()
+        return max(0.0, (self.timestamp - snapshot.timestamp).total_seconds())
 
     def feature_is_stale(self, name: str) -> bool:
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return True
+
+        ttl = self.freshness_map.get(name)
+        if ttl is not None:
+            return snapshot.age_seconds(self.timestamp) > ttl
+
         return snapshot.is_stale(self.timestamp)
+
+    def feature_is_expired(self, name: str) -> bool:
+        snapshot = self.feature_map.get(name)
+        if snapshot is None:
+            return True
+        return snapshot.is_expired(self.timestamp)
 
     def put_feature(self, snapshot: FeatureSnapshot) -> None:
         snapshot.validate()
+
+        if snapshot.symbol != self.symbol:
+            raise ValidationError(
+                f"FeatureSnapshot.symbol '{snapshot.symbol}' does not match context.symbol '{self.symbol}'"
+            )
+
         self.feature_map[snapshot.name] = snapshot
+
+    def put_domain_feature(
+        self,
+        source: FeatureSource,
+        key: str,
+        value: Any,
+    ) -> None:
+        if not key.strip():
+            raise ValidationError("domain feature key cannot be empty")
+
+        self.domain_dict(source)[key] = value
 
     def domain_dict(self, source: FeatureSource) -> dict[str, Any]:
         mapping = {
@@ -616,6 +798,9 @@ class SignalEnvelope:
     source_event: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.emitted_at = ensure_aware_utc(self.emitted_at)
+
     def validate(self) -> None:
         self.signal.validate()
 
@@ -627,6 +812,9 @@ class CooldownState:
     until: datetime
     reason: str | None = None
 
+    def __post_init__(self) -> None:
+        self.until = ensure_aware_utc(self.until)
+
     def validate(self) -> None:
         if not self.symbol.strip():
             raise ValidationError("CooldownState.symbol cannot be empty")
@@ -634,11 +822,11 @@ class CooldownState:
             raise ValidationError("CooldownState.strategy_name cannot be empty")
 
     def is_active(self, now: datetime | None = None) -> bool:
-        current = now or utcnow()
+        current = ensure_aware_utc(now or utcnow())
         return current < self.until
 
     def remaining_seconds(self, now: datetime | None = None) -> float:
-        current = now or utcnow()
+        current = ensure_aware_utc(now or utcnow())
         return max(0.0, (self.until - current).total_seconds())
 
 
@@ -647,14 +835,26 @@ class SignalWindow:
     opened_at: datetime
     expires_at: datetime | None = None
 
+    def __post_init__(self) -> None:
+        self.opened_at = ensure_aware_utc(self.opened_at)
+        if self.expires_at is not None:
+            self.expires_at = ensure_aware_utc(self.expires_at)
+
+    def validate(self) -> None:
+        if self.expires_at is not None and self.expires_at <= self.opened_at:
+            raise ValidationError("SignalWindow.expires_at must be after opened_at")
+
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
             return False
-        current = now or utcnow()
+        current = ensure_aware_utc(now or utcnow())
         return current >= self.expires_at
 
     @classmethod
-    def from_seconds(cls, ttl_seconds: int | None) -> "SignalWindow":
+    def from_seconds(cls, ttl_seconds: int | None) -> SignalWindow:
+        if ttl_seconds is not None and ttl_seconds <= 0:
+            raise ValidationError("ttl_seconds must be > 0")
+
         now = utcnow()
         expires_at = None if ttl_seconds is None else now + timedelta(seconds=ttl_seconds)
         return cls(opened_at=now, expires_at=expires_at)
@@ -682,3 +882,7 @@ def confidence_to_strength(confidence: float) -> SignalStrength:
     if confidence >= 0.50:
         return SignalStrength.MODERATE
     return SignalStrength.WEAK
+
+
+
+StrategyContext = SignalContext
