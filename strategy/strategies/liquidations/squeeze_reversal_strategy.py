@@ -1,49 +1,73 @@
 from __future__ import annotations
 
-import hashlib
-import json
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
-from decimal import Decimal
-from typing import Any, Deque, TypeVar
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
-from core.event_bus import Event, EventBus, EventPriority, Subscription
-from core.logger import get_logger
+from core.event_bus import Event, EventBus, EventPriority
 from core.scheduler import Scheduler
 
 from analytics.liquidations.enums import CascadeDirection, CascadeSeverity
 from analytics.liquidations.models import CascadeDetectionResult
-from analytics.liquidations.utils import clamp_float, ensure_utc, normalize_symbol, utc_now
+
+from strategy.strategies.liquidations.base import (
+    BaseAnalyticsStrategy,
+    BaseStrategyStats,
+    BaseSymbolStrategyState,
+    FilterResult,
+    StrategyRejection,
+    clamp_float,
+    ensure_utc,
+    normalize_symbol,
+    serialize_value,
+    utc_now,
+)
 
 
-# ---------------------------------------------------------------------------
-# Generic helper — замінює три майже ідентичні _remember_* методи
-# ---------------------------------------------------------------------------
-
-_T = TypeVar("_T")
+DECIMAL_ZERO = Decimal("0")
 
 
-def _remember(buf: Deque[_T], item: _T) -> None:
-    """Append item to a bounded deque (maxlen enforced by deque itself)."""
-    buf.append(item)
+def _safe_decimal(value: Any, default: Decimal = DECIMAL_ZERO) -> Decimal:
+    if value is None:
+        return default
+
+    if isinstance(value, Decimal):
+        return value
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
 
 
-# ---------------------------------------------------------------------------
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================================
 # Config
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 
 @dataclass(slots=True)
 class SqueezeReversalStrategyConfig:
     """
-    Reversal strategy поверх analytics.liquidation.exhaustion_detected.
+    Exhaustion/reversal strategy поверх analytics.liquidation.exhaustion_detected.
 
     Ідея:
-    - detector уже виявив exhaustion-сценарій
-    - strategy не входить миттєво, а ставить candidate у pending
-    - після короткої затримки перевіряє, чи candidate все ще валідний
-    - якщо так -> генерує reversal signal
+    - analytics уже визначив exhaustion-сценарій після liquidation cascade;
+    - strategy перевіряє якість exhaustion-сигналу;
+    - використовує cluster, bias delta, imbalance, acceleration, severity, freshness;
+    - ставить candidate у pending-confirmation;
+    - після затримки підтверджує reversal, якщо сигнал не застарів і не був перебитий
+      новішим/сильнішим analytics result.
     """
 
     enabled: bool = True
@@ -51,8 +75,11 @@ class SqueezeReversalStrategyConfig:
     subscribe_topic: str = "analytics.liquidation.exhaustion_detected"
     publish_topic_signal_generated: str = "signal.generated"
     publish_topic_signal_rejected: str = "signal.rejected"
+
     publish_topic_pending_created: str = "strategy.liquidations.squeeze.pending_created"
     publish_topic_pending_expired: str = "strategy.liquidations.squeeze.pending_expired"
+    publish_topic_pending_replaced: str = "strategy.liquidations.squeeze.pending_replaced"
+    publish_topic_pending_confirmed: str = "strategy.liquidations.squeeze.pending_confirmed"
 
     publish_rejected_events: bool = False
     publish_pending_events: bool = True
@@ -79,25 +106,49 @@ class SqueezeReversalStrategyConfig:
         CascadeSeverity.EXTREME,
     )
 
+    # Base quality filters
     min_confidence: float = 0.65
     min_intensity_score: float = 0.60
-    min_exhaustion_bias: float = 0.70
     min_total_notional_usd: Decimal = Decimal("400000")
     min_event_count: int = 6
     max_price_range_pct: float | None = None
 
+    # Exhaustion-specific filters
     require_favors_exhaustion: bool = True
     require_high_confidence_only: bool = False
+    require_actionable_severity: bool = True
 
-    # pending confirmation model
+    min_exhaustion_bias: float = 0.70
+    min_bias_delta: float = 0.12
+    max_continuation_bias_after_exhaustion: float | None = 0.55
+
+    # Detector metadata filters
+    min_side_imbalance_ratio: float | None = 0.70
+    min_event_imbalance_ratio: float | None = None
+    min_climax_acceleration_ratio: float | None = 1.10
+
+    # Cluster-shape filters
+    max_cluster_duration_seconds: float | None = 12.0
+    min_avg_notional_per_event: Decimal | None = Decimal("50000")
+
+    # Freshness / clock skew
+    max_result_age_seconds: float = 20.0
+    max_future_detected_at_seconds: float = 5.0
+
+    # Pending confirmation model
     enable_pending_confirmation: bool = True
     confirmation_delay_seconds: float = 2.0
     pending_ttl_seconds: float = 8.0
     min_pending_age_seconds: float = 1.5
+    pending_scan_interval_seconds: float = 0.5
 
-    # якщо після exhaustion швидко прилетів continuation-cascade по тому ж символу,
-    # reversal-кандидат краще скасувати
+    # Якщо після candidate прийшов новіший analytics result по тому ж символу,
+    # старий reversal candidate краще скасувати.
     cancel_if_newer_detected_at: bool = True
+
+    # Якщо новіший candidate сильніший — замінити pending.
+    replace_pending_if_score_improves: bool = True
+    min_replacement_score_delta: float = 0.03
 
     symbol_cooldown_seconds: int = 35
     min_seconds_between_same_side_signals: int = 20
@@ -112,20 +163,31 @@ class SqueezeReversalStrategyConfig:
     recent_rejections_limit: int = 200
     recent_pending_limit: int = 200
 
-    score_confidence_weight: float = 0.35
-    score_exhaustion_bias_weight: float = 0.40
-    score_intensity_weight: float = 0.15
+    hot_symbols_window_seconds: int | None = 300
+
+    # Scoring
+    score_confidence_weight: float = 0.25
+    score_exhaustion_bias_weight: float = 0.30
+    score_bias_delta_weight: float = 0.15
+    score_intensity_weight: float = 0.12
     score_severity_weight: float = 0.10
+    score_cluster_quality_weight: float = 0.08
 
     def validate(self) -> None:
-        if not (0.0 <= self.min_confidence <= 1.0):
-            raise ValueError("min_confidence must be between 0 and 1")
+        bounded = {
+            "min_confidence": self.min_confidence,
+            "min_intensity_score": self.min_intensity_score,
+            "min_exhaustion_bias": self.min_exhaustion_bias,
+            "min_bias_delta": self.min_bias_delta,
+        }
 
-        if not (0.0 <= self.min_intensity_score <= 1.0):
-            raise ValueError("min_intensity_score must be between 0 and 1")
+        for name, value in bounded.items():
+            if not (0.0 <= value <= 1.0):
+                raise ValueError(f"{name} must be between 0 and 1")
 
-        if not (0.0 <= self.min_exhaustion_bias <= 1.0):
-            raise ValueError("min_exhaustion_bias must be between 0 and 1")
+        if self.max_continuation_bias_after_exhaustion is not None:
+            if not (0.0 <= self.max_continuation_bias_after_exhaustion <= 1.0):
+                raise ValueError("max_continuation_bias_after_exhaustion must be between 0 and 1 or None")
 
         if self.min_total_notional_usd < 0:
             raise ValueError("min_total_notional_usd must be >= 0")
@@ -136,6 +198,27 @@ class SqueezeReversalStrategyConfig:
         if self.max_price_range_pct is not None and self.max_price_range_pct < 0:
             raise ValueError("max_price_range_pct must be >= 0 or None")
 
+        if self.min_side_imbalance_ratio is not None and not (0.0 <= self.min_side_imbalance_ratio <= 1.0):
+            raise ValueError("min_side_imbalance_ratio must be between 0 and 1 or None")
+
+        if self.min_event_imbalance_ratio is not None and not (0.0 <= self.min_event_imbalance_ratio <= 1.0):
+            raise ValueError("min_event_imbalance_ratio must be between 0 and 1 or None")
+
+        if self.min_climax_acceleration_ratio is not None and self.min_climax_acceleration_ratio < 0:
+            raise ValueError("min_climax_acceleration_ratio must be >= 0 or None")
+
+        if self.max_cluster_duration_seconds is not None and self.max_cluster_duration_seconds <= 0:
+            raise ValueError("max_cluster_duration_seconds must be > 0 or None")
+
+        if self.min_avg_notional_per_event is not None and self.min_avg_notional_per_event < 0:
+            raise ValueError("min_avg_notional_per_event must be >= 0 or None")
+
+        if self.max_result_age_seconds <= 0:
+            raise ValueError("max_result_age_seconds must be > 0")
+
+        if self.max_future_detected_at_seconds < 0:
+            raise ValueError("max_future_detected_at_seconds must be >= 0")
+
         if self.confirmation_delay_seconds < 0:
             raise ValueError("confirmation_delay_seconds must be >= 0")
 
@@ -144,6 +227,9 @@ class SqueezeReversalStrategyConfig:
 
         if self.min_pending_age_seconds < 0:
             raise ValueError("min_pending_age_seconds must be >= 0")
+
+        if self.pending_scan_interval_seconds <= 0:
+            raise ValueError("pending_scan_interval_seconds must be > 0")
 
         if self.symbol_cooldown_seconds < 0:
             raise ValueError("symbol_cooldown_seconds must be >= 0")
@@ -160,19 +246,29 @@ class SqueezeReversalStrategyConfig:
         if self.diagnostics_interval_seconds <= 0:
             raise ValueError("diagnostics_interval_seconds must be > 0")
 
-        total_weight = (
-            self.score_confidence_weight
-            + self.score_exhaustion_bias_weight
-            + self.score_intensity_weight
-            + self.score_severity_weight
-        )
-        if total_weight <= 0:
+        if self.hot_symbols_window_seconds is not None and self.hot_symbols_window_seconds <= 0:
+            raise ValueError("hot_symbols_window_seconds must be > 0 or None")
+
+        weights = {
+            "score_confidence_weight": self.score_confidence_weight,
+            "score_exhaustion_bias_weight": self.score_exhaustion_bias_weight,
+            "score_bias_delta_weight": self.score_bias_delta_weight,
+            "score_intensity_weight": self.score_intensity_weight,
+            "score_severity_weight": self.score_severity_weight,
+            "score_cluster_quality_weight": self.score_cluster_quality_weight,
+        }
+
+        for name, weight in weights.items():
+            if weight < 0:
+                raise ValueError(f"{name} must be >= 0")
+
+        if sum(weights.values()) <= 0:
             raise ValueError("strategy score weights sum must be > 0")
 
 
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Models
+# ============================================================================
 
 
 @dataclass(slots=True)
@@ -202,7 +298,16 @@ class SqueezeReversalSignal:
     intensity_score: float
     continuation_bias: float
     exhaustion_bias: float
+    bias_delta: float
     price_range_pct: float
+    window_seconds: int
+
+    cluster_duration_seconds: float
+    cluster_avg_notional_per_event: Decimal
+
+    side_imbalance_ratio: float | None = None
+    event_imbalance_ratio: float | None = None
+    acceleration_ratio: float | None = None
 
     pending_started_at: datetime | None = None
     pending_confirmed_at: datetime | None = None
@@ -211,58 +316,37 @@ class SqueezeReversalSignal:
     source_event_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "strategy_name": self.strategy_name,
-            "signal_type": self.signal_type,
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "side": self.side,
-            "confidence": self.confidence,
-            "score": self.score,
-            "generated_at": self.generated_at.isoformat(),
-            "detected_at": self.detected_at.isoformat(),
-            "reason": self.reason,
-            "source_topic": self.source_topic,
-            "severity": self.severity,
-            "cascade_direction": self.cascade_direction,
-            "liquidation_side": self.liquidation_side,
-            "event_count": self.event_count,
-            "total_notional_usd": str(self.total_notional_usd),
-            "intensity_score": self.intensity_score,
-            "continuation_bias": self.continuation_bias,
-            "exhaustion_bias": self.exhaustion_bias,
-            "price_range_pct": self.price_range_pct,
-            "pending_started_at": self.pending_started_at.isoformat() if self.pending_started_at else None,
-            "pending_confirmed_at": self.pending_confirmed_at.isoformat() if self.pending_confirmed_at else None,
-            "correlation_id": self.correlation_id,
-            "source_event_id": self.source_event_id,
-            "metadata": self.metadata,
-        }
+    @property
+    def is_pending_confirmed(self) -> bool:
+        return self.pending_started_at is not None and self.pending_confirmed_at is not None
 
+    @property
+    def confirmation_delay_seconds(self) -> float | None:
+        if self.pending_started_at is None or self.pending_confirmed_at is None:
+            return None
 
-@dataclass(slots=True)
-class StrategyRejection:
-    exchange: str
-    symbol: str
-    rejected_at: datetime
-    reason: str
-    source_topic: str
-    correlation_id: str | None = None
-    source_event_id: str | None = None
-    details: dict[str, Any] = field(default_factory=dict)
+        return max(
+            0.0,
+            (ensure_utc(self.pending_confirmed_at) - ensure_utc(self.pending_started_at)).total_seconds(),
+        )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "rejected_at": self.rejected_at.isoformat(),
-            "reason": self.reason,
-            "source_topic": self.source_topic,
-            "correlation_id": self.correlation_id,
-            "source_event_id": self.source_event_id,
-            "details": self.details,
-        }
+    @property
+    def is_long(self) -> bool:
+        return self.side.upper() == "LONG"
+
+    @property
+    def is_short(self) -> bool:
+        return self.side.upper() == "SHORT"
+
+    def to_dict(self, *, serialize: bool = True) -> dict[str, Any]:
+        data = asdict(self)
+
+        data["is_pending_confirmed"] = self.is_pending_confirmed
+        data["confirmation_delay_seconds"] = self.confirmation_delay_seconds
+        data["is_long"] = self.is_long
+        data["is_short"] = self.is_short
+
+        return serialize_value(data) if serialize else data
 
 
 @dataclass(slots=True)
@@ -280,132 +364,93 @@ class PendingReversalCandidate:
     expires_at: datetime
 
     cluster_signature: str
+    score_at_creation: float
+    quality_snapshot: dict[str, Any] = field(default_factory=dict)
+
     cancelled: bool = False
     cancel_reason: str | None = None
 
-    # FIX: зберігаємо detected_at на момент створення candidate,
-    # щоб cancel_if_newer_detected_at порівнював саме з цим значенням,
-    # а не з мутованим state.last_detected_at, який оновлюється тільки
-    # після remember_signal — тобто вже після підтвердження попереднього сигналу.
-    # Без цього нові exhaustion-events, що не стали сигналами, не скасовують pending.
     candidate_detected_at: datetime = field(init=False)
 
     def __post_init__(self) -> None:
         self.candidate_detected_at = ensure_utc(self.result.detected_at)
 
     def is_ready(self, now: datetime) -> bool:
-        return ensure_utc(now) >= self.confirm_after
+        return ensure_utc(now) >= ensure_utc(self.confirm_after)
 
     def is_expired(self, now: datetime) -> bool:
-        return ensure_utc(now) > self.expires_at
+        return ensure_utc(now) > ensure_utc(self.expires_at)
 
 
 @dataclass(slots=True)
-class SymbolSqueezeStrategyState:
-    exchange: str
-    symbol: str
-
-    last_signal_at: datetime | None = None
-    cooldown_until: datetime | None = None
-    last_signal_side: str | None = None
-    last_detected_at: datetime | None = None
-    last_cluster_signature: str | None = None
-    last_signal_score: float | None = None
-
-    total_signals_emitted: int = 0
-    signal_timestamps: list[datetime] = field(default_factory=list)
-
+class SymbolSqueezeStrategyState(BaseSymbolStrategyState):
     pending: PendingReversalCandidate | None = None
 
-    # FIX: окремо трекаємо найсвіжіший detected_at з усіх exhaustion-events
-    # (незалежно від того, чи вони стали сигналом).
-    # Це дозволяє cancel_if_newer_detected_at коректно скасовувати pending,
-    # навіть якщо новий event не пройшов фільтри і не оновив last_detected_at.
     latest_seen_detected_at: datetime | None = None
+    latest_seen_score: float | None = None
 
-    def is_in_cooldown(self, now: datetime) -> bool:
-        return self.cooldown_until is not None and ensure_utc(now) < self.cooldown_until
-
-    def update_latest_seen(self, detected_at: datetime) -> None:
-        """Оновлюється при кожному вхідному exhaustion-event, незалежно від фільтрів."""
-        ts = ensure_utc(detected_at)
-        if self.latest_seen_detected_at is None or ts > self.latest_seen_detected_at:
-            self.latest_seen_detected_at = ts
-
-    def remember_signal(
+    def update_latest_seen(
         self,
         *,
-        signal_at: datetime,
-        signal_side: str,
-        score: float,
-        cooldown_seconds: int,
-        cluster_signature: str | None,
         detected_at: datetime,
+        score: float,
     ) -> None:
-        signal_at = ensure_utc(signal_at)
-        self.last_signal_at = signal_at
-        self.cooldown_until = (
-            signal_at + timedelta(seconds=cooldown_seconds)
-            if cooldown_seconds > 0
-            else None
-        )
-        self.last_signal_side = signal_side
-        self.last_signal_score = score
-        self.last_cluster_signature = cluster_signature
-        self.last_detected_at = ensure_utc(detected_at)
-        self.total_signals_emitted += 1
-        self.signal_timestamps.append(signal_at)
+        ts = ensure_utc(detected_at)
 
-    def prune_old_signal_timestamps(self, now: datetime, window_seconds: int) -> None:
-        min_ts = ensure_utc(now) - timedelta(seconds=window_seconds)
-        self.signal_timestamps = [ts for ts in self.signal_timestamps if ts >= min_ts]
-
-    def signals_in_window(self, now: datetime, window_seconds: int) -> int:
-        self.prune_old_signal_timestamps(now, window_seconds)
-        return len(self.signal_timestamps)
+        if self.latest_seen_detected_at is None or ts > ensure_utc(self.latest_seen_detected_at):
+            self.latest_seen_detected_at = ts
+            self.latest_seen_score = score
 
 
 @dataclass(slots=True)
-class SqueezeReversalStrategyStats:
-    started_at: datetime | None = None
-    stopped_at: datetime | None = None
-
-    processed_events: int = 0
-    emitted_signals: int = 0
-    rejected_events: int = 0
-
+class SqueezeReversalStrategyStats(BaseStrategyStats):
     pending_created: int = 0
     pending_confirmed: int = 0
     pending_cancelled: int = 0
     pending_expired: int = 0
+    pending_replaced: int = 0
 
-    duplicate_skips: int = 0
-    cooldown_skips: int = 0
-    rate_limit_skips: int = 0
-    filter_skips: int = 0
-    invalid_payload_skips: int = 0
-
-    last_signal_at: datetime | None = None
-    last_error_at: datetime | None = None
-    last_error: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Main strategy class
-# ---------------------------------------------------------------------------
+    def to_dict(self) -> dict[str, Any]:
+        data = BaseStrategyStats.to_dict(self)
+        data.update(
+            {
+                "pending_created": self.pending_created,
+                "pending_confirmed": self.pending_confirmed,
+                "pending_cancelled": self.pending_cancelled,
+                "pending_expired": self.pending_expired,
+                "pending_replaced": self.pending_replaced,
+            }
+        )
+        return data
 
 
-class SqueezeReversalStrategy:
+# ============================================================================
+# Strategy
+# ============================================================================
+
+
+class SqueezeReversalStrategy(
+    BaseAnalyticsStrategy[
+        CascadeDetectionResult,
+        SqueezeReversalSignal,
+        SymbolSqueezeStrategyState,
+        SqueezeReversalStrategyConfig,
+    ]
+):
     """
-    Reversal strategy поверх analytics.liquidation.exhaustion_detected.
+    Exhaustion reversal strategy.
 
-    Основна ідея:
-    - exhaustion event = кандидат на контррух
-    - для зниження шуму сигнал іде через pending-stage
-    - після короткої затримки candidate confirm-иться
-    - напрям сигналу протилежний до cascade direction:
-        DOWN -> LONG
-        UP   -> SHORT
+    Pipeline:
+        analytics.liquidation.exhaustion_detected
+            -> common filters
+            -> exhaustion-specific analytics filters
+            -> pending confirmation
+            -> SqueezeReversalSignal
+            -> signal.generated
+
+    Direction:
+        CascadeDirection.DOWN -> LONG
+        CascadeDirection.UP   -> SHORT
     """
 
     def __init__(
@@ -416,338 +461,197 @@ class SqueezeReversalStrategy:
         scheduler: Scheduler | None = None,
         service_name: str | None = None,
     ) -> None:
-        self.event_bus = event_bus
-        self.config = config or SqueezeReversalStrategyConfig()
-        self.scheduler = scheduler
-        self.service_name = service_name or self.config.service_name
-
-        self.config.validate()
-
-        if event_bus is None:
-            raise ValueError("event_bus is required")
-
-        self.logger = get_logger(
-            __name__,
-            service_name=self.service_name,
-            event_type="strategy",
-            strategies=self.config.strategy_name,
+        super().__init__(
+            event_bus=event_bus,
+            scheduler=scheduler,
+            config=config or SqueezeReversalStrategyConfig(),
+            service_name=service_name,
             component="strategy.liquidations.squeeze_reversal_strategy",
-        )
-
-        self._running = False
-        self._subscription: Subscription | None = None
-        self._diagnostics_job_id: str | None = None
-        self._pending_scan_job_id: str | None = None
-
-        self._states: dict[tuple[str, str], SymbolSqueezeStrategyState] = {}
-
-        # FIX: окремий set ключів станів з активним pending —
-        # щоб _process_pending_candidates не робив list(self._states.values())
-        # при кожному тіку, що O(N) по всіх трекованих символах.
-        self._pending_keys: set[tuple[str, str]] = set()
-
-        # FIX: deque з maxlen замість list + ручного зрізу
-        self._recent_signals: Deque[SqueezeReversalSignal] = deque(
-            maxlen=self.config.recent_signals_limit
-        )
-        self._recent_rejections: Deque[StrategyRejection] = deque(
-            maxlen=self.config.recent_rejections_limit
-        )
-        self._recent_pending: Deque[dict[str, Any]] = deque(
-            maxlen=self.config.recent_pending_limit
+            payload_type=CascadeDetectionResult,
         )
 
         self._stats = SqueezeReversalStrategyStats()
+        self._pending_scan_job_id: str | None = None
+        self._pending_keys: set[tuple[str, str]] = set()
+        self._recent_pending: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Base hooks
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
-        if self._running:
-            self.logger.warning("SqueezeReversalStrategy already running.")
-            return
-
-        if not self.config.enabled:
-            self.logger.warning("SqueezeReversalStrategy is disabled by config.")
-            return
-
-        self._running = True
-        self._stats.started_at = utc_now()
-        self._stats.stopped_at = None
-
-        self._subscription = self.event_bus.subscribe(
-            self.config.subscribe_topic,
-            self.on_exhaustion_detected,
-            name=f"{self.config.strategy_name}.on_exhaustion_detected",
+    def create_symbol_state(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+    ) -> SymbolSqueezeStrategyState:
+        return SymbolSqueezeStrategyState(
+            exchange=exchange.lower(),
+            symbol=normalize_symbol(symbol),
         )
 
-        self._register_scheduler_jobs()
+    def direction_to_trade_side(self, result: CascadeDetectionResult) -> str:
+        if result.direction is CascadeDirection.DOWN:
+            return "LONG"
 
-        self.logger.info(
-            "SqueezeReversalStrategy started.",
-            extra={
-                "topic": self.config.subscribe_topic,
-                "min_confidence": self.config.min_confidence,
-                "min_intensity_score": self.config.min_intensity_score,
-                "min_exhaustion_bias": self.config.min_exhaustion_bias,
-                "min_total_notional_usd": str(self.config.min_total_notional_usd),
-                "allowed_severities": [item.value for item in self.config.allowed_severities],
-                "enable_pending_confirmation": self.config.enable_pending_confirmation,
-                "confirmation_delay_seconds": self.config.confirmation_delay_seconds,
-                "pending_ttl_seconds": self.config.pending_ttl_seconds,
-            },
+        if result.direction is CascadeDirection.UP:
+            return "SHORT"
+
+        return "FLAT"
+
+    async def process_result(
+        self,
+        result: CascadeDetectionResult,
+        *,
+        bus_event: Event,
+    ) -> None:
+        state = self.get_or_create_state(result.exchange, result.symbol)
+        now = utc_now()
+
+        current_score = self.compute_strategy_score(result)
+        state.update_latest_seen(
+            detected_at=result.detected_at,
+            score=current_score,
         )
 
-    async def stop(self) -> None:
-        if not self._running:
-            return
-
-        self._running = False
-        self._stats.stopped_at = utc_now()
-
-        if self._subscription is not None:
-            self.event_bus.unsubscribe(self._subscription)
-            self._subscription = None
-
-        if self.scheduler is not None:
-            for job_id in (self._diagnostics_job_id, self._pending_scan_job_id):
-                if job_id is None:
-                    continue
-                try:
-                    self.scheduler.remove_job(job_id)
-                except KeyError:
-                    pass
-
-        self._diagnostics_job_id = None
-        self._pending_scan_job_id = None
-
-        self.logger.info(
-            "SqueezeReversalStrategy stopped.",
-            extra=self.get_stats(),
+        filter_result = self.evaluate_filters(
+            result=result,
+            state=state,
+            now=now,
         )
 
-    async def restart(self) -> None:
-        await self.stop()
-        await self.start()
-
-    # ------------------------------------------------------------------
-    # Main event handler
-    # ------------------------------------------------------------------
-
-    async def on_exhaustion_detected(self, bus_event: Event) -> None:
-        if not self._running:
-            return
-
-        payload = bus_event.payload
-        if not isinstance(payload, CascadeDetectionResult):
-            self._stats.invalid_payload_skips += 1
-            self.logger.debug(
-                "Non-CascadeDetectionResult payload received, ignored.",
-                extra={
-                    "topic": bus_event.topic,
-                    "payload_type": type(payload).__name__,
-                    "event_id": bus_event.event_id,
-                },
-            )
-            return
-
-        try:
-            self._stats.processed_events += 1
-
-            result = payload
-            state = self._get_or_create_state(result.exchange, result.symbol)
-            now = utc_now()
-
-            # FIX: оновлюємо latest_seen до фільтрів, щоб cancel_if_newer_detected_at
-            # враховував усі вхідні events, а не тільки ті, що стали сигналами.
-            state.update_latest_seen(result.detected_at)
-
-            rejection_reason = self._get_rejection_reason(
-                result=result,
-                state=state,
-                now=now,
-            )
-            if rejection_reason is not None:
-                await self._reject_result(
-                    result=result,
-                    bus_event=bus_event,
-                    reason=rejection_reason,
-                )
-                return
-
-            if self.config.enable_pending_confirmation:
-                await self._create_or_replace_pending_candidate(
-                    result=result,
-                    bus_event=bus_event,
-                    state=state,
-                    now=now,
-                )
-                return
-
-            signal = self._build_signal(
+        if filter_result.rejection_reason is not None:
+            await self.reject_result(
                 result=result,
                 bus_event=bus_event,
-                pending_started_at=None,
-                pending_confirmed_at=utc_now(),
-                # FIX: передаємо оригінальний source_event_id явно,
-                # щоб він потрапив у поле сигналу, а не тільки в headers
-                source_event_id=bus_event.event_id,
+                reason=filter_result.rejection_reason,
             )
-            await self._emit_signal(signal=signal, bus_event=bus_event)
+            return
 
-            cluster_signature = self._build_cluster_signature(result)
-            state.remember_signal(
-                signal_at=signal.generated_at,
-                signal_side=signal.side,
-                score=signal.score,
-                cooldown_seconds=self.config.symbol_cooldown_seconds,
-                cluster_signature=cluster_signature,
-                detected_at=result.detected_at,
+        if self.config.enable_pending_confirmation:
+            await self.create_or_replace_pending_candidate(
+                result=result,
+                bus_event=bus_event,
+                state=state,
+                now=now,
+                cluster_signature=filter_result.cluster_signature or self.build_cluster_signature(result),
+                score=current_score,
             )
-            state.pending = None
-            self._pending_keys.discard(self._state_key(result.exchange, result.symbol))
+            return
 
-            _remember(self._recent_signals, signal)
-
-            self._stats.emitted_signals += 1
-            self._stats.last_signal_at = signal.generated_at
-
-            self.logger.info(
-                "Squeeze reversal signal emitted immediately.",
-                extra={
-                    "exchange": signal.exchange,
-                    "symbol": signal.symbol,
-                    "side": signal.side,
-                    "score": signal.score,
-                    "confidence": signal.confidence,
-                    "severity": signal.severity,
-                    "exhaustion_bias": signal.exhaustion_bias,
-                    "event_count": signal.event_count,
-                    "total_notional_usd": str(signal.total_notional_usd),
-                    "event_id": bus_event.event_id,
-                    "correlation_id": bus_event.correlation_id,
-                },
-            )
-
-        except Exception as exc:
-            self._stats.last_error_at = utc_now()
-            self._stats.last_error = repr(exc)
-            self.logger.exception(
-                "Unhandled error in SqueezeReversalStrategy.on_exhaustion_detected.",
-                extra={
-                    "topic": bus_event.topic,
-                    "event_id": bus_event.event_id,
-                    "correlation_id": bus_event.correlation_id,
-                    "error": repr(exc),
-                },
-            )
+        await self.emit_confirmed_signal(
+            result=result,
+            bus_event=bus_event,
+            state=state,
+            cluster_signature=filter_result.cluster_signature,
+            pending_started_at=None,
+            pending_confirmed_at=now,
+            source_event_id=bus_event.event_id,
+        )
 
     # ------------------------------------------------------------------
     # Filters
     # ------------------------------------------------------------------
 
-    def _get_rejection_reason(
+    def evaluate_filters(
         self,
         *,
         result: CascadeDetectionResult,
         state: SymbolSqueezeStrategyState,
         now: datetime,
+    ) -> FilterResult:
+        common = self.evaluate_common_filters(
+            result=result,
+            state=state,
+            now=now,
+        )
+
+        if common.rejection_reason is not None:
+            return common
+
+        custom_rejection = self.get_exhaustion_rejection_reason(
+            result=result,
+            now=now,
+        )
+
+        if custom_rejection is not None:
+            return FilterResult(rejection_reason=custom_rejection)
+
+        return common
+
+    def get_exhaustion_rejection_reason(
+        self,
+        *,
+        result: CascadeDetectionResult,
+        now: datetime,
     ) -> str | None:
-        if self.config.allowed_exchanges:
-            allowed = {item.lower() for item in self.config.allowed_exchanges}
-            if result.exchange.lower() not in allowed:
-                self._stats.filter_skips += 1
-                return "exchange_not_allowed"
-
-        if self.config.allowed_symbols:
-            allowed_symbols = {normalize_symbol(item) for item in self.config.allowed_symbols}
-            if result.symbol.upper() not in allowed_symbols:
-                self._stats.filter_skips += 1
-                return "symbol_not_allowed"
-
-        if self.config.blocked_symbols:
-            blocked_symbols = {normalize_symbol(item) for item in self.config.blocked_symbols}
-            if result.symbol.upper() in blocked_symbols:
-                self._stats.filter_skips += 1
-                return "symbol_blocked"
-
-        if result.direction == CascadeDirection.UNKNOWN:
+        if not result.is_confirmed:
             self._stats.filter_skips += 1
-            return "unknown_direction"
+            return "result_not_confirmed"
+
+        if self.config.require_actionable_severity and not result.is_actionable_severity:
+            self._stats.filter_skips += 1
+            return "severity_not_actionable"
 
         if self.config.require_favors_exhaustion and not result.favors_exhaustion:
             self._stats.filter_skips += 1
             return "exhaustion_not_favored"
 
-        if self.config.require_high_confidence_only and not result.is_high_confidence:
-            self._stats.filter_skips += 1
-            return "not_high_confidence"
-
-        if result.confidence < self.config.min_confidence:
-            self._stats.filter_skips += 1
-            return "confidence_below_threshold"
-
-        if result.intensity_score < self.config.min_intensity_score:
-            self._stats.filter_skips += 1
-            return "intensity_below_threshold"
-
         if result.exhaustion_bias < self.config.min_exhaustion_bias:
             self._stats.filter_skips += 1
             return "exhaustion_bias_below_threshold"
 
-        if result.total_notional_usd < self.config.min_total_notional_usd:
+        if result.bias_delta < self.config.min_bias_delta:
             self._stats.filter_skips += 1
-            return "notional_below_threshold"
-
-        if result.event_count < self.config.min_event_count:
-            self._stats.filter_skips += 1
-            return "event_count_below_threshold"
-
-        if result.severity not in self.config.allowed_severities:
-            self._stats.filter_skips += 1
-            return "severity_not_allowed"
+            return "bias_delta_below_threshold"
 
         if (
-            self.config.max_price_range_pct is not None
-            and result.price_range_pct > self.config.max_price_range_pct
+            self.config.max_continuation_bias_after_exhaustion is not None
+            and result.continuation_bias > self.config.max_continuation_bias_after_exhaustion
         ):
             self._stats.filter_skips += 1
-            return "price_range_above_threshold"
+            return "continuation_bias_too_high_for_reversal"
 
-        if state.is_in_cooldown(now):
-            self._stats.cooldown_skips += 1
-            return "symbol_in_cooldown"
+        detected_at = ensure_utc(result.detected_at)
 
-        if self.config.deduplicate_by_detected_at:
-            if state.last_detected_at is not None and ensure_utc(result.detected_at) <= state.last_detected_at:
-                self._stats.duplicate_skips += 1
-                return "duplicate_detected_at"
+        if detected_at > ensure_utc(now) + timedelta(seconds=self.config.max_future_detected_at_seconds):
+            self._stats.filter_skips += 1
+            return "detected_at_in_future"
 
-        cluster_signature = self._build_cluster_signature(result)
-        if self.config.deduplicate_same_cluster_signature:
-            if cluster_signature and state.last_cluster_signature == cluster_signature:
-                self._stats.duplicate_skips += 1
-                return "duplicate_cluster_signature"
+        age_seconds = (ensure_utc(now) - detected_at).total_seconds()
+        if age_seconds > self.config.max_result_age_seconds:
+            self._stats.filter_skips += 1
+            return "result_too_old"
 
-        trade_side = self._direction_to_trade_side(result.direction)
-        if (
-            state.last_signal_at is not None
-            and state.last_signal_side == trade_side
-            and (ensure_utc(now) - state.last_signal_at).total_seconds()
-            < self.config.min_seconds_between_same_side_signals
-        ):
-            self._stats.duplicate_skips += 1
-            return "same_side_signal_too_soon"
+        if self.config.max_cluster_duration_seconds is not None:
+            if result.cluster.duration_seconds > self.config.max_cluster_duration_seconds:
+                self._stats.filter_skips += 1
+                return "cluster_duration_too_long"
 
-        if self.config.max_signals_per_symbol_window > 0:
-            signals_in_window = state.signals_in_window(
-                now=now,
-                window_seconds=self.config.signal_window_seconds,
-            )
-            if signals_in_window >= self.config.max_signals_per_symbol_window:
-                self._stats.rate_limit_skips += 1
-                return "symbol_signal_rate_limited"
+        if self.config.min_avg_notional_per_event is not None:
+            if result.cluster.avg_notional_per_event < self.config.min_avg_notional_per_event:
+                self._stats.filter_skips += 1
+                return "avg_notional_per_event_below_threshold"
+
+        analytics_meta = self.extract_analytics_metadata(result)
+
+        if self.config.min_side_imbalance_ratio is not None:
+            value = analytics_meta["side_imbalance_ratio"]
+            if value is None or value < self.config.min_side_imbalance_ratio:
+                self._stats.filter_skips += 1
+                return "side_imbalance_below_threshold"
+
+        if self.config.min_event_imbalance_ratio is not None:
+            value = analytics_meta["event_imbalance_ratio"]
+            if value is None or value < self.config.min_event_imbalance_ratio:
+                self._stats.filter_skips += 1
+                return "event_imbalance_below_threshold"
+
+        if self.config.min_climax_acceleration_ratio is not None:
+            value = analytics_meta["acceleration_ratio"]
+            if value is None or value < self.config.min_climax_acceleration_ratio:
+                self._stats.filter_skips += 1
+                return "acceleration_below_climax_threshold"
 
         return None
 
@@ -755,32 +659,52 @@ class SqueezeReversalStrategy:
     # Pending confirmation
     # ------------------------------------------------------------------
 
-    async def _create_or_replace_pending_candidate(
+    async def create_or_replace_pending_candidate(
         self,
         *,
         result: CascadeDetectionResult,
         bus_event: Event,
         state: SymbolSqueezeStrategyState,
         now: datetime,
+        cluster_signature: str,
+        score: float,
     ) -> None:
-        cluster_signature = self._build_cluster_signature(result)
-
         if state.pending is not None:
             existing = state.pending
 
-            # якщо новий candidate слабший або старіший — не замінюємо
-            if ensure_utc(result.detected_at) <= ensure_utc(existing.result.detected_at):
+            incoming_is_newer = ensure_utc(result.detected_at) > ensure_utc(existing.result.detected_at)
+            incoming_is_stronger = score >= existing.score_at_creation + self.config.min_replacement_score_delta
+
+            if not incoming_is_newer:
                 self._stats.duplicate_skips += 1
-                await self._reject_result(
+                await self.reject_result(
                     result=result,
                     bus_event=bus_event,
                     reason="older_than_existing_pending",
                 )
                 return
 
+            if self.config.replace_pending_if_score_improves and not incoming_is_stronger:
+                self._stats.duplicate_skips += 1
+                await self.reject_result(
+                    result=result,
+                    bus_event=bus_event,
+                    reason="newer_pending_not_stronger_enough",
+                )
+                return
+
             existing.cancelled = True
-            existing.cancel_reason = "replaced_by_newer_pending"
+            existing.cancel_reason = "replaced_by_newer_stronger_pending"
             self._stats.pending_cancelled += 1
+            self._stats.pending_replaced += 1
+
+            if self.config.publish_pending_events:
+                await self.emit_pending_event(
+                    topic=self.config.publish_topic_pending_replaced,
+                    candidate=existing,
+                    reason=existing.cancel_reason,
+                    correlation_id=bus_event.correlation_id or bus_event.event_id,
+                )
 
         candidate = PendingReversalCandidate(
             exchange=result.exchange,
@@ -793,42 +717,27 @@ class SqueezeReversalStrategy:
             confirm_after=ensure_utc(now) + timedelta(seconds=self.config.confirmation_delay_seconds),
             expires_at=ensure_utc(now) + timedelta(seconds=self.config.pending_ttl_seconds),
             cluster_signature=cluster_signature,
+            score_at_creation=score,
+            quality_snapshot=self.build_quality_snapshot(result),
         )
 
         state.pending = candidate
-        key = self._state_key(result.exchange, result.symbol)
-        self._pending_keys.add(key)
+        self._pending_keys.add(self.state_key(result.exchange, result.symbol))
 
         self._stats.pending_created += 1
-
-        _remember(
-            self._recent_pending,
-            {
-                "exchange": candidate.exchange,
-                "symbol": candidate.symbol,
-                "created_at": candidate.created_at.isoformat(),
-                "confirm_after": candidate.confirm_after.isoformat(),
-                "expires_at": candidate.expires_at.isoformat(),
-                "severity": result.severity.value,
-                "direction": result.direction.value,
-                "confidence": result.confidence,
-                "exhaustion_bias": result.exhaustion_bias,
-                "event_count": result.event_count,
-                "total_notional_usd": str(result.total_notional_usd),
-                "source_event_id": bus_event.event_id,
-                "correlation_id": bus_event.correlation_id,
-            },
-        )
+        self.remember_pending(candidate, state="created")
 
         self.logger.info(
-            "Squeeze reversal candidate moved to pending.",
+            "Squeeze reversal candidate moved to pending",
             extra={
+                "strategy": self.config.strategy_name,
                 "exchange": result.exchange,
                 "symbol": result.symbol,
-                "severity": result.severity.value,
-                "direction": result.direction.value,
+                "score": score,
                 "confidence": result.confidence,
+                "severity": result.severity.value,
                 "exhaustion_bias": result.exhaustion_bias,
+                "bias_delta": result.bias_delta,
                 "confirm_after": candidate.confirm_after.isoformat(),
                 "expires_at": candidate.expires_at.isoformat(),
                 "event_id": bus_event.event_id,
@@ -837,47 +746,28 @@ class SqueezeReversalStrategy:
         )
 
         if self.config.publish_pending_events:
-            await self._emit_event(
-                self.config.publish_topic_pending_created,
-                {
-                    "strategy_name": self.config.strategy_name,
-                    "exchange": candidate.exchange,
-                    "symbol": candidate.symbol,
-                    "created_at": candidate.created_at.isoformat(),
-                    "confirm_after": candidate.confirm_after.isoformat(),
-                    "expires_at": candidate.expires_at.isoformat(),
-                    "source_event_id": bus_event.event_id,
-                    "correlation_id": bus_event.correlation_id,
-                    "severity": result.severity.value,
-                    "direction": result.direction.value,
-                    "confidence": result.confidence,
-                    "exhaustion_bias": result.exhaustion_bias,
-                },
-                priority=self.config.pending_priority,
+            await self.emit_pending_event(
+                topic=self.config.publish_topic_pending_created,
+                candidate=candidate,
+                reason="pending_created",
                 correlation_id=bus_event.correlation_id or bus_event.event_id,
-                headers={
-                    "strategy": self.config.strategy_name,
-                    "symbol": candidate.symbol,
-                    "exchange": candidate.exchange,
-                    "state": "pending_created",
-                },
             )
 
-    async def _process_pending_candidates(self) -> None:
+    async def process_pending_candidates(self) -> None:
         if not self._running:
             return
 
         now = utc_now()
 
-        # FIX: ітеруємо тільки по ключах з активним pending (не по всіх _states),
-        # щоб уникнути O(N) по всіх трекованих символах на кожному тіку.
         for key in list(self._pending_keys):
             state = self._states.get(key)
+
             if state is None:
                 self._pending_keys.discard(key)
                 continue
 
             candidate = state.pending
+
             if candidate is None:
                 self._pending_keys.discard(key)
                 continue
@@ -888,36 +778,45 @@ class SqueezeReversalStrategy:
                 continue
 
             if candidate.is_expired(now):
-                await self._expire_pending_candidate(state=state, candidate=candidate)
-                self._pending_keys.discard(key)
+                await self.expire_pending_candidate(
+                    state=state,
+                    candidate=candidate,
+                    reason="pending_expired",
+                )
                 continue
 
             if not candidate.is_ready(now):
                 continue
 
-            age_seconds = (ensure_utc(now) - candidate.created_at).total_seconds()
+            age_seconds = (ensure_utc(now) - ensure_utc(candidate.created_at)).total_seconds()
             if age_seconds < self.config.min_pending_age_seconds:
                 continue
 
-            # FIX: порівнюємо з latest_seen_detected_at, а не з last_detected_at.
-            # last_detected_at оновлюється тільки після remember_signal (тобто після
-            # підтвердження сигналу), тому новий exhaustion-event що не пройшов фільтри
-            # не скасував би pending. latest_seen_detected_at оновлюється при кожному
-            # вхідному event ще до фільтрів.
-            if self.config.cancel_if_newer_detected_at and state.latest_seen_detected_at is not None:
-                if state.latest_seen_detected_at > candidate.candidate_detected_at:
-                    await self._expire_pending_candidate(
-                        state=state,
-                        candidate=candidate,
-                        reason="newer_detected_at_exists",
-                    )
-                    self._pending_keys.discard(key)
-                    continue
+            if (
+                self.config.cancel_if_newer_detected_at
+                and state.latest_seen_detected_at is not None
+                and ensure_utc(state.latest_seen_detected_at) > ensure_utc(candidate.candidate_detected_at)
+            ):
+                await self.expire_pending_candidate(
+                    state=state,
+                    candidate=candidate,
+                    reason="newer_detected_at_exists",
+                )
+                continue
 
-            # FIX: source_event_id береться з candidate (оригінальний event_id),
-            # а не з synthetic_event, який має свій новий event_id.
-            # Synthetic event потрібен лише для сумісності інтерфейсу _build_signal,
-            # але source_event_id передаємо явно, щоб він коректно потрапив у сигнал.
+            late_rejection = self.get_exhaustion_rejection_reason(
+                result=candidate.result,
+                now=now,
+            )
+
+            if late_rejection is not None:
+                await self.expire_pending_candidate(
+                    state=state,
+                    candidate=candidate,
+                    reason=f"late_filter_failed:{late_rejection}",
+                )
+                continue
+
             synthetic_event = Event(
                 topic=candidate.source_topic,
                 payload=candidate.result,
@@ -928,67 +827,50 @@ class SqueezeReversalStrategy:
                 if candidate.source_event_id
                 else {},
             )
-            signal = self._build_signal(
+
+            await self.emit_confirmed_signal(
                 result=candidate.result,
                 bus_event=synthetic_event,
+                state=state,
+                cluster_signature=candidate.cluster_signature,
                 pending_started_at=candidate.created_at,
-                pending_confirmed_at=ensure_utc(now),
-                source_event_id=candidate.source_event_id,  # оригінальний event_id
-            )
-
-            await self._emit_signal(
-                signal=signal,
-                bus_event=synthetic_event,
+                pending_confirmed_at=now,
+                source_event_id=candidate.source_event_id,
                 pending_confirmation=True,
             )
 
-            state.remember_signal(
-                signal_at=signal.generated_at,
-                signal_side=signal.side,
-                score=signal.score,
-                cooldown_seconds=self.config.symbol_cooldown_seconds,
-                cluster_signature=candidate.cluster_signature,
-                detected_at=candidate.result.detected_at,
-            )
+            self._stats.pending_confirmed += 1
+
+            if self.config.publish_pending_events:
+                await self.emit_pending_event(
+                    topic=self.config.publish_topic_pending_confirmed,
+                    candidate=candidate,
+                    reason="pending_confirmed",
+                    correlation_id=candidate.correlation_id or candidate.source_event_id,
+                )
+
             state.pending = None
             self._pending_keys.discard(key)
 
-            _remember(self._recent_signals, signal)
-
-            self._stats.emitted_signals += 1
-            self._stats.pending_confirmed += 1
-            self._stats.last_signal_at = signal.generated_at
-
-            self.logger.info(
-                "Pending squeeze reversal candidate confirmed and emitted.",
-                extra={
-                    "exchange": signal.exchange,
-                    "symbol": signal.symbol,
-                    "side": signal.side,
-                    "score": signal.score,
-                    "confidence": signal.confidence,
-                    "severity": signal.severity,
-                    "exhaustion_bias": signal.exhaustion_bias,
-                    "event_count": signal.event_count,
-                    "total_notional_usd": str(signal.total_notional_usd),
-                    "correlation_id": candidate.correlation_id,
-                    "source_event_id": candidate.source_event_id,
-                },
-            )
-
-    async def _expire_pending_candidate(
+    async def expire_pending_candidate(
         self,
         *,
         state: SymbolSqueezeStrategyState,
         candidate: PendingReversalCandidate,
-        reason: str = "pending_expired",
+        reason: str,
     ) -> None:
         self._stats.pending_expired += 1
+
+        candidate.cancelled = True
+        candidate.cancel_reason = reason
+
         state.pending = None
+        self._pending_keys.discard(self.state_key(candidate.exchange, candidate.symbol))
 
         self.logger.info(
-            "Pending squeeze reversal candidate expired.",
+            "Pending squeeze reversal candidate expired",
             extra={
+                "strategy": self.config.strategy_name,
                 "exchange": candidate.exchange,
                 "symbol": candidate.symbol,
                 "reason": reason,
@@ -1000,83 +882,161 @@ class SqueezeReversalStrategy:
         )
 
         if self.config.publish_pending_events:
-            await self._emit_event(
-                self.config.publish_topic_pending_expired,
-                {
-                    "strategy_name": self.config.strategy_name,
-                    "exchange": candidate.exchange,
-                    "symbol": candidate.symbol,
-                    "reason": reason,
-                    "created_at": candidate.created_at.isoformat(),
-                    "expires_at": candidate.expires_at.isoformat(),
-                    "correlation_id": candidate.correlation_id,
-                    "source_event_id": candidate.source_event_id,
-                },
-                priority=self.config.pending_priority,
+            await self.emit_pending_event(
+                topic=self.config.publish_topic_pending_expired,
+                candidate=candidate,
+                reason=reason,
                 correlation_id=candidate.correlation_id or candidate.source_event_id,
-                headers={
-                    "strategy": self.config.strategy_name,
-                    "symbol": candidate.symbol,
-                    "exchange": candidate.exchange,
-                    "state": "pending_expired",
-                },
             )
+
+    async def emit_pending_event(
+        self,
+        *,
+        topic: str,
+        candidate: PendingReversalCandidate,
+        reason: str,
+        correlation_id: str | None,
+    ) -> bool:
+        payload = {
+            "strategy_name": self.config.strategy_name,
+            "signal_type": self.config.signal_type,
+            "exchange": candidate.exchange,
+            "symbol": candidate.symbol,
+            "state": reason,
+            "created_at": candidate.created_at,
+            "confirm_after": candidate.confirm_after,
+            "expires_at": candidate.expires_at,
+            "score_at_creation": candidate.score_at_creation,
+            "source_event_id": candidate.source_event_id,
+            "correlation_id": candidate.correlation_id,
+            "cluster_signature": candidate.cluster_signature,
+            "quality_snapshot": candidate.quality_snapshot,
+        }
+
+        return await self.emit_event(
+            topic,
+            serialize_value(payload),
+            priority=self.config.pending_priority,
+            correlation_id=correlation_id,
+            headers={
+                "strategy": self.config.strategy_name,
+                "signal_type": self.config.signal_type,
+                "exchange": candidate.exchange,
+                "symbol": candidate.symbol,
+                "state": reason,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Signal building
     # ------------------------------------------------------------------
 
-    def _build_signal(
+    async def emit_confirmed_signal(
+        self,
+        *,
+        result: CascadeDetectionResult,
+        bus_event: Event,
+        state: SymbolSqueezeStrategyState,
+        cluster_signature: str | None,
+        pending_started_at: datetime | None,
+        pending_confirmed_at: datetime | None,
+        source_event_id: str | None,
+        pending_confirmation: bool = False,
+    ) -> bool:
+        signal = self.build_signal(
+            result=result,
+            bus_event=bus_event,
+            pending_started_at=pending_started_at,
+            pending_confirmed_at=pending_confirmed_at,
+            source_event_id=source_event_id,
+        )
+
+        headers = {
+            "pending_confirmation": "true" if pending_confirmation else "false",
+            "analytics_event_type": result.event_type.value,
+        }
+
+        emitted = await self.emit_signal(
+            signal,
+            bus_event=bus_event,
+            headers=headers,
+        )
+
+        if not emitted:
+            return False
+
+        self.remember_emitted_signal(
+            signal=signal,
+            state=state,
+            result=result,
+            signal_side=signal.side,
+            score=signal.score,
+            cluster_signature=cluster_signature,
+        )
+
+        self.logger.info(
+            "Squeeze reversal signal emitted",
+            extra={
+                "strategy": self.config.strategy_name,
+                "exchange": signal.exchange,
+                "symbol": signal.symbol,
+                "side": signal.side,
+                "score": signal.score,
+                "confidence": signal.confidence,
+                "severity": signal.severity,
+                "exhaustion_bias": signal.exhaustion_bias,
+                "bias_delta": signal.bias_delta,
+                "event_count": signal.event_count,
+                "total_notional_usd": str(signal.total_notional_usd),
+                "pending_confirmation": pending_confirmation,
+                "source_event_id": source_event_id,
+                "correlation_id": signal.correlation_id,
+            },
+        )
+
+        return True
+
+    def build_signal(
         self,
         *,
         result: CascadeDetectionResult,
         bus_event: Event,
         pending_started_at: datetime | None,
         pending_confirmed_at: datetime | None,
-        # FIX: явний параметр для оригінального source_event_id,
-        # бо bus_event може бути synthetic (з новим event_id)
-        source_event_id: str | None = None,
+        source_event_id: str | None,
     ) -> SqueezeReversalSignal:
-        trade_side = self._direction_to_trade_side(result.direction)
+        trade_side = self.direction_to_trade_side(result)
         generated_at = utc_now()
-        score = self._compute_strategy_score(result)
+        score = self.compute_strategy_score(result)
+        analytics_meta = self.extract_analytics_metadata(result)
 
         reason = (
-            f"squeeze reversal after exhaustion: "
+            "squeeze reversal after liquidation exhaustion: "
             f"direction={result.direction.value}, "
+            f"side={result.side.value}, "
             f"severity={result.severity.value}, "
             f"exhaustion_bias={result.exhaustion_bias:.3f}, "
+            f"continuation_bias={result.continuation_bias:.3f}, "
+            f"bias_delta={result.bias_delta:.3f}, "
             f"confidence={result.confidence:.3f}"
         )
 
-        metadata = {
-            "cluster": {
-                "start_time": result.cluster.start_time.isoformat(),
-                "end_time": result.cluster.end_time.isoformat(),
-                "event_count": result.cluster.event_count,
-                "total_notional_usd": str(result.cluster.total_notional_usd),
-                "avg_price": str(result.cluster.avg_price),
-                "min_price": str(result.cluster.min_price),
-                "max_price": str(result.cluster.max_price),
-                "duration_seconds": result.cluster.duration_seconds,
-                "avg_notional_per_event": str(result.cluster.avg_notional_per_event),
+        metadata = self.build_common_signal_metadata(
+            result=result,
+            bus_event=bus_event,
+        )
+
+        metadata["squeeze_reversal"] = {
+            "analytics_event_type": result.event_type.value,
+            "favors_exhaustion": result.favors_exhaustion,
+            "bias_delta": result.bias_delta,
+            "score": score,
+            "quality_snapshot": self.build_quality_snapshot(result),
+            "pending": {
+                "enabled": self.config.enable_pending_confirmation,
+                "pending_started_at": pending_started_at.isoformat() if pending_started_at else None,
+                "pending_confirmed_at": pending_confirmed_at.isoformat() if pending_confirmed_at else None,
             },
-            "strategy": {
-                "min_confidence": self.config.min_confidence,
-                "min_intensity_score": self.config.min_intensity_score,
-                "min_exhaustion_bias": self.config.min_exhaustion_bias,
-                "allowed_severities": [item.value for item in self.config.allowed_severities],
-                "enable_pending_confirmation": self.config.enable_pending_confirmation,
-            },
-            "bus_event": {
-                "topic": bus_event.topic,
-                "event_id": bus_event.event_id,
-                "source": bus_event.source,
-                "priority": int(bus_event.priority),
-                "correlation_id": bus_event.correlation_id,
-                "headers": dict(bus_event.headers),
-            },
-            "detector_metadata": dict(result.metadata),
         }
 
         return SqueezeReversalSignal(
@@ -1099,265 +1059,195 @@ class SqueezeReversalStrategy:
             intensity_score=clamp_float(result.intensity_score),
             continuation_bias=clamp_float(result.continuation_bias),
             exhaustion_bias=clamp_float(result.exhaustion_bias),
+            bias_delta=clamp_float(result.bias_delta),
             price_range_pct=result.price_range_pct,
+            window_seconds=result.window_seconds,
+            cluster_duration_seconds=result.cluster.duration_seconds,
+            cluster_avg_notional_per_event=result.cluster.avg_notional_per_event,
+            side_imbalance_ratio=analytics_meta["side_imbalance_ratio"],
+            event_imbalance_ratio=analytics_meta["event_imbalance_ratio"],
+            acceleration_ratio=analytics_meta["acceleration_ratio"],
             pending_started_at=pending_started_at,
             pending_confirmed_at=pending_confirmed_at,
-            correlation_id=bus_event.correlation_id,
-            # FIX: використовуємо явно переданий source_event_id
-            # (може відрізнятись від bus_event.event_id, якщо bus_event — synthetic)
-            source_event_id=source_event_id if source_event_id is not None else bus_event.event_id,
+            correlation_id=bus_event.correlation_id or result.correlation_id,
+            source_event_id=source_event_id or bus_event.event_id,
             metadata=metadata,
         )
 
-    def _compute_strategy_score(self, result: CascadeDetectionResult) -> float:
-        severity_score = self._severity_to_score(result.severity)
+    # ------------------------------------------------------------------
+    # Scoring / analytics extraction
+    # ------------------------------------------------------------------
 
+    def compute_strategy_score(self, result: CascadeDetectionResult) -> float:
         total_weight = (
             self.config.score_confidence_weight
             + self.config.score_exhaustion_bias_weight
+            + self.config.score_bias_delta_weight
             + self.config.score_intensity_weight
             + self.config.score_severity_weight
+            + self.config.score_cluster_quality_weight
         )
+
         if total_weight <= 0:
             return 0.0
+
+        cluster_quality = self.compute_cluster_quality_score(result)
 
         weighted_score = (
             clamp_float(result.confidence) * self.config.score_confidence_weight
             + clamp_float(result.exhaustion_bias) * self.config.score_exhaustion_bias_weight
+            + clamp_float(result.bias_delta) * self.config.score_bias_delta_weight
             + clamp_float(result.intensity_score) * self.config.score_intensity_weight
-            + severity_score * self.config.score_severity_weight
+            + self.severity_to_score(result.severity) * self.config.score_severity_weight
+            + cluster_quality * self.config.score_cluster_quality_weight
         ) / total_weight
 
         return clamp_float(weighted_score)
 
-    def _severity_to_score(self, severity: CascadeSeverity) -> float:
-        if severity == CascadeSeverity.EXTREME:
-            return 1.0
-        if severity == CascadeSeverity.HIGH:
-            return 0.8
-        if severity == CascadeSeverity.MEDIUM:
-            return 0.6
-        return 0.4
+    def compute_cluster_quality_score(self, result: CascadeDetectionResult) -> float:
+        duration_score = 0.5
+        avg_notional_score = 0.5
+        price_range_score = 0.5
 
-    def _direction_to_trade_side(self, direction: CascadeDirection) -> str:
-        # reversal = проти напряму каскаду
-        if direction == CascadeDirection.DOWN:
-            return "LONG"
-        if direction == CascadeDirection.UP:
-            return "SHORT"
-        return "FLAT"
-
-    # FIX: cluster signature через SHA-256 хеш замість конкатенації через "|".
-    # Конкатенація крихка — якщо exchange або symbol містять "|", можлива колізія.
-    # json.dumps дає стабільну серіалізацію, hashlib дає фіксовану довжину і без колізій.
-    def _build_cluster_signature(self, result: CascadeDetectionResult) -> str:
-        cluster = result.cluster
-        parts = {
-            "exchange": result.exchange.lower(),
-            "symbol": result.symbol.upper(),
-            "direction": result.direction.value,
-            "side": result.side.value,
-            "start_time": cluster.start_time.isoformat(),
-            "end_time": cluster.end_time.isoformat(),
-            "event_count": cluster.event_count,
-            "total_notional_usd": str(cluster.total_notional_usd),
-            "detected_at": result.detected_at.isoformat(),
-        }
-        raw = json.dumps(parts, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(raw.encode()).hexdigest()
-
-    async def _emit_event(
-        self,
-        topic: str,
-        payload: Any,
-        *,
-        priority: EventPriority,
-        correlation_id: str | None,
-        headers: dict[str, Any] | None = None,
-    ) -> bool:
-        """Emit through core.EventBus with consistent source/error handling."""
-        try:
-            return await self.event_bus.emit(
-                topic,
-                payload,
-                priority=priority,
-                source=self.config.strategy_name,
-                correlation_id=correlation_id,
-                headers=headers or {},
+        if self.config.max_cluster_duration_seconds:
+            duration_score = clamp_float(
+                1.0 - (result.cluster.duration_seconds / self.config.max_cluster_duration_seconds)
             )
-        except RuntimeError as exc:
-            self._stats.last_error_at = utc_now()
-            self._stats.last_error = repr(exc)
-            self.logger.exception(
-                "EventBus emit failed: bus is probably not started.",
-                extra={
-                    "event_type": "strategy_emit_error",
-                    "topic": topic,
-                    "correlation_id": correlation_id,
-                    "error": repr(exc),
-                },
+
+        if self.config.min_avg_notional_per_event and self.config.min_avg_notional_per_event > 0:
+            avg_notional_score = clamp_float(
+                float(result.cluster.avg_notional_per_event / self.config.min_avg_notional_per_event)
             )
-            return False
 
-    async def _emit_signal(
+        if self.config.max_price_range_pct and self.config.max_price_range_pct > 0:
+            price_range_score = clamp_float(
+                1.0 - (result.price_range_pct / self.config.max_price_range_pct)
+            )
+
+        return clamp_float((duration_score + avg_notional_score + price_range_score) / 3.0)
+
+    def extract_analytics_metadata(
         self,
-        *,
-        signal: SqueezeReversalSignal,
-        bus_event: Event,
-        pending_confirmation: bool = False,
-    ) -> bool:
-        headers = {
-            "strategy": self.config.strategy_name,
-            "signal_type": self.config.signal_type,
-            "exchange": signal.exchange,
-            "symbol": signal.symbol,
-            "side": signal.side,
-            "source_event_id": signal.source_event_id,  # вже містить оригінальний id
-            "source_topic": bus_event.topic,
-        }
-        if pending_confirmation:
-            headers["pending_confirmation"] = "true"
-
-        return await self._emit_event(
-            self.config.publish_topic_signal_generated,
-            signal,
-            priority=self.config.signal_priority,
-            correlation_id=bus_event.correlation_id or bus_event.event_id,
-            headers=headers,
-        )
-
-    # ------------------------------------------------------------------
-    # Reject / memory
-    # ------------------------------------------------------------------
-
-    async def _reject_result(
-        self,
-        *,
         result: CascadeDetectionResult,
-        bus_event: Event,
-        reason: str,
-    ) -> None:
-        self._stats.rejected_events += 1
+    ) -> dict[str, float | None]:
+        metadata = result.metadata or {}
 
-        rejection = StrategyRejection(
-            exchange=result.exchange,
-            symbol=result.symbol,
-            rejected_at=utc_now(),
-            reason=reason,
-            source_topic=bus_event.topic,
-            correlation_id=bus_event.correlation_id,
-            source_event_id=bus_event.event_id,
-            details={
-                "severity": result.severity.value,
-                "direction": result.direction.value,
-                "confidence": result.confidence,
-                "intensity_score": result.intensity_score,
-                "continuation_bias": result.continuation_bias,
-                "exhaustion_bias": result.exhaustion_bias,
-                "event_count": result.event_count,
-                "total_notional_usd": str(result.total_notional_usd),
-                "price_range_pct": result.price_range_pct,
-            },
-        )
-
-        _remember(self._recent_rejections, rejection)
-
-        self.logger.debug(
-            "Squeeze reversal result rejected by strategy filters.",
-            extra={
-                "exchange": result.exchange,
-                "symbol": result.symbol,
-                "reason": reason,
-                "severity": result.severity.value,
-                "confidence": result.confidence,
-                "exhaustion_bias": result.exhaustion_bias,
-                "event_id": bus_event.event_id,
-                "correlation_id": bus_event.correlation_id,
-            },
-        )
-
-        if self.config.publish_rejected_events:
-            await self._emit_event(
-                self.config.publish_topic_signal_rejected,
-                rejection,
-                priority=self.config.rejection_priority,
-                correlation_id=bus_event.correlation_id or bus_event.event_id,
-                headers={
-                    "strategy": self.config.strategy_name,
-                    "exchange": result.exchange,
-                    "symbol": result.symbol,
-                    "reason": reason,
-                    "source_event_id": bus_event.event_id,
-                    "source_topic": bus_event.topic,
-                },
-            )
-
-    # ------------------------------------------------------------------
-    # State / helpers
-    # ------------------------------------------------------------------
+        return {
+            "side_imbalance_ratio": self.optional_float(metadata.get("side_imbalance_ratio")),
+            "event_imbalance_ratio": self.optional_float(metadata.get("event_imbalance_ratio")),
+            "acceleration_ratio": self.optional_float(metadata.get("acceleration_ratio")),
+            "long_events": self.optional_float(metadata.get("long_events")),
+            "short_events": self.optional_float(metadata.get("short_events")),
+            "long_notional_usd": self.optional_float(metadata.get("long_notional_usd")),
+            "short_notional_usd": self.optional_float(metadata.get("short_notional_usd")),
+        }
 
     @staticmethod
-    def _state_key(exchange: str, symbol: str) -> tuple[str, str]:
-        return (exchange.lower(), normalize_symbol(symbol))
+    def optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
 
-    def _get_or_create_state(self, exchange: str, symbol: str) -> SymbolSqueezeStrategyState:
-        key = self._state_key(exchange, symbol)
-        state = self._states.get(key)
-        if state is None:
-            state = SymbolSqueezeStrategyState(
-                exchange=exchange.lower(),
-                symbol=normalize_symbol(symbol),
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def build_quality_snapshot(
+        self,
+        result: CascadeDetectionResult,
+    ) -> dict[str, Any]:
+        analytics_meta = self.extract_analytics_metadata(result)
+
+        return {
+            "confidence": result.confidence,
+            "intensity_score": result.intensity_score,
+            "continuation_bias": result.continuation_bias,
+            "exhaustion_bias": result.exhaustion_bias,
+            "bias_delta": result.bias_delta,
+            "severity": result.severity.value,
+            "event_type": result.event_type.value,
+            "event_count": result.event_count,
+            "total_notional_usd": str(result.total_notional_usd),
+            "window_seconds": result.window_seconds,
+            "price_range_pct": result.price_range_pct,
+            "cluster": {
+                "duration_seconds": result.cluster.duration_seconds,
+                "avg_notional_per_event": str(result.cluster.avg_notional_per_event),
+                "price_range_pct": result.cluster.price_range_pct,
+                "event_count": result.cluster.event_count,
+                "total_notional_usd": str(result.cluster.total_notional_usd),
+            },
+            "analytics_metadata": analytics_meta,
+        }
+
+    # ------------------------------------------------------------------
+    # Scheduler
+    # ------------------------------------------------------------------
+
+    def _register_scheduler_jobs(self) -> None:
+        super()._register_scheduler_jobs()
+
+        if self.scheduler is None:
+            return
+
+        self._pending_scan_job_id = self.scheduler.add_interval_job(
+            name=f"{self.config.strategy_name}:pending_scan",
+            func=self.process_pending_candidates,
+            interval=self.config.pending_scan_interval_seconds,
+            run_immediately=False,
+            max_retries=0,
+            retry_delay=1.0,
+            timeout=10.0,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    def _remove_scheduler_jobs(self) -> None:
+        super()._remove_scheduler_jobs()
+
+        if self.scheduler is None:
+            self._pending_scan_job_id = None
+            return
+
+        if self._pending_scan_job_id is None:
+            return
+
+        try:
+            self.scheduler.remove_job(self._pending_scan_job_id)
+        except KeyError:
+            pass
+        finally:
+            self._pending_scan_job_id = None
+
+    # ------------------------------------------------------------------
+    # Query / diagnostics
+    # ------------------------------------------------------------------
+
+    def remember_pending(
+        self,
+        candidate: PendingReversalCandidate,
+        *,
+        state: str,
+    ) -> None:
+        self._recent_pending.append(
+            serialize_value(
+                {
+                    "state": state,
+                    "exchange": candidate.exchange,
+                    "symbol": candidate.symbol,
+                    "created_at": candidate.created_at,
+                    "confirm_after": candidate.confirm_after,
+                    "expires_at": candidate.expires_at,
+                    "score_at_creation": candidate.score_at_creation,
+                    "source_event_id": candidate.source_event_id,
+                    "correlation_id": candidate.correlation_id,
+                    "quality_snapshot": candidate.quality_snapshot,
+                }
             )
-            self._states[key] = state
-        return state
+        )
 
-    # ------------------------------------------------------------------
-    # Public query API
-    # ------------------------------------------------------------------
-
-    def get_recent_signals(
-        self,
-        *,
-        exchange: str | None = None,
-        symbol: str | None = None,
-        limit: int = 50,
-    ) -> list[SqueezeReversalSignal]:
-        target_exchange = exchange.lower() if exchange else None
-        target_symbol = normalize_symbol(symbol) if symbol else None
-
-        result: list[SqueezeReversalSignal] = []
-        for signal in reversed(self._recent_signals):
-            if target_exchange and signal.exchange.lower() != target_exchange:
-                continue
-            if target_symbol and signal.symbol != target_symbol:
-                continue
-            result.append(signal)
-            if len(result) >= limit:
-                break
-
-        return result
-
-    def get_recent_rejections(
-        self,
-        *,
-        exchange: str | None = None,
-        symbol: str | None = None,
-        limit: int = 50,
-    ) -> list[StrategyRejection]:
-        target_exchange = exchange.lower() if exchange else None
-        target_symbol = normalize_symbol(symbol) if symbol else None
-
-        result: list[StrategyRejection] = []
-        for item in reversed(self._recent_rejections):
-            if target_exchange and item.exchange.lower() != target_exchange:
-                continue
-            if target_symbol and item.symbol != target_symbol:
-                continue
-            result.append(item)
-            if len(result) >= limit:
-                break
-
-        return result
+        if len(self._recent_pending) > self.config.recent_pending_limit:
+            self._recent_pending = self._recent_pending[-self.config.recent_pending_limit :]
 
     def get_recent_pending(
         self,
@@ -1369,20 +1259,28 @@ class SqueezeReversalStrategy:
         target_exchange = exchange.lower() if exchange else None
         target_symbol = normalize_symbol(symbol) if symbol else None
 
-        result: list[dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
+
         for item in reversed(self._recent_pending):
             if target_exchange and str(item.get("exchange", "")).lower() != target_exchange:
                 continue
-            if target_symbol and str(item.get("symbol", "")).upper() != target_symbol:
+
+            if target_symbol and normalize_symbol(str(item.get("symbol", ""))) != target_symbol:
                 continue
-            result.append(item)
-            if len(result) >= limit:
+
+            rows.append(item)
+
+            if len(rows) >= limit:
                 break
 
-        return result
+        return rows
 
-    def get_symbol_state_snapshot(self, exchange: str, symbol: str) -> dict[str, Any]:
-        key = self._state_key(exchange, symbol)
+    def get_symbol_state_snapshot(
+        self,
+        exchange: str,
+        symbol: str,
+    ) -> dict[str, Any]:
+        key = self.state_key(exchange, symbol)
         state = self._states.get(key)
 
         if state is None:
@@ -1397,41 +1295,58 @@ class SqueezeReversalStrategy:
 
         pending = None
         if state.pending is not None:
-            pending = {
-                "created_at": state.pending.created_at.isoformat(),
-                "confirm_after": state.pending.confirm_after.isoformat(),
-                "expires_at": state.pending.expires_at.isoformat(),
-                "cancelled": state.pending.cancelled,
-                "cancel_reason": state.pending.cancel_reason,
-                "source_event_id": state.pending.source_event_id,
-                "correlation_id": state.pending.correlation_id,
-                "cluster_signature": state.pending.cluster_signature,
+            pending = serialize_value(
+                {
+                    "created_at": state.pending.created_at,
+                    "confirm_after": state.pending.confirm_after,
+                    "expires_at": state.pending.expires_at,
+                    "cancelled": state.pending.cancelled,
+                    "cancel_reason": state.pending.cancel_reason,
+                    "source_event_id": state.pending.source_event_id,
+                    "correlation_id": state.pending.correlation_id,
+                    "cluster_signature": state.pending.cluster_signature,
+                    "score_at_creation": state.pending.score_at_creation,
+                    "quality_snapshot": state.pending.quality_snapshot,
+                }
+            )
+
+        return serialize_value(
+            {
+                "exchange": state.exchange,
+                "symbol": state.symbol,
+                "exists": True,
+                "last_signal_at": state.last_signal_at,
+                "cooldown_until": state.cooldown_until,
+                "last_signal_side": state.last_signal_side,
+                "last_detected_at": state.last_detected_at,
+                "latest_seen_detected_at": state.latest_seen_detected_at,
+                "latest_seen_score": state.latest_seen_score,
+                "last_cluster_signature": state.last_cluster_signature,
+                "last_signal_score": state.last_signal_score,
+                "total_signals_emitted": state.total_signals_emitted,
+                "signals_in_window": len(state.signal_timestamps),
+                "is_in_cooldown": state.is_in_cooldown(now),
+                "pending": pending,
             }
+        )
 
-        return {
-            "exchange": state.exchange,
-            "symbol": state.symbol,
-            "exists": True,
-            "last_signal_at": state.last_signal_at.isoformat() if state.last_signal_at else None,
-            "cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None,
-            "last_signal_side": state.last_signal_side,
-            "last_detected_at": state.last_detected_at.isoformat() if state.last_detected_at else None,
-            "latest_seen_detected_at": state.latest_seen_detected_at.isoformat() if state.latest_seen_detected_at else None,
-            "last_cluster_signature": state.last_cluster_signature,
-            "last_signal_score": state.last_signal_score,
-            "total_signals_emitted": state.total_signals_emitted,
-            "signals_in_window": len(state.signal_timestamps),
-            "is_in_cooldown": state.is_in_cooldown(now),
-            "pending": pending,
-        }
+    def get_hot_symbols(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        now = utc_now()
+        min_ts = None
 
-    def get_hot_symbols(self, limit: int = 10) -> list[dict[str, Any]]:
+        if self.config.hot_symbols_window_seconds is not None:
+            min_ts = now - timedelta(seconds=self.config.hot_symbols_window_seconds)
+
         latest_by_key: dict[tuple[str, str], SqueezeReversalSignal] = {}
 
         for signal in self._recent_signals:
-            key = (signal.exchange.lower(), signal.symbol)
+            if min_ts is not None and ensure_utc(signal.generated_at) < min_ts:
+                continue
+
+            key = (signal.exchange.lower(), normalize_symbol(signal.symbol))
             previous = latest_by_key.get(key)
-            if previous is None or signal.generated_at > previous.generated_at:
+
+            if previous is None or ensure_utc(signal.generated_at) > ensure_utc(previous.generated_at):
                 latest_by_key[key] = signal
 
         rows = [
@@ -1444,6 +1359,9 @@ class SqueezeReversalStrategy:
                 "severity": signal.severity,
                 "intensity_score": signal.intensity_score,
                 "exhaustion_bias": signal.exhaustion_bias,
+                "bias_delta": signal.bias_delta,
+                "acceleration_ratio": signal.acceleration_ratio,
+                "side_imbalance_ratio": signal.side_imbalance_ratio,
                 "generated_at": signal.generated_at.isoformat(),
                 "total_notional_usd": str(signal.total_notional_usd),
             }
@@ -1454,73 +1372,26 @@ class SqueezeReversalStrategy:
             key=lambda row: (
                 float(row["score"]),
                 float(row["confidence"]),
-                float(row["intensity_score"]),
+                float(row["exhaustion_bias"]),
+                float(row["bias_delta"]),
             ),
             reverse=True,
         )
-        return rows[:limit]
+
+        return rows[: max(0, limit)]
 
     def get_stats(self) -> dict[str, Any]:
-        return {
-            "running": self._running,
-            "started_at": self._stats.started_at.isoformat() if self._stats.started_at else None,
-            "stopped_at": self._stats.stopped_at.isoformat() if self._stats.stopped_at else None,
-            "processed_events": self._stats.processed_events,
-            "emitted_signals": self._stats.emitted_signals,
-            "rejected_events": self._stats.rejected_events,
-            "pending_created": self._stats.pending_created,
-            "pending_confirmed": self._stats.pending_confirmed,
-            "pending_cancelled": self._stats.pending_cancelled,
-            "pending_expired": self._stats.pending_expired,
-            "duplicate_skips": self._stats.duplicate_skips,
-            "cooldown_skips": self._stats.cooldown_skips,
-            "rate_limit_skips": self._stats.rate_limit_skips,
-            "filter_skips": self._stats.filter_skips,
-            "invalid_payload_skips": self._stats.invalid_payload_skips,
-            "tracked_symbols": len(self._states),
-            "active_pending": len(self._pending_keys),
-            "recent_signals": len(self._recent_signals),
-            "recent_rejections": len(self._recent_rejections),
-            "recent_pending": len(self._recent_pending),
-            "last_signal_at": self._stats.last_signal_at.isoformat() if self._stats.last_signal_at else None,
-            "last_error_at": self._stats.last_error_at.isoformat() if self._stats.last_error_at else None,
-            "last_error": self._stats.last_error,
-        }
-
-    # ------------------------------------------------------------------
-    # Scheduler / diagnostics
-    # ------------------------------------------------------------------
-
-    def _register_scheduler_jobs(self) -> None:
-        if self.scheduler is None:
-            return
-
-        self._pending_scan_job_id = self.scheduler.add_interval_job(
-            name=f"{self.config.strategy_name}:pending_scan",
-            func=self._process_pending_candidates,
-            interval=max(0.5, min(self.config.confirmation_delay_seconds, 1.0)),
-            run_immediately=False,
-            max_retries=0,
-            retry_delay=1.0,
-            timeout=10.0,
-            allow_overlap=False,
-            enabled=True,
+        data = super().get_stats()
+        data.update(
+            {
+                "active_pending": len(self._pending_keys),
+                "recent_pending": len(self._recent_pending),
+                "pending_scan_job_registered": self._pending_scan_job_id is not None,
+            }
         )
+        return data
 
-        if self.config.publish_diagnostics_snapshots:
-            self._diagnostics_job_id = self.scheduler.add_interval_job(
-                name=f"{self.config.strategy_name}:diagnostics",
-                func=self._publish_diagnostics_snapshot,
-                interval=self.config.diagnostics_interval_seconds,
-                run_immediately=False,
-                max_retries=0,
-                retry_delay=1.0,
-                timeout=10.0,
-                allow_overlap=False,
-                enabled=True,
-            )
-
-    async def _publish_diagnostics_snapshot(self) -> None:
+    async def publish_diagnostics_snapshot(self) -> None:
         if not self._running:
             return
 
@@ -1533,13 +1404,94 @@ class SqueezeReversalStrategy:
             "pending": self.get_recent_pending(limit=10),
         }
 
-        await self._emit_event(
+        await self.emit_event(
             self.config.diagnostics_topic,
             snapshot,
             priority=self.config.diagnostics_priority,
             correlation_id=None,
             headers={
                 "strategy": self.config.strategy_name,
+                "signal_type": self.config.signal_type,
                 "snapshot_type": "diagnostics",
             },
         )
+
+    def _start_log_extra(self) -> dict[str, Any]:
+        data = super()._start_log_extra()
+        data.update(
+            {
+                "min_exhaustion_bias": self.config.min_exhaustion_bias,
+                "min_bias_delta": self.config.min_bias_delta,
+                "max_continuation_bias_after_exhaustion": self.config.max_continuation_bias_after_exhaustion,
+                "min_side_imbalance_ratio": self.config.min_side_imbalance_ratio,
+                "min_climax_acceleration_ratio": self.config.min_climax_acceleration_ratio,
+                "enable_pending_confirmation": self.config.enable_pending_confirmation,
+                "confirmation_delay_seconds": self.config.confirmation_delay_seconds,
+                "pending_ttl_seconds": self.config.pending_ttl_seconds,
+                "allowed_severities": [
+                    severity.value for severity in self.config.allowed_severities
+                ],
+            }
+        )
+        return data
+
+    def get_symbol_state(self, exchange: str, symbol: str) -> dict[str, Any]:
+        key = self.state_key(exchange, symbol)
+        state = self._states.get(key)
+
+        normalized_exchange, normalized_symbol = key
+
+        if state is None:
+            return {
+                "exists": False,
+                "exchange": normalized_exchange,
+                "symbol": normalized_symbol,
+            }
+
+        now = utc_now()
+
+        pending = None
+        if state.pending is not None:
+            pending_candidate = state.pending
+            pending = {
+                "exchange": pending_candidate.exchange,
+                "symbol": pending_candidate.symbol,
+                "created_at": pending_candidate.created_at.isoformat(),
+                "confirm_after": pending_candidate.confirm_after.isoformat(),
+                "expires_at": pending_candidate.expires_at.isoformat(),
+                "cluster_signature": pending_candidate.cluster_signature,
+                "score_at_creation": pending_candidate.score_at_creation,
+                "candidate_detected_at": pending_candidate.candidate_detected_at.isoformat(),
+                "cancelled": pending_candidate.cancelled,
+                "cancel_reason": pending_candidate.cancel_reason,
+                "is_ready": pending_candidate.is_ready(now),
+                "is_expired": pending_candidate.is_expired(now),
+                "quality_snapshot": serialize_value(pending_candidate.quality_snapshot),
+                "source_event_id": pending_candidate.source_event_id,
+                "correlation_id": pending_candidate.correlation_id,
+            }
+
+        return {
+            "exists": True,
+            "exchange": state.exchange,
+            "symbol": state.symbol,
+            "last_signal_at": state.last_signal_at.isoformat() if state.last_signal_at else None,
+            "cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None,
+            "last_signal_side": state.last_signal_side,
+            "last_detected_at": state.last_detected_at.isoformat() if state.last_detected_at else None,
+            "last_cluster_signature": state.last_cluster_signature,
+            "last_signal_score": state.last_signal_score,
+            "total_signals_emitted": state.total_signals_emitted,
+            "signals_in_window": state.signals_in_window(
+                now=now,
+                window_seconds=self.config.signal_window_seconds,
+            ),
+            "is_in_cooldown": state.is_in_cooldown(now),
+            "pending": pending,
+            "latest_seen_detected_at": (
+                state.latest_seen_detected_at.isoformat()
+                if state.latest_seen_detected_at
+                else None
+            ),
+            "latest_seen_score": state.latest_seen_score,
+        }
