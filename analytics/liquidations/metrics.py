@@ -220,6 +220,8 @@ class LiquidationMetrics:
         }
     )
 
+    _latency_histogram: LatencyHistogram = field(init=False, repr=False)
+
     def __post_init__(self) -> None:
         self._validate()
         self._latency_histogram = LatencyHistogram(self.latency_buckets_ms)
