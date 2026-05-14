@@ -5,6 +5,9 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any, Iterable
 
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
 from .base import BaseSpoofingTracker
 from .config import SpoofingConfig
 from .enums import (
@@ -16,6 +19,7 @@ from .enums import (
 from .models import (
     LiquidityLifecycleEvent,
     OrderbookLevelSnapshot,
+    SpoofingFeatures,
     TrackedWall,
 )
 
@@ -24,32 +28,34 @@ class PersistenceTracker(BaseSpoofingTracker):
     """
     Stateful tracker життєвого циклу великих рівнів ліквідності в стакані.
 
-    Основні задачі:
-    - створювати та оновлювати tracked walls
-    - відстежувати lifetime, size evolution, pull/fill dynamics
-    - генерувати lifecycle events
-    - очищати прострочений стан
-    - надавати API для детекторів spoofing-пакета
-
-    Очікуване використання:
-    1. analyzer отримує orderbook update
-    2. analyzer / wall detector передає сюди relevant level snapshots
-    3. tracker повертає список lifecycle events та актуальні tracked walls
-    4. інші детектори аналізують цей state
+    Відповідає тільки за in-memory state та lifecycle events:
+    - створення / оновлення tracked walls;
+    - lifetime, size evolution, pull/fill dynamics;
+    - lifecycle history;
+    - cleanup прострочених walls;
+    - API для detector-ів.
 
     Важливо:
-    - Tracker сам по собі не вирішує, чи це spoofing.
-    - Він лише веде життєвий цикл стінок/рівнів.
+    - не визначає spoofing самостійно;
+    - не підписується на EventBus;
+    - не запускає власні asyncio loops;
+    - periodic cleanup має реєструвати SpoofingAnalyzer через Scheduler.add_interval_job().
     """
 
     component = SpoofingComponent.PERSISTENCE_TRACKER
 
     def __init__(
         self,
-        event_bus: Any | None,
+        *,
+        event_bus: EventBus | None,
+        scheduler: Scheduler | None,
         config: SpoofingConfig,
     ) -> None:
-        super().__init__(event_bus=event_bus, config=config)
+        super().__init__(
+            event_bus=event_bus,
+            scheduler=scheduler,
+            config=config,
+        )
 
         self._walls_by_id: dict[str, TrackedWall] = {}
         self._wall_ids_by_symbol: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -58,7 +64,7 @@ class PersistenceTracker(BaseSpoofingTracker):
         self._last_cleanup_at: datetime | None = None
 
     # -------------------------------------------------------------------------
-    # Public API
+    # Public read API
     # -------------------------------------------------------------------------
 
     def get_wall(self, wall_id: str) -> TrackedWall | None:
@@ -90,8 +96,8 @@ class PersistenceTracker(BaseSpoofingTracker):
     ) -> list[TrackedWall]:
         key = (exchange, symbol)
         wall_ids = self._wall_ids_by_symbol.get(key, set())
-        walls: list[TrackedWall] = []
 
+        walls: list[TrackedWall] = []
         for wall_id in wall_ids:
             wall = self._walls_by_id.get(wall_id)
             if wall is None:
@@ -121,7 +127,32 @@ class PersistenceTracker(BaseSpoofingTracker):
             price=price,
         )
         events = self._history_by_level.get(level_key, [])
-        return events[-limit:]
+        return events[-max(0, limit):]
+
+    def snapshot_state(
+        self,
+        *,
+        exchange: str | None = None,
+        symbol: str | None = None,
+    ) -> list[TrackedWall]:
+        """
+        Повертає копії tracked walls для безпечного читання зовнішніми модулями.
+        """
+        items: list[TrackedWall] = []
+
+        for wall in self._walls_by_id.values():
+            if exchange is not None and wall.exchange != exchange:
+                continue
+            if symbol is not None and wall.symbol != symbol:
+                continue
+            items.append(replace(wall))
+
+        items.sort(key=lambda item: item.last_seen_at, reverse=True)
+        return items
+
+    # -------------------------------------------------------------------------
+    # Public write/update API
+    # -------------------------------------------------------------------------
 
     def upsert_snapshot(
         self,
@@ -129,10 +160,10 @@ class PersistenceTracker(BaseSpoofingTracker):
     ) -> tuple[TrackedWall, list[LiquidityLifecycleEvent]]:
         """
         Створює або оновлює tracked wall на основі snapshot рівня стакана.
-
-        Якщо рівень новий -> створює wall + CREATED event.
-        Якщо рівень вже трекається -> оновлює wall + UPDATED / PARTIALLY_FILLED event.
         """
+        if not self.config.enabled or not self.config.persistence.enabled:
+            raise RuntimeError("PersistenceTracker is disabled by config")
+
         wall_id = self.build_wall_id(
             exchange=snapshot.exchange,
             symbol=snapshot.symbol,
@@ -146,8 +177,7 @@ class PersistenceTracker(BaseSpoofingTracker):
             self._maybe_enforce_symbol_limit(snapshot.exchange, snapshot.symbol)
             return wall, events
 
-        wall, events = self._update_wall(existing, snapshot)
-        return wall, events
+        return self._update_wall(existing, snapshot)
 
     def upsert_many(
         self,
@@ -194,11 +224,13 @@ class PersistenceTracker(BaseSpoofingTracker):
         inferred_removed = size_before if removed_size is None else max(0.0, removed_size)
         size_after = max(0.0, size_before - inferred_removed)
 
+        removed_delta = max(0.0, size_before - size_after)
+
         wall.last_seen_at = ts
         wall.current_size = size_after
         wall.min_size = min(wall.min_size, wall.current_size)
-        wall.total_removed_size += max(0.0, size_before - size_after)
-        wall.estimated_pulled_size += max(0.0, size_before - size_after)
+        wall.total_removed_size += removed_delta
+        wall.estimated_pulled_size += removed_delta
         wall.state = OrderbookWallState.PULLED
 
         event = self._make_lifecycle_event(
@@ -235,7 +267,7 @@ class PersistenceTracker(BaseSpoofingTracker):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[TrackedWall | None, LiquidityLifecycleEvent | None]:
         """
-        Позначає рівень як повністю або майже повністю виконаний.
+        Позначає рівень як повністю або частково виконаний.
         """
         wall = self.get_wall_by_level(
             exchange=exchange,
@@ -251,22 +283,22 @@ class PersistenceTracker(BaseSpoofingTracker):
         inferred_filled = size_before if filled_size is None else max(0.0, filled_size)
         size_after = max(0.0, size_before - inferred_filled)
 
+        filled_delta = max(0.0, size_before - size_after)
+
         wall.last_seen_at = ts
         wall.current_size = size_after
         wall.min_size = min(wall.min_size, wall.current_size)
-        wall.total_removed_size += max(0.0, size_before - size_after)
-        wall.estimated_filled_size += max(0.0, size_before - size_after)
-        wall.state = OrderbookWallState.FILLED if size_after <= self.config.persistence.size_update_epsilon else OrderbookWallState.WEAKENING
+        wall.total_removed_size += filled_delta
+        wall.estimated_filled_size += filled_delta
 
-        event_type = (
-            LiquidityEventType.FULLY_FILLED
-            if size_after <= self.config.persistence.size_update_epsilon
-            else LiquidityEventType.PARTIALLY_FILLED
-        )
+        is_fully_filled = size_after <= self.config.persistence.size_update_epsilon
+        wall.state = OrderbookWallState.FILLED if is_fully_filled else OrderbookWallState.WEAKENING
 
         event = self._make_lifecycle_event(
             wall=wall,
-            event_type=event_type,
+            event_type=LiquidityEventType.FULLY_FILLED
+            if is_fully_filled
+            else LiquidityEventType.PARTIALLY_FILLED,
             size_before=size_before,
             size_after=size_after,
             timestamp=ts,
@@ -298,12 +330,11 @@ class PersistenceTracker(BaseSpoofingTracker):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[TrackedWall | None, LiquidityLifecycleEvent | None]:
         """
-        Евристично застосовує trade execution до рівня.
-        Це корисно, якщо ти хочеш частково враховувати fills через trade flow.
+        Евристично застосовує trade execution до tracked wall.
 
-        side тут — сторона ЛІКВІДНОСТІ, яка стояла в стакані.
-        Наприклад:
-        - якщо aggressive buyer зняв ask wall, тоді side = ASK
+        side тут — сторона ліквідності, яка стояла в стакані:
+        - aggressive buyer зняв ask wall -> side = ASK;
+        - aggressive seller зняв bid wall -> side = BID.
         """
         wall = self.get_wall_by_level(
             exchange=exchange,
@@ -326,16 +357,14 @@ class PersistenceTracker(BaseSpoofingTracker):
         wall.estimated_filled_size += filled
         wall.touch_count += 1
 
-        if size_after <= self.config.persistence.size_update_epsilon:
-            wall.state = OrderbookWallState.FILLED
-            event_type = LiquidityEventType.FULLY_FILLED
-        else:
-            wall.state = OrderbookWallState.WEAKENING
-            event_type = LiquidityEventType.PARTIALLY_FILLED
+        is_fully_filled = size_after <= self.config.persistence.size_update_epsilon
+        wall.state = OrderbookWallState.FILLED if is_fully_filled else OrderbookWallState.WEAKENING
 
         event = self._make_lifecycle_event(
             wall=wall,
-            event_type=event_type,
+            event_type=LiquidityEventType.FULLY_FILLED
+            if is_fully_filled
+            else LiquidityEventType.PARTIALLY_FILLED,
             size_before=size_before,
             size_after=size_after,
             timestamp=ts,
@@ -344,6 +373,10 @@ class PersistenceTracker(BaseSpoofingTracker):
         self._store_history_event(wall, event)
 
         return wall, event
+
+    # -------------------------------------------------------------------------
+    # Cleanup API
+    # -------------------------------------------------------------------------
 
     def cleanup(self, now: datetime | None = None) -> int:
         """
@@ -356,7 +389,6 @@ class PersistenceTracker(BaseSpoofingTracker):
         ttl_ms = self.config.persistence.wall_ttl_ms
 
         expired_ids: list[str] = []
-        expired_events: list[LiquidityLifecycleEvent] = []
 
         for wall_id, wall in list(self._walls_by_id.items()):
             age_ms = (current_time - wall.last_seen_at).total_seconds() * 1000.0
@@ -373,7 +405,6 @@ class PersistenceTracker(BaseSpoofingTracker):
                 metadata={"reason": "ttl_expired"},
             )
             self._store_history_event(wall, event)
-            expired_events.append(event)
             expired_ids.append(wall_id)
 
         for wall_id in expired_ids:
@@ -381,17 +412,22 @@ class PersistenceTracker(BaseSpoofingTracker):
 
         self._last_cleanup_at = current_time
 
-        if expired_ids:
+        pruned_count = self.prune_history(
+            max_events_per_level=self.config.persistence.max_history_events_per_level,
+        )
+
+        if expired_ids or pruned_count:
             self.log_debug(
                 "Persistence tracker cleanup completed",
                 expired_count=len(expired_ids),
+                pruned_history_events=pruned_count,
             )
 
         return len(expired_ids)
 
     def maybe_cleanup(self, now: datetime | None = None) -> int:
         """
-        Cleanup only if cleanup interval elapsed.
+        Виконує cleanup тільки якщо минув persistence.cleanup_interval_ms.
         """
         current_time = self.ensure_utc(now)
         interval_ms = self.config.persistence.cleanup_interval_ms
@@ -405,18 +441,33 @@ class PersistenceTracker(BaseSpoofingTracker):
 
         return self.cleanup(current_time)
 
-    def prune_history(self, *, max_events_per_level: int = 200) -> int:
+    def prune_history(self, *, max_events_per_level: int | None = None) -> int:
         """
         Обрізає надто довгу історію lifecycle events для кожного рівня.
         """
+        limit = (
+            self.config.persistence.max_history_events_per_level
+            if max_events_per_level is None
+            else max_events_per_level
+        )
+
+        if limit <= 0:
+            return 0
+
         removed = 0
         for level_key, events in list(self._history_by_level.items()):
-            if len(events) <= max_events_per_level:
+            if len(events) <= limit:
                 continue
-            to_remove = len(events) - max_events_per_level
-            self._history_by_level[level_key] = events[-max_events_per_level:]
+
+            to_remove = len(events) - limit
+            self._history_by_level[level_key] = events[-limit:]
             removed += to_remove
+
         return removed
+
+    # -------------------------------------------------------------------------
+    # Feature helpers
+    # -------------------------------------------------------------------------
 
     def build_features_from_wall(
         self,
@@ -424,32 +475,49 @@ class PersistenceTracker(BaseSpoofingTracker):
         *,
         current_mid_price: float | None = None,
         repetition_count: int = 0,
-    ) -> dict[str, float | int | bool]:
+    ) -> SpoofingFeatures:
         """
-        Базовий helper для майбутніх detector-ів.
-        Повертає сирі persistence-related features.
+        Будує базові persistence-related features для detector-ів.
         """
         reference_mid = current_mid_price or wall.mid_price_at_creation or 0.0
-        distance_bps = self.bps_distance(wall.price, reference_mid) if reference_mid > 0 else 0.0
+        distance_bps = (
+            self.bps_distance(wall.price, reference_mid)
+            if reference_mid > 0
+            else 0.0
+        )
 
-        return {
-            "wall_size": wall.current_size,
-            "max_wall_size": wall.max_size,
-            "initial_wall_size": wall.initial_size,
-            "lifetime_ms": wall.lifetime_ms,
-            "fill_ratio": wall.fill_ratio,
-            "pull_ratio": wall.pull_ratio,
-            "current_to_max_ratio": wall.current_to_max_ratio,
-            "updates_count": wall.updates_count,
-            "touch_count": wall.touch_count,
-            "near_touch_count": wall.near_touch_count,
-            "distance_from_mid_bps": distance_bps,
-            "repetition_count": repetition_count,
-            "is_active": wall.state == OrderbookWallState.ACTIVE,
-            "is_pulled": wall.state == OrderbookWallState.PULLED,
-            "is_filled": wall.state == OrderbookWallState.FILLED,
-            "is_weakening": wall.state == OrderbookWallState.WEAKENING,
-        }
+        cancel_to_fill_ratio = (
+            wall.estimated_pulled_size / wall.estimated_filled_size
+            if wall.estimated_filled_size > 0
+            else wall.estimated_pulled_size
+        )
+
+        return SpoofingFeatures(
+            symbol=wall.symbol,
+            exchange=wall.exchange,
+            side=wall.side,
+            price=wall.price,
+            wall_size=wall.current_size,
+            wall_size_ratio=wall.current_to_max_ratio,
+            distance_from_mid_bps=distance_bps,
+            lifetime_ms=wall.lifetime_ms,
+            updates_count=wall.updates_count,
+            repetition_count=repetition_count,
+            fill_ratio=wall.fill_ratio,
+            pull_ratio=wall.pull_ratio,
+            cancel_to_fill_ratio=cancel_to_fill_ratio,
+            is_fast_pull=wall.state == OrderbookWallState.PULLED,
+            timestamp=wall.last_seen_at,
+            metadata={
+                "wall_id": wall.wall_id,
+                "max_wall_size": wall.max_size,
+                "initial_wall_size": wall.initial_size,
+                "current_to_max_ratio": wall.current_to_max_ratio,
+                "touch_count": wall.touch_count,
+                "near_touch_count": wall.near_touch_count,
+                "state": wall.state.value,
+            },
+        )
 
     # -------------------------------------------------------------------------
     # Internal wall lifecycle logic
@@ -536,57 +604,36 @@ class PersistenceTracker(BaseSpoofingTracker):
             wall.total_added_size += delta
             wall.state = OrderbookWallState.ACTIVE
 
+            event = self._make_lifecycle_event(
+                wall=wall,
+                event_type=LiquidityEventType.UPDATED,
+                size_before=size_before,
+                size_after=size_after,
+                timestamp=ts,
+                metadata={
+                    "best_bid": snapshot.best_bid,
+                    "best_ask": snapshot.best_ask,
+                    "mid_price": snapshot.mid_price,
+                    "reason": "size_increase",
+                    "sequence_id": snapshot.sequence_id,
+                },
+            )
+            events.append(event)
+            self._store_history_event(wall, event)
+
         elif delta < -self.config.persistence.size_update_epsilon:
-            removed = abs(delta)
-            wall.total_removed_size += removed
-
-            if self._is_partial_fill_candidate(wall=wall, snapshot=snapshot, removed_size=removed):
-                wall.estimated_filled_size += removed
-                wall.state = OrderbookWallState.WEAKENING
-
-                event = self._make_lifecycle_event(
-                    wall=wall,
-                    event_type=LiquidityEventType.PARTIALLY_FILLED,
-                    size_before=size_before,
-                    size_after=size_after,
-                    timestamp=ts,
-                    metadata={
-                        "best_bid": snapshot.best_bid,
-                        "best_ask": snapshot.best_ask,
-                        "mid_price": snapshot.mid_price,
-                        "reason": "heuristic_partial_fill",
-                        "sequence_id": snapshot.sequence_id,
-                    },
-                )
-                events.append(event)
-                self._store_history_event(wall, event)
-            else:
-                wall.estimated_pulled_size += removed
-                wall.state = (
-                    OrderbookWallState.PULLED
-                    if size_after <= self.config.persistence.size_update_epsilon
-                    else OrderbookWallState.WEAKENING
-                )
-
-                event = self._make_lifecycle_event(
-                    wall=wall,
-                    event_type=LiquidityEventType.UPDATED,
-                    size_before=size_before,
-                    size_after=size_after,
-                    timestamp=ts,
-                    metadata={
-                        "best_bid": snapshot.best_bid,
-                        "best_ask": snapshot.best_ask,
-                        "mid_price": snapshot.mid_price,
-                        "reason": "size_reduction",
-                        "sequence_id": snapshot.sequence_id,
-                    },
-                )
-                events.append(event)
-                self._store_history_event(wall, event)
+            event = self._handle_size_reduction(
+                wall=wall,
+                snapshot=snapshot,
+                size_before=size_before,
+                size_after=size_after,
+                removed=abs(delta),
+            )
+            events.append(event)
 
         else:
-            wall.state = wall.state if wall.state != OrderbookWallState.PULLED else OrderbookWallState.ACTIVE
+            if wall.state == OrderbookWallState.PULLED:
+                wall.state = OrderbookWallState.ACTIVE
 
             event = self._make_lifecycle_event(
                 wall=wall,
@@ -609,8 +656,6 @@ class PersistenceTracker(BaseSpoofingTracker):
             wall.near_touch_count += 1
 
         if size_after <= self.config.persistence.size_update_epsilon:
-            # Не видаляємо одразу, щоб детектори ще могли побачити стан.
-            # Cleanup прибере його пізніше.
             if wall.estimated_filled_size >= wall.estimated_pulled_size:
                 wall.state = OrderbookWallState.FILLED
             else:
@@ -631,6 +676,57 @@ class PersistenceTracker(BaseSpoofingTracker):
 
         return wall, events
 
+    def _handle_size_reduction(
+        self,
+        *,
+        wall: TrackedWall,
+        snapshot: OrderbookLevelSnapshot,
+        size_before: float,
+        size_after: float,
+        removed: float,
+    ) -> LiquidityLifecycleEvent:
+        wall.total_removed_size += removed
+
+        if self._is_partial_fill_candidate(
+            wall=wall,
+            snapshot=snapshot,
+            removed_size=removed,
+        ):
+            wall.estimated_filled_size += removed
+            wall.state = OrderbookWallState.WEAKENING
+            event_type = LiquidityEventType.PARTIALLY_FILLED
+            reason = "heuristic_partial_fill"
+        else:
+            wall.estimated_pulled_size += removed
+            wall.state = (
+                OrderbookWallState.PULLED
+                if size_after <= self.config.persistence.size_update_epsilon
+                else OrderbookWallState.WEAKENING
+            )
+            event_type = (
+                LiquidityEventType.PULLED
+                if wall.state == OrderbookWallState.PULLED
+                else LiquidityEventType.UPDATED
+            )
+            reason = "size_reduction"
+
+        event = self._make_lifecycle_event(
+            wall=wall,
+            event_type=event_type,
+            size_before=size_before,
+            size_after=size_after,
+            timestamp=snapshot.timestamp,
+            metadata={
+                "best_bid": snapshot.best_bid,
+                "best_ask": snapshot.best_ask,
+                "mid_price": snapshot.mid_price,
+                "reason": reason,
+                "sequence_id": snapshot.sequence_id,
+            },
+        )
+        self._store_history_event(wall, event)
+        return event
+
     def _is_partial_fill_candidate(
         self,
         *,
@@ -639,10 +735,11 @@ class PersistenceTracker(BaseSpoofingTracker):
         removed_size: float,
     ) -> bool:
         """
-        Проста евристика:
-        - якщо увімкнено estimate_fill_on_touch_only, то reduction розглядаємо як fill
-          лише коли рівень був близько до best quote
-        - інакше reduction скоріше трактуємо як pull
+        Евристика fill-vs-pull:
+        - якщо estimate_fill_on_touch_only=True, reduction вважається fill
+          тільки коли рівень був біля best quote;
+        - якщо estimate_fill_on_touch_only=False, використовуємо
+          estimate_fill_from_trade_flow.
         """
         if removed_size <= self.config.persistence.size_update_epsilon:
             return False
@@ -657,10 +754,6 @@ class PersistenceTracker(BaseSpoofingTracker):
         wall: TrackedWall,
         snapshot: OrderbookLevelSnapshot,
     ) -> bool:
-        """
-        Визначає, чи рівень знаходився достатньо близько до best quote,
-        щоб reduction size міг бути fill, а не pull.
-        """
         if wall.side == SpoofingSide.BID:
             if snapshot.best_bid is None:
                 return False
@@ -675,7 +768,9 @@ class PersistenceTracker(BaseSpoofingTracker):
 
     def _price_epsilon(self, price: float) -> float:
         decimals = self.config.persistence.price_rounding_decimals
-        return 10 ** (-decimals) if decimals > 0 else max(price * 1e-8, 1e-12)
+        if decimals > 0:
+            return 10 ** (-decimals)
+        return max(price * 1e-8, 1e-12)
 
     def _make_lifecycle_event(
         self,
@@ -712,7 +807,13 @@ class PersistenceTracker(BaseSpoofingTracker):
             side=wall.side,
             price=wall.price,
         )
-        self._history_by_level[level_key].append(event)
+
+        history = self._history_by_level[level_key]
+        history.append(event)
+
+        limit = self.config.persistence.max_history_events_per_level
+        if limit > 0 and len(history) > limit:
+            del history[: len(history) - limit]
 
     def _remove_wall_by_id(self, wall_id: str) -> None:
         wall = self._walls_by_id.pop(wall_id, None)
@@ -731,7 +832,10 @@ class PersistenceTracker(BaseSpoofingTracker):
         Обмежує кількість tracked walls на символ.
         Видаляє найстаріші / найменш релевантні.
         """
-        limit = self.config.analyzer.max_tracked_walls_per_symbol
+        limit = self.config.persistence.max_walls_per_symbol
+        if limit <= 0:
+            return
+
         key = (exchange, symbol)
         wall_ids = self._wall_ids_by_symbol.get(key, set())
 
@@ -790,26 +894,12 @@ class PersistenceTracker(BaseSpoofingTracker):
             "symbols": dict(by_symbol),
             "states": dict(by_state),
             "history_levels": len(self._history_by_level),
-            "last_cleanup_at": self._last_cleanup_at.isoformat() if self._last_cleanup_at else None,
+            "last_cleanup_at": (
+                self._last_cleanup_at.isoformat()
+                if self._last_cleanup_at
+                else None
+            ),
         }
 
-    def snapshot_state(
-        self,
-        *,
-        exchange: str | None = None,
-        symbol: str | None = None,
-    ) -> list[TrackedWall]:
-        """
-        Повертає копії tracked walls для безпечного читання зовнішніми модулями.
-        """
-        items: list[TrackedWall] = []
 
-        for wall in self._walls_by_id.values():
-            if exchange is not None and wall.exchange != exchange:
-                continue
-            if symbol is not None and wall.symbol != symbol:
-                continue
-            items.append(replace(wall))
-
-        items.sort(key=lambda item: item.last_seen_at, reverse=True)
-        return items
+__all__ = ["PersistenceTracker"]

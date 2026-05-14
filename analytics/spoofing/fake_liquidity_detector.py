@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Iterable
+
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
 
 from .base import BaseSpoofingDetector
 from .config import SpoofingConfig
@@ -10,35 +12,15 @@ from .enums import (
     OrderbookWallState,
     SpoofingComponent,
     SpoofingPattern,
+    SpoofingSide,
 )
 from .models import (
     DetectorResult,
+    FakeLiquidityCandidateContext,
     SpoofingFeatures,
     TrackedWall,
 )
 from .persistence_tracker import PersistenceTracker
-
-
-@dataclass(slots=True)
-class FakeLiquidityCandidateContext:
-    """
-    Внутрішній контейнер для оцінки кандидата на fake liquidity.
-    """
-    wall: TrackedWall
-    wall_notional: float
-    pulled_notional: float
-    lifetime_ms: float
-    fill_ratio: float
-    pull_ratio: float
-    price_reaction_bps: float
-    distance_from_mid_bps: float
-    is_short_lived: bool
-    is_low_fill: bool
-    is_high_pull: bool
-    has_market_reaction: bool
-    confidence: float
-    score: float
-    reason: str
 
 
 class FakeLiquidityDetector(BaseSpoofingDetector):
@@ -46,28 +28,36 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
     Detector фейкової ліквідності.
 
     Основна ідея:
-    - велика ліквідність з'явилась у стакані
-    - простояла недовго
-    - майже не була виконана
-    - значною мірою була знята
-    - після цього ринок відреагував у релевантний бік
+    - велика ліквідність з'явилась у стакані;
+    - простояла недовго;
+    - майже не була виконана;
+    - значною мірою була знята;
+    - після цього ринок відреагував у релевантний бік.
 
     Важливо:
-    - це advanced detector поверх persistence state
-    - він не працює як сирий orderbook parser
-    - для найкращої якості йому бажано мати current_mid_price
-      або інший reference price після pull-події
+    - працює поверх PersistenceTracker state;
+    - не працює як raw orderbook parser;
+    - не підписується на EventBus;
+    - не публікує події;
+    - не запускає Scheduler jobs;
+    - повертає тільки DetectorResult або None.
     """
 
     component = SpoofingComponent.FAKE_LIQUIDITY_DETECTOR
 
     def __init__(
         self,
-        event_bus: Any | None,
+        *,
+        event_bus: EventBus | None,
+        scheduler: Scheduler | None,
         config: SpoofingConfig,
         persistence_tracker: PersistenceTracker,
     ) -> None:
-        super().__init__(event_bus=event_bus, config=config)
+        super().__init__(
+            event_bus=event_bus,
+            scheduler=scheduler,
+            config=config,
+        )
         self.persistence_tracker = persistence_tracker
 
     # -------------------------------------------------------------------------
@@ -130,8 +120,11 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналізує набір tracked walls.
+        Аналізує набір tracked walls і повертає позитивні fake-liquidity candidates.
         """
+        if not self.config.enabled or not self.config.fake_liquidity.enabled:
+            return []
+
         results: list[DetectorResult] = []
 
         for wall in walls:
@@ -146,7 +139,7 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
                 current_mid_price=current_mid_price,
                 repetition_count=repetition_count,
             )
-            if result is not None and result.decision == DetectorDecision.POSITIVE:
+            if result is not None and result.is_positive():
                 results.append(result)
 
         results.sort(key=lambda item: (item.score, item.confidence), reverse=True)
@@ -160,7 +153,7 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
-        Зручний helper для аналізу всіх tracked walls символу.
+        Аналізує всі tracked walls одного символу.
         """
         walls = self.persistence_tracker.get_walls_for_symbol(
             exchange=exchange,
@@ -179,6 +172,9 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         *,
         current_mid_price: float | None = None,
     ) -> bool:
+        """
+        Boolean helper для швидкої перевірки tracked wall.
+        """
         return self._evaluate_candidate(
             wall=wall,
             current_mid_price=current_mid_price,
@@ -194,7 +190,7 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None = None,
     ) -> FakeLiquidityCandidateContext | None:
-        if not self.config.fake_liquidity.enabled:
+        if not self.config.enabled or not self.config.fake_liquidity.enabled:
             return None
 
         if wall.max_size <= 0.0 or wall.price <= 0.0:
@@ -206,33 +202,19 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         fill_ratio = wall.fill_ratio
         pull_ratio = wall.pull_ratio
 
-        # Базова відсічка: стінка має бути суттєвою
-        if wall_notional < self.config.wall_detection.min_wall_size_abs:
-            return None
-
-        # Стінка повинна мати ознаки "нереального наміру"
-        if fill_ratio > self.config.fake_liquidity.max_fill_ratio:
-            return None
-
-        if pull_ratio < self.config.fake_liquidity.min_pull_ratio:
-            return None
-
-        if lifetime_ms > self.config.fake_liquidity.max_lifetime_ms:
-            return None
-
-        if wall.state not in {
-            OrderbookWallState.PULLED,
-            OrderbookWallState.WEAKENING,
-            OrderbookWallState.EXPIRED,
-            OrderbookWallState.FILLED,
-        }:
+        if not self._passes_basic_filters(
+            wall=wall,
+            wall_notional=wall_notional,
+            lifetime_ms=lifetime_ms,
+            fill_ratio=fill_ratio,
+            pull_ratio=pull_ratio,
+        ):
             return None
 
         price_reaction_bps = self._estimate_price_reaction_bps(
             wall=wall,
             current_mid_price=current_mid_price,
         )
-
         if price_reaction_bps < self.config.fake_liquidity.min_price_reaction_bps:
             return None
 
@@ -247,7 +229,9 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             self.config.fake_liquidity.min_pull_ratio,
             self.config.pull_detection.strong_pull_ratio,
         )
-        has_market_reaction = price_reaction_bps >= self.config.fake_liquidity.min_price_reaction_bps
+        has_market_reaction = (
+            price_reaction_bps >= self.config.fake_liquidity.min_price_reaction_bps
+        )
 
         score = self._compute_score(
             wall=wall,
@@ -264,9 +248,7 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         confidence = self._compute_confidence(
             wall=wall,
             pulled_notional=pulled_notional,
-            lifetime_ms=lifetime_ms,
             fill_ratio=fill_ratio,
-            pull_ratio=pull_ratio,
             price_reaction_bps=price_reaction_bps,
             is_short_lived=is_short_lived,
             is_low_fill=is_low_fill,
@@ -303,6 +285,39 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             reason=reason,
         )
 
+    def _passes_basic_filters(
+        self,
+        *,
+        wall: TrackedWall,
+        wall_notional: float,
+        lifetime_ms: float,
+        fill_ratio: float,
+        pull_ratio: float,
+    ) -> bool:
+        cfg = self.config.fake_liquidity
+
+        if wall_notional < self.config.wall_detection.min_wall_size_abs:
+            return False
+
+        if fill_ratio > cfg.max_fill_ratio:
+            return False
+
+        if pull_ratio < cfg.min_pull_ratio:
+            return False
+
+        if lifetime_ms <= 0 or lifetime_ms > cfg.max_lifetime_ms:
+            return False
+
+        if wall.state not in {
+            OrderbookWallState.PULLED,
+            OrderbookWallState.WEAKENING,
+            OrderbookWallState.EXPIRED,
+            OrderbookWallState.FILLED,
+        }:
+            return False
+
+        return True
+
     def _build_features(
         self,
         *,
@@ -311,13 +326,16 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
     ) -> SpoofingFeatures:
         wall = candidate.wall
 
-        cancel_to_fill_ratio = 0.0
-        if candidate.fill_ratio > 0:
-            cancel_to_fill_ratio = candidate.pull_ratio / candidate.fill_ratio
-        elif candidate.pull_ratio > 0:
-            cancel_to_fill_ratio = candidate.pull_ratio
+        cancel_to_fill_ratio = self._compute_cancel_to_fill_ratio(
+            pull_ratio=candidate.pull_ratio,
+            fill_ratio=candidate.fill_ratio,
+        )
 
-        repetition = repetition_count if repetition_count is not None else self._estimate_repetition_count(wall)
+        repetition = (
+            repetition_count
+            if repetition_count is not None
+            else self._estimate_repetition_count(wall)
+        )
 
         is_near_best_quote = wall.near_touch_count > 0 or wall.touch_count > 0
 
@@ -348,6 +366,7 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
                 "estimated_pulled_size": wall.estimated_pulled_size,
                 "estimated_filled_size": wall.estimated_filled_size,
                 "current_to_max_ratio": wall.current_to_max_ratio,
+                "wall_state": wall.state.value,
                 "detector": self.component.value,
             },
         )
@@ -371,29 +390,27 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
     ) -> float:
         cfg = self.config.fake_liquidity
 
-        # 1. Коротке життя = підозріло
         max_lifetime = max(float(cfg.max_lifetime_ms), 1.0)
         lifetime_component = 1.0 - self.clamp(lifetime_ms / max_lifetime, 0.0, 1.0)
 
-        # 2. Низький fill = підозріло
         max_fill = max(cfg.max_fill_ratio, 1e-12)
         fill_component = 1.0 - self.clamp(fill_ratio / max_fill, 0.0, 1.0)
 
-        # 3. Високий pull = підозріло
         min_pull = max(cfg.min_pull_ratio, 1e-12)
         pull_component = (pull_ratio - min_pull) / max(1.0 - min_pull, 1e-12)
         pull_component = self.clamp(pull_component, 0.0, 1.0)
 
-        # 4. Реакція ринку
         reaction_component = self.clamp(
             price_reaction_bps / max(cfg.min_price_reaction_bps * 3.0, 1e-12),
             0.0,
             1.0,
         )
 
-        # 5. Розмір знятої ліквідності
         min_removed = max(self.config.pull_detection.min_removed_notional, 1e-12)
-        notional_component = (pulled_notional - min_removed) / max(min_removed * 2.0, 1e-12)
+        notional_component = (pulled_notional - min_removed) / max(
+            min_removed * 2.0,
+            1e-12,
+        )
         notional_component = self.clamp(notional_component, 0.0, 1.0)
 
         bonus = 0.0
@@ -403,18 +420,17 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             bonus += 0.05
         if is_high_pull:
             bonus += 0.05
+        if wall.state == OrderbookWallState.PULLED:
+            bonus += 0.03
 
         raw_score = (
-            0.22 * lifetime_component +
-            0.22 * fill_component +
-            0.22 * pull_component +
-            0.22 * reaction_component +
-            0.12 * notional_component +
-            bonus
+            0.22 * lifetime_component
+            + 0.22 * fill_component
+            + 0.22 * pull_component
+            + 0.22 * reaction_component
+            + 0.12 * notional_component
+            + bonus
         )
-
-        if wall.state == OrderbookWallState.PULLED:
-            raw_score += 0.03
 
         return self.clamp(raw_score, 0.0, 1.0)
 
@@ -423,9 +439,7 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         *,
         wall: TrackedWall,
         pulled_notional: float,
-        lifetime_ms: float,
         fill_ratio: float,
-        pull_ratio: float,
         price_reaction_bps: float,
         is_short_lived: bool,
         is_low_fill: bool,
@@ -469,11 +483,8 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         """
         Евристично оцінює реакцію ціни після поведінки ліквідності.
 
-        Логіка:
-        - ASK wall fake liquidity підозріла, якщо після її зникнення ціна пішла ВГОРУ
-        - BID wall fake liquidity підозріла, якщо після її зникнення ціна пішла ВНИЗ
-
-        Повертається абсолютна релевантна реакція в bps.
+        ASK wall fake liquidity підозріла, якщо після її зникнення ціна йде вгору.
+        BID wall fake liquidity підозріла, якщо після її зникнення ціна йде вниз.
         """
         reference = wall.mid_price_at_creation
         current = current_mid_price
@@ -483,12 +494,10 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
 
         signed_move = self.signed_bps_move(current, reference)
 
-        if wall.side.value == "ask":
-            # ask wall тиснула зверху; якщо після зникнення ціна росте — це релевантно
+        if wall.side == SpoofingSide.ASK:
             return max(0.0, signed_move)
 
-        if wall.side.value == "bid":
-            # bid wall підтримувала знизу; якщо після зникнення ціна падає — це релевантно
+        if wall.side == SpoofingSide.BID:
             return max(0.0, -signed_move)
 
         return 0.0
@@ -499,13 +508,10 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None,
     ) -> float:
-        if current_mid_price is not None and current_mid_price > 0:
-            return self.bps_distance(wall.price, current_mid_price)
-
-        if wall.mid_price_at_creation is not None and wall.mid_price_at_creation > 0:
-            return self.bps_distance(wall.price, wall.mid_price_at_creation)
-
-        return 0.0
+        reference_mid = current_mid_price or wall.mid_price_at_creation
+        if reference_mid is None or reference_mid <= 0:
+            return 0.0
+        return self.bps_distance(wall.price, reference_mid)
 
     # -------------------------------------------------------------------------
     # Helpers
@@ -521,8 +527,20 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         )
         return len(history)
 
+    @staticmethod
+    def _compute_cancel_to_fill_ratio(
+        *,
+        pull_ratio: float,
+        fill_ratio: float,
+    ) -> float:
+        if fill_ratio > 0:
+            return pull_ratio / fill_ratio
+        if pull_ratio > 0:
+            return pull_ratio
+        return 0.0
+
+    @staticmethod
     def _build_reason(
-        self,
         *,
         wall: TrackedWall,
         pulled_notional: float,
@@ -552,3 +570,6 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             parts.append("high_pull=true")
 
         return ", ".join(parts)
+
+
+__all__ = ["FakeLiquidityDetector"]
