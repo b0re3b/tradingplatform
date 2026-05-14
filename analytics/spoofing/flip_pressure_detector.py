@@ -188,10 +188,10 @@ class FlipPressureDetector(BaseSpoofingDetector):
     # -------------------------------------------------------------------------
 
     def _evaluate_candidate(
-        self,
-        *,
-        wall: TrackedWall,
-        current_mid_price: float | None = None,
+            self,
+            *,
+            wall: TrackedWall,
+            current_mid_price: float | None = None,
     ) -> FlipPressureCandidateContext | None:
         if not self.config.enabled or not self.config.flip_pressure.enabled:
             return None
@@ -209,17 +209,30 @@ class FlipPressureDetector(BaseSpoofingDetector):
         pull_ratio = wall.pull_ratio
 
         if not self._passes_basic_filters(
-            wall=wall,
-            wall_notional=wall_notional,
-            pull_ratio=pull_ratio,
+                wall=wall,
+                wall_notional=wall_notional,
+                pull_ratio=pull_ratio,
         ):
+            return None
+
+        is_pressure_removed = pull_ratio >= self.config.pull_detection.min_pull_ratio
+        if not is_pressure_removed:
+            return None
+
+        is_short_lived = lifetime_ms <= self.config.pull_detection.max_pull_lifetime_ms
+        if not is_short_lived:
+            return None
+
+        is_low_fill = fill_ratio <= self.config.pull_detection.max_fill_ratio_for_pull
+        if not is_low_fill:
             return None
 
         price_reaction_bps = self._estimate_relevant_price_reaction_bps(
             wall=wall,
             current_mid_price=current_mid_price,
         )
-        if price_reaction_bps < self.config.flip_pressure.min_price_reaction_bps:
+        has_reversal = price_reaction_bps >= self.config.flip_pressure.min_price_reaction_bps
+        if not has_reversal:
             return None
 
         pressure_flip_strength = self._estimate_pressure_flip_strength(
@@ -231,11 +244,6 @@ class FlipPressureDetector(BaseSpoofingDetector):
             return None
 
         distance_from_mid_bps = self.bps_distance(wall.price, current_mid_price)
-
-        is_pressure_removed = pull_ratio >= self.config.pull_detection.min_pull_ratio
-        is_short_lived = lifetime_ms <= self.config.pull_detection.max_pull_lifetime_ms
-        is_low_fill = fill_ratio <= self.config.pull_detection.max_fill_ratio_for_pull
-        has_reversal = price_reaction_bps >= self.config.flip_pressure.min_price_reaction_bps
 
         score = self._compute_score(
             wall=wall,

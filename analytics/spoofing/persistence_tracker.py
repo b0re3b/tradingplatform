@@ -127,7 +127,11 @@ class PersistenceTracker(BaseSpoofingTracker):
             price=price,
         )
         events = self._history_by_level.get(level_key, [])
-        return events[-max(0, limit):]
+
+        if limit <= 0:
+            return []
+
+        return events[-limit:]
 
     def snapshot_state(
         self,
@@ -385,6 +389,9 @@ class PersistenceTracker(BaseSpoofingTracker):
         Стінка вважається простроченою, якщо її не оновлювали довше за wall_ttl_ms.
         Перед видаленням їй ставиться state=EXPIRED і записується EXPIRED event.
         """
+        if not self.config.enabled or not self.config.persistence.enabled:
+            return 0
+
         current_time = self.ensure_utc(now)
         ttl_ms = self.config.persistence.wall_ttl_ms
 
@@ -424,6 +431,15 @@ class PersistenceTracker(BaseSpoofingTracker):
             )
 
         return len(expired_ids)
+
+    def cleanup_expired(self, now: datetime | None = None) -> int:
+        """
+        Явний alias для cleanup expired walls.
+
+        Корисно для тестів, analyzer integration і зовнішніх компонентів,
+        які хочуть викликати саме cleanup прострочених walls.
+        """
+        return self.cleanup(now)
 
     def maybe_cleanup(self, now: datetime | None = None) -> int:
         """
@@ -533,13 +549,14 @@ class PersistenceTracker(BaseSpoofingTracker):
             side=snapshot.side,
             price=snapshot.price,
         )
+        normalized_price = self._normalize_price(snapshot.price)
 
         wall = TrackedWall(
             wall_id=wall_id,
             symbol=snapshot.symbol,
             exchange=snapshot.exchange,
             side=snapshot.side,
-            price=snapshot.price,
+            price=normalized_price,
             first_seen_at=snapshot.timestamp,
             last_seen_at=snapshot.timestamp,
             initial_size=snapshot.size,
@@ -854,28 +871,34 @@ class PersistenceTracker(BaseSpoofingTracker):
             self._remove_wall_by_id(wall.wall_id)
 
     # -------------------------------------------------------------------------
-    # Static helpers
+    # Key helpers
     # -------------------------------------------------------------------------
 
-    @staticmethod
     def build_wall_id(
+        self,
         *,
         exchange: str,
         symbol: str,
         side: SpoofingSide,
         price: float,
     ) -> str:
-        return f"{exchange}:{symbol}:{side.value}:{price:.12f}"
+        normalized_price = self._normalize_price(price)
+        return f"{exchange}:{symbol}:{side.value}:{normalized_price:.12f}"
 
-    @staticmethod
     def build_level_key(
+        self,
         *,
         exchange: str,
         symbol: str,
         side: SpoofingSide,
         price: float,
     ) -> str:
-        return f"{exchange}:{symbol}:{side.value}:{price:.12f}"
+        normalized_price = self._normalize_price(price)
+        return f"{exchange}:{symbol}:{side.value}:{normalized_price:.12f}"
+
+    def _normalize_price(self, price: float) -> float:
+        decimals = max(0, int(self.config.persistence.price_rounding_decimals))
+        return round(float(price), decimals)
 
     # -------------------------------------------------------------------------
     # Debug / inspection helpers

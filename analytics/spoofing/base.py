@@ -282,19 +282,19 @@ class BaseSpoofingModule(ABC):
     # -------------------------------------------------------------------------
 
     def log_debug(self, message: str, **kwargs: Any) -> None:
-        self.logger.debug(message, extra=kwargs or None)
+        self.logger.debug(message, extra=kwargs)
 
     def log_info(self, message: str, **kwargs: Any) -> None:
-        self.logger.info(message, extra=kwargs or None)
+        self.logger.info(message, extra=kwargs)
 
     def log_warning(self, message: str, **kwargs: Any) -> None:
-        self.logger.warning(message, extra=kwargs or None)
+        self.logger.warning(message, extra=kwargs)
 
     def log_error(self, message: str, **kwargs: Any) -> None:
-        self.logger.error(message, extra=kwargs or None)
+        self.logger.error(message, extra=kwargs)
 
     def log_exception(self, message: str, **kwargs: Any) -> None:
-        self.logger.exception(message, extra=kwargs or None)
+        self.logger.exception(message, extra=kwargs)
 
 
 class BaseSpoofingDetector(BaseSpoofingModule, ABC):
