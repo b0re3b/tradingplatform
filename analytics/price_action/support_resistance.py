@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
-
+from copy import deepcopy
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
 
@@ -56,7 +56,7 @@ class SupportResistanceConfig(BasePriceActionConfig):
     swing_low_topic: str = "analytics.price_action.market_structure.swing_low"
 
     def validate(self) -> None:
-        super().validate()
+        BasePriceActionConfig.validate(self)
 
         if self.internal_merge_distance_pct < 0:
             raise ValueError("internal_merge_distance_pct must be >= 0")
@@ -292,24 +292,105 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
         return self.add_data(candles=candles, swings=swings)
 
     def add_data(
-        self,
-        *,
-        candles: Sequence[Mapping[str, Any]] | None = None,
-        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+            self,
+            *,
+            candles: Sequence[Mapping[str, Any]] | None = None,
+            swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """
+        Atomically ingest support/resistance inputs.
+
+        Important:
+        - If any candle or swing in the provided batch is invalid, no partial state
+          mutation is kept.
+        - This protects rolling levels/events/processed keys/global index from
+          half-committed updates.
+        - On success, behavior remains the same as before.
+        """
+        candles_batch = list(candles or [])
+        swings_batch = list(swings or [])
+
+        # Fast no-op path.
+        if not candles_batch and not swings_batch:
+            self._refresh_state()
+
+            self.logger.debug(
+                "Support/resistance updated",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "updated_levels": 0,
+                    "new_events": 0,
+                    "last_price": self._state.last_price,
+                },
+            )
+
+            return {
+                "state": self.snapshot(),
+                "updated_levels": [],
+                "new_events": [],
+            }
+
+        # Transaction snapshot. Deep copy is intentional because candle processing
+        # mutates existing level objects in-place: touch_count, status, flipped_at,
+        # metadata, etc.
+        rollback_internal_levels = deepcopy(self._internal_levels)
+        rollback_external_levels = deepcopy(self._external_levels)
+        rollback_events = deepcopy(self._events)
+        rollback_candles = deepcopy(self._candles)
+
+        rollback_processed_swings = set(self._processed_swings)
+        rollback_processed_touch_keys = set(self._processed_touch_keys)
+        rollback_processed_break_keys = set(self._processed_break_keys)
+        rollback_processed_retest_keys = set(self._processed_retest_keys)
+        rollback_processed_rejection_keys = set(self._processed_rejection_keys)
+        rollback_processed_flip_keys = set(self._processed_flip_keys)
+
+        rollback_global_candle_index = self._global_candle_index
+        rollback_state = deepcopy(self._state)
+
         new_events: list[SupportResistanceEvent] = []
         updated_levels: list[SupportResistanceLevel] = []
 
-        if swings:
-            levels_from_swings, events_from_swings = self._ingest_swings(swings)
-            updated_levels.extend(levels_from_swings)
-            new_events.extend(events_from_swings)
+        try:
+            if swings_batch:
+                levels_from_swings, events_from_swings = self._ingest_swings(swings_batch)
+                updated_levels.extend(levels_from_swings)
+                new_events.extend(events_from_swings)
 
-        if candles:
-            events_from_candles = self._ingest_candles(candles)
-            new_events.extend(events_from_candles)
+            if candles_batch:
+                events_from_candles = self._ingest_candles(candles_batch)
+                new_events.extend(events_from_candles)
 
-        self._refresh_state()
+            self._refresh_state()
+
+        except Exception:
+            self._internal_levels = rollback_internal_levels
+            self._external_levels = rollback_external_levels
+            self._events = rollback_events
+            self._candles = rollback_candles
+
+            self._processed_swings = rollback_processed_swings
+            self._processed_touch_keys = rollback_processed_touch_keys
+            self._processed_break_keys = rollback_processed_break_keys
+            self._processed_retest_keys = rollback_processed_retest_keys
+            self._processed_rejection_keys = rollback_processed_rejection_keys
+            self._processed_flip_keys = rollback_processed_flip_keys
+
+            self._global_candle_index = rollback_global_candle_index
+            self._state = rollback_state
+
+            self.logger.exception(
+                "Support/resistance batch ingestion failed and was rolled back",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "candles_count": len(candles_batch),
+                    "swings_count": len(swings_batch),
+                    "rollback_global_candle_index": rollback_global_candle_index,
+                },
+            )
+            raise
 
         self.logger.debug(
             "Support/resistance updated",
@@ -321,6 +402,12 @@ class SupportResistanceAnalyzer(BasePriceActionModule[SupportResistanceState]):
                 "last_price": self._state.last_price,
             },
         )
+
+        return {
+            "state": self.snapshot(),
+            "updated_levels": [self._level_to_dict(level) for level in updated_levels],
+            "new_events": [self._event_to_dict(event) for event in new_events],
+        }
 
         return {
             "state": self.snapshot(),

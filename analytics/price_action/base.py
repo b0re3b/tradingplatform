@@ -173,7 +173,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         if self._registered:
             self.logger.warning(
                 "Price action module already registered",
-                extra={"module": self.module_name},
+                extra={"price_action_module": self.module_name},
             )
             return
 
@@ -198,7 +198,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.info(
             "Price action module registered",
             extra={
-                "module": self.module_name,
+                "price_action_module": self.module_name,
                 "subscriptions": len(self._subscriptions),
                 "scheduled_jobs": len(self._scheduled_job_ids),
             },
@@ -217,7 +217,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
                 self.logger.exception(
                     "Failed to unsubscribe price action handler",
                     extra={
-                        "module": self.module_name,
+                        "price_action_module": self.module_name,
                         "pattern": getattr(subscription, "pattern", None),
                         "handler": getattr(subscription, "name", None),
                     },
@@ -232,7 +232,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             except Exception:
                 self.logger.exception(
                     "Failed to disable scheduled job",
-                    extra={"module": self.module_name, "job_id": job_id},
+                    extra={"price_action_module": self.module_name, "job_id": job_id},
                 )
 
         self._scheduled_job_ids.clear()
@@ -240,7 +240,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         self.logger.info(
             "Price action module unregistered",
-            extra={"module": self.module_name},
+            extra={"price_action_module": self.module_name},
         )
 
     async def shutdown(self) -> None:
@@ -257,7 +257,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         self.logger.info(
             "Price action module shutdown completed",
-            extra={"module": self.module_name},
+            extra={"price_action_module": self.module_name},
         )
 
     def _subscribe(
@@ -281,7 +281,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.debug(
             "Price action handler subscribed",
             extra={
-                "module": self.module_name,
+                "price_action_module": self.module_name,
                 "pattern": normalized_pattern,
                 "handler": subscription.name,
             },
@@ -298,7 +298,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         if self.scheduler is None:
             self.logger.warning(
                 "Snapshot publishing requested but Scheduler is not provided",
-                extra={"module": self.module_name},
+                extra={"price_action_module": self.module_name},
             )
             return
 
@@ -323,7 +323,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.info(
             "Price action snapshot job registered",
             extra={
-                "module": self.module_name,
+                "price_action_module": self.module_name,
                 "job_id": job_id,
                 "job_name": job_name,
                 "interval": self.config.snapshot_interval_seconds,
@@ -344,7 +344,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.debug(
             "Candle event ignored by base module",
             extra={
-                "module": self.module_name,
+                "price_action_module": self.module_name,
                 "topic": event.topic,
                 "event_id": event.event_id,
             },
@@ -360,7 +360,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.debug(
             "Candles event ignored by base module",
             extra={
-                "module": self.module_name,
+                "price_action_module": self.module_name,
                 "topic": event.topic,
                 "event_id": event.event_id,
             },
@@ -530,18 +530,19 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             return await self.event_bus.emit(
                 normalized_event_name,
                 dict(safe_payload),
-                priority=priority or self.config.event_priority,
+                priority=priority if priority is not None else self.config.event_priority,
                 source=source or self.module_name,
                 correlation_id=correlation_id,
                 headers=headers or {},
             )
         except Exception:
+            payload_keys = list(payload.keys()) if isinstance(payload, Mapping) else None
             self.logger.exception(
                 "Failed to emit price action event",
                 extra={
-                    "module": self.module_name,
+                    "price_action_module": self.module_name,
                     "event_name": normalized_event_name,
-                    "payload_keys": list(payload.keys()),
+                    "payload_keys": payload_keys,
                 },
             )
             return False

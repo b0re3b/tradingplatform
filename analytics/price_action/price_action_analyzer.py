@@ -70,17 +70,39 @@ class PriceActionAnalyzerConfig(BasePriceActionConfig):
     trend_config: TrendConfig | None = None
 
     def validate(self) -> None:
-        super().validate()
+        """
+        Validate facade infrastructure settings.
 
-        if self.auto_register_modules and not any(
-            (
-                self.enable_market_structure,
-                self.enable_support_resistance,
-                self.enable_fair_value_gap,
-                self.enable_liquidity_levels,
-                self.enable_trend,
-            )
-        ):
+        Notes:
+        - Uses explicit BasePriceActionConfig.validate(self), not zero-arg
+          super(), because this config is a slotted dataclass.
+        - Normalizes child update topics before checking emptiness.
+        """
+        BasePriceActionConfig.validate(self)
+
+        self.market_structure_updated_topic = self._normalize_topic(
+            self.market_structure_updated_topic
+        )
+        self.support_resistance_updated_topic = self._normalize_topic(
+            self.support_resistance_updated_topic
+        )
+        self.fair_value_gap_updated_topic = self._normalize_topic(
+            self.fair_value_gap_updated_topic
+        )
+        self.liquidity_levels_updated_topic = self._normalize_topic(
+            self.liquidity_levels_updated_topic
+        )
+        self.trend_updated_topic = self._normalize_topic(self.trend_updated_topic)
+
+        enabled_modules = (
+            self.enable_market_structure,
+            self.enable_support_resistance,
+            self.enable_fair_value_gap,
+            self.enable_liquidity_levels,
+            self.enable_trend,
+        )
+
+        if self.auto_register_modules and not any(enabled_modules):
             raise ValueError("at least one price action module must be enabled")
 
         if self.enable_market_structure and not self.market_structure_updated_topic:
@@ -105,13 +127,21 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
 
     Responsibilities:
     - own and register child price action analyzers;
-    - listen to child *.updated events;
+    - listen only to enabled child *.updated events;
     - aggregate child states into PriceActionCompositeState;
     - publish analytics.price_action.updated / snapshot / reset;
     - expose one facade snapshot for strategy, dashboard and storage layers.
 
     It must not duplicate domain calculations from child analyzers.
     """
+
+    _MODULE_ORDER: tuple[str, ...] = (
+        "market_structure",
+        "support_resistance",
+        "fair_value_gap",
+        "liquidity_levels",
+        "trend",
+    )
 
     def __init__(
         self,
@@ -140,38 +170,40 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
 
         self.config: PriceActionAnalyzerConfig = resolved_config
 
+        # Enable flags are authoritative. Explicitly injected children must not
+        # bypass disabled module configuration.
         self.market_structure = (
             market_structure
             if market_structure is not None
             else self._build_market_structure_analyzer()
-        )
+        ) if self.config.enable_market_structure else None
+
         self.support_resistance = (
             support_resistance
             if support_resistance is not None
             else self._build_support_resistance_analyzer()
-        )
+        ) if self.config.enable_support_resistance else None
+
         self.fair_value_gap = (
             fair_value_gap
             if fair_value_gap is not None
             else self._build_fair_value_gap_analyzer()
-        )
+        ) if self.config.enable_fair_value_gap else None
+
         self.liquidity_levels = (
             liquidity_levels
             if liquidity_levels is not None
             else self._build_liquidity_levels_analyzer()
-        )
+        ) if self.config.enable_liquidity_levels else None
+
         self.trend = (
             trend
             if trend is not None
             else self._build_trend_analyzer()
-        )
+        ) if self.config.enable_trend else None
 
         self._child_update_counts: dict[str, int] = {
-            "market_structure": 0,
-            "support_resistance": 0,
-            "fair_value_gap": 0,
-            "liquidity_levels": 0,
-            "trend": 0,
+            module_name: 0 for module_name in self._MODULE_ORDER
         }
         self._last_child_payloads: dict[str, dict[str, Any]] = {}
         self._state_version = 0
@@ -180,7 +212,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
-        self._refresh_composite_state()
+        self._refresh_composite_state(advance_version=True)
 
         self.logger.info(
             "Initialized PriceActionAnalyzer facade",
@@ -264,8 +296,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         """
         Register facade subscriptions and optionally child analyzers.
 
-        The facade subscribes to child *.updated topics. Child analyzers subscribe
-        to market/analytics topics through their own register() methods.
+        The operation is rollback-safe: if any child module fails during
+        auto-registration, facade subscriptions and already-registered children
+        are cleaned up so the facade is not left half-registered.
         """
         if self._registered:
             self.logger.warning(
@@ -274,37 +307,45 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             )
             return
 
-        super().register()
+        registered_children: list[BasePriceActionModule[Any]] = []
 
-        self._subscribe(
-            self.config.market_structure_updated_topic,
-            self.on_market_structure_updated,
-            name=f"{self.module_name}.on_market_structure_updated",
-        )
-        self._subscribe(
-            self.config.support_resistance_updated_topic,
-            self.on_support_resistance_updated,
-            name=f"{self.module_name}.on_support_resistance_updated",
-        )
-        self._subscribe(
-            self.config.fair_value_gap_updated_topic,
-            self.on_fair_value_gap_updated,
-            name=f"{self.module_name}.on_fair_value_gap_updated",
-        )
-        self._subscribe(
-            self.config.liquidity_levels_updated_topic,
-            self.on_liquidity_levels_updated,
-            name=f"{self.module_name}.on_liquidity_levels_updated",
-        )
-        self._subscribe(
-            self.config.trend_updated_topic,
-            self.on_trend_updated,
-            name=f"{self.module_name}.on_trend_updated",
-        )
+        try:
+            super().register()
 
-        if self.config.auto_register_modules:
-            for module in self._iter_enabled_modules():
-                module.register()
+            for topic, handler, name in self._enabled_child_update_subscriptions():
+                self._subscribe(topic, handler, name=name)
+
+            if self.config.auto_register_modules:
+                for module in self._iter_enabled_modules():
+                    module.register()
+                    registered_children.append(module)
+
+        except Exception:
+            for module in reversed(registered_children):
+                try:
+                    module.unregister()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to rollback registered child price action module",
+                        extra={
+                            "symbol": self.symbol,
+                            "timeframe": self.timeframe,
+                            "child_module": getattr(
+                                module,
+                                "module_name",
+                                module.__class__.__name__,
+                            ),
+                        },
+                    )
+
+            try:
+                self.unregister()
+            except Exception:
+                self._subscriptions.clear()
+                self._scheduled_job_ids.clear()
+                self._registered = False
+
+            raise
 
         self.logger.info(
             "PriceActionAnalyzer facade registered",
@@ -312,6 +353,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 "symbol": self.symbol,
                 "timeframe": self.timeframe,
                 "enabled_modules": self._enabled_module_names(),
+                "subscriptions": len(self._subscriptions),
             },
         )
 
@@ -357,13 +399,27 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         await self._handle_child_update("trend", event)
 
     async def _handle_child_update(self, module_name: str, event: Event) -> None:
+        active_children = self.get_child_analyzers()
+        if module_name not in active_children:
+            self.logger.warning(
+                "Ignoring update from disabled or unknown price action child module",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "child_module": module_name,
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
+            )
+            return
+
         if not isinstance(event.payload, Mapping):
             self.logger.warning(
                 "PriceActionAnalyzer received invalid child update payload",
                 extra={
                     "symbol": self.symbol,
                     "timeframe": self.timeframe,
-                    "module_name": module_name,
+                    "child_module": module_name,
                     "topic": event.topic,
                     "event_id": event.event_id,
                 },
@@ -376,6 +432,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         self._refresh_composite_state(
             updated_module=module_name,
             source_topic=event.topic,
+            advance_version=True,
         )
 
         if self.config.publish_on_module_update:
@@ -393,25 +450,22 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
+        # Reset children first. If a child reset fails, facade counters/state are
+        # intentionally left unchanged instead of becoming partially reset.
         if self.config.reset_child_modules:
             for module in self._iter_enabled_modules():
                 module.reset()
 
         self._child_update_counts = {
-            "market_structure": 0,
-            "support_resistance": 0,
-            "fair_value_gap": 0,
-            "liquidity_levels": 0,
-            "trend": 0,
+            module_name: 0 for module_name in self._MODULE_ORDER
         }
         self._last_child_payloads.clear()
-        self._state_version += 1
 
         self._state = PriceActionCompositeState(
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
-        self._refresh_composite_state()
+        self._refresh_composite_state(advance_version=True)
 
         self.logger.info(
             "PriceActionAnalyzer facade reset",
@@ -442,11 +496,13 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         )
 
     def get_state(self) -> PriceActionCompositeState:
-        self._refresh_composite_state()
+        # Read-only access must not advance state_version.
+        self._refresh_composite_state(advance_version=False)
         return self._state
 
     def snapshot(self) -> dict[str, Any]:
-        self._refresh_composite_state()
+        # Read-only snapshots must not create fake version changes.
+        self._refresh_composite_state(advance_version=False)
 
         return self._snapshot_envelope(
             state=self._state,
@@ -461,16 +517,18 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         )
 
     def get_child_analyzers(self) -> dict[str, BasePriceActionModule[Any]]:
+        modules: dict[str, BasePriceActionModule[Any] | None] = {
+            "market_structure": self.market_structure,
+            "support_resistance": self.support_resistance,
+            "fair_value_gap": self.fair_value_gap,
+            "liquidity_levels": self.liquidity_levels,
+            "trend": self.trend,
+        }
+
         return {
             module_name: module
-            for module_name, module in {
-                "market_structure": self.market_structure,
-                "support_resistance": self.support_resistance,
-                "fair_value_gap": self.fair_value_gap,
-                "liquidity_levels": self.liquidity_levels,
-                "trend": self.trend,
-            }.items()
-            if module is not None
+            for module_name, module in modules.items()
+            if module is not None and self._is_module_enabled(module_name)
         }
 
     def get_market_structure_state(self) -> MarketStructureState | None:
@@ -498,6 +556,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         self._refresh_composite_state(
             updated_module=updated_module,
             source_topic=source_topic,
+            advance_version=False,
         )
 
         return await self._emit_event(
@@ -524,7 +583,11 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         *,
         updated_module: str | None = None,
         source_topic: str | None = None,
+        advance_version: bool = False,
     ) -> None:
+        if advance_version:
+            self._state_version += 1
+
         market_structure_state = self.get_market_structure_state()
         support_resistance_state = self.get_support_resistance_state()
         fair_value_gap_state = self.get_fair_value_gap_state()
@@ -558,8 +621,6 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 "last_refreshed_at": self._now_utc().isoformat(),
             },
         )
-
-        self._state_version += 1
 
     def _resolve_latest_price_and_update(
         self,
@@ -612,6 +673,63 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _enabled_child_update_subscriptions(
+        self,
+    ) -> tuple[tuple[str, Any, str], ...]:
+        subscriptions: list[tuple[str, Any, str]] = []
+
+        if self.market_structure is not None:
+            subscriptions.append(
+                (
+                    self.config.market_structure_updated_topic,
+                    self.on_market_structure_updated,
+                    f"{self.module_name}.on_market_structure_updated",
+                )
+            )
+        if self.support_resistance is not None:
+            subscriptions.append(
+                (
+                    self.config.support_resistance_updated_topic,
+                    self.on_support_resistance_updated,
+                    f"{self.module_name}.on_support_resistance_updated",
+                )
+            )
+        if self.fair_value_gap is not None:
+            subscriptions.append(
+                (
+                    self.config.fair_value_gap_updated_topic,
+                    self.on_fair_value_gap_updated,
+                    f"{self.module_name}.on_fair_value_gap_updated",
+                )
+            )
+        if self.liquidity_levels is not None:
+            subscriptions.append(
+                (
+                    self.config.liquidity_levels_updated_topic,
+                    self.on_liquidity_levels_updated,
+                    f"{self.module_name}.on_liquidity_levels_updated",
+                )
+            )
+        if self.trend is not None:
+            subscriptions.append(
+                (
+                    self.config.trend_updated_topic,
+                    self.on_trend_updated,
+                    f"{self.module_name}.on_trend_updated",
+                )
+            )
+
+        return tuple(subscriptions)
+
+    def _is_module_enabled(self, module_name: str) -> bool:
+        return {
+            "market_structure": self.config.enable_market_structure,
+            "support_resistance": self.config.enable_support_resistance,
+            "fair_value_gap": self.config.enable_fair_value_gap,
+            "liquidity_levels": self.config.enable_liquidity_levels,
+            "trend": self.config.enable_trend,
+        }.get(module_name, False)
+
     def _iter_enabled_modules(self) -> tuple[BasePriceActionModule[Any], ...]:
         return tuple(self.get_child_analyzers().values())
 
@@ -626,3 +744,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 registered.append(module_name)
 
         return registered
+
+
+__all__ = [
+    "PriceActionAnalyzerConfig",
+    "PriceActionAnalyzer",
+]

@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
-
+from copy import deepcopy
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
 
@@ -55,7 +55,7 @@ class LiquidityLevelsConfig(BasePriceActionConfig):
     swing_low_topic: str = "analytics.price_action.market_structure.swing_low"
 
     def validate(self) -> None:
-        super().validate()
+        BasePriceActionConfig.validate(self)
 
         if self.max_candles < 100:
             raise ValueError("max_candles must be >= 100")
@@ -306,24 +306,105 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         return self.add_data(swings=swings)
 
     def add_data(
-        self,
-        *,
-        candles: Sequence[Mapping[str, Any]] | None = None,
-        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+            self,
+            *,
+            candles: Sequence[Mapping[str, Any]] | None = None,
+            swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        """
+        Atomically ingest liquidity level inputs.
+
+        If any candle or swing in the provided batch is invalid, all state mutations
+        performed during this batch are rolled back:
+        - candles buffer;
+        - internal/external liquidity levels;
+        - emitted domain events;
+        - processed swing/touch/sweep/reclaim/failed-breakout/stop-run keys;
+        - global candle index;
+        - typed liquidity state.
+
+        This prevents half-committed liquidity state after malformed market data.
+        """
+        candles_batch = list(candles or [])
+        swings_batch = list(swings or [])
+
+        if not candles_batch and not swings_batch:
+            self._refresh_state()
+
+            self.logger.debug(
+                "Liquidity levels updated",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "updated_levels": 0,
+                    "new_events": 0,
+                    "last_price": self._state.last_price,
+                },
+            )
+
+            return {
+                "state": self.snapshot(),
+                "updated_levels": [],
+                "new_events": [],
+            }
+
+        rollback_candles = deepcopy(self._candles)
+        rollback_internal_levels = deepcopy(self._internal_levels)
+        rollback_external_levels = deepcopy(self._external_levels)
+        rollback_events = deepcopy(self._events)
+
+        rollback_processed_swings = set(self._processed_swings)
+        rollback_processed_touch_keys = set(self._processed_touch_keys)
+        rollback_processed_sweep_keys = set(self._processed_sweep_keys)
+        rollback_processed_reclaim_keys = set(self._processed_reclaim_keys)
+        rollback_processed_failed_breakout_keys = set(self._processed_failed_breakout_keys)
+        rollback_processed_stop_run_keys = set(self._processed_stop_run_keys)
+
+        rollback_global_candle_index = self._global_candle_index
+        rollback_state = deepcopy(self._state)
+
         updated_levels: list[LiquidityLevel] = []
         new_events: list[LiquidityEvent] = []
 
-        if swings:
-            levels_from_swings, events_from_swings = self._ingest_swings(swings)
-            updated_levels.extend(levels_from_swings)
-            new_events.extend(events_from_swings)
+        try:
+            if swings_batch:
+                levels_from_swings, events_from_swings = self._ingest_swings(swings_batch)
+                updated_levels.extend(levels_from_swings)
+                new_events.extend(events_from_swings)
 
-        if candles:
-            events_from_candles = self._ingest_candles(candles)
-            new_events.extend(events_from_candles)
+            if candles_batch:
+                events_from_candles = self._ingest_candles(candles_batch)
+                new_events.extend(events_from_candles)
 
-        self._refresh_state()
+            self._refresh_state()
+
+        except Exception:
+            self._candles = rollback_candles
+            self._internal_levels = rollback_internal_levels
+            self._external_levels = rollback_external_levels
+            self._events = rollback_events
+
+            self._processed_swings = rollback_processed_swings
+            self._processed_touch_keys = rollback_processed_touch_keys
+            self._processed_sweep_keys = rollback_processed_sweep_keys
+            self._processed_reclaim_keys = rollback_processed_reclaim_keys
+            self._processed_failed_breakout_keys = rollback_processed_failed_breakout_keys
+            self._processed_stop_run_keys = rollback_processed_stop_run_keys
+
+            self._global_candle_index = rollback_global_candle_index
+            self._state = rollback_state
+
+            self.logger.exception(
+                "Liquidity levels batch ingestion failed and was rolled back",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "candles_count": len(candles_batch),
+                    "swings_count": len(swings_batch),
+                    "rollback_global_candle_index": rollback_global_candle_index,
+                },
+            )
+            raise
 
         self.logger.debug(
             "Liquidity levels updated",

@@ -48,7 +48,7 @@ class MarketStructureConfig(BasePriceActionConfig):
     higher_timeframe_context_topic: str = "analytics.price_action.higher_timeframe_context.updated"
 
     def validate(self) -> None:
-        super().validate()
+        BasePriceActionConfig.validate(self)
 
         if self.pivot_left < 1 or self.pivot_right < 1:
             raise ValueError("pivot_left and pivot_right must be >= 1")

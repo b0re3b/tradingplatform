@@ -627,7 +627,8 @@ class LayerLiquidityState:
     active_levels: int = 0
     swept_levels: int = 0
     reclaimed_levels: int = 0
-
+    invalidated_levels: int = 0
+    
     nearest_buy_side: LiquidityLevel | None = None
     nearest_sell_side: LiquidityLevel | None = None
     strongest_buy_side: LiquidityLevel | None = None

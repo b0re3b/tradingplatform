@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
-
+from copy import deepcopy
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
 
@@ -62,7 +62,7 @@ class TrendConfig(BasePriceActionConfig):
     support_resistance_updated_topic: str = "analytics.price_action.support_resistance.updated"
 
     def validate(self) -> None:
-        super().validate()
+        BasePriceActionConfig.validate(self)
 
         if self.max_candles < 100:
             raise ValueError("max_candles must be >= 100")
@@ -330,37 +330,118 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         return self.add_data(candles=candles)
 
     def add_data(
-        self,
-        *,
-        candles: Sequence[Mapping[str, Any]] | None = None,
-        market_structure: Mapping[str, Any] | None = None,
-        support_resistance: Mapping[str, Any] | None = None,
+            self,
+            *,
+            candles: Sequence[Mapping[str, Any]] | None = None,
+            market_structure: Mapping[str, Any] | None = None,
+            support_resistance: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if candles:
-            for raw in candles:
-                candle = self._parse_candle(raw, index=self._global_candle_index)
-                self._global_candle_index += 1
+        """
+        Atomically update trend analyzer inputs.
 
-                self._candles.append(candle)
-                self._state.last_price = candle.close
-                self._state.last_update = candle.timestamp
+        If any candle/context processing step fails, all mutations from this update
+        are rolled back:
+        - candles buffer;
+        - generated signals;
+        - latest market-structure/support-resistance context;
+        - global candle index;
+        - state version;
+        - typed TrendState;
+        - missing-MTF logging guard.
 
-        if market_structure is not None:
-            self._latest_market_structure = dict(market_structure)
+        This prevents half-committed trend state after malformed market data or
+        malformed context updates.
+        """
+        candles_batch = list(candles or [])
 
-        if support_resistance is not None:
-            self._latest_support_resistance = dict(support_resistance)
+        if (
+                not candles_batch
+                and market_structure is None
+                and support_resistance is None
+        ):
+            self._state_version += 1
 
-        self._state_version += 1
+            new_signals: list[TrendSignal] = []
+            new_signals.extend(self._refresh_layer(StructureLayer.INTERNAL))
+            new_signals.extend(self._refresh_layer(StructureLayer.EXTERNAL))
+            self._refresh_global_state()
+            new_signals.extend(self._detect_cross_layer_events())
+
+            self.logger.debug(
+                "TrendAnalyzer updated",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "new_signals": len(new_signals),
+                    "last_price": self._state.last_price,
+                    "state_version": self._state_version,
+                },
+            )
+
+            return {
+                "state": self.snapshot(),
+                "new_signals": [self._signal_to_dict(signal) for signal in new_signals],
+            }
+
+        rollback_candles = deepcopy(self._candles)
+        rollback_signals = deepcopy(self._signals)
+        rollback_latest_market_structure = deepcopy(self._latest_market_structure)
+        rollback_latest_support_resistance = deepcopy(self._latest_support_resistance)
+        rollback_global_candle_index = self._global_candle_index
+        rollback_state_version = self._state_version
+        rollback_state = deepcopy(self._state)
+        rollback_missing_mtf_logged = self._missing_mtf_logged
 
         new_signals: list[TrendSignal] = []
 
-        new_signals.extend(self._refresh_layer(StructureLayer.INTERNAL))
-        new_signals.extend(self._refresh_layer(StructureLayer.EXTERNAL))
+        try:
+            if candles_batch:
+                for raw in candles_batch:
+                    candle = self._parse_candle(raw, index=self._global_candle_index)
+                    self._global_candle_index += 1
 
-        self._refresh_global_state()
+                    self._candles.append(candle)
+                    self._state.last_price = candle.close
+                    self._state.last_update = candle.timestamp
 
-        new_signals.extend(self._detect_cross_layer_events())
+            if market_structure is not None:
+                self._latest_market_structure = dict(market_structure)
+
+            if support_resistance is not None:
+                self._latest_support_resistance = dict(support_resistance)
+
+            self._state_version += 1
+
+            new_signals.extend(self._refresh_layer(StructureLayer.INTERNAL))
+            new_signals.extend(self._refresh_layer(StructureLayer.EXTERNAL))
+
+            self._refresh_global_state()
+
+            new_signals.extend(self._detect_cross_layer_events())
+
+        except Exception:
+            self._candles = rollback_candles
+            self._signals = rollback_signals
+            self._latest_market_structure = rollback_latest_market_structure
+            self._latest_support_resistance = rollback_latest_support_resistance
+            self._global_candle_index = rollback_global_candle_index
+            self._state_version = rollback_state_version
+            self._state = rollback_state
+            self._missing_mtf_logged = rollback_missing_mtf_logged
+
+            self.logger.exception(
+                "TrendAnalyzer batch update failed and was rolled back",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "candles_count": len(candles_batch),
+                    "has_market_structure": market_structure is not None,
+                    "has_support_resistance": support_resistance is not None,
+                    "rollback_global_candle_index": rollback_global_candle_index,
+                    "rollback_state_version": rollback_state_version,
+                },
+            )
+            raise
 
         self.logger.debug(
             "TrendAnalyzer updated",

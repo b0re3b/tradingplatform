@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from copy import deepcopy
 from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
@@ -45,7 +45,7 @@ class FairValueGapConfig(BasePriceActionConfig):
     publish_snapshots: bool = False
 
     def validate(self) -> None:
-        super().validate()
+        BasePriceActionConfig.validate(self)
 
         if self.max_candles < 100:
             raise ValueError("max_candles must be >= 100")
@@ -251,7 +251,24 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         return self.add_candles([candle])
 
     def add_candles(self, candles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        if not candles:
+        """
+        Atomically ingest candle batches for Fair Value Gap analysis.
+
+        If any candle in the batch is invalid, the analyzer rolls back all state
+        mutations performed during this batch:
+        - candles buffer;
+        - internal/external gaps;
+        - events;
+        - processed lifecycle keys;
+        - global candle index;
+        - last processed triplet index;
+        - typed state snapshot.
+
+        This prevents half-committed analyzer state after malformed market data.
+        """
+        candles_batch = list(candles or [])
+
+        if not candles_batch:
             self._refresh_state()
             return {
                 "state": self.snapshot(),
@@ -259,25 +276,69 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                 "new_events": [],
             }
 
+        rollback_candles = deepcopy(self._candles)
+        rollback_internal_gaps = deepcopy(self._internal_gaps)
+        rollback_external_gaps = deepcopy(self._external_gaps)
+        rollback_events = deepcopy(self._events)
+
+        rollback_global_candle_index = self._global_candle_index
+        rollback_last_processed_triplet_end_index = self._last_processed_triplet_end_index
+
+        rollback_processed_fill_keys = set(self._processed_fill_keys)
+        rollback_processed_respect_keys = set(self._processed_respect_keys)
+        rollback_processed_invalidation_keys = set(self._processed_invalidation_keys)
+        rollback_processed_retest_keys = set(self._processed_retest_keys)
+
+        rollback_state = deepcopy(self._state)
+
         updated_gaps: list[FairValueGap] = []
         new_events: list[FVGEvent] = []
 
-        for raw in candles:
-            candle = self._parse_candle(raw, index=self._global_candle_index)
-            self._global_candle_index += 1
+        try:
+            for raw in candles_batch:
+                candle = self._parse_candle(raw, index=self._global_candle_index)
+                self._global_candle_index += 1
 
-            self._candles.append(candle)
-            self._state.last_price = candle.close
-            self._state.last_update = candle.timestamp
+                self._candles.append(candle)
+                self._state.last_price = candle.close
+                self._state.last_update = candle.timestamp
 
-            created_gaps, creation_events = self._process_incremental_gap_detection()
-            updated_gaps.extend(created_gaps)
-            new_events.extend(creation_events)
+                created_gaps, creation_events = self._process_incremental_gap_detection()
+                updated_gaps.extend(created_gaps)
+                new_events.extend(creation_events)
 
-            lifecycle_events = self._process_gap_lifecycle(candle)
-            new_events.extend(lifecycle_events)
+                lifecycle_events = self._process_gap_lifecycle(candle)
+                new_events.extend(lifecycle_events)
 
-        self._refresh_state()
+            self._refresh_state()
+
+        except Exception:
+            self._candles = rollback_candles
+            self._internal_gaps = rollback_internal_gaps
+            self._external_gaps = rollback_external_gaps
+            self._events = rollback_events
+
+            self._global_candle_index = rollback_global_candle_index
+            self._last_processed_triplet_end_index = rollback_last_processed_triplet_end_index
+
+            self._processed_fill_keys = rollback_processed_fill_keys
+            self._processed_respect_keys = rollback_processed_respect_keys
+            self._processed_invalidation_keys = rollback_processed_invalidation_keys
+            self._processed_retest_keys = rollback_processed_retest_keys
+
+            self._state = rollback_state
+
+            self.logger.exception(
+                "Fair value gap batch ingestion failed and was rolled back",
+                extra={
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                    "candles_count": len(candles_batch),
+                    "rollback_global_candle_index": rollback_global_candle_index,
+                    "rollback_last_processed_triplet_end_index": rollback_last_processed_triplet_end_index,
+                },
+            )
+            raise
 
         self.logger.debug(
             "Fair value gap analyzer updated",
