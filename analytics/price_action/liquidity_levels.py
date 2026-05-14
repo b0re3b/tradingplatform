@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
+
+from core.event_bus import Event, EventBus
+from core.scheduler import Scheduler
 
 from analytics.price_action.base import BasePriceActionConfig, BasePriceActionModule
 from analytics.price_action.enums import (
@@ -44,8 +47,12 @@ class LiquidityLevelsConfig(BasePriceActionConfig):
     failed_breakout_reclaim_window_bars: int = 3
 
     emit_events: bool = True
-    event_namespace: str = "price_action.liquidity_levels"
+    event_namespace: str = "analytics.price_action.liquidity_levels"
     publish_snapshots: bool = False
+
+    subscribe_market_structure_swings: bool = True
+    swing_high_topic: str = "analytics.price_action.market_structure.swing_high"
+    swing_low_topic: str = "analytics.price_action.market_structure.swing_low"
 
     def validate(self) -> None:
         super().validate()
@@ -79,18 +86,25 @@ class LiquidityLevelsConfig(BasePriceActionConfig):
         if self.stop_run_wick_ratio_threshold < 0:
             raise ValueError("stop_run_wick_ratio_threshold must be >= 0")
 
+        if self.subscribe_market_structure_swings:
+            if not self.swing_high_topic:
+                raise ValueError("swing_high_topic must not be empty")
+            if not self.swing_low_topic:
+                raise ValueError("swing_low_topic must not be empty")
+
 
 class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     """
-    Stateful liquidity levels analyzer.
+    Event-driven liquidity levels analyzer.
 
-    Features
-    --------
-    - builds liquidity pools from swing highs/lows
-    - detects equal highs / equal lows clusters
-    - tracks touches, sweeps, reclaims, failed breakouts, stop runs
-    - supports internal / external layers
-    - integrates with EventBus
+    Responsibilities:
+    - listen to market.candle / market.candles;
+    - listen to analytics.price_action.market_structure.swing_high;
+    - listen to analytics.price_action.market_structure.swing_low;
+    - build liquidity pools from swing highs/lows;
+    - detect equal highs / equal lows clusters;
+    - track touches, sweeps, reclaims, failed breakouts and stop runs;
+    - publish analytics.price_action.liquidity_levels.* events.
     """
 
     def __init__(
@@ -98,17 +112,21 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         symbol: str,
         timeframe: str,
         *,
-        event_bus: Optional[Any] = None,
-        config: Optional[LiquidityLevelsConfig] = None,
+        event_bus: EventBus,
+        scheduler: Scheduler | None = None,
+        config: LiquidityLevelsConfig | None = None,
     ) -> None:
         resolved_config = config or LiquidityLevelsConfig()
+
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
             event_bus=event_bus,
+            scheduler=scheduler,
             config=resolved_config,
-            service_name="price_action.liquidity_levels",
+            service_name="analytics.price_action.liquidity_levels",
         )
+
         self.config: LiquidityLevelsConfig = resolved_config
 
         self._candles: Deque[Candle] = deque(maxlen=self.config.max_candles)
@@ -117,14 +135,17 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self._events: Deque[LiquidityEvent] = deque(maxlen=self.config.max_events)
 
         self._processed_swings: set[str] = set()
-        self._processed_touch_keys: set[Tuple[str, int]] = set()
-        self._processed_sweep_keys: set[Tuple[str, int]] = set()
-        self._processed_reclaim_keys: set[Tuple[str, int]] = set()
-        self._processed_failed_breakout_keys: set[Tuple[str, int]] = set()
-        self._processed_stop_run_keys: set[Tuple[str, int]] = set()
+        self._processed_touch_keys: set[tuple[str, int]] = set()
+        self._processed_sweep_keys: set[tuple[str, int]] = set()
+        self._processed_reclaim_keys: set[tuple[str, int]] = set()
+        self._processed_failed_breakout_keys: set[tuple[str, int]] = set()
+        self._processed_stop_run_keys: set[tuple[str, int]] = set()
 
-        self._global_candle_index: int = 0
-        self._state = LiquidityState(symbol=self.symbol, timeframe=self.timeframe)
+        self._global_candle_index = 0
+        self._state = LiquidityState(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
         self.logger.info(
             "Initialized LiquidityLevelsAnalyzer",
@@ -136,7 +157,98 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         )
 
     # -------------------------------------------------------------------------
-    # Public API
+    # Registration / EventBus handlers
+    # -------------------------------------------------------------------------
+
+    def register(self) -> None:
+        super().register()
+
+        if self.config.subscribe_market_structure_swings:
+            self._subscribe(
+                self.config.swing_high_topic,
+                self.on_swing_event,
+                name=f"{self.module_name}.on_swing_high_event",
+            )
+            self._subscribe(
+                self.config.swing_low_topic,
+                self.on_swing_event,
+                name=f"{self.module_name}.on_swing_low_event",
+            )
+
+    async def on_candle_event(self, event: Event) -> None:
+        candles = self._extract_candles_payload(event)
+        if not candles:
+            self.logger.warning(
+                "LiquidityLevelsAnalyzer received empty candle payload",
+                extra={"topic": event.topic, "event_id": event.event_id},
+            )
+            return
+
+        result = self.add_data(candles=candles)
+        await self._publish_update_result(result, correlation_id=event.correlation_id)
+
+    async def on_candles_event(self, event: Event) -> None:
+        candles = self._extract_candles_payload(event)
+        if not candles:
+            self.logger.warning(
+                "LiquidityLevelsAnalyzer received empty candles payload",
+                extra={"topic": event.topic, "event_id": event.event_id},
+            )
+            return
+
+        result = self.add_data(candles=candles)
+        await self._publish_update_result(result, correlation_id=event.correlation_id)
+
+    async def on_swing_event(self, event: Event) -> None:
+        if not isinstance(event.payload, Mapping):
+            self.logger.warning(
+                "LiquidityLevelsAnalyzer received invalid swing payload",
+                extra={"topic": event.topic, "event_id": event.event_id},
+            )
+            return
+
+        result = self.add_data(swings=[event.payload])
+        await self._publish_update_result(result, correlation_id=event.correlation_id)
+
+    async def _publish_update_result(
+        self,
+        result: Mapping[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
+        for event_payload in result.get("new_events", []):
+            if not isinstance(event_payload, Mapping):
+                continue
+
+            event_type = event_payload.get("event_type")
+            if not event_type:
+                continue
+
+            await self._emit_event(
+                self._build_event_name(str(event_type)),
+                event_payload,
+                source=self.module_name,
+                correlation_id=correlation_id,
+            )
+
+        await self._emit_event(
+            self._build_event_name("updated"),
+            {
+                "symbol": self.symbol,
+                "timeframe": self.timeframe,
+                "state": result.get("state"),
+                "updated_levels_count": len(result.get("updated_levels", [])),
+                "new_events_count": len(result.get("new_events", [])),
+            },
+            source=self.module_name,
+            correlation_id=correlation_id,
+        )
+
+        if self.config.publish_snapshots:
+            await self.publish_snapshot(correlation_id=correlation_id)
+
+    # -------------------------------------------------------------------------
+    # Public sync domain API
     # -------------------------------------------------------------------------
 
     def reset(self) -> None:
@@ -153,7 +265,10 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self._processed_stop_run_keys.clear()
 
         self._global_candle_index = 0
-        self._state = LiquidityState(symbol=self.symbol, timeframe=self.timeframe)
+        self._state = LiquidityState(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
         self.logger.info(
             "LiquidityLevelsAnalyzer reset",
@@ -163,32 +278,41 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     def get_state(self) -> LiquidityState:
         return self._state
 
-    def get_levels(self, layer: Optional[StructureLayer] = None) -> List[LiquidityLevel]:
+    def get_levels(self, layer: StructureLayer | None = None) -> list[LiquidityLevel]:
         if layer == StructureLayer.INTERNAL:
             return list(self._internal_levels)
         if layer == StructureLayer.EXTERNAL:
             return list(self._external_levels)
         return [*self._internal_levels, *self._external_levels]
 
-    def get_events(self) -> List[LiquidityEvent]:
+    def get_events(self) -> list[LiquidityEvent]:
         return list(self._events)
 
     def update(
         self,
         *,
-        candles: Optional[Sequence[Mapping[str, Any]]] = None,
-        swings: Optional[Sequence[SwingPoint | Mapping[str, Any]]] = None,
-    ) -> Dict[str, Any]:
+        candles: Sequence[Mapping[str, Any]] | None = None,
+        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return self.add_data(candles=candles, swings=swings)
+
+    def add_candle(self, candle: Mapping[str, Any]) -> dict[str, Any]:
+        return self.add_data(candles=[candle])
+
+    def add_candles(self, candles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        return self.add_data(candles=candles)
+
+    def add_swings(self, swings: Sequence[SwingPoint | Mapping[str, Any]]) -> dict[str, Any]:
+        return self.add_data(swings=swings)
 
     def add_data(
         self,
         *,
-        candles: Optional[Sequence[Mapping[str, Any]]] = None,
-        swings: Optional[Sequence[SwingPoint | Mapping[str, Any]]] = None,
-    ) -> Dict[str, Any]:
-        updated_levels: List[LiquidityLevel] = []
-        new_events: List[LiquidityEvent] = []
+        candles: Sequence[Mapping[str, Any]] | None = None,
+        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        updated_levels: list[LiquidityLevel] = []
+        new_events: list[LiquidityEvent] = []
 
         if swings:
             levels_from_swings, events_from_swings = self._ingest_swings(swings)
@@ -200,9 +324,6 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             new_events.extend(events_from_candles)
 
         self._refresh_state()
-
-        if self.config.publish_snapshots:
-            self._publish_snapshot()
 
         self.logger.debug(
             "Liquidity levels updated",
@@ -221,16 +342,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             "new_events": [self._event_to_dict(event) for event in new_events],
         }
 
-    def add_candle(self, candle: Mapping[str, Any]) -> Dict[str, Any]:
-        return self.add_data(candles=[candle])
-
-    def add_candles(self, candles: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-        return self.add_data(candles=candles)
-
-    def add_swings(self, swings: Sequence[SwingPoint | Mapping[str, Any]]) -> Dict[str, Any]:
-        return self.add_data(swings=swings)
-
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         return self._snapshot_envelope(
             state=self._state,
             metadata={
@@ -250,9 +362,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     def _ingest_swings(
         self,
         swings: Sequence[SwingPoint | Mapping[str, Any]],
-    ) -> Tuple[List[LiquidityLevel], List[LiquidityEvent]]:
-        updated_levels: List[LiquidityLevel] = []
-        new_events: List[LiquidityEvent] = []
+    ) -> tuple[list[LiquidityLevel], list[LiquidityEvent]]:
+        updated_levels: list[LiquidityLevel] = []
+        new_events: list[LiquidityEvent] = []
 
         for raw in swings:
             swing = self._parse_swing(raw)
@@ -312,8 +424,8 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         *,
         swing: SwingPoint,
         level_type: LiquidityLevelType,
-    ) -> Tuple[Optional[LiquidityLevel], List[LiquidityEvent]]:
-        events: List[LiquidityEvent] = []
+    ) -> tuple[LiquidityLevel | None, list[LiquidityEvent]]:
+        events: list[LiquidityEvent] = []
 
         upper_bound, lower_bound = self._build_zone_bounds(price=swing.price, layer=swing.layer)
         existing = self._find_merge_candidate(
@@ -416,11 +528,12 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         upper_bound: float,
         lower_bound: float,
     ) -> None:
-        level.source_swing_ids.append(swing.swing_id)
-        level.source_prices.append(swing.price)
-        level.source_count += 1
-        level.touch_count += 1
+        if swing.swing_id not in level.source_swing_ids:
+            level.source_swing_ids.append(swing.swing_id)
+            level.source_prices.append(swing.price)
+            level.source_count += 1
 
+        level.touch_count += 1
         level.price = sum(level.source_prices) / len(level.source_prices)
         level.upper_bound = max(level.upper_bound, upper_bound)
         level.lower_bound = min(level.lower_bound, lower_bound)
@@ -436,14 +549,15 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                 level.level_type = LiquidityLevelType.EQUAL_HIGHS
             elif level.level_type == LiquidityLevelType.SWING_LOW_LIQUIDITY:
                 level.level_type = LiquidityLevelType.EQUAL_LOWS
+
             level.metadata["equal_cluster_confirmed"] = True
 
     # -------------------------------------------------------------------------
     # Candles ingestion
     # -------------------------------------------------------------------------
 
-    def _ingest_candles(self, candles: Sequence[Mapping[str, Any]]) -> List[LiquidityEvent]:
-        new_events: List[LiquidityEvent] = []
+    def _ingest_candles(self, candles: Sequence[Mapping[str, Any]]) -> list[LiquidityEvent]:
+        new_events: list[LiquidityEvent] = []
 
         for raw in candles:
             candle = self._parse_candle(raw, index=self._global_candle_index)
@@ -454,11 +568,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             self._state.last_update = candle.timestamp
 
             for layer in (StructureLayer.INTERNAL, StructureLayer.EXTERNAL):
-                layer_levels = list(self._levels_for_layer(layer))
-                for level in layer_levels:
+                for level in list(self._levels_for_layer(layer)):
                     events = self._process_level_against_candle(level, candle)
-                    if events:
-                        new_events.extend(events)
+                    new_events.extend(events)
 
         return new_events
 
@@ -466,8 +578,8 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self,
         level: LiquidityLevel,
         candle: Candle,
-    ) -> List[LiquidityEvent]:
-        events: List[LiquidityEvent] = []
+    ) -> list[LiquidityEvent]:
+        events: list[LiquidityEvent] = []
 
         if level.status == LiquidityLevelStatus.INVALIDATED:
             return events
@@ -477,6 +589,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             touch_key = (level.level_id, candle.index)
             if touch_key not in self._processed_touch_keys:
                 self._processed_touch_keys.add(touch_key)
+
                 level.touch_count += 1
                 level.last_touched_at = candle.timestamp
                 level.updated_at = candle.timestamp
@@ -528,6 +641,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                     stop_run_key = (level.level_id, candle.index)
                     if stop_run_key not in self._processed_stop_run_keys:
                         self._processed_stop_run_keys.add(stop_run_key)
+
                         events.append(
                             self._create_event(
                                 event_type=LiquidityEventType.STOP_RUN,
@@ -571,6 +685,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                     failed_key = (level.level_id, candle.index)
                     if failed_key not in self._processed_failed_breakout_keys:
                         self._processed_failed_breakout_keys.add(failed_key)
+
                         events.append(
                             self._create_event(
                                 event_type=LiquidityEventType.FAILED_BREAKOUT,
@@ -585,7 +700,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                             )
                         )
 
-        self._maybe_invalidate_level(level, candle)
+        invalidation_event = self._maybe_invalidate_level(level, candle)
+        if invalidation_event is not None:
+            events.append(invalidation_event)
 
         return events
 
@@ -597,6 +714,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         return candle.high >= level.lower_bound and candle.low <= level.upper_bound
 
     def _is_swept(self, level: LiquidityLevel, candle: Candle) -> bool:
+        if level.status == LiquidityLevelStatus.INVALIDATED:
+            return False
+
         penetration = self.config.min_sweep_penetration_pct
 
         if self._is_upper_side_liquidity(level):
@@ -612,7 +732,10 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         if level.last_sweep_index is None:
             return False
 
-        if self._bars_since_index(level.last_sweep_index) is None:
+        bars_since_sweep = self._bars_since_index(level.last_sweep_index)
+        if bars_since_sweep is None:
+            return False
+        if bars_since_sweep > self.config.retest_window_bars:
             return False
 
         buffer_pct = self.config.reclaim_close_buffer_pct
@@ -642,26 +765,50 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
 
     def _is_stop_run(self, level: LiquidityLevel, candle: Candle) -> bool:
         if self._is_upper_side_liquidity(level):
-            return candle.upper_wick_ratio >= self.config.stop_run_wick_ratio_threshold and candle.close < level.price
+            return (
+                candle.upper_wick_ratio >= self.config.stop_run_wick_ratio_threshold
+                and candle.close < level.price
+            )
 
-        return candle.lower_wick_ratio >= self.config.stop_run_wick_ratio_threshold and candle.close > level.price
+        return (
+            candle.lower_wick_ratio >= self.config.stop_run_wick_ratio_threshold
+            and candle.close > level.price
+        )
 
-    def _maybe_invalidate_level(self, level: LiquidityLevel, candle: Candle) -> None:
+    def _maybe_invalidate_level(
+        self,
+        level: LiquidityLevel,
+        candle: Candle,
+    ) -> LiquidityEvent | None:
         if level.status == LiquidityLevelStatus.INVALIDATED:
-            return
+            return None
         if level.status != LiquidityLevelStatus.RECLAIMED:
-            return
+            return None
         if level.last_sweep_index is None:
-            return
+            return None
 
         bars_since_sweep = self._bars_since_index(level.last_sweep_index)
         if bars_since_sweep is None:
-            return
+            return None
 
-        if bars_since_sweep > self.config.retest_window_bars * 2 and level.reclaim_count == 0:
-            level.status = LiquidityLevelStatus.INVALIDATED
-            level.invalidated_at = candle.timestamp
-            level.updated_at = candle.timestamp
+        if bars_since_sweep <= self.config.retest_window_bars * 2:
+            return None
+
+        level.status = LiquidityLevelStatus.INVALIDATED
+        level.invalidated_at = candle.timestamp
+        level.updated_at = candle.timestamp
+
+        return self._create_event(
+            event_type=LiquidityEventType.LEVEL_INVALIDATED,
+            level=level,
+            timestamp=candle.timestamp,
+            reference_price=candle.close,
+            confidence=min(1.0, level.strength),
+            metadata={
+                "candle_index": candle.index,
+                "bars_since_sweep": bars_since_sweep,
+            },
+        )
 
     # -------------------------------------------------------------------------
     # State refresh
@@ -675,16 +822,21 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         state = self._layer_state(layer)
         levels = list(self._levels_for_layer(layer))
 
-        active_levels = [x for x in levels if x.status == LiquidityLevelStatus.ACTIVE]
-        swept_levels = [x for x in levels if x.status == LiquidityLevelStatus.SWEPT]
-        reclaimed_levels = [x for x in levels if x.status == LiquidityLevelStatus.RECLAIMED]
+        active_levels = [level for level in levels if level.status == LiquidityLevelStatus.ACTIVE]
+        swept_levels = [level for level in levels if level.status == LiquidityLevelStatus.SWEPT]
+        reclaimed_levels = [level for level in levels if level.status == LiquidityLevelStatus.RECLAIMED]
+        invalidated_levels = [
+            level for level in levels if level.status == LiquidityLevelStatus.INVALIDATED
+        ]
 
         state.total_levels = len(levels)
         state.active_levels = len(active_levels)
         state.swept_levels = len(swept_levels)
         state.reclaimed_levels = len(reclaimed_levels)
+        state.invalidated_levels = len(invalidated_levels)
 
         current_price = self._state.last_price
+
         state.nearest_buy_side = self._nearest_level(
             levels,
             current_price=current_price,
@@ -698,21 +850,32 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         state.strongest_buy_side = self._strongest_level(levels, upper_side=True)
         state.strongest_sell_side = self._strongest_level(levels, upper_side=False)
 
-        layer_events = [x for x in self._events if x.layer == layer]
+        layer_events = [event for event in self._events if event.layer == layer]
         state.last_event = layer_events[-1] if layer_events else None
+
         state.recent_sweep_count = len(
             [
-                x for x in levels
-                if x.last_sweep_index is not None
-                and self._bars_since_index(x.last_sweep_index) is not None
-                and self._bars_since_index(x.last_sweep_index) <= self.config.retest_window_bars
+                level
+                for level in levels
+                if level.last_sweep_index is not None
+                and self._bars_since_index(level.last_sweep_index) is not None
+                and self._bars_since_index(level.last_sweep_index) <= self.config.retest_window_bars
             ]
         )
+
         state.metadata = {
-            "equal_highs": len([x for x in levels if x.level_type == LiquidityLevelType.EQUAL_HIGHS]),
-            "equal_lows": len([x for x in levels if x.level_type == LiquidityLevelType.EQUAL_LOWS]),
-            "buy_side_levels": len([x for x in levels if self._is_upper_side_liquidity(x)]),
-            "sell_side_levels": len([x for x in levels if not self._is_upper_side_liquidity(x)]),
+            "equal_highs": len(
+                [level for level in levels if level.level_type == LiquidityLevelType.EQUAL_HIGHS]
+            ),
+            "equal_lows": len(
+                [level for level in levels if level.level_type == LiquidityLevelType.EQUAL_LOWS]
+            ),
+            "buy_side_levels": len(
+                [level for level in levels if self._is_upper_side_liquidity(level)]
+            ),
+            "sell_side_levels": len(
+                [level for level in levels if not self._is_upper_side_liquidity(level)]
+            ),
         }
 
     # -------------------------------------------------------------------------
@@ -725,7 +888,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     def _layer_state(self, layer: StructureLayer) -> LayerLiquidityState:
         return self._state.internal if layer == StructureLayer.INTERNAL else self._state.external
 
-    def _build_zone_bounds(self, *, price: float, layer: StructureLayer) -> Tuple[float, float]:
+    def _build_zone_bounds(self, *, price: float, layer: StructureLayer) -> tuple[float, float]:
         width_pct = (
             self.config.swing_liquidity_zone_width_pct_internal
             if layer == StructureLayer.INTERNAL
@@ -747,21 +910,24 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         layer: StructureLayer,
         level_type: LiquidityLevelType,
         price: float,
-    ) -> Optional[LiquidityLevel]:
+    ) -> LiquidityLevel | None:
         candidates = [
-            x for x in self._levels_for_layer(layer)
-            if x.level_type == level_type and x.status != LiquidityLevelStatus.INVALIDATED
+            level
+            for level in self._levels_for_layer(layer)
+            if level.level_type == level_type and level.status != LiquidityLevelStatus.INVALIDATED
         ]
         if not candidates:
             return None
 
         threshold_pct = self._equal_level_tolerance_pct(layer)
-        best: Optional[LiquidityLevel] = None
+
+        best: LiquidityLevel | None = None
         best_distance = float("inf")
 
         for level in candidates:
             if level.price <= 0:
                 continue
+
             distance_pct = abs(price - level.price) / level.price
             if distance_pct <= threshold_pct and distance_pct < best_distance:
                 best = level
@@ -772,6 +938,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     def _can_promote_to_equal_level(self, level: LiquidityLevel) -> bool:
         if level.source_count < self.config.min_cluster_size_for_equal_levels:
             return False
+
         return level.level_type in {
             LiquidityLevelType.SWING_HIGH_LIQUIDITY,
             LiquidityLevelType.SWING_LOW_LIQUIDITY,
@@ -793,53 +960,62 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     def _sweep_side(self, level: LiquidityLevel) -> str:
         return "up" if self._is_upper_side_liquidity(level) else "down"
 
-    def _bars_since_index(self, index: int) -> Optional[int]:
+    def _bars_since_index(self, index: int) -> int | None:
         if not self._candles:
             return None
+
         return max(0, self._candles[-1].index - index)
 
     def _nearest_level(
         self,
         levels: Sequence[LiquidityLevel],
         *,
-        current_price: Optional[float],
+        current_price: float | None,
         upper_side: bool,
-    ) -> Optional[LiquidityLevel]:
+    ) -> LiquidityLevel | None:
         if current_price is None:
             return None
 
         candidates = [
-            x for x in levels
-            if x.status != LiquidityLevelStatus.INVALIDATED
-            and self._is_upper_side_liquidity(x) == upper_side
+            level
+            for level in levels
+            if level.status != LiquidityLevelStatus.INVALIDATED
+            and self._is_upper_side_liquidity(level) == upper_side
         ]
+
         if upper_side:
-            candidates = [x for x in candidates if x.price >= current_price]
+            candidates = [level for level in candidates if level.price >= current_price]
         else:
-            candidates = [x for x in candidates if x.price <= current_price]
+            candidates = [level for level in candidates if level.price <= current_price]
 
         if not candidates:
             return None
 
-        return min(candidates, key=lambda x: abs(x.price - current_price))
+        return min(candidates, key=lambda level: abs(level.price - current_price))
 
     def _strongest_level(
         self,
         levels: Sequence[LiquidityLevel],
         *,
         upper_side: bool,
-    ) -> Optional[LiquidityLevel]:
+    ) -> LiquidityLevel | None:
         candidates = [
-            x for x in levels
-            if x.status != LiquidityLevelStatus.INVALIDATED
-            and self._is_upper_side_liquidity(x) == upper_side
+            level
+            for level in levels
+            if level.status != LiquidityLevelStatus.INVALIDATED
+            and self._is_upper_side_liquidity(level) == upper_side
         ]
         if not candidates:
             return None
 
         return max(
             candidates,
-            key=lambda x: (x.strength, x.source_count, x.touch_count, x.sweep_count),
+            key=lambda level: (
+                level.strength,
+                level.source_count,
+                level.touch_count,
+                level.sweep_count,
+            ),
         )
 
     def _sweep_confidence(self, level: LiquidityLevel, candle: Candle) -> float:
@@ -853,7 +1029,11 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         return max(0.0, min(1.0, raw))
 
     def _reclaim_confidence(self, level: LiquidityLevel, candle: Candle) -> float:
-        wick_ratio = candle.upper_wick_ratio if self._is_upper_side_liquidity(level) else candle.lower_wick_ratio
+        wick_ratio = (
+            candle.upper_wick_ratio
+            if self._is_upper_side_liquidity(level)
+            else candle.lower_wick_ratio
+        )
         raw = (level.strength + min(1.0, wick_ratio) + candle.body_ratio) / 3.0
         return max(0.0, min(1.0, raw))
 
@@ -862,7 +1042,11 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         return max(0.0, min(1.0, raw))
 
     def _stop_run_confidence(self, level: LiquidityLevel, candle: Candle) -> float:
-        wick_ratio = candle.upper_wick_ratio if self._is_upper_side_liquidity(level) else candle.lower_wick_ratio
+        wick_ratio = (
+            candle.upper_wick_ratio
+            if self._is_upper_side_liquidity(level)
+            else candle.lower_wick_ratio
+        )
         raw = (level.strength + min(1.0, wick_ratio)) / 2.0
         return max(0.0, min(1.0, raw))
 
@@ -872,9 +1056,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         event_type: LiquidityEventType,
         level: LiquidityLevel,
         timestamp: Any,
-        reference_price: Optional[float],
+        reference_price: float | None,
         confidence: float,
-        metadata: Optional[Mapping[str, Any]] = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> LiquidityEvent:
         event = LiquidityEvent(
             event_id=uuid4().hex,
@@ -891,15 +1075,12 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             metadata=dict(metadata or {}),
         )
         self._events.append(event)
-        self._emit_event(
-            self._build_event_name(event.event_type.value),
-            self._event_to_dict(event),
-            source="liquidity_levels_analyzer",
-        )
         return event
 
-    def _level_to_dict(self, level: LiquidityLevel) -> Dict[str, Any]:
-        return self._safe_serialize(level)
+    def _level_to_dict(self, level: LiquidityLevel) -> dict[str, Any]:
+        serialized = self._safe_serialize(level)
+        return serialized if isinstance(serialized, dict) else {"value": serialized}
 
-    def _event_to_dict(self, event: LiquidityEvent) -> Dict[str, Any]:
-        return self._safe_serialize(event)
+    def _event_to_dict(self, event: LiquidityEvent) -> dict[str, Any]:
+        serialized = self._safe_serialize(event)
+        return serialized if isinstance(serialized, dict) else {"value": serialized}

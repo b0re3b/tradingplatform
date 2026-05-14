@@ -41,7 +41,12 @@ class PriceActionEnum(str, Enum):
         return any(member.value == value for member in cls)
 
     @classmethod
-    def from_value(cls: type[EnumT], value: str | EnumT, *, default: EnumT | None = None) -> EnumT:
+    def from_value(
+        cls: type[EnumT],
+        value: str | EnumT,
+        *,
+        default: EnumT | None = None,
+    ) -> EnumT:
         """
         Safely coerce a raw value into the enum.
 
@@ -69,7 +74,7 @@ class PriceActionEnum(str, Enum):
 
 class PriceActionModuleType(PriceActionEnum):
     """
-    Logical module identifiers used by the future PriceActionAnalyzer facade.
+    Logical module identifiers used by the PriceActionAnalyzer facade.
     """
 
     MARKET_STRUCTURE = "market_structure"
@@ -83,7 +88,7 @@ class PriceActionSnapshotType(PriceActionEnum):
     """
     Common snapshot/update event types shared by price action modules.
 
-    Concrete EventBus topics should still be namespaced as:
+    Concrete EventBus topics should be namespaced as:
         analytics.price_action.<module>.<event>
     """
 
@@ -203,12 +208,18 @@ class LiquidityLevelStatus(PriceActionEnum):
 class LiquidityEventType(PriceActionEnum):
     LEVEL_CREATED = "level_created"
     LEVEL_MERGED = "level_merged"
+    LEVEL_INVALIDATED = "level_invalidated"
+
     LIQUIDITY_TOUCHED = "liquidity_touched"
     LIQUIDITY_SWEPT = "liquidity_swept"
     LIQUIDITY_RECLAIMED = "liquidity_reclaimed"
+
     FAILED_BREAKOUT = "failed_breakout"
     STOP_RUN = "stop_run"
-    LIQUIDITY_INVALIDATED = "liquidity_invalidated"
+
+    # Backward-compatible alias for older consumers.
+    # Prefer LEVEL_INVALIDATED in new code.
+    LIQUIDITY_INVALIDATED = "level_invalidated"
 
 
 # ---------------------------------------------------------------------------
@@ -248,19 +259,24 @@ __all__ = [
     "PriceActionEnum",
     "PriceActionModuleType",
     "PriceActionSnapshotType",
+
     "SwingType",
     "StructureLayer",
     "MarketBias",
     "StructureEventType",
+
     "LevelType",
     "LevelStatus",
     "SREventType",
+
     "FVGDirection",
     "FVGStatus",
     "FVGEventType",
+
     "LiquidityLevelType",
     "LiquidityLevelStatus",
     "LiquidityEventType",
+
     "TrendDirection",
     "TrendRegime",
     "TrendEventType",
