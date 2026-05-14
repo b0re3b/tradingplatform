@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Iterable
+
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
 
 from .base import BaseSpoofingDetector
 from .config import SpoofingConfig
@@ -10,36 +12,15 @@ from .enums import (
     OrderbookWallState,
     SpoofingComponent,
     SpoofingPattern,
+    SpoofingSide,
 )
 from .models import (
     DetectorResult,
+    FlipPressureCandidateContext,
     SpoofingFeatures,
     TrackedWall,
 )
 from .persistence_tracker import PersistenceTracker
-
-
-@dataclass(slots=True)
-class FlipPressureCandidateContext:
-    """
-    Внутрішній контейнер для оцінки кандидата на flip pressure.
-    """
-    wall: TrackedWall
-    wall_notional: float
-    pulled_notional: float
-    lifetime_ms: float
-    fill_ratio: float
-    pull_ratio: float
-    price_reaction_bps: float
-    pressure_flip_strength: float
-    distance_from_mid_bps: float
-    is_pressure_removed: bool
-    is_short_lived: bool
-    is_low_fill: bool
-    has_reversal: bool
-    confidence: float
-    score: float
-    reason: str
 
 
 class FlipPressureDetector(BaseSpoofingDetector):
@@ -47,30 +28,38 @@ class FlipPressureDetector(BaseSpoofingDetector):
     Detector патерну pressure flip / pressure bluff.
 
     Основна ідея:
-    - ASK wall тиснула зверху, створюючи bearish pressure
-      -> wall weakens / pulled
-      -> ціна йде вгору
-    - BID wall підтримувала знизу, створюючи bullish support pressure
-      -> wall weakens / pulled
-      -> ціна йде вниз
+    - ASK wall тиснула зверху, створюючи bearish pressure;
+      після weakening/pull ціна йде вгору.
+    - BID wall підтримувала знизу, створюючи bullish support pressure;
+      після weakening/pull ціна йде вниз.
 
-    Тобто detector фіксує не просто зняття стінки, а саме
+    Тобто detector фіксує не просто зняття стінки, а саме:
     "скасований тиск + реверсивна реакція ринку".
 
     Важливо:
-    - detector працює поверх persistence state
-    - для хорошої якості бажано передавати current_mid_price
+    - працює поверх PersistenceTracker state;
+    - потребує current_mid_price для якісного сигналу;
+    - не підписується на EventBus;
+    - не публікує події;
+    - не запускає Scheduler jobs;
+    - повертає тільки DetectorResult або None.
     """
 
     component = SpoofingComponent.FLIP_PRESSURE_DETECTOR
 
     def __init__(
         self,
-        event_bus: Any | None,
+        *,
+        event_bus: EventBus | None,
+        scheduler: Scheduler | None,
         config: SpoofingConfig,
         persistence_tracker: PersistenceTracker,
     ) -> None:
-        super().__init__(event_bus=event_bus, config=config)
+        super().__init__(
+            event_bus=event_bus,
+            scheduler=scheduler,
+            config=config,
+        )
         self.persistence_tracker = persistence_tracker
 
     # -------------------------------------------------------------------------
@@ -134,8 +123,11 @@ class FlipPressureDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналізує набір tracked walls.
+        Аналізує набір tracked walls і повертає позитивні pressure-flip candidates.
         """
+        if not self.config.enabled or not self.config.flip_pressure.enabled:
+            return []
+
         results: list[DetectorResult] = []
 
         for wall in walls:
@@ -150,7 +142,7 @@ class FlipPressureDetector(BaseSpoofingDetector):
                 current_mid_price=current_mid_price,
                 repetition_count=repetition_count,
             )
-            if result is not None and result.decision == DetectorDecision.POSITIVE:
+            if result is not None and result.is_positive():
                 results.append(result)
 
         results.sort(key=lambda item: (item.score, item.confidence), reverse=True)
@@ -164,7 +156,7 @@ class FlipPressureDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
-        Зручний helper для аналізу всіх tracked walls одного символу.
+        Аналізує всі tracked walls одного символу.
         """
         walls = self.persistence_tracker.get_walls_for_symbol(
             exchange=exchange,
@@ -183,6 +175,9 @@ class FlipPressureDetector(BaseSpoofingDetector):
         *,
         current_mid_price: float | None = None,
     ) -> bool:
+        """
+        Boolean helper для швидкої перевірки tracked wall.
+        """
         return self._evaluate_candidate(
             wall=wall,
             current_mid_price=current_mid_price,
@@ -198,7 +193,7 @@ class FlipPressureDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None = None,
     ) -> FlipPressureCandidateContext | None:
-        if not self.config.flip_pressure.enabled:
+        if not self.config.enabled or not self.config.flip_pressure.enabled:
             return None
 
         if wall.max_size <= 0.0 or wall.price <= 0.0:
@@ -213,18 +208,11 @@ class FlipPressureDetector(BaseSpoofingDetector):
         fill_ratio = wall.fill_ratio
         pull_ratio = wall.pull_ratio
 
-        if wall_notional < self.config.wall_detection.min_wall_size_abs:
-            return None
-
-        if wall.state not in {
-            OrderbookWallState.PULLED,
-            OrderbookWallState.WEAKENING,
-            OrderbookWallState.EXPIRED,
-            OrderbookWallState.FILLED,
-        }:
-            return None
-
-        if pull_ratio <= 0.0:
+        if not self._passes_basic_filters(
+            wall=wall,
+            wall_notional=wall_notional,
+            pull_ratio=pull_ratio,
+        ):
             return None
 
         price_reaction_bps = self._estimate_relevant_price_reaction_bps(
@@ -265,9 +253,6 @@ class FlipPressureDetector(BaseSpoofingDetector):
         confidence = self._compute_confidence(
             wall=wall,
             pulled_notional=pulled_notional,
-            lifetime_ms=lifetime_ms,
-            fill_ratio=fill_ratio,
-            pull_ratio=pull_ratio,
             price_reaction_bps=price_reaction_bps,
             pressure_flip_strength=pressure_flip_strength,
             is_pressure_removed=is_pressure_removed,
@@ -307,6 +292,32 @@ class FlipPressureDetector(BaseSpoofingDetector):
             reason=reason,
         )
 
+    def _passes_basic_filters(
+        self,
+        *,
+        wall: TrackedWall,
+        wall_notional: float,
+        pull_ratio: float,
+    ) -> bool:
+        if wall_notional < self.config.wall_detection.min_wall_size_abs:
+            return False
+
+        if wall.state not in {
+            OrderbookWallState.PULLED,
+            OrderbookWallState.WEAKENING,
+            OrderbookWallState.EXPIRED,
+            OrderbookWallState.FILLED,
+        }:
+            return False
+
+        if pull_ratio <= 0.0:
+            return False
+
+        if wall.side not in {SpoofingSide.BID, SpoofingSide.ASK}:
+            return False
+
+        return True
+
     def _build_features(
         self,
         *,
@@ -315,13 +326,16 @@ class FlipPressureDetector(BaseSpoofingDetector):
     ) -> SpoofingFeatures:
         wall = candidate.wall
 
-        cancel_to_fill_ratio = 0.0
-        if candidate.fill_ratio > 0:
-            cancel_to_fill_ratio = candidate.pull_ratio / candidate.fill_ratio
-        elif candidate.pull_ratio > 0:
-            cancel_to_fill_ratio = candidate.pull_ratio
+        cancel_to_fill_ratio = self._compute_cancel_to_fill_ratio(
+            pull_ratio=candidate.pull_ratio,
+            fill_ratio=candidate.fill_ratio,
+        )
 
-        repetition = repetition_count if repetition_count is not None else self._estimate_repetition_count(wall)
+        repetition = (
+            repetition_count
+            if repetition_count is not None
+            else self._estimate_repetition_count(wall)
+        )
 
         is_near_best_quote = wall.near_touch_count > 0 or wall.touch_count > 0
 
@@ -352,6 +366,8 @@ class FlipPressureDetector(BaseSpoofingDetector):
                 "estimated_pulled_size": wall.estimated_pulled_size,
                 "estimated_filled_size": wall.estimated_filled_size,
                 "current_to_max_ratio": wall.current_to_max_ratio,
+                "wall_state": wall.state.value,
+                "has_reversal": candidate.has_reversal,
                 "detector": self.component.value,
             },
         )
@@ -374,29 +390,27 @@ class FlipPressureDetector(BaseSpoofingDetector):
         is_short_lived: bool,
         is_low_fill: bool,
     ) -> float:
-        # 1. reversal reaction
         reaction_component = self.clamp(
-            price_reaction_bps / max(self.config.flip_pressure.min_price_reaction_bps * 3.0, 1e-12),
+            price_reaction_bps / max(
+                self.config.flip_pressure.min_price_reaction_bps * 3.0,
+                1e-12,
+            ),
             0.0,
             1.0,
         )
 
-        # 2. pressure flip strength
         flip_component = self.clamp(pressure_flip_strength, 0.0, 1.0)
-
-        # 3. removed pressure
         pull_component = self.clamp(pull_ratio, 0.0, 1.0)
-
-        # 4. low fill is suspicious
         fill_component = 1.0 - self.clamp(fill_ratio, 0.0, 1.0)
 
-        # 5. lifetime
         max_lifetime = max(float(self.config.pull_detection.max_pull_lifetime_ms), 1.0)
         lifetime_component = 1.0 - self.clamp(lifetime_ms / max_lifetime, 0.0, 1.0)
 
-        # 6. removed notional
         min_removed = max(self.config.pull_detection.min_removed_notional, 1e-12)
-        notional_component = (pulled_notional - min_removed) / max(min_removed * 2.0, 1e-12)
+        notional_component = (pulled_notional - min_removed) / max(
+            min_removed * 2.0,
+            1e-12,
+        )
         notional_component = self.clamp(notional_component, 0.0, 1.0)
 
         bonus = 0.0
@@ -410,13 +424,13 @@ class FlipPressureDetector(BaseSpoofingDetector):
             bonus += 0.03
 
         raw_score = (
-            0.24 * reaction_component +
-            0.24 * flip_component +
-            0.18 * pull_component +
-            0.12 * fill_component +
-            0.10 * lifetime_component +
-            0.12 * notional_component +
-            bonus
+            0.24 * reaction_component
+            + 0.24 * flip_component
+            + 0.18 * pull_component
+            + 0.12 * fill_component
+            + 0.10 * lifetime_component
+            + 0.12 * notional_component
+            + bonus
         )
 
         return self.clamp(raw_score, 0.0, 1.0)
@@ -426,9 +440,6 @@ class FlipPressureDetector(BaseSpoofingDetector):
         *,
         wall: TrackedWall,
         pulled_notional: float,
-        lifetime_ms: float,
-        fill_ratio: float,
-        pull_ratio: float,
         price_reaction_bps: float,
         pressure_flip_strength: float,
         is_pressure_removed: bool,
@@ -477,9 +488,10 @@ class FlipPressureDetector(BaseSpoofingDetector):
         Рахує релевантну реакцію ціни після ослаблення/зникнення тиску.
 
         ASK wall:
-            очікуваний bluff-confirmation = ціна йде ВГОРУ
+            очікуваний bluff-confirmation = ціна йде вгору.
+
         BID wall:
-            очікуваний bluff-confirmation = ціна йде ВНИЗ
+            очікуваний bluff-confirmation = ціна йде вниз.
         """
         reference_mid = wall.mid_price_at_creation
         if reference_mid is None or reference_mid <= 0.0:
@@ -487,10 +499,10 @@ class FlipPressureDetector(BaseSpoofingDetector):
 
         signed_move = self.signed_bps_move(current_mid_price, reference_mid)
 
-        if wall.side.value == "ask":
+        if wall.side == SpoofingSide.ASK:
             return max(0.0, signed_move)
 
-        if wall.side.value == "bid":
+        if wall.side == SpoofingSide.BID:
             return max(0.0, -signed_move)
 
         return 0.0
@@ -506,18 +518,22 @@ class FlipPressureDetector(BaseSpoofingDetector):
         Інтегральна оцінка сили pressure flip.
 
         Комбінує:
-        - наскільки сильно ліквідність була знята
-        - наскільки мало вона реально виконалась
-        - наскільки сильна реверсивна реакція ціни
-        - наскільки близько до ринку стояла стінка
+        - наскільки сильно ліквідність була знята;
+        - наскільки мало вона реально виконалась;
+        - наскільки сильна реверсивна реакція ціни;
+        - наскільки близько до ринку стояла стінка.
         """
         if current_mid_price <= 0.0:
             return 0.0
 
         pull_component = self.clamp(wall.pull_ratio, 0.0, 1.0)
         fill_component = 1.0 - self.clamp(wall.fill_ratio, 0.0, 1.0)
+
         reaction_component = self.clamp(
-            price_reaction_bps / max(self.config.flip_pressure.min_price_reaction_bps * 3.0, 1e-12),
+            price_reaction_bps / max(
+                self.config.flip_pressure.min_price_reaction_bps * 3.0,
+                1e-12,
+            ),
             0.0,
             1.0,
         )
@@ -527,10 +543,10 @@ class FlipPressureDetector(BaseSpoofingDetector):
         proximity_component = 1.0 - self.clamp(distance_bps / max_distance, 0.0, 1.0)
 
         value = (
-            0.35 * pull_component +
-            0.20 * fill_component +
-            0.30 * reaction_component +
-            0.15 * proximity_component
+            0.35 * pull_component
+            + 0.20 * fill_component
+            + 0.30 * reaction_component
+            + 0.15 * proximity_component
         )
         return self.clamp(value, 0.0, 1.0)
 
@@ -548,8 +564,20 @@ class FlipPressureDetector(BaseSpoofingDetector):
         )
         return len(history)
 
+    @staticmethod
+    def _compute_cancel_to_fill_ratio(
+        *,
+        pull_ratio: float,
+        fill_ratio: float,
+    ) -> float:
+        if fill_ratio > 0:
+            return pull_ratio / fill_ratio
+        if pull_ratio > 0:
+            return pull_ratio
+        return 0.0
+
+    @staticmethod
     def _build_reason(
-        self,
         *,
         wall: TrackedWall,
         pulled_notional: float,
@@ -581,3 +609,6 @@ class FlipPressureDetector(BaseSpoofingDetector):
             parts.append("low_fill=true")
 
         return ", ".join(parts)
+
+
+__all__ = ["FlipPressureDetector"]

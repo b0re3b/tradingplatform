@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from statistics import mean
-from typing import Any, Iterable
+from typing import Iterable
+
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
 
 from .base import BaseSpoofingDetector
 from .config import SpoofingConfig
@@ -15,42 +17,12 @@ from .enums import (
 )
 from .models import (
     DetectorResult,
+    LayeringCandidateContext,
+    LayeringCluster,
     SpoofingFeatures,
     TrackedWall,
 )
 from .persistence_tracker import PersistenceTracker
-
-
-@dataclass(slots=True)
-class LayeringCluster:
-    """
-    Внутрішня модель кластера потенційного layering-патерну.
-    """
-    exchange: str
-    symbol: str
-    side: SpoofingSide
-    walls: list[TrackedWall]
-    total_notional: float
-    average_pull_ratio: float
-    average_fill_ratio: float
-    average_lifetime_ms: float
-    synchronized_pull_ratio: float
-    price_span_bps: float
-    layering_score: float
-    cluster_price: float
-    cluster_wall_id: str | None
-
-
-@dataclass(slots=True)
-class LayeringCandidateContext:
-    """
-    Контекст для оцінки layering cluster як detector result.
-    """
-    cluster: LayeringCluster
-    confidence: float
-    score: float
-    reason: str
-    price_reaction_bps: float
 
 
 class LayeringDetector(BaseSpoofingDetector):
@@ -58,23 +30,34 @@ class LayeringDetector(BaseSpoofingDetector):
     Detector multi-level layering.
 
     Основна ідея:
-    - на одній стороні книги присутні кілька аномально великих рівнів
-    - рівні знаходяться близько по ціні
-    - сумарна ліквідність велика
-    - значна частина рівнів знімається/слабшає в близькому часовому вікні
+    - на одній стороні книги присутні кілька аномально великих рівнів;
+    - рівні знаходяться близько по ціні;
+    - сумарна ліквідність велика;
+    - значна частина рівнів знімається/слабшає в близькому часовому вікні.
 
-    Detector працює поверх PersistenceTracker state.
+    Важливо:
+    - працює поверх PersistenceTracker state;
+    - не підписується на EventBus;
+    - не публікує події;
+    - не запускає Scheduler jobs;
+    - повертає тільки DetectorResult або None.
     """
 
     component = SpoofingComponent.LAYERING_DETECTOR
 
     def __init__(
         self,
-        event_bus: Any | None,
+        *,
+        event_bus: EventBus | None,
+        scheduler: Scheduler | None,
         config: SpoofingConfig,
         persistence_tracker: PersistenceTracker,
     ) -> None:
-        super().__init__(event_bus=event_bus, config=config)
+        super().__init__(
+            event_bus=event_bus,
+            scheduler=scheduler,
+            config=config,
+        )
         self.persistence_tracker = persistence_tracker
 
     # -------------------------------------------------------------------------
@@ -116,13 +99,16 @@ class LayeringDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналіз набору tracked walls.
+        Аналізує набір tracked walls і повертає позитивні layering candidates.
         """
-        filtered = [
-            wall for wall in walls
-            if (exchange is None or wall.exchange == exchange)
-            and (symbol is None or wall.symbol == symbol)
-        ]
+        if not self.config.enabled or not self.config.layering.enabled:
+            return []
+
+        filtered = self._filter_walls(
+            walls=walls,
+            exchange=exchange,
+            symbol=symbol,
+        )
         if not filtered:
             return []
 
@@ -147,7 +133,9 @@ class LayeringDetector(BaseSpoofingDetector):
             if candidate is None:
                 continue
 
-            results.append(self._build_result(candidate))
+            result = self._build_result(candidate)
+            if result.is_positive():
+                results.append(result)
 
         results.sort(key=lambda item: (item.score, item.confidence), reverse=True)
         return results
@@ -179,7 +167,13 @@ class LayeringDetector(BaseSpoofingDetector):
         *,
         current_mid_price: float | None = None,
     ) -> bool:
-        return self.analyze(wall, current_mid_price=current_mid_price) is not None
+        """
+        Boolean helper для швидкої перевірки tracked wall.
+        """
+        return self.analyze(
+            wall,
+            current_mid_price=current_mid_price,
+        ) is not None
 
     # -------------------------------------------------------------------------
     # Cluster construction
@@ -192,50 +186,52 @@ class LayeringDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[LayeringCluster]:
         """
-        Будує потенційні кластери layering для кожної сторони окремо.
+        Будує потенційні layering-кластери для кожної сторони окремо.
         """
-        if not self.config.layering.enabled:
+        if not self.config.enabled or not self.config.layering.enabled:
             return []
 
         relevant = [
-            wall for wall in walls
-            if self._is_relevant_wall(wall, current_mid_price=current_mid_price)
+            wall
+            for wall in walls
+            if self._is_relevant_wall(
+                wall=wall,
+                current_mid_price=current_mid_price,
+            )
         ]
         if not relevant:
             return []
 
         clusters: list[LayeringCluster] = []
-
-        groups: dict[tuple[str, str, SpoofingSide], list[TrackedWall]] = {}
-        for wall in relevant:
-            key = (wall.exchange, wall.symbol, wall.side)
-            groups.setdefault(key, []).append(wall)
+        groups = self._group_walls_by_market_side(relevant)
 
         for (exchange, symbol, side), side_walls in groups.items():
             ordered = self._sort_walls_for_side(side_walls, side)
-
             current_group: list[TrackedWall] = []
+
             for wall in ordered:
                 if not current_group:
                     current_group.append(wall)
                     continue
 
-                prev = current_group[-1]
-                gap_bps = self.bps_distance(wall.price, prev.price)
+                previous = current_group[-1]
+                gap_bps = self.bps_distance(wall.price, previous.price)
 
                 if gap_bps <= self.config.layering.max_price_gap_bps_between_layers:
                     current_group.append(wall)
-                else:
-                    cluster = self._make_cluster(
-                        exchange=exchange,
-                        symbol=symbol,
-                        side=side,
-                        walls=current_group,
-                        current_mid_price=current_mid_price,
-                    )
-                    if cluster is not None:
-                        clusters.append(cluster)
-                    current_group = [wall]
+                    continue
+
+                cluster = self._make_cluster(
+                    exchange=exchange,
+                    symbol=symbol,
+                    side=side,
+                    walls=current_group,
+                    current_mid_price=current_mid_price,
+                )
+                if cluster is not None:
+                    clusters.append(cluster)
+
+                current_group = [wall]
 
             if current_group:
                 cluster = self._make_cluster(
@@ -269,6 +265,7 @@ class LayeringDetector(BaseSpoofingDetector):
         for cluster in clusters:
             if any(item.wall_id == wall.wall_id for item in cluster.walls):
                 return cluster
+
         return None
 
     def _make_cluster(
@@ -287,11 +284,12 @@ class LayeringDetector(BaseSpoofingDetector):
         if total_notional < self.config.layering.min_total_layer_notional:
             return None
 
-        average_pull_ratio = mean(max(wall.pull_ratio, 0.0) for wall in walls)
-        average_fill_ratio = mean(max(wall.fill_ratio, 0.0) for wall in walls)
-        average_lifetime_ms = mean(max(wall.lifetime_ms, 0.0) for wall in walls)
+        average_pull_ratio = self._mean_or_zero(wall.pull_ratio for wall in walls)
+        average_fill_ratio = self._mean_or_zero(wall.fill_ratio for wall in walls)
+        average_lifetime_ms = self._mean_or_zero(wall.lifetime_ms for wall in walls)
         synchronized_pull_ratio = self._estimate_synchronized_pull_ratio(walls)
         price_span_bps = self._estimate_price_span_bps(walls)
+
         layering_score = self._estimate_layering_score(
             walls=walls,
             total_notional=total_notional,
@@ -300,7 +298,7 @@ class LayeringDetector(BaseSpoofingDetector):
             current_mid_price=current_mid_price,
         )
 
-        cluster_price = mean(wall.price for wall in walls)
+        cluster_price = self._mean_or_zero(wall.price for wall in walls)
         cluster_wall_id = self._resolve_cluster_wall_id(walls)
 
         return LayeringCluster(
@@ -329,28 +327,7 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         current_mid_price: float | None = None,
     ) -> LayeringCandidateContext | None:
-        if len(cluster.walls) < self.config.layering.min_layers:
-            return None
-
-        if cluster.total_notional < self.config.layering.min_total_layer_notional:
-            return None
-
-        if cluster.synchronized_pull_ratio <= 0.0:
-            return None
-
-        # Має бути ознака coordinated removal / weakening
-        if cluster.synchronized_pull_ratio < 0.5:
-            return None
-
-        # Має бути низький/помірний fill
-        if cluster.average_fill_ratio > max(
-            self.config.fake_liquidity.max_fill_ratio,
-            self.config.pull_detection.max_fill_ratio_for_pull,
-        ):
-            return None
-
-        # Має бути помітний average pull
-        if cluster.average_pull_ratio < self.config.pull_detection.min_pull_ratio:
+        if not self._passes_cluster_filters(cluster):
             return None
 
         price_reaction_bps = self._estimate_cluster_price_reaction_bps(
@@ -378,6 +355,31 @@ class LayeringDetector(BaseSpoofingDetector):
             reason=reason,
             price_reaction_bps=price_reaction_bps,
         )
+
+    def _passes_cluster_filters(self, cluster: LayeringCluster) -> bool:
+        if len(cluster.walls) < self.config.layering.min_layers:
+            return False
+
+        if cluster.total_notional < self.config.layering.min_total_layer_notional:
+            return False
+
+        if cluster.synchronized_pull_ratio <= 0.0:
+            return False
+
+        if cluster.synchronized_pull_ratio < 0.5:
+            return False
+
+        max_allowed_fill = max(
+            self.config.fake_liquidity.max_fill_ratio,
+            self.config.pull_detection.max_fill_ratio_for_pull,
+        )
+        if cluster.average_fill_ratio > max_allowed_fill:
+            return False
+
+        if cluster.average_pull_ratio < self.config.pull_detection.min_pull_ratio:
+            return False
+
+        return True
 
     def _build_result(
         self,
@@ -414,16 +416,17 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster = candidate.cluster
         repetition_count = self._estimate_cluster_repetition_count(cluster)
 
-        cancel_to_fill_ratio = 0.0
-        if cluster.average_fill_ratio > 0:
-            cancel_to_fill_ratio = cluster.average_pull_ratio / cluster.average_fill_ratio
-        elif cluster.average_pull_ratio > 0:
-            cancel_to_fill_ratio = cluster.average_pull_ratio
+        cancel_to_fill_ratio = self._compute_cancel_to_fill_ratio(
+            pull_ratio=cluster.average_pull_ratio,
+            fill_ratio=cluster.average_fill_ratio,
+        )
 
-        current_mid_distance = 0.0
         reference_mid = self._resolve_cluster_reference_mid(cluster)
-        if reference_mid is not None and reference_mid > 0:
-            current_mid_distance = self.bps_distance(cluster.cluster_price, reference_mid)
+        distance_from_mid_bps = (
+            self.bps_distance(cluster.cluster_price, reference_mid)
+            if reference_mid is not None and reference_mid > 0
+            else 0.0
+        )
 
         return SpoofingFeatures(
             symbol=cluster.symbol,
@@ -432,7 +435,7 @@ class LayeringDetector(BaseSpoofingDetector):
             price=cluster.cluster_price,
             wall_size=sum(wall.max_size for wall in cluster.walls),
             wall_size_ratio=self._estimate_cluster_wall_size_ratio(cluster),
-            distance_from_mid_bps=current_mid_distance,
+            distance_from_mid_bps=distance_from_mid_bps,
             lifetime_ms=cluster.average_lifetime_ms,
             updates_count=sum(wall.updates_count for wall in cluster.walls),
             repetition_count=repetition_count,
@@ -451,6 +454,7 @@ class LayeringDetector(BaseSpoofingDetector):
                 "total_notional": cluster.total_notional,
                 "synchronized_pull_ratio": cluster.synchronized_pull_ratio,
                 "price_span_bps": cluster.price_span_bps,
+                "wall_ids": [wall.wall_id for wall in cluster.walls],
                 "detector": self.component.value,
             },
         )
@@ -469,26 +473,30 @@ class LayeringDetector(BaseSpoofingDetector):
         pull_component = self.clamp(cluster.average_pull_ratio, 0.0, 1.0)
         fill_component = 1.0 - self.clamp(cluster.average_fill_ratio, 0.0, 1.0)
         sync_component = self.clamp(cluster.synchronized_pull_ratio, 0.0, 1.0)
+
+        max_span = self._cluster_max_span_bps(cluster)
         compactness_component = 1.0 - self.clamp(
-            cluster.price_span_bps / max(self.config.layering.max_price_gap_bps_between_layers * max(len(cluster.walls) - 1, 1), 1e-12),
+            cluster.price_span_bps / max(max_span, 1e-12),
             0.0,
             1.0,
         )
+
         layering_component = self.clamp(cluster.layering_score, 0.0, 1.0)
         reaction_component = self.clamp(
-            price_reaction_bps / max(self.config.flip_pressure.min_price_reaction_bps * 3.0, 1e-12),
+            price_reaction_bps
+            / max(self.config.flip_pressure.min_price_reaction_bps * 3.0, 1e-12),
             0.0,
             1.0,
         )
 
         raw_score = (
-            0.18 * notional_component +
-            0.17 * pull_component +
-            0.12 * fill_component +
-            0.20 * sync_component +
-            0.12 * compactness_component +
-            0.16 * layering_component +
-            0.05 * reaction_component
+            0.18 * notional_component
+            + 0.17 * pull_component
+            + 0.12 * fill_component
+            + 0.20 * sync_component
+            + 0.12 * compactness_component
+            + 0.16 * layering_component
+            + 0.05 * reaction_component
         )
         return self.clamp(raw_score, 0.0, 1.0)
 
@@ -537,29 +545,29 @@ class LayeringDetector(BaseSpoofingDetector):
         if not walls:
             return 0.0
 
-        window_ms = self.config.layering.synchronized_pull_window_ms
-
-        reference_times = []
-        for wall in walls:
-            if wall.state in {OrderbookWallState.PULLED, OrderbookWallState.WEAKENING, OrderbookWallState.EXPIRED, OrderbookWallState.FILLED}:
-                reference_times.append(wall.last_seen_at)
+        relevant_states = self._removed_or_weakened_states()
+        reference_times = [
+            wall.last_seen_at
+            for wall in walls
+            if wall.state in relevant_states
+        ]
 
         if len(reference_times) < self.config.layering.min_layers:
             return 0.0
 
         reference_times.sort()
-        base_time = reference_times[0]
+        window_ms = self.config.layering.synchronized_pull_window_ms
 
-        synchronized = 0
-        for wall in walls:
-            if wall.state not in {OrderbookWallState.PULLED, OrderbookWallState.WEAKENING, OrderbookWallState.EXPIRED, OrderbookWallState.FILLED}:
-                continue
+        best_count = 0
+        for base_time in reference_times:
+            count = sum(
+                1
+                for ts in reference_times
+                if abs((ts - base_time).total_seconds() * 1000.0) <= window_ms
+            )
+            best_count = max(best_count, count)
 
-            diff_ms = abs((wall.last_seen_at - base_time).total_seconds() * 1000.0)
-            if diff_ms <= window_ms:
-                synchronized += 1
-
-        return self.normalize_ratio(synchronized, len(walls))
+        return self.normalize_ratio(best_count, len(walls))
 
     def _estimate_price_span_bps(
         self,
@@ -572,9 +580,7 @@ class LayeringDetector(BaseSpoofingDetector):
         if len(prices) < 2:
             return 0.0
 
-        low = min(prices)
-        high = max(prices)
-        return self.bps_distance(high, low)
+        return self.bps_distance(max(prices), min(prices))
 
     def _estimate_layering_score(
         self,
@@ -585,29 +591,44 @@ class LayeringDetector(BaseSpoofingDetector):
         price_span_bps: float,
         current_mid_price: float | None = None,
     ) -> float:
-        layers_component = self.clamp(len(walls) / max(self.config.layering.min_layers + 2, 1), 0.0, 1.0)
+        layers_component = self.clamp(
+            len(walls) / max(self.config.layering.min_layers + 2, 1),
+            0.0,
+            1.0,
+        )
         notional_component = self._normalize_total_notional(total_notional)
         sync_component = self.clamp(synchronized_pull_ratio, 0.0, 1.0)
 
-        max_span = max(
-            self.config.layering.max_price_gap_bps_between_layers * max(len(walls) - 1, 1),
-            1e-12,
+        max_span = self.config.layering.max_price_gap_bps_between_layers * max(
+            len(walls) - 1,
+            1,
         )
-        compactness_component = 1.0 - self.clamp(price_span_bps / max_span, 0.0, 1.0)
+        compactness_component = 1.0 - self.clamp(
+            price_span_bps / max(max_span, 1e-12),
+            0.0,
+            1.0,
+        )
 
         proximity_component = 0.5
         if current_mid_price is not None and current_mid_price > 0:
-            cluster_price = mean(wall.price for wall in walls)
+            cluster_price = self._mean_or_zero(wall.price for wall in walls)
             distance = self.bps_distance(cluster_price, current_mid_price)
-            max_distance = max(self.config.wall_detection.max_distance_from_mid_bps, 1e-12)
-            proximity_component = 1.0 - self.clamp(distance / max_distance, 0.0, 1.0)
+            max_distance = max(
+                self.config.wall_detection.max_distance_from_mid_bps,
+                1e-12,
+            )
+            proximity_component = 1.0 - self.clamp(
+                distance / max_distance,
+                0.0,
+                1.0,
+            )
 
         value = (
-            0.20 * layers_component +
-            0.25 * notional_component +
-            0.30 * sync_component +
-            0.15 * compactness_component +
-            0.10 * proximity_component
+            0.20 * layers_component
+            + 0.25 * notional_component
+            + 0.30 * sync_component
+            + 0.15 * compactness_component
+            + 0.10 * proximity_component
         )
         return self.clamp(value, 0.0, 1.0)
 
@@ -648,10 +669,25 @@ class LayeringDetector(BaseSpoofingDetector):
     # Filters / helpers
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _filter_walls(
+        *,
+        walls: Iterable[TrackedWall],
+        exchange: str | None,
+        symbol: str | None,
+    ) -> list[TrackedWall]:
+        return [
+            wall
+            for wall in walls
+            if (exchange is None or wall.exchange == exchange)
+            and (symbol is None or wall.symbol == symbol)
+        ]
+
     def _is_relevant_wall(
-            self,
-            wall: TrackedWall,
-            current_mid_price: float | None = None,
+        self,
+        *,
+        wall: TrackedWall,
+        current_mid_price: float | None = None,
     ) -> bool:
         if wall.max_size <= 0 or wall.price <= 0:
             return False
@@ -659,13 +695,7 @@ class LayeringDetector(BaseSpoofingDetector):
         if wall.price * wall.max_size < self.config.wall_detection.min_wall_size_abs:
             return False
 
-        if (
-                wall.state != OrderbookWallState.ACTIVE
-                and wall.state != OrderbookWallState.WEAKENING
-                and wall.state != OrderbookWallState.PULLED
-                and wall.state != OrderbookWallState.EXPIRED
-                and wall.state != OrderbookWallState.FILLED
-        ):
+        if wall.state not in self._candidate_wall_states():
             return False
 
         if current_mid_price is not None and current_mid_price > 0:
@@ -673,9 +703,25 @@ class LayeringDetector(BaseSpoofingDetector):
             if distance > self.config.wall_detection.max_distance_from_mid_bps * 2.0:
                 return False
 
+        if wall.side not in {SpoofingSide.BID, SpoofingSide.ASK}:
+            return False
+
         return True
+
+    @staticmethod
+    def _group_walls_by_market_side(
+        walls: Iterable[TrackedWall],
+    ) -> dict[tuple[str, str, SpoofingSide], list[TrackedWall]]:
+        groups: dict[tuple[str, str, SpoofingSide], list[TrackedWall]] = {}
+
+        for wall in walls:
+            key = (wall.exchange, wall.symbol, wall.side)
+            groups.setdefault(key, []).append(wall)
+
+        return groups
+
+    @staticmethod
     def _sort_walls_for_side(
-        self,
         walls: list[TrackedWall],
         side: SpoofingSide,
     ) -> list[TrackedWall]:
@@ -683,30 +729,27 @@ class LayeringDetector(BaseSpoofingDetector):
             return sorted(walls, key=lambda item: item.price, reverse=True)
         return sorted(walls, key=lambda item: item.price)
 
+    @staticmethod
     def _resolve_cluster_wall_id(
-        self,
         walls: list[TrackedWall],
     ) -> str | None:
         if not walls:
             return None
-        # беремо wall з найбільшим notional як representative id
+
         strongest = max(walls, key=lambda item: item.price * item.max_size)
         return strongest.wall_id
 
+    @staticmethod
     def _resolve_cluster_reference_mid(
-            self,
-            cluster: LayeringCluster,
+        cluster: LayeringCluster,
     ) -> float | None:
-        mids: list[float] = []
-
-        for wall in cluster.walls:
-            mid = wall.mid_price_at_creation
-            if mid is not None and mid > 0:
-                mids.append(mid)
-
+        mids = [
+            wall.mid_price_at_creation
+            for wall in cluster.walls
+            if wall.mid_price_at_creation is not None and wall.mid_price_at_creation > 0
+        ]
         if not mids:
             return None
-
         return mean(mids)
 
     def _normalize_total_notional(self, total_notional: float) -> float:
@@ -718,7 +761,10 @@ class LayeringDetector(BaseSpoofingDetector):
         self,
         cluster: LayeringCluster,
     ) -> bool:
-        return any((wall.touch_count > 0 or wall.near_touch_count > 0) for wall in cluster.walls)
+        return any(
+            wall.touch_count > 0 or wall.near_touch_count > 0
+            for wall in cluster.walls
+        )
 
     def _cluster_fast_pull(
         self,
@@ -746,15 +792,55 @@ class LayeringDetector(BaseSpoofingDetector):
 
         return int(mean(counts)) if counts else 0
 
-    def _cluster_key(
-        self,
-        cluster: LayeringCluster,
-    ) -> str:
+    @staticmethod
+    def _cluster_key(cluster: LayeringCluster) -> str:
         wall_ids = sorted(wall.wall_id for wall in cluster.walls)
         return f"{cluster.exchange}:{cluster.symbol}:{cluster.side.value}:{'|'.join(wall_ids)}"
 
+    @staticmethod
+    def _candidate_wall_states() -> set[OrderbookWallState]:
+        return {
+            OrderbookWallState.ACTIVE,
+            OrderbookWallState.WEAKENING,
+            OrderbookWallState.PULLED,
+            OrderbookWallState.EXPIRED,
+            OrderbookWallState.FILLED,
+        }
+
+    @staticmethod
+    def _removed_or_weakened_states() -> set[OrderbookWallState]:
+        return {
+            OrderbookWallState.WEAKENING,
+            OrderbookWallState.PULLED,
+            OrderbookWallState.EXPIRED,
+            OrderbookWallState.FILLED,
+        }
+
+    @staticmethod
+    def _compute_cancel_to_fill_ratio(
+        *,
+        pull_ratio: float,
+        fill_ratio: float,
+    ) -> float:
+        if fill_ratio > 0:
+            return pull_ratio / fill_ratio
+        if pull_ratio > 0:
+            return pull_ratio
+        return 0.0
+
+    def _cluster_max_span_bps(self, cluster: LayeringCluster) -> float:
+        return self.config.layering.max_price_gap_bps_between_layers * max(
+            len(cluster.walls) - 1,
+            1,
+        )
+
+    @staticmethod
+    def _mean_or_zero(values: Iterable[float]) -> float:
+        items = [max(value, 0.0) for value in values]
+        return mean(items) if items else 0.0
+
+    @staticmethod
     def _build_reason(
-        self,
         *,
         cluster: LayeringCluster,
         price_reaction_bps: float,
@@ -770,3 +856,6 @@ class LayeringDetector(BaseSpoofingDetector):
             f"layering_score={cluster.layering_score:.4f}, "
             f"price_reaction_bps={price_reaction_bps:.4f}"
         )
+
+
+__all__ = ["LayeringDetector"]

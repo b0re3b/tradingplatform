@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import timedelta
 from hashlib import sha1
-from typing import Any, Iterable
+from typing import Iterable
+
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
 
 from .base import BaseSpoofingModule
 from .config import SpoofingConfig
@@ -16,6 +19,7 @@ from .enums import (
     SpoofingType,
 )
 from .models import (
+    AggregationContext,
     DetectorResult,
     ScoreContribution,
     SpoofingFeatures,
@@ -24,47 +28,41 @@ from .models import (
 )
 
 
-@dataclass(slots=True)
-class AggregationContext:
-    """
-    Внутрішній контейнер агрегованого стану перед побудовою фінального score.
-    """
-    symbol: str
-    exchange: str
-    price: float
-    features: SpoofingFeatures
-    detector_results: list[DetectorResult]
-    agreement_ratio: float
-    average_confidence: float
-    primary_pattern: SpoofingPattern
-    spoofing_type: SpoofingType
-    wall_id: str | None
-
-
 class SpoofingScoreEngine(BaseSpoofingModule):
     """
-    Aggregation/scoring engine для spoofing-пакета.
+    Aggregation/scoring engine для analytics.spoofing.
 
     Відповідає за:
-    - збирання detector results у єдиний контекст
-    - побудову contribution breakdown
-    - розрахунок фінального spoofing score
-    - визначення severity
-    - побудову фінального SpoofingSignal
+    - фільтрацію позитивних detector results;
+    - збирання detector results у єдиний AggregationContext;
+    - merge SpoofingFeatures;
+    - побудову contribution breakdown;
+    - розрахунок фінального spoofing score;
+    - визначення severity;
+    - побудову фінального SpoofingSignal.
 
     Важливо:
-    - цей модуль не виявляє патерн самостійно
-    - він агрегує результати окремих detector-ів
+    - не виявляє spoofing самостійно;
+    - не підписується на EventBus;
+    - не публікує події;
+    - не запускає Scheduler jobs;
+    - працює як pure aggregation/scoring component.
     """
 
     component = SpoofingComponent.SPOOFING_SCORE
 
     def __init__(
         self,
-        event_bus: Any | None,
+        *,
+        event_bus: EventBus | None,
+        scheduler: Scheduler | None,
         config: SpoofingConfig,
     ) -> None:
-        super().__init__(event_bus=event_bus, config=config)
+        super().__init__(
+            event_bus=event_bus,
+            scheduler=scheduler,
+            config=config,
+        )
 
     # -------------------------------------------------------------------------
     # Public API
@@ -78,8 +76,11 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         exchange: str | None = None,
     ) -> SpoofingScore | None:
         """
-        Рахує фінальний spoofing score на основі detector results.
+        Рахує фінальний SpoofingScore на основі detector results.
         """
+        if not self.config.enabled or not self.config.scoring.enabled:
+            return None
+
         context = self._build_aggregation_context(
             detector_results=detector_results,
             symbol=symbol,
@@ -113,6 +114,7 @@ class SpoofingScoreEngine(BaseSpoofingModule):
                 "primary_pattern": context.primary_pattern.value,
                 "spoofing_type": context.spoofing_type.value,
                 "detector_count": len(context.detector_results),
+                "wall_id": context.wall_id,
             },
         )
 
@@ -125,8 +127,11 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         status: SpoofingStatus = SpoofingStatus.DETECTED,
     ) -> SpoofingSignal | None:
         """
-        Будує фінальний spoofing signal із detector results.
+        Будує фінальний SpoofingSignal із detector results.
         """
+        if not self.config.enabled or not self.config.scoring.enabled:
+            return None
+
         context = self._build_aggregation_context(
             detector_results=detector_results,
             symbol=symbol,
@@ -153,18 +158,10 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         )
 
         detected_at = self.now()
-        first_seen_at = detected_at
-
-        # якщо є lifetime, намагаємось зсунути first_seen назад
-        if context.features.lifetime_ms > 0:
-            try:
-                delta_seconds = context.features.lifetime_ms / 1000.0
-                first_seen_at = detected_at.fromtimestamp(
-                    detected_at.timestamp() - delta_seconds,
-                    tz=detected_at.tzinfo,
-                )
-            except Exception:
-                first_seen_at = detected_at
+        first_seen_at = self._resolve_first_seen_at(
+            detected_at=detected_at,
+            features=context.features,
+        )
 
         return SpoofingSignal(
             signal_id=signal_id,
@@ -188,6 +185,8 @@ class SpoofingScoreEngine(BaseSpoofingModule):
                 "agreement_ratio": context.agreement_ratio,
                 "average_confidence": context.average_confidence,
                 "detector_count": len(context.detector_results),
+                "passed": score.passed,
+                "threshold": score.threshold,
             },
         )
 
@@ -199,7 +198,7 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         exchange: str | None = None,
     ) -> bool:
         """
-        Чи достатній score для генерації detection event.
+        Перевіряє, чи достатній score для detection event.
         """
         score = self.score(
             detector_results=detector_results,
@@ -219,23 +218,11 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         symbol: str | None = None,
         exchange: str | None = None,
     ) -> AggregationContext | None:
-        results = [
-            result for result in detector_results
-            if result is not None and result.decision == DetectorDecision.POSITIVE
-        ]
-
-        if symbol is not None:
-            results = [
-                result for result in results
-                if result.features is not None and result.features.symbol == symbol
-            ]
-
-        if exchange is not None:
-            results = [
-                result for result in results
-                if result.features is not None and result.features.exchange == exchange
-            ]
-
+        results = self._filter_positive_results(
+            detector_results=detector_results,
+            symbol=symbol,
+            exchange=exchange,
+        )
         if not results:
             return None
 
@@ -246,7 +233,10 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         agreement_ratio = self._compute_agreement_ratio(results)
         average_confidence = self._compute_average_confidence(results)
         primary_pattern = self._resolve_primary_pattern(results)
-        spoofing_type = self._resolve_spoofing_type(results, primary_pattern)
+        spoofing_type = self._resolve_spoofing_type(
+            results=results,
+            primary_pattern=primary_pattern,
+        )
         wall_id = self._resolve_wall_id(results)
 
         return AggregationContext(
@@ -262,11 +252,46 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             wall_id=wall_id,
         )
 
+    @staticmethod
+    def _filter_positive_results(
+        *,
+        detector_results: Iterable[DetectorResult],
+        symbol: str | None,
+        exchange: str | None,
+    ) -> list[DetectorResult]:
+        results = [
+            result
+            for result in detector_results
+            if result is not None
+            and result.decision == DetectorDecision.POSITIVE
+            and result.features is not None
+        ]
+
+        if symbol is not None:
+            results = [
+                result
+                for result in results
+                if result.features is not None and result.features.symbol == symbol
+            ]
+
+        if exchange is not None:
+            results = [
+                result
+                for result in results
+                if result.features is not None and result.features.exchange == exchange
+            ]
+
+        return results
+
     def _merge_features(
         self,
         results: list[DetectorResult],
     ) -> SpoofingFeatures | None:
-        feature_list = [result.features for result in results if result.features is not None]
+        feature_list = [
+            result.features
+            for result in results
+            if result.features is not None
+        ]
         if not feature_list:
             return None
 
@@ -274,31 +299,49 @@ class SpoofingScoreEngine(BaseSpoofingModule):
 
         wall_size = max((item.wall_size for item in feature_list), default=0.0)
         wall_size_ratio = max((item.wall_size_ratio for item in feature_list), default=0.0)
-        distance_from_mid_bps = min(
-            (item.distance_from_mid_bps for item in feature_list if item.distance_from_mid_bps >= 0),
-            default=0.0,
-        )
+
+        distance_values = [
+            item.distance_from_mid_bps
+            for item in feature_list
+            if item.distance_from_mid_bps >= 0
+        ]
+        distance_from_mid_bps = min(distance_values) if distance_values else 0.0
+
         lifetime_ms = max((item.lifetime_ms for item in feature_list), default=0.0)
         updates_count = max((item.updates_count for item in feature_list), default=0)
         repetition_count = max((item.repetition_count for item in feature_list), default=0)
 
         fill_ratio = max((item.fill_ratio for item in feature_list), default=0.0)
         pull_ratio = max((item.pull_ratio for item in feature_list), default=0.0)
-        cancel_to_fill_ratio = max((item.cancel_to_fill_ratio for item in feature_list), default=0.0)
+        cancel_to_fill_ratio = max(
+            (item.cancel_to_fill_ratio for item in feature_list),
+            default=0.0,
+        )
 
-        price_reaction_bps = max((item.price_reaction_bps for item in feature_list), default=0.0)
-        pressure_flip_strength = max((item.pressure_flip_strength for item in feature_list), default=0.0)
-        layering_score = max((item.layering_score for item in feature_list), default=0.0)
+        price_reaction_bps = max(
+            (item.price_reaction_bps for item in feature_list),
+            default=0.0,
+        )
+        pressure_flip_strength = max(
+            (item.pressure_flip_strength for item in feature_list),
+            default=0.0,
+        )
+        layering_score = max(
+            (item.layering_score for item in feature_list),
+            default=0.0,
+        )
 
-        is_near_best_quote = any(item.is_near_best_quote for item in feature_list)
-        is_fast_pull = any(item.is_fast_pull for item in feature_list)
-        is_fake_liquidity = any(item.is_fake_liquidity for item in feature_list)
-        is_layering = any(item.is_layering for item in feature_list)
+        merged_metadata: dict[str, object] = {}
+        detector_names: list[str] = []
 
-        merged_metadata: dict[str, Any] = {}
+        for result in results:
+            detector_names.append(result.detector.value)
+
         for item in feature_list:
             if item.metadata:
                 merged_metadata.update(item.metadata)
+
+        merged_metadata["detectors"] = detector_names
 
         return SpoofingFeatures(
             symbol=base.symbol,
@@ -317,10 +360,10 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             price_reaction_bps=price_reaction_bps,
             pressure_flip_strength=pressure_flip_strength,
             layering_score=layering_score,
-            is_near_best_quote=is_near_best_quote,
-            is_fast_pull=is_fast_pull,
-            is_fake_liquidity=is_fake_liquidity,
-            is_layering=is_layering,
+            is_near_best_quote=any(item.is_near_best_quote for item in feature_list),
+            is_fast_pull=any(item.is_fast_pull for item in feature_list),
+            is_fake_liquidity=any(item.is_fake_liquidity for item in feature_list),
+            is_layering=any(item.is_layering for item in feature_list),
             metadata=merged_metadata,
         )
 
@@ -328,17 +371,18 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         if not results:
             return 0.0
 
-        positive_count = sum(1 for result in results if result.decision == DetectorDecision.POSITIVE)
-        ratio = positive_count / max(len(results), 1)
-        return self.clamp(ratio, 0.0, 1.0)
+        detector_count = len({result.detector for result in results})
+        return self.clamp(detector_count / max(len(SpoofingComponent), 1), 0.0, 1.0)
 
     def _compute_average_confidence(self, results: list[DetectorResult]) -> float:
         if not results:
             return 0.0
+
         value = sum(result.confidence for result in results) / len(results)
         return self.clamp(value, 0.0, 1.0)
 
-    def _resolve_primary_pattern(self, results: list[DetectorResult]) -> SpoofingPattern:
+    @staticmethod
+    def _resolve_primary_pattern(results: list[DetectorResult]) -> SpoofingPattern:
         if not results:
             return SpoofingPattern.UNKNOWN
 
@@ -352,8 +396,9 @@ class SpoofingScoreEngine(BaseSpoofingModule):
 
         return max(weights.items(), key=lambda item: item[1])[0]
 
+    @staticmethod
     def _resolve_spoofing_type(
-        self,
+        *,
         results: list[DetectorResult],
         primary_pattern: SpoofingPattern,
     ) -> SpoofingType:
@@ -375,7 +420,8 @@ class SpoofingScoreEngine(BaseSpoofingModule):
 
         return SpoofingType.UNKNOWN
 
-    def _resolve_wall_id(self, results: list[DetectorResult]) -> str | None:
+    @staticmethod
+    def _resolve_wall_id(results: list[DetectorResult]) -> str | None:
         wall_ids = [result.wall_id for result in results if result.wall_id]
         if not wall_ids:
             return None
@@ -397,7 +443,7 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         features = context.features
         cfg = self.config.scoring
 
-        contributions = [
+        return [
             self._make_contribution(
                 component=ScoreComponent.WALL_SIZE,
                 raw_value=features.wall_size_ratio,
@@ -442,7 +488,10 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             ),
             self._make_contribution(
                 component=ScoreComponent.PRICE_REACTION,
-                raw_value=max(features.price_reaction_bps, features.pressure_flip_strength),
+                raw_value=max(
+                    features.price_reaction_bps,
+                    features.pressure_flip_strength,
+                ),
                 normalized_value=self._normalize_price_reaction(
                     price_reaction_bps=features.price_reaction_bps,
                     pressure_flip_strength=features.pressure_flip_strength,
@@ -469,8 +518,6 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             ),
         ]
 
-        return contributions
-
     def _make_contribution(
         self,
         *,
@@ -481,13 +528,14 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         description: str,
     ) -> ScoreContribution:
         normalized = self.clamp(normalized_value, 0.0, 1.0)
-        contribution = normalized * max(weight, 0.0)
+        safe_weight = max(weight, 0.0)
+        contribution = normalized * safe_weight
 
         return ScoreContribution(
             component=component,
             raw_value=raw_value,
             normalized_value=normalized,
-            weight=weight,
+            weight=safe_weight,
             contribution=contribution,
             description=description,
         )
@@ -496,13 +544,12 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         self,
         contributions: list[ScoreContribution],
     ) -> float:
-        total_weight = sum(max(item.weight, 0.0) for item in contributions)
+        total_weight = sum(item.weight for item in contributions)
         if total_weight <= 0:
             return 0.0
 
         weighted_sum = sum(item.contribution for item in contributions)
-        score = weighted_sum / total_weight
-        return self.clamp(score, 0.0, 1.0)
+        return self.clamp(weighted_sum / total_weight, 0.0, 1.0)
 
     def _compute_final_confidence(
         self,
@@ -581,7 +628,6 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         cancel_to_fill_ratio: float,
     ) -> float:
         fill_component = 1.0 - self.clamp(fill_ratio, 0.0, 1.0)
-
         ratio_component = self.clamp(cancel_to_fill_ratio / 3.0, 0.0, 1.0)
         value = 0.60 * fill_component + 0.40 * ratio_component
         return self.clamp(value, 0.0, 1.0)
@@ -594,14 +640,13 @@ class SpoofingScoreEngine(BaseSpoofingModule):
     ) -> float:
         reaction_part = self.clamp(price_reaction_bps / 10.0, 0.0, 1.0)
         pressure_part = self.clamp(pressure_flip_strength, 0.0, 1.0)
-        value = max(reaction_part, pressure_part)
-        return self.clamp(value, 0.0, 1.0)
+        return self.clamp(max(reaction_part, pressure_part), 0.0, 1.0)
 
     def _normalize_repetition(self, repetition_count: int) -> float:
         if repetition_count <= 0:
             return 0.0
-        value = repetition_count / 10.0
-        return self.clamp(value, 0.0, 1.0)
+
+        return self.clamp(repetition_count / 10.0, 0.0, 1.0)
 
     def _normalize_layering(
         self,
@@ -610,16 +655,32 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         is_layering: bool,
     ) -> float:
         base = self.clamp(layering_score, 0.0, 1.0)
+
         if is_layering and base < 0.5:
             base = 0.5
+
         return self.clamp(base, 0.0, 1.0)
 
     # -------------------------------------------------------------------------
     # Signal helpers
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_first_seen_at(
+        *,
+        detected_at,
+        features: SpoofingFeatures,
+    ):
+        if features.lifetime_ms <= 0:
+            return detected_at
+
+        try:
+            return detected_at - timedelta(milliseconds=features.lifetime_ms)
+        except Exception:
+            return detected_at
+
+    @staticmethod
     def _build_signal_id(
-        self,
         *,
         exchange: str,
         symbol: str,
@@ -628,6 +689,12 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         pattern: SpoofingPattern,
         price: float,
     ) -> str:
-        raw = f"{exchange}|{symbol}|{wall_id or 'none'}|{spoofing_type.value}|{pattern.value}|{price:.12f}"
+        raw = (
+            f"{exchange}|{symbol}|{wall_id or 'none'}|"
+            f"{spoofing_type.value}|{pattern.value}|{price:.12f}"
+        )
         digest = sha1(raw.encode("utf-8")).hexdigest()[:16]
         return f"spoof-{digest}"
+
+
+__all__ = ["SpoofingScoreEngine"]
