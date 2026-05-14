@@ -4,7 +4,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Optional
+from typing import Any
 
 from analytics.whales.enums import (
     LargeTradeTriggerType,
@@ -17,28 +17,62 @@ from analytics.whales.enums import (
 
 
 # =============================================================================
-# Base models
+# Common helpers
+# =============================================================================
+
+
+def utc_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_non_negative(value: float) -> float:
+    return max(0.0, value)
+
+
+def _clamp_0_1(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+# =============================================================================
+# Base signal model
 # =============================================================================
 
 
 @dataclass(slots=True)
-class WhaleBaseEventModel:
+class WhaleBaseSignalModel:
     """
     Базова модель для всіх whale-сигналів.
+
+    Важливо:
+    - це не core.event_bus.Event;
+    - to_payload() повертає dict payload для EventBus.emit(...);
+    - runtime-компонент сам обгортає payload у EventBus.emit().
     """
 
     detector_name: str
     event_type: str
     schema_version: int = 1
-    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    created_at_ms: int = field(default_factory=utc_now_ms)
 
-    def to_event(self) -> Dict[str, Any]:
+    def to_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "event_type": self.event_type,
             "detector": self.detector_name,
             "created_at_ms": self.created_at_ms,
         }
+
+    def to_event(self) -> dict[str, Any]:
+        """
+        Backward-compatible alias.
+
+        Новий runtime-код має використовувати to_payload().
+        """
+        return self.to_payload()
+
+
+# Backward-compatible alias for old imports.
+WhaleBaseEventModel = WhaleBaseSignalModel
 
 
 # =============================================================================
@@ -49,7 +83,7 @@ class WhaleBaseEventModel:
 @dataclass(slots=True)
 class TradeRecord:
     """
-    Нормалізований raw trade record.
+    Нормалізований raw trade record після прийому market.trade payload.
     """
 
     symbol: str
@@ -57,13 +91,28 @@ class TradeRecord:
     quantity: float
     side: str
     timestamp_ms: int
-    trade_id: Optional[str] = None
-    exchange: Optional[str] = None
-    raw_event: Optional[Dict[str, Any]] = None
+    trade_id: str | None = None
+    exchange: str | None = None
+    raw_event: dict[str, Any] | None = None
 
     @property
     def notional(self) -> float:
         return self.price * self.quantity
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "symbol": self.symbol,
+            "price": self.price,
+            "quantity": self.quantity,
+            "side": self.side,
+            "timestamp_ms": self.timestamp_ms,
+            "trade_id": self.trade_id,
+            "exchange": self.exchange,
+            "notional": self.notional,
+        }
+        if include_raw:
+            payload["raw_event"] = self.raw_event
+        return payload
 
 
 @dataclass(slots=True)
@@ -80,15 +129,32 @@ class WhaleTradeRecord:
     timestamp_ms: int
     zscore: float = 0.0
     trigger_type: str = LargeTradeTriggerType.UNKNOWN.value
-    trade_id: Optional[str] = None
-    exchange: Optional[str] = None
-    raw_event: Optional[Dict[str, Any]] = None
+    trade_id: str | None = None
+    exchange: str | None = None
+    raw_event: dict[str, Any] | None = None
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "symbol": self.symbol,
+            "side": self.side,
+            "notional": self.notional,
+            "price": self.price,
+            "quantity": self.quantity,
+            "timestamp_ms": self.timestamp_ms,
+            "zscore": self.zscore,
+            "trigger_type": self.trigger_type,
+            "trade_id": self.trade_id,
+            "exchange": self.exchange,
+        }
+        if include_raw:
+            payload["raw_event"] = self.raw_event
+        return payload
 
 
 @dataclass(slots=True)
 class LiquidationRecord:
     """
-    Нормалізований liquidation record.
+    Нормалізований liquidation record після прийому market.liquidation payload.
     """
 
     symbol: str
@@ -97,9 +163,24 @@ class LiquidationRecord:
     price: float
     quantity: float
     timestamp_ms: int
-    liquidation_id: Optional[str] = None
-    exchange: Optional[str] = None
-    raw_event: Optional[Dict[str, Any]] = None
+    liquidation_id: str | None = None
+    exchange: str | None = None
+    raw_event: dict[str, Any] | None = None
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "symbol": self.symbol,
+            "side": self.side,
+            "notional": self.notional,
+            "price": self.price,
+            "quantity": self.quantity,
+            "timestamp_ms": self.timestamp_ms,
+            "liquidation_id": self.liquidation_id,
+            "exchange": self.exchange,
+        }
+        if include_raw:
+            payload["raw_event"] = self.raw_event
+        return payload
 
 
 @dataclass(slots=True)
@@ -112,7 +193,22 @@ class WhaleActivityRecord:
     max_notional: float
     window_sec: int
     timestamp_ms: int
-    raw_event: Optional[Dict[str, Any]] = None
+    raw_event: dict[str, Any] | None = None
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "symbol": self.symbol,
+            "side": self.side,
+            "trade_count": self.trade_count,
+            "total_notional": self.total_notional,
+            "avg_notional": self.avg_notional,
+            "max_notional": self.max_notional,
+            "window_sec": self.window_sec,
+            "timestamp_ms": self.timestamp_ms,
+        }
+        if include_raw:
+            payload["raw_event"] = self.raw_event
+        return payload
 
 
 @dataclass(slots=True)
@@ -128,7 +224,33 @@ class WhalePressureRecord:
     net_flow_notional: float
     window_sec: int
     timestamp_ms: int
-    raw_event: Optional[Dict[str, Any]] = None
+    raw_event: dict[str, Any] | None = None
+
+    @property
+    def pressure_type(self) -> str:
+        return WhalePressureType.from_notional(
+            buy_notional=self.buy_notional,
+            sell_notional=self.sell_notional,
+        ).value
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "symbol": self.symbol,
+            "dominant_side": self.dominant_side,
+            "buy_trade_count": self.buy_trade_count,
+            "sell_trade_count": self.sell_trade_count,
+            "buy_notional": self.buy_notional,
+            "sell_notional": self.sell_notional,
+            "total_notional": self.total_notional,
+            "imbalance_ratio": self.imbalance_ratio,
+            "net_flow_notional": self.net_flow_notional,
+            "pressure_type": self.pressure_type,
+            "window_sec": self.window_sec,
+            "timestamp_ms": self.timestamp_ms,
+        }
+        if include_raw:
+            payload["raw_event"] = self.raw_event
+        return payload
 
 
 @dataclass(slots=True)
@@ -142,7 +264,23 @@ class WhaleLiquidationContextRecord:
     liquidation_count: int
     context_strength: float
     timestamp_ms: int
-    raw_event: Optional[Dict[str, Any]] = None
+    raw_event: dict[str, Any] | None = None
+
+    def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "symbol": self.symbol,
+            "whale_side": self.whale_side,
+            "whale_total_notional": self.whale_total_notional,
+            "whale_trade_count": self.whale_trade_count,
+            "liquidation_side": self.liquidation_side,
+            "liquidation_total_notional": self.liquidation_total_notional,
+            "liquidation_count": self.liquidation_count,
+            "context_strength": self.context_strength,
+            "timestamp_ms": self.timestamp_ms,
+        }
+        if include_raw:
+            payload["raw_event"] = self.raw_event
+        return payload
 
 
 # =============================================================================
@@ -151,7 +289,7 @@ class WhaleLiquidationContextRecord:
 
 
 @dataclass(slots=True)
-class LargeTradeSignal(WhaleBaseEventModel):
+class LargeTradeSignal(WhaleBaseSignalModel):
     symbol: str = ""
     side: str = WhaleTradeSide.UNKNOWN.value
     price: float = 0.0
@@ -165,15 +303,15 @@ class LargeTradeSignal(WhaleBaseEventModel):
     zscore: float = 0.0
 
     trigger_type: str = LargeTradeTriggerType.UNKNOWN.value
-    trade_id: Optional[str] = None
-    exchange: Optional[str] = None
+    trade_id: str | None = None
+    exchange: str | None = None
 
     detector_name: str = "LargeTradeDetector"
     event_type: str = WhaleEventType.LARGE_TRADE.value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "side": self.side,
@@ -190,11 +328,42 @@ class LargeTradeSignal(WhaleBaseEventModel):
                 "exchange": self.exchange,
             }
         )
-        return base
+        return payload
+
+    @classmethod
+    def from_trade(
+        cls,
+        *,
+        trade: TradeRecord,
+        abs_threshold: float,
+        mean_notional: float,
+        std_notional: float,
+        zscore: float,
+        absolute_triggered: bool,
+        relative_triggered: bool,
+    ) -> LargeTradeSignal:
+        return cls(
+            symbol=trade.symbol,
+            side=trade.side,
+            price=trade.price,
+            quantity=trade.quantity,
+            notional=trade.notional,
+            timestamp_ms=trade.timestamp_ms,
+            abs_threshold=abs_threshold,
+            mean_notional=mean_notional,
+            std_notional=std_notional,
+            zscore=zscore,
+            trigger_type=LargeTradeTriggerType.from_flags(
+                absolute_triggered=absolute_triggered,
+                relative_triggered=relative_triggered,
+            ).value,
+            trade_id=trade.trade_id,
+            exchange=trade.exchange,
+        )
 
 
 @dataclass(slots=True)
-class WhaleActivitySignal(WhaleBaseEventModel):
+class WhaleActivitySignal(WhaleBaseSignalModel):
     symbol: str = ""
     side: str = WhaleTradeSide.UNKNOWN.value
     trade_count: int = 0
@@ -207,9 +376,9 @@ class WhaleActivitySignal(WhaleBaseEventModel):
     detector_name: str = "WhaleTracker"
     event_type: str = WhaleEventType.WHALE_ACTIVITY.value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "side": self.side,
@@ -221,11 +390,11 @@ class WhaleActivitySignal(WhaleBaseEventModel):
                 "timestamp_ms": self.timestamp_ms,
             }
         )
-        return base
+        return payload
 
 
 @dataclass(slots=True)
-class WhalePressureSignal(WhaleBaseEventModel):
+class WhalePressureSignal(WhaleBaseSignalModel):
     symbol: str = ""
     dominant_side: str = WhaleTradeSide.UNKNOWN.value
     buy_trade_count: int = 0
@@ -243,15 +412,14 @@ class WhalePressureSignal(WhaleBaseEventModel):
 
     @property
     def pressure_type(self) -> str:
-        if self.buy_notional > self.sell_notional:
-            return WhalePressureType.BUY_PRESSURE.value
-        if self.sell_notional > self.buy_notional:
-            return WhalePressureType.SELL_PRESSURE.value
-        return WhalePressureType.BALANCED.value
+        return WhalePressureType.from_notional(
+            buy_notional=self.buy_notional,
+            sell_notional=self.sell_notional,
+        ).value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "dominant_side": self.dominant_side,
@@ -267,11 +435,11 @@ class WhalePressureSignal(WhaleBaseEventModel):
                 "timestamp_ms": self.timestamp_ms,
             }
         )
-        return base
+        return payload
 
 
 @dataclass(slots=True)
-class WhaleLiquidationContextSignal(WhaleBaseEventModel):
+class WhaleLiquidationContextSignal(WhaleBaseSignalModel):
     symbol: str = ""
     whale_side: str = WhaleTradeSide.UNKNOWN.value
     whale_total_notional: float = 0.0
@@ -285,9 +453,9 @@ class WhaleLiquidationContextSignal(WhaleBaseEventModel):
     detector_name: str = "WhaleTracker"
     event_type: str = WhaleEventType.WHALE_LIQUIDATION_CONTEXT.value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "whale_side": self.whale_side,
@@ -300,11 +468,11 @@ class WhaleLiquidationContextSignal(WhaleBaseEventModel):
                 "timestamp_ms": self.timestamp_ms,
             }
         )
-        return base
+        return payload
 
 
 @dataclass(slots=True)
-class WhaleClusterSignal(WhaleBaseEventModel):
+class WhaleClusterSignal(WhaleBaseSignalModel):
     symbol: str = ""
     cluster_side: str = WhaleTradeSide.UNKNOWN.value
     cluster_score: float = 0.0
@@ -330,25 +498,18 @@ class WhaleClusterSignal(WhaleBaseEventModel):
 
     @property
     def bias(self) -> str:
-        if self.cluster_side == WhaleTradeSide.BUY.value:
-            return WhaleBias.BULLISH.value
-        if self.cluster_side == WhaleTradeSide.SELL.value:
-            return WhaleBias.BEARISH.value
-        return WhaleBias.UNKNOWN.value
+        return WhaleBias.from_side(self.cluster_side).value
 
     @property
     def state(self) -> str:
-        if self.exhaustion_probability >= 0.7:
-            return WhaleClusterStateType.EXHAUSTING.value
-        if self.cluster_score >= 0.6:
-            return WhaleClusterStateType.ACTIVE.value
-        if self.cluster_score > 0.0:
-            return WhaleClusterStateType.FORMING.value
-        return WhaleClusterStateType.INACTIVE.value
+        return WhaleClusterStateType.from_scores(
+            cluster_score=self.cluster_score,
+            exhaustion_probability=self.exhaustion_probability,
+        ).value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "cluster_side": self.cluster_side,
@@ -370,11 +531,11 @@ class WhaleClusterSignal(WhaleBaseEventModel):
                 "cluster_state": self.state,
             }
         )
-        return base
+        return payload
 
 
 @dataclass(slots=True)
-class WhaleClusterUpdateSignal(WhaleBaseEventModel):
+class WhaleClusterUpdateSignal(WhaleBaseSignalModel):
     symbol: str = ""
     cluster_side: str = WhaleTradeSide.UNKNOWN.value
     cluster_score: float = 0.0
@@ -389,9 +550,9 @@ class WhaleClusterUpdateSignal(WhaleBaseEventModel):
     detector_name: str = "WhaleClusterAnalyzer"
     event_type: str = WhaleEventType.WHALE_CLUSTER_UPDATE.value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "cluster_side": self.cluster_side,
@@ -405,11 +566,11 @@ class WhaleClusterUpdateSignal(WhaleBaseEventModel):
                 "timestamp_ms": self.timestamp_ms,
             }
         )
-        return base
+        return payload
 
 
 @dataclass(slots=True)
-class WhaleClusterExhaustionSignal(WhaleBaseEventModel):
+class WhaleClusterExhaustionSignal(WhaleBaseSignalModel):
     symbol: str = ""
     cluster_side: str = WhaleTradeSide.UNKNOWN.value
     cluster_score: float = 0.0
@@ -420,9 +581,9 @@ class WhaleClusterExhaustionSignal(WhaleBaseEventModel):
     detector_name: str = "WhaleClusterAnalyzer"
     event_type: str = WhaleEventType.WHALE_CLUSTER_EXHAUSTION.value
 
-    def to_event(self) -> Dict[str, Any]:
-        base = super().to_event()
-        base.update(
+    def to_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        payload.update(
             {
                 "symbol": self.symbol,
                 "cluster_side": self.cluster_side,
@@ -432,7 +593,7 @@ class WhaleClusterExhaustionSignal(WhaleBaseEventModel):
                 "timestamp_ms": self.timestamp_ms,
             }
         )
-        return base
+        return payload
 
 
 # =============================================================================
@@ -444,9 +605,11 @@ class WhaleClusterExhaustionSignal(WhaleBaseEventModel):
 class SymbolStats:
     """
     Rolling-статистика для LargeTradeDetector.
+
+    Це внутрішній state, не EventBus payload.
     """
 
-    notionals: Deque[float]
+    notionals: deque[float]
     trades_processed: int = 0
     signals_emitted: int = 0
     last_signal_ts_monotonic: float = 0.0
@@ -464,6 +627,8 @@ class SymbolStats:
         return len(self.notionals)
 
     def add(self, value: float, recalibration_interval: int) -> None:
+        value = _safe_non_negative(value)
+
         if self.notionals.maxlen is not None and len(self.notionals) == self.notionals.maxlen:
             evicted = self.notionals[0]
             self.running_sum -= evicted
@@ -481,27 +646,28 @@ class SymbolStats:
     def recalibrate(self) -> None:
         values = list(self.notionals)
         self.running_sum = math.fsum(values)
-        self.running_sum_sq = math.fsum(x * x for x in values)
+        self.running_sum_sq = math.fsum(value * value for value in values)
         self.updates_since_recalibration = 0
 
     def mean(self) -> float:
-        n = len(self.notionals)
-        if n == 0:
+        sample_size = len(self.notionals)
+        if sample_size == 0:
             return 0.0
-        return self.running_sum / n
+        return self.running_sum / sample_size
 
     def std(self) -> float:
-        n = len(self.notionals)
-        if n < 2:
+        sample_size = len(self.notionals)
+        if sample_size < 2:
             return 0.0
 
-        mean_value = self.running_sum / n
-        numerator = self.running_sum_sq - (n * mean_value * mean_value)
+        mean_value = self.running_sum / sample_size
+        numerator = self.running_sum_sq - sample_size * mean_value * mean_value
         numerator = max(numerator, 0.0)
-        variance = numerator / (n - 1)
+
+        variance = numerator / (sample_size - 1)
         return math.sqrt(max(variance, 0.0))
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "sample_size": self.sample_size,
             "trades_processed": self.trades_processed,
@@ -517,10 +683,12 @@ class SymbolStats:
 class SymbolTrackerState:
     """
     Rolling-state для WhaleTracker.
+
+    Це внутрішній state, не EventBus payload.
     """
 
-    large_trades: Deque[WhaleTradeRecord]
-    liquidations: Deque[LiquidationRecord]
+    large_trades: deque[WhaleTradeRecord]
+    liquidations: deque[LiquidationRecord]
 
     total_large_trades_seen: int = 0
     total_liquidations_seen: int = 0
@@ -538,7 +706,7 @@ class SymbolTrackerState:
     def touch(self) -> None:
         self.last_update_ts_monotonic = time.monotonic()
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "large_trades_buffer_size": len(self.large_trades),
             "liquidations_buffer_size": len(self.liquidations),
@@ -546,7 +714,9 @@ class SymbolTrackerState:
             "total_liquidations_seen": self.total_liquidations_seen,
             "whale_activity_signals_emitted": self.whale_activity_signals_emitted,
             "whale_pressure_signals_emitted": self.whale_pressure_signals_emitted,
-            "whale_liquidation_context_signals_emitted": self.whale_liquidation_context_signals_emitted,
+            "whale_liquidation_context_signals_emitted": (
+                self.whale_liquidation_context_signals_emitted
+            ),
             "last_update_ts_monotonic": self.last_update_ts_monotonic,
         }
 
@@ -555,19 +725,21 @@ class SymbolTrackerState:
 class SymbolClusterState:
     """
     Rolling-state для WhaleClusterAnalyzer.
+
+    Це внутрішній state, не EventBus payload.
     """
 
-    activity_records: Deque[WhaleActivityRecord]
-    pressure_records: Deque[WhalePressureRecord]
-    liquidation_context_records: Deque[WhaleLiquidationContextRecord]
+    activity_records: deque[WhaleActivityRecord]
+    pressure_records: deque[WhalePressureRecord]
+    liquidation_context_records: deque[WhaleLiquidationContextRecord]
 
     total_events_seen: int = 0
     total_clusters_emitted: int = 0
     total_cluster_updates_emitted: int = 0
     total_cluster_exhaustions_emitted: int = 0
 
-    cluster_first_seen_ts_ms: Optional[int] = None
-    cluster_last_seen_ts_ms: Optional[int] = None
+    cluster_first_seen_ts_ms: int | None = None
+    cluster_last_seen_ts_ms: int | None = None
 
     last_cluster_emit_ts_monotonic: float = 0.0
     last_cluster_update_emit_ts_monotonic: float = 0.0
@@ -578,7 +750,7 @@ class SymbolClusterState:
     def touch(self) -> None:
         self.last_update_ts_monotonic = time.monotonic()
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "activity_records_size": len(self.activity_records),
             "pressure_records_size": len(self.pressure_records),
@@ -600,24 +772,46 @@ class SymbolClusterState:
 
 @dataclass(slots=True)
 class WhaleTrackerResult:
-    whale_activity_signal: Optional[WhaleActivitySignal] = None
-    whale_pressure_signal: Optional[WhalePressureSignal] = None
-    whale_liquidation_context_signal: Optional[WhaleLiquidationContextSignal] = None
+    whale_activity_signal: WhaleActivitySignal | None = None
+    whale_pressure_signal: WhalePressureSignal | None = None
+    whale_liquidation_context_signal: WhaleLiquidationContextSignal | None = None
 
-    def to_dict(self) -> Dict[str, Optional[Dict[str, Any]]]:
+    @property
+    def has_signals(self) -> bool:
+        return any(
+            signal is not None
+            for signal in (
+                self.whale_activity_signal,
+                self.whale_pressure_signal,
+                self.whale_liquidation_context_signal,
+            )
+        )
+
+    def iter_signals(self) -> tuple[WhaleBaseSignalModel, ...]:
+        return tuple(
+            signal
+            for signal in (
+                self.whale_activity_signal,
+                self.whale_pressure_signal,
+                self.whale_liquidation_context_signal,
+            )
+            if signal is not None
+        )
+
+    def to_dict(self) -> dict[str, dict[str, Any] | None]:
         return {
             "whale_activity_signal": (
-                self.whale_activity_signal.to_event()
+                self.whale_activity_signal.to_payload()
                 if self.whale_activity_signal is not None
                 else None
             ),
             "whale_pressure_signal": (
-                self.whale_pressure_signal.to_event()
+                self.whale_pressure_signal.to_payload()
                 if self.whale_pressure_signal is not None
                 else None
             ),
             "whale_liquidation_context_signal": (
-                self.whale_liquidation_context_signal.to_event()
+                self.whale_liquidation_context_signal.to_payload()
                 if self.whale_liquidation_context_signal is not None
                 else None
             ),
@@ -626,24 +820,46 @@ class WhaleTrackerResult:
 
 @dataclass(slots=True)
 class WhaleClusterAnalysisResult:
-    whale_cluster_signal: Optional[WhaleClusterSignal] = None
-    whale_cluster_update_signal: Optional[WhaleClusterUpdateSignal] = None
-    whale_cluster_exhaustion_signal: Optional[WhaleClusterExhaustionSignal] = None
+    whale_cluster_signal: WhaleClusterSignal | None = None
+    whale_cluster_update_signal: WhaleClusterUpdateSignal | None = None
+    whale_cluster_exhaustion_signal: WhaleClusterExhaustionSignal | None = None
 
-    def to_dict(self) -> Dict[str, Optional[Dict[str, Any]]]:
+    @property
+    def has_signals(self) -> bool:
+        return any(
+            signal is not None
+            for signal in (
+                self.whale_cluster_signal,
+                self.whale_cluster_update_signal,
+                self.whale_cluster_exhaustion_signal,
+            )
+        )
+
+    def iter_signals(self) -> tuple[WhaleBaseSignalModel, ...]:
+        return tuple(
+            signal
+            for signal in (
+                self.whale_cluster_signal,
+                self.whale_cluster_update_signal,
+                self.whale_cluster_exhaustion_signal,
+            )
+            if signal is not None
+        )
+
+    def to_dict(self) -> dict[str, dict[str, Any] | None]:
         return {
             "whale_cluster_signal": (
-                self.whale_cluster_signal.to_event()
+                self.whale_cluster_signal.to_payload()
                 if self.whale_cluster_signal is not None
                 else None
             ),
             "whale_cluster_update_signal": (
-                self.whale_cluster_update_signal.to_event()
+                self.whale_cluster_update_signal.to_payload()
                 if self.whale_cluster_update_signal is not None
                 else None
             ),
             "whale_cluster_exhaustion_signal": (
-                self.whale_cluster_exhaustion_signal.to_event()
+                self.whale_cluster_exhaustion_signal.to_payload()
                 if self.whale_cluster_exhaustion_signal is not None
                 else None
             ),
@@ -656,6 +872,8 @@ class WhaleClusterAnalysisResult:
 
 
 def make_symbol_stats(window_size: int) -> SymbolStats:
+    if window_size <= 1:
+        raise ValueError("window_size must be > 1")
     return SymbolStats(notionals=deque(maxlen=window_size))
 
 
@@ -663,6 +881,11 @@ def make_symbol_tracker_state(
     large_trade_window_size: int,
     liquidation_window_size: int,
 ) -> SymbolTrackerState:
+    if large_trade_window_size <= 0:
+        raise ValueError("large_trade_window_size must be > 0")
+    if liquidation_window_size <= 0:
+        raise ValueError("liquidation_window_size must be > 0")
+
     return SymbolTrackerState(
         large_trades=deque(maxlen=large_trade_window_size),
         liquidations=deque(maxlen=liquidation_window_size),
@@ -674,8 +897,56 @@ def make_symbol_cluster_state(
     pressure_window_size: int,
     liquidation_context_window_size: int,
 ) -> SymbolClusterState:
+    if activity_window_size <= 0:
+        raise ValueError("activity_window_size must be > 0")
+    if pressure_window_size <= 0:
+        raise ValueError("pressure_window_size must be > 0")
+    if liquidation_context_window_size <= 0:
+        raise ValueError("liquidation_context_window_size must be > 0")
+
     return SymbolClusterState(
         activity_records=deque(maxlen=activity_window_size),
         pressure_records=deque(maxlen=pressure_window_size),
         liquidation_context_records=deque(maxlen=liquidation_context_window_size),
     )
+
+
+__all__ = [
+    # base
+    "WhaleBaseSignalModel",
+    "WhaleBaseEventModel",
+
+    # normalized records
+    "TradeRecord",
+    "WhaleTradeRecord",
+    "LiquidationRecord",
+    "WhaleActivityRecord",
+    "WhalePressureRecord",
+    "WhaleLiquidationContextRecord",
+
+    # signals
+    "LargeTradeSignal",
+    "WhaleActivitySignal",
+    "WhalePressureSignal",
+    "WhaleLiquidationContextSignal",
+    "WhaleClusterSignal",
+    "WhaleClusterUpdateSignal",
+    "WhaleClusterExhaustionSignal",
+
+    # states
+    "SymbolStats",
+    "SymbolTrackerState",
+    "SymbolClusterState",
+
+    # results
+    "WhaleTrackerResult",
+    "WhaleClusterAnalysisResult",
+
+    # factories
+    "make_symbol_stats",
+    "make_symbol_tracker_state",
+    "make_symbol_cluster_state",
+
+    # helpers
+    "utc_now_ms",
+]

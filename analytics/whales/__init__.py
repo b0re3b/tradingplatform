@@ -1,25 +1,67 @@
 from __future__ import annotations
 
+# =============================================================================
+# Facade
+# =============================================================================
+
 from analytics.whales.analyzer import WhaleAnalyzer
-from analytics.whales.base import BaseWhaleAnalyzerComponent, BaseWhaleComponent
+
+
+# =============================================================================
+# Base
+# =============================================================================
+
+from analytics.whales.base import (
+    BaseWhaleAnalyzerComponent,
+    BaseWhaleComponent,
+    EventHandler,
+    JobCallable,
+)
+
+
+# =============================================================================
+# Configs
+# =============================================================================
+
 from analytics.whales.config import (
     LargeTradeDetectorConfig,
     WhaleClusterAnalyzerConfig,
     WhaleTrackerConfig,
     WhalesConfig,
 )
+
+
+# =============================================================================
+# Enums
+# =============================================================================
+
 from analytics.whales.enums import (
     LargeTradeTriggerType,
     WhaleBias,
     WhaleClusterStateType,
     WhaleComponentName,
     WhaleDataSource,
+    WhaleEventTopic,
     WhaleEventType,
     WhaleNormalizationStatus,
     WhalePressureType,
     WhaleTradeSide,
 )
+
+
+# =============================================================================
+# Runtime components
+# =============================================================================
+
 from analytics.whales.large_trade_detector import LargeTradeDetector
+from analytics.whales.whale_cluster_analyzer import WhaleClusterAnalyzer
+from analytics.whales.whale_tracker import WhaleTracker
+
+
+# =============================================================================
+# Models
+# =============================================================================
+
 from analytics.whales.models import (
     LargeTradeSignal,
     LiquidationRecord,
@@ -30,6 +72,7 @@ from analytics.whales.models import (
     WhaleActivityRecord,
     WhaleActivitySignal,
     WhaleBaseEventModel,
+    WhaleBaseSignalModel,
     WhaleClusterAnalysisResult,
     WhaleClusterExhaustionSignal,
     WhaleClusterSignal,
@@ -43,28 +86,31 @@ from analytics.whales.models import (
     make_symbol_cluster_state,
     make_symbol_stats,
     make_symbol_tracker_state,
+    utc_now_ms,
 )
-from analytics.whales.whale_cluster_analyzer import WhaleClusterAnalyzer
-from analytics.whales.whale_tracker import WhaleTracker
+
 
 __all__ = [
-    # facade
+    # Facade
     "WhaleAnalyzer",
 
-    # base
+    # Base
     "BaseWhaleComponent",
     "BaseWhaleAnalyzerComponent",
+    "EventHandler",
+    "JobCallable",
 
-    # configs
+    # Configs
     "LargeTradeDetectorConfig",
     "WhaleTrackerConfig",
     "WhaleClusterAnalyzerConfig",
     "WhalesConfig",
 
-    # enums
+    # Enums
     "WhaleTradeSide",
     "LargeTradeTriggerType",
     "WhaleEventType",
+    "WhaleEventTopic",
     "WhaleComponentName",
     "WhaleBias",
     "WhaleClusterStateType",
@@ -72,15 +118,16 @@ __all__ = [
     "WhaleNormalizationStatus",
     "WhaleDataSource",
 
-    # detectors / analyzers
+    # Runtime components
     "LargeTradeDetector",
     "WhaleTracker",
     "WhaleClusterAnalyzer",
 
-    # base model
+    # Base models
+    "WhaleBaseSignalModel",
     "WhaleBaseEventModel",
 
-    # normalized records
+    # Normalized records
     "TradeRecord",
     "WhaleTradeRecord",
     "LiquidationRecord",
@@ -88,7 +135,7 @@ __all__ = [
     "WhalePressureRecord",
     "WhaleLiquidationContextRecord",
 
-    # signals
+    # Signals
     "LargeTradeSignal",
     "WhaleActivitySignal",
     "WhalePressureSignal",
@@ -97,17 +144,20 @@ __all__ = [
     "WhaleClusterUpdateSignal",
     "WhaleClusterExhaustionSignal",
 
-    # states
+    # States
     "SymbolStats",
     "SymbolTrackerState",
     "SymbolClusterState",
 
-    # result models
+    # Result models
     "WhaleTrackerResult",
     "WhaleClusterAnalysisResult",
 
-    # factories
+    # Factories
     "make_symbol_stats",
     "make_symbol_tracker_state",
     "make_symbol_cluster_state",
+
+    # Helpers
+    "utc_now_ms",
 ]
