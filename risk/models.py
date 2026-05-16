@@ -289,10 +289,13 @@ class RiskDecision:
     Final decision emitted by RiskManager.
 
     Це payload-основа для:
-    risk.approved
-    risk.rejected
-    risk.size_adjusted
-    risk.trading_halted
+    signal.confirmed
+    risk.position_blocked
+    risk.limit_warning
+    risk.kill_switch
+
+    Legacy/dashboard topics such as risk.approved/risk.rejected may still
+    reuse the same payload.
     """
 
     allowed: bool
@@ -307,6 +310,9 @@ class RiskDecision:
     final_risk_amount: float | None = None
     final_margin: float | None = None
     final_notional: float | None = None
+
+    reservation_id: str | None = None
+    reservation_expires_at: float | None = None
 
     risk_mode: RiskMode = RiskMode.NORMAL
 
@@ -371,9 +377,88 @@ class PortfolioPosition:
 
 
 @dataclass(slots=True)
+class PendingRiskReservation:
+    """
+    Temporary reservation created after a risk approval and before execution
+    confirms/rejects/cancels the order.
+
+    This model lets RiskState count already-approved but not-yet-opened risk
+    in exposure, symbol/strategy budgets and dashboard snapshots.
+    """
+
+    reservation_id: str
+    symbol: str
+    side: PositionSide
+
+    signal_id: str | None = None
+    strategy_name: str | None = None
+    tier: TradeTier | None = None
+    position_id: str | None = None
+
+    size: float = 0.0
+    open_risk: float = 0.0
+    margin: float = 0.0
+    notional: float = 0.0
+
+    created_at: float | None = None
+    expires_at: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PendingRiskReservationSnapshot:
+    """
+    Read-only snapshot of one pending risk reservation.
+    """
+
+    reservation_id: str
+    symbol: str
+    side: PositionSide
+
+    signal_id: str | None = None
+    strategy_name: str | None = None
+    tier: TradeTier | None = None
+    position_id: str | None = None
+
+    size: float = 0.0
+    open_risk: float = 0.0
+    margin: float = 0.0
+    notional: float = 0.0
+
+    created_at: float | None = None
+    expires_at: float | None = None
+    expired: bool = False
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RiskReservationSnapshot:
+    """
+    Aggregate pending-reservation snapshot for RiskState/dashboard/API.
+    """
+
+    reservations_count: int = 0
+    total_open_risk: float = 0.0
+    total_open_risk_r: float = 0.0
+    total_margin: float = 0.0
+    total_notional: float = 0.0
+
+    symbol_open_risk: dict[str, float] = field(default_factory=dict)
+    strategy_open_risk: dict[str, float] = field(default_factory=dict)
+    tier_open_risk: dict[str, float] = field(default_factory=dict)
+
+    reservations: dict[str, PendingRiskReservationSnapshot] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class OpenRiskSnapshot:
     """
     Open risk / margin snapshot.
+
+    total_open_risk is conservative: actual_open_risk + pending_open_risk.
+    This prevents approved-but-not-yet-filled orders from being invisible to
+    downstream guards and dashboards.
     """
 
     total_open_risk: float
@@ -387,13 +472,28 @@ class OpenRiskSnapshot:
     tier_open_risk: dict[str, float] = field(default_factory=dict)
 
     positions_count: int = 0
+
+    actual_open_risk: float = 0.0
+    actual_open_risk_r: float = 0.0
+
     pending_orders_risk: float = 0.0
+    pending_orders_risk_r: float = 0.0
+    pending_margin: float = 0.0
+    pending_notional: float = 0.0
+    pending_reservations_count: int = 0
+
+    projected_open_risk: float = 0.0
+    projected_open_risk_r: float = 0.0
 
 
 @dataclass(slots=True)
 class ExposureSnapshot:
     """
     Notional exposure snapshot.
+
+    gross_exposure / total_notional may include pending reservations when
+    produced by RiskState. The explicit pending_* fields make that accounting
+    visible to dashboards and tests.
     """
 
     total_notional: float
@@ -406,6 +506,12 @@ class ExposureSnapshot:
     leverage_weighted_exposure: float | None = None
     margin_used: float = 0.0
     margin_used_pct: float = 0.0
+
+    actual_notional: float = 0.0
+    pending_notional: float = 0.0
+    pending_margin: float = 0.0
+    pending_symbol_exposure: dict[str, float] = field(default_factory=dict)
+    pending_side_exposure: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -601,6 +707,13 @@ class RiskStateSnapshot:
 
     circuit_breaker: CircuitBreakerState
 
+    weekly_start_equity: float = 0.0
+    monthly_start_equity: float = 0.0
+
+    pending_reservations: RiskReservationSnapshot = field(
+        default_factory=RiskReservationSnapshot
+    )
+
     symbols: dict[str, SymbolRiskSnapshot] = field(default_factory=dict)
     strategies: dict[str, StrategyRiskSnapshot] = field(default_factory=dict)
     tiers: dict[TradeTier, TierStatsSnapshot] = field(default_factory=dict)
@@ -614,6 +727,8 @@ __all__ = [
     "ExpectedValueSnapshot",
     "ExposureSnapshot",
     "OpenRiskSnapshot",
+    "PendingRiskReservation",
+    "PendingRiskReservationSnapshot",
     "PortfolioPosition",
     "PositionSizeRequest",
     "PositionSizeResult",
@@ -621,6 +736,7 @@ __all__ = [
     "RiskCheckResult",
     "RiskDecision",
     "RiskEvaluationRequest",
+    "RiskReservationSnapshot",
     "RiskStateSnapshot",
     "RiskUnitSnapshot",
     "RiskViolation",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from core.logger import get_logger
 from risk.config import RiskBudgetConfig, StrategyRiskConfig, SymbolRiskConfig
 from risk.enums import (
@@ -12,15 +14,16 @@ from risk.enums import (
 )
 from risk.models import RiskCheckResult, RiskEvaluationRequest, RiskViolation
 from risk.state import RiskState, StrategyRiskState, SymbolRiskState
-from risk.utils import safe_div
+from risk.utils import is_finite_number, safe_div
 
 
 class RiskModeResolver:
     """
     Resolves global RiskMode from current RiskState and RiskBudgetConfig.
 
-    This class does not mutate RiskState. RiskManager should apply returned
-    mode via state.set_risk_mode(...) after the guard decision is accepted.
+    Pure domain service: it does not mutate RiskState. RiskManager must apply
+    the returned mode through state.set_risk_mode(...) under its orchestration
+    lock, so all downstream guards observe one consistent mode.
     """
 
     def __init__(
@@ -48,7 +51,7 @@ class RiskModeResolver:
         if state.trading_halted:
             return RiskMode.HALTED, state.halt_reason or "Trading is halted"
 
-        if risk_unit <= 0:
+        if not is_finite_number(risk_unit) or risk_unit <= 0:
             return RiskMode.HALTED, "Invalid risk unit"
 
         daily_loss_r = self._loss_r(state.get_daily_pnl(), risk_unit)
@@ -86,15 +89,9 @@ class RiskBudgetGuard:
     """
     Checks global risk budget.
 
-    Covers:
-    - emergency stop;
-    - monthly review;
-    - weekly hard loss;
-    - hard daily loss;
-    - soft daily loss;
-    - caution daily loss.
-
-    Does not mutate RiskState directly.
+    This guard resolves the mode and returns a decision, but deliberately does
+    not mutate RiskState. RiskManager should call state.set_risk_mode(...) once
+    per evaluation after this result is accepted into the pipeline.
     """
 
     def __init__(
@@ -123,6 +120,7 @@ class RiskBudgetGuard:
         risk_unit: float,
     ) -> RiskCheckResult:
         mode, reason = self._mode_resolver.resolve(state, risk_unit=risk_unit)
+        budget_metadata = self.build_snapshot_metadata(state, risk_unit=risk_unit)
 
         if request.order_intent.reduces_risk:
             return RiskCheckResult(
@@ -134,6 +132,7 @@ class RiskBudgetGuard:
                     "mode": mode.value,
                     "reason": reason,
                     "reduce_order_allowed": True,
+                    **budget_metadata,
                 },
             )
 
@@ -144,6 +143,7 @@ class RiskBudgetGuard:
                 reason=reason or "Emergency stop is active",
                 violation_type=RiskViolationType.EMERGENCY_STOP_TRIGGERED,
                 decision=RiskDecisionType.EMERGENCY_STOP,
+                metadata=budget_metadata,
             )
 
         if mode is RiskMode.HALTED:
@@ -153,6 +153,7 @@ class RiskBudgetGuard:
                 reason=reason or "Trading is halted",
                 violation_type=RiskViolationType.TRADING_HALTED,
                 decision=RiskDecisionType.HALT_TRADING,
+                metadata=budget_metadata,
             )
 
         if mode is RiskMode.REDUCE_ONLY:
@@ -162,6 +163,7 @@ class RiskBudgetGuard:
                 reason=reason or "Reduce-only mode is active",
                 violation_type=RiskViolationType.REDUCE_ONLY_ACTIVE,
                 decision=RiskDecisionType.ONLY_REDUCE,
+                metadata=budget_metadata,
             )
 
         violations: list[RiskViolation] = []
@@ -192,7 +194,11 @@ class RiskBudgetGuard:
                 )
             )
 
-        decision = RiskDecisionType.REDUCE_RISK if mode in {RiskMode.CAUTION, RiskMode.SAFE_MODE} else RiskDecisionType.ALLOW
+        decision = (
+            RiskDecisionType.REDUCE_RISK
+            if mode in {RiskMode.CAUTION, RiskMode.SAFE_MODE}
+            else RiskDecisionType.ALLOW
+        )
 
         return RiskCheckResult(
             passed=True,
@@ -205,6 +211,7 @@ class RiskBudgetGuard:
                 "daily_pnl": state.get_daily_pnl(),
                 "weekly_pnl": state.get_weekly_pnl(),
                 "monthly_pnl": state.get_monthly_pnl(),
+                **budget_metadata,
             },
         )
 
@@ -233,13 +240,14 @@ class RiskBudgetGuard:
         reason: str,
         violation_type: RiskViolationType,
         decision: RiskDecisionType,
+        metadata: dict[str, object] | None = None,
     ) -> RiskCheckResult:
         self._logger.warning(
             "Global budget check denied request | symbol=%s mode=%s reason=%s",
             request.symbol,
             mode.value,
             reason,
-            extra={"symbol": request.symbol},
+            extra={"symbol": request.symbol, "risk_mode": mode.value},
         )
 
         return RiskCheckResult(
@@ -258,6 +266,7 @@ class RiskBudgetGuard:
             ],
             risk_mode=mode,
             reason=reason,
+            metadata=dict(metadata or {}),
         )
 
 
@@ -265,16 +274,9 @@ class SymbolRiskGuard:
     """
     Checks symbol-level budget and throttling.
 
-    Covers:
-    - disabled symbol;
-    - cooldown;
-    - max positions per symbol;
-    - max trades per symbol/day;
-    - max symbol daily loss in R;
-    - max symbol open risk in R.
-
-    This guard may refresh expired cooldown/disabled status locally, but does
-    not publish events and does not perform orchestration.
+    Pending risk reservations are treated as already committed risk for limits.
+    This prevents multiple approved-but-not-yet-opened orders from bypassing
+    symbol position/open-risk/trade budgets.
     """
 
     def __init__(
@@ -298,14 +300,41 @@ class SymbolRiskGuard:
         risk_unit: float,
         candidate_open_risk: float = 0.0,
     ) -> RiskCheckResult:
+        validation_error = self._validate_inputs(
+            risk_unit=risk_unit,
+            candidate_open_risk=candidate_open_risk,
+        )
+        if validation_error is not None:
+            return validation_error
+
         symbol_state = state.get_symbol_state(request.symbol)
         symbol_state.refresh_status()
+
+        pending_open_risk = _pending_open_risk(state, symbol=request.symbol)
+        pending_trades = _pending_count(state, symbol=request.symbol)
+        projected_open_risk = (
+            symbol_state.open_risk
+            + pending_open_risk
+            + max(0.0, candidate_open_risk)
+        )
+        projected_open_risk_r = safe_div(projected_open_risk, risk_unit)
+
+        metadata: dict[str, Any] = {
+            "symbol_snapshot": symbol_state.snapshot(risk_unit=risk_unit),
+            "actual_open_risk": symbol_state.open_risk,
+            "pending_open_risk": pending_open_risk,
+            "candidate_open_risk": max(0.0, candidate_open_risk),
+            "projected_open_risk": projected_open_risk,
+            "projected_open_risk_r": projected_open_risk_r,
+            "pending_reservations_count": pending_trades,
+        }
 
         if request.order_intent.reduces_risk:
             return RiskCheckResult(
                 passed=True,
                 decision=RiskDecisionType.ALLOW,
                 metadata={
+                    **metadata,
                     "symbol_status": symbol_state.status.value,
                     "reduce_order_allowed": True,
                 },
@@ -339,38 +368,53 @@ class SymbolRiskGuard:
                 )
             )
 
-        active_positions = self._count_symbol_positions(state, request.symbol)
-        if active_positions >= self._config.max_positions_per_symbol:
+        actual_positions = self._count_symbol_positions(state, request.symbol)
+        projected_positions = actual_positions + pending_trades + self._candidate_position_increment(request)
+        metadata.update(
+            {
+                "actual_positions": actual_positions,
+                "projected_positions": projected_positions,
+            }
+        )
+        if projected_positions > self._config.max_positions_per_symbol:
             violations.append(
                 RiskViolation(
                     violation_type=RiskViolationType.SYMBOL_POSITION_LIMIT_EXCEEDED,
                     level=RiskLevel.CRITICAL,
                     message="Maximum positions per symbol would be exceeded",
-                    current_value=float(active_positions),
+                    current_value=float(projected_positions),
                     limit_value=float(self._config.max_positions_per_symbol),
                     symbol=request.symbol,
                     strategy_name=request.strategy_name,
                     tier=request.tier,
+                    metadata={
+                        "actual_positions": actual_positions,
+                        "pending_positions": pending_trades,
+                    },
                 )
             )
 
         trade_limit = self._resolve_trade_limit(request.symbol)
-        if trade_limit is not None and symbol_state.trades_today >= trade_limit:
+        projected_trades_today = symbol_state.trades_today + pending_trades + self._candidate_trade_increment(request)
+        metadata["projected_trades_today"] = projected_trades_today
+        if trade_limit is not None and projected_trades_today > trade_limit:
             violations.append(
                 RiskViolation(
                     violation_type=RiskViolationType.SYMBOL_TRADE_LIMIT_EXCEEDED,
                     level=RiskLevel.WARNING,
-                    message="Maximum trades per symbol/day reached",
-                    current_value=float(symbol_state.trades_today),
+                    message="Maximum trades per symbol/day would be exceeded",
+                    current_value=float(projected_trades_today),
                     limit_value=float(trade_limit),
                     symbol=request.symbol,
                     strategy_name=request.strategy_name,
                     tier=request.tier,
+                    metadata={"pending_trades": pending_trades},
                 )
             )
 
         symbol_daily_loss_limit_r = self._resolve_daily_loss_limit(request.symbol)
         symbol_daily_loss_r = safe_div(abs(min(0.0, symbol_state.daily_pnl)), risk_unit)
+        metadata["symbol_daily_loss_r"] = symbol_daily_loss_r
         if symbol_daily_loss_r >= symbol_daily_loss_limit_r:
             violations.append(
                 RiskViolation(
@@ -386,10 +430,7 @@ class SymbolRiskGuard:
             )
 
         symbol_open_risk_limit_r = self._resolve_open_risk_limit(request.symbol)
-        projected_open_risk_r = safe_div(
-            symbol_state.open_risk + max(0.0, candidate_open_risk),
-            risk_unit,
-        )
+        metadata["symbol_open_risk_limit_r"] = symbol_open_risk_limit_r
         if projected_open_risk_r > symbol_open_risk_limit_r:
             violations.append(
                 RiskViolation(
@@ -401,14 +442,17 @@ class SymbolRiskGuard:
                     symbol=request.symbol,
                     strategy_name=request.strategy_name,
                     tier=request.tier,
+                    metadata={"pending_open_risk": pending_open_risk},
                 )
             )
 
         if violations:
             self._logger.warning(
-                "Symbol risk check failed | symbol=%s violations=%s",
+                "Symbol risk check failed | symbol=%s violations=%s pending=%s projected_open_risk_r=%s",
                 request.symbol,
                 len(violations),
+                pending_trades,
+                projected_open_risk_r,
                 extra={"symbol": request.symbol},
             )
             return RiskCheckResult(
@@ -416,10 +460,7 @@ class SymbolRiskGuard:
                 decision=RiskDecisionType.DENY,
                 violations=violations,
                 reason="Symbol risk check failed",
-                metadata={
-                    "symbol_snapshot": symbol_state.snapshot(risk_unit=risk_unit),
-                    "projected_open_risk_r": projected_open_risk_r,
-                },
+                metadata=metadata,
             )
 
         decision = (
@@ -431,10 +472,7 @@ class SymbolRiskGuard:
         return RiskCheckResult(
             passed=True,
             decision=decision,
-            metadata={
-                "symbol_snapshot": symbol_state.snapshot(risk_unit=risk_unit),
-                "projected_open_risk_r": projected_open_risk_r,
-            },
+            metadata=metadata,
         )
 
     def should_apply_loss_cooldown(self, symbol_state: SymbolRiskState) -> bool:
@@ -465,22 +503,60 @@ class SymbolRiskGuard:
     def _count_symbol_positions(state: RiskState, symbol: str) -> int:
         return sum(1 for position in state.positions.values() if position.symbol == symbol)
 
+    @staticmethod
+    def _candidate_position_increment(request: RiskEvaluationRequest) -> int:
+        # OPEN creates a new position slot. INCREASE normally changes an existing
+        # position, while reduce/close are returned early.
+        return 1 if request.order_intent.value == "open" else 0
+
+    @staticmethod
+    def _candidate_trade_increment(request: RiskEvaluationRequest) -> int:
+        return 1 if getattr(request.order_intent, "increases_risk", True) else 0
+
+    @staticmethod
+    def _validate_inputs(
+        *,
+        risk_unit: float,
+        candidate_open_risk: float,
+    ) -> RiskCheckResult | None:
+        if not is_finite_number(risk_unit) or risk_unit <= 0:
+            return RiskCheckResult(
+                passed=False,
+                decision=RiskDecisionType.DENY,
+                violations=[
+                    RiskViolation(
+                        violation_type=RiskViolationType.INVALID_REQUEST,
+                        level=RiskLevel.CRITICAL,
+                        message="risk_unit must be a finite positive number",
+                    )
+                ],
+                reason="Invalid risk unit",
+            )
+
+        if not is_finite_number(candidate_open_risk) or candidate_open_risk < 0:
+            return RiskCheckResult(
+                passed=False,
+                decision=RiskDecisionType.DENY,
+                violations=[
+                    RiskViolation(
+                        violation_type=RiskViolationType.INVALID_REQUEST,
+                        level=RiskLevel.CRITICAL,
+                        message="candidate_open_risk must be a finite non-negative number",
+                    )
+                ],
+                reason="Invalid candidate open risk",
+            )
+
+        return None
+
 
 class StrategyRiskGuard:
     """
     Checks strategy-level budget and expectancy.
 
-    Covers:
-    - disabled strategy;
-    - strategy cooldown;
-    - max strategy daily loss in R;
-    - max strategy open risk in R;
-    - max trades/day if configured;
-    - consecutive losses;
-    - rolling expectancy reduce/disable logic.
-
-    This guard does not mutate state into disabled/reduced automatically.
-    RiskManager may apply returned metadata to state after decision.
+    Pending reservations are counted as committed strategy risk/trades. The
+    guard does not disable/reduce strategies directly; it returns suggested
+    actions for RiskManager to apply explicitly.
     """
 
     def __init__(
@@ -504,6 +580,13 @@ class StrategyRiskGuard:
         risk_unit: float,
         candidate_open_risk: float = 0.0,
     ) -> RiskCheckResult:
+        validation_error = SymbolRiskGuard._validate_inputs(
+            risk_unit=risk_unit,
+            candidate_open_risk=candidate_open_risk,
+        )
+        if validation_error is not None:
+            return validation_error
+
         if not request.strategy_name:
             return RiskCheckResult(
                 passed=True,
@@ -514,11 +597,31 @@ class StrategyRiskGuard:
         strategy_state = state.get_strategy_state(request.strategy_name)
         strategy_state.refresh_status()
 
+        pending_open_risk = _pending_open_risk(state, strategy_name=request.strategy_name)
+        pending_trades = _pending_count(state, strategy_name=request.strategy_name)
+        projected_open_risk = (
+            strategy_state.open_risk
+            + pending_open_risk
+            + max(0.0, candidate_open_risk)
+        )
+        projected_open_risk_r = safe_div(projected_open_risk, risk_unit)
+
+        metadata: dict[str, Any] = {
+            "strategy_snapshot": strategy_state.snapshot(risk_unit=risk_unit),
+            "actual_open_risk": strategy_state.open_risk,
+            "pending_open_risk": pending_open_risk,
+            "candidate_open_risk": max(0.0, candidate_open_risk),
+            "projected_open_risk": projected_open_risk,
+            "projected_open_risk_r": projected_open_risk_r,
+            "pending_reservations_count": pending_trades,
+        }
+
         if request.order_intent.reduces_risk:
             return RiskCheckResult(
                 passed=True,
                 decision=RiskDecisionType.ALLOW,
                 metadata={
+                    **metadata,
                     "strategy_status": strategy_state.status.value,
                     "reduce_order_allowed": True,
                 },
@@ -555,22 +658,30 @@ class StrategyRiskGuard:
             )
 
         trade_limit = self._resolve_trade_limit(request.strategy_name)
-        if trade_limit is not None and strategy_state.trades_today >= trade_limit:
+        projected_trades_today = (
+            strategy_state.trades_today
+            + pending_trades
+            + SymbolRiskGuard._candidate_trade_increment(request)
+        )
+        metadata["projected_trades_today"] = projected_trades_today
+        if trade_limit is not None and projected_trades_today > trade_limit:
             violations.append(
                 RiskViolation(
                     violation_type=RiskViolationType.STRATEGY_BUDGET_EXCEEDED,
                     level=RiskLevel.WARNING,
-                    message="Maximum trades per strategy/day reached",
-                    current_value=float(strategy_state.trades_today),
+                    message="Maximum trades per strategy/day would be exceeded",
+                    current_value=float(projected_trades_today),
                     limit_value=float(trade_limit),
                     symbol=request.symbol,
                     strategy_name=request.strategy_name,
                     tier=request.tier,
+                    metadata={"pending_trades": pending_trades},
                 )
             )
 
         daily_loss_budget_r = self._resolve_daily_loss_budget(request.strategy_name)
         strategy_daily_loss_r = safe_div(abs(min(0.0, strategy_state.daily_pnl)), risk_unit)
+        metadata["strategy_daily_loss_r"] = strategy_daily_loss_r
         if strategy_daily_loss_r >= daily_loss_budget_r:
             violations.append(
                 RiskViolation(
@@ -586,10 +697,7 @@ class StrategyRiskGuard:
             )
 
         open_risk_budget_r = self._resolve_open_risk_budget(request.strategy_name)
-        projected_open_risk_r = safe_div(
-            strategy_state.open_risk + max(0.0, candidate_open_risk),
-            risk_unit,
-        )
+        metadata["strategy_open_risk_budget_r"] = open_risk_budget_r
         if projected_open_risk_r > open_risk_budget_r:
             violations.append(
                 RiskViolation(
@@ -601,10 +709,14 @@ class StrategyRiskGuard:
                     symbol=request.symbol,
                     strategy_name=request.strategy_name,
                     tier=request.tier,
+                    metadata={"pending_open_risk": pending_open_risk},
                 )
             )
 
-        if strategy_state.consecutive_losses >= self._config.max_consecutive_losses:
+        if (
+            self._config.max_consecutive_losses > 0
+            and strategy_state.consecutive_losses >= self._config.max_consecutive_losses
+        ):
             violations.append(
                 RiskViolation(
                     violation_type=RiskViolationType.STRATEGY_COOLDOWN_ACTIVE,
@@ -619,12 +731,16 @@ class StrategyRiskGuard:
             )
             suggested_action = "cooldown"
 
+        rolling_trades = len(strategy_state.rolling_pnls)
+        metadata["rolling_trades"] = rolling_trades
         expectancy = strategy_state.rolling_expectancy
-        if expectancy is not None:
+        has_enough_expectancy_data = rolling_trades >= max(1, self._config.rolling_expectancy_window)
+        metadata["has_enough_expectancy_data"] = has_enough_expectancy_data
+
+        if expectancy is not None and has_enough_expectancy_data:
             if (
                 self._config.disable_on_negative_expectancy
                 and expectancy <= self._config.disable_when_expectancy_below
-                and strategy_state.rolling_trades if hasattr(strategy_state, "rolling_trades") else len(strategy_state.rolling_pnls)
             ):
                 violations.append(
                     RiskViolation(
@@ -647,21 +763,29 @@ class StrategyRiskGuard:
                 )
                 suggested_action = "reduce"
 
+        metadata.update(
+            {
+                "suggested_action": suggested_action,
+                "suggested_multiplier": suggested_multiplier,
+            }
+        )
+
         if violations:
             deny_level_violations = [
                 violation
                 for violation in violations
                 if violation.level is RiskLevel.CRITICAL
             ]
-
             decision = RiskDecisionType.DENY if deny_level_violations else RiskDecisionType.REDUCE_RISK
             passed = not deny_level_violations
 
             self._logger.warning(
-                "Strategy risk check %s | strategy=%s violations=%s",
+                "Strategy risk check %s | strategy=%s violations=%s pending=%s projected_open_risk_r=%s",
                 "failed" if not passed else "reduced",
                 request.strategy_name,
                 len(violations),
+                pending_trades,
+                projected_open_risk_r,
                 extra={"strategy": request.strategy_name},
             )
 
@@ -670,34 +794,21 @@ class StrategyRiskGuard:
                 decision=decision,
                 violations=violations,
                 reason="Strategy risk check failed" if not passed else "Strategy risk reduced",
-                metadata={
-                    "strategy_snapshot": strategy_state.snapshot(risk_unit=risk_unit),
-                    "projected_open_risk_r": projected_open_risk_r,
-                    "suggested_action": suggested_action,
-                    "suggested_multiplier": suggested_multiplier,
-                },
+                metadata=metadata,
             )
 
         if strategy_state.status is StrategyRiskStatus.REDUCED or suggested_action == "reduce":
+            metadata["suggested_action"] = suggested_action or "reduce"
             return RiskCheckResult(
                 passed=True,
                 decision=RiskDecisionType.REDUCE_RISK,
-                metadata={
-                    "strategy_snapshot": strategy_state.snapshot(risk_unit=risk_unit),
-                    "projected_open_risk_r": projected_open_risk_r,
-                    "suggested_action": suggested_action or "reduce",
-                    "suggested_multiplier": suggested_multiplier,
-                },
+                metadata=metadata,
             )
 
         return RiskCheckResult(
             passed=True,
             decision=RiskDecisionType.ALLOW,
-            metadata={
-                "strategy_snapshot": strategy_state.snapshot(risk_unit=risk_unit),
-                "projected_open_risk_r": projected_open_risk_r,
-                "suggested_multiplier": suggested_multiplier,
-            },
+            metadata=metadata,
         )
 
     def should_apply_loss_cooldown(self, strategy_state: StrategyRiskState) -> bool:
@@ -720,6 +831,70 @@ class StrategyRiskGuard:
 
     def _resolve_trade_limit(self, strategy_name: str) -> int | None:
         return self._config.per_strategy_trade_limit.get(strategy_name)
+
+
+def _pending_open_risk(
+    state: RiskState,
+    *,
+    symbol: str | None = None,
+    strategy_name: str | None = None,
+) -> float:
+    getter = getattr(state, "get_pending_open_risk", None)
+    if callable(getter):
+        kwargs: dict[str, Any] = {}
+        if symbol is not None:
+            kwargs["symbol"] = symbol
+        if strategy_name is not None:
+            kwargs["strategy_name"] = strategy_name
+        return float(getter(**kwargs))
+
+    return sum(
+        float(getattr(reservation, "open_risk", 0.0) or 0.0)
+        for reservation in _iter_pending_reservations(
+            state,
+            symbol=symbol,
+            strategy_name=strategy_name,
+        )
+    )
+
+
+def _pending_count(
+    state: RiskState,
+    *,
+    symbol: str | None = None,
+    strategy_name: str | None = None,
+) -> int:
+    return sum(
+        1
+        for _ in _iter_pending_reservations(
+            state,
+            symbol=symbol,
+            strategy_name=strategy_name,
+        )
+    )
+
+
+def _iter_pending_reservations(
+    state: RiskState,
+    *,
+    symbol: str | None = None,
+    strategy_name: str | None = None,
+):
+    iterator = getattr(state, "_iter_pending_reservations", None)
+    if callable(iterator):
+        yield from iterator(symbol=symbol, strategy_name=strategy_name)
+        return
+
+    reservations = getattr(state, "pending_reservations", {})
+    for reservation in reservations.values():
+        if symbol is not None and getattr(reservation, "symbol", None) != symbol:
+            continue
+        if strategy_name is not None and getattr(reservation, "strategy_name", None) != strategy_name:
+            continue
+        is_expired = getattr(reservation, "is_expired", None)
+        if callable(is_expired) and is_expired():
+            continue
+        yield reservation
 
 
 __all__ = [

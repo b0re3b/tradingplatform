@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 from risk.enums import (
     ExecutionQuality,
@@ -46,7 +47,7 @@ class TierRiskConfig:
 
     risk_units: float
     min_rr: float
-    min_expected_value: float = 0.0
+    min_expected_value: float = 0.02
     max_cost_to_reward_pct: float = 0.10
 
     default_leverage: float = 5.0
@@ -70,8 +71,8 @@ class TierModelConfig:
         default_factory=lambda: {
             TradeTier.T1: TierRiskConfig(
                 risk_units=0.25,
-                min_rr=1.20,
-                min_expected_value=0.0,
+                min_rr=1.50,
+                min_expected_value=0.02,
                 max_cost_to_reward_pct=0.08,
                 default_leverage=5.0,
                 max_leverage=10.0,
@@ -81,8 +82,8 @@ class TierModelConfig:
             ),
             TradeTier.T2: TierRiskConfig(
                 risk_units=0.50,
-                min_rr=1.50,
-                min_expected_value=0.0,
+                min_rr=1.80,
+                min_expected_value=0.03,
                 max_cost_to_reward_pct=0.10,
                 default_leverage=5.0,
                 max_leverage=10.0,
@@ -93,7 +94,7 @@ class TierModelConfig:
             TradeTier.T3: TierRiskConfig(
                 risk_units=1.00,
                 min_rr=2.00,
-                min_expected_value=0.0,
+                min_expected_value=0.05,
                 max_cost_to_reward_pct=0.12,
                 default_leverage=5.0,
                 max_leverage=5.0,
@@ -103,8 +104,8 @@ class TierModelConfig:
             ),
             TradeTier.T4: TierRiskConfig(
                 risk_units=1.50,
-                min_rr=2.00,
-                min_expected_value=0.0,
+                min_rr=2.50,
+                min_expected_value=0.07,
                 max_cost_to_reward_pct=0.15,
                 default_leverage=5.0,
                 max_leverage=5.0,
@@ -343,6 +344,35 @@ class PositionSizingConfig:
 
 
 @dataclass(slots=True)
+class RiskReservationConfig:
+    """
+    Pending risk reservation policy.
+
+    Reservation закриває race-condition між risk ALLOW і фактичним
+    position.opened/execution rejection. Якщо enabled=True, RiskManager
+    має резервувати open risk одразу після фінального ALLOW і звільняти
+    його після confirm/release/timeout.
+    """
+
+    enabled: bool = True
+    ttl_seconds: float = 30.0
+    cleanup_interval_seconds: float = 10.0
+
+    max_pending_reservations: int = 100
+    max_pending_per_symbol: int | None = 3
+    max_pending_per_strategy: int | None = 10
+
+    include_pending_in_exposure: bool = True
+    include_pending_in_symbol_budget: bool = True
+    include_pending_in_strategy_budget: bool = True
+    include_pending_in_correlation: bool = True
+
+    reserve_on_allow: bool = True
+    fail_closed_on_reservation_error: bool = True
+    auto_expire_on_evaluate: bool = True
+
+
+@dataclass(slots=True)
 class CircuitBreakerConfig:
     """
     Emergency risk blocker.
@@ -383,6 +413,7 @@ class RiskConfig:
     leverage: LeveragePolicyConfig = field(default_factory=LeveragePolicyConfig)
     exposure: ExposureConfig = field(default_factory=ExposureConfig)
     position_sizing: PositionSizingConfig = field(default_factory=PositionSizingConfig)
+    reservation: RiskReservationConfig = field(default_factory=RiskReservationConfig)
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
 
     def validate(self) -> None:
@@ -395,6 +426,7 @@ class RiskConfig:
         self._validate_leverage()
         self._validate_exposure()
         self._validate_position_sizing()
+        self._validate_reservation()
         self._validate_circuit_breaker()
 
     def _validate_risk_unit(self) -> None:
@@ -456,6 +488,10 @@ class RiskConfig:
             if cfg.min_rr < 0:
                 raise RiskConfigurationError(
                     f"tiers.{tier.value}.min_rr must be >= 0"
+                )
+            if not math.isfinite(cfg.min_expected_value):
+                raise RiskConfigurationError(
+                    f"tiers.{tier.value}.min_expected_value must be finite"
                 )
             if cfg.default_leverage <= 0:
                 raise RiskConfigurationError(
@@ -866,6 +902,38 @@ class RiskConfig:
                 "position_sizing.volatility_scale_max must be >= volatility_scale_min"
             )
 
+    def _validate_reservation(self) -> None:
+        self._validate_positive(
+            self.reservation.ttl_seconds,
+            "reservation.ttl_seconds",
+        )
+        self._validate_positive(
+            self.reservation.cleanup_interval_seconds,
+            "reservation.cleanup_interval_seconds",
+        )
+        self._validate_positive_int(
+            self.reservation.max_pending_reservations,
+            "reservation.max_pending_reservations",
+        )
+
+        if self.reservation.max_pending_per_symbol is not None:
+            self._validate_positive_int(
+                self.reservation.max_pending_per_symbol,
+                "reservation.max_pending_per_symbol",
+            )
+
+        if self.reservation.max_pending_per_strategy is not None:
+            self._validate_positive_int(
+                self.reservation.max_pending_per_strategy,
+                "reservation.max_pending_per_strategy",
+            )
+
+        if self.reservation.enabled and not self.reservation.reserve_on_allow:
+            raise RiskConfigurationError(
+                "reservation.reserve_on_allow must be True when reservation.enabled is True"
+            )
+
+
     def _validate_circuit_breaker(self) -> None:
         self._validate_non_negative(
             self.circuit_breaker.max_consecutive_failures,
@@ -898,6 +966,8 @@ class RiskConfig:
         field_name: str,
         upper_bound: float | None = 1.0,
     ) -> None:
+        if not math.isfinite(value):
+            raise RiskConfigurationError(f"{field_name} must be finite")
         if value < 0:
             raise RiskConfigurationError(f"{field_name} must be >= 0")
         if upper_bound is not None and value > upper_bound:
@@ -905,16 +975,22 @@ class RiskConfig:
 
     @staticmethod
     def _validate_positive(value: float, field_name: str) -> None:
+        if not math.isfinite(value):
+            raise RiskConfigurationError(f"{field_name} must be finite")
         if value <= 0:
             raise RiskConfigurationError(f"{field_name} must be > 0")
 
     @staticmethod
     def _validate_non_negative(value: float | int, field_name: str) -> None:
+        if not math.isfinite(float(value)):
+            raise RiskConfigurationError(f"{field_name} must be finite")
         if value < 0:
             raise RiskConfigurationError(f"{field_name} must be >= 0")
 
     @staticmethod
     def _validate_positive_int(value: int, field_name: str) -> None:
+        if not isinstance(value, int):
+            raise RiskConfigurationError(f"{field_name} must be an int")
         if value <= 0:
             raise RiskConfigurationError(f"{field_name} must be > 0")
 
@@ -925,6 +1001,7 @@ __all__ = [
     "ExposureConfig",
     "LeveragePolicyConfig",
     "PositionSizingConfig",
+    "RiskReservationConfig",
     "RiskBudgetConfig",
     "RiskConfig",
     "RiskUnitConfig",

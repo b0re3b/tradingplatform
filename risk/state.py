@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from risk.enums import (
     CircuitBreakerReason,
@@ -60,6 +61,13 @@ class CooldownState:
         self.cooldown_until = None
 
     def is_active(self, *, now_ts: float | None = None) -> bool:
+        """
+        Return whether cooldown is active without mutating state.
+
+        Important: this method is intentionally side-effect free so snapshots,
+        metrics and dashboard reads cannot accidentally deactivate cooldowns.
+        Use expire_if_needed() or refresh_status() when mutation is desired.
+        """
         if not self.active:
             return False
 
@@ -67,11 +75,79 @@ class CooldownState:
             return True
 
         now_ts = now_ts or time.time()
-        if now_ts >= self.cooldown_until:
-            self.deactivate()
-            return False
+        return now_ts < self.cooldown_until
 
+    def has_expired(self, *, now_ts: float | None = None) -> bool:
+        """Return True when a finite cooldown is active but already expired."""
+        if not self.active or self.cooldown_until is None:
+            return False
+        now_ts = now_ts or time.time()
+        return now_ts >= self.cooldown_until
+
+    def expire_if_needed(self, *, now_ts: float | None = None) -> bool:
+        """
+        Mutating counterpart of is_active().
+
+        Returns True if the cooldown was active and got deactivated.
+        """
+        if not self.has_expired(now_ts=now_ts):
+            return False
+        self.deactivate()
         return True
+
+
+@dataclass(slots=True)
+class PendingRiskReservation:
+    """
+    Temporary risk reservation created after an ALLOW decision and before the
+    exchange/execution layer confirms that a position was opened.
+
+    RiskState owns only the reservation accounting. RiskManager is responsible
+    for creating/releasing reservations under its async lock and for emitting
+    EventBus events outside that lock.
+    """
+
+    reservation_id: str
+    symbol: str
+    side: PositionSide
+
+    signal_id: str | None = None
+    strategy_name: str | None = None
+    tier: TradeTier | None = None
+    position_id: str | None = None
+
+    size: float = 0.0
+    open_risk: float = 0.0
+    margin: float = 0.0
+    notional: float = 0.0
+
+    created_at: float = field(default_factory=time.time)
+    expires_at: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def is_expired(self, *, now_ts: float | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        now_ts = now_ts or time.time()
+        return now_ts >= self.expires_at
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "reservation_id": self.reservation_id,
+            "signal_id": self.signal_id,
+            "symbol": self.symbol,
+            "side": self.side.value,
+            "strategy_name": self.strategy_name,
+            "tier": self.tier.value if self.tier else None,
+            "position_id": self.position_id,
+            "size": self.size,
+            "open_risk": self.open_risk,
+            "margin": self.margin,
+            "notional": self.notional,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(slots=True)
@@ -150,7 +226,7 @@ class SymbolRiskState:
             if now_ts >= self.disabled_until:
                 self.activate()
 
-        if self.status is SymbolRiskStatus.COOLDOWN and not self.cooldown.is_active(now_ts=now_ts):
+        if self.status is SymbolRiskStatus.COOLDOWN and self.cooldown.expire_if_needed(now_ts=now_ts):
             self.activate()
 
     def reset_daily(self) -> None:
@@ -168,18 +244,28 @@ class SymbolRiskState:
         self.updated_at = time.time()
 
     def snapshot(self, *, risk_unit: float) -> SymbolRiskSnapshot:
-        self.refresh_status()
+        now_ts = time.time()
+        status = self.status
+        cooldown_active = self.cooldown.is_active(now_ts=now_ts)
+
+        if status is SymbolRiskStatus.DISABLED and self.disabled_until is not None:
+            if now_ts >= self.disabled_until:
+                status = SymbolRiskStatus.ACTIVE
+
+        if status is SymbolRiskStatus.COOLDOWN and not cooldown_active:
+            status = SymbolRiskStatus.ACTIVE
+
         return SymbolRiskSnapshot(
             symbol=self.symbol,
-            status=self.status,
+            status=status,
             daily_pnl=self.daily_pnl,
             daily_loss_r=safe_div(abs(min(0.0, self.daily_pnl)), risk_unit),
             open_risk=self.open_risk,
             open_risk_r=safe_div(self.open_risk, risk_unit),
             trades_today=self.trades_today,
             consecutive_losses=self.consecutive_losses,
-            cooldown_until=self.cooldown.cooldown_until if self.cooldown.active else None,
-            disabled_until=self.disabled_until,
+            cooldown_until=self.cooldown.cooldown_until if cooldown_active else None,
+            disabled_until=self.disabled_until if status is SymbolRiskStatus.DISABLED else None,
             metadata=dict(self.metadata),
         )
 
@@ -283,7 +369,7 @@ class StrategyRiskState:
             if now_ts >= self.disabled_until:
                 self.activate()
 
-        if self.status is StrategyRiskStatus.COOLDOWN and not self.cooldown.is_active(now_ts=now_ts):
+        if self.status is StrategyRiskStatus.COOLDOWN and self.cooldown.expire_if_needed(now_ts=now_ts):
             self.activate()
 
     def reset_daily(self) -> None:
@@ -301,10 +387,23 @@ class StrategyRiskState:
         self.updated_at = time.time()
 
     def snapshot(self, *, risk_unit: float) -> StrategyRiskSnapshot:
-        self.refresh_status()
+        now_ts = time.time()
+        status = self.status
+        cooldown_active = self.cooldown.is_active(now_ts=now_ts)
+        risk_multiplier = self.risk_multiplier
+
+        if status is StrategyRiskStatus.DISABLED and self.disabled_until is not None:
+            if now_ts >= self.disabled_until:
+                status = StrategyRiskStatus.ACTIVE
+                risk_multiplier = 1.0
+
+        if status is StrategyRiskStatus.COOLDOWN and not cooldown_active:
+            status = StrategyRiskStatus.ACTIVE
+            risk_multiplier = 1.0
+
         return StrategyRiskSnapshot(
             strategy_name=self.strategy_name,
-            status=self.status,
+            status=status,
             daily_pnl=self.daily_pnl,
             daily_loss_r=safe_div(abs(min(0.0, self.daily_pnl)), risk_unit),
             open_risk=self.open_risk,
@@ -313,9 +412,9 @@ class StrategyRiskState:
             consecutive_losses=self.consecutive_losses,
             rolling_expectancy=self.rolling_expectancy,
             rolling_trades=len(self.rolling_pnls),
-            risk_multiplier=self.risk_multiplier,
-            cooldown_until=self.cooldown.cooldown_until if self.cooldown.active else None,
-            disabled_until=self.disabled_until,
+            risk_multiplier=risk_multiplier,
+            cooldown_until=self.cooldown.cooldown_until if cooldown_active else None,
+            disabled_until=self.disabled_until if status is StrategyRiskStatus.DISABLED else None,
             metadata=dict(self.metadata),
         )
 
@@ -439,6 +538,7 @@ class RiskState:
     halt_reason: str | None = None
 
     positions: dict[str, PortfolioPosition] = field(default_factory=dict)
+    pending_reservations: dict[str, PendingRiskReservation] = field(default_factory=dict)
 
     symbols: dict[str, SymbolRiskState] = field(default_factory=dict)
     strategies: dict[str, StrategyRiskState] = field(default_factory=dict)
@@ -557,6 +657,226 @@ class RiskState:
         if self.risk_mode is RiskMode.EMERGENCY_STOP:
             self.set_risk_mode(RiskMode.NORMAL)
         self.updated_at = time.time()
+
+    def reserve_risk(
+        self,
+        *,
+        symbol: str,
+        side: PositionSide,
+        signal_id: str | None = None,
+        strategy_name: str | None = None,
+        tier: TradeTier | None = None,
+        position_id: str | None = None,
+        size: float = 0.0,
+        open_risk: float = 0.0,
+        margin: float = 0.0,
+        notional: float = 0.0,
+        ttl_seconds: float | None = 30.0,
+        reservation_id: str | None = None,
+        now_ts: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PendingRiskReservation:
+        """
+        Reserve candidate risk between risk approval and execution confirmation.
+
+        The reservation must be released on execution rejection/cancellation/failure
+        or confirmed when a real position is opened. This prevents multiple
+        approved signals from temporarily exceeding open-risk/exposure budgets.
+        """
+        now_ts = now_ts or time.time()
+        reservation = PendingRiskReservation(
+            reservation_id=reservation_id or self._reservation_id(symbol, signal_id),
+            signal_id=signal_id,
+            symbol=symbol,
+            side=side,
+            strategy_name=strategy_name,
+            tier=tier,
+            position_id=position_id,
+            size=max(0.0, size),
+            open_risk=max(0.0, open_risk),
+            margin=max(0.0, margin),
+            notional=abs(notional),
+            created_at=now_ts,
+            expires_at=(now_ts + max(0.0, ttl_seconds)) if ttl_seconds is not None else None,
+            metadata=dict(metadata or {}),
+        )
+        self.pending_reservations[reservation.reservation_id] = reservation
+        self.updated_at = time.time()
+        return reservation
+
+    def get_pending_reservation(
+        self,
+        reservation_id: str | None = None,
+        *,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+    ) -> PendingRiskReservation | None:
+        if reservation_id is not None:
+            return self.pending_reservations.get(reservation_id)
+
+        for reservation in self.pending_reservations.values():
+            if signal_id is not None and reservation.signal_id != signal_id:
+                continue
+            if symbol is not None and reservation.symbol != symbol:
+                continue
+            if position_id is not None and reservation.position_id != position_id:
+                continue
+            return reservation
+        return None
+
+    def release_risk_reservation(
+        self,
+        reservation_id: str | None = None,
+        *,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+    ) -> PendingRiskReservation | None:
+        reservation = self.get_pending_reservation(
+            reservation_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            position_id=position_id,
+        )
+        if reservation is None:
+            return None
+
+        removed = self.pending_reservations.pop(reservation.reservation_id, None)
+        self.updated_at = time.time()
+        return removed
+
+    def confirm_risk_reservation(
+        self,
+        reservation_id: str | None = None,
+        *,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+    ) -> PendingRiskReservation | None:
+        """
+        Remove a reservation after execution confirms the position.
+
+        This method intentionally does not call add_position(). RiskManager should
+        confirm the reservation and then add/update the PortfolioPosition from the
+        execution/position event payload so accounting remains explicit.
+        """
+        return self.release_risk_reservation(
+            reservation_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            position_id=position_id,
+        )
+
+    def expire_pending_reservations(
+        self,
+        *,
+        now_ts: float | None = None,
+    ) -> list[PendingRiskReservation]:
+        now_ts = now_ts or time.time()
+        expired_ids = [
+            reservation_id
+            for reservation_id, reservation in self.pending_reservations.items()
+            if reservation.is_expired(now_ts=now_ts)
+        ]
+        expired: list[PendingRiskReservation] = []
+        for reservation_id in expired_ids:
+            reservation = self.pending_reservations.pop(reservation_id, None)
+            if reservation is not None:
+                expired.append(reservation)
+
+        if expired:
+            self.updated_at = time.time()
+        return expired
+
+    def get_pending_open_risk(
+        self,
+        *,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        tier: TradeTier | None = None,
+        now_ts: float | None = None,
+        include_expired: bool = False,
+    ) -> float:
+        return sum(
+            reservation.open_risk
+            for reservation in self._iter_pending_reservations(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                tier=tier,
+                now_ts=now_ts,
+                include_expired=include_expired,
+            )
+        )
+
+    def get_pending_margin(
+        self,
+        *,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        tier: TradeTier | None = None,
+        now_ts: float | None = None,
+        include_expired: bool = False,
+    ) -> float:
+        return sum(
+            reservation.margin
+            for reservation in self._iter_pending_reservations(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                tier=tier,
+                now_ts=now_ts,
+                include_expired=include_expired,
+            )
+        )
+
+    def get_pending_notional(
+        self,
+        *,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        tier: TradeTier | None = None,
+        side: PositionSide | None = None,
+        now_ts: float | None = None,
+        include_expired: bool = False,
+    ) -> float:
+        return sum(
+            reservation.notional
+            for reservation in self._iter_pending_reservations(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                tier=tier,
+                side=side,
+                now_ts=now_ts,
+                include_expired=include_expired,
+            )
+        )
+
+    def get_projected_open_risk(
+        self,
+        *,
+        candidate_open_risk: float = 0.0,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        tier: TradeTier | None = None,
+        now_ts: float | None = None,
+    ) -> float:
+        actual_open_risk = sum(
+            position.open_risk
+            for position in self.positions.values()
+            if (symbol is None or position.symbol == symbol)
+            and (strategy_name is None or position.strategy_name == strategy_name)
+            and (tier is None or position.tier == tier)
+        )
+        return (
+            actual_open_risk
+            + self.get_pending_open_risk(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                tier=tier,
+                now_ts=now_ts,
+            )
+            + max(0.0, candidate_open_risk)
+        )
 
     def add_position(self, position: PortfolioPosition) -> None:
         key = self._position_key(position.symbol, position.position_id)
@@ -865,7 +1185,25 @@ class RiskState:
             if position.leverage is not None:
                 leverage_weighted_exposure += notional * position.leverage
 
-        effective_margin_used = margin_used if margin_used > 0 else self.used_margin
+        pending_margin = 0.0
+        for reservation in self._iter_pending_reservations():
+            pending_notional = abs(reservation.notional)
+            gross_exposure += pending_notional
+
+            if reservation.side is PositionSide.LONG:
+                net_exposure += pending_notional
+            elif reservation.side is PositionSide.SHORT:
+                net_exposure -= pending_notional
+
+            pending_margin += max(0.0, reservation.margin)
+            symbol_exposure[reservation.symbol] = (
+                symbol_exposure.get(reservation.symbol, 0.0) + pending_notional
+            )
+            side_exposure[reservation.side.value] = (
+                side_exposure.get(reservation.side.value, 0.0) + pending_notional
+            )
+
+        effective_margin_used = (margin_used if margin_used > 0 else self.used_margin) + pending_margin
 
         return ExposureSnapshot(
             total_notional=gross_exposure,
@@ -885,12 +1223,11 @@ class RiskState:
         strategy_open_risk: dict[str, float] = {}
         tier_open_risk: dict[str, float] = {}
 
-        total_open_risk = 0.0
-        pending_orders_risk = 0.0
+        actual_open_risk = 0.0
 
         for position in self.positions.values():
             open_risk = position.open_risk
-            total_open_risk += open_risk
+            actual_open_risk += open_risk
 
             symbol_open_risk[position.symbol] = (
                 symbol_open_risk.get(position.symbol, 0.0) + open_risk
@@ -905,15 +1242,38 @@ class RiskState:
                 tier_key = position.tier.value
                 tier_open_risk[tier_key] = tier_open_risk.get(tier_key, 0.0) + open_risk
 
+        pending_orders_risk = 0.0
+        for reservation in self._iter_pending_reservations():
+            pending_orders_risk += reservation.open_risk
+
+            symbol_open_risk[reservation.symbol] = (
+                symbol_open_risk.get(reservation.symbol, 0.0) + reservation.open_risk
+            )
+
+            if reservation.strategy_name:
+                strategy_open_risk[reservation.strategy_name] = (
+                    strategy_open_risk.get(reservation.strategy_name, 0.0)
+                    + reservation.open_risk
+                )
+
+            if reservation.tier:
+                tier_key = reservation.tier.value
+                tier_open_risk[tier_key] = (
+                    tier_open_risk.get(tier_key, 0.0) + reservation.open_risk
+                )
+
+        total_open_risk = actual_open_risk + pending_orders_risk
+        effective_margin_used = self.used_margin + self.get_pending_margin()
+
         return OpenRiskSnapshot(
             total_open_risk=total_open_risk,
             total_open_risk_r=safe_div(total_open_risk, risk_unit),
-            used_margin=self.used_margin,
-            used_margin_pct=safe_div(self.used_margin, self.equity),
+            used_margin=effective_margin_used,
+            used_margin_pct=safe_div(effective_margin_used, self.equity),
             symbol_open_risk=symbol_open_risk,
             strategy_open_risk=strategy_open_risk,
             tier_open_risk=tier_open_risk,
-            positions_count=len(self.positions),
+            positions_count=len(self.positions) + len(self.pending_reservations),
             pending_orders_risk=pending_orders_risk,
         )
 
@@ -931,6 +1291,12 @@ class RiskState:
             if group_name is not None:
                 group_exposure[group_name] += abs(position.notional_value)
                 group_open_risk[group_name] += position.open_risk
+
+        for reservation in self._iter_pending_reservations():
+            group_name = symbol_to_group.get(reservation.symbol)
+            if group_name is not None:
+                group_exposure[group_name] += abs(reservation.notional)
+                group_open_risk[group_name] += reservation.open_risk
 
         return CorrelationSnapshot(
             groups=groups,
@@ -1040,6 +1406,30 @@ class RiskState:
             tiers={tier: stats.snapshot() for tier, stats in self.tiers.items()},
         )
 
+    def _iter_pending_reservations(
+        self,
+        *,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        tier: TradeTier | None = None,
+        side: PositionSide | None = None,
+        now_ts: float | None = None,
+        include_expired: bool = False,
+    ):
+        now_ts = now_ts or time.time()
+        for reservation in self.pending_reservations.values():
+            if not include_expired and reservation.is_expired(now_ts=now_ts):
+                continue
+            if symbol is not None and reservation.symbol != symbol:
+                continue
+            if strategy_name is not None and reservation.strategy_name != strategy_name:
+                continue
+            if tier is not None and reservation.tier != tier:
+                continue
+            if side is not None and reservation.side != side:
+                continue
+            yield reservation
+
     def _initialize_equity_anchors(self) -> None:
         if self.equity <= 0:
             return
@@ -1073,12 +1463,18 @@ class RiskState:
         return mapping[mode]
 
     @staticmethod
+    def _reservation_id(symbol: str, signal_id: str | None = None) -> str:
+        suffix = signal_id or uuid4().hex
+        return f"reservation:{symbol}:{suffix}"
+
+    @staticmethod
     def _position_key(symbol: str, position_id: str | None = None) -> str:
         return f"{symbol}:{position_id}" if position_id else symbol
 
 
 __all__ = [
     "CooldownState",
+    "PendingRiskReservation",
     "RiskState",
     "StrategyRiskState",
     "SymbolRiskState",

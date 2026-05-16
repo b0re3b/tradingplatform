@@ -262,6 +262,11 @@ class RiskManager:
                     name="risk_on_execution_failed",
                 ),
                 self._event_bus.subscribe(
+                    "execution.order_cancelled",
+                    self._handle_execution_cancelled,
+                    name="risk_on_execution_cancelled",
+                ),
+                self._event_bus.subscribe(
                     "execution.order_filled",
                     self._handle_execution_filled,
                     name="risk_on_execution_filled",
@@ -323,454 +328,460 @@ class RiskManager:
             count,
         )
 
+
     def register_scheduler_jobs(self) -> None:
         """
-        Register reset jobs in core Scheduler if provided.
+        Register reset/cleanup jobs in core Scheduler if provided.
 
-        We keep this defensive because the exact Scheduler runtime owns job
-        execution. RiskManager only registers jobs; it does not run loops.
+        Reset boundaries should preferably be driven by system.clock.* events
+        emitted by the platform clock service. These interval jobs are defensive
+        fallbacks only; RiskManager never starts unmanaged asyncio loops.
         """
         if self._scheduler is None:
             return
 
-        try:
-            daily_job = self._scheduler.add_interval_job(
-                self.reset_daily_state,
-                interval_seconds=24 * 60 * 60,
-                name="risk.daily_reset",
-                run_immediately=False,
-            )
-            self._scheduler_jobs.append(daily_job)
-        except Exception:
-            self._logger.exception("Failed to register risk daily reset scheduler job")
+        jobs: list[tuple[str, Any, float]] = [
+            ("risk.daily_reset", self.reset_daily_state, 24 * 60 * 60),
+            ("risk.weekly_reset", self.reset_weekly_state, 7 * 24 * 60 * 60),
+            ("risk.monthly_reset", self.reset_monthly_state, 30 * 24 * 60 * 60),
+        ]
 
-        try:
-            weekly_job = self._scheduler.add_interval_job(
-                self.reset_weekly_state,
-                interval_seconds=7 * 24 * 60 * 60,
-                name="risk.weekly_reset",
-                run_immediately=False,
+        reservation_cfg = getattr(self._config, "reservation", None)
+        if reservation_cfg is not None and getattr(reservation_cfg, "enabled", False):
+            jobs.append(
+                (
+                    "risk.reservation_cleanup",
+                    self.cleanup_expired_reservations,
+                    max(1.0, float(getattr(reservation_cfg, "cleanup_interval_seconds", 10.0))),
+                )
             )
-            self._scheduler_jobs.append(weekly_job)
-        except Exception:
-            self._logger.exception("Failed to register risk weekly reset scheduler job")
+
+        for name, callback, interval_seconds in jobs:
+            try:
+                job = self._scheduler.add_interval_job(
+                    callback,
+                    interval_seconds=interval_seconds,
+                    name=name,
+                    run_immediately=False,
+                )
+                self._scheduler_jobs.append(job)
+            except Exception:
+                self._logger.exception("Failed to register risk scheduler job | name=%s", name)
+
+
 
     async def evaluate_request(self, request: RiskEvaluationRequest) -> RiskDecision:
+        """
+        Evaluate a pre-trade request and emit resulting events outside the state lock.
+
+        The lock protects state reads/mutations and pending reservation creation.
+        EventBus emits are intentionally performed after the lock is released to
+        avoid re-entrancy/deadlock when downstream handlers call RiskManager again.
+        """
         started_at = time.perf_counter()
 
+        await self._emit_event(
+            "risk.request_received",
+            {
+                "symbol": request.symbol,
+                "side": request.side.value,
+                "signal_id": request.signal_id,
+                "strategy_name": request.strategy_name,
+                "tier": request.tier.value if request.tier else None,
+                "order_intent": request.order_intent.value,
+                "requested_size": request.requested_size,
+                "requested_leverage": request.requested_leverage,
+            },
+        )
+
         async with self._lock:
-            self._circuit_breaker.release_if_ready(self._state)
+            decision, events = self._evaluate_request_locked(request, started_at=started_at)
 
-            checks: dict[str, RiskCheckResult] = {}
+        await self._emit_events(events)
+        return decision
 
-            await self._emit_event(
-                "risk.request_received",
-                {
-                    "symbol": request.symbol,
-                    "side": request.side.value,
-                    "signal_id": request.signal_id,
-                    "strategy_name": request.strategy_name,
-                    "tier": request.tier.value if request.tier else None,
-                    "order_intent": request.order_intent.value,
-                    "requested_size": request.requested_size,
-                    "requested_leverage": request.requested_leverage,
-                },
+    def _evaluate_request_locked(
+        self,
+        request: RiskEvaluationRequest,
+        *,
+        started_at: float,
+    ) -> tuple[RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
+        events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
+
+        self._circuit_breaker.release_if_ready(self._state)
+        events.extend(self._expire_reservations_locked(reason="evaluate_request"))
+
+        checks: dict[str, RiskCheckResult] = {}
+
+        def finalize(decision: RiskDecision) -> tuple[RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
+            events.extend(
+                self._finalize_decision_locked(
+                    request,
+                    decision,
+                    latency_ms=self._elapsed_ms(started_at),
+                )
+            )
+            return decision, events
+
+        base_risk_unit_snapshot = self._risk_unit_calculator.calculate(
+            self._state,
+            mode=self._state.risk_mode,
+        )
+        risk_unit = base_risk_unit_snapshot.effective_risk_unit
+
+        cb_result = self._circuit_breaker.check(self._state)
+        checks["circuit_breaker"] = cb_result
+        if not cb_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=cb_result,
+                checks=checks,
+                reason=cb_result.reason or "Circuit breaker is active",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+            )
+            return finalize(decision)
+
+        budget_result = self._budget_guard.check(
+            request,
+            self._state,
+            risk_unit=max(risk_unit, 1e-12),
+        )
+        checks["budget"] = budget_result
+
+        if budget_result.risk_mode is not None:
+            self._state.set_risk_mode(
+                budget_result.risk_mode,
+                reason=budget_result.reason,
             )
 
-            base_risk_unit_snapshot = self._risk_unit_calculator.calculate(
+        if not budget_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=budget_result,
+                checks=checks,
+                reason=budget_result.reason or "Global risk budget check failed",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+            )
+            return finalize(decision)
+
+        tier_result = self._tier_guard.check(
+            request,
+            self._state,
+            mode=self._state.risk_mode,
+        )
+        checks["tier"] = tier_result
+        if not tier_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=tier_result,
+                checks=checks,
+                reason=tier_result.reason or "Tier validation failed",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+            )
+            return finalize(decision)
+
+        tier_profile = self._extract_tier_profile(tier_result)
+        if tier_profile is None:
+            tier_profile = self._tier_guard.resolve_profile(
+                request,
                 self._state,
                 mode=self._state.risk_mode,
             )
-            risk_unit = base_risk_unit_snapshot.effective_risk_unit
 
-            cb_result = self._circuit_breaker.check(self._state)
-            checks["circuit_breaker"] = cb_result
-            if not cb_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=cb_result,
-                    checks=checks,
-                    reason=cb_result.reason or "Circuit breaker is active",
-                    final_size=None,
-                    final_leverage=request.requested_leverage,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            budget_result = self._budget_guard.check(
-                request,
-                self._state,
-                risk_unit=max(risk_unit, 1e-12),
+        rr_result = self._risk_reward_guard.check(request, tier_profile)
+        checks["risk_reward"] = rr_result
+        if not rr_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=rr_result,
+                checks=checks,
+                reason=rr_result.reason or "Risk/reward validation failed",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+                final_tier=tier_profile.final_tier,
             )
-            checks["budget"] = budget_result
+            return finalize(decision)
 
-            if budget_result.risk_mode is not None:
-                self._state.set_risk_mode(
-                    budget_result.risk_mode,
-                    reason=budget_result.reason,
-                )
+        ev_snapshot = self._extract_ev_snapshot(rr_result)
 
-            if not budget_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=budget_result,
-                    checks=checks,
-                    reason=budget_result.reason or "Global risk budget check failed",
-                    final_size=None,
-                    final_leverage=request.requested_leverage,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            tier_result = self._tier_guard.check(
-                request,
-                self._state,
-                mode=self._state.risk_mode,
+        execution_cost_result = self._execution_cost_guard.check(
+            request,
+            tier_profile,
+            ev_snapshot,
+            mode=self._state.risk_mode,
+        )
+        checks["execution_cost"] = execution_cost_result
+        if not execution_cost_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=execution_cost_result,
+                checks=checks,
+                reason=execution_cost_result.reason or "Execution cost validation failed",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+                final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
             )
-            checks["tier"] = tier_result
-            if not tier_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=tier_result,
-                    checks=checks,
-                    reason=tier_result.reason or "Tier validation failed",
-                    final_size=None,
-                    final_leverage=request.requested_leverage,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
+            return finalize(decision)
 
-            tier_profile = self._extract_tier_profile(tier_result)
-            if tier_profile is None:
-                tier_profile = self._tier_guard.resolve_profile(
-                    request,
-                    self._state,
-                    mode=self._state.risk_mode,
-                )
-
-            rr_result = self._risk_reward_guard.check(request, tier_profile)
-            checks["risk_reward"] = rr_result
-            if not rr_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=rr_result,
-                    checks=checks,
-                    reason=rr_result.reason or "Risk/reward validation failed",
-                    final_size=None,
-                    final_leverage=request.requested_leverage,
-                    final_tier=tier_profile.final_tier,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            ev_snapshot = self._extract_ev_snapshot(rr_result)
-
-            execution_cost_result = self._execution_cost_guard.check(
-                request,
-                tier_profile,
-                ev_snapshot,
-                mode=self._state.risk_mode,
+        leverage_result = self._leverage_guard.check(
+            request,
+            tier_profile,
+            mode=self._state.risk_mode,
+        )
+        checks["leverage"] = leverage_result
+        if not leverage_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=leverage_result,
+                checks=checks,
+                reason=leverage_result.reason or "Leverage validation failed",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+                final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
             )
-            checks["execution_cost"] = execution_cost_result
-            if not execution_cost_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=execution_cost_result,
-                    checks=checks,
-                    reason=execution_cost_result.reason or "Execution cost validation failed",
-                    final_size=None,
-                    final_leverage=request.requested_leverage,
-                    final_tier=tier_profile.final_tier,
-                    ev_snapshot=ev_snapshot,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
+            return finalize(decision)
 
-            leverage_result = self._leverage_guard.check(
-                request,
-                tier_profile,
-                mode=self._state.risk_mode,
-            )
-            checks["leverage"] = leverage_result
-            if not leverage_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=leverage_result,
-                    checks=checks,
-                    reason=leverage_result.reason or "Leverage validation failed",
-                    final_size=None,
-                    final_leverage=request.requested_leverage,
-                    final_tier=tier_profile.final_tier,
-                    ev_snapshot=ev_snapshot,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
+        final_leverage = (
+            leverage_result.adjusted_leverage
+            or request.requested_leverage
+            or tier_profile.default_leverage
+            or 1.0
+        )
 
-            final_leverage = (
-                leverage_result.adjusted_leverage
-                or request.requested_leverage
-                or tier_profile.default_leverage
-                or 1.0
-            )
+        strategy_multiplier = self._resolve_strategy_multiplier(request)
+        symbol_multiplier = self._resolve_symbol_multiplier(request)
 
-            strategy_multiplier = self._resolve_strategy_multiplier(request)
-            symbol_multiplier = self._resolve_symbol_multiplier(request)
+        risk_unit_snapshot = self._risk_unit_calculator.calculate(
+            self._state,
+            mode=self._state.risk_mode,
+            strategy_multiplier=strategy_multiplier,
+            symbol_multiplier=symbol_multiplier,
+        )
 
-            risk_unit_snapshot = self._risk_unit_calculator.calculate(
-                self._state,
-                mode=self._state.risk_mode,
-                strategy_multiplier=strategy_multiplier,
-                symbol_multiplier=symbol_multiplier,
-            )
+        risk_amount = risk_unit_snapshot.effective_risk_unit * tier_profile.risk_units
 
-            risk_amount = risk_unit_snapshot.effective_risk_unit * tier_profile.risk_units
-
-            if risk_amount <= 0 and request.order_intent.increases_risk:
-                decision = RiskDecision(
-                    allowed=False,
-                    decision=RiskDecisionType.DENY,
-                    final_size=None,
-                    final_leverage=final_leverage,
-                    final_tier=tier_profile.final_tier,
-                    final_risk_amount=risk_amount,
-                    risk_mode=self._state.risk_mode,
-                    reason="Effective risk amount is zero",
-                    symbol=request.symbol,
-                    side=request.side,
-                    signal_id=request.signal_id,
-                    strategy_name=request.strategy_name,
-                    order_intent=request.order_intent,
-                    violations=self._collect_violations(checks),
-                    checks=checks,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            size_request = PositionSizeRequest(
-                symbol=request.symbol,
-                side=request.side,
-                entry_price=request.entry_price,
-                stop_loss=request.stop_loss,
-                account_equity=self._state.equity,
-                free_balance=self._state.free_balance,
-                risk_amount=risk_amount,
-                risk_unit_snapshot=risk_unit_snapshot,
-                tier_profile=tier_profile,
-                leverage=final_leverage,
-                margin_mode=request.margin_mode,
-                requested_size=request.requested_size,
-                requested_margin=request.requested_margin,
-                confidence=request.confidence,
-                volatility=request.volatility,
-                metadata=dict(request.metadata),
-            )
-
-            size_result = self._position_sizer.check(size_request, self._state)
-            checks["position_sizing"] = size_result
-            if not size_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=size_result,
-                    checks=checks,
-                    reason=size_result.reason or "Position sizing failed",
-                    final_size=None,
-                    final_leverage=final_leverage,
-                    final_tier=tier_profile.final_tier,
-                    ev_snapshot=ev_snapshot,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            candidate_size = size_result.adjusted_size
-            candidate_margin = size_result.adjusted_margin
-            candidate_open_risk = size_result.adjusted_risk_amount or risk_amount
-
-            if candidate_size is None or candidate_size <= 0:
-                decision = RiskDecision(
-                    allowed=False,
-                    decision=RiskDecisionType.DENY,
-                    final_size=None,
-                    final_leverage=final_leverage,
-                    final_tier=tier_profile.final_tier,
-                    final_risk_amount=candidate_open_risk,
-                    risk_mode=self._state.risk_mode,
-                    reason="Calculated candidate size is invalid",
-                    symbol=request.symbol,
-                    side=request.side,
-                    signal_id=request.signal_id,
-                    strategy_name=request.strategy_name,
-                    order_intent=request.order_intent,
-                    violations=self._collect_violations(checks),
-                    checks=checks,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            strategy_result = self._strategy_guard.check(
-                request,
-                self._state,
-                risk_unit=max(risk_unit_snapshot.effective_risk_unit, 1e-12),
-                candidate_open_risk=candidate_open_risk,
-            )
-            checks["strategy"] = strategy_result
-            if not strategy_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=strategy_result,
-                    checks=checks,
-                    reason=strategy_result.reason or "Strategy risk check failed",
-                    final_size=None,
-                    final_leverage=final_leverage,
-                    final_tier=tier_profile.final_tier,
-                    ev_snapshot=ev_snapshot,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            symbol_result = self._symbol_guard.check(
-                request,
-                self._state,
-                risk_unit=max(risk_unit_snapshot.effective_risk_unit, 1e-12),
-                candidate_open_risk=candidate_open_risk,
-            )
-            checks["symbol"] = symbol_result
-            if not symbol_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=symbol_result,
-                    checks=checks,
-                    reason=symbol_result.reason or "Symbol risk check failed",
-                    final_size=None,
-                    final_leverage=final_leverage,
-                    final_tier=tier_profile.final_tier,
-                    ev_snapshot=ev_snapshot,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            exposure_result = self._exposure_control.check(
-                request,
-                self._state,
-                candidate_size=candidate_size,
-                candidate_open_risk=candidate_open_risk,
-                candidate_leverage=final_leverage,
-                candidate_margin=candidate_margin,
-                risk_unit=max(risk_unit_snapshot.effective_risk_unit, 1e-12),
-                mode=self._state.risk_mode,
-            )
-            checks["exposure"] = exposure_result
-            if not exposure_result.passed:
-                decision = self._build_terminal_decision(
-                    request=request,
-                    check=exposure_result,
-                    checks=checks,
-                    reason=exposure_result.reason or "Exposure limit exceeded",
-                    final_size=None,
-                    final_leverage=final_leverage,
-                    final_tier=tier_profile.final_tier,
-                    ev_snapshot=ev_snapshot,
-                )
-                await self._finalize_decision(
-                    request,
-                    decision,
-                    latency_ms=self._elapsed_ms(started_at),
-                )
-                return decision
-
-            decision_type = self._resolve_success_decision(checks)
-
+        if risk_amount <= 0 and self._order_increases_risk(request.order_intent):
             decision = RiskDecision(
-                allowed=True,
-                decision=decision_type,
-                final_size=candidate_size,
+                allowed=False,
+                decision=RiskDecisionType.DENY,
+                final_size=None,
                 final_leverage=final_leverage,
                 final_tier=tier_profile.final_tier,
-                final_risk_amount=candidate_open_risk,
-                final_margin=candidate_margin,
-                final_notional=(
-                    exposure_result.metadata.get("candidate_notional")
-                    if exposure_result.metadata
-                    else None
-                ),
+                final_risk_amount=risk_amount,
                 risk_mode=self._state.risk_mode,
-                risk_reward_ratio=ev_snapshot.risk_reward_ratio,
-                expected_value=ev_snapshot.expected_value,
-                expected_value_after_cost=ev_snapshot.expected_value_after_cost,
-                expected_cost=ev_snapshot.expected_cost,
-                cost_to_reward_ratio=ev_snapshot.cost_to_reward_ratio,
-                reason=self._build_success_reason(decision_type),
-                signal_id=request.signal_id,
-                strategy_name=request.strategy_name,
+                reason="Effective risk amount is zero",
                 symbol=request.symbol,
                 side=request.side,
+                signal_id=request.signal_id,
+                strategy_name=request.strategy_name,
                 order_intent=request.order_intent,
                 violations=self._collect_violations(checks),
                 checks=checks,
-                metadata={
-                    "risk_unit_snapshot": risk_unit_snapshot,
-                    "tier_profile": tier_profile,
-                    "expected_value_snapshot": ev_snapshot,
-                    "confidence": request.confidence,
-                    "edge_score": request.edge_score,
-                    "liquidity_class": request.liquidity_class.value,
-                    "execution_quality": request.execution_quality.value,
-                },
             )
+            return finalize(decision)
 
-            await self._finalize_decision(
-                request,
-                decision,
-                latency_ms=self._elapsed_ms(started_at),
+        size_request = PositionSizeRequest(
+            symbol=request.symbol,
+            side=request.side,
+            entry_price=request.entry_price,
+            stop_loss=request.stop_loss,
+            account_equity=self._state.equity,
+            free_balance=self._state.free_balance,
+            risk_amount=risk_amount,
+            risk_unit_snapshot=risk_unit_snapshot,
+            tier_profile=tier_profile,
+            leverage=final_leverage,
+            margin_mode=request.margin_mode,
+            requested_size=request.requested_size,
+            requested_margin=request.requested_margin,
+            confidence=request.confidence,
+            volatility=request.volatility,
+            metadata=dict(request.metadata),
+        )
+
+        size_result = self._position_sizer.check(size_request, self._state)
+        checks["position_sizing"] = size_result
+        if not size_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=size_result,
+                checks=checks,
+                reason=size_result.reason or "Position sizing failed",
+                final_size=None,
+                final_leverage=final_leverage,
+                final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
             )
-            self._circuit_breaker.register_success()
-            return decision
+            return finalize(decision)
+
+        candidate_size = size_result.adjusted_size
+        candidate_margin = size_result.adjusted_margin
+        candidate_open_risk = size_result.adjusted_risk_amount or risk_amount
+
+        if candidate_size is None or candidate_size <= 0:
+            decision = RiskDecision(
+                allowed=False,
+                decision=RiskDecisionType.DENY,
+                final_size=None,
+                final_leverage=final_leverage,
+                final_tier=tier_profile.final_tier,
+                final_risk_amount=candidate_open_risk,
+                risk_mode=self._state.risk_mode,
+                reason="Calculated candidate size is invalid",
+                symbol=request.symbol,
+                side=request.side,
+                signal_id=request.signal_id,
+                strategy_name=request.strategy_name,
+                order_intent=request.order_intent,
+                violations=self._collect_violations(checks),
+                checks=checks,
+            )
+            return finalize(decision)
+
+        strategy_result = self._strategy_guard.check(
+            request,
+            self._state,
+            risk_unit=max(risk_unit_snapshot.effective_risk_unit, 1e-12),
+            candidate_open_risk=candidate_open_risk,
+        )
+        checks["strategy"] = strategy_result
+        if not strategy_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=strategy_result,
+                checks=checks,
+                reason=strategy_result.reason or "Strategy risk check failed",
+                final_size=None,
+                final_leverage=final_leverage,
+                final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
+            )
+            return finalize(decision)
+
+        symbol_result = self._symbol_guard.check(
+            request,
+            self._state,
+            risk_unit=max(risk_unit_snapshot.effective_risk_unit, 1e-12),
+            candidate_open_risk=candidate_open_risk,
+        )
+        checks["symbol"] = symbol_result
+        if not symbol_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=symbol_result,
+                checks=checks,
+                reason=symbol_result.reason or "Symbol risk check failed",
+                final_size=None,
+                final_leverage=final_leverage,
+                final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
+            )
+            return finalize(decision)
+
+        exposure_result = self._exposure_control.check(
+            request,
+            self._state,
+            candidate_size=candidate_size,
+            candidate_open_risk=candidate_open_risk,
+            candidate_leverage=final_leverage,
+            candidate_margin=candidate_margin,
+            risk_unit=max(risk_unit_snapshot.effective_risk_unit, 1e-12),
+            mode=self._state.risk_mode,
+        )
+        checks["exposure"] = exposure_result
+        if not exposure_result.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=exposure_result,
+                checks=checks,
+                reason=exposure_result.reason or "Exposure limit exceeded",
+                final_size=None,
+                final_leverage=final_leverage,
+                final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
+            )
+            return finalize(decision)
+
+        decision_type = self._resolve_success_decision(checks)
+
+        decision = RiskDecision(
+            allowed=True,
+            decision=decision_type,
+            final_size=candidate_size,
+            final_leverage=final_leverage,
+            final_tier=tier_profile.final_tier,
+            final_risk_amount=candidate_open_risk,
+            final_margin=candidate_margin,
+            final_notional=(
+                exposure_result.metadata.get("candidate_notional")
+                if exposure_result.metadata
+                else None
+            ),
+            risk_mode=self._state.risk_mode,
+            risk_reward_ratio=ev_snapshot.risk_reward_ratio,
+            expected_value=ev_snapshot.expected_value,
+            expected_value_after_cost=ev_snapshot.expected_value_after_cost,
+            expected_cost=ev_snapshot.expected_cost,
+            cost_to_reward_ratio=ev_snapshot.cost_to_reward_ratio,
+            reason=self._build_success_reason(decision_type),
+            signal_id=request.signal_id,
+            strategy_name=request.strategy_name,
+            symbol=request.symbol,
+            side=request.side,
+            order_intent=request.order_intent,
+            violations=self._collect_violations(checks),
+            checks=checks,
+            metadata={
+                "risk_unit_snapshot": risk_unit_snapshot,
+                "tier_profile": tier_profile,
+                "expected_value_snapshot": ev_snapshot,
+                "confidence": request.confidence,
+                "edge_score": request.edge_score,
+                "liquidity_class": request.liquidity_class.value,
+                "execution_quality": request.execution_quality.value,
+            },
+        )
+
+        self._circuit_breaker.register_success()
+        return finalize(decision)
+
+
 
     async def on_position_opened(self, position: PortfolioPosition) -> None:
+        events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
+
         async with self._lock:
+            reservation = self._state.confirm_risk_reservation(
+                getattr(position, "metadata", {}).get("reservation_id") if position.metadata else None,
+                signal_id=position.signal_id,
+                symbol=position.symbol,
+                position_id=position.position_id,
+            )
+            if reservation is not None:
+                age_ms = self._reservation_age_ms(reservation)
+                self._metrics.register_reservation_confirmed(
+                    reservation_id=reservation.reservation_id,
+                    symbol=reservation.symbol,
+                    tier=reservation.tier,
+                    strategy_name=reservation.strategy_name,
+                    open_risk=reservation.open_risk,
+                    margin=reservation.margin,
+                    notional=reservation.notional,
+                    age_ms=age_ms,
+                )
+                events.append(
+                    (
+                        "risk.reservation_confirmed",
+                        self._serialize_reservation(reservation, status="confirmed", age_ms=age_ms),
+                        EventPriority.NORMAL,
+                    )
+                )
+
             self._state.add_position(position)
             self._metrics.register_position_opened(
                 symbol=position.symbol,
@@ -779,20 +790,28 @@ class RiskManager:
                 open_risk=position.open_risk,
             )
 
-        await self._emit_event(
-            "risk.position_registered",
-            {
-                "symbol": position.symbol,
-                "position_id": position.position_id,
-                "size": position.size,
-                "side": position.side.value,
-                "notional_value": position.notional_value,
-                "margin_used": position.margin_used,
-                "risk_amount": position.risk_amount,
-                "tier": position.tier.value if position.tier else None,
-                "strategy_name": position.strategy_name,
-            },
+        events.append(
+            (
+                "risk.position_registered",
+                {
+                    "symbol": position.symbol,
+                    "position_id": position.position_id,
+                    "size": position.size,
+                    "side": position.side.value,
+                    "notional_value": position.notional_value,
+                    "margin_used": position.margin_used,
+                    "risk_amount": position.risk_amount,
+                    "tier": position.tier.value if position.tier else None,
+                    "strategy_name": position.strategy_name,
+                    "signal_id": position.signal_id,
+                    "reservation_id": reservation.reservation_id if reservation is not None else None,
+                },
+                EventPriority.NORMAL,
+            )
         )
+
+        await self._emit_events(events)
+
 
     async def on_position_updated(
         self,
@@ -1062,18 +1081,35 @@ class RiskManager:
             position_id=payload.get("position_id"),
         )
 
+
     async def _handle_execution_rejected(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
-        await self.on_execution_failure(
-            message=payload.get("reason") or payload.get("message") or "Execution order rejected",
-            reason=CircuitBreakerReason.EXECUTION_FAILURES,
+        await self.on_execution_rejected(
+            reservation_id=payload.get("reservation_id"),
+            signal_id=payload.get("signal_id"),
+            symbol=payload.get("symbol"),
+            position_id=payload.get("position_id"),
+            reason=payload.get("reason") or payload.get("message") or "Execution order rejected",
         )
 
     async def _handle_execution_failed(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
-        await self.on_execution_failure(
-            message=payload.get("reason") or payload.get("message") or "Execution order failed",
-            reason=CircuitBreakerReason.EXECUTION_FAILURES,
+        await self.on_execution_failed(
+            reservation_id=payload.get("reservation_id"),
+            signal_id=payload.get("signal_id"),
+            symbol=payload.get("symbol"),
+            position_id=payload.get("position_id"),
+            reason=payload.get("reason") or payload.get("message") or "Execution order failed",
+        )
+
+    async def _handle_execution_cancelled(self, event: Any) -> None:
+        payload = getattr(event, "payload", {}) or {}
+        await self.on_execution_cancelled(
+            reservation_id=payload.get("reservation_id"),
+            signal_id=payload.get("signal_id"),
+            symbol=payload.get("symbol"),
+            position_id=payload.get("position_id"),
+            reason=payload.get("reason") or payload.get("message") or "Execution order cancelled",
         )
 
     async def _handle_execution_filled(self, event: Any) -> None:
@@ -1133,6 +1169,7 @@ class RiskManager:
             },
         )
 
+
     async def _finalize_decision(
         self,
         request: RiskEvaluationRequest,
@@ -1140,6 +1177,65 @@ class RiskManager:
         *,
         latency_ms: float | None = None,
     ) -> None:
+        """
+        Backward-compatible async finalizer.
+
+        New code uses _finalize_decision_locked() under the manager lock and emits
+        returned events afterwards. This wrapper is kept for older call sites.
+        """
+        async with self._lock:
+            events = self._finalize_decision_locked(request, decision, latency_ms=latency_ms)
+        await self._emit_events(events)
+
+    def _finalize_decision_locked(
+        self,
+        request: RiskEvaluationRequest,
+        decision: RiskDecision,
+        *,
+        latency_ms: float | None = None,
+    ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
+        events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
+
+        if decision.allowed and self._should_reserve_for_decision(request, decision):
+            try:
+                reservation = self._create_reservation_locked(request, decision)
+                setattr(decision, "reservation_id", reservation.reservation_id)
+                setattr(decision, "reservation_expires_at", reservation.expires_at)
+                decision.metadata["reservation_id"] = reservation.reservation_id
+                decision.metadata["reservation_expires_at"] = reservation.expires_at
+                self._metrics.register_reservation_created(
+                    reservation_id=reservation.reservation_id,
+                    symbol=reservation.symbol,
+                    tier=reservation.tier,
+                    strategy_name=reservation.strategy_name,
+                    open_risk=reservation.open_risk,
+                    margin=reservation.margin,
+                    notional=reservation.notional,
+                )
+                events.append(
+                    (
+                        "risk.reservation_created",
+                        self._serialize_reservation(reservation, status="created"),
+                        EventPriority.NORMAL,
+                    )
+                )
+            except Exception as exc:
+                self._logger.exception("Failed to create risk reservation")
+                self._metrics.register_reservation_failed(
+                    reservation_id=None,
+                    symbol=request.symbol,
+                    tier=decision.final_tier or request.tier,
+                    strategy_name=request.strategy_name,
+                    open_risk=decision.final_risk_amount or 0.0,
+                    margin=decision.final_margin or 0.0,
+                    notional=decision.final_notional or 0.0,
+                    reason=str(exc),
+                )
+                if getattr(self._config.reservation, "fail_closed_on_reservation_error", True):
+                    decision.allowed = False
+                    decision.decision = RiskDecisionType.DENY
+                    decision.reason = f"Risk reservation failed: {exc}"
+
         self._metrics.register_decision(decision, latency_ms=latency_ms)
 
         if not decision.allowed:
@@ -1150,32 +1246,33 @@ class RiskManager:
                 tier=decision.final_tier or request.tier,
             )
 
-        serialized = self._serialize_decision(request, decision)
-
-        topic, priority = self._topic_for_decision(decision)
-
         if decision.decision is RiskDecisionType.HALT_TRADING:
             self._state.halt_trading(decision.reason or "Risk halt triggered")
 
         if decision.decision is RiskDecisionType.EMERGENCY_STOP:
             self._state.emergency_stop(decision.reason or "Emergency stop triggered")
 
-        await self._emit_event(topic, serialized, priority=priority)
+        serialized = self._serialize_decision(request, decision)
+        events.extend(self._events_for_decision(decision, serialized))
 
         self._logger.info(
-            "Risk decision completed | symbol=%s decision=%s allowed=%s tier=%s size=%s leverage=%s",
+            "Risk decision completed | symbol=%s decision=%s allowed=%s tier=%s size=%s leverage=%s reservation_id=%s",
             request.symbol,
             decision.decision.value,
             decision.allowed,
             decision.final_tier.value if decision.final_tier else None,
             decision.final_size,
             decision.final_leverage,
+            getattr(decision, "reservation_id", None),
             extra={
                 "symbol": request.symbol,
                 "strategy_name": request.strategy_name,
                 "signal_id": request.signal_id,
+                "reservation_id": getattr(decision, "reservation_id", None),
             },
         )
+        return events
+
 
     async def _emit_event(
         self,
@@ -1212,6 +1309,352 @@ class RiskManager:
                 "Failed to emit risk event | topic=%s",
                 topic,
             )
+
+
+    async def on_execution_rejected(
+        self,
+        *,
+        reservation_id: str | None = None,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        events = await self._release_reservation_for_execution_event(
+            reservation_id=reservation_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            position_id=position_id,
+            status="released",
+            reason=reason or "Execution order rejected",
+        )
+        await self._emit_events(events)
+
+    async def on_execution_cancelled(
+        self,
+        *,
+        reservation_id: str | None = None,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        events = await self._release_reservation_for_execution_event(
+            reservation_id=reservation_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            position_id=position_id,
+            status="released",
+            reason=reason or "Execution order cancelled",
+        )
+        await self._emit_events(events)
+
+    async def on_execution_failed(
+        self,
+        *,
+        reservation_id: str | None = None,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        async with self._lock:
+            events = self._release_reservation_locked(
+                reservation_id=reservation_id,
+                signal_id=signal_id,
+                symbol=symbol,
+                position_id=position_id,
+                status="failed",
+                reason=reason or "Execution order failed",
+            )
+
+            was_active = self._state.is_circuit_breaker_active()
+            triggered = self._circuit_breaker.register_failure(
+                self._state,
+                reason=CircuitBreakerReason.EXECUTION_FAILURES,
+                message=reason,
+            )
+            is_active = self._state.is_circuit_breaker_active()
+
+            if triggered or (not was_active and is_active):
+                self._metrics.register_circuit_breaker_trigger()
+                events.append(
+                    (
+                        "risk.kill_switch",
+                        {
+                            "reason": (
+                                self._state.circuit_breaker.reason.value
+                                if self._state.circuit_breaker.reason
+                                else None
+                            ),
+                            "message": self._state.circuit_breaker.message,
+                            "cooldown_until": self._state.circuit_breaker.cooldown_until,
+                            "manual_release_required": self._state.circuit_breaker.manual_release_required,
+                        },
+                        EventPriority.CRITICAL,
+                    )
+                )
+
+        await self._emit_events(events)
+
+    async def cleanup_expired_reservations(self) -> None:
+        async with self._lock:
+            events = self._expire_reservations_locked(reason="scheduled_cleanup")
+        await self._emit_events(events)
+
+    async def _release_reservation_for_execution_event(
+        self,
+        *,
+        reservation_id: str | None = None,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+        status: str,
+        reason: str | None = None,
+    ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
+        async with self._lock:
+            return self._release_reservation_locked(
+                reservation_id=reservation_id,
+                signal_id=signal_id,
+                symbol=symbol,
+                position_id=position_id,
+                status=status,
+                reason=reason,
+            )
+
+    def _release_reservation_locked(
+        self,
+        *,
+        reservation_id: str | None = None,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        position_id: str | None = None,
+        status: str,
+        reason: str | None = None,
+    ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
+        reservation = self._state.release_risk_reservation(
+            reservation_id,
+            signal_id=signal_id,
+            symbol=symbol,
+            position_id=position_id,
+        )
+        if reservation is None:
+            return []
+
+        age_ms = self._reservation_age_ms(reservation)
+        if status == "failed":
+            self._metrics.register_reservation_failed(
+                reservation_id=reservation.reservation_id,
+                symbol=reservation.symbol,
+                tier=reservation.tier,
+                strategy_name=reservation.strategy_name,
+                open_risk=reservation.open_risk,
+                margin=reservation.margin,
+                notional=reservation.notional,
+                reason=reason,
+                age_ms=age_ms,
+            )
+        else:
+            self._metrics.register_reservation_released(
+                reservation_id=reservation.reservation_id,
+                symbol=reservation.symbol,
+                tier=reservation.tier,
+                strategy_name=reservation.strategy_name,
+                open_risk=reservation.open_risk,
+                margin=reservation.margin,
+                notional=reservation.notional,
+                reason=reason,
+                age_ms=age_ms,
+            )
+
+        return [
+            (
+                f"risk.reservation_{status}",
+                self._serialize_reservation(reservation, status=status, reason=reason, age_ms=age_ms),
+                EventPriority.NORMAL,
+            )
+        ]
+
+    def _expire_reservations_locked(
+        self,
+        *,
+        reason: str,
+    ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
+        reservation_cfg = getattr(self._config, "reservation", None)
+        if reservation_cfg is not None and not getattr(reservation_cfg, "auto_expire_on_evaluate", True):
+            return []
+
+        expired = self._state.expire_pending_reservations()
+        events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
+        for reservation in expired:
+            age_ms = self._reservation_age_ms(reservation)
+            self._metrics.register_reservation_expired(
+                reservation_id=reservation.reservation_id,
+                symbol=reservation.symbol,
+                tier=reservation.tier,
+                strategy_name=reservation.strategy_name,
+                open_risk=reservation.open_risk,
+                margin=reservation.margin,
+                notional=reservation.notional,
+                age_ms=age_ms,
+            )
+            events.append(
+                (
+                    "risk.reservation_expired",
+                    self._serialize_reservation(
+                        reservation,
+                        status="expired",
+                        reason=reason,
+                        age_ms=age_ms,
+                    ),
+                    EventPriority.NORMAL,
+                )
+            )
+        return events
+
+    def _should_reserve_for_decision(
+        self,
+        request: RiskEvaluationRequest,
+        decision: RiskDecision,
+    ) -> bool:
+        reservation_cfg = getattr(self._config, "reservation", None)
+        if reservation_cfg is None:
+            return False
+        if not getattr(reservation_cfg, "enabled", False):
+            return False
+        if not getattr(reservation_cfg, "reserve_on_allow", True):
+            return False
+        if not decision.allowed:
+            return False
+        if not self._order_increases_risk(request.order_intent):
+            return False
+        return bool(decision.final_size and decision.final_size > 0)
+
+    def _create_reservation_locked(
+        self,
+        request: RiskEvaluationRequest,
+        decision: RiskDecision,
+    ) -> Any:
+        reservation_cfg = self._config.reservation
+        pending = list(self._state.pending_reservations.values())
+
+        max_pending = getattr(reservation_cfg, "max_pending_reservations", None)
+        if max_pending is not None and len(pending) >= max_pending:
+            raise RuntimeError("maximum pending risk reservations exceeded")
+
+        max_per_symbol = getattr(reservation_cfg, "max_pending_per_symbol", None)
+        if max_per_symbol is not None:
+            symbol_pending = sum(1 for item in pending if item.symbol == request.symbol)
+            if symbol_pending >= max_per_symbol:
+                raise RuntimeError("maximum pending risk reservations per symbol exceeded")
+
+        max_per_strategy = getattr(reservation_cfg, "max_pending_per_strategy", None)
+        if max_per_strategy is not None and request.strategy_name:
+            strategy_pending = sum(
+                1 for item in pending if item.strategy_name == request.strategy_name
+            )
+            if strategy_pending >= max_per_strategy:
+                raise RuntimeError("maximum pending risk reservations per strategy exceeded")
+
+        return self._state.reserve_risk(
+            symbol=request.symbol,
+            side=request.side,
+            signal_id=request.signal_id,
+            strategy_name=request.strategy_name,
+            tier=decision.final_tier or request.tier,
+            size=decision.final_size or 0.0,
+            open_risk=decision.final_risk_amount or 0.0,
+            margin=decision.final_margin or 0.0,
+            notional=decision.final_notional or 0.0,
+            ttl_seconds=getattr(reservation_cfg, "ttl_seconds", 30.0),
+            metadata={
+                "decision": decision.decision.value,
+                "risk_mode": decision.risk_mode.value,
+                "source": self._service_name,
+            },
+        )
+
+    def _events_for_decision(
+        self,
+        decision: RiskDecision,
+        serialized: dict[str, Any],
+    ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
+        primary_topic, primary_priority = self._topic_for_decision(decision)
+        events: list[tuple[str, dict[str, Any], EventPriority | None]] = [
+            (primary_topic, serialized, primary_priority)
+        ]
+
+        if decision.decision is RiskDecisionType.EMERGENCY_STOP:
+            events.append(("risk.emergency_stop", serialized, EventPriority.CRITICAL))
+        elif decision.decision is RiskDecisionType.HALT_TRADING:
+            events.append(("risk.trading_halted", serialized, EventPriority.CRITICAL))
+        elif not decision.allowed:
+            events.append(("risk.rejected", serialized, EventPriority.HIGH))
+        elif decision.decision in {
+            RiskDecisionType.REDUCE_SIZE,
+            RiskDecisionType.REDUCE_RISK,
+            RiskDecisionType.DOWNGRADE_TIER,
+        }:
+            events.append(("risk.limit_warning", serialized, EventPriority.NORMAL))
+            events.append(("risk.size_adjusted", serialized, EventPriority.NORMAL))
+        else:
+            events.append(("risk.approved", serialized, EventPriority.NORMAL))
+
+        # Deduplicate primary/legacy pair when they match.
+        deduped: list[tuple[str, dict[str, Any], EventPriority | None]] = []
+        seen: set[str] = set()
+        for topic, payload, priority in events:
+            if topic in seen:
+                continue
+            seen.add(topic)
+            deduped.append((topic, payload, priority))
+        return deduped
+
+    async def _emit_events(
+        self,
+        events: list[tuple[str, dict[str, Any], EventPriority | None]],
+    ) -> None:
+        for topic, payload, priority in events:
+            await self._emit_event(topic, payload, priority=priority)
+
+    @staticmethod
+    def _order_increases_risk(order_intent: OrderIntent) -> bool:
+        value = getattr(order_intent, "increases_risk", None)
+        if isinstance(value, bool):
+            return value
+        return order_intent in {OrderIntent.OPEN, OrderIntent.INCREASE}
+
+    @staticmethod
+    def _reservation_age_ms(reservation: Any) -> float:
+        return max(0.0, (time.time() - reservation.created_at) * 1000.0)
+
+    @staticmethod
+    def _serialize_reservation(
+        reservation: Any,
+        *,
+        status: str,
+        reason: str | None = None,
+        age_ms: float | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "reservation_id": reservation.reservation_id,
+            "status": status,
+            "reason": reason,
+            "signal_id": reservation.signal_id,
+            "symbol": reservation.symbol,
+            "side": reservation.side.value,
+            "strategy_name": reservation.strategy_name,
+            "tier": reservation.tier.value if reservation.tier else None,
+            "position_id": reservation.position_id,
+            "size": reservation.size,
+            "open_risk": reservation.open_risk,
+            "margin": reservation.margin,
+            "notional": reservation.notional,
+            "created_at": reservation.created_at,
+            "expires_at": reservation.expires_at,
+            "age_ms": age_ms,
+            "metadata": RiskManager._json_safe(reservation.metadata),
+        }
 
     def _resolve_strategy_multiplier(self, request: RiskEvaluationRequest) -> float:
         if not request.strategy_name:
@@ -1307,24 +1750,21 @@ class RiskManager:
         return "Request approved"
 
     @staticmethod
+
+    @staticmethod
     def _topic_for_decision(decision: RiskDecision) -> tuple[str, EventPriority | None]:
         if decision.decision is RiskDecisionType.EMERGENCY_STOP:
-            return "risk.emergency_stop", EventPriority.CRITICAL
+            return "risk.kill_switch", EventPriority.CRITICAL
 
         if decision.decision is RiskDecisionType.HALT_TRADING:
-            return "risk.trading_halted", EventPriority.CRITICAL
+            return "risk.kill_switch", EventPriority.CRITICAL
 
         if not decision.allowed:
-            return "risk.rejected", EventPriority.HIGH
+            return "risk.position_blocked", EventPriority.HIGH
 
-        if decision.decision in {
-            RiskDecisionType.REDUCE_SIZE,
-            RiskDecisionType.REDUCE_RISK,
-            RiskDecisionType.DOWNGRADE_TIER,
-        }:
-            return "risk.size_adjusted", EventPriority.NORMAL
+        return "signal.confirmed", EventPriority.NORMAL
 
-        return "risk.approved", EventPriority.NORMAL
+
 
     @staticmethod
     def _serialize_decision(
@@ -1345,6 +1785,8 @@ class RiskManager:
             "final_risk_amount": decision.final_risk_amount,
             "final_margin": decision.final_margin,
             "final_notional": decision.final_notional,
+            "reservation_id": getattr(decision, "reservation_id", None),
+            "reservation_expires_at": getattr(decision, "reservation_expires_at", None),
             "risk_reward_ratio": decision.risk_reward_ratio,
             "expected_value": decision.expected_value,
             "expected_value_after_cost": decision.expected_value_after_cost,
@@ -1391,7 +1833,7 @@ class RiskManager:
             "metadata": RiskManager._json_safe(decision.metadata),
         }
 
-    @staticmethod
+
     def _request_from_payload(payload: dict[str, Any]) -> RiskEvaluationRequest:
         symbol = payload.get("symbol")
         side_raw = payload.get("side")
