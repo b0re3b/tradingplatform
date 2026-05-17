@@ -26,6 +26,7 @@ from risk.models import (
 )
 from risk.state import RiskState
 from risk.utils import (
+    is_finite_number,
     calculate_cost_to_reward_ratio,
     calculate_expected_value,
     calculate_reward_distance,
@@ -262,17 +263,31 @@ class RiskRewardGuard:
 
         expected_loss = (
             request.expected_loss
-            if request.expected_loss is not None and request.expected_loss >= 0
+            if request.expected_loss is not None
             else stop_distance
         )
         expected_reward = (
             request.expected_reward
-            if request.expected_reward is not None and request.expected_reward >= 0
+            if request.expected_reward is not None
             else reward_distance
+        )
+
+        self._validate_non_negative_finite(
+            expected_loss,
+            field_name="expected_loss",
+            allow_zero=False,
+        )
+        self._validate_non_negative_finite(
+            expected_reward,
+            field_name="expected_reward",
+            allow_zero=False,
         )
 
         expected_cost = self._resolve_expected_cost(request)
         win_probability = request.expected_win_probability
+
+        if win_probability is not None:
+            self._validate_probability(win_probability)
 
         expected_value: float | None = None
         expected_value_after_cost: float | None = None
@@ -291,9 +306,22 @@ class RiskRewardGuard:
                 expected_cost=0.0,
             )
 
+            self._validate_optional_finite(
+                expected_value,
+                field_name="expected_value",
+            )
+            self._validate_optional_finite(
+                expected_value_after_cost,
+                field_name="expected_value_after_cost",
+            )
+
         cost_to_reward = calculate_cost_to_reward_ratio(
             expected_cost=expected_cost,
             expected_reward=expected_reward,
+        )
+        self._validate_optional_finite(
+            cost_to_reward,
+            field_name="cost_to_reward_ratio",
         )
 
         return ExpectedValueSnapshot(
@@ -404,16 +432,53 @@ class RiskRewardGuard:
     @staticmethod
     def _resolve_expected_cost(request: RiskEvaluationRequest) -> float:
         if request.execution_cost is not None:
-            return request.execution_cost.total_cost
+            cost = request.execution_cost.total_cost
+        elif request.expected_cost is not None:
+            cost = request.expected_cost
+        else:
+            return 0.0
 
-        if request.expected_cost is not None:
-            return max(0.0, request.expected_cost)
+        RiskRewardGuard._validate_non_negative_finite(
+            cost,
+            field_name="expected_cost",
+            allow_zero=True,
+        )
+        return max(0.0, cost)
 
-        return 0.0
+    @staticmethod
+    def _validate_probability(value: float) -> None:
+        if not is_finite_number(value) or value < 0.0 or value > 1.0:
+            raise ValueError("expected_win_probability must be a finite number in [0, 1]")
+
+    @staticmethod
+    def _validate_non_negative_finite(
+        value: float,
+        *,
+        field_name: str,
+        allow_zero: bool,
+    ) -> None:
+        if not is_finite_number(value):
+            raise ValueError(f"{field_name} must be finite")
+
+        if allow_zero:
+            if value < 0.0:
+                raise ValueError(f"{field_name} must be >= 0")
+            return
+
+        if value <= 0.0:
+            raise ValueError(f"{field_name} must be > 0")
+
+    @staticmethod
+    def _validate_optional_finite(value: float | None, *, field_name: str) -> None:
+        if value is not None and not is_finite_number(value):
+            raise ValueError(f"{field_name} must be finite")
 
     @staticmethod
     def _classify_validation_error(message: str) -> RiskViolationType:
         normalized = message.lower()
+
+        if "finite" in normalized or "probability" in normalized or "expected_" in normalized:
+            return RiskViolationType.INVALID_REQUEST
 
         if "stop loss is required" in normalized or "stop_loss is required" in normalized:
             return RiskViolationType.STOP_LOSS_MISSING
@@ -545,7 +610,24 @@ class ExecutionCostGuard:
                 expected_reward=ev_snapshot.expected_reward,
             )
 
-        if cost_ratio > max_cost_to_reward:
+        if not is_finite_number(cost_ratio):
+            violations.append(
+                RiskViolation(
+                    violation_type=RiskViolationType.EXECUTION_COST_TOO_HIGH,
+                    level=RiskLevel.CRITICAL,
+                    message="Execution cost-to-reward ratio must be finite",
+                    current_value=cost_ratio,
+                    limit_value=max_cost_to_reward,
+                    symbol=request.symbol,
+                    strategy_name=request.strategy_name,
+                    tier=tier_profile.final_tier,
+                    metadata={
+                        "expected_cost": execution_cost.total_cost,
+                        "expected_reward": ev_snapshot.expected_reward,
+                    },
+                )
+            )
+        elif cost_ratio > max_cost_to_reward:
             violations.append(
                 RiskViolation(
                     violation_type=RiskViolationType.EXECUTION_COST_TOO_HIGH,
@@ -564,8 +646,25 @@ class ExecutionCostGuard:
             )
 
         if (
+            ev_snapshot.expected_value_after_cost is not None
+            and not is_finite_number(ev_snapshot.expected_value_after_cost)
+        ):
+            violations.append(
+                RiskViolation(
+                    violation_type=RiskViolationType.EXPECTED_VALUE_NEGATIVE,
+                    level=RiskLevel.CRITICAL,
+                    message="Expected value after cost must be finite",
+                    current_value=ev_snapshot.expected_value_after_cost,
+                    symbol=request.symbol,
+                    strategy_name=request.strategy_name,
+                    tier=tier_profile.final_tier,
+                )
+            )
+
+        if (
             self._config.require_positive_ev_after_cost
             and ev_snapshot.expected_value_after_cost is not None
+            and is_finite_number(ev_snapshot.expected_value_after_cost)
             and ev_snapshot.expected_value_after_cost <= 0
         ):
             violations.append(
@@ -686,13 +785,9 @@ class LeverageGuard:
         *,
         mode: RiskMode = RiskMode.NORMAL,
     ) -> RiskCheckResult:
-        requested = (
-            request.requested_leverage
-            or tier_profile.default_leverage
-            or self._config.default_leverage
-        )
+        requested = self._resolve_requested_leverage(request, tier_profile)
 
-        if requested <= 0:
+        if not is_finite_number(requested) or requested <= 0:
             return RiskCheckResult(
                 passed=False,
                 decision=RiskDecisionType.DENY,
@@ -778,6 +873,21 @@ class LeverageGuard:
             },
         )
 
+    def _resolve_requested_leverage(
+        self,
+        request: RiskEvaluationRequest,
+        tier_profile: TierRiskProfile,
+    ) -> float:
+        # None means no explicit user/strategy request, so defaults may be used.
+        # Numeric zero/NaN/inf are explicit invalid inputs and must fail closed.
+        if request.requested_leverage is not None:
+            return request.requested_leverage
+
+        if tier_profile.default_leverage is not None:
+            return tier_profile.default_leverage
+
+        return self._config.default_leverage
+
     def resolve_max_leverage(
         self,
         request: RiskEvaluationRequest,
@@ -833,7 +943,11 @@ class LeverageGuard:
             caps.append(min(caps) if caps else 1.0)
             caps.append(1.0)
 
-        return max(0.0, min(caps))
+        finite_caps = [cap for cap in caps if is_finite_number(cap) and cap >= 0.0]
+        if not finite_caps:
+            return 0.0
+
+        return max(0.0, min(finite_caps))
 
 
 __all__ = [

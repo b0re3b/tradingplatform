@@ -341,6 +341,8 @@ class SymbolRiskGuard:
             )
 
         violations: list[RiskViolation] = []
+        soft_violations: list[RiskViolation] = []
+        suggested_action: str | None = None
 
         if symbol_state.status is SymbolRiskStatus.DISABLED:
             violations.append(
@@ -356,7 +358,12 @@ class SymbolRiskGuard:
             )
 
         if symbol_state.status is SymbolRiskStatus.COOLDOWN and symbol_state.cooldown.is_active():
-            violations.append(
+            # Cooldown is a soft throttling state for this guard: it should not
+            # hard-deny a fresh request by itself. RiskManager can use the
+            # REDUCE_RISK decision and metadata to scale the final risk down or
+            # route the request through a stricter pipeline. Hard blocks remain
+            # reserved for DISABLED/status and budget-limit violations.
+            soft_violations.append(
                 RiskViolation(
                     violation_type=RiskViolationType.SYMBOL_COOLDOWN_ACTIVE,
                     level=RiskLevel.WARNING,
@@ -367,6 +374,7 @@ class SymbolRiskGuard:
                     metadata={"cooldown_until": symbol_state.cooldown.cooldown_until},
                 )
             )
+            suggested_action = "reduce"
 
         actual_positions = self._count_symbol_positions(state, request.symbol)
         projected_positions = actual_positions + pending_trades + self._candidate_position_increment(request)
@@ -458,21 +466,30 @@ class SymbolRiskGuard:
             return RiskCheckResult(
                 passed=False,
                 decision=RiskDecisionType.DENY,
-                violations=violations,
+                violations=violations + soft_violations,
                 reason="Symbol risk check failed",
-                metadata=metadata,
+                metadata={
+                    **metadata,
+                    "suggested_action": suggested_action,
+                },
             )
 
         decision = (
             RiskDecisionType.REDUCE_RISK
-            if symbol_state.status is SymbolRiskStatus.REDUCED
+            if symbol_state.status in {SymbolRiskStatus.REDUCED, SymbolRiskStatus.COOLDOWN}
+            or suggested_action == "reduce"
             else RiskDecisionType.ALLOW
         )
 
         return RiskCheckResult(
             passed=True,
             decision=decision,
-            metadata=metadata,
+            violations=soft_violations,
+            reason="Symbol risk reduced" if decision is RiskDecisionType.REDUCE_RISK else None,
+            metadata={
+                **metadata,
+                "suggested_action": suggested_action,
+            },
         )
 
     def should_apply_loss_cooldown(self, symbol_state: SymbolRiskState) -> bool:
@@ -591,7 +608,10 @@ class StrategyRiskGuard:
             return RiskCheckResult(
                 passed=True,
                 decision=RiskDecisionType.ALLOW,
-                metadata={"strategy_name": None},
+                metadata={
+                    "strategy_name": None,
+                    "strategy_name_missing": True,
+                },
             )
 
         strategy_state = state.get_strategy_state(request.strategy_name)
@@ -733,8 +753,9 @@ class StrategyRiskGuard:
 
         rolling_trades = len(strategy_state.rolling_pnls)
         metadata["rolling_trades"] = rolling_trades
-        expectancy = strategy_state.rolling_expectancy
+        expectancy = self._resolve_rolling_expectancy(strategy_state)
         has_enough_expectancy_data = rolling_trades >= max(1, self._config.rolling_expectancy_window)
+        metadata["rolling_expectancy"] = expectancy
         metadata["has_enough_expectancy_data"] = has_enough_expectancy_data
 
         if expectancy is not None and has_enough_expectancy_data:
@@ -816,6 +837,38 @@ class StrategyRiskGuard:
             self._config.max_consecutive_losses > 0
             and strategy_state.consecutive_losses >= self._config.max_consecutive_losses
         )
+
+    @staticmethod
+    def _resolve_rolling_expectancy(strategy_state: StrategyRiskState) -> float | None:
+        """Return finite rolling expectancy from state or rolling PnL history.
+
+        Some state implementations expose rolling_expectancy as a cached field
+        that may be None until a separate updater refreshes it. The guard must
+        still be able to make a safe decision from rolling_pnls that are already
+        present in StrategyRiskState.
+        """
+        expectancy = getattr(strategy_state, "rolling_expectancy", None)
+        if expectancy is not None:
+            try:
+                expectancy_float = float(expectancy)
+            except (TypeError, ValueError):
+                return None
+            return expectancy_float if is_finite_number(expectancy_float) else None
+
+        rolling_pnls = list(getattr(strategy_state, "rolling_pnls", []) or [])
+        finite_pnls: list[float] = []
+        for pnl in rolling_pnls:
+            try:
+                pnl_float = float(pnl)
+            except (TypeError, ValueError):
+                continue
+            if is_finite_number(pnl_float):
+                finite_pnls.append(pnl_float)
+
+        if not finite_pnls:
+            return None
+
+        return sum(finite_pnls) / len(finite_pnls)
 
     def _resolve_daily_loss_budget(self, strategy_name: str) -> float:
         return self._config.per_strategy_daily_loss_budget_r.get(
