@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -8,8 +9,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from html import unescape as html_unescape
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from xml.etree import ElementTree
 
 import aiohttp
@@ -49,7 +51,7 @@ def _clean_text(value: Any) -> str:
     if value is None:
         return ""
 
-    text = str(value)
+    text = html_unescape(str(value))
     text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
@@ -377,6 +379,9 @@ class BaseNewsSource(ABC):
         headers = {
             "User-Agent": DEFAULT_USER_AGENT,
             "Accept": "application/json,text/xml,application/xml,text/html;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
             **self.config.headers,
         }
 
@@ -828,59 +833,25 @@ class APINewsSource(BaseNewsSource):
         return self.config.default_language
 
 
-class ExchangeAnnouncementSource(APINewsSource):
-    """
-    Exchange announcement source.
-
-    This class extends APINewsSource but gives a dedicated source type and
-    safer defaults for exchange announcement feeds.
-    """
-
-    async def fetch(
-        self,
-        session: aiohttp.ClientSession | None = None,
-    ) -> list[RawNewsItem]:
-        if self.config.source_type != NewsSourceType.EXCHANGE_ANNOUNCEMENT:
-            raise NewsInvalidResponseError(
-                f"Exchange source '{self.name}' must use EXCHANGE_ANNOUNCEMENT source type",
-                context=self._context(reason=NewsFailureReason.INVALID_CONFIG),
-            )
-
-        return await self._run_fetch(self._fetch_exchange_announcements, session=session)
-
-    async def _fetch_exchange_announcements(
-        self,
-        *,
-        session: aiohttp.ClientSession | None = None,
-    ) -> list[RawNewsItem]:
-        """
-        Fetch exchange announcements.
-
-        This supports both JSON APIs and RSS-like endpoints:
-            - if api_url is configured, uses JSON API parsing
-            - otherwise, falls back to RSS parsing from url
-        """
-
-        if self.config.api_url:
-            return await self._fetch_api(session=session)
-
-        if self.config.url:
-            rss_adapter = RSSNewsSource(self.config)
-            return await rss_adapter._fetch_rss(session=session)
-
-        raise NewsInvalidResponseError(
-            f"Exchange announcement source '{self.name}' has neither api_url nor url",
-            context=self._context(reason=NewsFailureReason.INVALID_CONFIG),
-        )
-
-
 class StaticHTMLNewsSource(BaseNewsSource):
     """
-    Minimal static HTML source fallback.
+    Static HTML / embedded-data news source adapter.
 
-    This is intentionally simple and should only be used when RSS/API is not
-    available. Dynamic JavaScript-heavy websites should not be handled here.
-    Browser automation can be added later as a separate fallback if needed.
+    The adapter remains dependency-free and does not use browser automation, but
+    it handles the common shapes used by modern news/exchange pages:
+        1. metadata-driven custom regex
+        2. JSON-LD structured data
+        3. Next.js ``__NEXT_DATA__`` / application JSON script blocks
+        4. conservative anchor scan fallback
+
+    Useful metadata keys:
+        article_link_regex: regex with named groups title/url/summary/published_at/id
+        article_link_regexes: list/tuple of such regexes
+        article_url_allow_patterns: substrings or regexes that article URLs must match
+        article_url_block_patterns: substrings or regexes to reject
+        title_exclude_patterns: substrings or regexes to reject titles
+        min_title_length: minimum title length, default 12
+        max_embedded_json_nodes: recursion cap for embedded JSON extraction
     """
 
     async def fetch(
@@ -901,8 +872,21 @@ class StaticHTMLNewsSource(BaseNewsSource):
             )
 
         html = await self._request_text(self.config.url, session=session)
-
         items = self._extract_items_from_html(html, base_url=self.config.url)
+
+        if not items and self._looks_blocked_or_dynamic(html):
+            raise NewsInvalidResponseError(
+                f"HTML source '{self.name}' did not expose parseable static article data",
+                context=self._context(
+                    reason=NewsFailureReason.INVALID_RESPONSE,
+                    details={
+                        "parser": "static_html",
+                        "hint": "blocked_or_javascript_rendered",
+                        "body_preview": _clean_text(html[:500]),
+                    },
+                ),
+            )
+
         return items[: self.config.max_items_per_fetch]
 
     def _extract_items_from_html(
@@ -911,25 +895,44 @@ class StaticHTMLNewsSource(BaseNewsSource):
         *,
         base_url: str,
     ) -> list[RawNewsItem]:
-        """
-        Extract basic article links from static HTML.
+        parsed: list[RawNewsItem] = []
 
-        Supported metadata keys:
-            article_link_regex: regex with optional named groups title/url
-            article_title_regex: fallback title regex
-        """
+        parsed.extend(self._extract_by_custom_regexes(html, base_url=base_url))
+        parsed.extend(self._extract_json_ld_items(html, base_url=base_url))
+        parsed.extend(self._extract_next_data_items(html, base_url=base_url))
+        parsed.extend(self._extract_application_json_items(html, base_url=base_url))
+        parsed.extend(self._extract_by_basic_anchor_scan(html, base_url=base_url))
 
+        return self._deduplicate_items(parsed)[: self.config.max_items_per_fetch]
+
+    def _extract_by_custom_regexes(
+        self,
+        html: str,
+        *,
+        base_url: str,
+    ) -> list[RawNewsItem]:
         metadata = self.config.metadata
-        link_regex = metadata.get("article_link_regex")
+        patterns: list[str] = []
 
-        if link_regex:
-            return self._extract_by_custom_regex(
-                html,
-                base_url=base_url,
-                pattern=str(link_regex),
+        single_pattern = metadata.get("article_link_regex")
+        if single_pattern:
+            patterns.append(str(single_pattern))
+
+        multiple_patterns = metadata.get("article_link_regexes")
+        if isinstance(multiple_patterns, Sequence) and not isinstance(multiple_patterns, str):
+            patterns.extend(str(pattern) for pattern in multiple_patterns if pattern)
+
+        parsed: list[RawNewsItem] = []
+        for pattern in patterns:
+            parsed.extend(
+                self._extract_by_custom_regex(
+                    html,
+                    base_url=base_url,
+                    pattern=pattern,
+                )
             )
 
-        return self._extract_by_basic_anchor_scan(html, base_url=base_url)
+        return parsed
 
     def _extract_by_custom_regex(
         self,
@@ -954,22 +957,257 @@ class StaticHTMLNewsSource(BaseNewsSource):
 
         for match in compiled.finditer(html):
             group_dict = match.groupdict()
-            title = group_dict.get("title") or match.group(0)
-            url = group_dict.get("url")
-
-            if url:
-                url = urljoin(base_url, url)
-
-            raw_item = self._build_raw_item(
-                title=title,
-                url=url,
-                raw_payload={"match": group_dict},
+            title = group_dict.get("title") or group_dict.get("headline") or match.group(0)
+            url = group_dict.get("url") or group_dict.get("href")
+            summary = group_dict.get("summary") or group_dict.get("description")
+            source_item_id = group_dict.get("id") or group_dict.get("source_item_id")
+            published_at = _parse_datetime(
+                group_dict.get("published_at")
+                or group_dict.get("date")
+                or group_dict.get("published")
             )
 
+            raw_item = self._item_from_candidate(
+                title=title,
+                url=url,
+                base_url=base_url,
+                summary=summary,
+                source_item_id=source_item_id,
+                published_at=published_at,
+                raw_payload={"parser": "custom_regex", "match": group_dict},
+            )
             if raw_item:
                 parsed.append(raw_item)
 
         return parsed
+
+    def _extract_json_ld_items(
+        self,
+        html: str,
+        *,
+        base_url: str,
+    ) -> list[RawNewsItem]:
+        pattern = re.compile(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(?P<payload>.*?)</script>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        parsed: list[RawNewsItem] = []
+        for match in pattern.finditer(html):
+            payload_text = html_unescape(match.group("payload")).strip()
+            if not payload_text:
+                continue
+
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+
+            for candidate in self._iter_json_article_candidates(payload):
+                raw_item = self._raw_item_from_json_candidate(
+                    candidate,
+                    base_url=base_url,
+                    parser="json_ld",
+                )
+                if raw_item:
+                    parsed.append(raw_item)
+
+        return parsed
+
+    def _extract_next_data_items(
+        self,
+        html: str,
+        *,
+        base_url: str,
+    ) -> list[RawNewsItem]:
+        pattern = re.compile(
+            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(?P<payload>.*?)</script>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        parsed: list[RawNewsItem] = []
+        for match in pattern.finditer(html):
+            payload_text = html_unescape(match.group("payload")).strip()
+            if not payload_text:
+                continue
+
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+
+            for candidate in self._iter_json_article_candidates(payload):
+                raw_item = self._raw_item_from_json_candidate(
+                    candidate,
+                    base_url=base_url,
+                    parser="next_data",
+                )
+                if raw_item:
+                    parsed.append(raw_item)
+
+        return parsed
+
+    def _extract_application_json_items(
+        self,
+        html: str,
+        *,
+        base_url: str,
+    ) -> list[RawNewsItem]:
+        pattern = re.compile(
+            r'<script[^>]+type=["\']application/json["\'][^>]*>(?P<payload>.*?)</script>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        parsed: list[RawNewsItem] = []
+        max_scripts = int(self.config.metadata.get("max_application_json_scripts", 5))
+
+        for index, match in enumerate(pattern.finditer(html)):
+            if index >= max_scripts:
+                break
+
+            payload_text = html_unescape(match.group("payload")).strip()
+            if not payload_text or len(payload_text) > 3_000_000:
+                continue
+
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+
+            for candidate in self._iter_json_article_candidates(payload):
+                raw_item = self._raw_item_from_json_candidate(
+                    candidate,
+                    base_url=base_url,
+                    parser="application_json",
+                )
+                if raw_item:
+                    parsed.append(raw_item)
+
+        return parsed
+
+    def _iter_json_article_candidates(self, payload: Any) -> list[Mapping[str, Any]]:
+        max_nodes = int(self.config.metadata.get("max_embedded_json_nodes", 5000))
+        candidates: list[Mapping[str, Any]] = []
+        visited = 0
+
+        def walk(value: Any) -> None:
+            nonlocal visited
+            if visited >= max_nodes:
+                return
+            visited += 1
+
+            if isinstance(value, Mapping):
+                if self._mapping_looks_like_article(value):
+                    candidates.append(value)
+
+                # JSON-LD ItemList entries often wrap the real object.
+                for key in ("item", "article", "news", "post", "data"):
+                    nested = value.get(key)
+                    if nested is not None:
+                        walk(nested)
+
+                for nested in value.values():
+                    if isinstance(nested, Mapping | list | tuple):
+                        walk(nested)
+
+            elif isinstance(value, list | tuple):
+                for nested in value:
+                    walk(nested)
+
+        walk(payload)
+        return candidates
+
+    def _mapping_looks_like_article(self, item: Mapping[str, Any]) -> bool:
+        title = self._first_mapping_value(
+            item,
+            "headline",
+            "title",
+            "name",
+            "announcementTitle",
+            "articleTitle",
+        )
+        url = self._first_mapping_value(
+            item,
+            "url",
+            "link",
+            "href",
+            "path",
+            "slug",
+            "webUrl",
+        )
+
+        if not title or not url:
+            return False
+
+        title_clean = _clean_text(title)
+        if not self._is_allowed_title(title_clean):
+            return False
+
+        return True
+
+    def _raw_item_from_json_candidate(
+        self,
+        item: Mapping[str, Any],
+        *,
+        base_url: str,
+        parser: str,
+    ) -> RawNewsItem | None:
+        title = self._first_mapping_value(
+            item,
+            "headline",
+            "title",
+            "name",
+            "announcementTitle",
+            "articleTitle",
+        )
+        url = self._first_mapping_value(
+            item,
+            "url",
+            "link",
+            "href",
+            "path",
+            "slug",
+            "webUrl",
+        )
+        summary = self._first_mapping_value(
+            item,
+            "description",
+            "summary",
+            "excerpt",
+            "subtitle",
+            "brief",
+        )
+        source_item_id = self._first_mapping_value(
+            item,
+            "id",
+            "guid",
+            "uuid",
+            "code",
+            "articleId",
+            "announcementId",
+        )
+        published_at = _parse_datetime(
+            self._first_mapping_value(
+                item,
+                "datePublished",
+                "dateModified",
+                "published_at",
+                "publishedAt",
+                "publishDate",
+                "releaseDate",
+                "createdAt",
+            )
+        )
+
+        return self._item_from_candidate(
+            title=title,
+            url=url,
+            base_url=base_url,
+            summary=summary,
+            source_item_id=str(source_item_id) if source_item_id else None,
+            published_at=published_at,
+            raw_payload={"parser": parser},
+        )
 
     def _extract_by_basic_anchor_scan(
         self,
@@ -977,49 +1215,108 @@ class StaticHTMLNewsSource(BaseNewsSource):
         *,
         base_url: str,
     ) -> list[RawNewsItem]:
-        """
-        Basic anchor extraction for static pages.
-
-        This is deliberately conservative to avoid turning navigation links
-        into news items.
-        """
-
         anchor_pattern = re.compile(
             r'<a[^>]+href=["\'](?P<url>[^"\']+)["\'][^>]*>(?P<title>.*?)</a>',
             flags=re.IGNORECASE | re.DOTALL,
         )
 
         parsed: list[RawNewsItem] = []
-        seen_urls: set[str] = set()
-
         for match in anchor_pattern.finditer(html):
-            url = urljoin(base_url, match.group("url"))
-            title = _clean_text(match.group("title"))
-
-            if not title or len(title) < 12:
-                continue
-
-            if url in seen_urls:
-                continue
-
-            if self._is_likely_non_article_url(url):
-                continue
-
-            seen_urls.add(url)
-
-            raw_item = self._build_raw_item(
-                title=title,
-                url=url,
-                raw_payload={"html_link": url},
+            raw_item = self._item_from_candidate(
+                title=match.group("title"),
+                url=match.group("url"),
+                base_url=base_url,
+                raw_payload={"parser": "anchor_scan"},
             )
-
             if raw_item:
                 parsed.append(raw_item)
 
-            if len(parsed) >= self.config.max_items_per_fetch:
+            if len(parsed) >= self.config.max_items_per_fetch * 3:
                 break
 
         return parsed
+
+    def _item_from_candidate(
+        self,
+        *,
+        title: Any,
+        url: Any,
+        base_url: str,
+        summary: Any = None,
+        source_item_id: str | None = None,
+        published_at: datetime | None = None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> RawNewsItem | None:
+        title_clean = _clean_text(title)
+        if not self._is_allowed_title(title_clean):
+            return None
+
+        absolute_url = self._normalize_candidate_url(url, base_url=base_url)
+        if absolute_url and not self._is_allowed_article_url(absolute_url):
+            return None
+
+        return self._build_raw_item(
+            title=title_clean,
+            url=absolute_url,
+            summary=str(summary) if summary else None,
+            source_item_id=source_item_id or absolute_url or title_clean,
+            published_at=published_at,
+            raw_payload=raw_payload or {},
+        )
+
+    def _normalize_candidate_url(self, value: Any, *, base_url: str) -> str | None:
+        if value is None:
+            return None
+
+        raw = str(value).strip()
+        if not raw:
+            return None
+
+        if raw.startswith("//"):
+            scheme = urlsplit(base_url).scheme or "https"
+            raw = f"{scheme}:{raw}"
+
+        return urljoin(base_url, raw)
+
+    def _is_allowed_title(self, title: str) -> bool:
+        if not title:
+            return False
+
+        min_length = int(self.config.metadata.get("min_title_length", 12))
+        if len(title) < min_length:
+            return False
+
+        lowered = title.lower()
+        blocked_defaults = (
+            "log in",
+            "sign up",
+            "privacy policy",
+            "terms of use",
+            "cookie",
+            "subscribe",
+            "help center",
+            "download app",
+        )
+        if any(fragment in lowered for fragment in blocked_defaults):
+            return False
+
+        blocked_patterns = self.config.metadata.get("title_exclude_patterns", ())
+        return not self._matches_any(title, blocked_patterns)
+
+    def _is_allowed_article_url(self, url: str) -> bool:
+        lowered = url.lower()
+        if self._is_likely_non_article_url(lowered):
+            return False
+
+        allow_patterns = self.config.metadata.get("article_url_allow_patterns", ())
+        if allow_patterns and not self._matches_any(url, allow_patterns):
+            return False
+
+        block_patterns = self.config.metadata.get("article_url_block_patterns", ())
+        if block_patterns and self._matches_any(url, block_patterns):
+            return False
+
+        return True
 
     def _is_likely_non_article_url(self, url: str) -> bool:
         lowered = url.lower()
@@ -1037,10 +1334,174 @@ class StaticHTMLNewsSource(BaseNewsSource):
             "/contact",
             "/advertise",
             "/careers",
+            "/settings",
+            "/account",
+            "/download",
         )
 
         return any(fragment in lowered for fragment in blocked_fragments)
 
+    def _matches_any(self, value: str, patterns: Any) -> bool:
+        if not patterns:
+            return False
+
+        if isinstance(patterns, str):
+            patterns = (patterns,)
+
+        lowered = value.lower()
+        for pattern in patterns:
+            raw_pattern = str(pattern)
+            if not raw_pattern:
+                continue
+
+            # Treat simple strings as case-insensitive substrings; regex still works.
+            if raw_pattern.lower() in lowered:
+                return True
+
+            try:
+                if re.search(raw_pattern, value, flags=re.IGNORECASE):
+                    return True
+            except re.error:
+                continue
+
+        return False
+
+    def _deduplicate_items(self, items: list[RawNewsItem]) -> list[RawNewsItem]:
+        deduped: list[RawNewsItem] = []
+        seen: set[str] = set()
+
+        for item in items:
+            key = (item.url or item.source_item_id or item.title).strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+
+        return deduped
+
+    def _first_mapping_value(self, item: Mapping[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _looks_blocked_or_dynamic(self, html: str) -> bool:
+        lowered = html[:20_000].lower()
+        markers = (
+            "cloudflare",
+            "enable javascript",
+            "please enable js",
+            "access denied",
+            "request blocked",
+            "captcha",
+            "cf-browser-verification",
+            "__cf_chl",
+        )
+        return any(marker in lowered for marker in markers)
+
+
+class ExchangeAnnouncementSource(APINewsSource):
+    """
+    Exchange announcement source router.
+
+    The old implementation treated every non-API exchange URL as RSS. Real
+    exchange announcement pages often return static/Next.js HTML, so this
+    adapter now routes by actual payload shape:
+        - api_url -> JSON API parser
+        - XML/RSS/Atom body -> RSS/Atom parser
+        - JSON body from url -> generic API payload parser
+        - HTML body -> StaticHTMLNewsSource embedded/anchor parser
+    """
+
+    async def fetch(
+        self,
+        session: aiohttp.ClientSession | None = None,
+    ) -> list[RawNewsItem]:
+        if self.config.source_type != NewsSourceType.EXCHANGE_ANNOUNCEMENT:
+            raise NewsInvalidResponseError(
+                f"Exchange source '{self.name}' must use EXCHANGE_ANNOUNCEMENT source type",
+                context=self._context(reason=NewsFailureReason.INVALID_CONFIG),
+            )
+
+        return await self._run_fetch(self._fetch_exchange_announcements, session=session)
+
+    async def _fetch_exchange_announcements(
+        self,
+        *,
+        session: aiohttp.ClientSession | None = None,
+    ) -> list[RawNewsItem]:
+        if self.config.api_url:
+            return await self._fetch_api(session=session)
+
+        if not self.config.url:
+            raise NewsInvalidResponseError(
+                f"Exchange announcement source '{self.name}' has neither api_url nor url",
+                context=self._context(reason=NewsFailureReason.INVALID_CONFIG),
+            )
+
+        payload_text = await self._request_text(self.config.url, session=session)
+        stripped = payload_text.lstrip()
+
+        if self._looks_like_json(stripped):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise NewsInvalidResponseError(
+                    f"Exchange source '{self.name}' returned invalid JSON",
+                    context=self._context(
+                        reason=NewsFailureReason.PARSE_ERROR,
+                        details={"body_preview": stripped[:300]},
+                    ),
+                    cause=exc,
+                ) from exc
+
+            parsed: list[RawNewsItem] = []
+            for item in self._extract_items_from_payload(payload):
+                if isinstance(item, Mapping):
+                    raw_item = self._raw_item_from_mapping(item)
+                    if raw_item:
+                        parsed.append(raw_item)
+            return parsed[: self.config.max_items_per_fetch]
+
+        if self._looks_like_xml(stripped):
+            return self._parse_xml_payload(stripped)
+
+        html_adapter = StaticHTMLNewsSource(self.config)
+        return html_adapter._extract_items_from_html(payload_text, base_url=self.config.url)
+
+    def _looks_like_json(self, text: str) -> bool:
+        return text.startswith("{") or text.startswith("[")
+
+    def _looks_like_xml(self, text: str) -> bool:
+        lowered = text[:500].lower()
+        return (
+            lowered.startswith("<?xml")
+            or lowered.startswith("<rss")
+            or lowered.startswith("<feed")
+            or "<rss" in lowered
+            or "<feed" in lowered
+        )
+
+    def _parse_xml_payload(self, xml_text: str) -> list[RawNewsItem]:
+        try:
+            root = ElementTree.fromstring(xml_text)
+        except ElementTree.ParseError as exc:
+            raise NewsInvalidResponseError(
+                f"Exchange source '{self.name}' returned invalid XML",
+                context=self._context(
+                    reason=NewsFailureReason.PARSE_ERROR,
+                    details={"body_preview": xml_text[:300]},
+                ),
+                cause=exc,
+            ) from exc
+
+        rss_adapter = RSSNewsSource(self.config)
+        items = rss_adapter._parse_rss_items(root)
+        if not items:
+            items = rss_adapter._parse_atom_items(root)
+
+        return items[: self.config.max_items_per_fetch]
 
 def build_news_source(config: NewsSourceConfig) -> BaseNewsSource:
     """

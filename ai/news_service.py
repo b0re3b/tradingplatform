@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +20,8 @@ from .exceptions import NewsAIError, NewsErrorContext, NewsPublishError
 from .models import (
     NewsLLMResult,
     NewsProcessingResult,
+    NormalizedNewsItem,
+    RawNewsItem,
     ScoredNewsItem,
     utc_now,
 )
@@ -83,6 +86,16 @@ class NewsAIService:
 
     This is the only AI/news class that should directly use EventBus and
     Scheduler. Other classes stay focused on their local responsibilities.
+
+    Important deduplication rule:
+        The service never commits raw items to the global deduplication memory
+        before normalization/scoring. Raw-stage dedup is only a pre-check against
+        previously accepted news plus an in-run batch filter.
+
+        The final global dedup commit is done only after a normalized item was
+        successfully scored. This prevents the same item from being accepted as
+        raw and then immediately rejected as a normalized duplicate in the same
+        pipeline run.
     """
 
     def __init__(
@@ -221,6 +234,8 @@ class NewsAIService:
             scored_count = 0
             high_impact_count = 0
             failed_count = 0
+            raw_duplicate_count = 0
+            normalized_duplicate_count = 0
 
             try:
                 collection_result = await self.collector.collect()
@@ -243,7 +258,9 @@ class NewsAIService:
                         priority=EventPriority.NORMAL,
                     )
 
-                raw_unique_items = self.deduplicator.filter_new_raw(raw_items)
+                raw_unique_items, raw_duplicate_count = self._filter_new_raw_candidates(
+                    raw_items
+                )
                 raw_unique_count = len(raw_unique_items)
 
                 processed_batch = self.processor.process_many(raw_unique_items)
@@ -259,20 +276,43 @@ class NewsAIService:
                         finished_at=utc_now(),
                         raw_count=raw_unique_count,
                         processed_count=processed_batch.processed_count,
-                        duplicate_count=raw_unique_count - processed_batch.processed_count,
+                        duplicate_count=raw_duplicate_count,
                         failed_count=processed_batch.failed_count,
                         skipped_count=0,
                         errors=processed_batch.errors,
                         metadata={
                             "component": "NewsProcessor",
+                            "raw_duplicate_count": raw_duplicate_count,
+                            "dedup_commit_stage": "after_successful_scoring",
                         },
                     )
                 )
 
-                normalized_unique_items = self.deduplicator.filter_new_normalized(
-                    normalized_items
-                )
+                (
+                    normalized_unique_items,
+                    normalized_duplicate_count,
+                ) = self._filter_new_normalized_candidates(normalized_items)
                 normalized_unique_count = len(normalized_unique_items)
+
+                if normalized_duplicate_count:
+                    processing_results.append(
+                        NewsProcessingResult(
+                            stage=NewsProcessingStage.DEDUPLICATE,
+                            started_at=started_at,
+                            finished_at=utc_now(),
+                            raw_count=len(normalized_items),
+                            processed_count=normalized_unique_count,
+                            duplicate_count=normalized_duplicate_count,
+                            failed_count=0,
+                            skipped_count=normalized_duplicate_count,
+                            errors=(),
+                            metadata={
+                                "component": "NewsDeduplicator",
+                                "item_type": "NormalizedNewsItem",
+                                "commit": False,
+                            },
+                        )
+                    )
 
                 scored_items: list[ScoredNewsItem] = []
 
@@ -296,6 +336,9 @@ class NewsAIService:
                         scored_count += 1
                         self._total_scored += 1
 
+                        # Final dedup commit happens only after the item passed
+                        # normalization, feature extraction, optional LLM analysis,
+                        # scoring, and ScoredNewsItem construction.
                         self.deduplicator.remember_normalized(item)
 
                         if self.config.publish_scored_event:
@@ -360,7 +403,11 @@ class NewsAIService:
                         "service_name": self.config.service_name,
                         "collector_stats": self.collector.stats(),
                         "deduplicator_stats": self.deduplicator.stats(),
+                        "raw_duplicate_count": raw_duplicate_count,
+                        "normalized_duplicate_count": normalized_duplicate_count,
                         "llm_enabled": self.config.llm.enabled,
+                        "dedup_commit_stage": "after_successful_scoring",
+                        "scored_item_count": len(scored_items),
                     },
                 )
 
@@ -405,6 +452,8 @@ class NewsAIService:
                     metadata={
                         "service_name": self.config.service_name,
                         "pipeline_failed": True,
+                        "raw_duplicate_count": raw_duplicate_count,
+                        "normalized_duplicate_count": normalized_duplicate_count,
                     },
                 )
                 self._last_result = result
@@ -442,6 +491,8 @@ class NewsAIService:
                     metadata={
                         "service_name": self.config.service_name,
                         "unexpected_pipeline_failed": True,
+                        "raw_duplicate_count": raw_duplicate_count,
+                        "normalized_duplicate_count": normalized_duplicate_count,
                     },
                 )
                 self._last_result = result
@@ -500,6 +551,121 @@ class NewsAIService:
             )
 
         return await self.llm_client.analyze(item=item, features=features)
+
+    def _filter_new_raw_candidates(
+        self,
+        items: list[RawNewsItem],
+    ) -> tuple[list[RawNewsItem], int]:
+        """
+        Pre-filter raw items without committing them to global dedup memory.
+
+        Why not use NewsDeduplicator.filter_new_raw() here?
+            filter_new_raw() remembers accepted raw items immediately. The same
+            item then appears as NormalizedNewsItem and gets rejected as a
+            duplicate before scoring. This method only checks against previous
+            dedup state and uses an in-run fingerprint set for same-batch
+            duplicates.
+        """
+
+        unique: list[RawNewsItem] = []
+        seen_in_run: set[str] = set()
+        duplicate_count = 0
+
+        for item in items:
+            fingerprint = self._raw_item_fingerprint(item)
+            if fingerprint in seen_in_run:
+                duplicate_count += 1
+                continue
+
+            decision = self.deduplicator.check_raw(item)
+            if decision.is_duplicate:
+                duplicate_count += 1
+                continue
+
+            seen_in_run.add(fingerprint)
+            unique.append(item)
+
+        return unique, duplicate_count
+
+    def _filter_new_normalized_candidates(
+        self,
+        items: list[NormalizedNewsItem],
+    ) -> tuple[list[NormalizedNewsItem], int]:
+        """
+        Filter normalized items without committing them before scoring.
+
+        The final commit is done by remember_normalized() only after successful
+        scoring. This prevents failed scoring attempts from permanently hiding a
+        news item from future runs.
+        """
+
+        unique: list[NormalizedNewsItem] = []
+        seen_in_run: set[str] = set()
+        duplicate_count = 0
+
+        for item in items:
+            fingerprint = self._normalized_item_fingerprint(item)
+            if fingerprint in seen_in_run:
+                duplicate_count += 1
+                continue
+
+            decision = self.deduplicator.check_normalized(item)
+            if decision.is_duplicate:
+                duplicate_count += 1
+                continue
+
+            seen_in_run.add(fingerprint)
+            unique.append(item)
+
+        return unique, duplicate_count
+
+    def _raw_item_fingerprint(self, item: RawNewsItem) -> str:
+        """
+        Build an in-run raw item fingerprint.
+
+        This is intentionally local to the service and is not a persistent
+        identifier. Persistent deduplication remains NewsDeduplicator's job.
+        """
+
+        candidates = (
+            f"source_item:{item.source_name}:{item.source_item_id}"
+            if item.source_item_id
+            else None,
+            f"url:{item.url}" if item.url else None,
+            f"title:{item.title}",
+            f"text:{item.text}",
+        )
+        return self._stable_fingerprint(candidates)
+
+    def _normalized_item_fingerprint(self, item: NormalizedNewsItem) -> str:
+        """
+        Build an in-run normalized item fingerprint.
+
+        Prefer the stable news_id generated by NewsProcessor, then canonical
+        identifiers. This catches duplicates within the same run before the
+        item is committed to global dedup memory.
+        """
+
+        candidates = (
+            f"news_id:{item.news_id}" if item.news_id else None,
+            f"source_item:{item.source_name}:{item.source_item_id}"
+            if item.source_item_id
+            else None,
+            f"canonical_url:{item.canonical_url}" if item.canonical_url else None,
+            f"url:{item.url}" if item.url else None,
+            f"title_hash:{item.title_hash}" if item.title_hash else None,
+            f"content_hash:{item.content_hash}" if item.content_hash else None,
+            f"title:{item.title}",
+        )
+        return self._stable_fingerprint(candidates)
+
+    def _stable_fingerprint(self, candidates: tuple[str | None, ...]) -> str:
+        for candidate in candidates:
+            if candidate and candidate.strip():
+                normalized = " ".join(candidate.strip().lower().split())
+                return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+        return hashlib.sha1(str(utc_now().timestamp()).encode("utf-8")).hexdigest()
 
     async def _publish_scored(self, scored_item: ScoredNewsItem) -> None:
         await self._emit(
