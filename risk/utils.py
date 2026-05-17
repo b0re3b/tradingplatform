@@ -1,8 +1,49 @@
 from __future__ import annotations
 
 import math
+from typing import Final
 
 from risk.enums import PositionSide
+
+
+_EPSILON: Final[float] = 1e-12
+
+
+def is_finite_number(value: float | int | None) -> bool:
+    """
+    Check that value is a finite int/float.
+
+    This helper is intentionally strict: None, NaN and +/-inf are not valid
+    runtime risk inputs. Risk code should reject them before they can reach
+    sizing, exposure or PnL calculations.
+    """
+    if value is None:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _require_finite_number(value: float | int, field_name: str) -> float:
+    """Return value as float or raise ValueError for NaN/inf/non-numeric input."""
+    if not is_finite_number(value):
+        raise ValueError(f"{field_name} must be finite")
+    return float(value)
+
+
+def _validate_positive_number(value: float | int, field_name: str) -> float:
+    value_f = _require_finite_number(value, field_name)
+    if value_f <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return value_f
+
+
+def _validate_non_negative_number(value: float | int, field_name: str) -> float:
+    value_f = _require_finite_number(value, field_name)
+    if value_f < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return value_f
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -11,9 +52,13 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
 
     Pure helper. No side effects.
     """
-    if min_value > max_value:
+    value_f = _require_finite_number(value, "value")
+    min_f = _require_finite_number(min_value, "min_value")
+    max_f = _require_finite_number(max_value, "max_value")
+
+    if min_f > max_f:
         raise ValueError("min_value must be <= max_value")
-    return max(min_value, min(value, max_value))
+    return max(min_f, min(value_f, max_f))
 
 
 def safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
@@ -22,9 +67,13 @@ def safe_div(numerator: float, denominator: float, default: float = 0.0) -> floa
 
     Returns default when denominator is zero.
     """
-    if denominator == 0:
-        return default
-    return numerator / denominator
+    numerator_f = _require_finite_number(numerator, "numerator")
+    denominator_f = _require_finite_number(denominator, "denominator")
+    default_f = _require_finite_number(default, "default")
+
+    if denominator_f == 0:
+        return default_f
+    return numerator_f / denominator_f
 
 
 def calculate_pct(value: float, base: float, default: float = 0.0) -> float:
@@ -40,11 +89,14 @@ def calculate_drawdown_pct(current_equity: float, peak_equity: float) -> float:
 
     Returns 0 if peak_equity is not positive.
     """
-    if peak_equity <= 0:
+    current_equity_f = _require_finite_number(current_equity, "current_equity")
+    peak_equity_f = _require_finite_number(peak_equity, "peak_equity")
+
+    if peak_equity_f <= 0:
         return 0.0
 
-    drawdown = max(0.0, peak_equity - current_equity)
-    return drawdown / peak_equity
+    drawdown = max(0.0, peak_equity_f - current_equity_f)
+    return drawdown / peak_equity_f
 
 
 def calculate_loss_r(loss_amount: float, risk_unit: float, default: float = 0.0) -> float:
@@ -54,14 +106,16 @@ def calculate_loss_r(loss_amount: float, risk_unit: float, default: float = 0.0)
     loss_amount may be positive or negative. The returned value is always
     non-negative and represents loss magnitude in R.
     """
-    return safe_div(abs(min(0.0, loss_amount)), risk_unit, default=default)
+    loss_amount_f = _require_finite_number(loss_amount, "loss_amount")
+    return safe_div(abs(min(0.0, loss_amount_f)), risk_unit, default=default)
 
 
 def calculate_r_units(amount: float, risk_unit: float, default: float = 0.0) -> float:
     """
     Convert any absolute amount into R units by magnitude.
     """
-    return safe_div(abs(amount), risk_unit, default=default)
+    amount_f = _require_finite_number(amount, "amount")
+    return safe_div(abs(amount_f), risk_unit, default=default)
 
 
 def calculate_stop_distance(entry_price: float, stop_loss: float | None) -> float | None:
@@ -70,9 +124,11 @@ def calculate_stop_distance(entry_price: float, stop_loss: float | None) -> floa
 
     Prefer calculate_side_aware_stop_distance() for new risk logic.
     """
+    entry_price_f = _validate_positive_number(entry_price, "entry_price")
     if stop_loss is None:
         return None
-    return abs(entry_price - stop_loss)
+    stop_loss_f = _validate_positive_number(stop_loss, "stop_loss")
+    return abs(entry_price_f - stop_loss_f)
 
 
 def calculate_side_aware_stop_distance(
@@ -91,24 +147,24 @@ def calculate_side_aware_stop_distance(
         None if stop_loss is missing.
 
     Raises:
-        ValueError if prices are invalid or stop is on the wrong side.
+        ValueError if prices are invalid, non-finite or stop is on the wrong side.
     """
-    _validate_positive_price(entry_price, "entry_price")
+    entry_price_f = _validate_positive_number(entry_price, "entry_price")
 
     if stop_loss is None:
         return None
 
-    _validate_positive_price(stop_loss, "stop_loss")
+    stop_loss_f = _validate_positive_number(stop_loss, "stop_loss")
 
     if side is PositionSide.LONG:
-        if stop_loss >= entry_price:
+        if stop_loss_f >= entry_price_f:
             raise ValueError("LONG stop_loss must be below entry_price")
-        return entry_price - stop_loss
+        return entry_price_f - stop_loss_f
 
     if side is PositionSide.SHORT:
-        if stop_loss <= entry_price:
+        if stop_loss_f <= entry_price_f:
             raise ValueError("SHORT stop_loss must be above entry_price")
-        return stop_loss - entry_price
+        return stop_loss_f - entry_price_f
 
     raise ValueError(f"Unsupported position side: {side!r}")
 
@@ -129,24 +185,24 @@ def calculate_reward_distance(
         None if take_profit is missing.
 
     Raises:
-        ValueError if prices are invalid or take profit is on the wrong side.
+        ValueError if prices are invalid, non-finite or take profit is on the wrong side.
     """
-    _validate_positive_price(entry_price, "entry_price")
+    entry_price_f = _validate_positive_number(entry_price, "entry_price")
 
     if take_profit is None:
         return None
 
-    _validate_positive_price(take_profit, "take_profit")
+    take_profit_f = _validate_positive_number(take_profit, "take_profit")
 
     if side is PositionSide.LONG:
-        if take_profit <= entry_price:
+        if take_profit_f <= entry_price_f:
             raise ValueError("LONG take_profit must be above entry_price")
-        return take_profit - entry_price
+        return take_profit_f - entry_price_f
 
     if side is PositionSide.SHORT:
-        if take_profit >= entry_price:
+        if take_profit_f >= entry_price_f:
             raise ValueError("SHORT take_profit must be below entry_price")
-        return entry_price - take_profit
+        return entry_price_f - take_profit_f
 
     raise ValueError(f"Unsupported position side: {side!r}")
 
@@ -202,17 +258,14 @@ def calculate_expected_value(
 
     expected_reward and expected_loss should be positive magnitudes.
     """
-    if expected_reward < 0:
-        raise ValueError("expected_reward must be >= 0")
-    if expected_loss < 0:
-        raise ValueError("expected_loss must be >= 0")
-    if expected_cost < 0:
-        raise ValueError("expected_cost must be >= 0")
+    expected_reward_f = _validate_non_negative_number(expected_reward, "expected_reward")
+    expected_loss_f = _validate_non_negative_number(expected_loss, "expected_loss")
+    expected_cost_f = _validate_non_negative_number(expected_cost, "expected_cost")
 
     probability = normalize_probability(win_probability)
     loss_probability = 1.0 - probability
 
-    return probability * expected_reward - loss_probability * expected_loss - expected_cost
+    return probability * expected_reward_f - loss_probability * expected_loss_f - expected_cost_f
 
 
 def calculate_cost_to_reward_ratio(
@@ -226,21 +279,23 @@ def calculate_cost_to_reward_ratio(
 
     Returns default when expected_reward is not positive.
     """
-    if expected_cost < 0:
-        raise ValueError("expected_cost must be >= 0")
-    if expected_reward <= 0:
-        return default
-    return expected_cost / expected_reward
+    expected_cost_f = _validate_non_negative_number(expected_cost, "expected_cost")
+    expected_reward_f = _require_finite_number(expected_reward, "expected_reward")
+    # math.inf is an intentional default used by callers/tests when reward <= 0.
+    default_f = default if default == math.inf else _require_finite_number(default, "default")
+
+    if expected_reward_f <= 0:
+        return default_f
+    return expected_cost_f / expected_reward_f
 
 
 def calculate_notional(entry_price: float, size: float) -> float:
     """
     Calculate absolute notional value.
     """
-    _validate_positive_price(entry_price, "entry_price")
-    if size < 0:
-        raise ValueError("size must be >= 0")
-    return abs(entry_price * size)
+    entry_price_f = _validate_positive_number(entry_price, "entry_price")
+    size_f = _validate_non_negative_number(size, "size")
+    return abs(entry_price_f * size_f)
 
 
 def calculate_margin_required(
@@ -256,22 +311,19 @@ def calculate_margin_required(
     notional = calculate_notional(entry_price, size)
     if leverage is None:
         return notional
-    if leverage <= 0:
-        raise ValueError("leverage must be > 0")
-    return notional / leverage
+    leverage_f = _validate_positive_number(leverage, "leverage")
+    return notional / leverage_f
 
 
 def calculate_margin_from_notional(notional_value: float, leverage: float | None) -> float:
     """
     Calculate margin from already known notional.
     """
-    if notional_value < 0:
-        raise ValueError("notional_value must be >= 0")
+    notional_value_f = _validate_non_negative_number(notional_value, "notional_value")
     if leverage is None:
-        return notional_value
-    if leverage <= 0:
-        raise ValueError("leverage must be > 0")
-    return notional_value / leverage
+        return notional_value_f
+    leverage_f = _validate_positive_number(leverage, "leverage")
+    return notional_value_f / leverage_f
 
 
 def calculate_position_size_by_risk(
@@ -284,11 +336,9 @@ def calculate_position_size_by_risk(
 
     size = risk_amount / stop_distance
     """
-    if risk_amount < 0:
-        raise ValueError("risk_amount must be >= 0")
-    if stop_distance <= 0:
-        raise ValueError("stop_distance must be > 0")
-    return risk_amount / stop_distance
+    risk_amount_f = _validate_non_negative_number(risk_amount, "risk_amount")
+    stop_distance_f = _validate_positive_number(stop_distance, "stop_distance")
+    return risk_amount_f / stop_distance_f
 
 
 def calculate_risk_amount_from_size(
@@ -299,11 +349,9 @@ def calculate_risk_amount_from_size(
     """
     Calculate risk amount from size and stop distance.
     """
-    if size < 0:
-        raise ValueError("size must be >= 0")
-    if stop_distance <= 0:
-        raise ValueError("stop_distance must be > 0")
-    return size * stop_distance
+    size_f = _validate_non_negative_number(size, "size")
+    stop_distance_f = _validate_positive_number(stop_distance, "stop_distance")
+    return size_f * stop_distance_f
 
 
 def calculate_pnl(
@@ -316,14 +364,12 @@ def calculate_pnl(
     """
     Calculate realized/unrealized PnL for long or short position.
     """
-    _validate_positive_price(entry_price, "entry_price")
-    _validate_positive_price(exit_price, "exit_price")
+    entry_price_f = _validate_positive_number(entry_price, "entry_price")
+    exit_price_f = _validate_positive_number(exit_price, "exit_price")
+    size_f = _validate_non_negative_number(size, "size")
 
-    if size < 0:
-        raise ValueError("size must be >= 0")
-
-    price_delta = exit_price - entry_price
-    return price_delta * size * side.sign
+    price_delta = exit_price_f - entry_price_f
+    return price_delta * size_f * side.sign
 
 
 def normalize_probability(value: float | None, default: float = 0.5) -> float:
@@ -331,8 +377,9 @@ def normalize_probability(value: float | None, default: float = 0.5) -> float:
     Normalize probability to [0, 1].
     """
     if value is None:
-        return default
-    return clamp(value, 0.0, 1.0)
+        return _require_finite_number(default, "default")
+    value_f = _require_finite_number(value, "probability")
+    return clamp(value_f, 0.0, 1.0)
 
 
 def normalize_confidence(confidence: float | None, default: float = 0.5) -> float:
@@ -354,14 +401,16 @@ def apply_confidence_scale(
     confidence=0 → scale_min
     confidence=1 → scale_max
     """
-    if scale_min < 0:
-        raise ValueError("scale_min must be >= 0")
-    if scale_max < scale_min:
+    value_f = _require_finite_number(value, "value")
+    scale_min_f = _validate_non_negative_number(scale_min, "scale_min")
+    scale_max_f = _require_finite_number(scale_max, "scale_max")
+
+    if scale_max_f < scale_min_f:
         raise ValueError("scale_max must be >= scale_min")
 
     normalized_confidence = normalize_confidence(confidence)
-    scale = scale_min + (scale_max - scale_min) * normalized_confidence
-    return value * scale
+    scale = scale_min_f + (scale_max_f - scale_min_f) * normalized_confidence
+    return value_f * scale
 
 
 def apply_volatility_scale(
@@ -377,26 +426,34 @@ def apply_volatility_scale(
     volatility is expected as non-negative normalized value.
     Higher volatility means lower multiplier.
     """
-    if scale_min < 0:
-        raise ValueError("scale_min must be >= 0")
-    if scale_max < scale_min:
+    value_f = _require_finite_number(value, "value")
+    scale_min_f = _validate_non_negative_number(scale_min, "scale_min")
+    scale_max_f = _require_finite_number(scale_max, "scale_max")
+
+    if scale_max_f < scale_min_f:
         raise ValueError("scale_max must be >= scale_min")
 
-    if volatility is None or volatility <= 0:
-        return value
+    if volatility is None:
+        return value_f
 
-    volatility_scale = 1.0 / (1.0 + volatility)
-    volatility_scale = clamp(volatility_scale, scale_min, scale_max)
-    return value * volatility_scale
+    volatility_f = _require_finite_number(volatility, "volatility")
+    if volatility_f <= 0:
+        return value_f
+
+    volatility_scale = 1.0 / (1.0 + volatility_f)
+    volatility_scale = clamp(volatility_scale, scale_min_f, scale_max_f)
+    return value_f * volatility_scale
 
 
 def apply_cap(value: float, cap: float | None) -> float:
     """
     Apply upper cap if provided.
     """
+    value_f = _require_finite_number(value, "value")
     if cap is None:
-        return value
-    return min(value, cap)
+        return value_f
+    cap_f = _require_finite_number(cap, "cap")
+    return min(value_f, cap_f)
 
 
 def round_down_to_step(value: float, step: float | None) -> float:
@@ -405,35 +462,29 @@ def round_down_to_step(value: float, step: float | None) -> float:
 
     This never rounds up, which is important for risk safety.
     """
-    if step is None or step <= 0:
-        return value
-    if value < 0:
-        raise ValueError("value must be >= 0")
-    return math.floor(value / step) * step
+    value_f = _validate_non_negative_number(value, "value")
+    if step is None:
+        return value_f
+
+    step_f = _require_finite_number(step, "step")
+    if step_f <= 0:
+        return value_f
+    return math.floor(value_f / step_f) * step_f
 
 
 def coalesce_float(*values: float | None, default: float = 0.0) -> float:
     """
-    Return first non-None float-like value.
+    Return first non-None finite float-like value.
     """
     for value in values:
         if value is not None:
-            return value
-    return default
+            return _require_finite_number(value, "value")
+    return _require_finite_number(default, "default")
 
 
-def is_finite_number(value: float | int | None) -> bool:
-    """
-    Check that value is a finite int/float.
-    """
-    if value is None:
-        return False
-    return math.isfinite(float(value))
-
-
+# Backward-compatible alias for internal validators used by older code.
 def _validate_positive_price(value: float, field_name: str) -> None:
-    if value <= 0:
-        raise ValueError(f"{field_name} must be > 0")
+    _validate_positive_number(value, field_name)
 
 
 __all__ = [

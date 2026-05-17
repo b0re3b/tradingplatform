@@ -407,7 +407,8 @@ class RiskManager:
         events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
 
         self._circuit_breaker.release_if_ready(self._state)
-        events.extend(self._expire_reservations_locked(reason="evaluate_request"))
+        _, expired_events = self._expire_reservations_locked(reason="evaluate_request")
+        events.extend(expired_events)
 
         checks: dict[str, RiskCheckResult] = {}
 
@@ -784,6 +785,34 @@ class RiskManager:
 
         decision_type = self._resolve_success_decision(checks)
 
+        decision_type = self._resolve_success_decision(checks)
+
+        sizing_metadata = size_result.metadata or {}
+        exposure_metadata = exposure_result.metadata or {}
+
+        final_notional: float | None = None
+
+        raw_sizing_notional = sizing_metadata.get("notional_value")
+        if raw_sizing_notional is not None:
+            try:
+                parsed_notional = float(raw_sizing_notional)
+            except (TypeError, ValueError):
+                parsed_notional = math.nan
+
+            if math.isfinite(parsed_notional):
+                final_notional = parsed_notional
+
+        if final_notional is None:
+            raw_exposure_notional = exposure_metadata.get("candidate_notional")
+            if raw_exposure_notional is not None:
+                try:
+                    parsed_notional = float(raw_exposure_notional)
+                except (TypeError, ValueError):
+                    parsed_notional = math.nan
+
+                if math.isfinite(parsed_notional):
+                    final_notional = parsed_notional
+
         decision = RiskDecision(
             allowed=True,
             decision=decision_type,
@@ -792,11 +821,7 @@ class RiskManager:
             final_tier=tier_profile.final_tier,
             final_risk_amount=candidate_open_risk,
             final_margin=candidate_margin,
-            final_notional=(
-                exposure_result.metadata.get("candidate_notional")
-                if exposure_result.metadata
-                else None
-            ),
+            final_notional=final_notional,
             risk_mode=self._state.risk_mode,
             risk_reward_ratio=ev_snapshot.risk_reward_ratio,
             expected_value=ev_snapshot.expected_value,
@@ -849,7 +874,7 @@ class RiskManager:
                 )
                 events.append(
                     (
-                        "risk.reservation_confirmed",
+                        "risk.reservation.confirmed",
                         self._serialize_reservation(reservation, status="confirmed", age_ms=age_ms),
                         EventPriority.NORMAL,
                     )
@@ -1063,10 +1088,18 @@ class RiskManager:
 
         try:
             request = self._request_from_payload(payload)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             self._logger.warning(
                 "Ignoring malformed signal.generated event | reason=%s",
                 str(exc),
+            )
+            await self._emit_event(
+                "risk.signal_invalid",
+                {
+                    "reason": str(exc),
+                    "payload_keys": sorted(str(key) for key in payload.keys()),
+                },
+                priority=EventPriority.HIGH,
             )
             return
 
@@ -1097,7 +1130,7 @@ class RiskManager:
             )
             return
 
-        if topic == "account.snapshot":
+        if topic in {"account.updated", "account.snapshot"}:
             await self.on_account_update(
                 balance=self._to_float_or_none(payload.get("balance")),
                 equity=self._to_float_or_none(payload.get("equity")),
@@ -1184,7 +1217,35 @@ class RiskManager:
         )
 
     async def _handle_execution_filled(self, event: Any) -> None:
+        payload = getattr(event, "payload", {}) or {}
         self._circuit_breaker.register_success()
+
+        # A filled order should never leave an approved risk reservation pending.
+        # Prefer the explicit position payload when available; it lets state and
+        # metrics confirm the reservation and register the opened position in one
+        # path. If the fill event does not contain enough position data, release
+        # the reservation fail-safe so projected risk is not stuck forever.
+        if payload.get("symbol") and payload.get("side") and payload.get("size") is not None:
+            try:
+                position = self._position_from_payload(payload)
+            except ValueError as exc:
+                self._logger.warning(
+                    "Malformed execution.order_filled position payload | reason=%s",
+                    str(exc),
+                )
+            else:
+                await self.on_position_opened(position)
+                return
+
+        events = await self._release_reservation_for_execution_event(
+            reservation_id=payload.get("reservation_id"),
+            signal_id=payload.get("signal_id"),
+            symbol=payload.get("symbol"),
+            position_id=payload.get("position_id"),
+            status="released",
+            reason="Execution order filled without usable position payload",
+        )
+        await self._emit_events(events)
 
     async def _handle_day_rollover(self, event: Any) -> None:
         await self.reset_daily_state()
@@ -1210,13 +1271,17 @@ class RiskManager:
 
         async with self._lock:
             self._circuit_breaker.trigger_manual_halt(self._state, message=message)
+            self._state.halt_trading(message)
             self._metrics.register_circuit_breaker_trigger()
+            payload = {
+                "reason": CircuitBreakerReason.MANUAL_HALT.value,
+                "message": message,
+                "manual_release_required": True,
+            }
 
-        await self._emit_event(
-            "risk.circuit_breaker_triggered",
-            {"reason": CircuitBreakerReason.MANUAL_HALT.value, "message": message},
-            priority=EventPriority.CRITICAL,
-        )
+        await self._emit_event("risk.kill_switch", payload, priority=EventPriority.CRITICAL)
+        await self._emit_event("risk.trading_halted", payload, priority=EventPriority.CRITICAL)
+        await self._emit_event("risk.circuit_breaker_triggered", payload, priority=EventPriority.CRITICAL)
 
     async def _handle_manual_resume(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
@@ -1232,13 +1297,14 @@ class RiskManager:
             if released and not self._state.emergency_stop_active:
                 self._state.resume_trading()
 
-        await self._emit_event(
-            "risk.manual_resume_processed",
-            {
-                "released": released,
-                "clear_emergency_stop": clear_emergency_stop,
-            },
-        )
+        payload = {
+            "released": released,
+            "clear_emergency_stop": clear_emergency_stop,
+            "emergency_stop_active": self._state.emergency_stop_active,
+        }
+        await self._emit_event("risk.manual_resume_processed", payload)
+        if released and not self._state.emergency_stop_active:
+            await self._emit_event("risk.trading_resumed", payload)
 
     async def _finalize_decision(
             self,
@@ -1284,7 +1350,7 @@ class RiskManager:
                 )
                 events.append(
                     (
-                        "risk.reservation_created",
+                        "risk.reservation.created",
                         self._serialize_reservation(reservation, status="created"),
                         EventPriority.NORMAL,
                     )
@@ -1465,10 +1531,18 @@ class RiskManager:
 
         await self._emit_events(events)
 
-    async def cleanup_expired_reservations(self) -> None:
+    async def cleanup_expired_reservations(
+            self,
+            *,
+            now_ts: float | None = None,
+    ) -> list[Any]:
         async with self._lock:
-            events = self._expire_reservations_locked(reason="scheduled_cleanup")
+            expired, events = self._expire_reservations_locked(
+                reason="scheduled_cleanup",
+                now_ts=now_ts,
+            )
         await self._emit_events(events)
+        return expired
 
     async def _release_reservation_for_execution_event(
             self,
@@ -1537,7 +1611,7 @@ class RiskManager:
 
         return [
             (
-                f"risk.reservation_{status}",
+                f"risk.reservation.{status}",
                 self._serialize_reservation(reservation, status=status, reason=reason, age_ms=age_ms),
                 EventPriority.NORMAL,
             )
@@ -1547,12 +1621,13 @@ class RiskManager:
             self,
             *,
             reason: str,
-    ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
+            now_ts: float | None = None,
+    ) -> tuple[list[Any], list[tuple[str, dict[str, Any], EventPriority | None]]]:
         reservation_cfg = getattr(self._config, "reservation", None)
         if reservation_cfg is not None and not getattr(reservation_cfg, "auto_expire_on_evaluate", True):
-            return []
+            return [], []
 
-        expired = self._state.expire_pending_reservations()
+        expired = self._state.expire_pending_reservations(now_ts=now_ts)
         events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
         for reservation in expired:
             age_ms = self._reservation_age_ms(reservation)
@@ -1568,7 +1643,7 @@ class RiskManager:
             )
             events.append(
                 (
-                    "risk.reservation_expired",
+                    "risk.reservation.expired",
                     self._serialize_reservation(
                         reservation,
                         status="expired",
@@ -1578,7 +1653,7 @@ class RiskManager:
                     EventPriority.NORMAL,
                 )
             )
-        return events
+        return expired, events
 
     def _should_reserve_for_decision(
             self,
@@ -1901,7 +1976,7 @@ class RiskManager:
             },
             "metadata": RiskManager._json_safe(decision.metadata),
         }
-
+    @staticmethod
     def _request_from_payload(payload: dict[str, Any]) -> RiskEvaluationRequest:
         symbol = payload.get("symbol")
         side_raw = payload.get("side")
@@ -1980,6 +2055,9 @@ class RiskManager:
         )
 
         tier = RiskManager._optional_enum_from_value(TradeTier, payload.get("tier"))
+        metadata = dict(payload.get("metadata", {}))
+        if payload.get("reservation_id") is not None:
+            metadata["reservation_id"] = payload.get("reservation_id")
 
         return PortfolioPosition(
             symbol=str(symbol),
@@ -2001,7 +2079,7 @@ class RiskManager:
             unrealized_pnl=RiskManager._to_float_or_none(payload.get("unrealized_pnl")) or 0.0,
             opened_at=RiskManager._to_float_or_none(payload.get("opened_at")) or time.time(),
             updated_at=RiskManager._to_float_or_none(payload.get("updated_at")),
-            metadata=dict(payload.get("metadata", {})),
+            metadata=metadata,
         )
 
     @staticmethod
@@ -2047,9 +2125,10 @@ class RiskManager:
         if value is None:
             return None
         try:
-            return float(value)
+            result = float(value)
         except (TypeError, ValueError):
             return None
+        return result if math.isfinite(result) else None
 
     @staticmethod
     def _elapsed_ms(started_at: float) -> float:

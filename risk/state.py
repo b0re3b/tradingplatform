@@ -1102,12 +1102,15 @@ class RiskState:
 
     def activate_circuit_breaker(
         self,
-        reason: CircuitBreakerReason,
+        reason: CircuitBreakerReason | str,
         *,
         cooldown_until: float | None = None,
         message: str | None = None,
         manual_release_required: bool = False,
     ) -> None:
+        if isinstance(reason, str):
+            reason = CircuitBreakerReason(reason)
+
         self.circuit_breaker.active = True
         self.circuit_breaker.reason = reason
         self.circuit_breaker.triggered_at = time.time()
@@ -1130,6 +1133,17 @@ class RiskState:
         self.updated_at = time.time()
 
     def is_circuit_breaker_active(self, now_ts: float | None = None) -> bool:
+        """
+        Return whether circuit breaker is currently marked active.
+
+        This method is intentionally side-effect free and does not implicitly
+        compare deterministic/test timestamps with wall-clock time. If now_ts is
+        omitted, the active flag is treated as authoritative. Pass now_ts when
+        the caller explicitly wants a time-aware read.
+
+        Use deactivate_circuit_breaker() or a dedicated lifecycle/check layer to
+        mutate/release the breaker after cooldown.
+        """
         if not self.circuit_breaker.active:
             return False
 
@@ -1139,7 +1153,9 @@ class RiskState:
         if self.circuit_breaker.cooldown_until is None:
             return True
 
-        now_ts = now_ts or time.time()
+        if now_ts is None:
+            return True
+
         return now_ts < self.circuit_breaker.cooldown_until
 
     def get_daily_pnl(self) -> float:
@@ -1489,9 +1505,23 @@ class RiskState:
         now_ts: float | None = None,
         include_expired: bool = False,
     ):
-        now_ts = now_ts or time.time()
+        """
+        Iterate pending reservations using explicit time semantics.
+
+        By default, this is a pure state read over reservations currently stored
+        in pending_reservations. It must not silently drop items by comparing
+        test/deterministic reservation timestamps with wall-clock time.
+
+        If a caller wants a time-aware active-only view, it must pass now_ts.
+        Actual mutation/removal of expired reservations belongs to
+        expire_pending_reservations().
+        """
         for reservation in self.pending_reservations.values():
-            if not include_expired and reservation.is_expired(now_ts=now_ts):
+            if (
+                now_ts is not None
+                and not include_expired
+                and reservation.is_expired(now_ts=now_ts)
+            ):
                 continue
             if symbol is not None and reservation.symbol != symbol:
                 continue
