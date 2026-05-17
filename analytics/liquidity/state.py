@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
     EqualLevel,
     LiquidityLevel,
     LiquidityMapSnapshot,
@@ -23,10 +25,23 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalize_scope_value(value: Any, default: str) -> str:
+    normalized = str(value or default).strip()
+    return normalized if normalized else default
+
+
+def _normalize_symbol(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _normalize_timeframe(value: Any) -> str:
+    return str(value or "").strip()
+
+
 @dataclass(slots=True)
 class LiquidityTimeframeState:
     """
-    In-memory state для конкретного symbol + timeframe.
+    In-memory state для конкретного exchange + market_type + symbol + timeframe.
 
     Це чистий state container:
     - не має EventBus;
@@ -38,6 +53,8 @@ class LiquidityTimeframeState:
     Оновлюється LiquidityService після побудови LiquidityMapSnapshot.
     """
 
+    exchange: str
+    market_type: str
     symbol: str
     timeframe: str
 
@@ -61,12 +78,23 @@ class LiquidityTimeframeState:
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = _normalize_symbol(self.symbol)
+        self.timeframe = _normalize_timeframe(self.timeframe)
+
     @property
     def key(self) -> str:
-        return LiquidityState.make_key(self.symbol, self.timeframe)
+        return LiquidityState.make_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     def touch(self, ts: datetime | None = None) -> None:
-        self.last_update_at = ts or utcnow()
+        self.last_update_at = self._normalize_timestamp(ts) or utcnow()
 
     def apply_snapshot(
         self,
@@ -79,13 +107,18 @@ class LiquidityTimeframeState:
 
         Викликається LiquidityService після успішного rebuild_snapshot().
         """
+        self.exchange = _normalize_scope_value(snapshot.exchange, self.exchange)
+        self.market_type = _normalize_scope_value(snapshot.market_type, self.market_type)
+        self.symbol = _normalize_symbol(snapshot.symbol)
+        self.timeframe = _normalize_timeframe(snapshot.timeframe)
+
         self.last_snapshot = snapshot
 
         self.active_levels = list(snapshot.active_levels)
         self.equal_levels = list(snapshot.equal_levels)
         self.stop_clusters = list(snapshot.stop_clusters)
 
-        self.last_snapshot_at = snapshot.timestamp
+        self.last_snapshot_at = self._normalize_timestamp(snapshot.timestamp)
         self.snapshots_built += 1
         self.touch(ts or snapshot.timestamp)
 
@@ -98,11 +131,14 @@ class LiquidityTimeframeState:
     ) -> None:
         self.processed_candles += 1
 
-        if open_time is not None:
-            self.last_candle_open_time = open_time
+        normalized_open_time = self._normalize_timestamp(open_time)
+        normalized_close_time = self._normalize_timestamp(close_time)
 
-        if close_time is not None:
-            self.last_candle_close_time = close_time
+        if normalized_open_time is not None:
+            self.last_candle_open_time = normalized_open_time
+
+        if normalized_close_time is not None:
+            self.last_candle_close_time = normalized_close_time
 
         self.touch(ts)
 
@@ -111,7 +147,7 @@ class LiquidityTimeframeState:
         *,
         ts: datetime | None = None,
     ) -> None:
-        event_ts = ts or utcnow()
+        event_ts = self._normalize_timestamp(ts) or utcnow()
         self.processed_orderbook_updates += 1
         self.last_orderbook_update_at = event_ts
         self.touch(event_ts)
@@ -121,7 +157,7 @@ class LiquidityTimeframeState:
         *,
         ts: datetime | None = None,
     ) -> None:
-        event_ts = ts or utcnow()
+        event_ts = self._normalize_timestamp(ts) or utcnow()
         self.processed_price_updates += 1
         self.last_price_update_at = event_ts
         self.touch(event_ts)
@@ -145,7 +181,7 @@ class LiquidityTimeframeState:
                 reverse=True,
             )[:max_active_levels]
 
-        if len(self.equal_levels) > max_active_levels:
+        if max_active_levels > 0 and len(self.equal_levels) > max_active_levels:
             self.equal_levels = sorted(
                 self.equal_levels,
                 key=lambda level: level.confidence,
@@ -209,8 +245,11 @@ class LiquidityTimeframeState:
         Compact metrics payload для analytics.liquidity.state.metrics.
         """
         return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "key": self.key,
             "active_levels": len(self.active_levels),
             "equal_levels": len(self.equal_levels),
             "stop_clusters": len(self.stop_clusters),
@@ -273,6 +312,16 @@ class LiquidityTimeframeState:
 
         self.metadata.clear()
 
+    @staticmethod
+    def _normalize_timestamp(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+
+        return value.astimezone(timezone.utc)
+
 
 @dataclass(slots=True)
 class LiquidityState:
@@ -280,7 +329,7 @@ class LiquidityState:
     Загальний in-memory state liquidity-модуля.
 
     Ключ:
-        "{symbol}:{timeframe}"
+        "{exchange}:{market_type}:{symbol}:{timeframe}"
 
     Цей клас не керує lifecycle. Його використовує LiquidityService.
     """
@@ -288,36 +337,107 @@ class LiquidityState:
     states: dict[str, LiquidityTimeframeState] = field(default_factory=dict)
 
     @staticmethod
-    def make_key(symbol: str, timeframe: str) -> str:
-        return f"{symbol}:{timeframe}"
+    def make_key(
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        symbol: str = "",
+        timeframe: str = "",
+    ) -> str:
+        normalized_exchange = _normalize_scope_value(exchange, DEFAULT_EXCHANGE).lower()
+        normalized_market_type = _normalize_scope_value(
+            market_type,
+            DEFAULT_MARKET_TYPE,
+        ).lower()
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_timeframe = _normalize_timeframe(timeframe)
+
+        return (
+            f"{normalized_exchange}:"
+            f"{normalized_market_type}:"
+            f"{normalized_symbol}:"
+            f"{normalized_timeframe}"
+        )
+
+    @staticmethod
+    def make_market_prefix(
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        symbol: str = "",
+    ) -> str:
+        normalized_exchange = _normalize_scope_value(exchange, DEFAULT_EXCHANGE).lower()
+        normalized_market_type = _normalize_scope_value(
+            market_type,
+            DEFAULT_MARKET_TYPE,
+        ).lower()
+        normalized_symbol = _normalize_symbol(symbol)
+
+        return f"{normalized_exchange}:{normalized_market_type}:{normalized_symbol}:"
 
     def get(
         self,
         symbol: str,
         timeframe: str,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> LiquidityTimeframeState | None:
-        return self.states.get(self.make_key(symbol, timeframe))
+        return self.states.get(
+            self.make_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        )
 
     def get_or_create(
         self,
         symbol: str,
         timeframe: str,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> LiquidityTimeframeState:
-        key = self.make_key(symbol, timeframe)
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
 
         if key not in self.states:
             self.states[key] = LiquidityTimeframeState(
+                exchange=exchange,
+                market_type=market_type,
                 symbol=symbol,
                 timeframe=timeframe,
             )
 
         return self.states[key]
 
+    def get_for_market(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+    ) -> list[LiquidityTimeframeState]:
+        prefix = self.make_market_prefix(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+        )
+        return [
+            state
+            for key, state in self.states.items()
+            if key.startswith(prefix)
+        ]
+
     def apply_snapshot(
         self,
         snapshot: LiquidityMapSnapshot,
     ) -> LiquidityTimeframeState:
         state = self.get_or_create(
+            exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
             symbol=snapshot.symbol,
             timeframe=snapshot.timeframe,
         )
@@ -328,8 +448,41 @@ class LiquidityState:
         self,
         symbol: str,
         timeframe: str,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> None:
-        self.states.pop(self.make_key(symbol, timeframe), None)
+        self.states.pop(
+            self.make_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            ),
+            None,
+        )
+
+    def remove_market(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+    ) -> int:
+        prefix = self.make_market_prefix(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+        )
+        keys_to_remove = [
+            key
+            for key in self.states
+            if key.startswith(prefix)
+        ]
+
+        for key in keys_to_remove:
+            self.states.pop(key, None)
+
+        return len(keys_to_remove)
 
     def clear(self) -> None:
         self.states.clear()
@@ -402,6 +555,8 @@ class LiquidityState:
 
         return {
             "states_count": len(states),
+            "exchanges": sorted({state.exchange for state in states}),
+            "market_types": sorted({state.market_type for state in states}),
             "symbols": sorted({state.symbol for state in states}),
             "timeframes": sorted({state.timeframe for state in states}),
             "total_active_levels": sum(len(state.active_levels) for state in states),

@@ -14,6 +14,10 @@ from .enums import (
 )
 
 
+DEFAULT_EXCHANGE = "unknown"
+DEFAULT_MARKET_TYPE = "perpetual"
+
+
 def _utcnow() -> datetime:
     """
     Timezone-aware UTC timestamp for model state transitions.
@@ -46,6 +50,11 @@ def _clamp_signed(value: Any) -> float:
     return max(-1.0, min(_safe_float(value), 1.0))
 
 
+def _normalize_scope_value(value: Any, default: str) -> str:
+    normalized = str(value or default).strip()
+    return normalized if normalized else default
+
+
 @dataclass(slots=True)
 class LiquidityLevel:
     """
@@ -64,6 +73,11 @@ class LiquidityLevel:
     - не має logger;
     - не виконує IO;
     - містить тільки стан і прості domain-helper методи.
+
+    Multi-exchange scope:
+    - exchange + market_type + symbol + timeframe мають формувати повний scope;
+    - exchange/market_type мають default-и для backward compatibility з detector-ами,
+      які ще створюють рівні тільки через symbol/timeframe.
     """
 
     symbol: str
@@ -71,6 +85,9 @@ class LiquidityLevel:
     level_type: LiquidityLevelType
     side: LiquiditySide
     price: float
+
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
 
     status: LiquidityStatus = LiquidityStatus.ACTIVE
     sweep_status: SweepStatus = SweepStatus.NOT_SWEPT
@@ -89,19 +106,36 @@ class LiquidityLevel:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = str(self.symbol).strip().upper()
+        self.timeframe = str(self.timeframe).strip()
+
         self.price = _safe_float(self.price)
         self.confidence = _clamp01(self.confidence)
         self.touches_count = max(0, int(self.touches_count))
         self.reaction_count = max(0, int(self.reaction_count))
 
     @property
+    def scope_key(self) -> str:
+        return (
+            f"{self.exchange.lower()}:"
+            f"{self.market_type.lower()}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
+
+    @property
     def key(self) -> str:
         """
         Стабільний lightweight key для deduplication/cache/state.
+
+        Важливо:
+        exchange + market_type включені в key, щоб liquidity levels з різних
+        бірж або різних market_type не дедуплікувались як один рівень.
         """
         return (
-            f"{self.symbol}:"
-            f"{self.timeframe}:"
+            f"{self.scope_key}:"
             f"{self.level_type.value}:"
             f"{self.side.value}:"
             f"{self.price:.12f}"
@@ -206,8 +240,11 @@ class LiquidityLevel:
         Payload-safe представлення для EventBus events / dashboard / storage.
         """
         return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope_key": self.scope_key,
             "level_type": self.level_type.value,
             "side": self.side.value,
             "price": self.price,
@@ -232,15 +269,6 @@ class LiquidityLevel:
 class EqualLevel(LiquidityLevel):
     """
     Рівень типу equal highs / equal lows.
-
-    Наслідує службові поля з LiquidityLevel:
-    - status;
-    - sweep_status;
-    - confidence;
-    - touches_count;
-    - reaction_count;
-    - timestamps;
-    - metadata.
     """
 
     tolerance_pct: float = 0.0
@@ -297,7 +325,6 @@ class EqualLevel(LiquidityLevel):
 
     def to_event_payload(self) -> dict[str, Any]:
         payload = LiquidityLevel.to_event_payload(self)
-
         payload.update(
             {
                 "tolerance_pct": self.tolerance_pct,
@@ -317,12 +344,6 @@ class StopCluster:
     """
     Оцінений кластер стопів навколо очевидного liquidity-рівня.
 
-    Зазвичай будується з:
-    - equal highs / lows;
-    - swing highs / lows;
-    - range boundaries;
-    - external levels, якщо вони передані в LiquidityMap.
-
     Це чиста domain-модель. Вона не має EventBus, Scheduler, logger або IO.
     """
 
@@ -333,6 +354,9 @@ class StopCluster:
     low_price: float
     high_price: float
     center_price: float
+
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
 
     confidence: float = 0.0
     estimated_stop_density: float = 0.0
@@ -349,6 +373,11 @@ class StopCluster:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = str(self.symbol).strip().upper()
+        self.timeframe = str(self.timeframe).strip()
+
         self.low_price = _safe_float(self.low_price)
         self.high_price = _safe_float(self.high_price)
         self.center_price = _safe_float(self.center_price)
@@ -364,10 +393,18 @@ class StopCluster:
         self.touches_count = max(0, int(self.touches_count))
 
     @property
+    def scope_key(self) -> str:
+        return (
+            f"{self.exchange.lower()}:"
+            f"{self.market_type.lower()}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
+
+    @property
     def key(self) -> str:
         return (
-            f"{self.symbol}:"
-            f"{self.timeframe}:"
+            f"{self.scope_key}:"
             f"{self.side.value}:"
             f"{self.low_price:.12f}:"
             f"{self.high_price:.12f}"
@@ -429,8 +466,11 @@ class StopCluster:
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope_key": self.scope_key,
             "side": self.side.value,
             "low_price": self.low_price,
             "high_price": self.high_price,
@@ -480,12 +520,20 @@ class LiquidityZone:
     low_price: float
     high_price: float
 
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
+
     score: float = 0.0
     label: str | None = None
     source_types: list[LiquidityLevelType] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = str(self.symbol).strip().upper()
+        self.timeframe = str(self.timeframe).strip()
+
         self.low_price = _safe_float(self.low_price)
         self.high_price = _safe_float(self.high_price)
 
@@ -493,6 +541,15 @@ class LiquidityZone:
             self.low_price, self.high_price = self.high_price, self.low_price
 
         self.score = _clamp01(self.score)
+
+    @property
+    def scope_key(self) -> str:
+        return (
+            f"{self.exchange.lower()}:"
+            f"{self.market_type.lower()}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
 
     @property
     def center_price(self) -> float:
@@ -518,8 +575,11 @@ class LiquidityZone:
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope_key": self.scope_key,
             "side": self.side.value,
             "low_price": self.low_price,
             "high_price": self.high_price,
@@ -547,6 +607,9 @@ class LiquiditySignal:
     timeframe: str
     timestamp: datetime
 
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
+
     bias: LiquidityBias = LiquidityBias.NEUTRAL
 
     nearest_buy_side_liquidity: LiquidityLevel | StopCluster | None = None
@@ -562,11 +625,30 @@ class LiquiditySignal:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = str(self.symbol).strip().upper()
+        self.timeframe = str(self.timeframe).strip()
+
         self.sweep_risk_up = _clamp01(self.sweep_risk_up)
         self.sweep_risk_down = _clamp01(self.sweep_risk_down)
         self.magnet_score_up = _clamp01(self.magnet_score_up)
         self.magnet_score_down = _clamp01(self.magnet_score_down)
         self.confidence = _clamp01(self.confidence)
+
+        if self.timestamp.tzinfo is None:
+            self.timestamp = self.timestamp.replace(tzinfo=timezone.utc)
+        else:
+            self.timestamp = self.timestamp.astimezone(timezone.utc)
+
+    @property
+    def scope_key(self) -> str:
+        return (
+            f"{self.exchange.lower()}:"
+            f"{self.market_type.lower()}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
 
     @property
     def is_directional(self) -> bool:
@@ -574,8 +656,11 @@ class LiquiditySignal:
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope_key": self.scope_key,
             "timestamp": self.timestamp.isoformat(),
             "bias": self.bias.value,
             "sweep_risk_up": self.sweep_risk_up,
@@ -605,7 +690,7 @@ class LiquiditySignal:
 @dataclass(slots=True)
 class LiquidityMapSnapshot:
     """
-    Повний snapshot liquidity-карти для symbol + timeframe.
+    Повний snapshot liquidity-карти для exchange + market_type + symbol + timeframe.
 
     Створюється LiquidityMap, зберігається в LiquidityState,
     публікується LiquidityService через EventBus як
@@ -616,6 +701,9 @@ class LiquidityMapSnapshot:
     timeframe: str
     timestamp: datetime
     current_price: float
+
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
 
     active_levels: list[LiquidityLevel] = field(default_factory=list)
     equal_levels: list[EqualLevel] = field(default_factory=list)
@@ -638,6 +726,16 @@ class LiquidityMapSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = str(self.symbol).strip().upper()
+        self.timeframe = str(self.timeframe).strip()
+
+        if self.timestamp.tzinfo is None:
+            self.timestamp = self.timestamp.replace(tzinfo=timezone.utc)
+        else:
+            self.timestamp = self.timestamp.astimezone(timezone.utc)
+
         self.current_price = _safe_float(self.current_price)
         self.above_liquidity_score = _clamp01(self.above_liquidity_score)
         self.below_liquidity_score = _clamp01(self.below_liquidity_score)
@@ -646,6 +744,79 @@ class LiquidityMapSnapshot:
         # Do NOT clamp it to [0, 1], otherwise short/downside pressure
         # is lost before strategy layer consumes the snapshot.
         self.liquidity_pressure_score = _clamp_signed(self.liquidity_pressure_score)
+
+        self._apply_scope_to_children()
+
+    @property
+    def scope_key(self) -> str:
+        return (
+            f"{self.exchange.lower()}:"
+            f"{self.market_type.lower()}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
+
+    def _apply_scope_to_children(self) -> None:
+        """
+        Підтягує exchange/market_type/symbol/timeframe у вкладені моделі.
+
+        Це важливо для backward compatibility: detector-и можуть ще створювати
+        EqualLevel/StopCluster без exchange/market_type, а snapshot уже знає scope.
+        """
+        for level in self.active_levels:
+            self._scope_level(level)
+
+        for level in self.equal_levels:
+            self._scope_level(level)
+
+        for cluster in self.stop_clusters:
+            self._scope_cluster(cluster)
+
+        for zone in self.zones:
+            self._scope_zone(zone)
+
+        if isinstance(self.nearest_above_level, LiquidityLevel):
+            self._scope_level(self.nearest_above_level)
+        elif isinstance(self.nearest_above_level, StopCluster):
+            self._scope_cluster(self.nearest_above_level)
+
+        if isinstance(self.nearest_below_level, LiquidityLevel):
+            self._scope_level(self.nearest_below_level)
+        elif isinstance(self.nearest_below_level, StopCluster):
+            self._scope_cluster(self.nearest_below_level)
+
+        if self.strongest_cluster_above is not None:
+            self._scope_cluster(self.strongest_cluster_above)
+
+        if self.strongest_cluster_below is not None:
+            self._scope_cluster(self.strongest_cluster_below)
+
+        if self.signal is not None:
+            self.signal.exchange = self.exchange
+            self.signal.market_type = self.market_type
+            self.signal.symbol = self.symbol
+            self.signal.timeframe = self.timeframe
+
+    def _scope_level(self, level: LiquidityLevel) -> None:
+        level.exchange = self.exchange
+        level.market_type = self.market_type
+        level.symbol = self.symbol
+        level.timeframe = self.timeframe
+
+    def _scope_cluster(self, cluster: StopCluster) -> None:
+        cluster.exchange = self.exchange
+        cluster.market_type = self.market_type
+        cluster.symbol = self.symbol
+        cluster.timeframe = self.timeframe
+
+        for source_level in cluster.source_levels:
+            self._scope_level(source_level)
+
+    def _scope_zone(self, zone: LiquidityZone) -> None:
+        zone.exchange = self.exchange
+        zone.market_type = self.market_type
+        zone.symbol = self.symbol
+        zone.timeframe = self.timeframe
 
     def has_levels(self) -> bool:
         return bool(
@@ -724,8 +895,11 @@ class LiquidityMapSnapshot:
         Payload-safe snapshot для EventBus, dashboard, storage, AI layer.
         """
         return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope_key": self.scope_key,
             "timestamp": self.timestamp.isoformat(),
             "current_price": self.current_price,
             "active_levels": [

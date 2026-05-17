@@ -686,3 +686,6 @@ class OrderBookCache:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.time() * 1000)

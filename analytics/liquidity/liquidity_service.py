@@ -100,9 +100,17 @@ class LiquidityServiceStats:
 @dataclass(slots=True)
 class LiquidityServiceContext:
     """
-    Runtime market context для конкретного symbol + timeframe.
+    Runtime market context для конкретного exchange + market_type + symbol + timeframe.
+
+    Важливо:
+    - context не може бути тільки symbol/timeframe, бо BTCUSDT з Binance,
+      Bybit, OKX і MEXC не є одним і тим самим market stream;
+    - orderbook updates зазвичай не мають timeframe, тому вони застосовуються
+      тільки до context-ів того самого exchange + market_type + symbol.
     """
 
+    exchange: str
+    market_type: str
     symbol: str
     timeframe: str
 
@@ -116,6 +124,21 @@ class LiquidityServiceContext:
     last_rebuild_at: datetime | None = None
     last_update_at: datetime | None = None
 
+    def __post_init__(self) -> None:
+        self.exchange = self._normalize_scope_value(self.exchange)
+        self.market_type = self._normalize_scope_value(self.market_type)
+        self.symbol = str(self.symbol or "").strip().upper()
+        self.timeframe = str(self.timeframe or "").strip()
+
+    @property
+    def key(self) -> str:
+        return LiquidityService.make_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
     def touch(self, ts: datetime | None = None) -> None:
         self.last_update_at = ts or datetime.now(timezone.utc)
 
@@ -126,6 +149,11 @@ class LiquidityServiceContext:
             and len(self.candles) >= min_candles
         )
 
+    @staticmethod
+    def _normalize_scope_value(value: Any) -> str:
+        normalized = str(value or "").strip()
+        return normalized if normalized else "unknown"
+
 
 class LiquidityService:
     """
@@ -134,7 +162,7 @@ class LiquidityService:
     Відповідальність:
     - приймає EventBus / Scheduler / Config через dependency injection;
     - підписується на market.* події через register();
-    - накопичує market context per symbol/timeframe;
+    - накопичує market context per exchange/market_type/symbol/timeframe;
     - викликає LiquidityMap;
     - оновлює LiquidityState;
     - публікує analytics.liquidity.* події;
@@ -142,7 +170,8 @@ class LiquidityService:
 
     Важливо:
     - detectors і LiquidityMap залишаються чистими domain-компонентами;
-    - вся інтеграція з core.EventBus і core.Scheduler живе тут.
+    - вся інтеграція з core.EventBus і core.Scheduler живе тут;
+    - цей service не читає біржі напряму і не звертається напряму до exchange adapters.
     """
 
     def __init__(
@@ -346,6 +375,9 @@ class LiquidityService:
 
     async def rebuild_snapshot(
         self,
+        *,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
         extra_levels: Sequence[LiquidityLevel] | None = None,
@@ -353,9 +385,19 @@ class LiquidityService:
         force: bool = False,
     ) -> LiquidityMapSnapshot | None:
         """
-        Явна перебудова snapshot-а для symbol/timeframe.
+        Явна перебудова snapshot-а для exchange/market_type/symbol/timeframe.
         """
-        key = self._make_key(symbol, timeframe)
+        exchange = self._normalize_exchange(exchange)
+        market_type = self._normalize_market_type_value(market_type)
+        symbol = self._normalize_symbol(symbol)
+        timeframe = self._normalize_timeframe(timeframe)
+
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
         lock = self._get_lock(key)
 
         async with lock:
@@ -363,7 +405,12 @@ class LiquidityService:
             if context is None:
                 self._logger.debug(
                     "Skip rebuild: context not found",
-                    extra={"symbol": symbol, "timeframe": timeframe},
+                    extra={
+                        "exchange": exchange,
+                        "market_type": market_type,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    },
                 )
                 return None
 
@@ -382,33 +429,61 @@ class LiquidityService:
 
     def get_last_snapshot(
         self,
+        *,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
     ) -> LiquidityMapSnapshot | None:
-        state = self._state.get(symbol, timeframe)
-        return state.last_snapshot if state else None
+        state = self._state.get(
+            exchange=self._normalize_exchange(exchange),
+            market_type=self._normalize_market_type_value(market_type),
+            symbol=self._normalize_symbol(symbol),
+            timeframe=self._normalize_timeframe(timeframe),
+        )
+
+        if state is not None:
+            return state.last_snapshot
+
+        context = self.get_context(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return context.last_snapshot if context else None
 
     def get_context(
         self,
+        *,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
     ) -> LiquidityServiceContext | None:
-        return self._contexts.get(self._make_key(symbol, timeframe))
+        return self._contexts.get(
+            self.make_key(
+                exchange=self._normalize_exchange(exchange),
+                market_type=self._normalize_market_type_value(market_type),
+                symbol=self._normalize_symbol(symbol),
+                timeframe=self._normalize_timeframe(timeframe),
+            )
+        )
 
-    async def on_candle_closed(self, event: Event) -> None:
+    async def on_candle_closed(self, event: Event | dict[str, Any]) -> None:
         await self._on_candle_closed(event)
 
-    async def on_orderbook_updated(self, event: Event) -> None:
+    async def on_orderbook_updated(self, event: Event | dict[str, Any]) -> None:
         await self._on_orderbook_updated(event)
 
-    async def on_price_updated(self, event: Event) -> None:
+    async def on_price_updated(self, event: Event | dict[str, Any]) -> None:
         await self._on_price_updated(event)
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def _on_candle_closed(self, event: Event) -> None:
+    async def _on_candle_closed(self, event: Event | dict[str, Any]) -> None:
         if not self._running or not self._config.enabled:
             return
 
@@ -417,9 +492,24 @@ class LiquidityService:
         try:
             payload = self._event_payload(event)
 
-            symbol = self._extract_required(payload, "symbol")
-            timeframe = self._extract_required(payload, "timeframe")
-            candle = self._extract_required(payload, "candle")
+            exchange = self._normalize_exchange(
+                self._extract_required_str(payload, "exchange")
+            )
+            market_type = self._normalize_market_type_value(
+                self._extract_market_type(payload)
+            )
+            symbol = self._normalize_symbol(
+                self._extract_required_str(payload, "symbol")
+            )
+            timeframe = self._normalize_timeframe(
+                self._extract_required_str(payload, "timeframe")
+            )
+
+            # CandlesCache емiтить serialized candle напряму.
+            # Деякі інтеграційні шари можуть емiтити {"candle": {...}}.
+            candle = payload.get("candle")
+            if candle is None:
+                candle = payload
 
             current_price = self._extract_optional(payload, "current_price")
             if current_price is None:
@@ -427,11 +517,21 @@ class LiquidityService:
 
             event_ts = self._extract_event_timestamp(payload) or self._utcnow()
 
-            key = self._make_key(symbol, timeframe)
+            key = self.make_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
             lock = self._get_lock(key)
 
             async with lock:
-                context = self._get_or_create_context(symbol, timeframe)
+                context = self._get_or_create_context(
+                    exchange=exchange,
+                    market_type=market_type,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
                 context.candles.append(candle)
                 context.candles = context.candles[
                     -self._config.max_candles_per_context :
@@ -444,7 +544,12 @@ class LiquidityService:
 
                 context.touch(event_ts)
 
-                state = self._state.get_or_create(symbol, timeframe)
+                state = self._state.get_or_create(
+                    exchange=context.exchange,
+                    market_type=context.market_type,
+                    symbol=context.symbol,
+                    timeframe=context.timeframe,
+                )
                 state.record_candle_processed(
                     close_time=event_ts,
                     ts=event_ts,
@@ -459,10 +564,10 @@ class LiquidityService:
             self._handle_error(
                 "Failed to process candle closed event",
                 exc,
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra=self._error_extra(event),
             )
 
-    async def _on_orderbook_updated(self, event: Event) -> None:
+    async def _on_orderbook_updated(self, event: Event | dict[str, Any]) -> None:
         if not self._running or not self._config.enabled:
             return
 
@@ -471,58 +576,80 @@ class LiquidityService:
         try:
             payload = self._event_payload(event)
 
-            symbol = self._extract_required(payload, "symbol")
-            timeframe = self._extract_optional(
-                payload,
-                "timeframe",
-                default="default",
+            exchange = self._normalize_exchange(
+                self._extract_required_str(payload, "exchange")
+            )
+            market_type = self._normalize_market_type_value(
+                self._extract_market_type(payload)
+            )
+            symbol = self._normalize_symbol(
+                self._extract_required_str(payload, "symbol")
             )
 
             bids = self._extract_optional(payload, "bids", default=[])
             asks = self._extract_optional(payload, "asks", default=[])
             current_price = self._extract_optional(payload, "current_price")
 
+            if current_price is None:
+                current_price = self._extract_mid_price(payload)
+
             event_ts = self._extract_event_timestamp(payload) or self._utcnow()
 
-            key = self._make_key(symbol, timeframe)
-            lock = self._get_lock(key)
+            # Orderbook не має природного timeframe, тому оновлюємо тільки ті
+            # liquidity contexts, які вже існують для цього exchange/market/symbol.
+            matching_keys = self._find_context_keys_for_market(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+            )
 
-            async with lock:
-                context = self._get_or_create_context(symbol, timeframe)
-                context.orderbook = {
-                    "bids": list(bids or []),
-                    "asks": list(asks or []),
-                }
+            for key in matching_keys:
+                lock = self._get_lock(key)
 
-                if current_price is not None:
-                    price = safe_float(current_price)
-                    if price > 0:
-                        context.current_price = price
+                async with lock:
+                    context = self._contexts.get(key)
+                    if context is None:
+                        continue
 
-                context.touch(event_ts)
+                    context.orderbook = {
+                        "bids": list(bids or []),
+                        "asks": list(asks or []),
+                    }
 
-                state = self._state.get_or_create(symbol, timeframe)
-                state.record_orderbook_processed(ts=event_ts)
+                    if current_price is not None:
+                        price = safe_float(current_price)
+                        if price > 0:
+                            context.current_price = price
 
-                if not self._config.rebuild_on_orderbook_updates:
-                    return
+                    context.touch(event_ts)
 
-                if not self._should_rebuild_context(context):
-                    return
+                    state = self._state.get_or_create(
+                        exchange=context.exchange,
+                        market_type=context.market_type,
+                        symbol=context.symbol,
+                        timeframe=context.timeframe,
+                    )
+                    state.record_orderbook_processed(ts=event_ts)
 
-                await self._rebuild_context_snapshot_locked(
-                    context=context,
-                    force=False,
-                )
+                    if not self._config.rebuild_on_orderbook_updates:
+                        continue
+
+                    if not self._should_rebuild_context(context):
+                        continue
+
+                    await self._rebuild_context_snapshot_locked(
+                        context=context,
+                        force=False,
+                    )
 
         except Exception as exc:
             self._handle_error(
                 "Failed to process orderbook update event",
                 exc,
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra=self._error_extra(event),
             )
 
-    async def _on_price_updated(self, event: Event) -> None:
+    async def _on_price_updated(self, event: Event | dict[str, Any]) -> None:
         if not self._running or not self._config.enabled:
             return
 
@@ -531,7 +658,16 @@ class LiquidityService:
         try:
             payload = self._event_payload(event)
 
-            symbol = self._extract_required(payload, "symbol")
+            exchange = self._normalize_exchange(
+                self._extract_required_str(payload, "exchange")
+            )
+            market_type = self._normalize_market_type_value(
+                self._extract_market_type(payload)
+            )
+            symbol = self._normalize_symbol(
+                self._extract_required_str(payload, "symbol")
+            )
+
             price = safe_float(self._extract_required(payload, "price"))
             if price <= 0:
                 raise ValueError("price must be > 0")
@@ -540,13 +676,20 @@ class LiquidityService:
             event_ts = self._extract_event_timestamp(payload) or self._utcnow()
 
             if timeframe is not None:
-                keys = [self._make_key(symbol, timeframe)]
-            else:
                 keys = [
-                    key
-                    for key in self._contexts.keys()
-                    if key.startswith(f"{symbol}:")
+                    self.make_key(
+                        exchange=exchange,
+                        market_type=market_type,
+                        symbol=symbol,
+                        timeframe=self._normalize_timeframe(timeframe),
+                    )
                 ]
+            else:
+                keys = self._find_context_keys_for_market(
+                    exchange=exchange,
+                    market_type=market_type,
+                    symbol=symbol,
+                )
 
             for key in keys:
                 lock = self._get_lock(key)
@@ -560,8 +703,10 @@ class LiquidityService:
                     context.touch(event_ts)
 
                     state = self._state.get_or_create(
-                        context.symbol,
-                        context.timeframe,
+                        exchange=context.exchange,
+                        market_type=context.market_type,
+                        symbol=context.symbol,
+                        timeframe=context.timeframe,
                     )
                     state.record_price_processed(ts=event_ts)
 
@@ -580,7 +725,7 @@ class LiquidityService:
             self._handle_error(
                 "Failed to process price update event",
                 exc,
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra=self._error_extra(event),
             )
 
     # ------------------------------------------------------------------
@@ -610,6 +755,8 @@ class LiquidityService:
 
         try:
             snapshot = self._liquidity_map.build_snapshot(
+                exchange=context.exchange,
+                market_type=context.market_type,
                 symbol=context.symbol,
                 timeframe=context.timeframe,
                 candles=context.candles,
@@ -631,6 +778,8 @@ class LiquidityService:
                 "Failed to rebuild liquidity snapshot",
                 exc,
                 extra={
+                    "exchange": context.exchange,
+                    "market_type": context.market_type,
                     "symbol": context.symbol,
                     "timeframe": context.timeframe,
                 },
@@ -654,48 +803,71 @@ class LiquidityService:
 
         if self._config.publish_events:
             await self._emit_snapshot_events(
+                context=context,
                 snapshot=snapshot,
                 previous_snapshot=previous_snapshot,
             )
 
     async def _emit_snapshot_events(
         self,
+        *,
+        context: LiquidityServiceContext,
         snapshot: LiquidityMapSnapshot,
         previous_snapshot: LiquidityMapSnapshot | None,
     ) -> None:
         if self._config.emit_map_updates:
-            await self._emit_map_updated(snapshot)
+            await self._emit_map_updated(context, snapshot)
 
         if self._config.emit_level_events or self._config.emit_sweep_events:
-            await self._emit_level_events(snapshot, previous_snapshot)
+            await self._emit_level_events(context, snapshot, previous_snapshot)
 
         if self._config.emit_cluster_events:
-            await self._emit_cluster_events(snapshot, previous_snapshot)
+            await self._emit_cluster_events(context, snapshot, previous_snapshot)
 
         if self._config.emit_signal_events and snapshot.signal is not None:
-            await self._emit_signal_updated(snapshot)
+            await self._emit_signal_updated(context, snapshot)
 
-    async def _emit_map_updated(self, snapshot: LiquidityMapSnapshot) -> None:
+    async def _emit_map_updated(
+        self,
+        context: LiquidityServiceContext,
+        snapshot: LiquidityMapSnapshot,
+    ) -> None:
         await self._safe_emit(
             topic=LiquidityTopics.ANALYTICS_LIQUIDITY_MAP_UPDATED,
-            payload=snapshot.to_event_payload(),
+            payload=self._scoped_snapshot_payload(context, snapshot),
             priority=EventPriority.NORMAL,
         )
         self._stats.emitted_map_updates += 1
 
-    async def _emit_signal_updated(self, snapshot: LiquidityMapSnapshot) -> None:
+    async def _emit_signal_updated(
+        self,
+        context: LiquidityServiceContext,
+        snapshot: LiquidityMapSnapshot,
+    ) -> None:
         if snapshot.signal is None:
             return
 
+        payload = snapshot.signal.to_event_payload()
+        payload.update(
+            {
+                "exchange": context.exchange,
+                "market_type": context.market_type,
+                "symbol": context.symbol,
+                "timeframe": context.timeframe,
+                "context_key": context.key,
+            }
+        )
+
         await self._safe_emit(
             topic=LiquidityTopics.ANALYTICS_LIQUIDITY_SIGNAL_UPDATED,
-            payload=snapshot.signal.to_event_payload(),
+            payload=payload,
             priority=EventPriority.NORMAL,
         )
         self._stats.emitted_signal_events += 1
 
     async def _emit_level_events(
         self,
+        context: LiquidityServiceContext,
         snapshot: LiquidityMapSnapshot,
         previous_snapshot: LiquidityMapSnapshot | None,
     ) -> None:
@@ -708,9 +880,20 @@ class LiquidityService:
             previous = previous_levels.get(level_key)
 
             if previous is None and self._config.emit_level_events:
+                payload = level.to_event_payload()
+                payload.update(
+                    {
+                        "exchange": context.exchange,
+                        "market_type": context.market_type,
+                        "symbol": context.symbol,
+                        "timeframe": context.timeframe,
+                        "context_key": context.key,
+                    }
+                )
+
                 await self._safe_emit(
                     topic=LiquidityTopics.ANALYTICS_LIQUIDITY_LEVEL_DETECTED,
-                    payload=level.to_event_payload(),
+                    payload=payload,
                     priority=EventPriority.NORMAL,
                 )
                 self._stats.emitted_level_events += 1
@@ -730,15 +913,27 @@ class LiquidityService:
                 and sweep_changed
                 and swept_now
             ):
+                payload = level.to_event_payload()
+                payload.update(
+                    {
+                        "exchange": context.exchange,
+                        "market_type": context.market_type,
+                        "symbol": context.symbol,
+                        "timeframe": context.timeframe,
+                        "context_key": context.key,
+                    }
+                )
+
                 await self._safe_emit(
                     topic=LiquidityTopics.ANALYTICS_LIQUIDITY_LEVEL_SWEPT,
-                    payload=level.to_event_payload(),
+                    payload=payload,
                     priority=EventPriority.HIGH,
                 )
                 self._stats.emitted_level_events += 1
 
     async def _emit_cluster_events(
         self,
+        context: LiquidityServiceContext,
         snapshot: LiquidityMapSnapshot,
         previous_snapshot: LiquidityMapSnapshot | None,
     ) -> None:
@@ -751,9 +946,20 @@ class LiquidityService:
             if cluster_key in previous_clusters:
                 continue
 
+            payload = cluster.to_event_payload()
+            payload.update(
+                {
+                    "exchange": context.exchange,
+                    "market_type": context.market_type,
+                    "symbol": context.symbol,
+                    "timeframe": context.timeframe,
+                    "context_key": context.key,
+                }
+            )
+
             await self._safe_emit(
                 topic=LiquidityTopics.ANALYTICS_LIQUIDITY_STOP_CLUSTER_DETECTED,
-                payload=cluster.to_event_payload(),
+                payload=payload,
                 priority=EventPriority.NORMAL,
             )
             self._stats.emitted_cluster_events += 1
@@ -823,6 +1029,7 @@ class LiquidityService:
             "stats": self._stats.to_payload(),
             "state": self._state.to_metrics_payload(),
             "contexts_count": len(self._contexts),
+            "context_keys": list(self._contexts.keys()),
         }
 
         await self._safe_emit(
@@ -847,6 +1054,7 @@ class LiquidityService:
             "scheduler_jobs": len(self._scheduler_job_ids),
             "errors_count": self._stats.errors_count,
             "last_error": self._stats.last_error,
+            "context_keys": list(self._contexts.keys()),
         }
 
         await self._safe_emit(
@@ -875,9 +1083,8 @@ class LiquidityService:
 
         sorted_items = sorted(
             self._contexts.items(),
-            key=lambda item: item[1].last_update_at or datetime.min.replace(
-                tzinfo=timezone.utc
-            ),
+            key=lambda item: item[1].last_update_at
+            or datetime.min.replace(tzinfo=timezone.utc),
         )
 
         excess = len(self._contexts) - self._config.max_contexts
@@ -926,18 +1133,51 @@ class LiquidityService:
 
     def _get_or_create_context(
         self,
+        *,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
     ) -> LiquidityServiceContext:
-        key = self._make_key(symbol, timeframe)
+        exchange = self._normalize_exchange(exchange)
+        market_type = self._normalize_market_type_value(market_type)
+        symbol = self._normalize_symbol(symbol)
+        timeframe = self._normalize_timeframe(timeframe)
+
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
 
         if key not in self._contexts:
             self._contexts[key] = LiquidityServiceContext(
+                exchange=exchange,
+                market_type=market_type,
                 symbol=symbol,
                 timeframe=timeframe,
             )
 
         return self._contexts[key]
+
+    def _find_context_keys_for_market(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+    ) -> list[str]:
+        prefix = self.make_market_prefix(
+            exchange=self._normalize_exchange(exchange),
+            market_type=self._normalize_market_type_value(market_type),
+            symbol=self._normalize_symbol(symbol),
+        )
+        return [
+            key
+            for key in self._contexts.keys()
+            if key.startswith(prefix)
+        ]
 
     def _get_lock(self, key: str) -> asyncio.Lock:
         if key not in self._locks:
@@ -946,12 +1186,72 @@ class LiquidityService:
         return self._locks[key]
 
     @staticmethod
-    def _make_key(symbol: str, timeframe: str) -> str:
-        return f"{symbol}:{timeframe}"
+    def make_key(
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+    ) -> str:
+        return (
+            f"{LiquidityService._normalize_key_part(exchange)}:"
+            f"{LiquidityService._normalize_key_part(market_type)}:"
+            f"{LiquidityService._normalize_key_part(symbol)}:"
+            f"{LiquidityService._normalize_key_part(timeframe)}"
+        )
+
+    @staticmethod
+    def make_market_prefix(
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+    ) -> str:
+        return (
+            f"{LiquidityService._normalize_key_part(exchange)}:"
+            f"{LiquidityService._normalize_key_part(market_type)}:"
+            f"{LiquidityService._normalize_key_part(symbol)}:"
+        )
+
+    @staticmethod
+    def _normalize_key_part(value: Any) -> str:
+        return str(value).strip().lower()
+
+    # Backward-compatible private alias, якщо десь у тестах викликається _make_key.
+    @staticmethod
+    def _make_key(
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+    ) -> str:
+        return LiquidityService.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
 
     # ------------------------------------------------------------------
-    # Event payload parsing
+    # Payload helpers
     # ------------------------------------------------------------------
+
+    def _scoped_snapshot_payload(
+        self,
+        context: LiquidityServiceContext,
+        snapshot: LiquidityMapSnapshot,
+    ) -> dict[str, Any]:
+        payload = snapshot.to_event_payload()
+        payload.update(
+            {
+                "exchange": context.exchange,
+                "market_type": context.market_type,
+                "symbol": context.symbol,
+                "timeframe": context.timeframe,
+                "context_key": context.key,
+            }
+        )
+        return payload
 
     def _event_payload(self, event: Event | dict[str, Any]) -> dict[str, Any]:
         if isinstance(event, Event):
@@ -976,6 +1276,17 @@ class LiquidityService:
 
         return value
 
+    def _extract_required_str(
+        self,
+        payload: dict[str, Any],
+        field_name: str,
+    ) -> str:
+        value = self._extract_required(payload, field_name)
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError(f"Event payload field '{field_name}' must not be empty")
+        return normalized
+
     @staticmethod
     def _extract_optional(
         payload: dict[str, Any],
@@ -984,6 +1295,15 @@ class LiquidityService:
     ) -> Any:
         return payload.get(field_name, default)
 
+    def _extract_market_type(self, payload: dict[str, Any]) -> str:
+        value = (
+            payload.get("market_type")
+            or payload.get("category")
+            or payload.get("inst_type")
+            or "perpetual"
+        )
+        return self._normalize_market_type_value(value)
+
     def _extract_event_timestamp(
         self,
         payload: dict[str, Any],
@@ -991,6 +1311,12 @@ class LiquidityService:
         value = get_first_value(
             payload,
             (
+                "timestamp_ms",
+                "received_at_ms",
+                "last_update_ts_ms",
+                "last_update_received_ms",
+                "close_time_ms",
+                "open_time_ms",
                 "timestamp",
                 "time",
                 "event_time",
@@ -1004,6 +1330,49 @@ class LiquidityService:
     def _extract_price_from_candle(self, candle: Any) -> float | None:
         price = safe_float(get_candle_close(candle), default=0.0)
         return price if price > 0 else None
+
+    def _extract_mid_price(self, payload: dict[str, Any]) -> float | None:
+        mid_price = safe_float(payload.get("mid_price"), default=0.0)
+        if mid_price > 0:
+            return mid_price
+
+        best_bid = payload.get("best_bid")
+        best_ask = payload.get("best_ask")
+
+        bid_price = self._extract_level_price(best_bid)
+        ask_price = self._extract_level_price(best_ask)
+
+        if bid_price > 0 and ask_price > 0:
+            return (bid_price + ask_price) / 2.0
+
+        bids = payload.get("bids") or []
+        asks = payload.get("asks") or []
+
+        bid_price = self._extract_level_price(bids[0]) if bids else 0.0
+        ask_price = self._extract_level_price(asks[0]) if asks else 0.0
+
+        if bid_price > 0 and ask_price > 0:
+            return (bid_price + ask_price) / 2.0
+
+        return None
+
+    @staticmethod
+    def _extract_level_price(level: Any) -> float:
+        if level is None:
+            return 0.0
+
+        if isinstance(level, dict):
+            return safe_float(
+                level.get("price")
+                or level.get("p")
+                or level.get(0),
+                default=0.0,
+            )
+
+        if isinstance(level, (list, tuple)) and level:
+            return safe_float(level[0], default=0.0)
+
+        return safe_float(getattr(level, "price", None), default=0.0)
 
     def _parse_datetime(self, value: Any) -> datetime | None:
         if value is None:
@@ -1042,9 +1411,39 @@ class LiquidityService:
 
         return value.astimezone(timezone.utc)
 
+    @staticmethod
+    def _normalize_exchange(value: Any) -> str:
+        normalized = str(value or "").strip()
+        return normalized if normalized else "unknown"
+
+    @staticmethod
+    def _normalize_market_type_value(value: Any) -> str:
+        normalized = str(value or "").strip()
+        return normalized if normalized else "perpetual"
+
+    @staticmethod
+    def _normalize_symbol(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _normalize_timeframe(value: Any) -> str:
+        return str(value or "").strip()
+
     # ------------------------------------------------------------------
     # Error / time
     # ------------------------------------------------------------------
+
+    def _error_extra(self, event: Event | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(event, Event):
+            return {
+                "topic": getattr(event, "topic", None),
+                "event_id": getattr(event, "event_id", None),
+            }
+
+        return {
+            "topic": None,
+            "event_id": None,
+        }
 
     def _handle_error(
         self,

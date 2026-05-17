@@ -8,7 +8,13 @@ from core.logger import get_logger
 
 from .config import LiquidityConfig
 from .enums import LiquidityLevelType, LiquiditySide
-from .models import EqualLevel, LiquidityLevel, StopCluster
+from .models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    EqualLevel,
+    LiquidityLevel,
+    StopCluster,
+)
 from .scoring import LiquidityScorer
 from .utils import (
     clamp,
@@ -49,6 +55,8 @@ class StopClusterCandidate:
     Використовується тільки всередині StopClustersDetector.
 
     Важливо:
+    - exchange + market_type зберігаються в candidate, щоб merge/dedup
+      не змішували різні біржі або різні типи ринку;
     - swept_at переноситься із source LiquidityLevel у StopCluster;
     - partially/fully swept source levels знижують density/confidence, але не губляться;
     - це дає strategy-шару змогу відрізнити swept cluster від звичайного cluster.
@@ -60,6 +68,9 @@ class StopClusterCandidate:
 
     low_price: float
     high_price: float
+
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
 
     source_levels: list[LiquidityLevel] = field(default_factory=list)
 
@@ -78,6 +89,11 @@ class StopClusterCandidate:
     partially_swept_source_count: int = 0
 
     def __post_init__(self) -> None:
+        self.exchange = self._normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
+        self.market_type = self._normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
+        self.symbol = str(self.symbol or "").strip().upper()
+        self.timeframe = str(self.timeframe or "").strip()
+
         self.low_price = safe_float(self.low_price)
         self.high_price = safe_float(self.high_price)
 
@@ -97,6 +113,15 @@ class StopClusterCandidate:
         )
 
     @property
+    def scope_key(self) -> str:
+        return (
+            f"{self.exchange.lower()}:"
+            f"{self.market_type.lower()}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
+
+    @property
     def center_price(self) -> float:
         return midpoint(self.low_price, self.high_price)
 
@@ -107,6 +132,14 @@ class StopClusterCandidate:
         return not (
             self.high_price < other.low_price
             or other.high_price < self.low_price
+        )
+
+    def same_scope(self, other: "StopClusterCandidate") -> bool:
+        return (
+            self.exchange == other.exchange
+            and self.market_type == other.market_type
+            and self.symbol == other.symbol
+            and self.timeframe == other.timeframe
         )
 
     def is_swept(self) -> bool:
@@ -122,6 +155,11 @@ class StopClusterCandidate:
             or self.swept_source_count > 0
             or self.partially_swept_source_count > 0
         )
+
+    @staticmethod
+    def _normalize_scope_value(value: Any, default: str) -> str:
+        normalized = str(value or default).strip()
+        return normalized if normalized else default
 
 
 class StopClustersDetector:
@@ -142,6 +180,11 @@ class StopClustersDetector:
     - не публікує події;
     - не керує lifecycle;
     - використовується LiquidityMap як чистий domain detector.
+
+    Multi-exchange behavior:
+    - detector не отримує дані напряму з бірж;
+    - exchange/market_type передаються як scope metadata;
+    - merge/dedup є scope-aware і не змішує різні біржі/market_type.
     """
 
     def __init__(
@@ -172,6 +215,8 @@ class StopClustersDetector:
         current_price: float,
         candles: Sequence[Any] | None = None,
         orderbook: dict[str, Sequence[Any]] | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> list[StopCluster]:
         """
         Будує stop clusters з liquidity levels.
@@ -181,10 +226,20 @@ class StopClustersDetector:
         list[StopCluster]
             Scored, merged і deduplicated stop clusters.
         """
+        exchange = self._normalize_scope_value(exchange, DEFAULT_EXCHANGE)
+        market_type = self._normalize_scope_value(market_type, DEFAULT_MARKET_TYPE)
+        symbol = self._normalize_symbol(symbol)
+        timeframe = self._normalize_timeframe(timeframe)
+
         if not self._config.enabled:
             self._logger.debug(
                 "Stop cluster detection skipped: liquidity module disabled",
-                extra={"symbol": symbol, "timeframe": timeframe},
+                extra={
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                },
             )
             return []
 
@@ -199,7 +254,17 @@ class StopClustersDetector:
         if not levels_list:
             return []
 
+        self._scope_levels(
+            levels=levels_list,
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
         candidates = self._build_candidates(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             levels=levels_list,
@@ -217,11 +282,22 @@ class StopClustersDetector:
             current_price=current_price,
         )
 
-        clusters.sort(key=lambda cluster: (cluster.side.value, cluster.center_price))
+        clusters.sort(
+            key=lambda cluster: (
+                cluster.exchange,
+                cluster.market_type,
+                cluster.symbol,
+                cluster.timeframe,
+                cluster.side.value,
+                cluster.center_price,
+            )
+        )
 
         self._logger.info(
             "Stop clusters detected",
             extra={
+                "exchange": exchange,
+                "market_type": market_type,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "input_levels": len(levels_list),
@@ -242,11 +318,15 @@ class StopClustersDetector:
         current_price: float,
         candles: Sequence[Any] | None = None,
         orderbook: dict[str, Sequence[Any]] | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> list[StopCluster]:
         """
         Зручний wrapper для EqualLevel sequence.
         """
         return self.detect_from_levels(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             levels=list(equal_levels),
@@ -271,6 +351,8 @@ class StopClustersDetector:
                 continue
 
             candidate = self._level_to_candidate(
+                exchange=level.exchange,
+                market_type=level.market_type,
                 symbol=level.symbol,
                 timeframe=level.timeframe,
                 level=level,
@@ -292,6 +374,8 @@ class StopClustersDetector:
 
     def _build_candidates(
         self,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
         levels: Sequence[LiquidityLevel],
@@ -305,6 +389,8 @@ class StopClustersDetector:
                 continue
 
             candidate = self._level_to_candidate(
+                exchange=exchange,
+                market_type=market_type,
                 symbol=symbol,
                 timeframe=timeframe,
                 level=level,
@@ -388,6 +474,8 @@ class StopClustersDetector:
 
     def _level_to_candidate(
         self,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
         level: LiquidityLevel,
@@ -418,6 +506,8 @@ class StopClustersDetector:
         )
 
         return StopClusterCandidate(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             side=side,
@@ -709,6 +799,8 @@ class StopClustersDetector:
                 high_price += extra_width
 
         return StopClusterCandidate(
+            exchange=candidate.exchange,
+            market_type=candidate.market_type,
             symbol=candidate.symbol,
             timeframe=candidate.timeframe,
             side=candidate.side,
@@ -736,15 +828,17 @@ class StopClustersDetector:
         self,
         candidates: Sequence[StopClusterCandidate],
     ) -> list[StopClusterCandidate]:
-        grouped: dict[LiquiditySide, list[StopClusterCandidate]] = {
-            LiquiditySide.BUY_SIDE: [],
-            LiquiditySide.SELL_SIDE: [],
-            LiquiditySide.BOTH: [],
-            LiquiditySide.UNKNOWN: [],
-        }
+        grouped: dict[tuple[str, str, str, str, LiquiditySide], list[StopClusterCandidate]] = {}
 
         for candidate in candidates:
-            grouped.setdefault(candidate.side, []).append(candidate)
+            key = (
+                candidate.exchange,
+                candidate.market_type,
+                candidate.symbol,
+                candidate.timeframe,
+                candidate.side,
+            )
+            grouped.setdefault(key, []).append(candidate)
 
         merged: list[StopClusterCandidate] = []
 
@@ -782,6 +876,9 @@ class StopClustersDetector:
         left: StopClusterCandidate,
         right: StopClusterCandidate,
     ) -> bool:
+        if not left.same_scope(right):
+            return False
+
         if left.side != right.side:
             return False
 
@@ -815,6 +912,8 @@ class StopClustersDetector:
             swept_at = max(swept_timestamps) if swept_timestamps else None
 
         return StopClusterCandidate(
+            exchange=left.exchange,
+            market_type=left.market_type,
             symbol=left.symbol,
             timeframe=left.timeframe,
             side=left.side,
@@ -901,6 +1000,8 @@ class StopClustersDetector:
         )
 
         cluster = StopCluster(
+            exchange=candidate.exchange,
+            market_type=candidate.market_type,
             symbol=candidate.symbol,
             timeframe=candidate.timeframe,
             side=candidate.side,
@@ -918,6 +1019,8 @@ class StopClustersDetector:
             source_levels=list(candidate.source_levels),
             metadata={
                 "detector": self.__class__.__name__,
+                "exchange": candidate.exchange,
+                "market_type": candidate.market_type,
                 "source_count": len(candidate.source_levels),
                 "source_keys": [level.key for level in candidate.source_levels],
                 "source_prices": [
@@ -1043,6 +1146,10 @@ class StopClustersDetector:
         sorted_clusters = sorted(
             clusters,
             key=lambda cluster: (
+                cluster.exchange,
+                cluster.market_type,
+                cluster.symbol,
+                cluster.timeframe,
                 cluster.side.value,
                 cluster.center_price,
             ),
@@ -1053,7 +1160,14 @@ class StopClustersDetector:
         for cluster in sorted_clusters[1:]:
             previous = result[-1]
 
-            if cluster.side != previous.side:
+            same_scope = (
+                cluster.exchange == previous.exchange
+                and cluster.market_type == previous.market_type
+                and cluster.symbol == previous.symbol
+                and cluster.timeframe == previous.timeframe
+            )
+
+            if not same_scope or cluster.side != previous.side:
                 result.append(cluster)
                 continue
 
@@ -1109,8 +1223,8 @@ class StopClustersDetector:
         Deduplicate source levels without losing swept / partially swept context.
 
         Важливо:
-        - level.key не містить sweep_status/status;
-        - тому active і swept level на тій самій ціні мають однаковий key;
+        - level.key містить exchange + market_type + symbol + timeframe;
+        - active і swept level на тій самій ціні можуть мати однаковий key;
         - для reversal strategies swept/partial swept source важливіший за active
           source з вищим confidence.
         """
@@ -1256,6 +1370,38 @@ class StopClustersDetector:
                 result.append(int(item))
 
         return result
+
+    # ------------------------------------------------------------------
+    # Scope helpers
+    # ------------------------------------------------------------------
+
+    def _scope_levels(
+        self,
+        *,
+        levels: Sequence[LiquidityLevel],
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        for level in levels:
+            level.exchange = exchange
+            level.market_type = market_type
+            level.symbol = symbol
+            level.timeframe = timeframe
+
+    @staticmethod
+    def _normalize_scope_value(value: Any, default: str) -> str:
+        normalized = str(value or default).strip()
+        return normalized if normalized else default
+
+    @staticmethod
+    def _normalize_symbol(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _normalize_timeframe(value: Any) -> str:
+        return str(value or "").strip()
 
     # ------------------------------------------------------------------
     # Datetime helpers

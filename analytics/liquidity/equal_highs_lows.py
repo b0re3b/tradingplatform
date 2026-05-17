@@ -8,7 +8,7 @@ from core.logger import get_logger
 
 from .config import LiquidityConfig
 from .enums import LiquidityLevelType, LiquiditySide
-from .models import EqualLevel
+from .models import DEFAULT_EXCHANGE, DEFAULT_MARKET_TYPE, EqualLevel
 from .scoring import LiquidityScorer
 from .utils import (
     calculate_atr_pct_from_ohlc,
@@ -64,6 +64,12 @@ class EqualHighsLowsDetector:
     - не запускає Scheduler jobs;
     - не зберігає глобальний mutable state;
     - використовується як pure domain detector всередині LiquidityMap.
+
+    Multi-exchange behavior:
+    - detector не отримує дані напряму з бірж;
+    - exchange/market_type передаються як scope metadata;
+    - основне джерело candles — LiquidityMap/LiquidityService, які вже отримали
+      нормалізовані market.candle.closed з data layer.
     """
 
     def __init__(
@@ -92,14 +98,20 @@ class EqualHighsLowsDetector:
         timeframe: str,
         candles: Sequence[Any],
         current_price: float | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> list[EqualLevel]:
         """
         Повний batch-аналіз equal highs / equal lows.
 
         Parameters
         ----------
+        exchange:
+            Біржа, наприклад binance / bybit / okx / mexc.
+        market_type:
+            Тип ринку, наприклад usdm_futures / linear / swap / spot.
         symbol:
-            Торговий символ, наприклад BTCUSDT.
+            Нормалізований торговий символ, наприклад BTCUSDT.
         timeframe:
             Таймфрейм, наприклад 1m / 5m / 1h.
         candles:
@@ -112,12 +124,22 @@ class EqualHighsLowsDetector:
         list[EqualLevel]
             Відфільтровані, scored і deduplicated equal levels.
         """
+        exchange = self._normalize_scope_value(exchange, DEFAULT_EXCHANGE)
+        market_type = self._normalize_scope_value(market_type, DEFAULT_MARKET_TYPE)
+        symbol = self._normalize_symbol(symbol)
+        timeframe = self._normalize_timeframe(timeframe)
+
         candles_list = list(candles)
 
         if not self._config.enabled:
             self._logger.debug(
                 "Equal highs/lows detection skipped: liquidity module disabled",
-                extra={"symbol": symbol, "timeframe": timeframe},
+                extra={
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                },
             )
             return []
 
@@ -129,6 +151,8 @@ class EqualHighsLowsDetector:
             self._logger.debug(
                 "Not enough candles for equal highs/lows detection",
                 extra={
+                    "exchange": exchange,
+                    "market_type": market_type,
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "candles_count": len(candles_list),
@@ -148,6 +172,8 @@ class EqualHighsLowsDetector:
             self._logger.exception(
                 "Failed to extract OHLC for equal highs/lows detection",
                 extra={
+                    "exchange": exchange,
+                    "market_type": market_type,
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "candles_count": len(candles_list),
@@ -177,6 +203,8 @@ class EqualHighsLowsDetector:
         )
 
         equal_highs = self._build_equal_levels(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             pivots=pivot_highs,
@@ -188,6 +216,8 @@ class EqualHighsLowsDetector:
         )
 
         equal_lows = self._build_equal_levels(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             pivots=pivot_lows,
@@ -204,6 +234,8 @@ class EqualHighsLowsDetector:
         self._logger.info(
             "Equal highs/lows detected",
             extra={
+                "exchange": exchange,
+                "market_type": market_type,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "candles_count": len(candles_list),
@@ -224,6 +256,8 @@ class EqualHighsLowsDetector:
         timeframe: str,
         candles: Sequence[Any],
         current_price: float | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
     ) -> list[EqualLevel]:
         """
         Incremental entrypoint.
@@ -233,6 +267,8 @@ class EqualHighsLowsDetector:
         але state має жити у LiquidityService/LiquidityState, не тут.
         """
         return self.detect(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             candles=candles,
@@ -346,6 +382,8 @@ class EqualHighsLowsDetector:
 
     def _build_equal_levels(
         self,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
         pivots: list[PivotPoint],
@@ -370,6 +408,8 @@ class EqualHighsLowsDetector:
                 continue
 
             level = self._create_equal_level(
+                exchange=exchange,
+                market_type=market_type,
                 symbol=symbol,
                 timeframe=timeframe,
                 cluster=cluster,
@@ -424,6 +464,8 @@ class EqualHighsLowsDetector:
 
     def _create_equal_level(
         self,
+        exchange: str,
+        market_type: str,
         symbol: str,
         timeframe: str,
         cluster: list[PivotPoint],
@@ -454,6 +496,8 @@ class EqualHighsLowsDetector:
         )
 
         return EqualLevel(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             level_type=level_type,
@@ -472,6 +516,8 @@ class EqualHighsLowsDetector:
             pivot_indexes=pivot_indexes,
             metadata={
                 "detector": self.__class__.__name__,
+                "exchange": exchange,
+                "market_type": market_type,
                 "pivot_count": len(cluster),
                 "pivot_indexes": pivot_indexes,
                 "pivot_prices": prices,
@@ -624,6 +670,10 @@ class EqualHighsLowsDetector:
     ) -> list[EqualLevel]:
         """
         Якщо кілька clusters майже накладаються — залишаємо сильніший.
+
+        Scope-aware:
+        рівні з різних exchange/market_type/symbol/timeframe не дедуплікуються
+        між собою.
         """
         if not levels:
             return []
@@ -631,6 +681,10 @@ class EqualHighsLowsDetector:
         sorted_levels = sorted(
             levels,
             key=lambda level: (
+                level.exchange,
+                level.market_type,
+                level.symbol,
+                level.timeframe,
                 level.side.value,
                 level.level_type.value,
                 level.price,
@@ -642,12 +696,19 @@ class EqualHighsLowsDetector:
         for level in sorted_levels[1:]:
             previous = deduplicated[-1]
 
+            same_scope = (
+                level.exchange == previous.exchange
+                and level.market_type == previous.market_type
+                and level.symbol == previous.symbol
+                and level.timeframe == previous.timeframe
+            )
             same_side = level.side == previous.side
             same_type = level.level_type == previous.level_type
             tolerance = max(level.tolerance_pct, previous.tolerance_pct)
 
             is_duplicate = (
-                same_side
+                same_scope
+                and same_side
                 and same_type
                 and pct_distance(level.price, previous.price) <= tolerance
             )
@@ -785,3 +846,16 @@ class EqualHighsLowsDetector:
             return value.replace(tzinfo=timezone.utc)
 
         return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _normalize_scope_value(value: Any, default: str) -> str:
+        normalized = str(value or default).strip()
+        return normalized if normalized else default
+
+    @staticmethod
+    def _normalize_symbol(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def _normalize_timeframe(value: Any) -> str:
+        return str(value or "").strip()
