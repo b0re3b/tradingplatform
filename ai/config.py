@@ -604,6 +604,333 @@ class NewsAIConfig:
         }
 
 
+def build_default_news_source_configs() -> tuple[NewsSourceConfig, ...]:
+    """
+    Build a balanced default source list for crypto trading news.
+
+    The list intentionally avoids API-key-only providers and prefers RSS or
+    public official announcement pages so the service can run out of the box.
+    Application layer can still override this tuple for paid feeds, private
+    APIs, regional sources, or stricter compliance environments.
+    """
+
+    return (
+        # Tier 1 crypto news / broad market coverage.
+        NewsSourceConfig(
+            name="coindesk_rss",
+            source_type=NewsSourceType.RSS,
+            url="https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=40,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.GENERAL,),
+            source_reputation_score=0.86,
+            metadata={
+                "display_name": "CoinDesk",
+                "priority": "tier_1_crypto_news",
+                "reason": "Broad crypto market coverage and fast breaking news.",
+            },
+        ),
+        NewsSourceConfig(
+            name="cointelegraph_rss",
+            source_type=NewsSourceType.RSS,
+            url="https://cointelegraph.com/rss",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=40,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.GENERAL,),
+            source_reputation_score=0.78,
+            metadata={
+                "display_name": "Cointelegraph",
+                "priority": "tier_1_crypto_news",
+                "reason": "High-volume crypto news feed useful for early signal discovery.",
+            },
+        ),
+        NewsSourceConfig(
+            name="decrypt_rss",
+            source_type=NewsSourceType.RSS,
+            url="https://decrypt.co/feed",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=30,
+            min_fetch_interval_seconds=90.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.GENERAL,),
+            source_reputation_score=0.76,
+            metadata={
+                "display_name": "Decrypt",
+                "priority": "crypto_news",
+                "reason": "Useful secondary source for crypto, Web3, ETF and regulatory stories.",
+            },
+        ),
+        NewsSourceConfig(
+            name="the_defiant_rss",
+            source_type=NewsSourceType.RSS,
+            url="https://thedefiant.io/feed",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=25,
+            min_fetch_interval_seconds=120.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.DEFI,),
+            source_reputation_score=0.74,
+            metadata={
+                "display_name": "The Defiant",
+                "priority": "defi_news",
+                "reason": "DeFi-focused coverage for protocol, exploit, yield and governance signals.",
+            },
+        ),
+        NewsSourceConfig(
+            name="cryptoslate_rss",
+            source_type=NewsSourceType.RSS,
+            url="https://cryptoslate.com/feed/",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=25,
+            min_fetch_interval_seconds=120.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.GENERAL,),
+            source_reputation_score=0.70,
+            metadata={
+                "display_name": "CryptoSlate",
+                "priority": "crypto_news",
+                "reason": "Additional market/news coverage for redundancy and cross-source confirmation.",
+            },
+        ),
+
+        # Official exchange announcements: listings, delistings, maintenance, API changes.
+        NewsSourceConfig(
+            name="binance_announcements",
+            source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
+            url="https://www.binance.com/en/support/announcement",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=40,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE, NewsCategory.LISTING, NewsCategory.DELISTING),
+            source_reputation_score=0.94,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "Binance Announcements",
+                "priority": "official_exchange_announcements",
+                "reason": "Listings, delistings, trading updates, maintenance and API announcements.",
+            },
+        ),
+        NewsSourceConfig(
+            name="bybit_announcements",
+            source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
+            url="https://announcements.bybit.com/en/",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=35,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE, NewsCategory.LISTING, NewsCategory.DELISTING),
+            source_reputation_score=0.90,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "Bybit Announcements",
+                "priority": "official_exchange_announcements",
+                "reason": "Fast official exchange updates for listings, delistings and product changes.",
+            },
+        ),
+        NewsSourceConfig(
+            name="okx_latest_announcements",
+            source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
+            url="https://www.okx.com/help/section/announcements-latest-announcements",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=35,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE,),
+            source_reputation_score=0.90,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "OKX Latest Announcements",
+                "priority": "official_exchange_announcements",
+                "reason": "Official exchange updates, policy changes, trading changes and product announcements.",
+            },
+        ),
+        NewsSourceConfig(
+            name="okx_new_listings",
+            source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
+            url="https://www.okx.com/help/section/announcements-new-listings",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=25,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE, NewsCategory.LISTING),
+            source_reputation_score=0.92,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "OKX New Listings",
+                "priority": "official_listing_announcements",
+                "reason": "Dedicated listing feed/page for tradable-market catalysts.",
+            },
+        ),
+        NewsSourceConfig(
+            name="okx_delistings",
+            source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
+            url="https://www.okx.com/help/section/announcements-delistings",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=25,
+            min_fetch_interval_seconds=60.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE, NewsCategory.DELISTING),
+            source_reputation_score=0.92,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "OKX Delistings",
+                "priority": "official_delisting_announcements",
+                "reason": "Dedicated delisting page for high-risk market events.",
+            },
+        ),
+        NewsSourceConfig(
+            name="coinbase_blog",
+            source_type=NewsSourceType.STATIC_HTML,
+            url="https://www.coinbase.com/blog",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE, NewsCategory.REGULATION),
+            source_reputation_score=0.86,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "Coinbase Blog",
+                "priority": "official_exchange_blog",
+                "reason": "Official U.S. exchange updates, regulatory milestones and product news.",
+            },
+        ),
+        NewsSourceConfig(
+            name="kraken_blog",
+            source_type=NewsSourceType.STATIC_HTML,
+            url="https://blog.kraken.com/",
+            request_timeout_seconds=12.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.EXCHANGE, NewsCategory.REGULATION),
+            source_reputation_score=0.84,
+            is_official_source=True,
+            is_exchange_source=True,
+            metadata={
+                "display_name": "Kraken Blog",
+                "priority": "official_exchange_blog",
+                "reason": "Official exchange updates, regulatory/product changes and market structure notes.",
+            },
+        ),
+
+        # Macro and regulation: lower frequency but high impact for BTC/ETH and broad risk sentiment.
+        NewsSourceConfig(
+            name="federal_reserve_all_press_releases",
+            source_type=NewsSourceType.RSS,
+            url="https://www.federalreserve.gov/feeds/press_all.xml",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.MACRO,),
+            source_reputation_score=0.96,
+            is_official_source=True,
+            metadata={
+                "display_name": "Federal Reserve Press Releases",
+                "priority": "official_macro",
+                "reason": "Official macro and monetary-policy source for risk sentiment shocks.",
+            },
+        ),
+        NewsSourceConfig(
+            name="federal_reserve_monetary_policy",
+            source_type=NewsSourceType.RSS,
+            url="https://www.federalreserve.gov/feeds/press_monetary.xml",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=15,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.MACRO,),
+            source_reputation_score=0.98,
+            is_official_source=True,
+            metadata={
+                "display_name": "Federal Reserve Monetary Policy",
+                "priority": "official_macro_high_impact",
+                "reason": "Monetary policy announcements can strongly affect BTC, ETH and risk assets.",
+            },
+        ),
+        NewsSourceConfig(
+            name="sec_press_releases",
+            source_type=NewsSourceType.RSS,
+            url="https://www.sec.gov/news/pressreleases.rss",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.REGULATION, NewsCategory.LEGAL),
+            source_reputation_score=0.96,
+            is_official_source=True,
+            metadata={
+                "display_name": "SEC Press Releases",
+                "priority": "official_regulation",
+                "reason": "Official U.S. securities-regulation feed for crypto enforcement and ETF/legal events.",
+            },
+        ),
+        NewsSourceConfig(
+            name="cftc_general_press_releases",
+            source_type=NewsSourceType.RSS,
+            url="https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.REGULATION, NewsCategory.LEGAL),
+            source_reputation_score=0.94,
+            is_official_source=True,
+            metadata={
+                "display_name": "CFTC General Press Releases",
+                "priority": "official_regulation",
+                "reason": "Official derivatives/commodities regulation source for crypto market structure news.",
+            },
+        ),
+        NewsSourceConfig(
+            name="cftc_enforcement_press_releases",
+            source_type=NewsSourceType.RSS,
+            url="https://www.cftc.gov/RSS/RSSEnforcement/rssEnf.xml",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.REGULATION, NewsCategory.LEGAL),
+            source_reputation_score=0.94,
+            is_official_source=True,
+            metadata={
+                "display_name": "CFTC Enforcement Press Releases",
+                "priority": "official_regulation_enforcement",
+                "reason": "Enforcement actions can move exchange tokens, DeFi protocols and broad sentiment.",
+            },
+        ),
+        NewsSourceConfig(
+            name="us_treasury_press_releases",
+            source_type=NewsSourceType.STATIC_HTML,
+            url="https://home.treasury.gov/news/press-releases",
+            request_timeout_seconds=10.0,
+            max_items_per_fetch=20,
+            min_fetch_interval_seconds=300.0,
+            default_language=NewsLanguage.EN,
+            default_categories=(NewsCategory.MACRO, NewsCategory.REGULATION),
+            source_reputation_score=0.94,
+            is_official_source=True,
+            metadata={
+                "display_name": "U.S. Treasury Press Releases",
+                "priority": "official_macro_regulation",
+                "reason": "Sanctions, Treasury policy and macro/regulatory statements can affect crypto flows.",
+            },
+        ),
+    )
+
+
 def build_default_news_ai_config() -> NewsAIConfig:
     """
     Build a conservative default config.
@@ -616,8 +943,15 @@ def build_default_news_ai_config() -> NewsAIConfig:
         enabled=True,
         collect_interval_seconds=60.0,
         startup_collect_enabled=True,
-        source_configs=(),
+        source_configs=build_default_news_source_configs(),
         llm=NewsLLMConfig(enabled=False, provider=LLMProvider.DISABLED),
+        metadata={
+            "source_profile": "balanced_crypto_trading_default",
+            "source_policy": (
+                "Public RSS feeds and official announcement pages only; "
+                "paid/private APIs should be injected by the application layer."
+            ),
+        },
     )
 
 
@@ -628,5 +962,6 @@ __all__ = [
     "NewsScoringConfig",
     "NewsLLMConfig",
     "NewsAIConfig",
+    "build_default_news_source_configs",
     "build_default_news_ai_config",
 ]

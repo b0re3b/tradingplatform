@@ -6,7 +6,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urljoin
@@ -35,7 +35,7 @@ from .exceptions import (
 )
 from .models import NewsSourceHealth, RawNewsItem, utc_now
 
-
+UTC = timezone.utc
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (compatible; TradingSystemNewsBot/1.0; +https://local.trading-system)"
 )
