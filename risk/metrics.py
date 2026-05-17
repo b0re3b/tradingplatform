@@ -13,6 +13,51 @@ from risk.models import RiskDecision, RiskViolation
 from risk.utils import safe_div
 
 
+def _violation_type_value(violation: RiskViolation) -> str:
+    """Return a stable string value for a violation type."""
+    violation_type = getattr(violation, "violation_type", None)
+    value = getattr(violation_type, "value", violation_type)
+    return str(value or "")
+
+
+def _decision_has_tier_downgrade(decision: RiskDecision) -> bool:
+    """Detect actual tier downgrades even when final decision has another priority."""
+    if decision.decision is RiskDecisionType.DOWNGRADE_TIER:
+        return True
+
+    for violation in decision.violations:
+        value = _violation_type_value(violation)
+        if value in {"tier_downgraded", "trade_tier_downgraded"}:
+            return True
+        if "tier" in value and "downgrad" in value:
+            return True
+
+    return False
+
+
+def _decision_has_risk_reduction(decision: RiskDecision) -> bool:
+    """Detect risk reductions independently from the final decision priority."""
+    if decision.decision is RiskDecisionType.REDUCE_RISK:
+        return True
+
+    explicit_values = {
+        "risk_reduced",
+        "risk_amount_reduced",
+        "risk_unit_reduced",
+        "risk_budget_capped",
+        "daily_budget_capped",
+        "open_risk_capped",
+        "strategy_budget_capped",
+        "symbol_budget_capped",
+    }
+    for violation in decision.violations:
+        value = _violation_type_value(violation)
+        if value in explicit_values:
+            return True
+
+    return False
+
+
 @dataclass(slots=True)
 class MetricStats:
     """
@@ -327,13 +372,13 @@ class GroupMetrics:
 
         if decision.decision is RiskDecisionType.REDUCE_SIZE:
             self.size_adjustments += 1
-        elif decision.decision is RiskDecisionType.DOWNGRADE_TIER:
+        if _decision_has_tier_downgrade(decision):
             self.tier_downgrades += 1
-        elif decision.decision is RiskDecisionType.REDUCE_RISK:
+        if _decision_has_risk_reduction(decision):
             self.risk_reductions += 1
-        elif decision.decision is RiskDecisionType.HALT_TRADING:
+        if decision.decision is RiskDecisionType.HALT_TRADING:
             self.halts += 1
-        elif decision.decision is RiskDecisionType.EMERGENCY_STOP:
+        if decision.decision is RiskDecisionType.EMERGENCY_STOP:
             self.emergency_stops += 1
 
         self.rr.add(decision.risk_reward_ratio)
@@ -480,17 +525,17 @@ class RiskMetrics:
 
         if decision.decision is RiskDecisionType.REDUCE_SIZE:
             self.size_adjustments += 1
-        elif decision.decision is RiskDecisionType.DOWNGRADE_TIER:
+        if _decision_has_tier_downgrade(decision):
             self.tier_downgrades += 1
-        elif decision.decision is RiskDecisionType.REDUCE_RISK:
+        if _decision_has_risk_reduction(decision):
             self.risk_reductions += 1
-        elif decision.decision is RiskDecisionType.HALT_TRADING:
+        if decision.decision is RiskDecisionType.HALT_TRADING:
             self.halts += 1
-        elif decision.decision is RiskDecisionType.EMERGENCY_STOP:
+        if decision.decision is RiskDecisionType.EMERGENCY_STOP:
             self.emergency_stops += 1
-        elif decision.decision is RiskDecisionType.FORCE_CLOSE:
+        if decision.decision is RiskDecisionType.FORCE_CLOSE:
             self.force_close_requests += 1
-        elif decision.decision is RiskDecisionType.ONLY_REDUCE:
+        if decision.decision is RiskDecisionType.ONLY_REDUCE:
             self.only_reduce_decisions += 1
 
         self.rr.add(decision.risk_reward_ratio)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import math
 import time
 from enum import Enum
 from typing import Any
@@ -58,27 +59,27 @@ class RiskManager:
     """
 
     def __init__(
-        self,
-        config: RiskConfig,
-        *,
-        event_bus: EventBus | None = None,
-        scheduler: Scheduler | None = None,
-        state: RiskState | None = None,
-        metrics: RiskMetrics | None = None,
-        risk_unit_calculator: RiskUnitCalculator | None = None,
-        tier_guard: TierRiskGuard | None = None,
-        risk_reward_guard: RiskRewardGuard | None = None,
-        execution_cost_guard: ExecutionCostGuard | None = None,
-        leverage_guard: LeverageGuard | None = None,
-        budget_guard: RiskBudgetGuard | None = None,
-        symbol_guard: SymbolRiskGuard | None = None,
-        strategy_guard: StrategyRiskGuard | None = None,
-        position_sizer: PositionSizer | None = None,
-        exposure_control: ExposureControl | None = None,
-        circuit_breaker: CircuitBreaker | None = None,
-        auto_subscribe: bool = True,
-        register_scheduler_jobs: bool = True,
-        service_name: str = "risk_manager",
+            self,
+            config: RiskConfig,
+            *,
+            event_bus: EventBus | None = None,
+            scheduler: Scheduler | None = None,
+            state: RiskState | None = None,
+            metrics: RiskMetrics | None = None,
+            risk_unit_calculator: RiskUnitCalculator | None = None,
+            tier_guard: TierRiskGuard | None = None,
+            risk_reward_guard: RiskRewardGuard | None = None,
+            execution_cost_guard: ExecutionCostGuard | None = None,
+            leverage_guard: LeverageGuard | None = None,
+            budget_guard: RiskBudgetGuard | None = None,
+            symbol_guard: SymbolRiskGuard | None = None,
+            strategy_guard: StrategyRiskGuard | None = None,
+            position_sizer: PositionSizer | None = None,
+            exposure_control: ExposureControl | None = None,
+            circuit_breaker: CircuitBreaker | None = None,
+            auto_subscribe: bool = True,
+            register_scheduler_jobs: bool = True,
+            service_name: str = "risk_manager",
     ) -> None:
         self._config = config
         self._config.validate()
@@ -328,7 +329,6 @@ class RiskManager:
             count,
         )
 
-
     def register_scheduler_jobs(self) -> None:
         """
         Register reset/cleanup jobs in core Scheduler if provided.
@@ -368,8 +368,6 @@ class RiskManager:
             except Exception:
                 self._logger.exception("Failed to register risk scheduler job | name=%s", name)
 
-
-
     async def evaluate_request(self, request: RiskEvaluationRequest) -> RiskDecision:
         """
         Evaluate a pre-trade request and emit resulting events outside the state lock.
@@ -401,10 +399,10 @@ class RiskManager:
         return decision
 
     def _evaluate_request_locked(
-        self,
-        request: RiskEvaluationRequest,
-        *,
-        started_at: float,
+            self,
+            request: RiskEvaluationRequest,
+            *,
+            started_at: float,
     ) -> tuple[RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
         events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
 
@@ -413,7 +411,8 @@ class RiskManager:
 
         checks: dict[str, RiskCheckResult] = {}
 
-        def finalize(decision: RiskDecision) -> tuple[RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
+        def finalize(decision: RiskDecision) -> tuple[
+            RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
             events.extend(
                 self._finalize_decision_locked(
                     request,
@@ -422,6 +421,22 @@ class RiskManager:
                 )
             )
             return decision, events
+
+        request_validation = self._finite_request_validation(request)
+        checks["request_validation"] = request_validation
+        if not request_validation.passed:
+            decision = self._build_terminal_decision(
+                request=request,
+                check=request_validation,
+                checks=checks,
+                reason=request_validation.reason or "Request validation failed",
+                final_size=None,
+                final_leverage=request.requested_leverage,
+                final_tier=request.tier,
+            )
+            return finalize(decision)
+
+        self._normalize_circuit_breaker_reason(self._state)
 
         base_risk_unit_snapshot = self._risk_unit_calculator.calculate(
             self._state,
@@ -493,7 +508,24 @@ class RiskManager:
 
         rr_result = self._risk_reward_guard.check(request, tier_profile)
         checks["risk_reward"] = rr_result
+
+        ev_snapshot: ExpectedValueSnapshot | None = None
+        try:
+            ev_snapshot = self._extract_ev_snapshot(rr_result)
+        except ValueError:
+            ev_snapshot = None
+
         if not rr_result.passed:
+
+            if ev_snapshot is not None:
+                execution_cost_result = self._execution_cost_guard.check(
+                    request,
+                    tier_profile,
+                    ev_snapshot,
+                    mode=self._state.risk_mode,
+                )
+                checks["execution_cost"] = execution_cost_result
+
             decision = self._build_terminal_decision(
                 request=request,
                 check=rr_result,
@@ -502,10 +534,28 @@ class RiskManager:
                 final_size=None,
                 final_leverage=request.requested_leverage,
                 final_tier=tier_profile.final_tier,
+                ev_snapshot=ev_snapshot,
             )
             return finalize(decision)
 
-        ev_snapshot = self._extract_ev_snapshot(rr_result)
+        if ev_snapshot is None:
+            decision = RiskDecision(
+                allowed=False,
+                decision=RiskDecisionType.DENY,
+                final_size=None,
+                final_leverage=request.requested_leverage,
+                final_tier=tier_profile.final_tier,
+                risk_mode=self._state.risk_mode,
+                reason="Expected value snapshot missing from risk/reward check",
+                symbol=request.symbol,
+                side=request.side,
+                signal_id=request.signal_id,
+                strategy_name=request.strategy_name,
+                order_intent=request.order_intent,
+                violations=self._collect_violations(checks),
+                checks=checks,
+            )
+            return finalize(decision)
 
         execution_cost_result = self._execution_cost_guard.check(
             request,
@@ -547,11 +597,36 @@ class RiskManager:
             return finalize(decision)
 
         final_leverage = (
-            leverage_result.adjusted_leverage
-            or request.requested_leverage
-            or tier_profile.default_leverage
-            or 1.0
+                leverage_result.adjusted_leverage
+                or request.requested_leverage
+                or tier_profile.default_leverage
+                or 1.0
         )
+
+        if (
+                request.strategy_name
+                and self._order_increases_risk(request.order_intent)
+                and self._is_strategy_disabled(request.strategy_name)
+        ):
+            strategy_result = self._strategy_guard.check(
+                request,
+                self._state,
+                risk_unit=max(risk_unit, 1e-12),
+                candidate_open_risk=0.0,
+            )
+            checks["strategy"] = strategy_result
+            if not strategy_result.passed:
+                decision = self._build_terminal_decision(
+                    request=request,
+                    check=strategy_result,
+                    checks=checks,
+                    reason=strategy_result.reason or "Strategy risk check failed",
+                    final_size=None,
+                    final_leverage=final_leverage,
+                    final_tier=tier_profile.final_tier,
+                    ev_snapshot=ev_snapshot,
+                )
+                return finalize(decision)
 
         strategy_multiplier = self._resolve_strategy_multiplier(request)
         symbol_multiplier = self._resolve_symbol_multiplier(request)
@@ -750,8 +825,6 @@ class RiskManager:
         self._circuit_breaker.register_success()
         return finalize(decision)
 
-
-
     async def on_position_opened(self, position: PortfolioPosition) -> None:
         events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
 
@@ -812,21 +885,20 @@ class RiskManager:
 
         await self._emit_events(events)
 
-
     async def on_position_updated(
-        self,
-        symbol: str,
-        *,
-        position_id: str | None = None,
-        size: float | None = None,
-        mark_price: float | None = None,
-        notional_value: float | None = None,
-        leverage: float | None = None,
-        margin_used: float | None = None,
-        risk_amount: float | None = None,
-        stop_loss: float | None = None,
-        take_profit: float | None = None,
-        unrealized_pnl: float | None = None,
+            self,
+            symbol: str,
+            *,
+            position_id: str | None = None,
+            size: float | None = None,
+            mark_price: float | None = None,
+            notional_value: float | None = None,
+            leverage: float | None = None,
+            margin_used: float | None = None,
+            risk_amount: float | None = None,
+            stop_loss: float | None = None,
+            take_profit: float | None = None,
+            unrealized_pnl: float | None = None,
     ) -> None:
         async with self._lock:
             self._state.update_position(
@@ -844,11 +916,11 @@ class RiskManager:
             )
 
     async def on_position_closed(
-        self,
-        symbol: str,
-        *,
-        realized_pnl: float = 0.0,
-        position_id: str | None = None,
+            self,
+            symbol: str,
+            *,
+            realized_pnl: float = 0.0,
+            position_id: str | None = None,
     ) -> None:
         async with self._lock:
             position = self._state.remove_position(
@@ -876,14 +948,14 @@ class RiskManager:
         )
 
     async def on_account_update(
-        self,
-        *,
-        balance: float | None = None,
-        equity: float | None = None,
-        free_balance: float | None = None,
-        used_margin: float | None = None,
-        realized_pnl: float | None = None,
-        unrealized_pnl: float | None = None,
+            self,
+            *,
+            balance: float | None = None,
+            equity: float | None = None,
+            free_balance: float | None = None,
+            used_margin: float | None = None,
+            realized_pnl: float | None = None,
+            unrealized_pnl: float | None = None,
     ) -> None:
         async with self._lock:
             self._state.update_account(
@@ -896,10 +968,10 @@ class RiskManager:
             )
 
     async def on_execution_failure(
-        self,
-        *,
-        message: str | None = None,
-        reason: CircuitBreakerReason = CircuitBreakerReason.EXECUTION_FAILURES,
+            self,
+            *,
+            message: str | None = None,
+            reason: CircuitBreakerReason = CircuitBreakerReason.EXECUTION_FAILURES,
     ) -> None:
         async with self._lock:
             was_active = self._state.is_circuit_breaker_active()
@@ -1081,7 +1153,6 @@ class RiskManager:
             position_id=payload.get("position_id"),
         )
 
-
     async def _handle_execution_rejected(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
         await self.on_execution_rejected(
@@ -1169,13 +1240,12 @@ class RiskManager:
             },
         )
 
-
     async def _finalize_decision(
-        self,
-        request: RiskEvaluationRequest,
-        decision: RiskDecision,
-        *,
-        latency_ms: float | None = None,
+            self,
+            request: RiskEvaluationRequest,
+            decision: RiskDecision,
+            *,
+            latency_ms: float | None = None,
     ) -> None:
         """
         Backward-compatible async finalizer.
@@ -1188,11 +1258,11 @@ class RiskManager:
         await self._emit_events(events)
 
     def _finalize_decision_locked(
-        self,
-        request: RiskEvaluationRequest,
-        decision: RiskDecision,
-        *,
-        latency_ms: float | None = None,
+            self,
+            request: RiskEvaluationRequest,
+            decision: RiskDecision,
+            *,
+            latency_ms: float | None = None,
     ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
         events: list[tuple[str, dict[str, Any], EventPriority | None]] = []
 
@@ -1273,13 +1343,12 @@ class RiskManager:
         )
         return events
 
-
     async def _emit_event(
-        self,
-        topic: str,
-        payload: dict[str, Any],
-        *,
-        priority: EventPriority | None = None,
+            self,
+            topic: str,
+            payload: dict[str, Any],
+            *,
+            priority: EventPriority | None = None,
     ) -> None:
         if self._event_bus is None:
             return
@@ -1310,15 +1379,14 @@ class RiskManager:
                 topic,
             )
 
-
     async def on_execution_rejected(
-        self,
-        *,
-        reservation_id: str | None = None,
-        signal_id: str | None = None,
-        symbol: str | None = None,
-        position_id: str | None = None,
-        reason: str | None = None,
+            self,
+            *,
+            reservation_id: str | None = None,
+            signal_id: str | None = None,
+            symbol: str | None = None,
+            position_id: str | None = None,
+            reason: str | None = None,
     ) -> None:
         events = await self._release_reservation_for_execution_event(
             reservation_id=reservation_id,
@@ -1331,13 +1399,13 @@ class RiskManager:
         await self._emit_events(events)
 
     async def on_execution_cancelled(
-        self,
-        *,
-        reservation_id: str | None = None,
-        signal_id: str | None = None,
-        symbol: str | None = None,
-        position_id: str | None = None,
-        reason: str | None = None,
+            self,
+            *,
+            reservation_id: str | None = None,
+            signal_id: str | None = None,
+            symbol: str | None = None,
+            position_id: str | None = None,
+            reason: str | None = None,
     ) -> None:
         events = await self._release_reservation_for_execution_event(
             reservation_id=reservation_id,
@@ -1350,13 +1418,13 @@ class RiskManager:
         await self._emit_events(events)
 
     async def on_execution_failed(
-        self,
-        *,
-        reservation_id: str | None = None,
-        signal_id: str | None = None,
-        symbol: str | None = None,
-        position_id: str | None = None,
-        reason: str | None = None,
+            self,
+            *,
+            reservation_id: str | None = None,
+            signal_id: str | None = None,
+            symbol: str | None = None,
+            position_id: str | None = None,
+            reason: str | None = None,
     ) -> None:
         async with self._lock:
             events = self._release_reservation_locked(
@@ -1403,14 +1471,14 @@ class RiskManager:
         await self._emit_events(events)
 
     async def _release_reservation_for_execution_event(
-        self,
-        *,
-        reservation_id: str | None = None,
-        signal_id: str | None = None,
-        symbol: str | None = None,
-        position_id: str | None = None,
-        status: str,
-        reason: str | None = None,
+            self,
+            *,
+            reservation_id: str | None = None,
+            signal_id: str | None = None,
+            symbol: str | None = None,
+            position_id: str | None = None,
+            status: str,
+            reason: str | None = None,
     ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
         async with self._lock:
             return self._release_reservation_locked(
@@ -1423,14 +1491,14 @@ class RiskManager:
             )
 
     def _release_reservation_locked(
-        self,
-        *,
-        reservation_id: str | None = None,
-        signal_id: str | None = None,
-        symbol: str | None = None,
-        position_id: str | None = None,
-        status: str,
-        reason: str | None = None,
+            self,
+            *,
+            reservation_id: str | None = None,
+            signal_id: str | None = None,
+            symbol: str | None = None,
+            position_id: str | None = None,
+            status: str,
+            reason: str | None = None,
     ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
         reservation = self._state.release_risk_reservation(
             reservation_id,
@@ -1476,9 +1544,9 @@ class RiskManager:
         ]
 
     def _expire_reservations_locked(
-        self,
-        *,
-        reason: str,
+            self,
+            *,
+            reason: str,
     ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
         reservation_cfg = getattr(self._config, "reservation", None)
         if reservation_cfg is not None and not getattr(reservation_cfg, "auto_expire_on_evaluate", True):
@@ -1513,9 +1581,9 @@ class RiskManager:
         return events
 
     def _should_reserve_for_decision(
-        self,
-        request: RiskEvaluationRequest,
-        decision: RiskDecision,
+            self,
+            request: RiskEvaluationRequest,
+            decision: RiskDecision,
     ) -> bool:
         reservation_cfg = getattr(self._config, "reservation", None)
         if reservation_cfg is None:
@@ -1531,9 +1599,9 @@ class RiskManager:
         return bool(decision.final_size and decision.final_size > 0)
 
     def _create_reservation_locked(
-        self,
-        request: RiskEvaluationRequest,
-        decision: RiskDecision,
+            self,
+            request: RiskEvaluationRequest,
+            decision: RiskDecision,
     ) -> Any:
         reservation_cfg = self._config.reservation
         pending = list(self._state.pending_reservations.values())
@@ -1575,9 +1643,9 @@ class RiskManager:
         )
 
     def _events_for_decision(
-        self,
-        decision: RiskDecision,
-        serialized: dict[str, Any],
+            self,
+            decision: RiskDecision,
+            serialized: dict[str, Any],
     ) -> list[tuple[str, dict[str, Any], EventPriority | None]]:
         primary_topic, primary_priority = self._topic_for_decision(decision)
         events: list[tuple[str, dict[str, Any], EventPriority | None]] = [
@@ -1611,8 +1679,8 @@ class RiskManager:
         return deduped
 
     async def _emit_events(
-        self,
-        events: list[tuple[str, dict[str, Any], EventPriority | None]],
+            self,
+            events: list[tuple[str, dict[str, Any], EventPriority | None]],
     ) -> None:
         for topic, payload, priority in events:
             await self._emit_event(topic, payload, priority=priority)
@@ -1630,11 +1698,11 @@ class RiskManager:
 
     @staticmethod
     def _serialize_reservation(
-        reservation: Any,
-        *,
-        status: str,
-        reason: str | None = None,
-        age_ms: float | None = None,
+            reservation: Any,
+            *,
+            status: str,
+            reason: str | None = None,
+            age_ms: float | None = None,
     ) -> dict[str, Any]:
         return {
             "reservation_id": reservation.reservation_id,
@@ -1655,6 +1723,11 @@ class RiskManager:
             "age_ms": age_ms,
             "metadata": RiskManager._json_safe(reservation.metadata),
         }
+
+    def _is_strategy_disabled(self, strategy_name: str) -> bool:
+        strategy_state = self._state.get_strategy_state(strategy_name)
+        status = getattr(strategy_state, "status", None)
+        return getattr(status, "value", status) == "disabled"
 
     def _resolve_strategy_multiplier(self, request: RiskEvaluationRequest) -> float:
         if not request.strategy_name:
@@ -1688,15 +1761,15 @@ class RiskManager:
 
     @staticmethod
     def _build_terminal_decision(
-        *,
-        request: RiskEvaluationRequest,
-        check: RiskCheckResult,
-        checks: dict[str, RiskCheckResult],
-        reason: str,
-        final_size: float | None,
-        final_leverage: float | None,
-        final_tier: TradeTier | None = None,
-        ev_snapshot: ExpectedValueSnapshot | None = None,
+            *,
+            request: RiskEvaluationRequest,
+            check: RiskCheckResult,
+            checks: dict[str, RiskCheckResult],
+            reason: str,
+            final_size: float | None,
+            final_leverage: float | None,
+            final_tier: TradeTier | None = None,
+            ev_snapshot: ExpectedValueSnapshot | None = None,
     ) -> RiskDecision:
         return RiskDecision(
             allowed=False,
@@ -1750,8 +1823,6 @@ class RiskManager:
         return "Request approved"
 
     @staticmethod
-
-    @staticmethod
     def _topic_for_decision(decision: RiskDecision) -> tuple[str, EventPriority | None]:
         if decision.decision is RiskDecisionType.EMERGENCY_STOP:
             return "risk.kill_switch", EventPriority.CRITICAL
@@ -1764,12 +1835,10 @@ class RiskManager:
 
         return "signal.confirmed", EventPriority.NORMAL
 
-
-
     @staticmethod
     def _serialize_decision(
-        request: RiskEvaluationRequest,
-        decision: RiskDecision,
+            request: RiskEvaluationRequest,
+            decision: RiskDecision,
     ) -> dict[str, Any]:
         return {
             "symbol": request.symbol,
@@ -1832,7 +1901,6 @@ class RiskManager:
             },
             "metadata": RiskManager._json_safe(decision.metadata),
         }
-
 
     def _request_from_payload(payload: dict[str, Any]) -> RiskEvaluationRequest:
         symbol = payload.get("symbol")
@@ -1907,8 +1975,8 @@ class RiskManager:
 
         mark_price = RiskManager._to_float_or_none(payload.get("mark_price")) or entry_price
         notional_value = (
-            RiskManager._to_float_or_none(payload.get("notional_value"))
-            or abs(size * entry_price)
+                RiskManager._to_float_or_none(payload.get("notional_value"))
+                or abs(size * entry_price)
         )
 
         tier = RiskManager._optional_enum_from_value(TradeTier, payload.get("tier"))
@@ -2011,6 +2079,88 @@ class RiskManager:
             return [RiskManager._json_safe(item) for item in value]
 
         return value
+
+    @staticmethod
+    def _normalize_circuit_breaker_reason(state: RiskState) -> None:
+        """
+        Keep RiskState tolerant to tests/events that set circuit breaker reason
+        as a raw string while CircuitBreaker internals expect CircuitBreakerReason.
+        """
+        reason = getattr(state.circuit_breaker, "reason", None)
+        if reason is None or isinstance(reason, CircuitBreakerReason):
+            return
+
+        if isinstance(reason, str):
+            try:
+                state.circuit_breaker.reason = CircuitBreakerReason(reason)
+            except ValueError:
+                state.circuit_breaker.reason = CircuitBreakerReason.MANUAL_HALT
+            return
+
+        value = getattr(reason, "value", None)
+        if isinstance(value, str):
+            try:
+                state.circuit_breaker.reason = CircuitBreakerReason(value)
+            except ValueError:
+                state.circuit_breaker.reason = CircuitBreakerReason.MANUAL_HALT
+
+    @staticmethod
+    def _finite_request_validation(request: RiskEvaluationRequest) -> RiskCheckResult:
+        fields = {
+            "entry_price": request.entry_price,
+            "stop_loss": request.stop_loss,
+            "take_profit": request.take_profit,
+            "confidence": request.confidence,
+            "edge_score": request.edge_score,
+            "volatility": request.volatility,
+            "expected_reward": request.expected_reward,
+            "expected_loss": request.expected_loss,
+            "expected_win_probability": request.expected_win_probability,
+            "expected_cost": request.expected_cost,
+            "requested_size": request.requested_size,
+            "requested_margin": request.requested_margin,
+            "requested_leverage": request.requested_leverage,
+        }
+
+        for name, value in fields.items():
+            if value is None:
+                continue
+            if not math.isfinite(float(value)):
+                return RiskCheckResult(
+                    passed=False,
+                    decision=RiskDecisionType.DENY,
+                    reason=f"Invalid non-finite request field: {name}",
+                    metadata={"field": name, "value": str(value)},
+                )
+
+        execution_cost = request.execution_cost
+        if execution_cost is not None:
+            cost_fields = {
+                "execution_cost.spread_cost": execution_cost.spread_cost,
+                "execution_cost.slippage_cost": execution_cost.slippage_cost,
+                "execution_cost.fee_cost": execution_cost.fee_cost,
+                "execution_cost.funding_cost": execution_cost.funding_cost,
+                "execution_cost.other_cost": execution_cost.other_cost,
+                "execution_cost.spread_pct": execution_cost.spread_pct,
+                "execution_cost.slippage_pct": execution_cost.slippage_pct,
+            }
+
+            for name, value in cost_fields.items():
+                if value is None:
+                    continue
+                if not math.isfinite(float(value)):
+                    return RiskCheckResult(
+                        passed=False,
+                        decision=RiskDecisionType.DENY,
+                        reason=f"Invalid non-finite request field: {name}",
+                        metadata={"field": name, "value": str(value)},
+                    )
+
+        return RiskCheckResult(
+            passed=True,
+            decision=RiskDecisionType.ALLOW,
+            metadata={"validated": True},
+        )
 
 
 __all__ = ["RiskManager"]

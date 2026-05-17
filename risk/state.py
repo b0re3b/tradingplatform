@@ -525,6 +525,12 @@ class RiskState:
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
 
+    # Global realized PnL buckets used by RiskBudgetGuard/RiskModeResolver.
+    # SymbolRiskState and StrategyRiskState keep their own independent buckets.
+    daily_pnl: float = 0.0
+    weekly_pnl: float = 0.0
+    monthly_pnl: float = 0.0
+
     peak_equity: float = 0.0
     daily_start_equity: float = 0.0
     weekly_start_equity: float = 0.0
@@ -621,6 +627,13 @@ class RiskState:
 
     def emergency_stop(self, reason: str) -> None:
         self.set_risk_mode(RiskMode.EMERGENCY_STOP, reason=reason)
+
+    def activate_emergency_stop(self, *, reason: str | None = None) -> None:
+        """Activate emergency stop using the explicit risk-state API."""
+        self.set_risk_mode(
+            RiskMode.EMERGENCY_STOP,
+            reason=reason or "Emergency stop is active",
+        )
 
     def resume_trading(self) -> None:
         if self.emergency_stop_active:
@@ -977,6 +990,9 @@ class RiskState:
         strategy_rolling_window: int | None = None,
     ) -> None:
         self.realized_pnl += pnl
+        self.daily_pnl += pnl
+        self.weekly_pnl += pnl
+        self.monthly_pnl += pnl
 
         if pnl < 0:
             self.loss_streak += 1
@@ -1048,6 +1064,7 @@ class RiskState:
 
     def reset_daily_state(self) -> None:
         self.daily_start_equity = self.equity
+        self.daily_pnl = 0.0
         self.loss_streak = 0
 
         for symbol_state in self.symbols.values():
@@ -1060,6 +1077,7 @@ class RiskState:
 
     def reset_weekly_state(self) -> None:
         self.weekly_start_equity = self.equity
+        self.weekly_pnl = 0.0
 
         for symbol_state in self.symbols.values():
             symbol_state.reset_weekly()
@@ -1071,6 +1089,7 @@ class RiskState:
 
     def reset_monthly_state(self) -> None:
         self.monthly_start_equity = self.equity
+        self.monthly_pnl = 0.0
         self.manual_review_required = False
 
         for symbol_state in self.symbols.values():
@@ -1124,19 +1143,44 @@ class RiskState:
         return now_ts < self.circuit_breaker.cooldown_until
 
     def get_daily_pnl(self) -> float:
-        if self.daily_start_equity <= 0:
-            return self.realized_pnl + self.unrealized_pnl
-        return self.equity - self.daily_start_equity
+        """
+        Return global daily PnL for budget/risk-mode decisions.
+
+        Supports both accounting styles used by the risk layer:
+        - explicit realized daily bucket updated by register_trade_outcome();
+        - equity-anchor delta used by account/equity based tests and snapshots.
+
+        If the explicit bucket is non-zero, it is treated as the source of truth
+        to avoid double-counting realized PnL and equity movement. Otherwise,
+        the method falls back to the daily equity anchor when available.
+        """
+        if self.daily_pnl != 0.0:
+            return self.daily_pnl + self.unrealized_pnl
+
+        if self.daily_start_equity > 0:
+            return self.equity - self.daily_start_equity
+
+        return self.realized_pnl + self.unrealized_pnl
 
     def get_weekly_pnl(self) -> float:
-        if self.weekly_start_equity <= 0:
-            return self.realized_pnl + self.unrealized_pnl
-        return self.equity - self.weekly_start_equity
+        """Return global weekly PnL for budget/risk-mode decisions."""
+        if self.weekly_pnl != 0.0:
+            return self.weekly_pnl + self.unrealized_pnl
+
+        if self.weekly_start_equity > 0:
+            return self.equity - self.weekly_start_equity
+
+        return self.realized_pnl + self.unrealized_pnl
 
     def get_monthly_pnl(self) -> float:
-        if self.monthly_start_equity <= 0:
-            return self.realized_pnl + self.unrealized_pnl
-        return self.equity - self.monthly_start_equity
+        """Return global monthly PnL for budget/risk-mode decisions."""
+        if self.monthly_pnl != 0.0:
+            return self.monthly_pnl + self.unrealized_pnl
+
+        if self.monthly_start_equity > 0:
+            return self.equity - self.monthly_start_equity
+
+        return self.realized_pnl + self.unrealized_pnl
 
     def get_drawdown_snapshot(self) -> DrawdownSnapshot:
         current_equity = self.equity
@@ -1169,11 +1213,13 @@ class RiskState:
         net_exposure = 0.0
         leverage_weighted_exposure = 0.0
         margin_used = 0.0
+        actual_notional = 0.0
 
         for position in self.positions.values():
             notional = abs(position.notional_value)
 
             gross_exposure += notional
+            actual_notional += notional
             net_exposure += position.signed_notional
             margin_used += max(0.0, position.margin_used)
 
@@ -1186,8 +1232,16 @@ class RiskState:
                 leverage_weighted_exposure += notional * position.leverage
 
         pending_margin = 0.0
+        total_pending_notional = 0.0
+        pending_symbol_exposure: dict[str, float] = {}
+        pending_side_exposure: dict[str, float] = {
+            PositionSide.LONG.value: 0.0,
+            PositionSide.SHORT.value: 0.0,
+        }
+
         for reservation in self._iter_pending_reservations():
             pending_notional = abs(reservation.notional)
+            total_pending_notional += pending_notional
             gross_exposure += pending_notional
 
             if reservation.side is PositionSide.LONG:
@@ -1199,8 +1253,14 @@ class RiskState:
             symbol_exposure[reservation.symbol] = (
                 symbol_exposure.get(reservation.symbol, 0.0) + pending_notional
             )
+            pending_symbol_exposure[reservation.symbol] = (
+                pending_symbol_exposure.get(reservation.symbol, 0.0) + pending_notional
+            )
             side_exposure[reservation.side.value] = (
                 side_exposure.get(reservation.side.value, 0.0) + pending_notional
+            )
+            pending_side_exposure[reservation.side.value] = (
+                pending_side_exposure.get(reservation.side.value, 0.0) + pending_notional
             )
 
         effective_margin_used = (margin_used if margin_used > 0 else self.used_margin) + pending_margin
@@ -1216,6 +1276,11 @@ class RiskState:
             ),
             margin_used=effective_margin_used,
             margin_used_pct=safe_div(effective_margin_used, self.equity),
+            actual_notional=actual_notional,
+            pending_notional=total_pending_notional,
+            pending_margin=pending_margin,
+            pending_symbol_exposure=pending_symbol_exposure,
+            pending_side_exposure=pending_side_exposure,
         )
 
     def get_open_risk_snapshot(self, *, risk_unit: float) -> OpenRiskSnapshot:
@@ -1265,6 +1330,8 @@ class RiskState:
         total_open_risk = actual_open_risk + pending_orders_risk
         effective_margin_used = self.used_margin + self.get_pending_margin()
 
+        pending_reservations_count = sum(1 for _ in self._iter_pending_reservations())
+
         return OpenRiskSnapshot(
             total_open_risk=total_open_risk,
             total_open_risk_r=safe_div(total_open_risk, risk_unit),
@@ -1273,8 +1340,14 @@ class RiskState:
             symbol_open_risk=symbol_open_risk,
             strategy_open_risk=strategy_open_risk,
             tier_open_risk=tier_open_risk,
-            positions_count=len(self.positions) + len(self.pending_reservations),
+            positions_count=len(self.positions) + pending_reservations_count,
+            actual_open_risk=actual_open_risk,
+            actual_open_risk_r=safe_div(actual_open_risk, risk_unit),
             pending_orders_risk=pending_orders_risk,
+            pending_orders_risk_r=safe_div(pending_orders_risk, risk_unit),
+            pending_margin=self.get_pending_margin(),
+            pending_notional=self.get_pending_notional(),
+            pending_reservations_count=pending_reservations_count,
         )
 
     def get_correlation_snapshot(self, groups: dict[str, list[str]]) -> CorrelationSnapshot:

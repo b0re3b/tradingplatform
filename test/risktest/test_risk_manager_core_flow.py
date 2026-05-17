@@ -340,6 +340,9 @@ def make_risk_config(
         aggressive_open_risk_r = 0.5
 
         max_used_margin_pct = 0.01
+        safe_used_margin_pct = 0.005
+        aggressive_used_margin_pct = 0.01
+
         max_total_exposure_pct = 0.01
         max_symbol_exposure_pct = 0.01
         max_side_exposure_pct = 0.01
@@ -350,6 +353,9 @@ def make_risk_config(
         aggressive_open_risk_r = 150.0
 
         max_used_margin_pct = 1.0
+        safe_used_margin_pct = 0.5
+        aggressive_used_margin_pct = 1.5
+
         max_total_exposure_pct = 10.0
         max_symbol_exposure_pct = 10.0
         max_side_exposure_pct = 10.0
@@ -358,7 +364,11 @@ def make_risk_config(
     set_if_exists(config.exposure, "max_open_risk_r", max_open_risk_r)
     set_if_exists(config.exposure, "safe_mode_max_open_risk_r", safe_open_risk_r)
     set_if_exists(config.exposure, "aggressive_max_open_risk_r", aggressive_open_risk_r)
+
     set_if_exists(config.exposure, "max_used_margin_pct", max_used_margin_pct)
+    set_if_exists(config.exposure, "safe_mode_max_used_margin_pct", safe_used_margin_pct)
+    set_if_exists(config.exposure, "aggressive_max_used_margin_pct", aggressive_used_margin_pct)
+
     set_if_exists(config.exposure, "max_total_exposure_pct", max_total_exposure_pct)
     set_if_exists(config.exposure, "max_symbol_exposure_pct", max_symbol_exposure_pct)
     set_if_exists(config.exposure, "max_side_exposure_pct", max_side_exposure_pct)
@@ -999,7 +1009,11 @@ class TestRiskManagerReservationFlow:
     @pytest.mark.asyncio
     async def test_second_allowed_request_sees_first_pending_reservation(self) -> None:
         config = make_risk_config(reservations_enabled=True)
+
+        set_if_exists(config.exposure, "safe_mode_max_open_risk_r", 1.0)
         set_if_exists(config.exposure, "max_open_risk_r", 1.5)
+        set_if_exists(config.exposure, "aggressive_max_open_risk_r", 2.0)
+
         config.validate()
 
         state = make_state()
@@ -1050,7 +1064,7 @@ class TestRiskManagerReservationFlow:
         assert len(state.pending_reservations) == 1
 
         topics = event_bus.topics()
-        assert "risk.reservation.expired" in topics or "risk.reservation.released" in topics
+        assert "risk.reservation_expired" in topics or "risk.reservation_released" in topics
 
 
 # =============================================================================
