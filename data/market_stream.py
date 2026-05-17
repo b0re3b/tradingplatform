@@ -4,19 +4,22 @@ import asyncio
 import contextlib
 import inspect
 import time
-from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from dataclasses import dataclass, field
+from typing import Any
 
 from core.config import Config
+from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
 
 @dataclass(slots=True)
-class StreamSubscription:
+class MarketDataSubscription:
+    """Declarative market-data subscription target for exchange adapters."""
+
     exchange: str
     symbol: str
-    channel: str
+    channels: tuple[str, ...] = ("trade", "orderbook", "candle")
     market_type: str = "perpetual"
     timeframe: str | None = None
     depth: int | None = None
@@ -24,57 +27,60 @@ class StreamSubscription:
 
 
 @dataclass(slots=True)
-class StreamRuntimeState:
-    subscription: StreamSubscription
-    stream_id: str
-    is_running: bool = False
-    reconnect_count: int = 0
-    last_message_at: float | None = None
+class ExchangeRuntimeState:
+    exchange: str
+    is_started: bool = False
+    started_at: float | None = None
+    stopped_at: float | None = None
     last_error: str | None = None
-    queue_dropped: int = 0
-    stream_task: asyncio.Task | None = None
-    consumer_task: asyncio.Task | None = None
+    restarts: int = 0
+
+
+@dataclass(slots=True)
+class MarketStreamConfig:
+    """Local config for the data-layer orchestration service."""
+
+    healthcheck_interval_seconds: float = 30.0
+    startup_timeout_seconds: float = 30.0
+    shutdown_timeout_seconds: float = 15.0
+    start_clients_on_start: bool = True
+    register_caches_on_start: bool = True
+    emit_lifecycle_events: bool = True
 
 
 class MarketStream:
     """
-    Центральний orchestration layer для market data.
+    EventBus-first orchestration layer for market data.
 
-    Відповідальність:
-    - керувати підписками на ринкові стріми бірж
-    - приймати сирі повідомлення
-    - нормалізувати market events
-    - оновлювати відповідні кеші
-    - публікувати події в EventBus
-    - робити healthcheck / reconnect / monitoring
+    Responsibilities:
+    - start/stop exchange adapters for all configured exchanges;
+    - register data caches so they listen to market.* / market.*.snapshot topics;
+    - run lightweight health checks through Scheduler;
+    - publish system.market_stream.* lifecycle events;
+    - never normalize raw exchange payloads and never update caches directly.
+
+    Data flow stays:
+        exchanges/* -> EventBus market.* -> data/*_cache.py -> market.*.updated -> analytics.
     """
 
     def __init__(
         self,
         *,
         config: Config,
-        event_bus: Any,
+        event_bus: EventBus,
         exchange_clients: dict[str, Any],
         scheduler: Scheduler | None = None,
-        orderbook_cache: Any | None = None,
-        trades_cache: Any | None = None,
-        candles_cache: Any | None = None,
-        funding_cache: Any | None = None,
-        open_interest_cache: Any | None = None,
-        liquidation_cache: Any | None = None,
+        stream_config: MarketStreamConfig | None = None,
+        caches: list[Any] | None = None,
         service_name: str = "market_stream",
     ) -> None:
         self.config = config
         self.event_bus = event_bus
-        self.exchange_clients = exchange_clients
+        self.exchange_clients = dict(exchange_clients)
         self.scheduler = scheduler
-
-        self.orderbook_cache = orderbook_cache
-        self.trades_cache = trades_cache
-        self.candles_cache = candles_cache
-        self.funding_cache = funding_cache
-        self.open_interest_cache = open_interest_cache
-        self.liquidation_cache = liquidation_cache
+        self.stream_config = stream_config or MarketStreamConfig()
+        self.caches = list(caches or [])
+        self._service_name = service_name
 
         self._logger = get_logger(
             __name__,
@@ -82,56 +88,64 @@ class MarketStream:
             event_type="market_stream",
         )
 
-        self._service_name = service_name
         self._running = False
-        self._stopping = False
-
-        self._subscriptions: dict[str, StreamSubscription] = {}
-        self._states: dict[str, StreamRuntimeState] = {}
-        self._queues: dict[str, asyncio.Queue] = {}
-
         self._healthcheck_job_id: str | None = None
-
+        self._states: dict[str, ExchangeRuntimeState] = {
+            exchange: ExchangeRuntimeState(exchange=exchange)
+            for exchange in self.exchange_clients
+        }
+        self._subscriptions: list[MarketDataSubscription] = []
         self._metrics: dict[str, int | float] = {
-            "messages_total": 0,
-            "published_events": 0,
-            "parse_errors": 0,
-            "reconnects": 0,
-            "queue_dropped": 0,
             "started_at": 0.0,
+            "clients_started": 0,
+            "clients_failed": 0,
+            "clients_stopped": 0,
+            "healthcheck_runs": 0,
+            "cache_components": len(self.caches),
         }
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    def register(self) -> None:
+        """Register all cache components against EventBus."""
+        if not self.stream_config.register_caches_on_start:
+            return
 
-    async def start(self, subscriptions: list[StreamSubscription]) -> None:
+        for cache in self.caches:
+            register = getattr(cache, "register", None)
+            if register is None:
+                continue
+            result = register()
+            if inspect.isawaitable(result):
+                raise RuntimeError(
+                    f"Cache register() must be synchronous for {cache.__class__.__name__}"
+                )
+
+        self._logger.info("MarketStream caches registered | caches=%s", len(self.caches))
+
+    async def start(self, subscriptions: list[MarketDataSubscription] | None = None) -> None:
         if self._running:
             self._logger.warning("MarketStream already started")
             return
 
         self._running = True
-        self._stopping = False
         self._metrics["started_at"] = time.time()
+        self._subscriptions = [sub for sub in subscriptions or [] if sub.enabled]
 
-        for subscription in subscriptions:
-            if subscription.enabled:
-                await self.subscribe(subscription)
+        self.register()
+
+        if self.stream_config.start_clients_on_start:
+            await self._start_exchange_clients()
 
         await self._start_healthcheck()
 
-        self._logger.info(
-            "MarketStream started | subscriptions=%s exchanges=%s",
-            len(self._subscriptions),
-            list(self.exchange_clients.keys()),
-        )
-
-        await self._emit_system_event(
+        await self._emit_event(
             "system.market_stream.started",
             {
-                "subscriptions": len(self._subscriptions),
                 "service": self._service_name,
+                "exchanges": list(self.exchange_clients),
+                "subscriptions": [self._serialize_subscription(s) for s in self._subscriptions],
+                "caches": [cache.__class__.__name__ for cache in self.caches],
             },
+            priority=EventPriority.NORMAL,
         )
 
     async def stop(self) -> None:
@@ -139,178 +153,144 @@ class MarketStream:
             self._logger.warning("MarketStream already stopped")
             return
 
-        self._stopping = True
         self._running = False
-
-        self._logger.info("Stopping MarketStream")
-
         await self._stop_healthcheck()
+        await self._stop_exchange_clients()
 
-        tasks: list[asyncio.Task] = []
-        for state in self._states.values():
-            if state.stream_task is not None:
-                state.stream_task.cancel()
-                tasks.append(state.stream_task)
-            if state.consumer_task is not None:
-                state.consumer_task.cancel()
-                tasks.append(state.consumer_task)
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        for exchange_name, client in self.exchange_clients.items():
-            try:
-                if hasattr(client, "close"):
-                    result = client.close()
-                    if inspect.isawaitable(result):
-                        await result
-            except Exception:
-                self._logger.exception(
-                    "Failed to close exchange client | exchange=%s",
-                    exchange_name,
-                )
-
-        self._logger.info("MarketStream stopped")
-
-        await self._emit_system_event(
+        await self._emit_event(
             "system.market_stream.stopped",
             {
                 "service": self._service_name,
+                "exchanges": list(self.exchange_clients),
             },
+            priority=EventPriority.NORMAL,
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    async def _start_exchange_clients(self) -> None:
+        for exchange, client in self.exchange_clients.items():
+            state = self._states.setdefault(exchange, ExchangeRuntimeState(exchange=exchange))
+            try:
+                register = getattr(client, "register", None)
+                if register is not None:
+                    result = register()
+                    if inspect.isawaitable(result):
+                        await result
 
-    async def subscribe(self, subscription: StreamSubscription) -> str:
-        stream_id = self._build_stream_id(subscription)
+                start = getattr(client, "start", None)
+                if start is None:
+                    self._logger.warning("Exchange client has no start() | exchange=%s", exchange)
+                    continue
 
-        if stream_id in self._subscriptions:
-            self._logger.warning(
-                "Subscription already exists | stream_id=%s",
-                stream_id,
-            )
-            return stream_id
+                result = start()
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=self.stream_config.startup_timeout_seconds)
 
-        queue = asyncio.Queue(maxsize=self.config.event_bus.max_queue_size)
+                state.is_started = True
+                state.started_at = time.time()
+                state.last_error = None
+                self._metrics["clients_started"] += 1
 
-        state = StreamRuntimeState(
-            subscription=subscription,
-            stream_id=stream_id,
+                await self._emit_event(
+                    "system.market_stream.exchange_started",
+                    {"exchange": exchange},
+                    priority=EventPriority.LOW,
+                )
+            except Exception as exc:
+                state.is_started = False
+                state.last_error = str(exc)
+                self._metrics["clients_failed"] += 1
+                self._logger.exception("Failed to start exchange client | exchange=%s", exchange)
+                await self._emit_event(
+                    "system.market_stream.exchange_start_failed",
+                    {"exchange": exchange, "error": str(exc)},
+                    priority=EventPriority.HIGH,
+                )
+
+    async def _stop_exchange_clients(self) -> None:
+        for exchange, client in self.exchange_clients.items():
+            state = self._states.setdefault(exchange, ExchangeRuntimeState(exchange=exchange))
+            try:
+                stop = getattr(client, "stop", None) or getattr(client, "close", None)
+                if stop is None:
+                    continue
+                result = stop()
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=self.stream_config.shutdown_timeout_seconds)
+
+                state.is_started = False
+                state.stopped_at = time.time()
+                state.last_error = None
+                self._metrics["clients_stopped"] += 1
+            except Exception as exc:
+                state.last_error = str(exc)
+                self._logger.exception("Failed to stop exchange client | exchange=%s", exchange)
+
+    async def restart_exchange(self, exchange: str) -> None:
+        client = self.exchange_clients.get(exchange)
+        if client is None:
+            raise KeyError(f"Unknown exchange client: {exchange}")
+
+        state = self._states.setdefault(exchange, ExchangeRuntimeState(exchange=exchange))
+        stop = getattr(client, "stop", None) or getattr(client, "close", None)
+        if stop is not None:
+            result = stop()
+            if inspect.isawaitable(result):
+                await result
+
+        start = getattr(client, "start", None)
+        if start is None:
+            raise RuntimeError(f"Exchange client has no start(): {exchange}")
+        result = start()
+        if inspect.isawaitable(result):
+            await result
+
+        state.is_started = True
+        state.started_at = time.time()
+        state.last_error = None
+        state.restarts += 1
+
+        await self._emit_event(
+            "system.market_stream.exchange_restarted",
+            {"exchange": exchange, "restarts": state.restarts},
+            priority=EventPriority.NORMAL,
         )
-
-        self._subscriptions[stream_id] = subscription
-        self._states[stream_id] = state
-        self._queues[stream_id] = queue
-
-        state.consumer_task = asyncio.create_task(
-            self._consume_queue(stream_id),
-            name=f"market-stream-consumer-{stream_id}",
-        )
-        state.stream_task = asyncio.create_task(
-            self._run_stream(stream_id),
-            name=f"market-stream-source-{stream_id}",
-        )
-
-        self._logger.info(
-            "Subscription added | stream_id=%s exchange=%s symbol=%s channel=%s",
-            stream_id,
-            subscription.exchange,
-            subscription.symbol,
-            subscription.channel,
-        )
-
-        return stream_id
-
-    async def unsubscribe(self, stream_id: str) -> None:
-        state = self._states.get(stream_id)
-        if state is None:
-            self._logger.warning("Unsubscribe ignored: stream not found | stream_id=%s", stream_id)
-            return
-
-        if state.stream_task is not None:
-            state.stream_task.cancel()
-        if state.consumer_task is not None:
-            state.consumer_task.cancel()
-
-        tasks = [task for task in (state.stream_task, state.consumer_task) if task is not None]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        self._subscriptions.pop(stream_id, None)
-        self._states.pop(stream_id, None)
-        self._queues.pop(stream_id, None)
-
-        self._logger.info("Subscription removed | stream_id=%s", stream_id)
 
     async def health_check(self) -> dict[str, Any]:
-        now = time.time()
-
-        streams: dict[str, Any] = {}
-        for stream_id, state in self._states.items():
-            lag_ms: int | None = None
-            if state.last_message_at is not None:
-                lag_ms = int((now - state.last_message_at) * 1000)
-
-            streams[stream_id] = {
-                "exchange": state.subscription.exchange,
-                "symbol": state.subscription.symbol,
-                "channel": state.subscription.channel,
-                "is_running": state.is_running,
-                "reconnect_count": state.reconnect_count,
-                "last_message_at": state.last_message_at,
-                "lag_ms": lag_ms,
-                "last_error": state.last_error,
-                "queue_size": self._queues[stream_id].qsize() if stream_id in self._queues else 0,
-                "queue_dropped": state.queue_dropped,
-            }
-
         return {
             "running": self._running,
-            "stopping": self._stopping,
             "stats": self.stats(),
-            "streams": streams,
+            "exchanges": {
+                exchange: {
+                    "is_started": state.is_started,
+                    "started_at": state.started_at,
+                    "stopped_at": state.stopped_at,
+                    "last_error": state.last_error,
+                    "restarts": state.restarts,
+                }
+                for exchange, state in self._states.items()
+            },
+            "caches": [
+                cache.stats() if hasattr(cache, "stats") else {"component": cache.__class__.__name__}
+                for cache in self.caches
+            ],
         }
 
     def stats(self) -> dict[str, Any]:
-        running_streams = sum(1 for state in self._states.values() if state.is_running)
-
         return {
             "running": self._running,
-            "stopping": self._stopping,
+            "exchanges_total": len(self.exchange_clients),
+            "exchanges_started": sum(1 for s in self._states.values() if s.is_started),
             "subscriptions_total": len(self._subscriptions),
-            "streams_running": running_streams,
-            "messages_total": self._metrics["messages_total"],
-            "published_events": self._metrics["published_events"],
-            "parse_errors": self._metrics["parse_errors"],
-            "reconnects": self._metrics["reconnects"],
-            "queue_dropped": self._metrics["queue_dropped"],
-            "started_at": self._metrics["started_at"],
+            **self._metrics,
         }
 
-    # ------------------------------------------------------------------
-    # Scheduler integration
-    # ------------------------------------------------------------------
-
     async def _start_healthcheck(self) -> None:
-        if self.scheduler is None:
-            self._logger.info("Scheduler is not provided, healthcheck job skipped")
+        if self.scheduler is None or self._healthcheck_job_id is not None:
             return
-
-        existing = self.scheduler.get_job_by_name("market-stream-healthcheck")
-        if existing is not None:
-            self._healthcheck_job_id = existing.job_id
-            self._logger.warning(
-                "Healthcheck job already exists | job_id=%s",
-                existing.job_id,
-            )
-            return
-
         self._healthcheck_job_id = self.scheduler.add_interval_job(
             name="market-stream-healthcheck",
             func=self._scheduled_healthcheck,
-            interval=max(self.config.scheduler.tick_interval * 10, 1.0),
+            interval=self.stream_config.healthcheck_interval_seconds,
             run_immediately=False,
             max_retries=1,
             retry_delay=1.0,
@@ -319,508 +299,50 @@ class MarketStream:
             enabled=True,
         )
 
-        self._logger.info(
-            "MarketStream healthcheck job registered | job_id=%s",
-            self._healthcheck_job_id,
-        )
-
     async def _stop_healthcheck(self) -> None:
         if self.scheduler is None or self._healthcheck_job_id is None:
             return
-
         with contextlib.suppress(Exception):
             self.scheduler.remove_job(self._healthcheck_job_id)
-
-        self._logger.info(
-            "MarketStream healthcheck job removed | job_id=%s",
-            self._healthcheck_job_id,
-        )
         self._healthcheck_job_id = None
 
     async def _scheduled_healthcheck(self) -> None:
+        self._metrics["healthcheck_runs"] += 1
         report = await self.health_check()
-        lag_threshold_ms = int(self.config.exchange.timeout_seconds * 1000)
-
-        for stream_id, stream_data in report["streams"].items():
-            lag_ms = stream_data.get("lag_ms")
-            if lag_ms is not None and lag_ms > lag_threshold_ms:
-                self._logger.warning(
-                    "Stream lag detected | stream_id=%s lag_ms=%s threshold_ms=%s",
-                    stream_id,
-                    lag_ms,
-                    lag_threshold_ms,
-                )
-
-                await self._emit_system_event(
-                    "system.market_stream.lag_detected",
-                    {
-                        "stream_id": stream_id,
-                        "lag_ms": lag_ms,
-                        "threshold_ms": lag_threshold_ms,
-                    },
-                )
-
-    # ------------------------------------------------------------------
-    # Stream runtime
-    # ------------------------------------------------------------------
-
-    async def _run_stream(self, stream_id: str) -> None:
-        state = self._states[stream_id]
-        subscription = state.subscription
-
-        while self._running and not self._stopping and stream_id in self._subscriptions:
-            try:
-                state.is_running = True
-                state.last_error = None
-
-                self._logger.info(
-                    "Stream connected | stream_id=%s exchange=%s symbol=%s channel=%s",
-                    stream_id,
-                    subscription.exchange,
-                    subscription.symbol,
-                    subscription.channel,
-                )
-
-                await self._emit_system_event(
-                    "system.market_stream.connected",
-                    {
-                        "stream_id": stream_id,
-                        "exchange": subscription.exchange,
-                        "symbol": subscription.symbol,
-                        "channel": subscription.channel,
-                    },
-                )
-
-                client = self._get_exchange_client(subscription.exchange)
-
-                async for raw_message in self._iterate_exchange_stream(client, subscription):
-                    if not self._running or self._stopping:
-                        break
-
-                    state.last_message_at = time.time()
-                    self._metrics["messages_total"] += 1
-
-                    await self._enqueue_message(stream_id, raw_message)
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                state.is_running = False
-                state.last_error = str(exc)
-                state.reconnect_count += 1
-                self._metrics["reconnects"] += 1
-
-                self._logger.exception(
-                    "Stream failed, reconnect scheduled | stream_id=%s reconnect_count=%s",
-                    stream_id,
-                    state.reconnect_count,
-                )
-
-                await self._emit_system_event(
-                    "system.market_stream.error",
-                    {
-                        "stream_id": stream_id,
-                        "exchange": subscription.exchange,
-                        "symbol": subscription.symbol,
-                        "channel": subscription.channel,
-                        "error": str(exc),
-                        "reconnect_count": state.reconnect_count,
-                    },
-                )
-
-                await asyncio.sleep(self.config.exchange.reconnect_delay)
-
-            finally:
-                state.is_running = False
-
-                if self._running and not self._stopping:
-                    await self._emit_system_event(
-                        "system.market_stream.disconnected",
-                        {
-                            "stream_id": stream_id,
-                            "exchange": subscription.exchange,
-                            "symbol": subscription.symbol,
-                            "channel": subscription.channel,
-                            "error": state.last_error,
-                        },
-                    )
-
-    async def _consume_queue(self, stream_id: str) -> None:
-        queue = self._queues[stream_id]
-        subscription = self._subscriptions[stream_id]
-
-        while self._running and not self._stopping and stream_id in self._subscriptions:
-            try:
-                raw_message = await queue.get()
-                await self._dispatch_message(subscription, raw_message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._metrics["parse_errors"] += 1
-                self._logger.exception(
-                    "Failed to process market data message | stream_id=%s channel=%s",
-                    stream_id,
-                    subscription.channel,
-                )
-
-    async def _enqueue_message(self, stream_id: str, raw_message: Any) -> None:
-        queue = self._queues[stream_id]
-        state = self._states[stream_id]
-
-        if queue.full():
-            state.queue_dropped += 1
-            self._metrics["queue_dropped"] += 1
-
-            self._logger.warning(
-                "Queue full, dropping message | stream_id=%s queue_size=%s",
-                stream_id,
-                queue.qsize(),
-            )
-            return
-
-        await queue.put(raw_message)
-
-    async def _dispatch_message(self, subscription: StreamSubscription, raw_message: dict[str, Any]) -> None:
-        channel = subscription.channel.lower()
-
-        if channel == "trades":
-            await self._handle_trade_message(subscription, raw_message)
-            return
-
-        if channel == "orderbook":
-            await self._handle_orderbook_message(subscription, raw_message)
-            return
-
-        if channel == "candles":
-            await self._handle_candle_message(subscription, raw_message)
-            return
-
-        if channel == "funding":
-            await self._handle_funding_message(subscription, raw_message)
-            return
-
-        if channel == "open_interest":
-            await self._handle_open_interest_message(subscription, raw_message)
-            return
-
-        if channel == "liquidations":
-            await self._handle_liquidation_message(subscription, raw_message)
-            return
-
-        self._logger.warning(
-            "Unknown channel received | exchange=%s symbol=%s channel=%s",
-            subscription.exchange,
-            subscription.symbol,
-            subscription.channel,
-        )
-
-    # ------------------------------------------------------------------
-    # Handlers
-    # ------------------------------------------------------------------
-
-    async def _handle_trade_message(self, sub: StreamSubscription, raw: dict[str, Any]) -> None:
-        event = self._normalize_trade_event(sub, raw)
-
-        if self.trades_cache is not None:
-            result = self.trades_cache.update(event)
-            if inspect.isawaitable(result):
-                await result
-
-        await self._publish_market_event("market.trade", event)
-
-    async def _handle_orderbook_message(self, sub: StreamSubscription, raw: dict[str, Any]) -> None:
-        is_snapshot = bool(raw.get("is_snapshot", False))
-
-        if is_snapshot:
-            event = self._normalize_orderbook_snapshot_event(sub, raw)
-
-            if self.orderbook_cache is not None:
-                result = self.orderbook_cache.apply_snapshot(event)
-                if inspect.isawaitable(result):
-                    await result
-
-            await self._publish_market_event("market.orderbook.snapshot", event)
-            return
-
-        event = self._normalize_orderbook_update_event(sub, raw)
-
-        if self.orderbook_cache is not None:
-            result = self.orderbook_cache.apply_delta(event)
-            if inspect.isawaitable(result):
-                await result
-
-        await self._publish_market_event("market.orderbook.update", event)
-
-    async def _handle_candle_message(self, sub: StreamSubscription, raw: dict[str, Any]) -> None:
-        event = self._normalize_candle_event(sub, raw)
-
-        if self.candles_cache is not None:
-            result = self.candles_cache.update(event)
-            if inspect.isawaitable(result):
-                await result
-
-        topic = "market.candle.closed" if event["is_closed"] else "market.candle.updated"
-        await self._publish_market_event(topic, event)
-
-    async def _handle_funding_message(self, sub: StreamSubscription, raw: dict[str, Any]) -> None:
-        event = self._normalize_funding_event(sub, raw)
-
-        if self.funding_cache is not None:
-            result = self.funding_cache.update(event)
-            if inspect.isawaitable(result):
-                await result
-
-        await self._publish_market_event("market.funding.updated", event)
-
-    async def _handle_open_interest_message(self, sub: StreamSubscription, raw: dict[str, Any]) -> None:
-        event = self._normalize_open_interest_event(sub, raw)
-
-        if self.open_interest_cache is not None:
-            result = self.open_interest_cache.update(event)
-            if inspect.isawaitable(result):
-                await result
-
-        await self._publish_market_event("market.open_interest.updated", event)
-
-    async def _handle_liquidation_message(self, sub: StreamSubscription, raw: dict[str, Any]) -> None:
-        event = self._normalize_liquidation_event(sub, raw)
-
-        if self.liquidation_cache is not None:
-            result = self.liquidation_cache.update(event)
-            if inspect.isawaitable(result):
-                await result
-
-        await self._publish_market_event("market.liquidation", event)
-
-    # ------------------------------------------------------------------
-    # Event publishing
-    # ------------------------------------------------------------------
-
-    async def _publish_market_event(self, topic: str, payload: dict[str, Any]) -> None:
-        await self.event_bus.emit(
-            topic,
-            payload,
-            source="market_stream",
-        )
-        self._metrics["published_events"] += 1
-
-    async def _emit_system_event(self, topic: str, payload: dict[str, Any]) -> None:
-        try:
-            await self.event_bus.emit(
-                topic,
-                payload,
-                source="market_stream",
-            )
-        except Exception:
-            self._logger.exception(
-                "Failed to emit system event | topic=%s",
-                topic,
+        unhealthy = [name for name, s in report["exchanges"].items() if not s["is_started"] or s["last_error"]]
+        if unhealthy:
+            await self._emit_event(
+                "system.market_stream.healthcheck_warning",
+                {"unhealthy_exchanges": unhealthy, "report": report},
+                priority=EventPriority.NORMAL,
             )
 
-    # ------------------------------------------------------------------
-    # Exchange integration
-    # ------------------------------------------------------------------
-
-    def _get_exchange_client(self, exchange: str) -> Any:
-        client = self.exchange_clients.get(exchange)
-        if client is None:
-            raise KeyError(f"Exchange client not found: {exchange}")
-        return client
-
-    async def _iterate_exchange_stream(
+    async def _emit_event(
         self,
-        client: Any,
-        subscription: StreamSubscription,
-    ) -> AsyncIterator[dict[str, Any]]:
-        if hasattr(client, "stream"):
-            async for item in client.stream(subscription):
-                yield item
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority = EventPriority.LOW,
+    ) -> None:
+        if not self.stream_config.emit_lifecycle_events:
             return
-
-        if hasattr(client, "subscribe"):
-            async for item in client.subscribe(
-                symbol=subscription.symbol,
-                channel=subscription.channel,
-                market_type=subscription.market_type,
-                timeframe=subscription.timeframe,
-                depth=subscription.depth,
-            ):
-                yield item
-            return
-
-        raise AttributeError(
-            f"Exchange client for {subscription.exchange} must provide "
-            "stream(subscription) or subscribe(...)"
-        )
-
-    # ------------------------------------------------------------------
-    # Normalization
-    # ------------------------------------------------------------------
-
-    def _normalize_trade_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "event_type": "trade",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "trade_id": self._safe_str(raw.get("trade_id", raw.get("id"))),
-            "price": float(raw.get("price", raw.get("p", 0.0))),
-            "quantity": float(raw.get("quantity", raw.get("qty", raw.get("q", 0.0)))),
-            "side": self._normalize_side(raw.get("side")),
-            "aggressor_side": self._normalize_side(
-                raw.get("aggressor_side", raw.get("taker_side", raw.get("side")))
-            ),
-        }
-
-    def _normalize_orderbook_snapshot_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "event_type": "orderbook_snapshot",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "bids": self._normalize_book_side(raw.get("bids", raw.get("b", []))),
-            "asks": self._normalize_book_side(raw.get("asks", raw.get("a", []))),
-            "sequence": self._safe_int(raw.get("sequence", raw.get("u"))),
-        }
-
-    def _normalize_orderbook_update_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "event_type": "orderbook_update",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "bids": self._normalize_book_side(raw.get("bids", raw.get("b", []))),
-            "asks": self._normalize_book_side(raw.get("asks", raw.get("a", []))),
-            "sequence": self._safe_int(raw.get("sequence", raw.get("u"))),
-            "prev_sequence": self._safe_int(raw.get("prev_sequence", raw.get("pu"))),
-        }
-
-    def _normalize_candle_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        is_closed = bool(raw.get("is_closed", raw.get("x", False)))
-
-        return {
-            "event_type": "candle",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "timeframe": raw.get("timeframe", sub.timeframe or "1m"),
-            "open": float(raw.get("open", raw.get("o", 0.0))),
-            "high": float(raw.get("high", raw.get("h", 0.0))),
-            "low": float(raw.get("low", raw.get("l", 0.0))),
-            "close": float(raw.get("close", raw.get("c", 0.0))),
-            "volume": float(raw.get("volume", raw.get("v", 0.0))),
-            "is_closed": is_closed,
-        }
-
-    def _normalize_funding_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "event_type": "funding",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "funding_rate": float(raw.get("funding_rate", raw.get("rate", 0.0))),
-            "next_funding_time_ms": self._safe_int(raw.get("next_funding_time_ms")),
-        }
-
-    def _normalize_open_interest_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "event_type": "open_interest",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "open_interest": float(raw.get("open_interest", raw.get("oi", 0.0))),
-        }
-
-    def _normalize_liquidation_event(self, sub: StreamSubscription, raw: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "event_type": "liquidation",
-            "exchange": sub.exchange,
-            "symbol": sub.symbol,
-            "market_type": sub.market_type,
-            "timestamp_ms": self._extract_timestamp_ms(raw),
-            "received_at_ms": self._now_ms(),
-            "price": float(raw.get("price", raw.get("p", 0.0))),
-            "quantity": float(raw.get("quantity", raw.get("qty", raw.get("q", 0.0)))),
-            "side": self._normalize_side(raw.get("side")),
-        }
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_stream_id(subscription: StreamSubscription) -> str:
-        timeframe = f":{subscription.timeframe}" if subscription.timeframe else ""
-        depth = f":depth={subscription.depth}" if subscription.depth is not None else ""
-        return (
-            f"{subscription.exchange}:"
-            f"{subscription.market_type}:"
-            f"{subscription.symbol}:"
-            f"{subscription.channel}"
-            f"{timeframe}{depth}"
-        )
-
-    @staticmethod
-    def _extract_timestamp_ms(raw: dict[str, Any]) -> int:
-        value = raw.get("timestamp_ms", raw.get("ts", raw.get("T", raw.get("E"))))
-        if value is None:
-            return int(time.time() * 1000)
-        return int(value)
-
-    @staticmethod
-    def _normalize_side(value: Any) -> str:
-        if value is None:
-            return "unknown"
-
-        normalized = str(value).strip().lower()
-        if normalized in {"buy", "bid", "b"}:
-            return "buy"
-        if normalized in {"sell", "ask", "s"}:
-            return "sell"
-        return "unknown"
-
-    @staticmethod
-    def _normalize_book_side(levels: Any) -> list[list[float]]:
-        normalized: list[list[float]] = []
-
-        for level in levels or []:
-            if not isinstance(level, (list, tuple)) or len(level) < 2:
-                continue
-
-            price = float(level[0])
-            quantity = float(level[1])
-            normalized.append([price, quantity])
-
-        return normalized
-
-    @staticmethod
-    def _safe_int(value: Any) -> int | None:
-        if value is None:
-            return None
         try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+            await self.event_bus.emit(topic, payload, source=self._service_name, priority=priority)
+        except Exception:
+            self._logger.exception("Failed to emit MarketStream event | topic=%s", topic)
 
     @staticmethod
-    def _safe_str(value: Any) -> str | None:
-        if value is None:
-            return None
-        return str(value)
+    def _serialize_subscription(subscription: MarketDataSubscription) -> dict[str, Any]:
+        return {
+            "exchange": subscription.exchange,
+            "symbol": subscription.symbol,
+            "channels": list(subscription.channels),
+            "market_type": subscription.market_type,
+            "timeframe": subscription.timeframe,
+            "depth": subscription.depth,
+            "enabled": subscription.enabled,
+        }
 
-    @staticmethod
-    def _now_ms() -> int:
-        return int(time.time() * 1000)
+
+# Backward-compatible alias for older imports.
+StreamSubscription = MarketDataSubscription

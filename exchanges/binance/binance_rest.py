@@ -1,688 +1,1562 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from typing import Any, Optional
+import hashlib
+import hmac
+import time
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlencode
 
 import aiohttp
 
 from core.config import Config
 from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
-from core.scheduler import Scheduler
 
 
-class BinanceWebSocketClient:
+@dataclass(slots=True)
+class BinanceFuturesRestClientConfig:
     """
-    Binance WebSocket client for public market streams + optional private user stream.
+    Binance USD-M Futures REST adapter config.
 
-    Public streams:
-    - trade
-    - depth
-    - kline
-
-    Private streams:
-    - outboundAccountPosition
-    - balanceUpdate
-    - executionReport
-
-    EventBus topics:
-    - market.trade
-    - market.orderbook
-    - market.candle
-    - execution.order_updated
-    - account.position_updated
-    - account.balance_updated
-    - system.ws.connected
-    - system.ws.disconnected
-    - system.ws.error
+    This adapter is the execution-capable Binance futures client.
+    It uses /fapi/* endpoints, not spot /api/v3/* endpoints.
     """
 
-    DEFAULT_PUBLIC_WS_URL = "wss://stream.binance.com:9443/stream"
-    DEFAULT_REST_URL = "https://api.binance.com"
+    rest_url: str = "https://fapi.binance.com"
+    timeout_seconds: float = 10.0
 
-    API_KEY_PLACEHOLDER = "BINANCE_API_KEY_PLACEHOLDER"
-    API_SECRET_PLACEHOLDER = "BINANCE_API_SECRET_PLACEHOLDER"
+    recv_window: int = 5000
+    request_retries: int = 2
+    retry_delay_seconds: float = 0.25
+
+    emit_success_events: bool = False
+    emit_error_events: bool = True
+
+    @classmethod
+    def from_core_config(cls, config: Config) -> "BinanceFuturesRestClientConfig":
+        return cls(
+            rest_url=config.exchange.rest_url or cls.rest_url,
+            timeout_seconds=config.exchange.timeout_seconds,
+        )
+
+
+class BinanceRestClient:
+    """
+    Binance USD-M Futures REST exchange adapter.
+
+    Responsibilities:
+    - perform Binance Futures REST HTTP requests;
+    - normalize futures market/account/order/position payloads;
+    - publish market.*, exchange.*, system.exchange.* events through EventBus;
+    - never call analytics, strategy, risk, or execution directly;
+    - never contain trading decision logic.
+
+    Execution layer may call:
+    - create_order()
+    - cancel_order()
+    - cancel_all_open_orders()
+    - change_leverage()
+    - change_margin_type()
+    - change_position_mode()
+
+    This adapter emits exchange.* events.
+    OrderManager/TradeExecutor must transform those into execution.* domain events.
+    """
+
+    EXCHANGE = "binance"
+    SOURCE = "binance_futures_rest"
 
     def __init__(
         self,
         *,
         config: Config,
         event_bus: EventBus,
-        scheduler: Optional[Scheduler] = None,
-        symbols: list[str],
-        streams: Optional[list[str]] = None,
-        depth_level: str = "20",
-        kline_interval: str = "1m",
-        enable_private_stream: bool = False,
+        rest_config: BinanceFuturesRestClientConfig | None = None,
     ) -> None:
         self._config = config
         self._event_bus = event_bus
-        self._scheduler = scheduler
-
-        self._symbols = [symbol.lower() for symbol in symbols]
-        self._streams = streams or ["trade", "depth", "kline"]
-
-        self._depth_level = depth_level
-        self._kline_interval = kline_interval
-        self._enable_private_stream = enable_private_stream
+        self._rest_config = rest_config or BinanceFuturesRestClientConfig.from_core_config(config)
 
         self._logger = get_logger(
             __name__,
-            exchange="binance",
-            event_type="binance_ws",
+            exchange=self.EXCHANGE,
+            event_type="exchange_futures_rest",
         )
 
-        self._public_ws_url = config.exchange.ws_url or self.DEFAULT_PUBLIC_WS_URL
-        self._rest_url = config.exchange.rest_url or self.DEFAULT_REST_URL
+        self._api_key = config.exchange.credentials.api_key
+        self._api_secret = config.exchange.credentials.api_secret
 
-        self._api_key = (
-            config.exchange.credentials.api_key
-            or self.API_KEY_PLACEHOLDER
-        )
-        self._api_secret = (
-            config.exchange.credentials.api_secret
-            or self.API_SECRET_PLACEHOLDER
-        )
-
-        self._timeout_seconds = config.exchange.timeout_seconds
-        self._reconnect_delay = config.exchange.reconnect_delay
-        self._max_reconnect_attempts = config.exchange.max_reconnect_attempts
-
-        self._session: Optional[aiohttp.ClientSession] = None
-
-        self._public_ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._private_ws: Optional[aiohttp.ClientWebSocketResponse] = None
-
-        self._public_task: Optional[asyncio.Task] = None
-        self._private_task: Optional[asyncio.Task] = None
-
-        self._running = False
-        self._listen_key: Optional[str] = None
-        self._listen_key_job_id: Optional[str] = None
+        self._session: aiohttp.ClientSession | None = None
+        self._time_offset_ms: int = 0
+        self._started = False
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def register(self) -> None:
+        """
+        REST adapter currently does not subscribe to EventBus topics.
+
+        Kept for project-wide consistency with modules that expose register().
+        """
+        self._logger.debug("Binance Futures REST register called | subscriptions=0")
+
     async def start(self) -> None:
-        if self._running:
-            self._logger.warning("Binance WS client already started")
+        if self._session is not None and not self._session.closed:
+            self._logger.warning("Binance Futures REST client already started")
+            self._started = True
             return
 
-        self._running = True
-
-        if self._session is None:
-            timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+        timeout = aiohttp.ClientTimeout(total=self._rest_config.timeout_seconds)
+        self._session = aiohttp.ClientSession(timeout=timeout)
+        self._started = True
 
         self._logger.info(
-            "Starting Binance WS client | symbols=%s streams=%s private_stream=%s",
-            self._symbols,
-            self._streams,
-            self._enable_private_stream,
+            "Binance Futures REST client started | base_url=%s timeout=%s",
+            self._rest_config.rest_url,
+            self._rest_config.timeout_seconds,
         )
 
-        self._public_task = asyncio.create_task(
-            self._run_public_loop(),
-            name="binance-public-ws-loop",
+        await self._emit_event(
+            "system.exchange.rest.started",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "rest_url": self._rest_config.rest_url,
+            },
+            priority=EventPriority.LOW,
         )
-
-        if self._enable_private_stream:
-            self._private_task = asyncio.create_task(
-                self._run_private_loop(),
-                name="binance-private-ws-loop",
-            )
 
     async def stop(self) -> None:
-        if not self._running:
-            self._logger.warning("Binance WS client already stopped")
+        if self._session is None:
+            self._logger.warning("Binance Futures REST client already stopped")
+            self._started = False
             return
 
-        self._running = False
-        self._logger.info("Stopping Binance WS client")
-
-        if self._listen_key_job_id and self._scheduler is not None:
-            try:
-                self._scheduler.remove_job(self._listen_key_job_id)
-            except Exception:
-                self._logger.exception("Failed to remove listen key keepalive job")
-            finally:
-                self._listen_key_job_id = None
-
-        tasks = [task for task in (self._public_task, self._private_task) if task is not None]
-        for task in tasks:
-            task.cancel()
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        self._public_task = None
-        self._private_task = None
-
-        await self._close_ws(self._public_ws)
-        await self._close_ws(self._private_ws)
-
-        self._public_ws = None
-        self._private_ws = None
-
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-
-        self._logger.info("Binance WS client stopped")
-
-    # ------------------------------------------------------------------
-    # Public WS
-    # ------------------------------------------------------------------
-
-    async def _run_public_loop(self) -> None:
-        reconnect_attempt = 0
-
-        while self._running:
-            try:
-                stream_url = self._build_public_stream_url()
-
-                self._logger.info(
-                    "Connecting to Binance public WS | url=%s",
-                    stream_url,
-                )
-
-                assert self._session is not None
-                self._public_ws = await self._session.ws_connect(
-                    stream_url,
-                    heartbeat=20,
-                    autoping=True,
-                )
-
-                reconnect_attempt = 0
-
-                self._logger.info("Connected to Binance public WS")
-                await self._event_bus.emit(
-                    "system.ws.connected",
-                    {
-                        "exchange": "binance",
-                        "channel": "public",
-                        "symbols": self._symbols,
-                    },
-                    priority=EventPriority.HIGH,
-                    source="binance_ws",
-                )
-
-                await self._consume_public_messages()
-
-            except asyncio.CancelledError:
-                self._logger.info("Public WS loop cancelled")
-                raise
-            except Exception as exc:
-                reconnect_attempt += 1
-                self._logger.exception(
-                    "Public WS loop error | attempt=%s max_attempts=%s",
-                    reconnect_attempt,
-                    self._max_reconnect_attempts,
-                )
-
-                await self._event_bus.emit(
-                    "system.ws.error",
-                    {
-                        "exchange": "binance",
-                        "channel": "public",
-                        "error": str(exc),
-                        "attempt": reconnect_attempt,
-                    },
-                    priority=EventPriority.HIGH,
-                    source="binance_ws",
-                )
-
-                if (
-                    self._max_reconnect_attempts > 0
-                    and reconnect_attempt >= self._max_reconnect_attempts
-                ):
-                    self._logger.error("Public WS max reconnect attempts reached")
-                    break
-
-                await asyncio.sleep(self._reconnect_delay)
-            finally:
-                await self._close_ws(self._public_ws)
-                self._public_ws = None
-
-                if self._running:
-                    await self._event_bus.emit(
-                        "system.ws.disconnected",
-                        {
-                            "exchange": "binance",
-                            "channel": "public",
-                        },
-                        priority=EventPriority.HIGH,
-                        source="binance_ws",
-                    )
-
-    async def _consume_public_messages(self) -> None:
-        assert self._public_ws is not None
-
-        async for msg in self._public_ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                await self._handle_public_message(msg.data)
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                raise RuntimeError("Binance public websocket error")
-            elif msg.type in (
-                aiohttp.WSMsgType.CLOSED,
-                aiohttp.WSMsgType.CLOSE,
-                aiohttp.WSMsgType.CLOSING,
-            ):
-                self._logger.warning("Binance public WS closed by server")
-                break
-
-    async def _handle_public_message(self, raw_message: str) -> None:
-        try:
-            message = json.loads(raw_message)
-        except json.JSONDecodeError:
-            self._logger.warning("Failed to decode public WS message")
-            return
-
-        stream_name = message.get("stream")
-        data = message.get("data", {})
-
-        if not stream_name or not data:
-            self._logger.debug("Received empty or malformed public WS payload")
-            return
-
-        if "@trade" in stream_name:
-            await self._publish_trade_event(data)
-            return
-
-        if "@depth" in stream_name:
-            await self._publish_orderbook_event(data)
-            return
-
-        if "@kline_" in stream_name:
-            await self._publish_kline_event(data)
-            return
-
-        self._logger.debug("Unhandled public stream message | stream=%s", stream_name)
-
-    # ------------------------------------------------------------------
-    # Private WS
-    # ------------------------------------------------------------------
-
-    async def _run_private_loop(self) -> None:
-        reconnect_attempt = 0
-
-        while self._running:
-            try:
-                await self._ensure_listen_key()
-
-                if not self._listen_key:
-                    raise RuntimeError("listenKey is not available")
-
-                private_ws_url = f"wss://stream.binance.com:9443/ws/{self._listen_key}"
-
-                self._logger.info("Connecting to Binance private WS")
-
-                assert self._session is not None
-                self._private_ws = await self._session.ws_connect(
-                    private_ws_url,
-                    heartbeat=20,
-                    autoping=True,
-                )
-
-                reconnect_attempt = 0
-
-                self._logger.info("Connected to Binance private WS")
-                await self._event_bus.emit(
-                    "system.ws.connected",
-                    {
-                        "exchange": "binance",
-                        "channel": "private",
-                    },
-                    priority=EventPriority.HIGH,
-                    source="binance_ws",
-                )
-
-                if self._scheduler is not None and self._listen_key_job_id is None:
-                    self._listen_key_job_id = self._scheduler.add_interval_job(
-                        name="binance_listen_key_keepalive",
-                        func=self._keepalive_listen_key,
-                        interval=30 * 60,
-                        run_immediately=False,
-                        max_retries=2,
-                        retry_delay=2.0,
-                        timeout=10.0,
-                        allow_overlap=False,
-                    )
-
-                await self._consume_private_messages()
-
-            except asyncio.CancelledError:
-                self._logger.info("Private WS loop cancelled")
-                raise
-            except Exception as exc:
-                reconnect_attempt += 1
-
-                self._logger.exception(
-                    "Private WS loop error | attempt=%s max_attempts=%s",
-                    reconnect_attempt,
-                    self._max_reconnect_attempts,
-                )
-
-                await self._event_bus.emit(
-                    "system.ws.error",
-                    {
-                        "exchange": "binance",
-                        "channel": "private",
-                        "error": str(exc),
-                        "attempt": reconnect_attempt,
-                    },
-                    priority=EventPriority.HIGH,
-                    source="binance_ws",
-                )
-
-                if (
-                    self._max_reconnect_attempts > 0
-                    and reconnect_attempt >= self._max_reconnect_attempts
-                ):
-                    self._logger.error("Private WS max reconnect attempts reached")
-                    break
-
-                await asyncio.sleep(self._reconnect_delay)
-            finally:
-                await self._close_ws(self._private_ws)
-                self._private_ws = None
-
-                if self._running:
-                    await self._event_bus.emit(
-                        "system.ws.disconnected",
-                        {
-                            "exchange": "binance",
-                            "channel": "private",
-                        },
-                        priority=EventPriority.HIGH,
-                        source="binance_ws",
-                    )
-
-    async def _consume_private_messages(self) -> None:
-        assert self._private_ws is not None
-
-        async for msg in self._private_ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                await self._handle_private_message(msg.data)
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                raise RuntimeError("Binance private websocket error")
-            elif msg.type in (
-                aiohttp.WSMsgType.CLOSED,
-                aiohttp.WSMsgType.CLOSE,
-                aiohttp.WSMsgType.CLOSING,
-            ):
-                self._logger.warning("Binance private WS closed by server")
-                break
-
-    async def _handle_private_message(self, raw_message: str) -> None:
-        try:
-            data = json.loads(raw_message)
-        except json.JSONDecodeError:
-            self._logger.warning("Failed to decode private WS message")
-            return
-
-        event_type = data.get("e")
-
-        if event_type == "executionReport":
-            await self._publish_execution_report_event(data)
-            return
-
-        if event_type == "outboundAccountPosition":
-            await self._publish_account_position_event(data)
-            return
-
-        if event_type == "balanceUpdate":
-            await self._publish_balance_update_event(data)
-            return
-
-        self._logger.debug("Unhandled private event | event_type=%s", event_type)
-
-    # ------------------------------------------------------------------
-    # REST for listenKey
-    # ------------------------------------------------------------------
-
-    async def _ensure_listen_key(self) -> None:
-        if self._listen_key:
-            return
-        self._listen_key = await self._create_listen_key()
-
-    async def _create_listen_key(self) -> str:
-        """
-        Для Binance user data stream достатньо API key.
-        Secret тут напряму не використовується.
-        """
-
-        headers = {
-            "X-MBX-APIKEY": self._api_key,
-        }
-
-        url = f"{self._rest_url}/api/v3/userDataStream"
-
-        self._logger.info("Creating Binance listen key")
-
-        assert self._session is not None
-        async with self._session.post(url, headers=headers) as response:
-            text = await response.text()
-
-            if response.status >= 400:
-                raise RuntimeError(
-                    f"Failed to create listen key | status={response.status} body={text}"
-                )
-
-            payload = json.loads(text)
-            listen_key = payload.get("listenKey")
-
-            if not listen_key:
-                raise RuntimeError("listenKey missing in Binance response")
-
-            self._logger.info("Binance listen key created")
-            return listen_key
-
-    async def _keepalive_listen_key(self) -> None:
-        if not self._listen_key:
-            self._logger.warning("Listen key keepalive skipped: listen key is empty")
-            return
-
-        headers = {
-            "X-MBX-APIKEY": self._api_key,
-        }
-        params = {
-            "listenKey": self._listen_key,
-        }
-        url = f"{self._rest_url}/api/v3/userDataStream"
-
-        self._logger.info("Refreshing Binance listen key")
-
-        assert self._session is not None
-        async with self._session.put(url, headers=headers, params=params) as response:
-            text = await response.text()
-
-            if response.status >= 400:
-                raise RuntimeError(
-                    f"Failed to refresh listen key | status={response.status} body={text}"
-                )
-
-            self._logger.info("Binance listen key refreshed")
-
-    # ------------------------------------------------------------------
-    # Event publishers
-    # ------------------------------------------------------------------
-
-    async def _publish_trade_event(self, data: dict[str, Any]) -> None:
-        payload = {
-            "exchange": "binance",
-            "symbol": data.get("s"),
-            "trade_id": data.get("t"),
-            "price": self._safe_float(data.get("p")),
-            "qty": self._safe_float(data.get("q")),
-            "buyer_is_maker": data.get("m"),
-            "side": "sell" if data.get("m") else "buy",
-            "event_time": data.get("E"),
-            "trade_time": data.get("T"),
-        }
-
-        await self._event_bus.emit(
-            "market.trade",
-            payload,
-            priority=EventPriority.NORMAL,
-            source="binance_ws",
+        await self._session.close()
+        self._session = None
+        self._started = False
+
+        self._logger.info("Binance Futures REST client stopped")
+
+        await self._emit_event(
+            "system.exchange.rest.stopped",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+            },
+            priority=EventPriority.LOW,
         )
 
-    async def _publish_orderbook_event(self, data: dict[str, Any]) -> None:
-        payload = {
-            "exchange": "binance",
-            "symbol": data.get("s"),
-            "first_update_id": data.get("U"),
-            "final_update_id": data.get("u"),
+    # ------------------------------------------------------------------
+    # Public market endpoints
+    # ------------------------------------------------------------------
+
+    async def ping(self) -> dict[str, Any]:
+        return await self._request(
+            method="GET",
+            path="/fapi/v1/ping",
+        )
+
+    async def get_server_time(self) -> dict[str, Any]:
+        return await self._request(
+            method="GET",
+            path="/fapi/v1/time",
+        )
+
+    async def sync_time(self) -> int:
+        local_before = self._current_timestamp_ms()
+        payload = await self.get_server_time()
+        local_after = self._current_timestamp_ms()
+
+        server_time = int(payload["serverTime"])
+        local_estimated = (local_before + local_after) // 2
+        self._time_offset_ms = server_time - local_estimated
+
+        self._logger.info(
+            "Binance Futures server time synced | server_time=%s offset_ms=%s",
+            server_time,
+            self._time_offset_ms,
+        )
+
+        await self._emit_event(
+            "system.exchange.time_synced",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "server_time": server_time,
+                "offset_ms": self._time_offset_ms,
+            },
+            priority=EventPriority.LOW,
+        )
+
+        return self._time_offset_ms
+
+    async def get_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/exchangeInfo",
+        )
+
+        if symbol is None:
+            return payload
+
+        symbol = symbol.upper()
+        symbols = payload.get("symbols", [])
+
+        filtered = [
+            item
+            for item in symbols
+            if isinstance(item, dict) and item.get("symbol") == symbol
+        ]
+
+        return {
+            **payload,
+            "symbols": filtered,
+        }
+
+    async def get_orderbook_snapshot(
+        self,
+        *,
+        symbol: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        symbol = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/depth",
+            params={
+                "symbol": symbol,
+                "limit": limit,
+            },
+        )
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol,
+            "last_update_id": payload.get("lastUpdateId"),
+            "message_output_time": payload.get("E"),
+            "transaction_time": payload.get("T"),
             "bids": [
                 [self._safe_float(price), self._safe_float(qty)]
-                for price, qty in data.get("b", [])
+                for price, qty in payload.get("bids", [])
             ],
             "asks": [
                 [self._safe_float(price), self._safe_float(qty)]
-                for price, qty in data.get("a", [])
+                for price, qty in payload.get("asks", [])
             ],
-            "event_time": data.get("E"),
+            "snapshot_time": self._current_timestamp_ms(),
         }
 
-        await self._event_bus.emit(
-            "market.orderbook",
-            payload,
-            priority=EventPriority.LOW,
-            source="binance_ws",
-        )
-
-    async def _publish_kline_event(self, data: dict[str, Any]) -> None:
-        kline = data.get("k", {})
-
-        payload = {
-            "exchange": "binance",
-            "symbol": data.get("s"),
-            "interval": kline.get("i"),
-            "open_time": kline.get("t"),
-            "close_time": kline.get("T"),
-            "open": self._safe_float(kline.get("o")),
-            "high": self._safe_float(kline.get("h")),
-            "low": self._safe_float(kline.get("l")),
-            "close": self._safe_float(kline.get("c")),
-            "volume": self._safe_float(kline.get("v")),
-            "trades": kline.get("n"),
-            "is_closed": kline.get("x"),
-            "quote_volume": self._safe_float(kline.get("q")),
-        }
-
-        await self._event_bus.emit(
-            "market.candle",
-            payload,
+        await self._emit_event(
+            "market.orderbook.snapshot",
+            normalized,
             priority=EventPriority.NORMAL,
-            source="binance_ws",
         )
 
-    async def _publish_execution_report_event(self, data: dict[str, Any]) -> None:
-        payload = {
-            "exchange": "binance",
-            "symbol": data.get("s"),
-            "side": data.get("S"),
-            "order_type": data.get("o"),
-            "time_in_force": data.get("f"),
-            "order_qty": self._safe_float(data.get("q")),
-            "order_price": self._safe_float(data.get("p")),
-            "stop_price": self._safe_float(data.get("P")),
-            "execution_type": data.get("x"),
-            "order_status": data.get("X"),
-            "order_id": data.get("i"),
-            "last_executed_qty": self._safe_float(data.get("l")),
-            "cumulative_filled_qty": self._safe_float(data.get("z")),
-            "last_executed_price": self._safe_float(data.get("L")),
-            "commission": self._safe_float(data.get("n")),
-            "commission_asset": data.get("N"),
-            "transaction_time": data.get("T"),
-            "event_time": data.get("E"),
-            "client_order_id": data.get("c"),
-        }
+        return normalized
 
-        await self._event_bus.emit(
-            "execution.order_updated",
-            payload,
-            priority=EventPriority.HIGH,
-            source="binance_ws",
+    async def get_recent_trades(
+        self,
+        *,
+        symbol: str,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        symbol = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/trades",
+            params={
+                "symbol": symbol,
+                "limit": limit,
+            },
         )
 
-    async def _publish_account_position_event(self, data: dict[str, Any]) -> None:
-        balances = data.get("B", [])
+        normalized = [
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol,
+                "trade_id": trade.get("id"),
+                "price": self._safe_float(trade.get("price")),
+                "qty": self._safe_float(trade.get("qty")),
+                "quote_qty": self._mul_safe(
+                    self._safe_float(trade.get("price")),
+                    self._safe_float(trade.get("qty")),
+                ),
+                "trade_time": trade.get("time"),
+                "buyer_is_maker": trade.get("isBuyerMaker"),
+                "side": "sell" if trade.get("isBuyerMaker") else "buy",
+            }
+            for trade in payload
+            if isinstance(trade, dict)
+        ]
 
-        payload = {
-            "exchange": "binance",
-            "event_time": data.get("E"),
-            "last_account_update_time": data.get("u"),
-            "balances": [
-                {
-                    "asset": balance.get("a"),
-                    "free": self._safe_float(balance.get("f")),
-                    "locked": self._safe_float(balance.get("l")),
-                }
-                for balance in balances
-            ],
-        }
-
-        await self._event_bus.emit(
-            "account.position_updated",
-            payload,
-            priority=EventPriority.HIGH,
-            source="binance_ws",
+        await self._emit_event(
+            "market.trades.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol,
+                "count": len(normalized),
+                "trades": normalized,
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.LOW,
         )
 
-    async def _publish_balance_update_event(self, data: dict[str, Any]) -> None:
-        payload = {
-            "exchange": "binance",
-            "asset": data.get("a"),
-            "balance_delta": self._safe_float(data.get("d")),
-            "clear_time": data.get("T"),
-            "event_time": data.get("E"),
+        return normalized
+
+    async def get_klines(
+        self,
+        *,
+        symbol: str,
+        interval: str = "1m",
+        limit: int = 500,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        symbol = symbol.upper()
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
         }
 
-        await self._event_bus.emit(
-            "account.balance_updated",
-            payload,
-            priority=EventPriority.HIGH,
-            source="binance_ws",
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/klines",
+            params=params,
+        )
+
+        normalized = [
+            self._normalize_kline(
+                item=item,
+                symbol=symbol,
+                timeframe=interval,
+                is_closed=True,
+            )
+            for item in payload
+            if isinstance(item, list) and len(item) >= 11
+        ]
+
+        await self._emit_event(
+            "market.candles.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol,
+                "timeframe": interval,
+                "count": len(normalized),
+                "candles": normalized,
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.LOW,
+        )
+
+        return normalized
+
+    async def get_premium_index(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {}
+
+        if symbol is not None:
+            params["symbol"] = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/premiumIndex",
+            params=params,
+        )
+
+        return payload
+
+    async def get_funding_rate(
+        self,
+        *,
+        symbol: str,
+        limit: int = 100,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        symbol = symbol.upper()
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "limit": limit,
+        }
+
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/fundingRate",
+            params=params,
+        )
+
+        normalized = [
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": item.get("symbol") or symbol,
+                "funding_rate": self._safe_float(item.get("fundingRate")),
+                "funding_time": item.get("fundingTime"),
+            }
+            for item in payload
+            if isinstance(item, dict)
+        ]
+
+        await self._emit_event(
+            "market.funding.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol,
+                "count": len(normalized),
+                "items": normalized,
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.NORMAL,
+        )
+
+        return normalized
+
+    async def get_open_interest(
+        self,
+        *,
+        symbol: str,
+    ) -> dict[str, Any]:
+        symbol = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/openInterest",
+            params={"symbol": symbol},
+        )
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol") or symbol,
+            "open_interest": self._safe_float(payload.get("openInterest")),
+            "time": payload.get("time"),
+            "snapshot_time": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "market.open_interest.snapshot",
+            normalized,
+            priority=EventPriority.NORMAL,
+        )
+
+        return normalized
+
+    async def get_ticker_24h(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {}
+
+        if symbol is not None:
+            params["symbol"] = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/ticker/24hr",
+            params=params,
+        )
+
+        await self._emit_event(
+            "market.tickers.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol.upper() if symbol else None,
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.LOW,
+        )
+
+        return payload
+
+    # ------------------------------------------------------------------
+    # Listen key endpoints for Binance Futures user data stream
+    # ------------------------------------------------------------------
+
+    async def create_listen_key(self) -> str:
+        payload = await self._request(
+            method="POST",
+            path="/fapi/v1/listenKey",
+            auth_required=True,
+        )
+
+        listen_key = payload.get("listenKey")
+        if not listen_key:
+            raise RuntimeError("Binance Futures listenKey missing in response")
+
+        self._logger.info("Binance Futures listenKey created")
+
+        await self._emit_event(
+            "system.exchange.listen_key.created",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+            },
+            priority=EventPriority.NORMAL,
+        )
+
+        return listen_key
+
+    async def keepalive_listen_key(self, listen_key: str) -> None:
+        await self._request(
+            method="PUT",
+            path="/fapi/v1/listenKey",
+            params={"listenKey": listen_key},
+            auth_required=True,
+        )
+
+        self._logger.info("Binance Futures listenKey refreshed")
+
+        await self._emit_event(
+            "system.exchange.listen_key.refreshed",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+            },
+            priority=EventPriority.LOW,
+        )
+
+    async def close_listen_key(self, listen_key: str) -> None:
+        await self._request(
+            method="DELETE",
+            path="/fapi/v1/listenKey",
+            params={"listenKey": listen_key},
+            auth_required=True,
+        )
+
+        self._logger.info("Binance Futures listenKey closed")
+
+        await self._emit_event(
+            "system.exchange.listen_key.closed",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+            },
+            priority=EventPriority.LOW,
         )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Private account / position endpoints
     # ------------------------------------------------------------------
 
-    def _build_public_stream_url(self) -> str:
-        stream_names: list[str] = []
+    async def get_balance(self, *, recv_window: int | None = None) -> list[dict[str, Any]]:
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v2/balance",
+            params={"recvWindow": recv_window or self._rest_config.recv_window},
+            signed=True,
+            auth_required=True,
+        )
 
-        for symbol in self._symbols:
-            if "trade" in self._streams:
-                stream_names.append(f"{symbol}@trade")
+        normalized = [
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "account_alias": item.get("accountAlias"),
+                "asset": item.get("asset"),
+                "balance": self._safe_float(item.get("balance")),
+                "cross_wallet_balance": self._safe_float(item.get("crossWalletBalance")),
+                "cross_unrealized_pnl": self._safe_float(item.get("crossUnPnl")),
+                "available_balance": self._safe_float(item.get("availableBalance")),
+                "max_withdraw_amount": self._safe_float(item.get("maxWithdrawAmount")),
+                "margin_available": item.get("marginAvailable"),
+                "update_time": item.get("updateTime"),
+            }
+            for item in payload
+            if isinstance(item, dict)
+        ]
 
-            if "depth" in self._streams:
-                stream_names.append(f"{symbol}@depth{self._depth_level}@100ms")
+        await self._emit_event(
+            "exchange.account.balance.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "balances": normalized,
+                "count": len(normalized),
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.HIGH,
+        )
 
-            if "kline" in self._streams:
-                stream_names.append(f"{symbol}@kline_{self._kline_interval}")
+        return normalized
 
-        streams = "/".join(stream_names)
-        return f"{self._public_ws_url}?streams={streams}"
+    async def get_account_info(self, *, recv_window: int | None = None) -> dict[str, Any]:
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v2/account",
+            params={"recvWindow": recv_window or self._rest_config.recv_window},
+            signed=True,
+            auth_required=True,
+        )
 
-    async def _close_ws(self, ws: Optional[aiohttp.ClientWebSocketResponse]) -> None:
-        if ws is None:
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "fee_tier": payload.get("feeTier"),
+            "can_trade": payload.get("canTrade"),
+            "can_deposit": payload.get("canDeposit"),
+            "can_withdraw": payload.get("canWithdraw"),
+            "update_time": payload.get("updateTime"),
+            "total_initial_margin": self._safe_float(payload.get("totalInitialMargin")),
+            "total_maint_margin": self._safe_float(payload.get("totalMaintMargin")),
+            "total_wallet_balance": self._safe_float(payload.get("totalWalletBalance")),
+            "total_unrealized_profit": self._safe_float(payload.get("totalUnrealizedProfit")),
+            "total_margin_balance": self._safe_float(payload.get("totalMarginBalance")),
+            "total_position_initial_margin": self._safe_float(payload.get("totalPositionInitialMargin")),
+            "total_open_order_initial_margin": self._safe_float(payload.get("totalOpenOrderInitialMargin")),
+            "total_cross_wallet_balance": self._safe_float(payload.get("totalCrossWalletBalance")),
+            "total_cross_unrealized_pnl": self._safe_float(payload.get("totalCrossUnPnl")),
+            "available_balance": self._safe_float(payload.get("availableBalance")),
+            "max_withdraw_amount": self._safe_float(payload.get("maxWithdrawAmount")),
+            "assets": payload.get("assets", []),
+            "positions": payload.get("positions", []),
+            "snapshot_time": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "exchange.account.updated",
+            normalized,
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    async def get_positions(
+        self,
+        *,
+        symbol: str | None = None,
+        recv_window: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if symbol is not None:
+            params["symbol"] = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v2/positionRisk",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = [
+            self._normalize_position(item)
+            for item in payload
+            if isinstance(item, dict)
+        ]
+
+        await self._emit_event(
+            "exchange.positions.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol.upper() if symbol else None,
+                "positions": normalized,
+                "count": len(normalized),
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Private order / trade endpoints
+    # ------------------------------------------------------------------
+
+    async def get_open_orders(
+        self,
+        *,
+        symbol: str | None = None,
+        recv_window: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if symbol is not None:
+            params["symbol"] = symbol.upper()
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/openOrders",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = [
+            self._normalize_order(order)
+            for order in payload
+            if isinstance(order, dict)
+        ]
+
+        await self._emit_event(
+            "exchange.open_orders.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol.upper() if symbol else None,
+                "orders": normalized,
+                "count": len(normalized),
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    async def get_order(
+        self,
+        *,
+        symbol: str,
+        order_id: int | None = None,
+        orig_client_order_id: str | None = None,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        if order_id is None and orig_client_order_id is None:
+            raise ValueError("Either order_id or orig_client_order_id must be provided")
+
+        symbol = symbol.upper()
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if order_id is not None:
+            params["orderId"] = order_id
+        if orig_client_order_id is not None:
+            params["origClientOrderId"] = orig_client_order_id
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/order",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = self._normalize_order(payload)
+
+        await self._emit_event(
+            "exchange.order.fetched",
+            normalized,
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    async def get_user_trades(
+        self,
+        *,
+        symbol: str,
+        limit: int = 500,
+        order_id: int | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        recv_window: int | None = None,
+    ) -> list[dict[str, Any]]:
+        symbol = symbol.upper()
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "limit": limit,
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if order_id is not None:
+            params["orderId"] = order_id
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/userTrades",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = [
+            self._normalize_user_trade(trade, symbol=symbol)
+            for trade in payload
+            if isinstance(trade, dict)
+        ]
+
+        await self._emit_event(
+            "exchange.trades.snapshot",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "symbol": symbol,
+                "trades": normalized,
+                "count": len(normalized),
+                "snapshot_time": self._current_timestamp_ms(),
+            },
+            priority=EventPriority.NORMAL,
+        )
+
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Futures trading endpoints
+    # ------------------------------------------------------------------
+
+    async def create_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float | None = None,
+        price: float | None = None,
+        position_side: str | None = None,
+        time_in_force: str | None = None,
+        reduce_only: bool | None = None,
+        new_client_order_id: str | None = None,
+        stop_price: float | None = None,
+        close_position: bool | None = None,
+        activation_price: float | None = None,
+        callback_rate: float | None = None,
+        working_type: str | None = None,
+        price_protect: bool | None = None,
+        new_order_resp_type: str | None = "RESULT",
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Low-level Binance USD-M Futures order endpoint.
+
+        This method must be called by execution/order_manager layer.
+        It does not decide whether an order should be opened.
+
+        Common examples:
+        - MARKET open long: side=BUY, order_type=MARKET, position_side=LONG
+        - MARKET open short: side=SELL, order_type=MARKET, position_side=SHORT
+        - LIMIT: provide price + time_in_force
+        - STOP_MARKET close: provide stop_price + close_position=True
+        """
+
+        symbol = symbol.upper()
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": order_type.upper(),
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if quantity is not None:
+            params["quantity"] = self._format_number(quantity)
+
+        if price is not None:
+            params["price"] = self._format_number(price)
+
+        if position_side is not None:
+            params["positionSide"] = position_side.upper()
+
+        if time_in_force is not None:
+            params["timeInForce"] = time_in_force.upper()
+
+        if reduce_only is not None:
+            params["reduceOnly"] = self._bool_str(reduce_only)
+
+        if new_client_order_id is not None:
+            params["newClientOrderId"] = new_client_order_id
+
+        if stop_price is not None:
+            params["stopPrice"] = self._format_number(stop_price)
+
+        if close_position is not None:
+            params["closePosition"] = self._bool_str(close_position)
+
+        if activation_price is not None:
+            params["activationPrice"] = self._format_number(activation_price)
+
+        if callback_rate is not None:
+            params["callbackRate"] = self._format_number(callback_rate)
+
+        if working_type is not None:
+            params["workingType"] = working_type.upper()
+
+        if price_protect is not None:
+            params["priceProtect"] = self._bool_str(price_protect)
+
+        if new_order_resp_type is not None:
+            params["newOrderRespType"] = new_order_resp_type.upper()
+
+        payload = await self._request(
+            method="POST",
+            path="/fapi/v1/order",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = self._normalize_order(payload)
+
+        await self._emit_event(
+            "exchange.order.submitted",
+            normalized,
+            priority=EventPriority.CRITICAL,
+        )
+
+        return normalized
+
+    async def cancel_order(
+        self,
+        *,
+        symbol: str,
+        order_id: int | None = None,
+        orig_client_order_id: str | None = None,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        if order_id is None and orig_client_order_id is None:
+            raise ValueError("Either order_id or orig_client_order_id must be provided")
+
+        symbol = symbol.upper()
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if order_id is not None:
+            params["orderId"] = order_id
+        if orig_client_order_id is not None:
+            params["origClientOrderId"] = orig_client_order_id
+
+        payload = await self._request(
+            method="DELETE",
+            path="/fapi/v1/order",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = self._normalize_order(payload)
+
+        await self._emit_event(
+            "exchange.order.cancelled",
+            normalized,
+            priority=EventPriority.CRITICAL,
+        )
+
+        return normalized
+
+    async def cancel_all_open_orders(
+        self,
+        *,
+        symbol: str,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        symbol = symbol.upper()
+
+        payload = await self._request(
+            method="DELETE",
+            path="/fapi/v1/allOpenOrders",
+            params={
+                "symbol": symbol,
+                "recvWindow": recv_window or self._rest_config.recv_window,
+            },
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol,
+            "code": payload.get("code"),
+            "message": payload.get("msg"),
+            "timestamp": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "exchange.orders.cancelled",
+            normalized,
+            priority=EventPriority.CRITICAL,
+        )
+
+        return normalized
+
+    async def change_leverage(
+        self,
+        *,
+        symbol: str,
+        leverage: int,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        if leverage < 1 or leverage > 125:
+            raise ValueError("Binance Futures leverage must be between 1 and 125")
+
+        symbol = symbol.upper()
+
+        payload = await self._request(
+            method="POST",
+            path="/fapi/v1/leverage",
+            params={
+                "symbol": symbol,
+                "leverage": leverage,
+                "recvWindow": recv_window or self._rest_config.recv_window,
+            },
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol") or symbol,
+            "leverage": self._safe_int(payload.get("leverage")),
+            "max_notional_value": self._safe_float(payload.get("maxNotionalValue")),
+            "timestamp": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "exchange.leverage.changed",
+            normalized,
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    async def change_margin_type(
+        self,
+        *,
+        symbol: str,
+        margin_type: str,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        symbol = symbol.upper()
+        margin_type = margin_type.upper()
+
+        if margin_type not in {"ISOLATED", "CROSSED"}:
+            raise ValueError("margin_type must be ISOLATED or CROSSED")
+
+        payload = await self._request(
+            method="POST",
+            path="/fapi/v1/marginType",
+            params={
+                "symbol": symbol,
+                "marginType": margin_type,
+                "recvWindow": recv_window or self._rest_config.recv_window,
+            },
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol,
+            "margin_type": margin_type,
+            "code": payload.get("code"),
+            "message": payload.get("msg"),
+            "timestamp": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "exchange.margin_type.changed",
+            normalized,
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    async def change_position_mode(
+        self,
+        *,
+        dual_side_position: bool,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        dual_side_position=False -> One-way Mode
+        dual_side_position=True  -> Hedge Mode
+        """
+
+        payload = await self._request(
+            method="POST",
+            path="/fapi/v1/positionSide/dual",
+            params={
+                "dualSidePosition": self._bool_str(dual_side_position),
+                "recvWindow": recv_window or self._rest_config.recv_window,
+            },
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "dual_side_position": dual_side_position,
+            "code": payload.get("code"),
+            "message": payload.get("msg"),
+            "timestamp": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "exchange.position_mode.changed",
+            normalized,
+            priority=EventPriority.HIGH,
+        )
+
+        return normalized
+
+    # ------------------------------------------------------------------
+    # Core HTTP request logic
+    # ------------------------------------------------------------------
+
+    async def _request(
+        self,
+        *,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        signed: bool = False,
+        auth_required: bool = False,
+    ) -> Any:
+        await self._ensure_session()
+
+        assert self._session is not None
+
+        method = method.upper()
+        params = dict(params or {})
+        headers: dict[str, str] = {}
+
+        if auth_required:
+            self._require_credentials()
+            assert self._api_key is not None
+            headers["X-MBX-APIKEY"] = self._api_key
+
+        if signed:
+            self._require_credentials()
+            assert self._api_secret is not None
+
+            if self._time_offset_ms == 0:
+                await self.sync_time()
+
+            params["timestamp"] = self._current_timestamp_ms() + self._time_offset_ms
+            query_string = self._build_query_string(params)
+            params["signature"] = self._sign(query_string)
+
+        url = f"{self._rest_config.rest_url}{path}"
+
+        last_error: Exception | None = None
+
+        for attempt in range(self._rest_config.request_retries + 1):
+            try:
+                self._logger.debug(
+                    "Sending Binance Futures REST request | method=%s path=%s signed=%s auth_required=%s attempt=%s",
+                    method,
+                    path,
+                    signed,
+                    auth_required,
+                    attempt + 1,
+                )
+
+                async with self._session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    headers=headers,
+                ) as response:
+                    response_text = await response.text()
+
+                    if response.status >= 400:
+                        error_payload = self._parse_error_payload(response_text)
+
+                        await self._handle_http_error(
+                            method=method,
+                            path=path,
+                            status=response.status,
+                            error_payload=error_payload,
+                        )
+
+                        raise RuntimeError(
+                            f"Binance Futures REST error | method={method} path={path} "
+                            f"status={response.status} code={error_payload.get('code')}"
+                        )
+
+                    payload = await response.json()
+
+                    # Binance Futures may return {"code":..., "msg":...} for some business errors
+                    # even with HTTP 200.
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    if isinstance(code, int) and code < 0:
+                        await self._handle_business_error(
+                            method=method,
+                            path=path,
+                            payload=payload,
+                        )
+
+                        raise RuntimeError(
+                            f"Binance Futures business error | method={method} path={path} "
+                            f"code={code} msg={payload.get('msg')}"
+                        )
+
+                    if self._rest_config.emit_success_events:
+                        await self._emit_event(
+                            "system.exchange.rest.success",
+                            {
+                                "exchange": self.EXCHANGE,
+                                "market_type": "usdm_futures",
+                                "method": method,
+                                "path": path,
+                                "status": response.status,
+                            },
+                            priority=EventPriority.LOW,
+                        )
+
+                    return payload
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+
+                if attempt >= self._rest_config.request_retries:
+                    self._logger.exception(
+                        "Binance Futures REST request failed | method=%s path=%s attempts=%s",
+                        method,
+                        path,
+                        attempt + 1,
+                    )
+                    raise
+
+                self._logger.warning(
+                    "Binance Futures REST retry scheduled | method=%s path=%s attempt=%s",
+                    method,
+                    path,
+                    attempt + 1,
+                )
+
+                await asyncio.sleep(self._rest_config.retry_delay_seconds)
+
+        if last_error is not None:
+            raise last_error
+
+        raise RuntimeError(f"Binance Futures REST request failed unexpectedly | method={method} path={path}")
+
+    async def _ensure_session(self) -> None:
+        if self._session is None or self._session.closed:
+            await self.start()
+
+    async def _handle_http_error(
+        self,
+        *,
+        method: str,
+        path: str,
+        status: int,
+        error_payload: dict[str, Any],
+    ) -> None:
+        self._logger.error(
+            "Binance Futures REST HTTP error | method=%s path=%s status=%s code=%s",
+            method,
+            path,
+            status,
+            error_payload.get("code"),
+        )
+
+        if not self._rest_config.emit_error_events:
             return
+
+        await self._emit_event(
+            "system.exchange.rest.error",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "method": method,
+                "path": path,
+                "status": status,
+                "code": error_payload.get("code"),
+                "message": error_payload.get("message"),
+            },
+            priority=EventPriority.HIGH,
+        )
+
+    async def _handle_business_error(
+        self,
+        *,
+        method: str,
+        path: str,
+        payload: dict[str, Any],
+    ) -> None:
+        self._logger.error(
+            "Binance Futures REST business error | method=%s path=%s code=%s",
+            method,
+            path,
+            payload.get("code"),
+        )
+
+        if not self._rest_config.emit_error_events:
+            return
+
+        await self._emit_event(
+            "system.exchange.rest.error",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "method": method,
+                "path": path,
+                "code": payload.get("code"),
+                "message": payload.get("msg") or payload.get("message"),
+            },
+            priority=EventPriority.HIGH,
+        )
+
+    async def _emit_event(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority,
+    ) -> None:
         try:
-            await ws.close()
+            await self._event_bus.emit(
+                topic,
+                payload,
+                priority=priority,
+                source=self.SOURCE,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            self._logger.exception("Failed to close websocket cleanly")
+            self._logger.exception(
+                "Failed to emit Binance Futures REST event | topic=%s",
+                topic,
+            )
+
+    # ------------------------------------------------------------------
+    # Auth / signing helpers
+    # ------------------------------------------------------------------
+
+    def _require_credentials(self) -> None:
+        if not self._api_key or not self._api_secret:
+            raise RuntimeError(
+                "Binance Futures API credentials are required for this endpoint"
+            )
+
+    def _sign(self, query_string: str) -> str:
+        self._require_credentials()
+
+        assert self._api_secret is not None
+
+        return hmac.new(
+            self._api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Normalizers
+    # ------------------------------------------------------------------
+
+    def _normalize_kline(
+        self,
+        *,
+        item: list[Any],
+        symbol: str,
+        timeframe: str,
+        is_closed: bool,
+    ) -> dict[str, Any]:
+        return {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "open_time": self._safe_int(item[0]),
+            "open": self._safe_float(item[1]),
+            "high": self._safe_float(item[2]),
+            "low": self._safe_float(item[3]),
+            "close": self._safe_float(item[4]),
+            "volume": self._safe_float(item[5]),
+            "close_time": self._safe_int(item[6]),
+            "quote_volume": self._safe_float(item[7]),
+            "trades_count": self._safe_int(item[8]),
+            "taker_buy_base_volume": self._safe_float(item[9]),
+            "taker_buy_quote_volume": self._safe_float(item[10]),
+            "is_closed": is_closed,
+        }
+
+    def _normalize_position(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol"),
+            "position_side": payload.get("positionSide"),
+            "position_amt": self._safe_float(payload.get("positionAmt")),
+            "entry_price": self._safe_float(payload.get("entryPrice")),
+            "break_even_price": self._safe_float(payload.get("breakEvenPrice")),
+            "mark_price": self._safe_float(payload.get("markPrice")),
+            "unrealized_profit": self._safe_float(payload.get("unRealizedProfit")),
+            "liquidation_price": self._safe_float(payload.get("liquidationPrice")),
+            "leverage": self._safe_int(payload.get("leverage")),
+            "max_notional_value": self._safe_float(payload.get("maxNotionalValue")),
+            "margin_type": payload.get("marginType"),
+            "isolated_margin": self._safe_float(payload.get("isolatedMargin")),
+            "is_auto_add_margin": payload.get("isAutoAddMargin"),
+            "update_time": payload.get("updateTime"),
+            "notional": self._safe_float(payload.get("notional")),
+            "isolated_wallet": self._safe_float(payload.get("isolatedWallet")),
+        }
+
+    def _normalize_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol"),
+            "order_id": payload.get("orderId"),
+            "client_order_id": payload.get("clientOrderId"),
+            "price": self._safe_float(payload.get("price")),
+            "avg_price": self._safe_float(payload.get("avgPrice")),
+            "orig_qty": self._safe_float(payload.get("origQty")),
+            "executed_qty": self._safe_float(payload.get("executedQty")),
+            "cum_qty": self._safe_float(payload.get("cumQty")),
+            "cum_quote": self._safe_float(payload.get("cumQuote")),
+            "cumulative_quote_qty": self._safe_float(payload.get("cumQuote")),
+            "status": payload.get("status"),
+            "time_in_force": payload.get("timeInForce"),
+            "type": payload.get("type"),
+            "orig_type": payload.get("origType"),
+            "side": payload.get("side"),
+            "position_side": payload.get("positionSide"),
+            "reduce_only": payload.get("reduceOnly"),
+            "close_position": payload.get("closePosition"),
+            "stop_price": self._safe_float(payload.get("stopPrice")),
+            "working_type": payload.get("workingType"),
+            "price_protect": payload.get("priceProtect"),
+            "update_time": payload.get("updateTime"),
+            "time": payload.get("time"),
+        }
+
+    def _normalize_user_trade(
+        self,
+        payload: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> dict[str, Any]:
+        return {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol") or symbol,
+            "id": payload.get("id"),
+            "order_id": payload.get("orderId"),
+            "side": payload.get("side"),
+            "position_side": payload.get("positionSide"),
+            "price": self._safe_float(payload.get("price")),
+            "qty": self._safe_float(payload.get("qty")),
+            "quote_qty": self._safe_float(payload.get("quoteQty")),
+            "realized_pnl": self._safe_float(payload.get("realizedPnl")),
+            "margin_asset": payload.get("marginAsset"),
+            "commission": self._safe_float(payload.get("commission")),
+            "commission_asset": payload.get("commissionAsset"),
+            "time": payload.get("time"),
+            "buyer": payload.get("buyer"),
+            "maker": payload.get("maker"),
+        }
+
+    # ------------------------------------------------------------------
+    # Generic helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _safe_float(value: Any) -> Optional[float]:
-        if value is None:
+    def _build_query_string(params: dict[str, Any]) -> str:
+        filtered = {
+            key: value
+            for key, value in params.items()
+            if value is not None
+        }
+
+        return urlencode(filtered, doseq=True)
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value is None or value == "":
             return None
+
         try:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_number(value: float) -> str:
+        formatted = format(value, "f")
+        return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+
+    @staticmethod
+    def _bool_str(value: bool) -> str:
+        return "true" if value else "false"
+
+    @staticmethod
+    def _mul_safe(left: float | None, right: float | None) -> float | None:
+        if left is None or right is None:
+            return None
+
+        return left * right
+
+    @staticmethod
+    def _parse_error_payload(response_text: str) -> dict[str, Any]:
+        try:
+            import json
+
+            raw = json.loads(response_text)
+
+            return {
+                "code": raw.get("code"),
+                "message": raw.get("msg") or raw.get("message"),
+            }
+        except Exception:
+            return {
+                "code": None,
+                "message": "Unable to parse Binance Futures error response",
+            }
+
+    @staticmethod
+    def _current_timestamp_ms() -> int:
+        return int(time.time() * 1000)

@@ -5,7 +5,8 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
 import aiohttp
 
@@ -14,103 +15,182 @@ from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
 
 
+@dataclass(slots=True)
+class BybitWebSocketClientConfig:
+    """
+    Local Bybit WS adapter config.
+
+    Bybit is currently used mainly as a market-data source.
+    Private stream is optional and must publish only exchange.* events,
+    not execution.* domain events.
+    """
+
+    category: str = "linear"
+
+    public_ws_url: str | None = None
+    private_ws_url: str = "wss://stream.bybit.com/v5/private"
+
+    timeout_seconds: float = 10.0
+    reconnect_delay_seconds: float = 5.0
+    max_reconnect_attempts: int = 20
+
+    ping_interval_seconds: float = 20.0
+    recv_window_ms: int = 5_000
+
+    symbols: list[str] = field(default_factory=list)
+    streams: list[str] = field(default_factory=lambda: ["trade", "orderbook", "kline"])
+
+    orderbook_depth: int = 50
+    kline_interval: str = "1"
+
+    enable_private_stream: bool = False
+
+    @classmethod
+    def from_core_config(
+        cls,
+        *,
+        config: Config,
+        symbols: list[str],
+        streams: list[str] | None = None,
+        category: str = "linear",
+        orderbook_depth: int = 50,
+        kline_interval: str = "1",
+        enable_private_stream: bool = False,
+        ping_interval_seconds: float = 20.0,
+        recv_window_ms: int = 5_000,
+    ) -> "BybitWebSocketClientConfig":
+        return cls(
+            category=category,
+            public_ws_url=config.exchange.ws_url,
+            timeout_seconds=config.exchange.timeout_seconds,
+            reconnect_delay_seconds=config.exchange.reconnect_delay,
+            max_reconnect_attempts=config.exchange.max_reconnect_attempts,
+            ping_interval_seconds=ping_interval_seconds,
+            recv_window_ms=recv_window_ms,
+            symbols=symbols,
+            streams=streams or ["trade", "orderbook", "kline"],
+            orderbook_depth=orderbook_depth,
+            kline_interval=kline_interval,
+            enable_private_stream=enable_private_stream,
+        )
+
+
 class BybitWebSocketClient:
     """
-    Bybit WebSocket client.
+    Bybit WebSocket exchange adapter.
 
-    Public topics:
-    - publicTrade.{symbol}
-    - orderbook.{depth}.{symbol}
-    - kline.{interval}.{symbol}
-    - liquidation.{symbol}
+    Responsibilities:
+    - connect to Bybit public market streams;
+    - normalize raw Bybit payloads into internal market events;
+    - optionally connect to private stream and publish exchange.* updates;
+    - publish all events through EventBus;
+    - never call analytics, strategy, risk, or execution directly;
+    - never contain trading decision logic.
 
-    Private topics:
-    - order
-    - position
-    - wallet
-
-    EventBus topics:
+    Public market events:
     - market.trade
     - market.orderbook
     - market.candle
     - market.liquidation
-    - execution.order_updated
-    - position.updated
-    - account.wallet_updated
-    - system.ws.connected
-    - system.ws.disconnected
-    - system.ws.error
+
+    Optional private exchange events:
+    - exchange.order.updated
+    - exchange.position.updated
+    - exchange.account.wallet_updated
+
+    System events:
+    - system.exchange.ws.started
+    - system.exchange.ws.stopped
+    - system.exchange.ws.connected
+    - system.exchange.ws.disconnected
+    - system.exchange.ws.error
+    - system.exchange.ws.authenticated
+    - system.exchange.ws.subscribed
     """
 
-    DEFAULT_PUBLIC_WS_URL = "wss://stream.bybit.com/v5/public/linear"
-    DEFAULT_PRIVATE_WS_URL = "wss://stream.bybit.com/v5/private"
+    EXCHANGE = "bybit"
+    SOURCE = "bybit_ws"
 
-    API_KEY_PLACEHOLDER = "BYBIT_API_KEY_PLACEHOLDER"
-    API_SECRET_PLACEHOLDER = "BYBIT_API_SECRET_PLACEHOLDER"
+    SUPPORTED_CATEGORIES = {"linear", "inverse", "spot", "option"}
+    SUPPORTED_STREAMS = {"trade", "orderbook", "kline", "liquidation"}
+    SUPPORTED_ORDERBOOK_DEPTHS = {1, 50, 200, 500}
 
     def __init__(
         self,
         *,
         config: Config,
         event_bus: EventBus,
-        symbols: list[str],
-        streams: Optional[list[str]] = None,
+        ws_config: BybitWebSocketClientConfig | None = None,
+        symbols: list[str] | None = None,
+        streams: list[str] | None = None,
         category: str = "linear",
         orderbook_depth: int = 50,
         kline_interval: str = "1",
         enable_private_stream: bool = False,
         ping_interval: float = 20.0,
-        recv_window_ms: int = 5000,
+        recv_window_ms: int = 5_000,
     ) -> None:
+        resolved_config = ws_config or BybitWebSocketClientConfig.from_core_config(
+            config=config,
+            symbols=symbols or [],
+            streams=streams,
+            category=category,
+            orderbook_depth=orderbook_depth,
+            kline_interval=kline_interval,
+            enable_private_stream=enable_private_stream,
+            ping_interval_seconds=ping_interval,
+            recv_window_ms=recv_window_ms,
+        )
+
         self._config = config
         self._event_bus = event_bus
+        self._ws_config = resolved_config
 
-        self._symbols = [symbol.upper() for symbol in symbols]
-        self._streams = streams or ["trade", "orderbook", "kline"]
-        self._category = category
-        self._orderbook_depth = orderbook_depth
-        self._kline_interval = kline_interval
-        self._enable_private_stream = enable_private_stream
-        self._ping_interval = ping_interval
-        self._recv_window_ms = recv_window_ms
+        self._category = self._ws_config.category.lower()
+        self._symbols = [symbol.upper() for symbol in self._ws_config.symbols]
+        self._streams = self._normalize_streams(self._ws_config.streams)
+
+        self._api_key = config.exchange.credentials.api_key
+        self._api_secret = config.exchange.credentials.api_secret
 
         self._logger = get_logger(
             __name__,
-            exchange="bybit",
-            event_type="bybit_ws",
+            exchange=self.EXCHANGE,
+            event_type="exchange_ws",
         )
 
-        self._public_ws_url = self._resolve_public_url(category)
-        self._private_ws_url = self.DEFAULT_PRIVATE_WS_URL
-
-        self._api_key = (
-            config.exchange.credentials.api_key
-            or self.API_KEY_PLACEHOLDER
+        self._public_ws_url = (
+            self._ws_config.public_ws_url
+            or self._resolve_public_url(self._category)
         )
-        self._api_secret = (
-            config.exchange.credentials.api_secret
-            or self.API_SECRET_PLACEHOLDER
-        )
+        self._private_ws_url = self._ws_config.private_ws_url
 
-        self._timeout_seconds = config.exchange.timeout_seconds
-        self._reconnect_delay = config.exchange.reconnect_delay
-        self._max_reconnect_attempts = config.exchange.max_reconnect_attempts
+        self._session: aiohttp.ClientSession | None = None
 
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._public_ws: aiohttp.ClientWebSocketResponse | None = None
+        self._private_ws: aiohttp.ClientWebSocketResponse | None = None
 
-        self._public_ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self._private_ws: Optional[aiohttp.ClientWebSocketResponse] = None
-
-        self._public_task: Optional[asyncio.Task] = None
-        self._private_task: Optional[asyncio.Task] = None
-        self._public_ping_task: Optional[asyncio.Task] = None
-        self._private_ping_task: Optional[asyncio.Task] = None
+        self._public_task: asyncio.Task | None = None
+        self._private_task: asyncio.Task | None = None
+        self._public_ping_task: asyncio.Task | None = None
+        self._private_ping_task: asyncio.Task | None = None
 
         self._running = False
+        self._started = False
+
+        self._validate_config()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def register(self) -> None:
+        """
+        WS adapter currently does not subscribe to EventBus topics.
+
+        Kept for project-wide consistency with modules that expose register().
+        """
+        self._logger.debug("Bybit WS register called | subscriptions=0")
 
     async def start(self) -> None:
         if self._running:
@@ -118,17 +198,28 @@ class BybitWebSocketClient:
             return
 
         self._running = True
+        self._started = True
 
-        if self._session is None:
-            timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+        await self._ensure_session()
 
         self._logger.info(
             "Starting Bybit WS client | category=%s symbols=%s streams=%s private_stream=%s",
             self._category,
             self._symbols,
             self._streams,
-            self._enable_private_stream,
+            self._ws_config.enable_private_stream,
+        )
+
+        await self._emit_event(
+            "system.exchange.ws.started",
+            {
+                "exchange": self.EXCHANGE,
+                "category": self._category,
+                "symbols": self._symbols,
+                "streams": self._streams,
+                "private_stream": self._ws_config.enable_private_stream,
+            },
+            priority=EventPriority.NORMAL,
         )
 
         self._public_task = asyncio.create_task(
@@ -136,19 +227,23 @@ class BybitWebSocketClient:
             name="bybit-public-ws-loop",
         )
 
-        if self._enable_private_stream:
+        if self._ws_config.enable_private_stream:
+            self._require_private_credentials()
+
             self._private_task = asyncio.create_task(
                 self._run_private_loop(),
                 name="bybit-private-ws-loop",
             )
 
     async def stop(self) -> None:
-        if not self._running:
+        if not self._running and not self._started:
             self._logger.warning("Bybit WS client already stopped")
             return
 
-        self._running = False
         self._logger.info("Stopping Bybit WS client")
+
+        self._running = False
+        self._started = False
 
         tasks = [
             task
@@ -172,20 +267,26 @@ class BybitWebSocketClient:
         self._public_ping_task = None
         self._private_ping_task = None
 
-        await self._close_ws(self._public_ws)
-        await self._close_ws(self._private_ws)
+        await self._close_ws(self._public_ws, channel="public")
+        await self._close_ws(self._private_ws, channel="private")
 
         self._public_ws = None
         self._private_ws = None
 
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        await self._close_session()
 
         self._logger.info("Bybit WS client stopped")
 
+        await self._emit_event(
+            "system.exchange.ws.stopped",
+            {
+                "exchange": self.EXCHANGE,
+            },
+            priority=EventPriority.NORMAL,
+        )
+
     # ------------------------------------------------------------------
-    # Public WS
+    # Public WS loop
     # ------------------------------------------------------------------
 
     async def _run_public_loop(self) -> None:
@@ -193,6 +294,8 @@ class BybitWebSocketClient:
 
         while self._running:
             try:
+                await self._ensure_session()
+
                 self._logger.info(
                     "Connecting to Bybit public WS | url=%s",
                     self._public_ws_url,
@@ -208,19 +311,20 @@ class BybitWebSocketClient:
                 reconnect_attempt = 0
 
                 self._logger.info("Connected to Bybit public WS")
-                await self._event_bus.emit(
-                    "system.ws.connected",
+
+                await self._emit_event(
+                    "system.exchange.ws.connected",
                     {
-                        "exchange": "bybit",
+                        "exchange": self.EXCHANGE,
                         "channel": "public",
                         "category": self._category,
                         "symbols": self._symbols,
                     },
                     priority=EventPriority.HIGH,
-                    source="bybit_ws",
                 )
 
                 await self._subscribe_public_topics()
+
                 self._public_ping_task = asyncio.create_task(
                     self._ping_loop(self._public_ws, "public"),
                     name="bybit-public-ws-ping",
@@ -229,59 +333,41 @@ class BybitWebSocketClient:
                 await self._consume_public_messages()
 
             except asyncio.CancelledError:
-                self._logger.info("Public WS loop cancelled")
+                self._logger.info("Bybit public WS loop cancelled")
                 raise
             except Exception as exc:
                 reconnect_attempt += 1
-                self._logger.exception(
-                    "Public WS loop error | attempt=%s max_attempts=%s",
-                    reconnect_attempt,
-                    self._max_reconnect_attempts,
+
+                await self._handle_ws_loop_error(
+                    channel="public",
+                    exc=exc,
+                    reconnect_attempt=reconnect_attempt,
                 )
 
-                await self._event_bus.emit(
-                    "system.ws.error",
-                    {
-                        "exchange": "bybit",
-                        "channel": "public",
-                        "error": str(exc),
-                        "attempt": reconnect_attempt,
-                    },
-                    priority=EventPriority.HIGH,
-                    source="bybit_ws",
-                )
-
-                if (
-                    self._max_reconnect_attempts > 0
-                    and reconnect_attempt >= self._max_reconnect_attempts
-                ):
-                    self._logger.error("Public WS max reconnect attempts reached")
+                if self._should_stop_reconnecting(reconnect_attempt):
+                    self._logger.error("Bybit public WS max reconnect attempts reached")
                     break
 
-                await asyncio.sleep(self._reconnect_delay)
-            finally:
-                if self._public_ping_task is not None:
-                    self._public_ping_task.cancel()
-                    await asyncio.gather(self._public_ping_task, return_exceptions=True)
-                    self._public_ping_task = None
+                await asyncio.sleep(self._ws_config.reconnect_delay_seconds)
 
-                await self._close_ws(self._public_ws)
+            finally:
+                await self._cancel_ping_task(channel="public")
+                await self._close_ws(self._public_ws, channel="public")
                 self._public_ws = None
 
                 if self._running:
-                    await self._event_bus.emit(
-                        "system.ws.disconnected",
+                    await self._emit_event(
+                        "system.exchange.ws.disconnected",
                         {
-                            "exchange": "bybit",
+                            "exchange": self.EXCHANGE,
                             "channel": "public",
                         },
                         priority=EventPriority.HIGH,
-                        source="bybit_ws",
                     )
 
     async def _subscribe_public_topics(self) -> None:
         if self._public_ws is None:
-            raise RuntimeError("Public websocket is not connected")
+            raise RuntimeError("Bybit public WebSocket is not connected")
 
         topics: list[str] = []
 
@@ -290,17 +376,20 @@ class BybitWebSocketClient:
                 topics.append(f"publicTrade.{symbol}")
 
             if "orderbook" in self._streams:
-                topics.append(f"orderbook.{self._orderbook_depth}.{symbol}")
+                topics.append(
+                    f"orderbook.{self._ws_config.orderbook_depth}.{symbol}"
+                )
 
             if "kline" in self._streams:
-                topics.append(f"kline.{self._kline_interval}.{symbol}")
+                topics.append(
+                    f"kline.{self._ws_config.kline_interval}.{symbol}"
+                )
 
             if "liquidation" in self._streams:
                 topics.append(f"liquidation.{symbol}")
 
         if not topics:
-            self._logger.warning("No public topics to subscribe")
-            return
+            raise RuntimeError("No Bybit public topics to subscribe")
 
         payload = {
             "op": "subscribe",
@@ -308,7 +397,22 @@ class BybitWebSocketClient:
         }
 
         await self._public_ws.send_json(payload)
-        self._logger.info("Subscribed to Bybit public topics | topics=%s", topics)
+
+        self._logger.info(
+            "Subscribed to Bybit public topics | count=%s",
+            len(topics),
+        )
+
+        await self._emit_event(
+            "system.exchange.ws.subscribed",
+            {
+                "exchange": self.EXCHANGE,
+                "channel": "public",
+                "category": self._category,
+                "topics": topics,
+            },
+            priority=EventPriority.LOW,
+        )
 
     async def _consume_public_messages(self) -> None:
         assert self._public_ws is not None
@@ -316,13 +420,16 @@ class BybitWebSocketClient:
         async for msg in self._public_ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 await self._handle_public_message(msg.data)
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                raise RuntimeError("Bybit public websocket error")
-            elif msg.type in (
+                continue
+
+            if msg.type == aiohttp.WSMsgType.ERROR:
+                raise RuntimeError("Bybit public WebSocket error")
+
+            if msg.type in {
                 aiohttp.WSMsgType.CLOSED,
                 aiohttp.WSMsgType.CLOSE,
                 aiohttp.WSMsgType.CLOSING,
-            ):
+            }:
                 self._logger.warning("Bybit public WS closed by server")
                 break
 
@@ -330,7 +437,7 @@ class BybitWebSocketClient:
         try:
             message = json.loads(raw_message)
         except json.JSONDecodeError:
-            self._logger.warning("Failed to decode public WS message")
+            self._logger.warning("Failed to decode Bybit public WS message")
             return
 
         if message.get("op") == "pong":
@@ -338,15 +445,31 @@ class BybitWebSocketClient:
             return
 
         if message.get("op") == "subscribe":
-            success = message.get("success")
-            self._logger.info("Bybit public subscribe response | success=%s", success)
+            success = bool(message.get("success"))
+
+            self._logger.info(
+                "Bybit public subscribe response | success=%s",
+                success,
+            )
+
+            if not success:
+                await self._emit_event(
+                    "system.exchange.ws.error",
+                    {
+                        "exchange": self.EXCHANGE,
+                        "channel": "public",
+                        "operation": "subscribe",
+                        "message": message.get("ret_msg") or message.get("msg"),
+                    },
+                    priority=EventPriority.HIGH,
+                )
             return
 
         topic = message.get("topic")
         data = message.get("data")
 
         if not topic or data is None:
-            self._logger.debug("Received empty or unhandled public payload")
+            self._logger.debug("Received empty or unhandled Bybit public payload")
             return
 
         if topic.startswith("publicTrade."):
@@ -362,13 +485,13 @@ class BybitWebSocketClient:
             return
 
         if topic.startswith("liquidation."):
-            await self._publish_liquidation_event(data)
+            await self._publish_liquidation_events(data)
             return
 
-        self._logger.debug("Unhandled public topic | topic=%s", topic)
+        self._logger.debug("Unhandled Bybit public topic | topic=%s", topic)
 
     # ------------------------------------------------------------------
-    # Private WS
+    # Private WS loop
     # ------------------------------------------------------------------
 
     async def _run_private_loop(self) -> None:
@@ -376,6 +499,9 @@ class BybitWebSocketClient:
 
         while self._running:
             try:
+                await self._ensure_session()
+                self._require_private_credentials()
+
                 self._logger.info("Connecting to Bybit private WS")
 
                 assert self._session is not None
@@ -391,14 +517,14 @@ class BybitWebSocketClient:
                 reconnect_attempt = 0
 
                 self._logger.info("Connected to Bybit private WS")
-                await self._event_bus.emit(
-                    "system.ws.connected",
+
+                await self._emit_event(
+                    "system.exchange.ws.connected",
                     {
-                        "exchange": "bybit",
+                        "exchange": self.EXCHANGE,
                         "channel": "private",
                     },
                     priority=EventPriority.HIGH,
-                    source="bybit_ws",
                 )
 
                 self._private_ping_task = asyncio.create_task(
@@ -409,61 +535,47 @@ class BybitWebSocketClient:
                 await self._consume_private_messages()
 
             except asyncio.CancelledError:
-                self._logger.info("Private WS loop cancelled")
+                self._logger.info("Bybit private WS loop cancelled")
                 raise
             except Exception as exc:
                 reconnect_attempt += 1
-                self._logger.exception(
-                    "Private WS loop error | attempt=%s max_attempts=%s",
-                    reconnect_attempt,
-                    self._max_reconnect_attempts,
+
+                await self._handle_ws_loop_error(
+                    channel="private",
+                    exc=exc,
+                    reconnect_attempt=reconnect_attempt,
                 )
 
-                await self._event_bus.emit(
-                    "system.ws.error",
-                    {
-                        "exchange": "bybit",
-                        "channel": "private",
-                        "error": str(exc),
-                        "attempt": reconnect_attempt,
-                    },
-                    priority=EventPriority.HIGH,
-                    source="bybit_ws",
-                )
-
-                if (
-                    self._max_reconnect_attempts > 0
-                    and reconnect_attempt >= self._max_reconnect_attempts
-                ):
-                    self._logger.error("Private WS max reconnect attempts reached")
+                if self._should_stop_reconnecting(reconnect_attempt):
+                    self._logger.error("Bybit private WS max reconnect attempts reached")
                     break
 
-                await asyncio.sleep(self._reconnect_delay)
-            finally:
-                if self._private_ping_task is not None:
-                    self._private_ping_task.cancel()
-                    await asyncio.gather(self._private_ping_task, return_exceptions=True)
-                    self._private_ping_task = None
+                await asyncio.sleep(self._ws_config.reconnect_delay_seconds)
 
-                await self._close_ws(self._private_ws)
+            finally:
+                await self._cancel_ping_task(channel="private")
+                await self._close_ws(self._private_ws, channel="private")
                 self._private_ws = None
 
                 if self._running:
-                    await self._event_bus.emit(
-                        "system.ws.disconnected",
+                    await self._emit_event(
+                        "system.exchange.ws.disconnected",
                         {
-                            "exchange": "bybit",
+                            "exchange": self.EXCHANGE,
                             "channel": "private",
                         },
                         priority=EventPriority.HIGH,
-                        source="bybit_ws",
                     )
 
     async def _authenticate_private_ws(self) -> None:
         if self._private_ws is None:
-            raise RuntimeError("Private websocket is not connected")
+            raise RuntimeError("Bybit private WebSocket is not connected")
 
-        expires = str(int(time.time() * 1000) + self._recv_window_ms)
+        self._require_private_credentials()
+
+        assert self._api_key is not None
+
+        expires = str(self._current_timestamp_ms() + self._ws_config.recv_window_ms)
         signature = self._sign_ws_auth(expires)
 
         payload = {
@@ -476,7 +588,7 @@ class BybitWebSocketClient:
 
     async def _subscribe_private_topics(self) -> None:
         if self._private_ws is None:
-            raise RuntimeError("Private websocket is not connected")
+            raise RuntimeError("Bybit private WebSocket is not connected")
 
         topics = ["order", "position", "wallet"]
 
@@ -486,7 +598,11 @@ class BybitWebSocketClient:
         }
 
         await self._private_ws.send_json(payload)
-        self._logger.info("Subscribed to Bybit private topics | topics=%s", topics)
+
+        self._logger.info(
+            "Subscribed to Bybit private topics | count=%s",
+            len(topics),
+        )
 
     async def _consume_private_messages(self) -> None:
         assert self._private_ws is not None
@@ -494,13 +610,16 @@ class BybitWebSocketClient:
         async for msg in self._private_ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 await self._handle_private_message(msg.data)
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                raise RuntimeError("Bybit private websocket error")
-            elif msg.type in (
+                continue
+
+            if msg.type == aiohttp.WSMsgType.ERROR:
+                raise RuntimeError("Bybit private WebSocket error")
+
+            if msg.type in {
                 aiohttp.WSMsgType.CLOSED,
                 aiohttp.WSMsgType.CLOSE,
                 aiohttp.WSMsgType.CLOSING,
-            ):
+            }:
                 self._logger.warning("Bybit private WS closed by server")
                 break
 
@@ -508,7 +627,7 @@ class BybitWebSocketClient:
         try:
             message = json.loads(raw_message)
         except json.JSONDecodeError:
-            self._logger.warning("Failed to decode private WS message")
+            self._logger.warning("Failed to decode Bybit private WS message")
             return
 
         if message.get("op") == "pong":
@@ -516,22 +635,49 @@ class BybitWebSocketClient:
             return
 
         if message.get("op") == "auth":
-            success = message.get("success")
+            success = bool(message.get("success"))
+
             if not success:
-                raise RuntimeError(f"Bybit private auth failed: {message}")
+                raise RuntimeError(
+                    f"Bybit private auth failed | msg={message.get('ret_msg') or message.get('msg')}"
+                )
+
             self._logger.info("Bybit private auth succeeded")
+
+            await self._emit_event(
+                "system.exchange.ws.authenticated",
+                {
+                    "exchange": self.EXCHANGE,
+                    "channel": "private",
+                },
+                priority=EventPriority.HIGH,
+            )
             return
 
         if message.get("op") == "subscribe":
-            success = message.get("success")
-            self._logger.info("Bybit private subscribe response | success=%s", success)
+            success = bool(message.get("success"))
+
+            self._logger.info(
+                "Bybit private subscribe response | success=%s",
+                success,
+            )
+
+            await self._emit_event(
+                "system.exchange.ws.subscribed",
+                {
+                    "exchange": self.EXCHANGE,
+                    "channel": "private",
+                    "success": success,
+                },
+                priority=EventPriority.LOW if success else EventPriority.HIGH,
+            )
             return
 
         topic = message.get("topic")
         data = message.get("data")
 
         if not topic or data is None:
-            self._logger.debug("Received empty or unhandled private payload")
+            self._logger.debug("Received empty or unhandled Bybit private payload")
             return
 
         if topic == "order":
@@ -546,7 +692,7 @@ class BybitWebSocketClient:
             await self._publish_private_wallet_events(data)
             return
 
-        self._logger.debug("Unhandled private topic | topic=%s", topic)
+        self._logger.debug("Unhandled Bybit private topic | topic=%s", topic)
 
     # ------------------------------------------------------------------
     # Ping
@@ -559,49 +705,62 @@ class BybitWebSocketClient:
     ) -> None:
         try:
             while self._running and not ws.closed:
-                await asyncio.sleep(self._ping_interval)
+                await asyncio.sleep(self._ws_config.ping_interval_seconds)
+
+                if not self._running or ws.closed:
+                    break
+
                 await ws.send_json({"op": "ping"})
                 self._logger.debug("Sent Bybit ping | channel=%s", channel)
+
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._logger.exception("Bybit ping loop failed | channel=%s", channel)
+            self._logger.exception(
+                "Bybit ping loop failed | channel=%s",
+                channel,
+            )
             raise
 
     # ------------------------------------------------------------------
-    # Event publishers - public
+    # Event publishers: public market data
     # ------------------------------------------------------------------
 
     async def _publish_trade_events(self, trades: list[dict[str, Any]]) -> None:
+        if not isinstance(trades, list):
+            return
+
         for trade in trades:
             side = (trade.get("S") or "").lower()
 
             payload = {
-                "exchange": "bybit",
+                "exchange": self.EXCHANGE,
                 "symbol": trade.get("s"),
                 "trade_id": trade.get("i"),
                 "price": self._safe_float(trade.get("p")),
                 "qty": self._safe_float(trade.get("v")),
                 "side": side,
-                "trade_time": trade.get("T"),
+                "trade_time": self._safe_int(trade.get("T")),
                 "is_block_trade": trade.get("BT"),
             }
 
-            await self._event_bus.emit(
+            await self._emit_event(
                 "market.trade",
                 payload,
                 priority=EventPriority.NORMAL,
-                source="bybit_ws",
             )
 
     async def _publish_orderbook_event(
         self,
         topic: str,
         data: dict[str, Any],
-        ts: Optional[int],
+        event_time: int | None,
     ) -> None:
+        if not isinstance(data, dict):
+            return
+
         payload = {
-            "exchange": "bybit",
+            "exchange": self.EXCHANGE,
             "symbol": data.get("s"),
             "type": data.get("type"),
             "update_id": data.get("u"),
@@ -614,67 +773,78 @@ class BybitWebSocketClient:
                 [self._safe_float(price), self._safe_float(qty)]
                 for price, qty in data.get("a", [])
             ],
-            "event_time": ts,
+            "event_time": self._safe_int(event_time),
             "topic": topic,
         }
 
-        await self._event_bus.emit(
+        await self._emit_event(
             "market.orderbook",
             payload,
             priority=EventPriority.LOW,
-            source="bybit_ws",
         )
 
     async def _publish_kline_events(self, klines: list[dict[str, Any]]) -> None:
+        if not isinstance(klines, list):
+            return
+
         for item in klines:
             payload = {
-                "exchange": "bybit",
+                "exchange": self.EXCHANGE,
                 "symbol": item.get("symbol"),
-                "interval": item.get("interval"),
-                "start": item.get("start"),
-                "end": item.get("end"),
+                "timeframe": str(item.get("interval")) if item.get("interval") is not None else None,
+                "open_time": self._safe_int(item.get("start")),
+                "close_time": self._safe_int(item.get("end")),
                 "open": self._safe_float(item.get("open")),
                 "high": self._safe_float(item.get("high")),
                 "low": self._safe_float(item.get("low")),
                 "close": self._safe_float(item.get("close")),
                 "volume": self._safe_float(item.get("volume")),
-                "turnover": self._safe_float(item.get("turnover")),
+                "quote_volume": self._safe_float(item.get("turnover")),
+                "trades_count": None,
+                "is_closed": bool(item.get("confirm")),
                 "confirm": item.get("confirm"),
-                "timestamp": item.get("timestamp"),
+                "timestamp": self._safe_int(item.get("timestamp")),
             }
 
-            await self._event_bus.emit(
+            await self._emit_event(
                 "market.candle",
                 payload,
                 priority=EventPriority.NORMAL,
-                source="bybit_ws",
             )
 
-    async def _publish_liquidation_event(self, data: dict[str, Any]) -> None:
-        payload = {
-            "exchange": "bybit",
-            "symbol": data.get("symbol"),
-            "side": (data.get("side") or "").lower(),
-            "price": self._safe_float(data.get("price")),
-            "qty": self._safe_float(data.get("size")),
-            "updated_time": data.get("updatedTime"),
-        }
+    async def _publish_liquidation_events(self, data: Any) -> None:
+        items = data if isinstance(data, list) else [data]
 
-        await self._event_bus.emit(
-            "market.liquidation",
-            payload,
-            priority=EventPriority.HIGH,
-            source="bybit_ws",
-        )
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            payload = {
+                "exchange": self.EXCHANGE,
+                "symbol": item.get("symbol"),
+                "side": (item.get("side") or "").lower(),
+                "price": self._safe_float(item.get("price")),
+                "qty": self._safe_float(item.get("size")),
+                "updated_time": self._safe_int(item.get("updatedTime")),
+            }
+
+            await self._emit_event(
+                "market.liquidation",
+                payload,
+                priority=EventPriority.HIGH,
+            )
 
     # ------------------------------------------------------------------
-    # Event publishers - private
+    # Event publishers: optional private exchange updates
     # ------------------------------------------------------------------
 
     async def _publish_private_order_events(self, orders: list[dict[str, Any]]) -> None:
+        if not isinstance(orders, list):
+            return
+
         for order in orders:
             payload = {
-                "exchange": "bybit",
+                "exchange": self.EXCHANGE,
                 "symbol": order.get("symbol"),
                 "order_id": order.get("orderId"),
                 "client_order_id": order.get("orderLinkId"),
@@ -688,21 +858,23 @@ class BybitWebSocketClient:
                 "cum_exec_fee": self._safe_float(order.get("cumExecFee")),
                 "avg_price": self._safe_float(order.get("avgPrice")),
                 "trigger_price": self._safe_float(order.get("triggerPrice")),
-                "created_time": order.get("createdTime"),
-                "updated_time": order.get("updatedTime"),
+                "created_time": self._safe_int(order.get("createdTime")),
+                "updated_time": self._safe_int(order.get("updatedTime")),
             }
 
-            await self._event_bus.emit(
-                "execution.order_updated",
+            await self._emit_event(
+                "exchange.order.updated",
                 payload,
                 priority=EventPriority.HIGH,
-                source="bybit_ws",
             )
 
     async def _publish_private_position_events(self, positions: list[dict[str, Any]]) -> None:
+        if not isinstance(positions, list):
+            return
+
         for position in positions:
             payload = {
-                "exchange": "bybit",
+                "exchange": self.EXCHANGE,
                 "symbol": position.get("symbol"),
                 "side": position.get("side"),
                 "size": self._safe_float(position.get("size")),
@@ -712,20 +884,22 @@ class BybitWebSocketClient:
                 "unrealised_pnl": self._safe_float(position.get("unrealisedPnl")),
                 "position_value": self._safe_float(position.get("positionValue")),
                 "leverage": self._safe_float(position.get("leverage")),
-                "updated_time": position.get("updatedTime"),
+                "updated_time": self._safe_int(position.get("updatedTime")),
             }
 
-            await self._event_bus.emit(
-                "position.updated",
+            await self._emit_event(
+                "exchange.position.updated",
                 payload,
                 priority=EventPriority.HIGH,
-                source="bybit_ws",
             )
 
     async def _publish_private_wallet_events(self, wallets: list[dict[str, Any]]) -> None:
+        if not isinstance(wallets, list):
+            return
+
         for wallet in wallets:
             payload = {
-                "exchange": "bybit",
+                "exchange": self.EXCHANGE,
                 "account_type": wallet.get("accountType"),
                 "total_equity": self._safe_float(wallet.get("totalEquity")),
                 "total_wallet_balance": self._safe_float(wallet.get("totalWalletBalance")),
@@ -734,52 +908,217 @@ class BybitWebSocketClient:
                 "coin": wallet.get("coin", []),
             }
 
-            await self._event_bus.emit(
-                "account.wallet_updated",
+            await self._emit_event(
+                "exchange.account.wallet_updated",
                 payload,
                 priority=EventPriority.HIGH,
-                source="bybit_ws",
             )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Shared event/error helpers
     # ------------------------------------------------------------------
 
-    def _resolve_public_url(self, category: str) -> str:
-        category_normalized = category.lower()
+    async def _emit_event(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority,
+    ) -> None:
+        try:
+            await self._event_bus.emit(
+                topic,
+                payload,
+                priority=priority,
+                source=self.SOURCE,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "Failed to emit Bybit WS event | topic=%s",
+                topic,
+            )
 
-        if category_normalized == "linear":
-            return "wss://stream.bybit.com/v5/public/linear"
-        if category_normalized == "inverse":
-            return "wss://stream.bybit.com/v5/public/inverse"
-        if category_normalized == "spot":
-            return "wss://stream.bybit.com/v5/public/spot"
-        if category_normalized == "option":
-            return "wss://stream.bybit.com/v5/public/option"
+    async def _handle_ws_loop_error(
+        self,
+        *,
+        channel: str,
+        exc: Exception,
+        reconnect_attempt: int,
+    ) -> None:
+        self._logger.exception(
+            "Bybit WS loop error | channel=%s attempt=%s max_attempts=%s",
+            channel,
+            reconnect_attempt,
+            self._ws_config.max_reconnect_attempts,
+        )
 
-        raise ValueError(f"Unsupported Bybit category: {category}")
+        await self._emit_event(
+            "system.exchange.ws.error",
+            {
+                "exchange": self.EXCHANGE,
+                "channel": channel,
+                "error": str(exc),
+                "attempt": reconnect_attempt,
+                "max_attempts": self._ws_config.max_reconnect_attempts,
+            },
+            priority=EventPriority.HIGH,
+        )
+
+    # ------------------------------------------------------------------
+    # Session / websocket helpers
+    # ------------------------------------------------------------------
+
+    async def _ensure_session(self) -> None:
+        if self._session is not None and not self._session.closed:
+            return
+
+        timeout = aiohttp.ClientTimeout(total=self._ws_config.timeout_seconds)
+        self._session = aiohttp.ClientSession(timeout=timeout)
+
+    async def _close_session(self) -> None:
+        if self._session is None:
+            return
+
+        try:
+            await self._session.close()
+        finally:
+            self._session = None
+
+    async def _close_ws(
+        self,
+        ws: aiohttp.ClientWebSocketResponse | None,
+        *,
+        channel: str,
+    ) -> None:
+        if ws is None:
+            return
+
+        try:
+            await ws.close()
+        except Exception:
+            self._logger.exception(
+                "Failed to close Bybit websocket cleanly | channel=%s",
+                channel,
+            )
+
+    async def _cancel_ping_task(self, *, channel: str) -> None:
+        task: asyncio.Task | None
+
+        if channel == "public":
+            task = self._public_ping_task
+            self._public_ping_task = None
+        elif channel == "private":
+            task = self._private_ping_task
+            self._private_ping_task = None
+        else:
+            return
+
+        if task is None:
+            return
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    # ------------------------------------------------------------------
+    # Auth / signing helpers
+    # ------------------------------------------------------------------
+
+    def _require_private_credentials(self) -> None:
+        if not self._api_key or not self._api_secret:
+            raise RuntimeError(
+                "Bybit API key and API secret are required for private WebSocket stream"
+            )
 
     def _sign_ws_auth(self, expires: str) -> str:
+        self._require_private_credentials()
+
+        assert self._api_secret is not None
+
         payload = f"GET/realtime{expires}"
+
         return hmac.new(
             self._api_secret.encode("utf-8"),
             payload.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-    async def _close_ws(self, ws: Optional[aiohttp.ClientWebSocketResponse]) -> None:
-        if ws is None:
-            return
-        try:
-            await ws.close()
-        except Exception:
-            self._logger.exception("Failed to close websocket cleanly")
+    # ------------------------------------------------------------------
+    # Validation / normalization helpers
+    # ------------------------------------------------------------------
+
+    def _validate_config(self) -> None:
+        if self._category not in self.SUPPORTED_CATEGORIES:
+            raise ValueError(f"Unsupported Bybit category: {self._category}")
+
+        if not self._symbols:
+            raise ValueError("At least one Bybit symbol must be configured")
+
+        unsupported_streams = set(self._streams) - self.SUPPORTED_STREAMS
+        if unsupported_streams:
+            raise ValueError(f"Unsupported Bybit streams: {sorted(unsupported_streams)}")
+
+        if (
+            "orderbook" in self._streams
+            and self._ws_config.orderbook_depth not in self.SUPPORTED_ORDERBOOK_DEPTHS
+        ):
+            raise ValueError(
+                f"Unsupported Bybit orderbook depth: {self._ws_config.orderbook_depth}"
+            )
+
+        if self._ws_config.enable_private_stream:
+            self._require_private_credentials()
+
+    def _should_stop_reconnecting(self, reconnect_attempt: int) -> bool:
+        return (
+            self._ws_config.max_reconnect_attempts > 0
+            and reconnect_attempt >= self._ws_config.max_reconnect_attempts
+        )
+
+    @classmethod
+    def _normalize_streams(cls, streams: list[str]) -> list[str]:
+        normalized = [stream.strip().lower() for stream in streams if stream.strip()]
+        return list(dict.fromkeys(normalized))
+
+    @classmethod
+    def _resolve_public_url(cls, category: str) -> str:
+        category_normalized = category.lower()
+
+        if category_normalized == "linear":
+            return "wss://stream.bybit.com/v5/public/linear"
+
+        if category_normalized == "inverse":
+            return "wss://stream.bybit.com/v5/public/inverse"
+
+        if category_normalized == "spot":
+            return "wss://stream.bybit.com/v5/public/spot"
+
+        if category_normalized == "option":
+            return "wss://stream.bybit.com/v5/public/option"
+
+        raise ValueError(f"Unsupported Bybit category: {category}")
 
     @staticmethod
-    def _safe_float(value: Any) -> Optional[float]:
+    def _safe_float(value: Any) -> float | None:
         if value is None or value == "":
             return None
+
         try:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _current_timestamp_ms() -> int:
+        return int(time.time() * 1000)

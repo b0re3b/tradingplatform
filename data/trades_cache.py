@@ -8,7 +8,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from core.config import Config
+from core.event_bus import EventBus
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 
 @dataclass(slots=True)
@@ -61,13 +63,18 @@ class TradesCache:
         self,
         *,
         config: Config,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        cleanup_interval_seconds: float = 60.0,
         max_trades_per_book: int = 5000,
         retention_ms: int = 15 * 60 * 1000,
         service_name: str = "trades_cache",
     ) -> None:
         self.config = config
         self.event_bus = event_bus
+        self.scheduler = scheduler
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self._cleanup_job_id: str | None = None
         self.max_trades_per_book = max_trades_per_book
         self.retention_ms = retention_ms
         self._service_name = service_name
@@ -92,6 +99,72 @@ class TradesCache:
             "cleanup_removed": 0,
             "last_cleanup_at": 0.0,
         }
+
+    # ------------------------------------------------------------------
+    # Lifecycle / EventBus integration
+    # ------------------------------------------------------------------
+
+    def register(self) -> None:
+        """Підписує cache на trade-події від усіх exchange adapters через EventBus."""
+        if self.event_bus is None:
+            self._logger.warning("TradesCache register skipped: EventBus is not provided")
+            return
+        self.event_bus.subscribe("market.trade", self._on_market_trade)
+        self.event_bus.subscribe("market.trades.snapshot", self._on_market_trades_snapshot)
+        self._register_cleanup_job()
+        self._logger.info("TradesCache registered | topics=%s", ["market.trade", "market.trades.snapshot"])
+
+    async def start(self) -> None:
+        self.register()
+
+    async def stop(self) -> None:
+        if self.scheduler is not None and self._cleanup_job_id is not None:
+            self.scheduler.remove_job(self._cleanup_job_id)
+            self._cleanup_job_id = None
+
+    async def _on_market_trade(self, event: Any) -> None:
+        await self.update(self._normalize_inbound_payload(self._extract_payload(event)))
+
+    async def _on_market_trades_snapshot(self, event: Any) -> None:
+        payload = self._extract_payload(event)
+        trades = payload.get("trades") or payload.get("items") or []
+        if isinstance(trades, list):
+            for trade in trades:
+                if isinstance(trade, dict):
+                    merged = {**payload, **trade}
+                    merged.pop("trades", None)
+                    merged.pop("items", None)
+                    await self.update(self._normalize_inbound_payload(merged))
+
+    def _register_cleanup_job(self) -> None:
+        if self.scheduler is None or self._cleanup_job_id is not None:
+            return
+        self._cleanup_job_id = self.scheduler.add_interval_job(
+            name="trades-cache-cleanup",
+            func=self.cleanup_stale,
+            interval=self.cleanup_interval_seconds,
+            run_immediately=False,
+            max_retries=1,
+            retry_delay=1.0,
+            timeout=30.0,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    @staticmethod
+    def _extract_payload(event: Any) -> dict[str, Any]:
+        payload = getattr(event, "payload", event)
+        return payload if isinstance(payload, dict) else {}
+
+    def _normalize_inbound_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._now_ms()
+        normalized = dict(payload)
+        normalized.setdefault("market_type", payload.get("category") or payload.get("market_type") or "perpetual")
+        normalized["timestamp_ms"] = payload.get("timestamp_ms") or payload.get("trade_time") or payload.get("event_time") or payload.get("timestamp") or now
+        normalized["received_at_ms"] = payload.get("received_at_ms") or now
+        normalized["quantity"] = payload.get("quantity") if payload.get("quantity") is not None else payload.get("qty")
+        normalized["aggressor_side"] = payload.get("aggressor_side") or payload.get("side") or "unknown"
+        return normalized
 
     # ------------------------------------------------------------------
     # Public API
@@ -162,6 +235,17 @@ class TradesCache:
                 state.trims_count += 1
                 state.total_dropped += removed
                 self._metrics["trades_dropped"] += removed
+
+            await self._emit_event(
+                "market.trades.updated",
+                {
+                    "exchange": record.exchange,
+                    "symbol": record.symbol,
+                    "market_type": record.market_type,
+                    "trade": self._serialize_trade(record),
+                    "last_trade_ts_ms": record.timestamp_ms,
+                },
+            )
 
     async def get_recent_trades(
         self,

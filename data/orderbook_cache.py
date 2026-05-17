@@ -7,7 +7,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from core.config import Config
+from core.event_bus import EventBus
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 
 @dataclass(slots=True)
@@ -57,12 +59,17 @@ class OrderBookCache:
         self,
         *,
         config: Config,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        cleanup_interval_seconds: float = 60.0,
         max_depth_per_side: int = 2000,
         service_name: str = "orderbook_cache",
     ) -> None:
         self.config = config
         self.event_bus = event_bus
+        self.scheduler = scheduler
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self._cleanup_job_id: str | None = None
         self.max_depth_per_side = max_depth_per_side
         self._service_name = service_name
 
@@ -84,6 +91,52 @@ class OrderBookCache:
             "books_created": 0,
             "last_reset_at": 0.0,
         }
+
+    # ------------------------------------------------------------------
+    # Lifecycle / EventBus integration
+    # ------------------------------------------------------------------
+
+    def register(self) -> None:
+        """Підписує cache на orderbook-події від усіх exchange adapters."""
+        if self.event_bus is None:
+            self._logger.warning("OrderBookCache register skipped: EventBus is not provided")
+            return
+        self.event_bus.subscribe("market.orderbook", self._on_market_orderbook)
+        self.event_bus.subscribe("market.orderbook.snapshot", self._on_market_orderbook_snapshot)
+        self._logger.info("OrderBookCache registered | topics=%s", ["market.orderbook", "market.orderbook.snapshot"])
+
+    async def start(self) -> None:
+        self.register()
+
+    async def stop(self) -> None:
+        return None
+
+    async def _on_market_orderbook_snapshot(self, event: Any) -> None:
+        await self.apply_snapshot(self._normalize_inbound_payload(self._extract_payload(event)))
+
+    async def _on_market_orderbook(self, event: Any) -> None:
+        payload = self._normalize_inbound_payload(self._extract_payload(event))
+        key = self._build_book_key_from_event(payload)
+        state = self._books.get(key)
+        if state is None or not state.snapshot_received or payload.get("type") == "snapshot":
+            await self.apply_snapshot(payload)
+        else:
+            await self.apply_delta(payload)
+
+    @staticmethod
+    def _extract_payload(event: Any) -> dict[str, Any]:
+        payload = getattr(event, "payload", event)
+        return payload if isinstance(payload, dict) else {}
+
+    def _normalize_inbound_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._now_ms()
+        normalized = dict(payload)
+        normalized.setdefault("market_type", payload.get("category") or payload.get("market_type") or "perpetual")
+        normalized["timestamp_ms"] = payload.get("timestamp_ms") or payload.get("event_time") or payload.get("timestamp") or payload.get("ts") or now
+        normalized["received_at_ms"] = payload.get("received_at_ms") or now
+        normalized["sequence"] = payload.get("sequence") or payload.get("final_update_id") or payload.get("update_id") or payload.get("seq_id") or payload.get("version")
+        normalized["prev_sequence"] = payload.get("prev_sequence") or payload.get("first_update_id") or payload.get("prev_seq_id")
+        return normalized
 
     # ------------------------------------------------------------------
     # Public API
@@ -136,6 +189,8 @@ class OrderBookCache:
                 len(state.asks),
                 state.sequence,
             )
+
+            await self._emit_event("market.orderbook.updated", self._serialize_book_state(state))
 
     async def apply_delta(self, event: dict[str, Any]) -> None:
         """
@@ -222,6 +277,8 @@ class OrderBookCache:
             state.updates_applied += 1
 
             self._metrics["updates_applied"] += 1
+
+            await self._emit_event("market.orderbook.updated", self._serialize_book_state(state))
 
     async def reset_book(
         self,
@@ -548,6 +605,27 @@ class OrderBookCache:
                 topic,
             )
 
+    def _serialize_book_state(self, state: OrderBookState) -> dict[str, Any]:
+        bids = self._sorted_bids(state.bids)
+        asks = self._sorted_asks(state.asks)
+        return {
+            "exchange": state.exchange,
+            "symbol": state.symbol,
+            "market_type": state.market_type,
+            "sequence": state.sequence,
+            "prev_sequence": state.prev_sequence,
+            "is_synced": state.is_synced,
+            "snapshot_received": state.snapshot_received,
+            "last_update_ts_ms": state.last_update_ts_ms,
+            "last_update_received_ms": state.last_update_received_ms,
+            "bids": bids[: self.max_depth_per_side],
+            "asks": asks[: self.max_depth_per_side],
+            "best_bid": bids[0] if bids else None,
+            "best_ask": asks[0] if asks else None,
+            "spread": self._calc_spread(bids, asks),
+            "mid_price": self._calc_mid_price(bids, asks),
+        }
+
     # ------------------------------------------------------------------
     # Serialization / helpers
     # ------------------------------------------------------------------
@@ -608,14 +686,3 @@ class OrderBookCache:
         except (TypeError, ValueError):
             return None
 
-#Важливе архітектурне правило, якого я дотримався
-
-#OrderBookCache тут:
-
-#не підключається сам до біржі
-#не приймає торгових рішень
-#не робить аналітику
-#не зберігає історію в БД
-
-#Він робить тільки своє:
-#snapshot + delta + sequence validation + локальний state.

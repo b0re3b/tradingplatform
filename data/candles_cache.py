@@ -7,7 +7,9 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from core.config import Config
+from core.event_bus import EventBus
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 
 @dataclass(slots=True)
@@ -67,13 +69,18 @@ class CandlesCache:
         self,
         *,
         config: Config,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        cleanup_interval_seconds: float = 60.0,
         max_candles_per_key: int = 2000,
         retention_ms: int = 7 * 24 * 60 * 60 * 1000,
         service_name: str = "candles_cache",
     ) -> None:
         self.config = config
         self.event_bus = event_bus
+        self.scheduler = scheduler
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self._cleanup_job_id: str | None = None
         self.max_candles_per_key = max_candles_per_key
         self.retention_ms = retention_ms
         self._service_name = service_name
@@ -98,6 +105,72 @@ class CandlesCache:
             "cleanup_removed": 0,
             "last_cleanup_at": 0.0,
         }
+
+    # ------------------------------------------------------------------
+    # Lifecycle / EventBus integration
+    # ------------------------------------------------------------------
+
+    def register(self) -> None:
+        """Підписує cache на всі candle-події від exchange adapters через EventBus."""
+        if self.event_bus is None:
+            self._logger.warning("CandlesCache register skipped: EventBus is not provided")
+            return
+        self.event_bus.subscribe("market.candle", self._on_market_candle)
+        self.event_bus.subscribe("market.candles.snapshot", self._on_market_candles_snapshot)
+        self._register_cleanup_job()
+        self._logger.info("CandlesCache registered | topics=%s", ["market.candle", "market.candles.snapshot"])
+
+    async def start(self) -> None:
+        self.register()
+
+    async def stop(self) -> None:
+        if self.scheduler is not None and self._cleanup_job_id is not None:
+            self.scheduler.remove_job(self._cleanup_job_id)
+            self._cleanup_job_id = None
+
+    async def _on_market_candle(self, event: Any) -> None:
+        await self.update(self._normalize_inbound_payload(self._extract_payload(event)))
+
+    async def _on_market_candles_snapshot(self, event: Any) -> None:
+        payload = self._extract_payload(event)
+        candles = payload.get("candles") or payload.get("items") or []
+        if isinstance(candles, list):
+            for candle in candles:
+                if isinstance(candle, dict):
+                    merged = {**payload, **candle}
+                    merged.pop("candles", None)
+                    merged.pop("items", None)
+                    await self.update(self._normalize_inbound_payload(merged))
+
+    def _register_cleanup_job(self) -> None:
+        if self.scheduler is None or self._cleanup_job_id is not None:
+            return
+        self._cleanup_job_id = self.scheduler.add_interval_job(
+            name="candles-cache-cleanup",
+            func=self.cleanup_stale,
+            interval=self.cleanup_interval_seconds,
+            run_immediately=False,
+            max_retries=1,
+            retry_delay=1.0,
+            timeout=30.0,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    @staticmethod
+    def _extract_payload(event: Any) -> dict[str, Any]:
+        payload = getattr(event, "payload", event)
+        return payload if isinstance(payload, dict) else {}
+
+    def _normalize_inbound_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        now = self._now_ms()
+        normalized = dict(payload)
+        normalized.setdefault("market_type", payload.get("category") or payload.get("market_type") or "perpetual")
+        normalized["timestamp_ms"] = payload.get("timestamp_ms") or payload.get("event_time") or payload.get("timestamp") or payload.get("open_time") or now
+        normalized["received_at_ms"] = payload.get("received_at_ms") or now
+        normalized["open_time_ms"] = payload.get("open_time_ms") or payload.get("open_time") or payload.get("start")
+        normalized["close_time_ms"] = payload.get("close_time_ms") or payload.get("close_time") or payload.get("end")
+        return normalized
 
     # ------------------------------------------------------------------
     # Public API
@@ -176,6 +249,11 @@ class CandlesCache:
             if removed > 0:
                 state.trims_count += 1
                 self._metrics["trimmed_candles"] += removed
+
+            serialized = self._serialize_candle(current)
+            await self._emit_event("market.candles.updated", serialized)
+            if current.is_closed:
+                await self._emit_event("market.candle.closed", serialized)
 
     async def get_recent_candles(
         self,
