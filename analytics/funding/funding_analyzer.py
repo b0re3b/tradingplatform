@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from statistics import median
+from uuid import uuid4
 from typing import Any, Deque
 
 from core.event_bus import Event, EventBus, EventPriority, Subscription
@@ -57,10 +60,12 @@ class FundingAnalyzerConfig:
     stale_liquidation_ttl_sec: float = 5 * 60.0
     cleanup_job_name: str = "analytics.funding.cleanup"
 
-    funding_event_name: str = "market.funding"
-    open_interest_event_name: str = "market.open_interest"
-    candle_event_name: str = "market.candle"
-    trade_event_name: str = "market.trade"
+    # FundingAnalyzer should consume normalized cache-level events, not raw exchange events.
+    # Exchange adapters publish market.*; data caches normalize/store and publish market.*.updated.
+    funding_event_name: str = "market.funding.updated"
+    open_interest_event_name: str = "market.open_interest.updated"
+    candle_event_name: str = "market.candle.closed"
+    trade_event_name: str = "market.trades.updated"
     cvd_event_name: str = "analytics.orderflow.updated"
     liquidation_event_name: str = "market.liquidation"
 
@@ -78,6 +83,18 @@ class FundingAnalyzerConfig:
     signal_on_divergence: bool = True
     signal_on_flip: bool = True
 
+    # Historical storage. The analyzer keeps a small in-memory rolling window for
+    # real-time statistics and stores full analytics history as parquet records.
+    enable_parquet_history: bool = True
+    parquet_base_path: str = "data/parquet"
+    parquet_dataset_name: str = "analytics_funding"
+    parquet_flush_interval_sec: float = 30.0
+    parquet_flush_timeout_sec: float = 10.0
+    parquet_flush_batch_size: int = 250
+    parquet_flush_job_name: str = "analytics.funding.parquet_flush"
+    load_history_from_parquet_on_start: bool = True
+    parquet_max_load_records_per_key: int = 500
+
     def __post_init__(self) -> None:
         if self.history_size <= 0:
             raise ValueError("history_size must be > 0")
@@ -91,6 +108,14 @@ class FundingAnalyzerConfig:
             raise ValueError("stale_context_ttl_sec must be > 0")
         if self.stale_liquidation_ttl_sec <= 0:
             raise ValueError("stale_liquidation_ttl_sec must be > 0")
+        if self.parquet_flush_interval_sec <= 0:
+            raise ValueError("parquet_flush_interval_sec must be > 0")
+        if self.parquet_flush_timeout_sec <= 0:
+            raise ValueError("parquet_flush_timeout_sec must be > 0")
+        if self.parquet_flush_batch_size <= 0:
+            raise ValueError("parquet_flush_batch_size must be > 0")
+        if self.parquet_max_load_records_per_key <= 0:
+            raise ValueError("parquet_max_load_records_per_key must be > 0")
 
 
 @dataclass(slots=True)
@@ -141,10 +166,12 @@ class FundingAnalyzer:
         flip_detector: FundingFlipDetector | None = None,
         extremes_detector: FundingExtremesDetector | None = None,
         divergence_detector: FundingDivergenceDetector | None = None,
+        parquet_storage: Any | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.scheduler = scheduler
         self.config = config or FundingAnalyzerConfig()
+        self.parquet_storage = parquet_storage
 
         self.logger = get_logger(
             __name__,
@@ -182,6 +209,10 @@ class FundingAnalyzer:
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._subscriptions: list[Subscription] = []
         self._cleanup_job_id: str | None = None
+        self._parquet_flush_job_id: str | None = None
+        self._history_write_buffer: list[dict[str, Any]] = []
+        self._history_buffer_lock = asyncio.Lock()
+        self._parquet_unavailable_logged = False
         self._registered: bool = False
 
     # ------------------------------------------------------------------
@@ -235,6 +266,7 @@ class FundingAnalyzer:
         )
 
         self._register_cleanup_job()
+        self._register_parquet_flush_job()
         self._registered = True
 
         self.logger.info(
@@ -264,8 +296,29 @@ class FundingAnalyzer:
                     self._cleanup_job_id,
                 )
 
+        if self.scheduler is not None and self._parquet_flush_job_id is not None:
+            try:
+                self.scheduler.disable_job(self._parquet_flush_job_id)
+            except KeyError:
+                self.logger.warning(
+                    "Parquet flush job not found during unregister | job_id=%s",
+                    self._parquet_flush_job_id,
+                )
+
         self._registered = False
         self.logger.info("FundingAnalyzer unregistered")
+
+
+    async def start(self) -> None:
+        """Load historical parquet state, then register EventBus/Scheduler integration."""
+        if self.config.enable_parquet_history and self.config.load_history_from_parquet_on_start:
+            await self.load_history_from_parquet()
+        self.register()
+
+    async def stop(self) -> None:
+        """Flush buffered history and unregister EventBus/Scheduler integration."""
+        await self.flush_history_to_parquet()
+        self.unregister()
 
     def get_latest_snapshot(
         self,
@@ -310,6 +363,10 @@ class FundingAnalyzer:
             "registered": self._registered,
             "subscriptions": len(self._subscriptions),
             "cleanup_job_id": self._cleanup_job_id,
+            "parquet_flush_job_id": self._parquet_flush_job_id,
+            "parquet_history_enabled": self.config.enable_parquet_history,
+            "parquet_buffer_size": len(self._history_write_buffer),
+            "parquet_root": str(self._parquet_root()),
             "symbols_tracked": len(self._history),
             "contexts_tracked": len(self._market_context),
             "latest_statistics": len(self._latest_statistics),
@@ -456,6 +513,17 @@ class FundingAnalyzer:
             if divergence_event is not None:
                 self._latest_divergence_event[key] = divergence_event
 
+            await self._buffer_history_record(
+                snapshot=snapshot,
+                statistics=statistics,
+                regime_state=regime_state,
+                pressure_state=pressure_state,
+                flip_event=flip_event,
+                extreme_event=extreme_event,
+                divergence_event=divergence_event,
+                context=context,
+            )
+
             await self._publish_updated_event(
                 snapshot=snapshot,
                 statistics=statistics,
@@ -533,11 +601,13 @@ class FundingAnalyzer:
     async def on_trade(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
-            symbol = str(payload["symbol"]).upper().strip()
-            exchange = str(payload.get("exchange", "unknown")).lower().strip()
+            trade_payload = payload.get("trade") if isinstance(payload.get("trade"), dict) else payload
+
+            symbol = str(payload.get("symbol") or trade_payload["symbol"]).upper().strip()
+            exchange = str(payload.get("exchange") or trade_payload.get("exchange", "unknown")).lower().strip()
             key = self._make_key(symbol, exchange)
 
-            price = self._to_optional_float(payload.get("price"))
+            price = self._to_optional_float(trade_payload.get("price"))
             if price is None:
                 return
 
@@ -1091,6 +1161,397 @@ class FundingAnalyzer:
             enabled=True,
         )
 
+    def _register_parquet_flush_job(self) -> None:
+        if not self.config.enable_parquet_history:
+            return
+
+        if self.scheduler is None:
+            self.logger.info("FundingAnalyzer parquet flush job disabled: scheduler not provided")
+            return
+
+        existing_job = self.scheduler.get_job_by_name(self.config.parquet_flush_job_name)
+        if existing_job is not None:
+            self._parquet_flush_job_id = existing_job.job_id
+            self.logger.warning(
+                "FundingAnalyzer parquet flush job already exists | job_id=%s name=%s",
+                existing_job.job_id,
+                existing_job.name,
+            )
+            return
+
+        self._parquet_flush_job_id = self.scheduler.add_interval_job(
+            name=self.config.parquet_flush_job_name,
+            func=self.flush_history_to_parquet,
+            interval=self.config.parquet_flush_interval_sec,
+            timeout=self.config.parquet_flush_timeout_sec,
+            max_retries=1,
+            retry_delay=1.0,
+            allow_overlap=False,
+            run_immediately=False,
+            enabled=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Parquet-backed analytics history
+    # ------------------------------------------------------------------
+
+    async def get_history(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "unknown",
+        limit: int = 100,
+        include_parquet: bool = True,
+    ) -> list[FundingSnapshot]:
+        """Read recent funding snapshots from memory and, optionally, parquet."""
+        if limit <= 0:
+            return []
+
+        key = self._make_key(symbol, exchange)
+        in_memory = list(self._history.get(key, []))[-limit:]
+        if len(in_memory) >= limit or not include_parquet or not self.config.enable_parquet_history:
+            return in_memory[-limit:]
+
+        records = await self.get_historical_records(
+            symbol=symbol,
+            exchange=exchange,
+            limit=limit,
+        )
+        snapshots = [self._history_row_to_snapshot(row) for row in records]
+        snapshots = [snapshot for snapshot in snapshots if snapshot is not None]
+
+        merged: dict[str, FundingSnapshot] = {
+            snapshot.event_time.isoformat(): snapshot
+            for snapshot in snapshots + in_memory
+        }
+        return sorted(merged.values(), key=lambda item: item.event_time)[-limit:]
+
+    async def get_historical_records(
+        self,
+        *,
+        symbol: str | None = None,
+        exchange: str | None = None,
+        timeframe: FundingTimeframe | str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read flattened analytics records from parquet history."""
+        if not self.config.enable_parquet_history:
+            return []
+
+        return await asyncio.to_thread(
+            self._read_history_rows_from_parquet,
+            symbol,
+            exchange,
+            timeframe.value if isinstance(timeframe, FundingTimeframe) else timeframe,
+            self._ensure_utc(since) if since is not None else None,
+            self._ensure_utc(until) if until is not None else None,
+            limit,
+        )
+
+    async def load_history_from_parquet(
+        self,
+        *,
+        symbol: str | None = None,
+        exchange: str | None = None,
+    ) -> int:
+        """Warm in-memory rolling windows from parquet history."""
+        if not self.config.enable_parquet_history:
+            return 0
+
+        records = await self.get_historical_records(
+            symbol=symbol,
+            exchange=exchange,
+            limit=self.config.parquet_max_load_records_per_key if symbol and exchange else None,
+        )
+
+        loaded = 0
+        per_key_loaded: dict[str, int] = defaultdict(int)
+        for record in records:
+            snapshot = self._history_row_to_snapshot(record)
+            if snapshot is None:
+                continue
+            key = self._make_key(snapshot.symbol, snapshot.exchange.value)
+            if per_key_loaded[key] >= self.config.parquet_max_load_records_per_key:
+                continue
+            self._history[key].append(snapshot)
+            per_key_loaded[key] += 1
+            loaded += 1
+
+        if loaded:
+            self.logger.info(
+                "FundingAnalyzer history loaded from parquet | records=%s symbols=%s",
+                loaded,
+                len(per_key_loaded),
+            )
+        return loaded
+
+    async def flush_history_to_parquet(self) -> int:
+        """Persist buffered funding analytics records to parquet."""
+        if not self.config.enable_parquet_history:
+            return 0
+
+        async with self._history_buffer_lock:
+            if not self._history_write_buffer:
+                return 0
+            rows = list(self._history_write_buffer)
+            self._history_write_buffer.clear()
+
+        try:
+            written = await asyncio.to_thread(self._write_history_rows_to_parquet, rows)
+            if written:
+                self.logger.debug("FundingAnalyzer parquet history flushed | records=%s", written)
+            return written
+        except Exception:
+            async with self._history_buffer_lock:
+                self._history_write_buffer[0:0] = rows
+            self.logger.exception("Failed to flush FundingAnalyzer history to parquet")
+            return 0
+
+    async def _buffer_history_record(
+        self,
+        *,
+        snapshot: FundingSnapshot,
+        statistics: FundingStatistics,
+        regime_state: FundingRegimeState,
+        pressure_state: FundingPressureState,
+        flip_event: FundingFlipEvent | None,
+        extreme_event: FundingExtremeEvent | None,
+        divergence_event: FundingDivergenceEvent | None,
+        context: FundingMarketContext,
+    ) -> None:
+        if not self.config.enable_parquet_history:
+            return
+
+        row = self._build_history_row(
+            snapshot=snapshot,
+            statistics=statistics,
+            regime_state=regime_state,
+            pressure_state=pressure_state,
+            flip_event=flip_event,
+            extreme_event=extreme_event,
+            divergence_event=divergence_event,
+            context=context,
+        )
+
+        should_flush = False
+        async with self._history_buffer_lock:
+            self._history_write_buffer.append(row)
+            should_flush = len(self._history_write_buffer) >= self.config.parquet_flush_batch_size
+
+        if should_flush:
+            await self.flush_history_to_parquet()
+
+    def _build_history_row(
+        self,
+        *,
+        snapshot: FundingSnapshot,
+        statistics: FundingStatistics,
+        regime_state: FundingRegimeState,
+        pressure_state: FundingPressureState,
+        flip_event: FundingFlipEvent | None,
+        extreme_event: FundingExtremeEvent | None,
+        divergence_event: FundingDivergenceEvent | None,
+        context: FundingMarketContext,
+    ) -> dict[str, Any]:
+        snapshot_dict = snapshot.to_dict()
+        statistics_dict = statistics.to_dict()
+        regime_dict = regime_state.to_dict()
+        pressure_dict = pressure_state.to_dict()
+        flip_dict = flip_event.to_dict() if flip_event is not None else None
+        extreme_dict = extreme_event.to_dict() if extreme_event is not None else None
+        divergence_dict = divergence_event.to_dict() if divergence_event is not None else None
+
+        return {
+            "event_kind": "funding_analysis",
+            "event_time": snapshot_dict.get("event_time"),
+            "received_at": snapshot_dict.get("received_at"),
+            "symbol": snapshot.symbol,
+            "exchange": snapshot.exchange.value,
+            "timeframe": self.config.default_timeframe.value,
+            "funding_rate": snapshot.funding_rate,
+            "predicted_funding_rate": snapshot.predicted_funding_rate,
+            "mark_price": snapshot.mark_price,
+            "index_price": snapshot.index_price,
+            "basis": snapshot.basis,
+            "funding_sign": snapshot.funding_sign,
+            "open_interest": snapshot.open_interest,
+            "volume_24h": snapshot.volume_24h,
+            "next_funding_time": snapshot_dict.get("next_funding_time"),
+            "latest_open_interest": context.latest_open_interest,
+            "previous_open_interest": context.previous_open_interest,
+            "latest_price": context.latest_price,
+            "previous_price": context.previous_price,
+            "latest_cvd": context.latest_cvd,
+            "previous_cvd": context.previous_cvd,
+            "long_liquidations": context.long_liquidations,
+            "short_liquidations": context.short_liquidations,
+            "statistics_json": self._json_dumps(statistics_dict),
+            "regime_json": self._json_dumps(regime_dict),
+            "pressure_json": self._json_dumps(pressure_dict),
+            "flip_json": self._json_dumps(flip_dict),
+            "extreme_json": self._json_dumps(extreme_dict),
+            "divergence_json": self._json_dumps(divergence_dict),
+            "metadata_json": self._json_dumps(snapshot.metadata),
+            "created_at": self._utc_now().isoformat(),
+        }
+
+    def _write_history_rows_to_parquet(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+
+        external_writer = getattr(self.parquet_storage, "append_records", None) or getattr(self.parquet_storage, "write_records", None)
+        if external_writer is not None:
+            result = external_writer(dataset=self.config.parquet_dataset_name, records=rows)
+            if inspectable := getattr(result, "__await__", None):
+                raise RuntimeError("Async parquet_storage writers are not supported from sync flush thread")
+            return len(rows)
+
+        pd = self._import_pandas_for_parquet()
+        if pd is None:
+            return 0
+
+        root = self._parquet_root()
+        grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            event_time = str(row.get("event_time") or self._utc_now().isoformat())
+            event_date = event_time[:10]
+            grouped[(row["exchange"], row["symbol"], row["timeframe"], event_date)].append(row)
+
+        written = 0
+        for (exchange, symbol, timeframe, event_date), group_rows in grouped.items():
+            output_dir = (
+                root
+                / "snapshots"
+                / f"exchange={exchange}"
+                / f"symbol={symbol}"
+                / f"timeframe={timeframe}"
+                / f"date={event_date}"
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_file = output_dir / f"part-{int(self._utc_now().timestamp() * 1000)}-{uuid4().hex}.parquet"
+            pd.DataFrame(group_rows).to_parquet(output_file, index=False)
+            written += len(group_rows)
+        return written
+
+    def _read_history_rows_from_parquet(
+        self,
+        symbol: str | None,
+        exchange: str | None,
+        timeframe: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        external_reader = getattr(self.parquet_storage, "read_records", None)
+        if external_reader is not None:
+            rows = external_reader(
+                dataset=self.config.parquet_dataset_name,
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+                since=since,
+                until=until,
+                limit=limit,
+            )
+            return list(rows or [])
+
+        pd = self._import_pandas_for_parquet()
+        if pd is None:
+            return []
+
+        root = self._parquet_root() / "snapshots"
+        if not root.exists():
+            return []
+
+        files = list(root.rglob("*.parquet"))
+        if exchange is not None:
+            exchange_part = f"exchange={exchange.lower().strip()}"
+            files = [path for path in files if exchange_part in path.parts]
+        if symbol is not None:
+            symbol_part = f"symbol={symbol.upper().strip()}"
+            files = [path for path in files if symbol_part in path.parts]
+        if timeframe is not None:
+            timeframe_part = f"timeframe={timeframe}"
+            files = [path for path in files if timeframe_part in path.parts]
+
+        frames = []
+        for file_path in files:
+            try:
+                frames.append(pd.read_parquet(file_path))
+            except Exception:
+                self.logger.exception("Failed to read funding parquet file | path=%s", file_path)
+
+        if not frames:
+            return []
+
+        df = pd.concat(frames, ignore_index=True)
+        if "event_time" in df.columns:
+            df["_event_dt"] = pd.to_datetime(df["event_time"], utc=True, errors="coerce")
+            if since is not None:
+                df = df[df["_event_dt"] >= since]
+            if until is not None:
+                df = df[df["_event_dt"] <= until]
+            df = df.sort_values("_event_dt")
+            df = df.drop(columns=["_event_dt"])
+
+        if limit is not None and limit > 0:
+            df = df.tail(limit)
+        return df.to_dict(orient="records")
+
+    def _history_row_to_snapshot(self, row: dict[str, Any]) -> FundingSnapshot | None:
+        try:
+            metadata = self._json_loads(row.get("metadata_json")) or {}
+            return FundingSnapshot(
+                symbol=str(row["symbol"]),
+                exchange=self._parse_exchange(row.get("exchange", "unknown")),
+                funding_rate=float(row.get("funding_rate", 0.0)),
+                predicted_funding_rate=self._to_optional_float(row.get("predicted_funding_rate")),
+                mark_price=self._to_optional_float(row.get("mark_price")),
+                index_price=self._to_optional_float(row.get("index_price")),
+                open_interest=self._to_optional_float(row.get("open_interest")),
+                volume_24h=self._to_optional_float(row.get("volume_24h")),
+                next_funding_time=self._parse_datetime(row["next_funding_time"]) if row.get("next_funding_time") else None,
+                event_time=self._parse_datetime(row.get("event_time")) if row.get("event_time") else self._utc_now(),
+                received_at=self._parse_datetime(row.get("received_at")) if row.get("received_at") else self._utc_now(),
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+        except Exception:
+            self.logger.exception("Failed to restore FundingSnapshot from parquet row")
+            return None
+
+    def _parquet_root(self) -> Path:
+        return Path(self.config.parquet_base_path).expanduser() / self.config.parquet_dataset_name
+
+    def _import_pandas_for_parquet(self):
+        try:
+            import pandas as pd  # type: ignore
+            return pd
+        except Exception:
+            if not self._parquet_unavailable_logged:
+                self.logger.warning(
+                    "Parquet history is enabled but pandas/pyarrow/fastparquet is unavailable; "
+                    "install pandas with pyarrow or inject parquet_storage"
+                )
+                self._parquet_unavailable_logged = True
+            return None
+
+    def _json_dumps(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _json_loads(self, value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(str(value))
+        except json.JSONDecodeError:
+            return None
+
     # ------------------------------------------------------------------
     # Parsing / utils
     # ------------------------------------------------------------------
@@ -1099,27 +1560,43 @@ class FundingAnalyzer:
         symbol = str(payload["symbol"]).upper().strip()
         exchange = self._parse_exchange(payload.get("exchange", "unknown"))
 
-        next_funding_time_raw = payload.get("next_funding_time")
+        next_funding_time_raw = (
+            payload.get("next_funding_time")
+            or payload.get("next_funding_time_ms")
+            or payload.get("next_funding_time_ms")
+            or payload.get("next_funding_time")
+        )
         next_funding_time = (
             self._parse_datetime(next_funding_time_raw)
             if next_funding_time_raw is not None
             else None
         )
 
-        event_time_raw = payload.get("event_time") or payload.get("ts") or payload.get("timestamp")
-        received_at_raw = payload.get("received_at")
+        event_time_raw = (
+            payload.get("event_time")
+            or payload.get("timestamp_ms")
+            or payload.get("timestamp")
+            or payload.get("ts")
+            or payload.get("funding_time")
+        )
+        received_at_raw = payload.get("received_at") or payload.get("received_at_ms")
 
         event_time = self._parse_datetime(event_time_raw) if event_time_raw is not None else self._utc_now()
         received_at = self._parse_datetime(received_at_raw) if received_at_raw is not None else self._utc_now()
 
         raw_metadata = payload.get("metadata")
         metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+        metadata.setdefault("market_type", payload.get("market_type") or payload.get("category") or "perpetual")
 
         return FundingSnapshot(
             symbol=symbol,
             exchange=exchange,
-            funding_rate=float(payload.get("funding_rate", 0.0)),
-            predicted_funding_rate=self._to_optional_float(payload.get("predicted_funding_rate")),
+            funding_rate=float(payload.get("funding_rate", payload.get("rate", 0.0))),
+            predicted_funding_rate=self._to_optional_float(
+                payload.get("predicted_funding_rate")
+                if payload.get("predicted_funding_rate") is not None
+                else payload.get("predicted_rate")
+            ),
             mark_price=self._to_optional_float(payload.get("mark_price")),
             index_price=self._to_optional_float(payload.get("index_price")),
             open_interest=self._to_optional_float(payload.get("open_interest")),
