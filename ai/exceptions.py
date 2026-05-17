@@ -1,13 +1,3 @@
-"""
-AI/news package exceptions.
-
-This module defines a small but explicit exception hierarchy for the
-independent news intelligence layer.
-
-The AI package is used only for news analysis and manual decision support.
-These exceptions must not directly trigger risk-management or execution logic.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

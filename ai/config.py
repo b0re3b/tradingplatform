@@ -1,14 +1,3 @@
-"""
-AI/news package configuration.
-
-This module contains typed dataclass configs for the independent news
-intelligence layer.
-
-The AI package is intentionally focused only on news collection and scoring.
-It does not directly affect risk management, execution, position sizing, or
-automatic order placement.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -185,6 +174,7 @@ class NewsFeatureConfig:
         "just in",
         "alert",
         "immediately",
+        "Trump"
     )
 
     regulatory_keywords: tuple[str, ...] = (

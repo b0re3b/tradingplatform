@@ -1,11 +1,3 @@
-"""
-AI/news package enums.
-
-This module defines stable enum contracts for the news intelligence layer.
-The AI package is intentionally focused on independent news analysis and does
-not directly affect risk management, execution, or position sizing.
-"""
-
 from __future__ import annotations
 
 from enum import Enum

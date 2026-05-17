@@ -1,14 +1,3 @@
-"""
-AI/news package models.
-
-This module contains typed dataclass contracts for the independent news
-intelligence layer.
-
-The AI package is used for news collection, normalization, feature extraction,
-scoring, and manual decision support. It must not directly trigger risk or
-execution actions.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
