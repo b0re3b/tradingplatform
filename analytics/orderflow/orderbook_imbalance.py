@@ -451,21 +451,38 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             )
             return None
 
-        if snapshot.timestamp <= 0:
+        if not self._is_finite_positive(snapshot.timestamp):
+            self._logger.debug(
+                "Orderbook snapshot with invalid timestamp skipped",
+                extra={
+                    **orderflow_key_to_dict(expected_key),
+                    "timestamp": snapshot.timestamp,
+                },
+            )
             return None
 
         valid_bids = [
             level
             for level in snapshot.bids
-            if isinstance(level, OrderbookLevel) and level.is_valid
+            if self._is_valid_level(level)
         ]
         valid_asks = [
             level
             for level in snapshot.asks
-            if isinstance(level, OrderbookLevel) and level.is_valid
+            if self._is_valid_level(level)
         ]
 
         if not valid_bids or not valid_asks:
+            self._logger.debug(
+                "Orderbook snapshot without valid bid/ask levels skipped",
+                extra={
+                    **orderflow_key_to_dict(expected_key),
+                    "bid_levels": len(snapshot.bids),
+                    "ask_levels": len(snapshot.asks),
+                    "valid_bid_levels": len(valid_bids),
+                    "valid_ask_levels": len(valid_asks),
+                },
+            )
             return None
 
         valid_bids.sort(key=lambda item: item.price, reverse=True)
@@ -501,32 +518,82 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         if not bids or not asks:
             return None
 
-        bid_levels = bids[: self._config.depth_levels]
-        ask_levels = asks[: self._config.depth_levels]
+        depth_levels = max(int(self._config.depth_levels), 1)
+        bid_levels = bids[:depth_levels]
+        ask_levels = asks[:depth_levels]
 
-        bid_volume = sum(level.size for level in bid_levels)
-        ask_volume = sum(level.size for level in ask_levels)
+        if not bid_levels or not ask_levels:
+            return None
+
+        bid_volume = math.fsum(level.size for level in bid_levels)
+        ask_volume = math.fsum(level.size for level in ask_levels)
         total_volume = bid_volume + ask_volume
 
-        if total_volume <= 0:
+        if (
+            not math.isfinite(bid_volume)
+            or not math.isfinite(ask_volume)
+            or not math.isfinite(total_volume)
+            or total_volume <= 0.0
+        ):
+            self._logger.debug(
+                "Orderbook snapshot with non-finite or non-positive volume skipped",
+                extra={
+                    **orderflow_key_to_dict(snapshot.key),
+                    "bid_volume": bid_volume,
+                    "ask_volume": ask_volume,
+                    "total_volume": total_volume,
+                },
+            )
             return None
 
         if total_volume < self._config.min_total_volume:
             return None
 
-        best_bid = bid_levels[0].price if bid_levels else None
-        best_ask = ask_levels[0].price if ask_levels else None
+        best_bid = bid_levels[0].price
+        best_ask = ask_levels[0].price
 
-        spread: float | None = None
-        mid_price: float | None = None
+        if not self._is_finite_positive(best_bid) or not self._is_finite_positive(best_ask):
+            return None
 
-        if best_bid is not None and best_ask is not None:
-            spread = best_ask - best_bid
-            mid_price = (best_bid + best_ask) / 2.0
+        spread = best_ask - best_bid
+
+        if not math.isfinite(spread) or spread <= 0.0:
+            self._logger.warning(
+                "Crossed or locked orderbook snapshot rejected",
+                extra={
+                    **orderflow_key_to_dict(snapshot.key),
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread": spread,
+                    "sequence_id": snapshot.sequence_id,
+                    "snapshot_ts": snapshot.timestamp,
+                },
+            )
+            return None
+
+        mid_price = (best_bid + best_ask) / 2.0
+        if not self._is_finite_positive(mid_price):
+            return None
 
         raw_ratio = bid_volume / total_volume
         imbalance_diff = (bid_volume - ask_volume) / total_volume
         imbalance_ratio = self._normalize_ratio(raw_ratio)
+
+        if (
+            not math.isfinite(raw_ratio)
+            or not math.isfinite(imbalance_diff)
+            or not math.isfinite(imbalance_ratio)
+        ):
+            self._logger.debug(
+                "Orderbook snapshot produced non-finite imbalance values",
+                extra={
+                    **orderflow_key_to_dict(snapshot.key),
+                    "raw_ratio": raw_ratio,
+                    "imbalance_diff": imbalance_diff,
+                    "imbalance_ratio": imbalance_ratio,
+                },
+            )
+            return None
 
         return OrderbookImbalanceStats(
             exchange=snapshot.exchange,
@@ -546,7 +613,7 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             spread=spread,
             mid_price=mid_price,
             depth_levels_used=min(
-                self._config.depth_levels,
+                depth_levels,
                 len(bid_levels),
                 len(ask_levels),
             ),
@@ -569,10 +636,27 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         filtered = [
             level
             for level in levels
-            if level.is_valid
+            if self._is_valid_level(level)
         ]
         filtered.sort(key=lambda item: item.price, reverse=reverse)
         return filtered
+
+    def _is_valid_level(self, level: Any) -> bool:
+        return (
+            isinstance(level, OrderbookLevel)
+            and level.is_valid
+            and self._is_finite_positive(level.price)
+            and self._is_finite_positive(level.size)
+        )
+
+    @staticmethod
+    def _is_finite_positive(value: Any) -> bool:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return False
+
+        return math.isfinite(parsed) and parsed > 0.0
 
     def _apply_smoothing(
         self,
@@ -581,6 +665,9 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
     ) -> OrderbookImbalanceStats:
         window = max(int(self._config.smooth_window), 1)
         if window <= 1:
+            return stats
+
+        if not math.isfinite(stats.imbalance_ratio):
             return stats
 
         history = self._ratio_history_by_key.setdefault(key, [])
@@ -594,6 +681,8 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             if history
             else stats.imbalance_ratio
         )
+        if not math.isfinite(smoothed_ratio):
+            return stats
 
         return OrderbookImbalanceStats(
             exchange=stats.exchange,
@@ -622,18 +711,27 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         )
 
     def _normalize_ratio(self, raw_ratio: float) -> float:
+        if not math.isfinite(raw_ratio):
+            return float("nan")
+
         if self._config.normalize_ratio_to_minus_one_one:
             return (raw_ratio * 2.0) - 1.0
 
         return raw_ratio
 
     def _denormalize_ratio_if_needed(self, value: float) -> float:
+        if not math.isfinite(value):
+            return float("nan")
+
         if self._config.normalize_ratio_to_minus_one_one:
             return (value + 1.0) / 2.0
 
         return value
 
     def _ratio_to_diff(self, ratio: float) -> float:
+        if not math.isfinite(ratio):
+            return float("nan")
+
         if self._config.normalize_ratio_to_minus_one_one:
             return ratio
 
@@ -645,6 +743,8 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
 
     def _build_signal(self, stats: OrderbookImbalanceStats) -> OrderFlowSignal | None:
         ratio_for_signal = self._denormalize_ratio_if_needed(stats.imbalance_ratio)
+        if not math.isfinite(ratio_for_signal):
+            return None
 
         bullish_ok = ratio_for_signal >= self._config.bullish_ratio_threshold
         bearish_ok = ratio_for_signal <= self._config.bearish_ratio_threshold
@@ -741,24 +841,44 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
     # ------------------------------------------------------------------
 
     def _spread_quality_component(self, stats: OrderbookImbalanceStats) -> float:
-        if stats.spread is None or not stats.mid_price or stats.mid_price <= 0:
-            return 0.5
+        if (
+            stats.spread is None
+            or stats.mid_price is None
+            or not math.isfinite(stats.spread)
+            or not math.isfinite(stats.mid_price)
+            or stats.spread <= 0.0
+            or stats.mid_price <= 0.0
+        ):
+            return 0.0
 
         spread_pct = stats.spread / stats.mid_price
+        if not math.isfinite(spread_pct) or spread_pct < 0.0:
+            return 0.0
+
         return max(0.0, 1.0 - min(spread_pct * 1000.0, 1.0))
 
     def _safe_ratio(self, value: float, threshold: float) -> float:
+        if not math.isfinite(value) or not math.isfinite(threshold):
+            return 0.0
+
         if threshold == 0:
             return self._normalize_magnitude(value)
 
         return max(0.0, value / threshold)
 
     def _normalize_magnitude(self, value: float) -> float:
+        if not math.isfinite(value):
+            return 0.0
+
         return math.log1p(abs(value))
 
     def _normalize_strength(self, values: list[float]) -> float:
-        if not values:
+        finite_values = [value for value in values if math.isfinite(value)]
+        if not finite_values:
             return 0.0
 
-        raw = sum(max(0.0, value) for value in values) / len(values)
+        raw = sum(max(0.0, value) for value in finite_values) / len(finite_values)
+        if not math.isfinite(raw):
+            return 0.0
+
         return max(0.0, min(raw / (1.0 + raw), 1.0))

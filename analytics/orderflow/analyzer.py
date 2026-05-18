@@ -219,7 +219,7 @@ class OrderFlowAnalyzer:
                 if not self._is_module_enabled(name):
                     self._logger.info(
                         "OrderFlow module skipped because it is disabled",
-                        extra={"module": name},
+                        extra={"module_name": name},
                     )
                     continue
 
@@ -229,7 +229,7 @@ class OrderFlowAnalyzer:
                 except Exception:
                     self._logger.exception(
                         "Failed to register order-flow module",
-                        extra={"module": name},
+                        extra={"module_name": name},
                     )
                     raise
 
@@ -290,7 +290,7 @@ class OrderFlowAnalyzer:
                 except Exception:
                     self._logger.exception(
                         "Failed to stop order-flow module",
-                        extra={"module": name},
+                        extra={"module_name": name},
                     )
 
             self._running = False
@@ -428,7 +428,7 @@ class OrderFlowAnalyzer:
                     "Manual order-flow module processing failed",
                     extra={
                         **self._key_payload(normalized_key),
-                        "module": name,
+                        "module_name": name,
                         "error": repr(exc),
                     },
                 )
@@ -499,7 +499,7 @@ class OrderFlowAnalyzer:
             except Exception as exc:
                 self._logger.exception(
                     "Order-flow cleanup failed",
-                    extra={"module": name, "error": repr(exc)},
+                    extra={"module_name": name, "error": repr(exc)},
                 )
                 await self._emit_lifecycle_event(
                     OrderFlowEventTopic.ERROR.value,

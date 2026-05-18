@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 import asyncio
 import inspect
@@ -554,11 +555,19 @@ class BaseOrderFlowAnalyzer(ABC):
         default_timeframe: str | None = None,
         default_exchange_symbol: str | None = None,
     ) -> NormalizedTrade | None:
+        """
+        Normalize one trade payload into a finite, scoped NormalizedTrade.
+
+        This method is intentionally strict because every trade-flow analyzer
+        depends on it. Invalid numeric values such as NaN/inf must be rejected
+        here before CVD, volume delta or aggressive-trades calculations can
+        produce corrupted stats.
+        """
         if raw_trade is None:
             return None
 
         if isinstance(raw_trade, NormalizedTrade):
-            if not raw_trade.is_valid:
+            if not self._is_valid_normalized_trade(raw_trade):
                 return None
             return raw_trade if self.should_process_key(raw_trade.key) else None
 
@@ -603,33 +612,69 @@ class BaseOrderFlowAnalyzer(ABC):
         if not symbol or not exchange:
             return None
 
-        raw_price = raw_trade.get("price", raw_trade.get("p"))
-        raw_quantity = raw_trade.get(
+        raw_price = self._first_present(raw_trade, "price", "p")
+        raw_quantity = self._first_present(
+            raw_trade,
             "quantity",
-            raw_trade.get("qty", raw_trade.get("q", raw_trade.get("size"))),
+            "qty",
+            "q",
+            "size",
+            "amount",
+            "volume",
         )
-        raw_timestamp = raw_trade.get(
+        raw_timestamp = self._first_present(
+            raw_trade,
             "timestamp",
-            raw_trade.get(
-                "timestamp_ms",
-                raw_trade.get("ts", raw_trade.get("T", time.time())),
-            ),
+            "timestamp_ms",
+            "ts",
+            "T",
+            "time",
         )
 
-        if raw_price is None or raw_quantity is None or raw_timestamp is None:
+        if raw_timestamp is None:
+            raw_timestamp = time.time()
+
+        price = self._parse_finite_float(raw_price)
+        quantity = self._parse_finite_float(raw_quantity)
+        timestamp_raw = self._parse_finite_float(raw_timestamp)
+
+        if price is None or quantity is None or timestamp_raw is None:
+            return None
+
+        if price <= 0.0 or quantity <= 0.0 or timestamp_raw <= 0.0:
+            return None
+
+        timestamp = self._normalize_timestamp(timestamp_raw)
+        if not math.isfinite(timestamp) or timestamp <= 0.0:
             return None
 
         side = self._extract_trade_side(dict(raw_trade))
-        trade_id = raw_trade.get("trade_id", raw_trade.get("id"))
-        is_aggressive = bool(
-            raw_trade.get("is_aggressive", raw_trade.get("aggressive", False))
+        if not side.is_known:
+            return None
+
+        raw_notional = self._first_present(
+            raw_trade,
+            "notional",
+            "quote_qty",
+            "quote_quantity",
+            "quote_volume",
+            "quoteVolume",
         )
 
-        raw_notional = (
-            raw_trade.get("notional")
-            or raw_trade.get("quote_qty")
-            or raw_trade.get("quote_quantity")
-            or raw_trade.get("quote_volume")
+        notional = self._parse_finite_float(raw_notional)
+        if notional is None:
+            notional = price * quantity
+
+        if not math.isfinite(notional) or notional <= 0.0:
+            return None
+
+        trade_id = raw_trade.get("trade_id", raw_trade.get("id"))
+        is_aggressive = self._parse_bool(
+            raw_trade.get(
+                "is_aggressive",
+                raw_trade.get("aggressive", False),
+            ),
+            default=False,
         )
 
         try:
@@ -642,21 +687,111 @@ class BaseOrderFlowAnalyzer(ABC):
                 ),
                 timeframe=str(timeframe),
                 side=side,
-                price=float(raw_price),
-                quantity=float(raw_quantity),
-                notional=float(raw_notional) if raw_notional is not None else None,
-                timestamp=self._normalize_timestamp(float(raw_timestamp)),
+                price=price,
+                quantity=quantity,
+                notional=notional,
+                timestamp=timestamp,
                 trade_id=str(trade_id) if trade_id is not None else None,
                 is_aggressive=is_aggressive,
                 raw=dict(raw_trade),
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
-        if not trade.is_valid:
+        if not self._is_valid_normalized_trade(trade):
             return None
 
         return trade if self.should_process_key(trade.key) else None
+
+    @staticmethod
+    def _first_present(data: Mapping[str, Any], *keys: str) -> Any:
+        """
+        Return the first key that exists and is not None.
+
+        Unlike `or` chains, this does not accidentally skip valid falsy values
+        such as 0. Those values are parsed and rejected explicitly later.
+        """
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+        return None
+
+    @staticmethod
+    def _parse_finite_float(value: Any) -> float | None:
+        if value is None:
+            return None
+
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if not math.isfinite(parsed):
+            return None
+
+        return parsed
+
+    @staticmethod
+    def _parse_bool(value: Any, *, default: bool = False) -> bool:
+        if value is None:
+            return default
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                return default
+            return bool(value)
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+
+        return default
+
+    def _is_valid_normalized_trade(self, trade: NormalizedTrade) -> bool:
+        """
+        Strong validation for NormalizedTrade models.
+
+        NormalizedTrade.is_valid may verify positive values, but this method
+        additionally guarantees that no NaN/inf can reach downstream analyzers.
+        """
+        if not trade.is_valid:
+            return False
+
+        numeric_values = (
+            trade.price,
+            trade.quantity,
+            trade.notional,
+            trade.timestamp,
+        )
+
+        for value in numeric_values:
+            if not isinstance(value, (int, float)):
+                return False
+            if not math.isfinite(float(value)):
+                return False
+
+        if trade.price <= 0.0:
+            return False
+
+        if trade.quantity <= 0.0:
+            return False
+
+        if trade.notional <= 0.0:
+            return False
+
+        if trade.timestamp <= 0.0:
+            return False
+
+        if not trade.side.is_known:
+            return False
+
+        return True
 
     def normalize_orderbook_snapshot(
         self,

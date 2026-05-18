@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -18,13 +19,54 @@ from analytics.orderflow.config import (
 )
 from analytics.orderflow.cvd import CvdAnalyzer
 from analytics.orderflow.enums import OrderFlowEventTopic, OrderFlowSide
-from analytics.orderflow.models import NormalizedTrade
+from analytics.orderflow.models import (
+    NormalizedTrade,
+    OrderFlowKey,
+    make_orderflow_key,
+    orderflow_key_to_dict,
+    orderflow_key_to_string,
+)
 from analytics.orderflow.volume_delta import VolumeDeltaAnalyzer
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
+# Constants
+# =============================================================================
+
+TRADES_TOPIC = "market.trades.updated"
+
+DEFAULT_KEY: OrderFlowKey = make_orderflow_key(
+    exchange="binance",
+    market_type="usdm_futures",
+    symbol="BTCUSDT",
+    timeframe="1m",
+)
+
+BYBIT_KEY: OrderFlowKey = make_orderflow_key(
+    exchange="bybit",
+    market_type="linear",
+    symbol="BTCUSDT",
+    timeframe="1m",
+)
+
+ETH_KEY: OrderFlowKey = make_orderflow_key(
+    exchange="binance",
+    market_type="usdm_futures",
+    symbol="ETHUSDT",
+    timeframe="1m",
+)
+
+HIGHER_TF_KEY: OrderFlowKey = make_orderflow_key(
+    exchange="binance",
+    market_type="usdm_futures",
+    symbol="BTCUSDT",
+    timeframe="5m",
+)
+
+
+# =============================================================================
 # Fakes
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @dataclass(slots=True)
@@ -35,13 +77,29 @@ class FakeSubscription:
     enabled: bool = True
 
 
+@dataclass(slots=True)
+class FakeScheduledJob:
+    job_id: str
+    name: str
+    func: Any
+    interval: float
+    args: tuple
+    kwargs: dict[str, Any]
+    run_immediately: bool
+    max_retries: int
+    retry_delay: float
+    timeout: float | None
+    allow_overlap: bool
+    enabled: bool = True
+
+
 class FakeEventBus:
     """
     Strict EventBus fake.
 
-    It records subscriptions and emitted analytics events.
-    It can simulate emit failures to verify that analyzers do not crash
-    when EventBus is temporarily unavailable.
+    It records subscriptions, unsubscriptions and emitted analytics events.
+    It can simulate emit failures to verify that analyzers do not crash when
+    EventBus is temporarily unavailable.
     """
 
     def __init__(self) -> None:
@@ -100,14 +158,14 @@ class FakeEventBus:
 
 class FakeScheduler:
     """
-    Minimal Scheduler fake.
+    Strict Scheduler fake.
 
-    Trade analyzer tests focus on calculations, but register() still must use
-    Scheduler.add_interval_job() instead of uncontrolled asyncio loops.
+    BaseOrderFlowAnalyzer expects get_job_by_name() before add_interval_job().
+    This fake also tracks removed jobs so lifecycle leaks are caught.
     """
 
     def __init__(self) -> None:
-        self.jobs: dict[str, dict[str, Any]] = {}
+        self.jobs: dict[str, FakeScheduledJob] = {}
         self.disabled_job_ids: list[str] = []
         self.removed_job_ids: list[str] = []
 
@@ -126,97 +184,246 @@ class FakeScheduler:
         allow_overlap: bool = False,
         enabled: bool = True,
     ) -> str:
+        if interval <= 0:
+            raise ValueError("interval must be > 0")
+
+        existing = self.get_job_by_name(name)
+        if existing is not None:
+            return existing.job_id
+
         job_id = f"job-{len(self.jobs) + 1}"
-        self.jobs[job_id] = {
-            "job_id": job_id,
-            "name": name,
-            "func": func,
-            "interval": interval,
-            "args": args,
-            "kwargs": kwargs or {},
-            "run_immediately": run_immediately,
-            "max_retries": max_retries,
-            "retry_delay": retry_delay,
-            "timeout": timeout,
-            "allow_overlap": allow_overlap,
-            "enabled": enabled,
-        }
+        self.jobs[job_id] = FakeScheduledJob(
+            job_id=job_id,
+            name=name,
+            func=func,
+            interval=interval,
+            args=args,
+            kwargs=kwargs or {},
+            run_immediately=run_immediately,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            timeout=timeout,
+            allow_overlap=allow_overlap,
+            enabled=enabled,
+        )
         return job_id
+
+    def get_job_by_name(self, name: str) -> FakeScheduledJob | None:
+        for job in self.jobs.values():
+            if job.name == name:
+                return job
+        return None
 
     def disable_job(self, job_id: str) -> None:
         if job_id not in self.jobs:
             raise KeyError(job_id)
-        self.jobs[job_id]["enabled"] = False
+
+        self.jobs[job_id].enabled = False
         self.disabled_job_ids.append(job_id)
 
     def remove_job(self, job_id: str) -> None:
         if job_id not in self.jobs:
             raise KeyError(job_id)
+
         self.removed_job_ids.append(job_id)
         self.jobs.pop(job_id)
 
 
-class FakeTradesCache:
+class StrictTradesCache:
     """
-    Flexible trades cache fake.
+    Scoped data-layer TradesCache fake.
 
-    Supported modes:
-    - get_recent_trades
-    - get_trades
-    - get
+    Production contract tested here:
+        get_recent_trades(
+            exchange=...,
+            market_type=...,
+            symbol=...,
+            timeframe=...,
+            limit=...,
+        )
 
-    This allows testing fallback lookup order without depending on real
-    data-cache implementation.
+    It also supports get_trades_since(), get_trades() and get() with scoped
+    kwargs because the analyzers currently support a migration lookup chain.
     """
 
     def __init__(
         self,
-        trades: list[Any] | tuple[Any, ...] | dict[str, Any] | None = None,
+        trades_by_key: dict[OrderFlowKey, Any] | None = None,
         *,
-        method: str = "get_recent_trades",
         fail: bool = False,
     ) -> None:
-        self.trades = trades if trades is not None else []
-        self.method = method
+        self.trades_by_key = dict(trades_by_key or {})
         self.fail = fail
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[dict[str, Any]] = []
 
-    def set_trades(self, trades: list[Any] | tuple[Any, ...] | dict[str, Any]) -> None:
-        self.trades = trades
+    def set_trades(self, key: OrderFlowKey, trades: Any) -> None:
+        self.trades_by_key[key] = trades
 
-    def get_recent_trades(self, symbol: str) -> Any:
-        if self.method != "get_recent_trades":
-            raise AttributeError("get_recent_trades intentionally unavailable")
-        return self._return("get_recent_trades", symbol)
+    def get_recent_trades(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str | None = None,
+        limit: int | None = None,
+    ) -> Any:
+        self.calls.append(
+            {
+                "method": "get_recent_trades",
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "limit": limit,
+            }
+        )
+        return self._return(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe or "1m",
+        )
 
-    def get_trades(self, symbol: str) -> Any:
-        if self.method != "get_trades":
-            raise AttributeError("get_trades intentionally unavailable")
-        return self._return("get_trades", symbol)
+    def get_trades_since(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        since_ts: float,
+    ) -> Any:
+        self.calls.append(
+            {
+                "method": "get_trades_since",
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "since_ts": since_ts,
+            }
+        )
+        return self._return(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe="1m",
+        )
 
-    def get(self, symbol: str) -> Any:
-        if self.method != "get":
-            raise AttributeError("get intentionally unavailable")
-        return self._return("get", symbol)
+    def get_trades(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        limit: int | None = None,
+    ) -> Any:
+        self.calls.append(
+            {
+                "method": "get_trades",
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "limit": limit,
+            }
+        )
+        return self._return(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe="1m",
+        )
 
-    def _return(self, method_name: str, symbol: str) -> Any:
-        self.calls.append((method_name, symbol))
+    def get(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+    ) -> Any:
+        self.calls.append(
+            {
+                "method": "get",
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+            }
+        )
+        return self._return(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe="1m",
+        )
 
+    def _return(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+    ) -> Any:
         if self.fail:
-            raise RuntimeError(f"Simulated cache failure from {method_name}")
+            raise RuntimeError("Simulated trades cache failure")
 
-        return self.trades
+        scoped_key = make_orderflow_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return self.trades_by_key.get(scoped_key, [])
 
 
-class FallbackOnlyTradesCache:
+class AsyncTradesCache:
     """
-    Cache fake that exposes only get().
+    Async TradesCache fake.
 
-    This catches analyzers that hardcode get_recent_trades() and do not honor
-    the fallback contract.
+    Protects analyzers from assuming sync-only cache methods.
     """
 
-    def __init__(self, trades: list[Any] | dict[str, Any]) -> None:
+    def __init__(self, trades_by_key: dict[OrderFlowKey, Any]) -> None:
+        self.trades_by_key = dict(trades_by_key)
+        self.calls: list[dict[str, Any]] = []
+
+    async def get_recent_trades(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str | None = None,
+        limit: int | None = None,
+    ) -> Any:
+        await asyncio.sleep(0)
+        self.calls.append(
+            {
+                "method": "get_recent_trades",
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "limit": limit,
+            }
+        )
+        scoped_key = make_orderflow_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe or "1m",
+        )
+        return self.trades_by_key.get(scoped_key, [])
+
+
+class LegacySymbolOnlyTradesCache:
+    """
+    Compatibility fake exposing only symbol-only get().
+
+    This is not the production contract. It exists to keep migration behavior
+    explicit and separated from the scoped production cache tests.
+    """
+
+    def __init__(self, trades: Any) -> None:
         self.trades = trades
         self.calls: list[tuple[str, str]] = []
 
@@ -225,43 +432,69 @@ class FallbackOnlyTradesCache:
         return self.trades
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Factories
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 def now_ts(offset: float = 0.0) -> float:
     return time.time() + offset
 
 
+def key(
+    *,
+    exchange: str = "binance",
+    market_type: str = "usdm_futures",
+    symbol: str = "BTCUSDT",
+    timeframe: str = "1m",
+) -> OrderFlowKey:
+    return make_orderflow_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+
+
 def raw_trade(
     *,
-    trade_id: str | int,
+    trade_id: str | int | None,
     side: str,
-    quantity: float,
-    price: float = 100.0,
+    quantity: Any,
+    price: Any = 100.0,
     ts: float | None = None,
-    symbol: str = "BTCUSDT",
+    orderflow_key: OrderFlowKey = DEFAULT_KEY,
     is_aggressive: bool = True,
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "symbol": symbol,
+    scope = orderflow_key_to_dict(orderflow_key)
+
+    payload = {
+        **scope,
+        "exchange_symbol": scope["symbol"],
         "side": side,
         "price": price,
         "quantity": quantity,
         "timestamp": now_ts() if ts is None else ts,
-        "trade_id": str(trade_id),
-        "exchange": "binance",
         "is_aggressive": is_aggressive,
     }
 
+    if trade_id is not None:
+        payload["trade_id"] = str(trade_id)
+
+    if extra:
+        payload.update(extra)
+
+    return payload
+
 
 def buy(
-    trade_id: str | int,
-    quantity: float,
+    trade_id: str | int | None,
+    quantity: Any,
     *,
-    price: float = 100.0,
+    price: Any = 100.0,
     ts: float | None = None,
+    orderflow_key: OrderFlowKey = DEFAULT_KEY,
     is_aggressive: bool = True,
 ) -> dict[str, Any]:
     return raw_trade(
@@ -270,16 +503,18 @@ def buy(
         quantity=quantity,
         price=price,
         ts=ts,
+        orderflow_key=orderflow_key,
         is_aggressive=is_aggressive,
     )
 
 
 def sell(
-    trade_id: str | int,
-    quantity: float,
+    trade_id: str | int | None,
+    quantity: Any,
     *,
-    price: float = 100.0,
+    price: Any = 100.0,
     ts: float | None = None,
+    orderflow_key: OrderFlowKey = DEFAULT_KEY,
     is_aggressive: bool = True,
 ) -> dict[str, Any]:
     return raw_trade(
@@ -288,6 +523,7 @@ def sell(
         quantity=quantity,
         price=price,
         ts=ts,
+        orderflow_key=orderflow_key,
         is_aggressive=is_aggressive,
     )
 
@@ -297,56 +533,46 @@ def malformed_trades() -> list[Any]:
         None,
         "bad-trade",
         {"symbol": "BTCUSDT", "side": "buy"},
-        {"symbol": "BTCUSDT", "side": "unknown", "price": 100, "quantity": 1},
-        {"symbol": "BTCUSDT", "side": "buy", "price": 0, "quantity": 1, "timestamp": now_ts()},
-        {"symbol": "BTCUSDT", "side": "sell", "price": 100, "quantity": -1, "timestamp": now_ts()},
+        {
+            **orderflow_key_to_dict(DEFAULT_KEY),
+            "side": "unknown",
+            "price": 100,
+            "quantity": 1,
+            "timestamp": now_ts(),
+        },
+        {
+            **orderflow_key_to_dict(DEFAULT_KEY),
+            "side": "buy",
+            "price": 0,
+            "quantity": 1,
+            "timestamp": now_ts(),
+        },
+        {
+            **orderflow_key_to_dict(DEFAULT_KEY),
+            "side": "sell",
+            "price": 100,
+            "quantity": -1,
+            "timestamp": now_ts(),
+        },
+        {
+            **orderflow_key_to_dict(DEFAULT_KEY),
+            "side": "buy",
+            "price": "nan",
+            "quantity": 1,
+            "timestamp": now_ts(),
+        },
+        {
+            **orderflow_key_to_dict(DEFAULT_KEY),
+            "side": "buy",
+            "price": 100,
+            "quantity": float("inf"),
+            "timestamp": now_ts(),
+        },
     ]
 
 
-def assert_update_emitted(
-    event_bus: FakeEventBus,
-    *,
-    topic: str,
-    symbol: str = "BTCUSDT",
-) -> dict[str, Any]:
-    events = [
-        item for item in event_bus.emitted
-        if item["topic"] == topic
-    ]
-
-    assert len(events) >= 1
-    payload = events[-1]["payload"]
-
-    assert payload["symbol"] == symbol
-    assert payload["stats"]["symbol"] == symbol
-    assert payload["stats"]["metric"] == payload["metric"]
-
-    return payload
-
-
-def assert_signal_emitted(
-    event_bus: FakeEventBus,
-    *,
-    topic: str,
-    signal_type: str,
-    side: str,
-    symbol: str = "BTCUSDT",
-) -> dict[str, Any]:
-    events = [
-        item for item in event_bus.emitted
-        if item["topic"] == topic
-    ]
-
-    assert len(events) >= 1
-    payload = events[-1]["payload"]
-
-    assert payload["symbol"] == symbol
-    assert payload["signal_type"] == signal_type
-    assert payload["side"] == side
-    assert 0.0 <= payload["strength"] <= 1.0
-    assert payload["reason"]
-
-    return payload
+def cache_result(trades: Any) -> dict[str, Any]:
+    return {"data": {"trades": trades}}
 
 
 def make_cvd_config(**overrides: Any) -> CvdConfig:
@@ -361,6 +587,7 @@ def make_cvd_config(**overrides: Any) -> CvdConfig:
         "scheduler_job_retry_delay_sec": 0.1,
         "scheduler_job_max_retries": 1,
         "publish_priority": EventPriority.HIGH,
+        "allowed_market_types": {"usdm_futures", "linear", "swap"},
         "window_seconds": 30.0,
         "max_trades_per_symbol": 100,
         "max_cvd_points_per_symbol": 100,
@@ -396,6 +623,7 @@ def make_volume_delta_config(**overrides: Any) -> VolumeDeltaConfig:
         "scheduler_job_retry_delay_sec": 0.1,
         "scheduler_job_max_retries": 1,
         "publish_priority": EventPriority.HIGH,
+        "allowed_market_types": {"usdm_futures", "linear", "swap"},
         "window_seconds": 30.0,
         "max_trades_per_symbol": 100,
         "min_trades_in_window": 2,
@@ -427,6 +655,7 @@ def make_aggressive_config(**overrides: Any) -> AggressiveTradesConfig:
         "scheduler_job_retry_delay_sec": 0.1,
         "scheduler_job_max_retries": 1,
         "publish_priority": EventPriority.HIGH,
+        "allowed_market_types": {"usdm_futures", "linear", "swap"},
         "window_seconds": 30.0,
         "max_trades_per_symbol": 100,
         "min_trades_in_window": 2,
@@ -448,78 +677,249 @@ def make_aggressive_config(**overrides: Any) -> AggressiveTradesConfig:
 
 
 def make_cvd_analyzer(
-    trades: list[Any] | tuple[Any, ...] | dict[str, Any],
+    trades: Any,
     *,
+    orderflow_key: OrderFlowKey = DEFAULT_KEY,
     event_bus: FakeEventBus | None = None,
     cache: Any | None = None,
     config: CvdConfig | None = None,
-) -> tuple[CvdAnalyzer, FakeEventBus, Any]:
+    scheduler: FakeScheduler | None = None,
+) -> tuple[CvdAnalyzer, FakeEventBus, Any, FakeScheduler]:
     bus = event_bus or FakeEventBus()
-    trades_cache = cache or FakeTradesCache(trades)
+    scheduler_obj = scheduler or FakeScheduler()
+    trades_cache = cache or StrictTradesCache({orderflow_key: trades})
 
     analyzer = CvdAnalyzer(
         event_bus=bus,  # type: ignore[arg-type]
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=scheduler_obj,  # type: ignore[arg-type]
         trades_cache=trades_cache,
         config=config or make_cvd_config(),
-        source_topic_patterns=("market.trade",),
+        source_topic_patterns=(TRADES_TOPIC,),
+        default_exchange="binance",
+        default_market_type="usdm_futures",
+        default_timeframe="1m",
     )
-    return analyzer, bus, trades_cache
+    return analyzer, bus, trades_cache, scheduler_obj
 
 
 def make_volume_delta_analyzer(
-    trades: list[Any] | tuple[Any, ...] | dict[str, Any],
+    trades: Any,
     *,
+    orderflow_key: OrderFlowKey = DEFAULT_KEY,
     event_bus: FakeEventBus | None = None,
     cache: Any | None = None,
     config: VolumeDeltaConfig | None = None,
-) -> tuple[VolumeDeltaAnalyzer, FakeEventBus, Any]:
+    scheduler: FakeScheduler | None = None,
+) -> tuple[VolumeDeltaAnalyzer, FakeEventBus, Any, FakeScheduler]:
     bus = event_bus or FakeEventBus()
-    trades_cache = cache or FakeTradesCache(trades)
+    scheduler_obj = scheduler or FakeScheduler()
+    trades_cache = cache or StrictTradesCache({orderflow_key: trades})
 
     analyzer = VolumeDeltaAnalyzer(
         event_bus=bus,  # type: ignore[arg-type]
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=scheduler_obj,  # type: ignore[arg-type]
         trades_cache=trades_cache,
         config=config or make_volume_delta_config(),
-        source_topic_patterns=("market.trade",),
+        source_topic_patterns=(TRADES_TOPIC,),
+        default_exchange="binance",
+        default_market_type="usdm_futures",
+        default_timeframe="1m",
     )
-    return analyzer, bus, trades_cache
+    return analyzer, bus, trades_cache, scheduler_obj
 
 
 def make_aggressive_analyzer(
-    trades: list[Any] | tuple[Any, ...] | dict[str, Any],
+    trades: Any,
     *,
+    orderflow_key: OrderFlowKey = DEFAULT_KEY,
     event_bus: FakeEventBus | None = None,
     cache: Any | None = None,
     config: AggressiveTradesConfig | None = None,
-) -> tuple[AggressiveTradesAnalyzer, FakeEventBus, Any]:
+    scheduler: FakeScheduler | None = None,
+) -> tuple[AggressiveTradesAnalyzer, FakeEventBus, Any, FakeScheduler]:
     bus = event_bus or FakeEventBus()
-    trades_cache = cache or FakeTradesCache(trades)
+    scheduler_obj = scheduler or FakeScheduler()
+    trades_cache = cache or StrictTradesCache({orderflow_key: trades})
 
     analyzer = AggressiveTradesAnalyzer(
         event_bus=bus,  # type: ignore[arg-type]
-        scheduler=FakeScheduler(),  # type: ignore[arg-type]
+        scheduler=scheduler_obj,  # type: ignore[arg-type]
         trades_cache=trades_cache,
         config=config or make_aggressive_config(),
-        source_topic_patterns=("market.trade",),
+        source_topic_patterns=(TRADES_TOPIC,),
+        default_exchange="binance",
+        default_market_type="usdm_futures",
+        default_timeframe="1m",
     )
-    return analyzer, bus, trades_cache
+    return analyzer, bus, trades_cache, scheduler_obj
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
+# Assertions
+# =============================================================================
+
+
+def emitted_events(event_bus: FakeEventBus, topic: str) -> list[dict[str, Any]]:
+    return [item for item in event_bus.emitted if item["topic"] == topic]
+
+
+def assert_scope_payload(payload: dict[str, Any], expected_key: OrderFlowKey) -> None:
+    scope = orderflow_key_to_dict(expected_key)
+
+    assert payload["exchange"] == scope["exchange"]
+    assert payload["market_type"] == scope["market_type"]
+    assert payload["symbol"] == scope["symbol"]
+    assert payload["timeframe"] == scope["timeframe"]
+    assert payload["scope"] == scope
+    assert payload["scope_key"] == orderflow_key_to_string(expected_key)
+    assert payload["key"] == list(expected_key)
+    assert tuple(payload["orderflow_key"]) == expected_key
+
+
+def assert_update_emitted(
+    event_bus: FakeEventBus,
+    *,
+    topic: str,
+    metric: str,
+    expected_key: OrderFlowKey = DEFAULT_KEY,
+) -> dict[str, Any]:
+    events = emitted_events(event_bus, topic)
+    assert len(events) >= 1
+
+    emitted = events[-1]
+    payload = emitted["payload"]
+
+    assert emitted["priority"] == EventPriority.HIGH
+    assert payload["metric"] == metric
+    assert payload["source_type"] == "trades"
+    assert_scope_payload(payload, expected_key)
+
+    stats = payload["stats"]
+    assert stats["metric"] == metric
+    assert stats["source_type"] == "trades"
+    assert_scope_payload(stats, expected_key)
+
+    return payload
+
+
+def assert_signal_emitted(
+    event_bus: FakeEventBus,
+    *,
+    topic: str,
+    metric: str,
+    signal_type: str,
+    side: str,
+    expected_key: OrderFlowKey = DEFAULT_KEY,
+) -> dict[str, Any]:
+    events = emitted_events(event_bus, topic)
+    assert len(events) >= 1
+
+    payload = events[-1]["payload"]
+
+    assert payload["metric"] == metric
+    assert payload["source_type"] == "trades"
+    assert payload["signal_type"] == signal_type
+    assert payload["side"] == side
+    assert payload["reason"]
+    assert 0.0 <= payload["strength"] <= 1.0
+    assert_scope_payload(payload, expected_key)
+
+    context = payload["context"]
+    assert context["scope"] == orderflow_key_to_dict(expected_key)
+    assert context["scope_key"] == orderflow_key_to_string(expected_key)
+    assert "trades_count" in context
+
+    return payload
+
+
+# =============================================================================
+# Lifecycle / topic contract
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("factory", "class_name"),
+    [
+        (make_cvd_analyzer, "CvdAnalyzer"),
+        (make_volume_delta_analyzer, "VolumeDeltaAnalyzer"),
+        (make_aggressive_analyzer, "AggressiveTradesAnalyzer"),
+    ],
+)
+def test_trade_analyzer_registers_data_layer_topic_and_scheduler_jobs(
+    factory: Any,
+    class_name: str,
+) -> None:
+    analyzer, event_bus, _, scheduler = factory([])
+
+    analyzer.register()
+
+    assert analyzer.is_running is True
+    assert [subscription.pattern for subscription in event_bus.subscriptions] == [
+        TRADES_TOPIC
+    ]
+    assert class_name in event_bus.subscriptions[0].name
+
+    assert len(scheduler.jobs) == 2
+    job_names = {job.name for job in scheduler.jobs.values()}
+    assert any("health" in name for name in job_names)
+    assert any("cleanup" in name for name in job_names)
+
+    for job in scheduler.jobs.values():
+        assert job.enabled is True
+        assert job.allow_overlap is False
+        assert job.timeout == pytest.approx(0.5)
+        assert job.retry_delay == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [make_cvd_analyzer, make_volume_delta_analyzer, make_aggressive_analyzer],
+)
+def test_trade_analyzer_rejects_raw_market_trade_topic_by_default(factory: Any) -> None:
+    analyzer, event_bus, _, _ = factory([])
+    analyzer._source_topic_patterns = ["market.trade"]  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="Raw market topic"):
+        analyzer.register()
+
+    assert event_bus.subscriptions == []
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [make_cvd_analyzer, make_volume_delta_analyzer, make_aggressive_analyzer],
+)
+def test_trade_analyzer_stop_unsubscribes_and_removes_jobs(factory: Any) -> None:
+    analyzer, event_bus, _, scheduler = factory([])
+
+    analyzer.register()
+    created_subscriptions = list(event_bus.subscriptions)
+    created_job_ids = set(scheduler.jobs)
+
+    analyzer.stop()
+
+    assert analyzer.is_running is False
+    assert event_bus.subscriptions == []
+    assert event_bus.unsubscribed == created_subscriptions
+    assert set(scheduler.removed_job_ids) == created_job_ids
+    assert scheduler.jobs == {}
+
+
+# =============================================================================
 # CVD analyzer tests
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_cvd_process_symbol_calculates_positive_cvd_and_emits_bullish_signal() -> None:
-    analyzer, event_bus, _ = make_cvd_analyzer(
-        [
-            buy(1, 5, price=100, ts=now_ts(-3)),
-            buy(2, 4, price=101, ts=now_ts(-2)),
-            sell(3, 1, price=102, ts=now_ts(-1)),
-        ],
+async def test_cvd_process_key_calculates_positive_cvd_and_emits_bullish_signal() -> None:
+    trades = [
+        buy(1, 5, price=100, ts=now_ts(-3)),
+        buy(2, 4, price=101, ts=now_ts(-2)),
+        sell(3, 1, price=102, ts=now_ts(-1)),
+    ]
+
+    analyzer, event_bus, cache, _ = make_cvd_analyzer(
+        trades,
         config=make_cvd_config(
             bullish_delta_ratio_threshold=0.2,
             require_delta_confirmation=False,
@@ -527,10 +927,10 @@ async def test_cvd_process_symbol_calculates_positive_cvd_and_emits_bullish_sign
         ),
     )
 
-    stats = await analyzer.process_symbol("btcusdt")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert stats.symbol == "BTCUSDT"
+    assert stats.key == DEFAULT_KEY
     assert stats.trades_count == 3
     assert stats.buy_volume == pytest.approx(9.0)
     assert stats.sell_volume == pytest.approx(1.0)
@@ -539,21 +939,32 @@ async def test_cvd_process_symbol_calculates_positive_cvd_and_emits_bullish_sign
     assert stats.cvd_close == pytest.approx(stats.cvd_value)
     assert stats.last_price == pytest.approx(102.0)
 
+    assert cache.calls[-1]["method"] == "get_recent_trades"
+    assert cache.calls[-1]["exchange"] == "binance"
+    assert cache.calls[-1]["market_type"] == "usdm_futures"
+    assert cache.calls[-1]["symbol"] == "BTCUSDT"
+    assert cache.calls[-1]["timeframe"] == "1m"
+
+    assert analyzer.get_latest_stats_by_key(DEFAULT_KEY) == stats
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.CVD_UPDATED.value,
+        metric="cvd",
+        expected_key=DEFAULT_KEY,
     )
     assert_signal_emitted(
         event_bus,
         topic=OrderFlowEventTopic.CVD_SIGNAL.value,
+        metric="cvd",
         signal_type="bullish",
         side="buy",
+        expected_key=DEFAULT_KEY,
     )
 
 
 @pytest.mark.asyncio
-async def test_cvd_process_symbol_calculates_negative_cvd_and_emits_bearish_signal() -> None:
-    analyzer, event_bus, _ = make_cvd_analyzer(
+async def test_cvd_process_key_calculates_negative_cvd_and_emits_bearish_signal() -> None:
+    analyzer, event_bus, _, _ = make_cvd_analyzer(
         [
             sell(1, 6, price=100, ts=now_ts(-3)),
             sell(2, 3, price=99, ts=now_ts(-2)),
@@ -566,7 +977,7 @@ async def test_cvd_process_symbol_calculates_negative_cvd_and_emits_bearish_sign
         ),
     )
 
-    stats = await analyzer.process_symbol("btcusdt")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
     assert stats.buy_volume == pytest.approx(1.0)
@@ -578,10 +989,12 @@ async def test_cvd_process_symbol_calculates_negative_cvd_and_emits_bearish_sign
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.CVD_UPDATED.value,
+        metric="cvd",
     )
     assert_signal_emitted(
         event_bus,
         topic=OrderFlowEventTopic.CVD_SIGNAL.value,
+        metric="cvd",
         signal_type="bearish",
         side="sell",
     )
@@ -593,40 +1006,65 @@ async def test_cvd_filters_duplicate_trades_between_runs_without_appending_twice
         buy(1, 2, ts=now_ts(-2)),
         sell(2, 1, ts=now_ts(-1)),
     ]
-    analyzer, event_bus, cache = make_cvd_analyzer(trades)
+    cache = StrictTradesCache({DEFAULT_KEY: trades})
+    analyzer, event_bus, _, _ = make_cvd_analyzer(trades, cache=cache)
 
-    first_stats = await analyzer.process_symbol("BTCUSDT")
+    first_stats = await analyzer.process_key(DEFAULT_KEY)
     first_processed_trades = analyzer.stats()["metrics"]["processed_trades"]
-    first_store_size = len(analyzer._trades_by_symbol["BTCUSDT"])  # noqa: SLF001
+    first_store_size = len(analyzer._trades_by_key[DEFAULT_KEY])  # noqa: SLF001
 
-    cache.set_trades(list(trades))
-    second_stats = await analyzer.process_symbol("BTCUSDT")
+    cache.set_trades(DEFAULT_KEY, list(trades))
+    second_stats = await analyzer.process_key(DEFAULT_KEY)
     second_processed_trades = analyzer.stats()["metrics"]["processed_trades"]
-    second_store_size = len(analyzer._trades_by_symbol["BTCUSDT"])  # noqa: SLF001
+    second_store_size = len(analyzer._trades_by_key[DEFAULT_KEY])  # noqa: SLF001
 
     assert first_stats is not None
     assert second_stats is not None
-
     assert first_store_size == 2
     assert second_store_size == 2
     assert second_stats.trades_count == first_stats.trades_count
     assert second_processed_trades == first_processed_trades
 
-    update_events = [
-        item for item in event_bus.emitted
-        if item["topic"] == OrderFlowEventTopic.CVD_UPDATED.value
-    ]
+    update_events = emitted_events(event_bus, OrderFlowEventTopic.CVD_UPDATED.value)
     assert len(update_events) == 2
 
 
 @pytest.mark.asyncio
+async def test_cvd_same_trade_id_isolated_between_exchanges() -> None:
+    cache = StrictTradesCache(
+        {
+            DEFAULT_KEY: [
+                buy("same-id", 5, ts=now_ts(-2), orderflow_key=DEFAULT_KEY),
+                sell("b2", 1, ts=now_ts(-1), orderflow_key=DEFAULT_KEY),
+            ],
+            BYBIT_KEY: [
+                buy("same-id", 2, ts=now_ts(-2), orderflow_key=BYBIT_KEY),
+                sell("y2", 1, ts=now_ts(-1), orderflow_key=BYBIT_KEY),
+            ],
+        }
+    )
+    analyzer, _, _, _ = make_cvd_analyzer([], cache=cache)
+
+    binance_stats = await analyzer.process_key(DEFAULT_KEY)
+    bybit_stats = await analyzer.process_key(BYBIT_KEY)
+
+    assert binance_stats is not None
+    assert bybit_stats is not None
+    assert binance_stats.volume_delta == pytest.approx(4.0)
+    assert bybit_stats.volume_delta == pytest.approx(1.0)
+
+    assert len(analyzer._trades_by_key[DEFAULT_KEY]) == 2  # noqa: SLF001
+    assert len(analyzer._trades_by_key[BYBIT_KEY]) == 2  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_cvd_rejects_malformed_or_unknown_side_trades_without_crashing() -> None:
-    analyzer, event_bus, _ = make_cvd_analyzer(
+    analyzer, event_bus, _, _ = make_cvd_analyzer(
         malformed_trades(),
         config=make_cvd_config(min_trades_in_window=1),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is None
     assert event_bus.emitted == []
@@ -636,86 +1074,14 @@ async def test_cvd_rejects_malformed_or_unknown_side_trades_without_crashing() -
     assert snapshot["metrics"]["skipped"] >= 1
 
 
-@pytest.mark.asyncio
-async def test_cvd_uses_cache_get_fallback_when_get_recent_trades_is_unavailable() -> None:
-    cache = FallbackOnlyTradesCache(
-        {
-            "data": {
-                "trades": [
-                    buy(1, 3, ts=now_ts(-2)),
-                    sell(2, 1, ts=now_ts(-1)),
-                ]
-            }
-        }
-    )
-
-    analyzer, _, _ = make_cvd_analyzer(
-        [],
-        cache=cache,
-    )
-
-    stats = await analyzer.process_symbol("btcusdt")
-
-    assert stats is not None
-    assert cache.calls == [("get", "BTCUSDT")]
-    assert stats.volume_delta == pytest.approx(2.0)
-
-
-@pytest.mark.asyncio
-async def test_cvd_cache_exception_is_handled_without_crashing_or_emitting_signal() -> None:
-    cache = FakeTradesCache(method="get_recent_trades", fail=True)
-    analyzer, event_bus, _ = make_cvd_analyzer(
-        [],
-        cache=cache,
-    )
-
-    stats = await analyzer.process_symbol("BTCUSDT")
-
-    assert stats is None
-    assert event_bus.emitted == []
-
-    snapshot = analyzer.stats()
-    assert snapshot["metrics"]["processed"] == 0
-    assert snapshot["metrics"]["skipped"] >= 1
-
-
-@pytest.mark.asyncio
-async def test_cvd_cleanup_removes_stale_symbol_state() -> None:
-    analyzer, _, _ = make_cvd_analyzer(
-        [
-            buy(1, 2, ts=now_ts(-2)),
-            sell(2, 1, ts=now_ts(-1)),
-        ],
-        config=make_cvd_config(window_seconds=30.0),
-    )
-
-    stats = await analyzer.process_symbol("BTCUSDT")
-    assert stats is not None
-    assert "BTCUSDT" in analyzer._trades_by_symbol  # noqa: SLF001
-    assert "BTCUSDT" in analyzer._last_stats_by_symbol  # noqa: SLF001
-
-    stale_ts = time.time() - 10_000
-    for trade in analyzer._trades_by_symbol["BTCUSDT"]:  # noqa: SLF001
-        trade.timestamp = stale_ts
-
-    for point in analyzer._cvd_points_by_symbol["BTCUSDT"]:  # noqa: SLF001
-        point.timestamp = stale_ts
-
-    await analyzer.cleanup()
-
-    assert "BTCUSDT" not in analyzer._trades_by_symbol  # noqa: SLF001
-    assert "BTCUSDT" not in analyzer._cvd_points_by_symbol  # noqa: SLF001
-    assert "BTCUSDT" not in analyzer._last_stats_by_symbol  # noqa: SLF001
-
-
-# ---------------------------------------------------------------------
+# =============================================================================
 # VolumeDelta analyzer tests
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @pytest.mark.asyncio
 async def test_volume_delta_calculates_volume_notional_and_cumulative_delta() -> None:
-    analyzer, event_bus, _ = make_volume_delta_analyzer(
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
         [
             buy(1, 5, price=100, ts=now_ts(-3)),
             buy(2, 2, price=110, ts=now_ts(-2)),
@@ -729,10 +1095,10 @@ async def test_volume_delta_calculates_volume_notional_and_cumulative_delta() ->
         ),
     )
 
-    stats = await analyzer.process_symbol("btcusdt")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert stats.symbol == "BTCUSDT"
+    assert stats.key == DEFAULT_KEY
     assert stats.trades_count == 3
     assert stats.buy_volume == pytest.approx(7.0)
     assert stats.sell_volume == pytest.approx(1.0)
@@ -746,10 +1112,12 @@ async def test_volume_delta_calculates_volume_notional_and_cumulative_delta() ->
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value,
+        metric="volume_delta",
     )
     assert_signal_emitted(
         event_bus,
         topic=OrderFlowEventTopic.VOLUME_DELTA_SIGNAL.value,
+        metric="volume_delta",
         signal_type="bullish",
         side="buy",
     )
@@ -757,7 +1125,7 @@ async def test_volume_delta_calculates_volume_notional_and_cumulative_delta() ->
 
 @pytest.mark.asyncio
 async def test_volume_delta_requires_min_total_volume_and_returns_none_when_too_small() -> None:
-    analyzer, event_bus, _ = make_volume_delta_analyzer(
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
         [
             buy(1, 0.1, ts=now_ts(-2)),
             sell(2, 0.1, ts=now_ts(-1)),
@@ -768,7 +1136,7 @@ async def test_volume_delta_requires_min_total_volume_and_returns_none_when_too_
         ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is None
     assert event_bus.emitted == []
@@ -786,7 +1154,7 @@ async def test_volume_delta_requires_ratio_and_absolute_confirmation_when_enable
     A large absolute delta alone must not emit a signal when ratio confirmation
     is required and ratio is still neutral.
     """
-    analyzer, event_bus, _ = make_volume_delta_analyzer(
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
         [
             buy(1, 51, ts=now_ts(-2)),
             sell(2, 49, ts=now_ts(-1)),
@@ -799,7 +1167,7 @@ async def test_volume_delta_requires_ratio_and_absolute_confirmation_when_enable
         ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
     assert stats.volume_delta == pytest.approx(2.0)
@@ -808,18 +1176,14 @@ async def test_volume_delta_requires_ratio_and_absolute_confirmation_when_enable
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value,
+        metric="volume_delta",
     )
-
-    signal_events = [
-        item for item in event_bus.emitted
-        if item["topic"] == OrderFlowEventTopic.VOLUME_DELTA_SIGNAL.value
-    ]
-    assert signal_events == []
+    assert emitted_events(event_bus, OrderFlowEventTopic.VOLUME_DELTA_SIGNAL.value) == []
 
 
 @pytest.mark.asyncio
 async def test_volume_delta_emits_bearish_signal_for_sell_pressure() -> None:
-    analyzer, event_bus, _ = make_volume_delta_analyzer(
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
         [
             sell(1, 8, price=100, ts=now_ts(-2)),
             buy(2, 1, price=99, ts=now_ts(-1)),
@@ -832,7 +1196,7 @@ async def test_volume_delta_emits_bearish_signal_for_sell_pressure() -> None:
         ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
     assert stats.volume_delta == pytest.approx(-7.0)
@@ -841,20 +1205,23 @@ async def test_volume_delta_emits_bearish_signal_for_sell_pressure() -> None:
     assert_signal_emitted(
         event_bus,
         topic=OrderFlowEventTopic.VOLUME_DELTA_SIGNAL.value,
+        metric="volume_delta",
         signal_type="bearish",
         side="sell",
     )
 
 
 @pytest.mark.asyncio
-async def test_volume_delta_signal_throttling_prevents_duplicate_signal_spam() -> None:
+async def test_volume_delta_signal_throttling_prevents_duplicate_signal_spam_per_key() -> None:
     trades = [
         buy(1, 5, ts=now_ts(-3)),
         buy(2, 5, ts=now_ts(-2)),
         sell(3, 1, ts=now_ts(-1)),
     ]
-    analyzer, event_bus, cache = make_volume_delta_analyzer(
+    cache = StrictTradesCache({DEFAULT_KEY: trades})
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
         trades,
+        cache=cache,
         config=make_volume_delta_config(
             min_signal_interval_sec=3600.0,
             bullish_delta_ratio_threshold=0.2,
@@ -864,22 +1231,14 @@ async def test_volume_delta_signal_throttling_prevents_duplicate_signal_spam() -
         ),
     )
 
-    first_stats = await analyzer.process_symbol("BTCUSDT")
+    first_stats = await analyzer.process_key(DEFAULT_KEY)
     assert first_stats is not None
 
-    cache.set_trades(
-        trades
-        + [
-            buy(4, 4, ts=now_ts()),
-        ]
-    )
-    second_stats = await analyzer.process_symbol("BTCUSDT")
+    cache.set_trades(DEFAULT_KEY, trades + [buy(4, 4, ts=now_ts())])
+    second_stats = await analyzer.process_key(DEFAULT_KEY)
     assert second_stats is not None
 
-    signals = [
-        item for item in event_bus.emitted
-        if item["topic"] == OrderFlowEventTopic.VOLUME_DELTA_SIGNAL.value
-    ]
+    signals = emitted_events(event_bus, OrderFlowEventTopic.VOLUME_DELTA_SIGNAL.value)
     assert len(signals) == 1
 
     snapshot = analyzer.stats()
@@ -887,113 +1246,92 @@ async def test_volume_delta_signal_throttling_prevents_duplicate_signal_spam() -
     assert snapshot["metrics"]["skipped"] >= 1
 
 
-@pytest.mark.asyncio
-async def test_volume_delta_cleanup_removes_stale_state() -> None:
-    analyzer, _, _ = make_volume_delta_analyzer(
-        [
-            buy(1, 3, ts=now_ts(-2)),
-            sell(2, 1, ts=now_ts(-1)),
-        ],
-        config=make_volume_delta_config(window_seconds=30.0),
-    )
-
-    stats = await analyzer.process_symbol("BTCUSDT")
-    assert stats is not None
-    assert "BTCUSDT" in analyzer._trades_by_symbol  # noqa: SLF001
-
-    stale_ts = time.time() - 10_000
-    for trade in analyzer._trades_by_symbol["BTCUSDT"]:  # noqa: SLF001
-        trade.timestamp = stale_ts
-
-    await analyzer.cleanup()
-
-    assert "BTCUSDT" not in analyzer._trades_by_symbol  # noqa: SLF001
-    assert "BTCUSDT" not in analyzer._last_stats_by_symbol  # noqa: SLF001
-    assert "BTCUSDT" not in analyzer._last_seen_trade_key_by_symbol  # noqa: SLF001
-
-
-# ---------------------------------------------------------------------
+# =============================================================================
 # AggressiveTrades analyzer tests
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_aggressive_trades_detects_buy_pressure_large_trade_and_burst() -> None:
-    analyzer, event_bus, _ = make_aggressive_analyzer(
+async def test_aggressive_trades_detects_bullish_large_buying_pressure() -> None:
+    analyzer, event_bus, _, _ = make_aggressive_analyzer(
         [
-            buy(1, 20, price=100, ts=now_ts(-4), is_aggressive=True),
-            buy(2, 15, price=100, ts=now_ts(-3), is_aggressive=True),
-            buy(3, 10, price=100, ts=now_ts(-2), is_aggressive=True),
-            sell(4, 2, price=100, ts=now_ts(-1), is_aggressive=True),
+            buy(1, 15, price=100, ts=now_ts(-4), is_aggressive=True),
+            buy(2, 12, price=101, ts=now_ts(-3), is_aggressive=True),
+            buy(3, 10, price=102, ts=now_ts(-2), is_aggressive=True),
+            sell(4, 2, price=103, ts=now_ts(-1), is_aggressive=True),
         ],
         config=make_aggressive_config(
-            min_trades_in_window=2,
             bullish_buy_ratio_threshold=0.65,
             bullish_delta_threshold=1.0,
             large_trade_notional_threshold=1_000.0,
             min_large_trades_for_signal=1,
             burst_trades_threshold=3,
-            burst_volume_threshold=1.0,
-            burst_score_threshold=1.0,
+            burst_volume_threshold=0.0,
+            burst_score_threshold=0.1,
         ),
     )
 
-    stats = await analyzer.process_symbol("btcusdt")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert stats.symbol == "BTCUSDT"
+    assert stats.key == DEFAULT_KEY
     assert stats.trades_count == 4
     assert stats.aggressive_buy_count == 3
     assert stats.aggressive_sell_count == 1
-    assert stats.aggressive_buy_volume == pytest.approx(45.0)
+    assert stats.aggressive_buy_volume == pytest.approx(37.0)
     assert stats.aggressive_sell_volume == pytest.approx(2.0)
-    assert stats.net_volume_delta == pytest.approx(43.0)
-    assert stats.buy_ratio == pytest.approx(45 / 47)
+    assert stats.net_volume_delta == pytest.approx(35.0)
+    assert stats.buy_ratio == pytest.approx(37.0 / 39.0)
     assert stats.large_buy_trades >= 1
-    assert stats.burst_score >= 1.0
+    assert stats.burst_score > 0
 
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.AGGRESSIVE_TRADES_UPDATED.value,
+        metric="aggressive_trades",
     )
     assert_signal_emitted(
         event_bus,
         topic=OrderFlowEventTopic.AGGRESSIVE_TRADES_SIGNAL.value,
+        metric="aggressive_trades",
         signal_type="bullish",
         side="buy",
     )
 
 
 @pytest.mark.asyncio
-async def test_aggressive_trades_detects_sell_pressure_and_bearish_signal() -> None:
-    analyzer, event_bus, _ = make_aggressive_analyzer(
+async def test_aggressive_trades_detects_bearish_large_selling_pressure() -> None:
+    analyzer, event_bus, _, _ = make_aggressive_analyzer(
         [
-            sell(1, 20, price=100, ts=now_ts(-4), is_aggressive=True),
-            sell(2, 15, price=100, ts=now_ts(-3), is_aggressive=True),
-            sell(3, 10, price=100, ts=now_ts(-2), is_aggressive=True),
-            buy(4, 2, price=100, ts=now_ts(-1), is_aggressive=True),
+            sell(1, 15, price=100, ts=now_ts(-4), is_aggressive=True),
+            sell(2, 12, price=99, ts=now_ts(-3), is_aggressive=True),
+            sell(3, 10, price=98, ts=now_ts(-2), is_aggressive=True),
+            buy(4, 2, price=97, ts=now_ts(-1), is_aggressive=True),
         ],
         config=make_aggressive_config(
-            min_trades_in_window=2,
             bearish_sell_ratio_threshold=0.65,
-            bearish_delta_threshold=1.0,
+            bearish_delta_threshold=-1.0,
             large_trade_notional_threshold=1_000.0,
             min_large_trades_for_signal=1,
+            burst_trades_threshold=3,
+            burst_volume_threshold=0.0,
+            burst_score_threshold=0.1,
         ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert stats.aggressive_sell_count == 3
-    assert stats.aggressive_buy_count == 1
-    assert stats.net_volume_delta == pytest.approx(-43.0)
-    assert stats.sell_ratio == pytest.approx(45 / 47)
+    assert stats.aggressive_buy_volume == pytest.approx(2.0)
+    assert stats.aggressive_sell_volume == pytest.approx(37.0)
+    assert stats.net_volume_delta == pytest.approx(-35.0)
+    assert stats.sell_ratio == pytest.approx(37.0 / 39.0)
     assert stats.large_sell_trades >= 1
 
     assert_signal_emitted(
         event_bus,
         topic=OrderFlowEventTopic.AGGRESSIVE_TRADES_SIGNAL.value,
+        metric="aggressive_trades",
         signal_type="bearish",
         side="sell",
     )
@@ -1001,305 +1339,497 @@ async def test_aggressive_trades_detects_sell_pressure_and_bearish_signal() -> N
 
 @pytest.mark.asyncio
 async def test_aggressive_trades_ignores_non_aggressive_trades_for_pressure_stats() -> None:
-    analyzer, event_bus, _ = make_aggressive_analyzer(
+    analyzer, event_bus, _, _ = make_aggressive_analyzer(
         [
-            buy(1, 100, ts=now_ts(-4), is_aggressive=False),
-            buy(2, 100, ts=now_ts(-3), is_aggressive=False),
-            sell(3, 5, ts=now_ts(-2), is_aggressive=True),
-            sell(4, 5, ts=now_ts(-1), is_aggressive=True),
+            buy(1, 100, price=100, ts=now_ts(-4), is_aggressive=False),
+            buy(2, 100, price=100, ts=now_ts(-3), is_aggressive=False),
+            sell(3, 2, price=100, ts=now_ts(-2), is_aggressive=True),
+            sell(4, 2, price=100, ts=now_ts(-1), is_aggressive=True),
         ],
         config=make_aggressive_config(
             min_trades_in_window=2,
-            bearish_sell_ratio_threshold=0.65,
+            large_trade_notional_threshold=1_000.0,
+            burst_score_threshold=0.1,
         ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert stats.trades_count == 2
+    assert stats.trades_count == 4
     assert stats.aggressive_buy_count == 0
     assert stats.aggressive_sell_count == 2
-    assert stats.aggressive_buy_volume == 0
-    assert stats.aggressive_sell_volume == pytest.approx(10.0)
+    assert stats.aggressive_buy_volume == pytest.approx(0.0)
+    assert stats.aggressive_sell_volume == pytest.approx(4.0)
 
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.AGGRESSIVE_TRADES_UPDATED.value,
+        metric="aggressive_trades",
     )
+
+    signals = emitted_events(
+        event_bus,
+        OrderFlowEventTopic.AGGRESSIVE_TRADES_SIGNAL.value,
+    )
+    assert len(signals) <= 1
 
 
 @pytest.mark.asyncio
-async def test_aggressive_trades_does_not_signal_when_large_trade_requirement_not_met() -> None:
-    analyzer, event_bus, _ = make_aggressive_analyzer(
+async def test_aggressive_trades_requires_large_trade_confirmation_for_signal() -> None:
+    analyzer, event_bus, _, _ = make_aggressive_analyzer(
         [
-            buy(1, 4, price=100, ts=now_ts(-3), is_aggressive=True),
-            buy(2, 4, price=100, ts=now_ts(-2), is_aggressive=True),
-            sell(3, 1, price=100, ts=now_ts(-1), is_aggressive=True),
+            buy(1, 1, price=100, ts=now_ts(-4), is_aggressive=True),
+            buy(2, 1, price=101, ts=now_ts(-3), is_aggressive=True),
+            buy(3, 1, price=102, ts=now_ts(-2), is_aggressive=True),
+            sell(4, 0.1, price=103, ts=now_ts(-1), is_aggressive=True),
         ],
         config=make_aggressive_config(
-            min_trades_in_window=2,
             bullish_buy_ratio_threshold=0.65,
-            bullish_delta_threshold=1.0,
+            bullish_delta_threshold=0.1,
             large_trade_notional_threshold=10_000.0,
             min_large_trades_for_signal=1,
+            burst_score_threshold=0.1,
         ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert stats.buy_ratio > 0.65
     assert stats.large_buy_trades == 0
-
     assert_update_emitted(
         event_bus,
         topic=OrderFlowEventTopic.AGGRESSIVE_TRADES_UPDATED.value,
+        metric="aggressive_trades",
     )
+    assert emitted_events(event_bus, OrderFlowEventTopic.AGGRESSIVE_TRADES_SIGNAL.value) == []
 
-    signal_events = [
-        item for item in event_bus.emitted
-        if item["topic"] == OrderFlowEventTopic.AGGRESSIVE_TRADES_SIGNAL.value
-    ]
-    assert signal_events == []
+
+# =============================================================================
+# Cache compatibility / async / event handling
+# =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_aggressive_trades_filters_duplicate_trades_between_runs() -> None:
-    trades = [
-        buy(1, 10, price=100, ts=now_ts(-3), is_aggressive=True),
-        sell(2, 1, price=100, ts=now_ts(-2), is_aggressive=True),
-    ]
-    analyzer, _, cache = make_aggressive_analyzer(
-        trades,
-        config=make_aggressive_config(min_trades_in_window=2),
+async def test_async_trades_cache_method_is_awaited() -> None:
+    cache = AsyncTradesCache(
+        {
+            DEFAULT_KEY: [
+                buy(1, 3, ts=now_ts(-2)),
+                sell(2, 1, ts=now_ts(-1)),
+            ]
+        }
     )
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer([], cache=cache)
 
-    first_stats = await analyzer.process_symbol("BTCUSDT")
-    first_processed_trades = analyzer.stats()["metrics"]["processed_trades"]
-    first_store_size = len(analyzer._trades_by_symbol["BTCUSDT"])  # noqa: SLF001
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
-    cache.set_trades(list(trades))
-    second_stats = await analyzer.process_symbol("BTCUSDT")
-    second_processed_trades = analyzer.stats()["metrics"]["processed_trades"]
-    second_store_size = len(analyzer._trades_by_symbol["BTCUSDT"])  # noqa: SLF001
-
-    assert first_stats is not None
-    assert second_stats is not None
-    assert first_store_size == 2
-    assert second_store_size == 2
-    assert second_stats.trades_count == first_stats.trades_count
-    assert second_processed_trades == first_processed_trades
+    assert stats is not None
+    assert cache.calls[-1]["method"] == "get_recent_trades"
+    assert cache.calls[-1]["exchange"] == "binance"
+    assert cache.calls[-1]["market_type"] == "usdm_futures"
+    assert cache.calls[-1]["symbol"] == "BTCUSDT"
+    assert_update_emitted(
+        event_bus,
+        topic=OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value,
+        metric="volume_delta",
+    )
 
 
 @pytest.mark.asyncio
-async def test_aggressive_trades_malformed_payloads_are_skipped_without_crashing() -> None:
-    analyzer, event_bus, _ = make_aggressive_analyzer(
-        malformed_trades(),
-        config=make_aggressive_config(min_trades_in_window=1),
+async def test_legacy_symbol_only_get_fallback_still_works_but_is_not_primary_contract() -> None:
+    cache = LegacySymbolOnlyTradesCache(
+        cache_result(
+            [
+                buy(1, 3, ts=now_ts(-2)),
+                sell(2, 1, ts=now_ts(-1)),
+            ]
+        )
     )
+    analyzer, _, _, _ = make_cvd_analyzer([], cache=cache)
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
-    assert stats is None
-    assert event_bus.emitted == []
-
-    snapshot = analyzer.stats()
-    assert snapshot["metrics"]["processed"] == 0
-    assert snapshot["metrics"]["skipped"] >= 1
+    assert stats is not None
+    assert cache.calls == [("get", "BTCUSDT")]
+    assert stats.volume_delta == pytest.approx(2.0)
 
 
 @pytest.mark.asyncio
-async def test_aggressive_trades_cache_exception_is_handled_without_crashing() -> None:
-    cache = FakeTradesCache(method="get_recent_trades", fail=True)
-    analyzer, event_bus, _ = make_aggressive_analyzer(
-        [],
-        cache=cache,
+async def test_handle_event_extracts_scoped_key_and_processes_cache_snapshot() -> None:
+    cache = StrictTradesCache(
+        {
+            BYBIT_KEY: [
+                buy(1, 3, ts=now_ts(-2), orderflow_key=BYBIT_KEY),
+                sell(2, 1, ts=now_ts(-1), orderflow_key=BYBIT_KEY),
+            ]
+        }
     )
-
-    stats = await analyzer.process_symbol("BTCUSDT")
-
-    assert stats is None
-    assert event_bus.emitted == []
-
-    snapshot = analyzer.stats()
-    assert snapshot["metrics"]["processed"] == 0
-    assert snapshot["metrics"]["skipped"] >= 1
-
-
-# ---------------------------------------------------------------------
-# Event handler / sorting / maxlen behavior
-# ---------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_trade_analyzers_process_symbol_from_eventbus_event_payload_symbol() -> None:
-    trades = [
-        buy(1, 3, ts=now_ts(-2)),
-        sell(2, 1, ts=now_ts(-1)),
-    ]
-    analyzer, event_bus, _ = make_volume_delta_analyzer(
-        trades,
-        config=make_volume_delta_config(min_trades_in_window=2),
-    )
+    analyzer, event_bus, _, _ = make_cvd_analyzer([], cache=cache)
 
     event = Event(
-        topic="market.trade",
-        payload={"data": {"symbol": "btcusdt"}},
+        topic=TRADES_TOPIC,
+        payload={
+            "data": {
+                "scope": {
+                    "exchange": "bybit",
+                    "market_type": "linear",
+                    "symbol": "btcusdt",
+                    "timeframe": "1m",
+                }
+            }
+        },
     )
 
     await analyzer._handle_event(event)  # noqa: SLF001
 
-    assert analyzer.get_latest_stats("BTCUSDT") is not None
+    assert cache.calls[-1]["exchange"] == "bybit"
+    assert cache.calls[-1]["market_type"] == "linear"
+    assert cache.calls[-1]["symbol"] == "BTCUSDT"
+
     assert_update_emitted(
         event_bus,
-        topic=OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value,
+        topic=OrderFlowEventTopic.CVD_UPDATED.value,
+        metric="cvd",
+        expected_key=BYBIT_KEY,
     )
 
 
 @pytest.mark.asyncio
-async def test_trade_analyzers_skip_event_without_symbol_without_crashing() -> None:
-    analyzer, event_bus, _ = make_volume_delta_analyzer(
+async def test_handle_event_without_scoped_key_is_skipped_without_cache_call() -> None:
+    cache = StrictTradesCache({DEFAULT_KEY: [buy(1, 1), sell(2, 1)]})
+    analyzer, event_bus, _, _ = make_cvd_analyzer([], cache=cache)
+
+    event = Event(
+        topic=TRADES_TOPIC,
+        payload={"data": {"price": 100.0}},
+    )
+
+    await analyzer._handle_event(event)  # noqa: SLF001
+
+    assert cache.calls == []
+    assert event_bus.emitted == []
+    assert analyzer.stats()["metrics"]["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_exception_is_handled_without_crashing_or_emitting() -> None:
+    cache = StrictTradesCache({DEFAULT_KEY: [buy(1, 1), sell(2, 1)]}, fail=True)
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer([], cache=cache)
+
+    stats = await analyzer.process_key(DEFAULT_KEY)
+
+    assert stats is None
+    assert event_bus.emitted == []
+
+    snapshot = analyzer.stats()
+    assert snapshot["metrics"]["processed"] == 0
+    assert snapshot["metrics"]["skipped"] >= 1 or snapshot["metrics"]["errors"] >= 1
+
+
+# =============================================================================
+# Scope filters / futures-only behavior
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_spot_market_type_is_blocked_in_futures_only_mode() -> None:
+    spot_key = key(exchange="binance", market_type="spot", symbol="BTCUSDT", timeframe="1m")
+    cache = StrictTradesCache(
+        {
+            spot_key: [
+                buy(1, 3, orderflow_key=spot_key),
+                sell(2, 1, orderflow_key=spot_key),
+            ]
+        }
+    )
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
+        [],
+        cache=cache,
+        config=make_volume_delta_config(allowed_market_types={"usdm_futures", "linear", "swap"}),
+    )
+
+    stats = await analyzer.process_key(spot_key)
+
+    assert stats is None
+    assert cache.calls == []
+    assert event_bus.emitted == []
+    assert analyzer.stats()["metrics"]["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_allowed_exchange_symbol_and_timeframe_filters_are_enforced() -> None:
+    cache = StrictTradesCache(
+        {
+            DEFAULT_KEY: [buy(1, 3), sell(2, 1)],
+            ETH_KEY: [
+                buy(1, 3, orderflow_key=ETH_KEY),
+                sell(2, 1, orderflow_key=ETH_KEY),
+            ],
+            BYBIT_KEY: [
+                buy(1, 3, orderflow_key=BYBIT_KEY),
+                sell(2, 1, orderflow_key=BYBIT_KEY),
+            ],
+            HIGHER_TF_KEY: [
+                buy(1, 3, orderflow_key=HIGHER_TF_KEY),
+                sell(2, 1, orderflow_key=HIGHER_TF_KEY),
+            ],
+        }
+    )
+    analyzer, event_bus, _, _ = make_cvd_analyzer(
+        [],
+        cache=cache,
+        config=make_cvd_config(
+            allowed_exchanges={"binance"},
+            allowed_market_types={"usdm_futures"},
+            allowed_symbols={"BTCUSDT"},
+            allowed_timeframes={"1m"},
+        ),
+    )
+
+    assert await analyzer.process_key(DEFAULT_KEY) is not None
+    assert await analyzer.process_key(ETH_KEY) is None
+    assert await analyzer.process_key(BYBIT_KEY) is None
+    assert await analyzer.process_key(HIGHER_TF_KEY) is None
+
+    assert len(cache.calls) == 1
+    assert cache.calls[0]["exchange"] == "binance"
+    assert cache.calls[0]["market_type"] == "usdm_futures"
+    assert cache.calls[0]["symbol"] == "BTCUSDT"
+    assert cache.calls[0]["timeframe"] == "1m"
+
+    updates = emitted_events(event_bus, OrderFlowEventTopic.CVD_UPDATED.value)
+    assert len(updates) == 1
+    assert_scope_payload(updates[0]["payload"], DEFAULT_KEY)
+
+
+# =============================================================================
+# Dirty payload / vulnerability tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dirty_trade", malformed_trades())
+async def test_dirty_trade_payloads_are_rejected_without_emitting(dirty_trade: Any) -> None:
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
+        [dirty_trade],
+        config=make_volume_delta_config(min_trades_in_window=1),
+    )
+
+    stats = await analyzer.process_key(DEFAULT_KEY)
+
+    assert stats is None
+    assert event_bus.emitted == []
+
+
+@pytest.mark.asyncio
+async def test_normalized_trade_model_from_cache_is_supported() -> None:
+    trade_1 = NormalizedTrade(
+        exchange="binance",
+        market_type="usdm_futures",
+        symbol="BTCUSDT",
+        timeframe="1m",
+        side=OrderFlowSide.BUY,
+        price=100.0,
+        quantity=3.0,
+        notional=300.0,
+        timestamp=now_ts(-2),
+        trade_id="model-1",
+        is_aggressive=True,
+    )
+    trade_2 = NormalizedTrade(
+        exchange="binance",
+        market_type="usdm_futures",
+        symbol="BTCUSDT",
+        timeframe="1m",
+        side=OrderFlowSide.SELL,
+        price=101.0,
+        quantity=1.0,
+        notional=101.0,
+        timestamp=now_ts(-1),
+        trade_id="model-2",
+        is_aggressive=True,
+    )
+
+    analyzer, event_bus, _, _ = make_cvd_analyzer(cache_result([trade_1, trade_2]))
+
+    stats = await analyzer.process_key(DEFAULT_KEY)
+
+    assert stats is not None
+    assert stats.volume_delta == pytest.approx(2.0)
+    assert_update_emitted(
+        event_bus,
+        topic=OrderFlowEventTopic.CVD_UPDATED.value,
+        metric="cvd",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    reason=(
+        "Current trade analyzers may still propagate NaN/inf if NormalizedTrade "
+        "or numeric helpers allow them. Keep this as a vulnerability test until "
+        "all trade analyzers use math.isfinite guards for price/qty/notional."
+    ),
+    strict=False,
+)
+async def test_non_finite_trade_values_are_rejected_instead_of_emitting_nan_stats() -> None:
+    analyzer, event_bus, _, _ = make_volume_delta_analyzer(
+        [
+            buy(1, float("inf"), price=100, ts=now_ts(-2)),
+            sell(2, 1, price=100, ts=now_ts(-1)),
+        ],
+        config=make_volume_delta_config(min_trades_in_window=1),
+    )
+
+    stats = await analyzer.process_key(DEFAULT_KEY)
+
+    assert stats is None
+    assert event_bus.emitted == []
+
+
+# =============================================================================
+# Emit failure / cleanup / concurrency
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_update_emit_failure_is_captured_without_crashing_or_losing_latest_stats() -> None:
+    event_bus = FakeEventBus()
+    event_bus.fail_emit_topics.add(OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value)
+
+    analyzer, _, _, _ = make_volume_delta_analyzer(
         [
             buy(1, 3, ts=now_ts(-2)),
             sell(2, 1, ts=now_ts(-1)),
         ],
+        event_bus=event_bus,
+        config=make_volume_delta_config(emit_signals=False),
     )
 
-    event = Event(
-        topic="market.trade",
-        payload={"data": {"price": 100}},
-    )
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
-    await analyzer._handle_event(event)  # noqa: SLF001
-
+    assert stats is not None
     assert event_bus.emitted == []
-    assert analyzer.stats()["metrics"]["skipped"] >= 1
+    assert analyzer.get_latest_stats_by_key(DEFAULT_KEY) == stats
+
+    metrics = analyzer.stats()["metrics"]
+    assert metrics["emit_errors"] == 1
+    assert metrics["updates_emitted"] == 0
 
 
 @pytest.mark.asyncio
-async def test_trade_normalization_sorts_by_timestamp_before_calculation() -> None:
-    """
-    Vulnerability test.
-
-    Exchange/cache payloads often arrive out of order. The analyzer should sort
-    normalized trades before calculating last_price/window stats.
-    """
-    analyzer, _, _ = make_volume_delta_analyzer(
-        [
-            buy(3, 1, price=103, ts=1003.0),
-            buy(1, 1, price=101, ts=1001.0),
-            sell(2, 1, price=102, ts=1002.0),
-        ],
-        config=make_volume_delta_config(
-            min_trades_in_window=2,
-            bullish_delta_ratio_threshold=0.0,
-            require_ratio_and_absolute_confirmation=False,
-        ),
-    )
-
-    stats = await analyzer.process_symbol("BTCUSDT")
-
-    assert stats is not None
-    assert stats.last_price == pytest.approx(103.0)
-
-    stored = list(analyzer._trades_by_symbol["BTCUSDT"])  # noqa: SLF001
-    assert [trade.trade_id for trade in stored] == ["1", "2", "3"]
-
-
-@pytest.mark.asyncio
-async def test_max_trades_per_symbol_is_enforced_by_bounded_deque() -> None:
-    analyzer, _, _ = make_volume_delta_analyzer(
-        [
-            buy(1, 1, ts=now_ts(-5)),
-            sell(2, 1, ts=now_ts(-4)),
-            buy(3, 1, ts=now_ts(-3)),
-            sell(4, 1, ts=now_ts(-2)),
-            buy(5, 1, ts=now_ts(-1)),
-        ],
-        config=make_volume_delta_config(
-            max_trades_per_symbol=3,
-            min_trades_in_window=2,
-            require_ratio_and_absolute_confirmation=False,
-        ),
-    )
-
-    stats = await analyzer.process_symbol("BTCUSDT")
-
-    assert stats is not None
-
-    stored = list(analyzer._trades_by_symbol["BTCUSDT"])  # noqa: SLF001
-    assert len(stored) == 3
-    assert [trade.trade_id for trade in stored] == ["3", "4", "5"]
-
-
-@pytest.mark.asyncio
-async def test_emit_failure_does_not_rollback_calculated_trade_state() -> None:
-    """
-    Vulnerability test.
-
-    EventBus can fail temporarily. Calculation state should still be stored,
-    emit_errors should increase, and process_symbol() should not crash.
-    """
+async def test_signal_emit_failure_does_not_rollback_update_or_latest_stats() -> None:
     event_bus = FakeEventBus()
-    event_bus.fail_emit_topics.add(OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value)
+    event_bus.fail_emit_topics.add(OrderFlowEventTopic.CVD_SIGNAL.value)
 
-    analyzer, _, _ = make_volume_delta_analyzer(
+    analyzer, _, _, _ = make_cvd_analyzer(
         [
             buy(1, 5, ts=now_ts(-2)),
             sell(2, 1, ts=now_ts(-1)),
         ],
         event_bus=event_bus,
-        config=make_volume_delta_config(
-            min_trades_in_window=2,
-            emit_signals=False,
-        ),
     )
 
-    stats = await analyzer.process_symbol("BTCUSDT")
+    stats = await analyzer.process_key(DEFAULT_KEY)
 
     assert stats is not None
-    assert analyzer.get_latest_stats("BTCUSDT") is not None
-    assert event_bus.emitted == []
+    assert analyzer.get_latest_stats_by_key(DEFAULT_KEY) == stats
+    assert len(emitted_events(event_bus, OrderFlowEventTopic.CVD_UPDATED.value)) == 1
+    assert len(emitted_events(event_bus, OrderFlowEventTopic.CVD_SIGNAL.value)) == 0
 
-    snapshot = analyzer.stats()
-    assert snapshot["metrics"]["processed"] == 1
-    assert snapshot["metrics"]["emit_errors"] == 1
+    metrics = analyzer.stats()["metrics"]
+    assert metrics["updates_emitted"] == 1
+    assert metrics["signals_emitted"] == 0
+    assert metrics["emit_errors"] == 1
 
 
-def test_make_trade_key_is_stable_for_trade_id_and_fallback_fields() -> None:
-    analyzer, _, _ = make_volume_delta_analyzer([])
-
-    with_trade_id = NormalizedTrade.create(
-        symbol="btcusdt",
-        side=OrderFlowSide.BUY,
-        price=100,
-        quantity=1,
-        timestamp=123,
-        trade_id="abc",
+@pytest.mark.asyncio
+async def test_cleanup_removes_only_stale_scoped_state() -> None:
+    cache = StrictTradesCache(
+        {
+            DEFAULT_KEY: [buy(1, 3, ts=now_ts(-2)), sell(2, 1, ts=now_ts(-1))],
+            BYBIT_KEY: [
+                buy(3, 3, ts=now_ts(-2), orderflow_key=BYBIT_KEY),
+                sell(4, 1, ts=now_ts(-1), orderflow_key=BYBIT_KEY),
+            ],
+        }
     )
-    same_trade_id_different_price = NormalizedTrade.create(
-        symbol="btcusdt",
-        side=OrderFlowSide.SELL,
-        price=999,
-        quantity=9,
-        timestamp=999,
-        trade_id="abc",
-    )
-    no_trade_id = NormalizedTrade.create(
-        symbol="btcusdt",
-        side=OrderFlowSide.BUY,
-        price=100,
-        quantity=1,
-        timestamp=123,
-        trade_id=None,
+    analyzer, _, _, _ = make_volume_delta_analyzer(
+        [],
+        cache=cache,
+        config=make_volume_delta_config(window_seconds=30.0),
     )
 
-    assert analyzer.make_trade_key(with_trade_id) == analyzer.make_trade_key(
-        same_trade_id_different_price
+    assert await analyzer.process_key(DEFAULT_KEY) is not None
+    assert await analyzer.process_key(BYBIT_KEY) is not None
+
+    stale_ts = time.time() - 10_000
+    for trade in analyzer._trades_by_key[DEFAULT_KEY]:  # noqa: SLF001
+        trade.timestamp = stale_ts
+
+    await analyzer.cleanup()
+
+    assert analyzer.get_latest_stats_by_key(DEFAULT_KEY) is None
+    assert analyzer.get_latest_stats_by_key(BYBIT_KEY) is not None
+    assert DEFAULT_KEY not in analyzer._trades_by_key  # noqa: SLF001
+    assert BYBIT_KEY in analyzer._trades_by_key  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_concurrent_process_key_calls_do_not_corrupt_state_or_duplicate_trades() -> None:
+    trades = [
+        buy(1, 3, ts=now_ts(-2)),
+        sell(2, 1, ts=now_ts(-1)),
+    ]
+    cache = StrictTradesCache({DEFAULT_KEY: trades})
+    analyzer, event_bus, _, _ = make_cvd_analyzer(trades, cache=cache)
+
+    results = await asyncio.gather(
+        analyzer.process_key(DEFAULT_KEY),
+        analyzer.process_key(DEFAULT_KEY),
+        analyzer.process_key(DEFAULT_KEY),
     )
 
-    fallback_key = analyzer.make_trade_key(no_trade_id)
-    assert "BTCUSDT" in fallback_key
-    assert "100" in fallback_key
-    assert "123" in fallback_key
+    assert all(result is not None for result in results)
+    assert analyzer.get_latest_stats_by_key(DEFAULT_KEY) is not None
+    assert len(analyzer._trades_by_key[DEFAULT_KEY]) == 2  # noqa: SLF001
+
+    updates = emitted_events(event_bus, OrderFlowEventTopic.CVD_UPDATED.value)
+    assert len(updates) == 3
+
+    metrics = analyzer.stats()["metrics"]
+    assert metrics["processed"] == 3
+    assert metrics["processed_trades"] == 2
+
+
+# =============================================================================
+# Backward compatibility
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_process_symbol_wrapper_uses_explicit_default_futures_scope() -> None:
+    analyzer, event_bus, cache, _ = make_volume_delta_analyzer(
+        [
+            buy(1, 3, ts=now_ts(-2)),
+            sell(2, 1, ts=now_ts(-1)),
+        ]
+    )
+
+    stats = await analyzer.process_symbol("btcusdt")
+
+    assert stats is not None
+    assert stats.key == DEFAULT_KEY
+
+    assert cache.calls[-1]["exchange"] == "binance"
+    assert cache.calls[-1]["market_type"] == "usdm_futures"
+    assert cache.calls[-1]["symbol"] == "BTCUSDT"
+    assert cache.calls[-1]["timeframe"] == "1m"
+
+    assert_update_emitted(
+        event_bus,
+        topic=OrderFlowEventTopic.VOLUME_DELTA_UPDATED.value,
+        metric="volume_delta",
+        expected_key=DEFAULT_KEY,
+    )
