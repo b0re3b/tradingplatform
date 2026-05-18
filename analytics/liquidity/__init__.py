@@ -42,7 +42,6 @@ from .liquidity_service import (
     LiquidityService,
     LiquidityServiceContext,
     LiquidityServiceStats,
-    LiquidityTopics,
 )
 
 
@@ -91,5 +90,4 @@ __all__ = [
     "LiquidityService",
     "LiquidityServiceContext",
     "LiquidityServiceStats",
-    "LiquidityTopics",
 ]

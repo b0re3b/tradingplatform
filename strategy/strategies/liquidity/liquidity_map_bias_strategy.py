@@ -35,42 +35,47 @@ from strategy.models import (
 from strategy.strategies.liquidity.base_liquidity_strategy import BaseLiquidityStrategy
 
 
-class LiquiditySweepStrategy(BaseLiquidityStrategy):
+class LiquidityMapBiasStrategy(BaseLiquidityStrategy):
     """
-    Production-ready liquidity magnet / sweep continuation strategy.
+    Production-ready directional bias strategy на основі повної liquidity map.
 
     Семантика:
-    - LONG: домінує upside liquidity magnet / sweep path до buy-side liquidity.
-    - SHORT: домінує downside liquidity magnet / sweep path до sell-side liquidity.
-    - Це НЕ stop-hunt reversal strategy.
-    - Swept / terminal liquidity не використовується як primary target.
-    - Strategy не виконує угоди напряму, а тільки формує StrategySignal.
-    - Risk / execution рішення залишаються в risk та execution пакетах.
+    - LONG: liquidity landscape явно зміщений до upside / buy-side liquidity.
+    - SHORT: liquidity landscape явно зміщений до downside / sell-side liquidity.
+    - Strategy не є stop-hunt reversal і не є aggressive sweep-entry trigger.
+    - Основна роль: дати directional context / bias signal для confluence,
+      hybrid strategies, AI/risk scoring, dashboard і downstream signal processor.
 
-    Очікуваний input:
-    - StrategyContext-like object із LiquidityMapSnapshot.
-    - Snapshot має бути сформований analytics/liquidity.
-    - Scope має збігатися: exchange + market_type + symbol + timeframe.
+    Важливо:
+    - не викликає analytics detectors;
+    - не читає raw market data;
+    - працює тільки з LiquidityMapSnapshot;
+    - перевіряє full scope через BaseLiquidityStrategy:
+      exchange + market_type + symbol + timeframe;
+    - futures/perpetual only;
+    - не виконує угоди напряму.
     """
 
-    EDGE_THRESHOLD: float = 0.45
-    EDGE_DELTA_THRESHOLD: float = 0.12
+    MIN_DIRECTIONAL_EDGE: float = 0.42
+    MIN_EDGE_DELTA: float = 0.10
+    MIN_PRESSURE_ABS: float = 0.12
+    MIN_ANALYTICS_CONFIDENCE: float = 0.35
 
     MIN_TARGET_DISTANCE_PCT: float = 0.0010
-    MAX_TARGET_DISTANCE_PCT: float = 0.0600
+    MAX_TARGET_DISTANCE_PCT: float = 0.0800
 
-    HIGH_PRIORITY_SCORE: float = 1.80
-    HIGH_PRIORITY_CONFIDENCE: float = 0.85
-    CRITICAL_PRIORITY_SCORE: float = 2.20
+    HIGH_PRIORITY_SCORE: float = 1.65
+    HIGH_PRIORITY_CONFIDENCE: float = 0.82
+    CRITICAL_PRIORITY_SCORE: float = 2.05
     CRITICAL_PRIORITY_CONFIDENCE: float = 0.90
 
-    FALLBACK_STOP_PCT: float = 0.0040
-    LONG_STOP_OFFSET: float = 0.9985
-    SHORT_STOP_OFFSET: float = 1.0015
+    FALLBACK_STOP_PCT: float = 0.0050
+    LONG_STOP_OFFSET: float = 0.9980
+    SHORT_STOP_OFFSET: float = 1.0020
 
     @property
     def strategy_name(self) -> str:
-        return "liquidity_sweep_strategy"
+        return "liquidity_map_bias_strategy"
 
     # ------------------------------------------------------------------
     # Public API
@@ -81,7 +86,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
 
         if not self.is_enabled():
             self.log_debug(
-                "LiquiditySweepStrategy skipped: disabled",
+                "LiquidityMapBiasStrategy skipped: disabled",
                 symbol=getattr(context, "symbol", None),
                 timeframe=self._value(getattr(context, "timeframe", None)),
             )
@@ -90,7 +95,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         snapshot = self._extract_snapshot(context)
         if snapshot is None:
             self.log_debug(
-                "LiquiditySweepStrategy skipped: liquidity snapshot not found",
+                "LiquidityMapBiasStrategy skipped: liquidity snapshot not found",
                 symbol=getattr(context, "symbol", None),
                 timeframe=self._value(getattr(context, "timeframe", None)),
             )
@@ -102,7 +107,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         current_price = self._resolve_current_price(context, snapshot)
         if current_price is None:
             self.log_warning(
-                "LiquiditySweepStrategy skipped: current price unavailable",
+                "LiquidityMapBiasStrategy skipped: current price unavailable",
                 exchange=snapshot.exchange,
                 market_type=snapshot.market_type,
                 symbol=snapshot.symbol,
@@ -117,7 +122,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         )
         if any(result.blocked for result in filters):
             self.log_debug(
-                "LiquiditySweepStrategy blocked by filters",
+                "LiquidityMapBiasStrategy blocked by filters",
                 exchange=snapshot.exchange,
                 market_type=snapshot.market_type,
                 symbol=snapshot.symbol,
@@ -129,14 +134,15 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         side = self._infer_side(snapshot)
         if side == SignalSide.UNKNOWN:
             self.log_debug(
-                "LiquiditySweepStrategy skipped: no directional liquidity sweep edge",
+                "LiquidityMapBiasStrategy skipped: no strong liquidity map bias",
                 exchange=snapshot.exchange,
                 market_type=snapshot.market_type,
                 symbol=snapshot.symbol,
                 timeframe=snapshot.timeframe,
-                up_edge=self._upside_edge(snapshot),
-                down_edge=self._downside_edge(snapshot),
                 bias=self._value(snapshot.bias),
+                upside_edge=self._upside_bias_edge(snapshot),
+                downside_edge=self._downside_bias_edge(snapshot),
+                pressure=snapshot.liquidity_pressure_score,
             )
             return None
 
@@ -145,16 +151,6 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             current_price=current_price,
             side=side,
         )
-        if target is None:
-            self.log_debug(
-                "LiquiditySweepStrategy skipped: no valid directional liquidity target",
-                exchange=snapshot.exchange,
-                market_type=snapshot.market_type,
-                symbol=snapshot.symbol,
-                timeframe=snapshot.timeframe,
-                side=self._value(side),
-            )
-            return None
 
         confidence = self._compute_confidence(
             snapshot=snapshot,
@@ -176,7 +172,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
 
         if confidence < min_confidence or score < min_score:
             self.log_debug(
-                "LiquiditySweepStrategy skipped: below thresholds",
+                "LiquidityMapBiasStrategy skipped: below thresholds",
                 exchange=snapshot.exchange,
                 market_type=snapshot.market_type,
                 symbol=snapshot.symbol,
@@ -232,107 +228,187 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             current_price=current_price,
         )
 
-        up_edge = self._upside_edge(snapshot)
-        down_edge = self._downside_edge(snapshot)
-        directional_edge = max(up_edge, down_edge)
-        edge_delta = abs(up_edge - down_edge)
+        upside_edge = self._upside_bias_edge(snapshot)
+        downside_edge = self._downside_bias_edge(snapshot)
+        edge_delta = abs(upside_edge - downside_edge)
+        directional_edge = max(upside_edge, downside_edge)
+        pressure_abs = abs(self._clamp_signed(snapshot.liquidity_pressure_score))
 
-        if directional_edge < self.EDGE_THRESHOLD and edge_delta < self.EDGE_DELTA_THRESHOLD:
+        if directional_edge < self.MIN_DIRECTIONAL_EDGE:
             results.append(
                 FilterResult(
-                    name="liquidity_sweep_directional_edge",
+                    name="liquidity_map_bias_directional_edge",
                     decision=FilterDecision.BLOCK,
                     reason=(
-                        "No strong directional liquidity sweep edge: "
-                        f"up_edge={up_edge:.4f}, down_edge={down_edge:.4f}, "
-                        f"delta={edge_delta:.4f}"
+                        "Directional liquidity map edge too weak: "
+                        f"upside={upside_edge:.4f}, downside={downside_edge:.4f}, "
+                        f"required={self.MIN_DIRECTIONAL_EDGE:.4f}"
                     ),
                 )
             )
         else:
             results.append(
                 FilterResult(
-                    name="liquidity_sweep_directional_edge",
+                    name="liquidity_map_bias_directional_edge",
                     decision=FilterDecision.PASS,
                     reason=(
-                        "Directional liquidity sweep edge present: "
-                        f"up_edge={up_edge:.4f}, down_edge={down_edge:.4f}, "
-                        f"delta={edge_delta:.4f}"
+                        "Directional liquidity map edge present: "
+                        f"upside={upside_edge:.4f}, downside={downside_edge:.4f}"
                     ),
                 )
             )
 
-        if self._snapshot_has_usable_targets(snapshot=snapshot, current_price=current_price):
+        if edge_delta < self.MIN_EDGE_DELTA and pressure_abs < self.MIN_PRESSURE_ABS:
             results.append(
                 FilterResult(
-                    name="liquidity_sweep_target_presence",
-                    decision=FilterDecision.PASS,
-                    reason="Valid non-swept directional liquidity target exists",
+                    name="liquidity_map_bias_separation",
+                    decision=FilterDecision.BLOCK,
+                    reason=(
+                        "Liquidity map bias separation too weak: "
+                        f"edge_delta={edge_delta:.4f}, pressure_abs={pressure_abs:.4f}"
+                    ),
                 )
             )
         else:
             results.append(
                 FilterResult(
-                    name="liquidity_sweep_target_presence",
+                    name="liquidity_map_bias_separation",
+                    decision=FilterDecision.PASS,
+                    reason=(
+                        "Liquidity map bias separation accepted: "
+                        f"edge_delta={edge_delta:.4f}, pressure_abs={pressure_abs:.4f}"
+                    ),
+                )
+            )
+
+        analytics_confidence = self._analytics_signal_confidence(snapshot)
+        if analytics_confidence < self.MIN_ANALYTICS_CONFIDENCE:
+            results.append(
+                FilterResult(
+                    name="liquidity_map_bias_analytics_confidence",
                     decision=FilterDecision.BLOCK,
-                    reason="No valid non-swept directional liquidity target exists",
+                    reason=(
+                        "Analytics liquidity signal confidence too weak: "
+                        f"{analytics_confidence:.4f}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                FilterResult(
+                    name="liquidity_map_bias_analytics_confidence",
+                    decision=FilterDecision.PASS,
+                    reason=(
+                        "Analytics liquidity signal confidence accepted: "
+                        f"{analytics_confidence:.4f}"
+                    ),
                 )
             )
 
         return results
 
-    def _snapshot_has_usable_targets(
-        self,
-        snapshot: LiquidityMapSnapshot,
-        current_price: float,
-    ) -> bool:
-        return bool(
-            self._collect_targets_above(snapshot, current_price)
-            or self._collect_targets_below(snapshot, current_price)
-        )
-
     # ------------------------------------------------------------------
-    # Direction inference
+    # Bias inference
     # ------------------------------------------------------------------
 
     def _infer_side(self, snapshot: LiquidityMapSnapshot) -> SignalSide:
-        up_edge = self._upside_edge(snapshot)
-        down_edge = self._downside_edge(snapshot)
-        delta = up_edge - down_edge
+        upside_edge = self._upside_bias_edge(snapshot)
+        downside_edge = self._downside_bias_edge(snapshot)
+        delta = upside_edge - downside_edge
+        pressure = self._clamp_signed(snapshot.liquidity_pressure_score)
 
-        if snapshot.bias == LiquidityBias.UP and up_edge >= self.EDGE_THRESHOLD:
+        if snapshot.bias == LiquidityBias.UP:
+            if upside_edge >= self.MIN_DIRECTIONAL_EDGE:
+                return SignalSide.LONG
+
+        if snapshot.bias == LiquidityBias.DOWN:
+            if downside_edge >= self.MIN_DIRECTIONAL_EDGE:
+                return SignalSide.SHORT
+
+        if (
+            delta >= self.MIN_EDGE_DELTA
+            and upside_edge >= self.MIN_DIRECTIONAL_EDGE
+            and pressure >= -0.05
+        ):
             return SignalSide.LONG
 
-        if snapshot.bias == LiquidityBias.DOWN and down_edge >= self.EDGE_THRESHOLD:
+        if (
+            delta <= -self.MIN_EDGE_DELTA
+            and downside_edge >= self.MIN_DIRECTIONAL_EDGE
+            and pressure <= 0.05
+        ):
             return SignalSide.SHORT
 
-        if delta >= self.EDGE_DELTA_THRESHOLD and up_edge >= self.EDGE_THRESHOLD * 0.80:
+        if pressure >= self.MIN_PRESSURE_ABS and upside_edge >= self.MIN_DIRECTIONAL_EDGE * 0.85:
             return SignalSide.LONG
 
-        if delta <= -self.EDGE_DELTA_THRESHOLD and down_edge >= self.EDGE_THRESHOLD * 0.80:
+        if pressure <= -self.MIN_PRESSURE_ABS and downside_edge >= self.MIN_DIRECTIONAL_EDGE * 0.85:
             return SignalSide.SHORT
 
         return SignalSide.UNKNOWN
 
-    def _upside_edge(self, snapshot: LiquidityMapSnapshot) -> float:
+    def _upside_bias_edge(self, snapshot: LiquidityMapSnapshot) -> float:
         pressure = max(self._clamp_signed(snapshot.liquidity_pressure_score), 0.0)
 
+        bias_bonus = 0.10 if snapshot.bias == LiquidityBias.UP else 0.0
+        signal_bias_bonus = 0.05 if self._snapshot_signal_bias(snapshot) == LiquidityBias.UP else 0.0
+
         return self._clamp01(
-            0.34 * self._magnet_score_up(snapshot)
-            + 0.28 * self._sweep_risk_up(snapshot)
-            + 0.22 * self._clamp01(snapshot.above_liquidity_score)
+            0.24 * self._clamp01(snapshot.above_liquidity_score)
+            + 0.22 * self._magnet_score_up(snapshot)
+            + 0.18 * self._sweep_risk_up(snapshot)
             + 0.16 * pressure
+            + 0.10 * self._zone_score(snapshot, LiquiditySide.BUY_SIDE)
+            + bias_bonus
+            + signal_bias_bonus
         )
 
-    def _downside_edge(self, snapshot: LiquidityMapSnapshot) -> float:
+    def _downside_bias_edge(self, snapshot: LiquidityMapSnapshot) -> float:
         pressure = max(-self._clamp_signed(snapshot.liquidity_pressure_score), 0.0)
 
+        bias_bonus = 0.10 if snapshot.bias == LiquidityBias.DOWN else 0.0
+        signal_bias_bonus = 0.05 if self._snapshot_signal_bias(snapshot) == LiquidityBias.DOWN else 0.0
+
         return self._clamp01(
-            0.34 * self._magnet_score_down(snapshot)
-            + 0.28 * self._sweep_risk_down(snapshot)
-            + 0.22 * self._clamp01(snapshot.below_liquidity_score)
+            0.24 * self._clamp01(snapshot.below_liquidity_score)
+            + 0.22 * self._magnet_score_down(snapshot)
+            + 0.18 * self._sweep_risk_down(snapshot)
             + 0.16 * pressure
+            + 0.10 * self._zone_score(snapshot, LiquiditySide.SELL_SIDE)
+            + bias_bonus
+            + signal_bias_bonus
         )
+
+    def _snapshot_signal_bias(self, snapshot: LiquidityMapSnapshot) -> LiquidityBias | None:
+        if snapshot.signal is None:
+            return None
+
+        bias = getattr(snapshot.signal, "bias", None)
+        if isinstance(bias, LiquidityBias):
+            return bias
+
+        try:
+            return LiquidityBias(str(bias))
+        except Exception:
+            return None
+
+    def _analytics_signal_confidence(self, snapshot: LiquidityMapSnapshot) -> float:
+        if snapshot.signal is None:
+            metadata_confidence = (snapshot.metadata or {}).get("confidence")
+            return self._clamp01(metadata_confidence or 0.0)
+
+        return self._clamp01(getattr(snapshot.signal, "confidence", 0.0))
+
+    def _zone_score(
+        self,
+        snapshot: LiquidityMapSnapshot,
+        side: LiquiditySide,
+    ) -> float:
+        zones = self._directional_zones(snapshot, side)
+        if not zones:
+            return 0.0
+
+        return self._clamp01(max(self._clamp01(zone.score) for zone in zones))
 
     # ------------------------------------------------------------------
     # Target selection
@@ -345,14 +421,10 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
         """
-        Обирає primary target для magnet follow-through.
+        Bias strategy може мати target, але target не є обов'язковим.
 
-        Пріоритет:
-        1. nearest directional liquidity;
-        2. strongest directional cluster;
-        3. sorted fallback targets from BaseLiquidityStrategy.
-
-        Swept/terminal targets не використовуються.
+        Для confluence-сигналу достатньо сильного directional bias.
+        Якщо target є — він посилює confidence/score і додається в metadata.
         """
 
         if side == SignalSide.LONG:
@@ -361,14 +433,12 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
                 snapshot.strongest_cluster_above,
                 *self._collect_targets_above(snapshot, current_price),
             ]
-            side_liquidity = LiquiditySide.BUY_SIDE
         elif side == SignalSide.SHORT:
             candidates = [
                 snapshot.nearest_below_level,
                 snapshot.strongest_cluster_below,
                 *self._collect_targets_below(snapshot, current_price),
             ]
-            side_liquidity = LiquiditySide.SELL_SIDE
         else:
             return None
 
@@ -376,7 +446,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             item
             for item in candidates
             if item is not None
-            and self._is_valid_follow_through_target(
+            and self._is_valid_bias_target(
                 item=item,
                 current_price=current_price,
                 side=side,
@@ -388,58 +458,19 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         if not valid:
             return None
 
-        zone = self._best_zone_for_side(
-            snapshot=snapshot,
-            side=side_liquidity,
-            current_price=current_price,
-        )
-
-        if zone is not None:
-            zone_center = self._reference_price(zone)
-            zone_aligned = [
-                item
-                for item in valid
-                if self._distance_pct(self._reference_price(item), zone_center) <= 0.01
-            ]
-            if zone_aligned:
-                valid = zone_aligned
-
         if side == SignalSide.LONG:
             return min(valid, key=self._reference_price)
 
         return max(valid, key=self._reference_price)
 
-    def _find_extended_target(
-        self,
-        snapshot: LiquidityMapSnapshot,
-        current_price: float,
-        side: SignalSide,
-        exclude: LiquidityLevel | StopCluster | None = None,
-    ) -> LiquidityLevel | StopCluster | None:
-        if side == SignalSide.LONG:
-            candidates = self._collect_targets_above(snapshot, current_price)
-        elif side == SignalSide.SHORT:
-            candidates = self._collect_targets_below(snapshot, current_price)
-        else:
-            return None
-
-        if exclude is not None:
-            exclude_price = self._reference_price(exclude)
-            candidates = [
-                item
-                for item in candidates
-                if abs(self._reference_price(item) - exclude_price) > 1e-12
-            ]
-
-        return candidates[0] if candidates else None
-
-    def _is_valid_follow_through_target(
+    def _is_valid_bias_target(
         self,
         item: LiquidityLevel | StopCluster,
         current_price: float,
         side: SignalSide,
     ) -> bool:
         ref_price = self._reference_price(item)
+
         if ref_price <= 0 or current_price <= 0:
             return False
 
@@ -478,45 +509,47 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
         side: SignalSide,
-        target: LiquidityLevel | StopCluster,
+        target: LiquidityLevel | StopCluster | None,
     ) -> float:
+        analytics_confidence = self._analytics_signal_confidence(snapshot)
+
         if side == SignalSide.LONG:
-            base = (
-                0.30 * self._magnet_score_up(snapshot)
-                + 0.24 * self._sweep_risk_up(snapshot)
-                + 0.18 * self._clamp01(snapshot.above_liquidity_score)
-                + 0.18 * max(self._clamp_signed(snapshot.liquidity_pressure_score), 0.0)
-                + 0.10 * self._target_quality_bonus(target, current_price)
-            )
+            edge = self._upside_bias_edge(snapshot)
+            opposite_edge = self._downside_bias_edge(snapshot)
+            pressure = max(self._clamp_signed(snapshot.liquidity_pressure_score), 0.0)
             zone_bonus = self._zone_alignment_bonus(
                 snapshot=snapshot,
                 side=LiquiditySide.BUY_SIDE,
                 current_price=current_price,
             )
+            bias_bonus = 0.06 if snapshot.bias == LiquidityBias.UP else 0.0
 
         elif side == SignalSide.SHORT:
-            base = (
-                0.30 * self._magnet_score_down(snapshot)
-                + 0.24 * self._sweep_risk_down(snapshot)
-                + 0.18 * self._clamp01(snapshot.below_liquidity_score)
-                + 0.18 * max(-self._clamp_signed(snapshot.liquidity_pressure_score), 0.0)
-                + 0.10 * self._target_quality_bonus(target, current_price)
-            )
+            edge = self._downside_bias_edge(snapshot)
+            opposite_edge = self._upside_bias_edge(snapshot)
+            pressure = max(-self._clamp_signed(snapshot.liquidity_pressure_score), 0.0)
             zone_bonus = self._zone_alignment_bonus(
                 snapshot=snapshot,
                 side=LiquiditySide.SELL_SIDE,
                 current_price=current_price,
             )
+            bias_bonus = 0.06 if snapshot.bias == LiquidityBias.DOWN else 0.0
+
         else:
             return 0.0
 
-        signal_confidence = (
-            self._clamp01(snapshot.signal.confidence)
-            if snapshot.signal is not None
-            else 0.0
-        )
+        separation = max(edge - opposite_edge, 0.0)
+        target_bonus = self._target_quality_bonus(target, current_price)
 
-        return self._clamp01(base + zone_bonus + 0.08 * signal_confidence)
+        return self._clamp01(
+            0.34 * edge
+            + 0.18 * separation
+            + 0.16 * analytics_confidence
+            + 0.12 * pressure
+            + 0.10 * target_bonus
+            + zone_bonus
+            + bias_bonus
+        )
 
     def _compute_score(
         self,
@@ -524,21 +557,27 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         current_price: float,
         side: SignalSide,
         confidence: float,
-        target: LiquidityLevel | StopCluster,
+        target: LiquidityLevel | StopCluster | None,
     ) -> float:
         if side == SignalSide.LONG:
-            directional_edge = self._upside_edge(snapshot) - self._downside_edge(snapshot)
+            edge = self._upside_bias_edge(snapshot)
+            opposite_edge = self._downside_bias_edge(snapshot)
         elif side == SignalSide.SHORT:
-            directional_edge = self._downside_edge(snapshot) - self._upside_edge(snapshot)
+            edge = self._downside_bias_edge(snapshot)
+            opposite_edge = self._upside_bias_edge(snapshot)
         else:
-            directional_edge = 0.0
+            return 0.0
+
+        separation = max(edge - opposite_edge, 0.0)
+        pressure_abs = abs(self._clamp_signed(snapshot.liquidity_pressure_score))
 
         return max(
             0.0,
-            1.25 * confidence
-            + 0.85 * max(directional_edge, 0.0)
-            + 0.45 * self._target_distance_score(target, current_price)
-            + 0.20 * self._target_quality_bonus(target, current_price)
+            1.20 * confidence
+            + 0.75 * edge
+            + 0.45 * separation
+            + 0.30 * pressure_abs
+            + 0.25 * self._target_distance_score(target, current_price)
         )
 
     def _target_quality_bonus(
@@ -558,31 +597,31 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         bonus = 0.0
 
         if 0.0010 <= distance_pct <= 0.0150:
-            bonus += 0.16
+            bonus += 0.14
         elif distance_pct <= 0.0300:
-            bonus += 0.10
+            bonus += 0.09
         elif distance_pct <= self.MAX_TARGET_DISTANCE_PCT:
             bonus += 0.04
 
         if isinstance(target, StopCluster):
-            bonus += 0.35 * self._clamp01(target.confidence)
+            bonus += 0.32 * self._clamp01(target.confidence)
             bonus += 0.20 * self._clamp01(target.estimated_stop_density)
 
-            strength_value = self._value(getattr(target, "strength", None))
-            if strength_value == "medium":
+            strength = self._value(getattr(target, "strength", None))
+            if strength == "medium":
                 bonus += 0.04
-            elif strength_value == "high":
+            elif strength == "high":
                 bonus += 0.07
-            elif strength_value == "extreme":
+            elif strength == "extreme":
                 bonus += 0.10
 
         elif isinstance(target, LiquidityLevel):
-            bonus += 0.35 * self._clamp01(target.confidence)
+            bonus += 0.32 * self._clamp01(target.confidence)
 
             if target.sweep_status == SweepStatus.PARTIALLY_SWEPT:
-                bonus -= 0.04
+                bonus -= 0.03
             elif target.sweep_status == SweepStatus.SWEPT:
-                bonus -= 0.12
+                bonus -= 0.10
 
         return self._clamp01(bonus)
 
@@ -617,17 +656,17 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         distance_pct = self._distance_pct(ref_price, current_price)
 
         if distance_pct <= 0.001:
-            return 0.10
+            return 0.08
         if distance_pct <= 0.003:
-            return 0.45
+            return 0.38
         if distance_pct <= 0.010:
-            return 1.00
+            return 0.90
         if distance_pct <= 0.020:
-            return 0.75
+            return 0.70
         if distance_pct <= 0.040:
             return 0.40
         if distance_pct <= self.MAX_TARGET_DISTANCE_PCT:
-            return 0.15
+            return 0.18
 
         return 0.0
 
@@ -641,7 +680,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
         side: SignalSide,
-        target: LiquidityLevel | StopCluster,
+        target: LiquidityLevel | StopCluster | None,
         confidence: float,
         score: float,
         filters: list[FilterResult],
@@ -686,33 +725,26 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             current_price=current_price,
             target=target,
             evidence=target,
-            setup_name="liquidity_magnet_follow_through",
+            setup_name="liquidity_map_directional_bias",
             extra={
                 "side": self._value(side),
-                "upside_edge": self._upside_edge(snapshot),
-                "downside_edge": self._downside_edge(snapshot),
-                "edge_delta": self._upside_edge(snapshot) - self._downside_edge(snapshot),
+                "upside_bias_edge": self._upside_bias_edge(snapshot),
+                "downside_bias_edge": self._downside_bias_edge(snapshot),
+                "bias_edge_delta": self._upside_bias_edge(snapshot) - self._downside_bias_edge(snapshot),
+                "analytics_signal_confidence": self._analytics_signal_confidence(snapshot),
                 "target_price": self._reference_price(target),
                 "target_type": self._target_type(target),
                 "target_confidence": self._target_confidence(target),
-                "target_distance_pct": self._distance_pct(
-                    self._reference_price(target),
-                    current_price,
+                "target_distance_pct": (
+                    self._distance_pct(self._reference_price(target), current_price)
+                    if target is not None
+                    else None
                 ),
                 "target_quality_bonus": self._target_quality_bonus(target, current_price),
-                "zone_alignment_bonus": self._zone_alignment_bonus(
-                    snapshot=snapshot,
-                    side=(
-                        LiquiditySide.BUY_SIDE
-                        if side == SignalSide.LONG
-                        else LiquiditySide.SELL_SIDE
-                    ),
-                    current_price=current_price,
-                ),
                 "strategy_weight": (
                     strategy_cfg.weight if strategy_cfg is not None else 1.0
                 ),
-                "strategy_semantics": "liquidity_magnet_follow_through",
+                "strategy_semantics": "liquidity_map_directional_bias",
             },
         )
 
@@ -722,14 +754,14 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             strategy_name=self.strategy_name,
             category=self.category,
             timeframe=snapshot.timeframe,
-            setup_type=SetupType.BREAKOUT,
+            setup_type=SetupType.CONTINUATION,
             timestamp=self._context_timestamp(context),
             confidence=confidence,
             score=score,
             strength=confidence_to_strength(confidence),
             confidence_grade=confidence_to_grade(confidence),
             status=SignalStatus.NEW,
-            trigger_type=TriggerType.PRIMARY,
+            trigger_type=TriggerType.CONFIRMATION,
             origin=SignalOrigin.SINGLE_STRATEGY,
             priority=priority,
             entry_plan=entry_plan,
@@ -741,10 +773,20 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         )
 
         signal.add_reason(self._build_primary_reason(snapshot, side))
-        signal.add_reason(self._build_target_reason(target))
         signal.add_reason(
-            f"Liquidity pressure score = {snapshot.liquidity_pressure_score:.3f}"
+            f"Liquidity map bias edge: up={self._upside_bias_edge(snapshot):.3f}, "
+            f"down={self._downside_bias_edge(snapshot):.3f}"
         )
+        signal.add_reason(
+            f"Signed liquidity pressure={snapshot.liquidity_pressure_score:.3f}"
+        )
+
+        if target is not None:
+            signal.add_reason(self._build_target_reason(target))
+        else:
+            signal.add_reason(
+                "No explicit primary target selected; signal is based on aggregate liquidity map bias"
+            )
 
         if snapshot.signal is not None and getattr(snapshot.signal, "explanation", None):
             signal.add_reason(snapshot.signal.explanation)
@@ -760,7 +802,7 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         signal.add_source_feature("liquidity_map_snapshot")
         signal.add_source_feature("analytics.liquidity")
         signal.add_source_feature("analytics.liquidity.signal")
-        signal.add_source_feature("liquidity.magnet_follow_through")
+        signal.add_source_feature("liquidity.map.bias")
 
         for filter_result in filters:
             signal.add_filter_result(filter_result)
@@ -778,12 +820,13 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         current_price: float,
         target: LiquidityLevel | StopCluster | None,
     ) -> EntryPlan:
-        notes = ["Enter in direction of dominant liquidity magnet / sweep pressure"]
+        notes = [
+            "Directional bias signal from aggregate liquidity map",
+            "Use as confluence input unless signal processor confirms trade execution path",
+        ]
 
         if target is not None:
-            notes.append(
-                f"Primary target liquidity at {self._reference_price(target):.6f}"
-            )
+            notes.append(f"Nearest directional liquidity target at {self._reference_price(target):.6f}")
 
         entry_type = (
             getattr(self.config.builders, "default_entry_type", None)
@@ -794,13 +837,15 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             entry_type=entry_type,
             price=current_price if entry_type == EntryType.LIMIT else None,
             timeout_seconds=getattr(self.config.runtime, "max_signal_age_seconds", 60),
-            max_slippage_bps=8.0 if side in {SignalSide.LONG, SignalSide.SHORT} else None,
-            confirmation_required=False,
+            max_slippage_bps=6.0,
+            confirmation_required=True,
             notes=notes,
             metadata={
-                "entry_logic": "liquidity_magnet_follow_through",
+                "entry_logic": "liquidity_map_directional_bias",
                 "target_price": self._reference_price(target),
                 "target_type": self._target_type(target),
+                "bias_signal": True,
+                "requires_confluence": True,
             },
         )
 
@@ -813,60 +858,29 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         snapshot: LiquidityMapSnapshot,
     ) -> ExitPlan:
         target_price = self._reference_price(target) if target is not None else None
-        stop_price = self._resolve_stop_price(side, current_price, invalidation_level)
+        stop_price = self._resolve_stop_price(
+            side=side,
+            current_price=current_price,
+            invalidation_level=invalidation_level,
+        )
 
         tp_levels: list[TargetPlan] = []
-
-        enable_partial_tp = bool(
-            getattr(self.config.builders, "enable_partial_take_profit", True)
-        )
 
         if target_price is not None and target_price > 0:
             tp_levels.append(
                 TargetPlan(
                     price=target_price,
-                    size_fraction=0.70 if enable_partial_tp else 1.0,
+                    size_fraction=1.0,
                     rr=self._compute_rr(
                         current_price=current_price,
                         stop_price=stop_price,
                         target_price=target_price,
                         side=side,
                     ),
-                    label="primary_liquidity_target",
+                    label="directional_bias_liquidity_target",
                     metadata={
-                        "source": "nearest_directional_liquidity",
+                        "source": "liquidity_map_bias_target",
                         "target_type": self._target_type(target),
-                    },
-                )
-            )
-
-        extended_target = self._find_extended_target(
-            snapshot=snapshot,
-            current_price=current_price,
-            side=side,
-            exclude=target,
-        )
-        extended_target_price = (
-            self._reference_price(extended_target)
-            if extended_target is not None
-            else None
-        )
-
-        if enable_partial_tp and extended_target_price is not None and extended_target_price > 0:
-            tp_levels.append(
-                TargetPlan(
-                    price=extended_target_price,
-                    size_fraction=0.30,
-                    rr=self._compute_rr(
-                        current_price=current_price,
-                        stop_price=stop_price,
-                        target_price=extended_target_price,
-                        side=side,
-                    ),
-                    label="secondary_liquidity_target",
-                    metadata={
-                        "source": "extended_directional_liquidity",
-                        "target_type": self._target_type(extended_target),
                     },
                 )
             )
@@ -881,15 +895,15 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             take_profit_levels=tp_levels,
             trailing_distance=None,
             max_holding_seconds=max(
-                getattr(self.config.runtime, "max_signal_age_seconds", 60) * 3,
-                60,
+                getattr(self.config.runtime, "max_signal_age_seconds", 60) * 4,
+                120,
             ),
-            partial_exit_enabled=enable_partial_tp,
+            partial_exit_enabled=False,
             metadata={
-                "exit_logic": "liquidity_target_then_invalidation",
+                "exit_logic": "bias_invalidated_or_target_reached",
                 "primary_target_price": target_price,
-                "secondary_target_price": extended_target_price,
                 "stop_price": stop_price,
+                "bias": self._value(snapshot.bias),
             },
         )
 
@@ -899,30 +913,33 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
         current_price: float,
         invalidation_level: LiquidityLevel | StopCluster | None,
     ) -> InvalidationPlan:
-        price = self._resolve_stop_price(side, current_price, invalidation_level)
+        price = self._resolve_stop_price(
+            side=side,
+            current_price=current_price,
+            invalidation_level=invalidation_level,
+        )
 
-        reason = None
-        if bool(getattr(self.config.builders, "require_invalidation", True)):
-            reason = (
-                "Downside liquidity reclaimed against long follow-through thesis"
-                if side == SignalSide.LONG
-                else "Upside liquidity reclaimed against short follow-through thesis"
-            )
+        reason = (
+            "Liquidity map bias invalidated by opposite-side liquidity reclaim"
+            if bool(getattr(self.config.builders, "require_invalidation", True))
+            else None
+        )
 
         return InvalidationPlan(
             price=price,
             reason=reason,
             timeout_seconds=max(
                 getattr(self.config.runtime, "max_signal_age_seconds", 60),
-                30,
+                60,
             ),
             conditions=[
-                "signal_age_expired",
+                "liquidity_map_bias_flipped",
                 "opposite_liquidity_pressure_domination",
-                "primary_liquidity_target_invalidated",
+                "snapshot_stale",
+                "signal_age_expired",
             ],
             metadata={
-                "invalidation_source": "opposite_side_liquidity",
+                "invalidation_source": "opposite_liquidity_bias",
                 "invalidation_price": price,
             },
         )
@@ -947,9 +964,10 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
             post_only=entry_plan.entry_type == EntryType.PASSIVE,
             expected_holding_seconds=exit_plan.max_holding_seconds,
             notes=[
-                "Generated by LiquiditySweepStrategy",
-                "Risk manager must validate portfolio/exposure/correlation constraints before execution",
-                "Execution should only consume risk-confirmed signals",
+                "Generated by LiquidityMapBiasStrategy",
+                "This is a directional liquidity bias signal, not standalone execution permission",
+                "SignalProcessor / ConfluenceEngine should combine it with other analytics before risk confirmation",
+                "Risk manager must validate exposure, drawdown, leverage and correlation constraints",
             ],
             metadata={
                 "strategy_name": self.strategy_name,
@@ -958,6 +976,8 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
                 "market_type": snapshot.market_type,
                 "scope": snapshot.scope,
                 "scope_key": snapshot.scope_key,
+                "bias_signal": True,
+                "requires_confluence": True,
             },
         )
 
@@ -972,41 +992,37 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
     ) -> str:
         if side == SignalSide.LONG:
             return (
-                "Upside liquidity magnet dominates: "
+                "Liquidity map directional bias favors upside: "
+                f"bias={self._value(snapshot.bias)}, "
+                f"above_score={snapshot.above_liquidity_score:.3f}, "
                 f"magnet_up={self._magnet_score_up(snapshot):.3f}, "
                 f"sweep_risk_up={self._sweep_risk_up(snapshot):.3f}, "
-                f"above_liquidity={snapshot.above_liquidity_score:.3f}, "
                 f"pressure={snapshot.liquidity_pressure_score:.3f}"
             )
 
         return (
-            "Downside liquidity magnet dominates: "
+            "Liquidity map directional bias favors downside: "
+            f"bias={self._value(snapshot.bias)}, "
+            f"below_score={snapshot.below_liquidity_score:.3f}, "
             f"magnet_down={self._magnet_score_down(snapshot):.3f}, "
             f"sweep_risk_down={self._sweep_risk_down(snapshot):.3f}, "
-            f"below_liquidity={snapshot.below_liquidity_score:.3f}, "
             f"pressure={snapshot.liquidity_pressure_score:.3f}"
         )
 
     def _build_target_reason(
         self,
-        target: LiquidityLevel | StopCluster | None,
+        target: LiquidityLevel | StopCluster,
     ) -> str:
-        if target is None:
-            return (
-                "No explicit nearest liquidity target found; signal is based on "
-                "aggregate liquidity magnet pressure"
-            )
-
         if isinstance(target, StopCluster):
             return (
-                f"Primary target is stop cluster at {target.center_price:.6f} "
+                f"Directional bias target is stop cluster at {target.center_price:.6f} "
                 f"(confidence={target.confidence:.3f}, "
                 f"density={target.estimated_stop_density:.3f}, "
                 f"strength={self._value(target.strength)})"
             )
 
         return (
-            f"Primary target is liquidity level at {target.price:.6f} "
+            f"Directional bias target is liquidity level at {target.price:.6f} "
             f"(type={self._value(target.level_type)}, "
             f"confidence={target.confidence:.3f}, "
             f"sweep_status={self._value(target.sweep_status)})"
@@ -1023,48 +1039,54 @@ class LiquiditySweepStrategy(BaseLiquidityStrategy):
 
         if side == SignalSide.LONG:
             if snapshot.bias == LiquidityBias.UP:
-                confirmations.append("Liquidity map bias confirms upside path")
+                confirmations.append("Snapshot bias is UP")
 
             if snapshot.liquidity_pressure_score > 0:
-                confirmations.append("Signed liquidity pressure is positive")
+                confirmations.append("Signed liquidity pressure confirms upside")
+
+            if self._upside_bias_edge(snapshot) > self._downside_bias_edge(snapshot):
+                confirmations.append("Upside bias edge dominates downside edge")
 
             if self._magnet_score_up(snapshot) >= 0.60:
                 confirmations.append("Upside magnet score is strong")
 
             if self._sweep_risk_up(snapshot) >= 0.60:
-                confirmations.append("Upside sweep risk supports continuation")
+                confirmations.append("Upside sweep risk supports directional bias")
 
             if self._has_high_quality_zone(
                 snapshot=snapshot,
                 side=LiquiditySide.BUY_SIDE,
                 current_price=current_price,
             ):
-                confirmations.append("High-quality buy-side liquidity zone ahead")
+                confirmations.append("High-quality buy-side liquidity zone supports bias")
 
         elif side == SignalSide.SHORT:
             if snapshot.bias == LiquidityBias.DOWN:
-                confirmations.append("Liquidity map bias confirms downside path")
+                confirmations.append("Snapshot bias is DOWN")
 
             if snapshot.liquidity_pressure_score < 0:
-                confirmations.append("Signed liquidity pressure is negative")
+                confirmations.append("Signed liquidity pressure confirms downside")
+
+            if self._downside_bias_edge(snapshot) > self._upside_bias_edge(snapshot):
+                confirmations.append("Downside bias edge dominates upside edge")
 
             if self._magnet_score_down(snapshot) >= 0.60:
                 confirmations.append("Downside magnet score is strong")
 
             if self._sweep_risk_down(snapshot) >= 0.60:
-                confirmations.append("Downside sweep risk supports continuation")
+                confirmations.append("Downside sweep risk supports directional bias")
 
             if self._has_high_quality_zone(
                 snapshot=snapshot,
                 side=LiquiditySide.SELL_SIDE,
                 current_price=current_price,
             ):
-                confirmations.append("High-quality sell-side liquidity zone ahead")
+                confirmations.append("High-quality sell-side liquidity zone supports bias")
 
         if target is not None:
-            confirmations.append("Clear non-swept directional liquidity target available")
+            confirmations.append("Directional liquidity target is available")
 
-        if snapshot.signal is not None and snapshot.signal.confidence >= 0.65:
+        if self._analytics_signal_confidence(snapshot) >= 0.65:
             confirmations.append("Analytics liquidity signal confidence is strong")
 
         return confirmations
