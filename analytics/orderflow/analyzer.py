@@ -13,11 +13,16 @@ from .cvd import CvdAnalyzer
 from .enums import OrderFlowEventTopic
 from .models import (
     BaseOrderFlowStats,
+    DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     OrderFlowKey,
     make_orderflow_key,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_timeframe,
     orderflow_key_to_dict,
+    orderflow_key_to_string,
 )
 from .orderbook_imbalance import OrderbookImbalanceAnalyzer
 from .volume_delta import VolumeDeltaAnalyzer
@@ -74,8 +79,8 @@ class OrderFlowAnalyzer:
         trades_topic_patterns: list[str] | tuple[str, ...] | None = None,
         orderbook_topic_patterns: list[str] | tuple[str, ...] | None = None,
         default_exchange: str | None = None,
-        default_market_type: str = DEFAULT_MARKET_TYPE,
-        default_timeframe: str = DEFAULT_TIMEFRAME,
+        default_market_type: str | None = None,
+        default_timeframe: str | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._scheduler = scheduler
@@ -84,25 +89,31 @@ class OrderFlowAnalyzer:
         self._config = config or OrderFlowConfig()
 
         self._config.validate()
+        self._config.assert_production_topics_allowed()
 
-        self._default_exchange = (
-            str(default_exchange).strip().lower()
-            if default_exchange
-            else None
+        self._default_exchange = normalize_exchange(
+            default_exchange or self._config.default_exchange or DEFAULT_EXCHANGE
         )
-        self._default_market_type = self._normalize_market_type(default_market_type)
-        self._default_timeframe = self._normalize_timeframe(default_timeframe)
+        self._default_market_type = normalize_market_type(
+            default_market_type or self._config.default_market_type or DEFAULT_MARKET_TYPE
+        )
+        self._default_timeframe = normalize_timeframe(
+            default_timeframe or self._config.default_timeframe or DEFAULT_TIMEFRAME
+        )
 
-        self._trades_topic_patterns = list(
+        self._trades_topic_patterns = self._normalize_topics(
             trades_topic_patterns
             if trades_topic_patterns is not None
-            else self._config.source_topic_patterns_trades
+            else self._config.trades_topics
         )
-        self._orderbook_topic_patterns = list(
+        self._orderbook_topic_patterns = self._normalize_topics(
             orderbook_topic_patterns
             if orderbook_topic_patterns is not None
-            else self._config.source_topic_patterns_orderbook
+            else self._config.orderbook_topics
         )
+
+        for topic in (*self._trades_topic_patterns, *self._orderbook_topic_patterns):
+            self._config.assert_input_topic_allowed(topic)
 
         self._logger = get_logger(
             __name__,
@@ -182,6 +193,9 @@ class OrderFlowAnalyzer:
                 self._logger.warning("OrderFlowAnalyzer already registered")
                 return
 
+            self._config.validate()
+            self._config.assert_production_topics_allowed()
+
             if not self._config.enabled:
                 self._logger.warning("OrderFlowAnalyzer is disabled by config")
                 await self._emit_lifecycle_event(
@@ -190,8 +204,12 @@ class OrderFlowAnalyzer:
                         "reason": "disabled_by_config",
                         "enabled": False,
                         "scope": "exchange:market_type:symbol:timeframe",
+                        "defaults": self._defaults_payload(),
+                        "input_topics": list(self._config.production_input_topics),
+                        "output_topics": list(self._config.output_topics),
                     },
                     priority=EventPriority.LOW,
+                    event_type="orderflow_disabled",
                 )
                 return
 
@@ -200,8 +218,8 @@ class OrderFlowAnalyzer:
             for name, module in self._modules.items():
                 if not self._is_module_enabled(name):
                     self._logger.info(
-                        "OrderFlow module skipped because it is disabled | module=%s",
-                        name,
+                        "OrderFlow module skipped because it is disabled",
+                        extra={"module": name},
                     )
                     continue
 
@@ -210,22 +228,25 @@ class OrderFlowAnalyzer:
                     registered_modules.append(name)
                 except Exception:
                     self._logger.exception(
-                        "Failed to register order-flow module | module=%s",
-                        name,
+                        "Failed to register order-flow module",
+                        extra={"module": name},
                     )
                     raise
 
             self._running = True
 
             self._logger.info(
-                (
-                    "OrderFlowAnalyzer registered | modules=%s "
-                    "trades_patterns=%s orderbook_patterns=%s scope=%s"
-                ),
-                registered_modules,
-                self._trades_topic_patterns,
-                self._orderbook_topic_patterns,
-                "exchange:market_type:symbol:timeframe",
+                "OrderFlowAnalyzer registered",
+                extra={
+                    "modules": registered_modules,
+                    "trades_topic_patterns": list(self._trades_topic_patterns),
+                    "orderbook_topic_patterns": list(self._orderbook_topic_patterns),
+                    "scope": "exchange:market_type:symbol:timeframe",
+                    "defaults": self._defaults_payload(),
+                    "input_topics": list(self._config.production_input_topics),
+                    "output_topics": list(self._config.output_topics),
+                    "enabled_modules": list(self.enabled_modules()),
+                },
             )
 
             await self._emit_lifecycle_event(
@@ -233,16 +254,17 @@ class OrderFlowAnalyzer:
                 {
                     "enabled": True,
                     "modules": registered_modules,
+                    "enabled_modules": list(self.enabled_modules()),
                     "trades_topic_patterns": list(self._trades_topic_patterns),
                     "orderbook_topic_patterns": list(self._orderbook_topic_patterns),
+                    "input_topics": list(self._config.production_input_topics),
+                    "output_topics": list(self._config.output_topics),
                     "scope": "exchange:market_type:symbol:timeframe",
-                    "defaults": {
-                        "exchange": self._default_exchange,
-                        "market_type": self._default_market_type,
-                        "timeframe": self._default_timeframe,
-                    },
+                    "defaults": self._defaults_payload(),
+                    "config": self._config.to_dict(),
                 },
                 priority=EventPriority.NORMAL,
+                event_type="orderflow_started",
             )
 
     async def start(self) -> None:
@@ -267,15 +289,18 @@ class OrderFlowAnalyzer:
                     stopped_modules.append(name)
                 except Exception:
                     self._logger.exception(
-                        "Failed to stop order-flow module | module=%s",
-                        name,
+                        "Failed to stop order-flow module",
+                        extra={"module": name},
                     )
 
             self._running = False
 
             self._logger.info(
-                "OrderFlowAnalyzer stopped | modules=%s",
-                stopped_modules,
+                "OrderFlowAnalyzer stopped",
+                extra={
+                    "modules": stopped_modules,
+                    "scope": "exchange:market_type:symbol:timeframe",
+                },
             )
 
             await self._emit_lifecycle_event(
@@ -284,8 +309,12 @@ class OrderFlowAnalyzer:
                     "enabled": self._config.enabled,
                     "modules": stopped_modules,
                     "scope": "exchange:market_type:symbol:timeframe",
+                    "defaults": self._defaults_payload(),
+                    "input_topics": list(self._config.production_input_topics),
+                    "output_topics": list(self._config.output_topics),
                 },
                 priority=EventPriority.NORMAL,
+                event_type="orderflow_stopped",
             )
 
     @property
@@ -317,9 +346,15 @@ class OrderFlowAnalyzer:
         """
         normalized_key = self._normalize_key_from_tuple(key)
 
+        if not self._config.should_process_key(normalized_key):
+            self._logger.debug(
+                "Latest order-flow stats skipped by scope filter",
+                extra=self._key_payload(normalized_key),
+            )
+            return self._empty_key_result(normalized_key)
+
         return {
-            "key": list(normalized_key),
-            "scope": orderflow_key_to_dict(normalized_key),
+            **self._key_result_base(normalized_key),
             "cvd": self.cvd.get_latest_stats_by_key(normalized_key),
             "volume_delta": self.volume_delta.get_latest_stats_by_key(normalized_key),
             "aggressive_trades": self.aggressive_trades.get_latest_stats_by_key(
@@ -367,7 +402,14 @@ class OrderFlowAnalyzer:
         if not self._config.enabled:
             self._logger.warning(
                 "Manual order-flow processing skipped: facade disabled",
-                extra=orderflow_key_to_dict(normalized_key),
+                extra=self._key_payload(normalized_key),
+            )
+            return self._empty_key_result(normalized_key)
+
+        if not self._config.should_process_key(normalized_key):
+            self._logger.debug(
+                "Manual order-flow processing skipped by scope filter",
+                extra=self._key_payload(normalized_key),
             )
             return self._empty_key_result(normalized_key)
 
@@ -381,23 +423,26 @@ class OrderFlowAnalyzer:
 
             try:
                 results[name] = await module.process_key(normalized_key)
-            except Exception:
+            except Exception as exc:
                 self._logger.exception(
                     "Manual order-flow module processing failed",
                     extra={
-                        **orderflow_key_to_dict(normalized_key),
+                        **self._key_payload(normalized_key),
                         "module": name,
+                        "error": repr(exc),
                     },
                 )
                 await self._emit_lifecycle_event(
                     OrderFlowEventTopic.ERROR.value,
                     {
-                        **orderflow_key_to_dict(normalized_key),
-                        "key": list(normalized_key),
+                        **self._key_payload(normalized_key),
                         "module": name,
                         "reason": "manual_process_failed",
+                        "error": repr(exc),
                     },
                     priority=EventPriority.HIGH,
+                    key=normalized_key,
+                    event_type="orderflow_manual_process_failed",
                 )
 
         return results
@@ -428,17 +473,9 @@ class OrderFlowAnalyzer:
         """
         Backward-compatible wrapper.
 
-        Symbol-only processing is unsafe in multi-exchange futures mode.
-        This method is allowed only when default_exchange was explicitly
-        configured for this facade instance.
+        Symbol-only processing uses explicit facade defaults.
+        Prefer process_market(...) or process_key(...).
         """
-        if not self._default_exchange:
-            raise ValueError(
-                "process_symbol(symbol) requires default_exchange. "
-                "Use process_market(exchange=..., market_type=..., symbol=..., timeframe=...) "
-                "or process_key(key) instead."
-            )
-
         key = self.make_key(
             exchange=self._default_exchange,
             market_type=self._default_market_type,
@@ -456,19 +493,24 @@ class OrderFlowAnalyzer:
         """
         for name, module in self._modules.items():
             try:
-                await module.cleanup()
-            except Exception:
+                result = module.cleanup()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
                 self._logger.exception(
-                    "Order-flow cleanup failed | module=%s",
-                    name,
+                    "Order-flow cleanup failed",
+                    extra={"module": name, "error": repr(exc)},
                 )
                 await self._emit_lifecycle_event(
                     OrderFlowEventTopic.ERROR.value,
                     {
                         "module": name,
                         "reason": "cleanup_failed",
+                        "error": repr(exc),
+                        "scope": "exchange:market_type:symbol:timeframe",
                     },
                     priority=EventPriority.HIGH,
+                    event_type="orderflow_cleanup_failed",
                 )
 
     def stats(self) -> dict[str, Any]:
@@ -477,14 +519,14 @@ class OrderFlowAnalyzer:
             "enabled": self._config.enabled,
             "enabled_modules": self.enabled_modules(),
             "scope": "exchange:market_type:symbol:timeframe",
-            "defaults": {
-                "exchange": self._default_exchange,
-                "market_type": self._default_market_type,
-                "timeframe": self._default_timeframe,
-            },
+            "defaults": self._defaults_payload(),
             "trades_topic_patterns": list(self._trades_topic_patterns),
             "orderbook_topic_patterns": list(self._orderbook_topic_patterns),
+            "input_topics": list(self._config.production_input_topics),
+            "output_topics": list(self._config.output_topics),
+            "scheduler_job_names": list(self._config.scheduler_job_names),
             "scheduler_attached": self._scheduler is not None,
+            "config": self._config.to_dict(),
             "modules": {
                 "cvd": self.cvd.stats(),
                 "volume_delta": self.volume_delta.stats(),
@@ -519,12 +561,22 @@ class OrderFlowAnalyzer:
         key: OrderFlowKey,
     ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
         return {
-            "key": list(key),
-            "scope": orderflow_key_to_dict(key),
+            **self._key_result_base(key),
             "cvd": None,
             "volume_delta": None,
             "aggressive_trades": None,
             "orderbook_imbalance": None,
+        }
+
+    def _key_result_base(
+        self,
+        key: OrderFlowKey,
+    ) -> dict[str, dict[str, str] | list[str] | str]:
+        return {
+            "key": list(key),
+            "orderflow_key": list(key),
+            "scope": orderflow_key_to_dict(key),
+            "scope_key": orderflow_key_to_string(key),
         }
 
     @staticmethod
@@ -558,14 +610,36 @@ class OrderFlowAnalyzer:
         )
 
     @staticmethod
-    def _normalize_market_type(value: Any) -> str:
-        normalized = str(value or DEFAULT_MARKET_TYPE).strip().lower()
-        return normalized if normalized else DEFAULT_MARKET_TYPE
+    def _normalize_topics(
+        values: list[str] | tuple[str, ...] | None,
+    ) -> list[str]:
+        return list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (values or ())
+                if str(value).strip()
+            )
+        )
+
+    def _defaults_payload(self) -> dict[str, str]:
+        return {
+            "exchange": self._default_exchange,
+            "market_type": self._default_market_type,
+            "timeframe": self._default_timeframe,
+        }
 
     @staticmethod
-    def _normalize_timeframe(value: Any) -> str:
-        normalized = str(value or DEFAULT_TIMEFRAME).strip()
-        return normalized if normalized else DEFAULT_TIMEFRAME
+    def _key_payload(key: OrderFlowKey) -> dict[str, Any]:
+        scope = orderflow_key_to_dict(key)
+        scope_key = orderflow_key_to_string(key)
+
+        return {
+            **scope,
+            "scope": scope,
+            "scope_key": scope_key,
+            "orderflow_key": key,
+            "key": list(key),
+        }
 
     async def _emit_lifecycle_event(
         self,
@@ -573,16 +647,52 @@ class OrderFlowAnalyzer:
         payload: dict[str, Any],
         *,
         priority: EventPriority,
+        key: OrderFlowKey | None = None,
+        event_type: str | None = None,
     ) -> None:
         try:
+            headers: dict[str, str] = {
+                "component": "analytics",
+                "component_module": "orderflow",
+            }
+
+            if event_type:
+                headers["event_type"] = event_type
+
+            if key is not None:
+                scope = orderflow_key_to_dict(key)
+                headers.update(
+                    {
+                        "exchange": scope["exchange"],
+                        "market_type": scope["market_type"],
+                        "symbol": scope["symbol"],
+                        "timeframe": scope["timeframe"],
+                        "scope_key": orderflow_key_to_string(key),
+                    }
+                )
+
+                payload.setdefault("scope", scope)
+                payload.setdefault("scope_key", orderflow_key_to_string(key))
+                payload.setdefault("orderflow_key", key)
+                payload.setdefault("key", list(key))
+
+            payload.setdefault("source", "orderflow_analyzer")
+            payload.setdefault("scope_model", "exchange:market_type:symbol:timeframe")
+
             await self._event_bus.emit(
                 topic,
                 payload,
                 priority=priority,
                 source="orderflow_analyzer",
+                headers=headers,
             )
         except Exception:
             self._logger.exception(
-                "Failed to emit order-flow lifecycle event | topic=%s",
-                topic,
+                "Failed to emit order-flow lifecycle event",
+                extra={
+                    "topic": topic,
+                    "event_type": event_type,
+                    "scope": orderflow_key_to_dict(key) if key is not None else None,
+                    "scope_key": orderflow_key_to_string(key) if key is not None else None,
+                },
             )

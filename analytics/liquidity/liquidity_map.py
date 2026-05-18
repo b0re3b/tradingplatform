@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Sequence
 
 from core.logger import get_logger
@@ -12,12 +12,23 @@ from .equal_highs_lows import EqualHighsLowsDetector
 from .models import (
     DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     EqualLevel,
+    LiquidityKey,
     LiquidityLevel,
     LiquidityMapSnapshot,
     LiquiditySignal,
     LiquidityZone,
     StopCluster,
+    ensure_utc,
+    liquidity_key_to_dict,
+    liquidity_key_to_string,
+    make_liquidity_key,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
+    utc_now,
 )
 from .scoring import LiquidityScorer
 from .stop_clusters import StopClustersDetector
@@ -99,9 +110,7 @@ class LiquidityMap:
     - використовується LiquidityService як чистий domain aggregator.
 
     Multi-exchange scope:
-    - основний scope snapshot-а: exchange + market_type + symbol + timeframe;
-    - detector-и можуть залишатися чистими symbol/timeframe компонентами;
-    - цей клас scope-ить результат detector-ів перед формуванням snapshot.
+        exchange + market_type + symbol + timeframe
     """
 
     def __init__(
@@ -150,19 +159,26 @@ class LiquidityMap:
         market_type: str = DEFAULT_MARKET_TYPE,
     ) -> LiquidityMapSnapshot:
         """
-        Повна побудова liquidity map snapshot для
-        exchange + market_type + symbol + timeframe.
+        Повна побудова liquidity map snapshot для:
+            exchange + market_type + symbol + timeframe
 
-        exchange / market_type мають default-и для backward compatibility,
-        але у production LiquidityService має передавати їх явно.
+        У production LiquidityService має передавати exchange/market_type явно.
         """
         if not self._config.enabled:
             raise RuntimeError("LiquidityMap is disabled by LiquidityConfig")
 
-        exchange = self._normalize_scope_value(exchange, DEFAULT_EXCHANGE)
-        market_type = self._normalize_scope_value(market_type, DEFAULT_MARKET_TYPE)
-        symbol = self._normalize_symbol(symbol)
-        timeframe = self._normalize_timeframe(timeframe)
+        key = self._make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        scope = liquidity_key_to_dict(key)
+
+        exchange = scope["exchange"]
+        market_type = scope["market_type"]
+        symbol = scope["symbol"]
+        timeframe = scope["timeframe"]
 
         self._validate_symbol_timeframe(symbol=symbol, timeframe=timeframe)
 
@@ -176,36 +192,33 @@ class LiquidityMap:
         )
 
         equal_levels = self._equal_detector.detect(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             candles=candles_list,
             current_price=current_price,
         )
-        self._scope_levels(
+        self._assert_and_scope_levels(
             levels=equal_levels,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         scoped_extra_levels = list(extra_levels or [])
-        self._scope_levels(
+        self._assert_and_scope_levels(
             levels=scoped_extra_levels,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         merged_levels = self._merge_levels(
             equal_levels=equal_levels,
             extra_levels=scoped_extra_levels,
         )
-
         active_levels = self._limit_levels(self._filter_active_levels(merged_levels))
 
         stop_clusters = self._stop_detector.detect_from_levels(
+            exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
             timeframe=timeframe,
             levels=active_levels,
@@ -213,21 +226,15 @@ class LiquidityMap:
             candles=candles_list,
             orderbook=orderbook,
         )
-        self._scope_clusters(
+        self._assert_and_scope_clusters(
             clusters=stop_clusters,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         scoped_extra_clusters = list(extra_clusters or [])
-        self._scope_clusters(
+        self._assert_and_scope_clusters(
             clusters=scoped_extra_clusters,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         if scoped_extra_clusters:
@@ -236,21 +243,15 @@ class LiquidityMap:
                 extra=scoped_extra_clusters,
                 current_price=current_price,
             )
-            self._scope_clusters(
+            self._assert_and_scope_clusters(
                 clusters=stop_clusters,
-                exchange=exchange,
-                market_type=market_type,
-                symbol=symbol,
-                timeframe=timeframe,
+                key=key,
             )
 
         active_clusters = self._limit_clusters(self._filter_active_clusters(stop_clusters))
 
         zones = self._build_liquidity_zones(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
             current_price=current_price,
             levels=active_levels,
             clusters=active_clusters,
@@ -263,10 +264,7 @@ class LiquidityMap:
         )
 
         signal = self._build_signal(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
             timestamp=snapshot_ts,
             features=features,
         )
@@ -293,6 +291,8 @@ class LiquidityMap:
             signal=signal,
             metadata={
                 "builder": self.__class__.__name__,
+                "scope": scope,
+                "scope_key": liquidity_key_to_string(key),
                 "exchange": exchange,
                 "market_type": market_type,
                 "levels_count": len(active_levels),
@@ -304,7 +304,9 @@ class LiquidityMap:
                 "sweep_risk_down": features.sweep_risk_down,
                 "magnet_score_up": features.magnet_score_up,
                 "magnet_score_down": features.magnet_score_down,
-                "pressure_score_semantics": "positive=upside_buy_side, negative=downside_sell_side",
+                "pressure_score_semantics": (
+                    "positive=upside_buy_side, negative=downside_sell_side"
+                ),
                 "orderbook_present": orderbook is not None,
                 "extra_levels_count": len(extra_levels or []),
                 "extra_clusters_count": len(extra_clusters or []),
@@ -314,6 +316,8 @@ class LiquidityMap:
         self._logger.info(
             "Liquidity map snapshot built",
             extra={
+                "scope": scope,
+                "scope_key": liquidity_key_to_string(key),
                 "exchange": exchange,
                 "market_type": market_type,
                 "symbol": symbol,
@@ -347,10 +351,18 @@ class LiquidityMap:
         """
         Альтернативний шлях побудови snapshot, якщо рівні/кластери вже пораховані.
         """
-        exchange = self._normalize_scope_value(exchange, DEFAULT_EXCHANGE)
-        market_type = self._normalize_scope_value(market_type, DEFAULT_MARKET_TYPE)
-        symbol = self._normalize_symbol(symbol)
-        timeframe = self._normalize_timeframe(timeframe)
+        key = self._make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        scope = liquidity_key_to_dict(key)
+
+        exchange = scope["exchange"]
+        market_type = scope["market_type"]
+        symbol = scope["symbol"]
+        timeframe = scope["timeframe"]
 
         self._validate_symbol_timeframe(symbol=symbol, timeframe=timeframe)
 
@@ -358,33 +370,24 @@ class LiquidityMap:
         if current_price <= 0:
             raise ValueError("current_price must be > 0")
 
-        snapshot_ts = self._normalize_timestamp(timestamp) or datetime.now(timezone.utc)
+        snapshot_ts = self._normalize_timestamp(timestamp) or utc_now()
 
         scoped_levels = list(levels)
-        self._scope_levels(
+        self._assert_and_scope_levels(
             levels=scoped_levels,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         scoped_equal_levels = list(equal_levels or [])
-        self._scope_levels(
+        self._assert_and_scope_levels(
             levels=scoped_equal_levels,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         scoped_clusters = list(clusters)
-        self._scope_clusters(
+        self._assert_and_scope_clusters(
             clusters=scoped_clusters,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         active_levels = self._limit_levels(self._filter_active_levels(scoped_levels))
@@ -394,21 +397,15 @@ class LiquidityMap:
             extra=[],
             current_price=current_price,
         )
-        self._scope_clusters(
+        self._assert_and_scope_clusters(
             clusters=stop_clusters,
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
         )
 
         active_clusters = self._limit_clusters(self._filter_active_clusters(stop_clusters))
 
         zones = self._build_liquidity_zones(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
             current_price=current_price,
             levels=active_levels,
             clusters=active_clusters,
@@ -421,10 +418,7 @@ class LiquidityMap:
         )
 
         signal = self._build_signal(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            key=key,
             timestamp=snapshot_ts,
             features=features,
         )
@@ -452,6 +446,8 @@ class LiquidityMap:
             metadata={
                 "builder": self.__class__.__name__,
                 "from_components": True,
+                "scope": scope,
+                "scope_key": liquidity_key_to_string(key),
                 "exchange": exchange,
                 "market_type": market_type,
                 "levels_count": len(active_levels),
@@ -462,7 +458,9 @@ class LiquidityMap:
                 "sweep_risk_down": features.sweep_risk_down,
                 "magnet_score_up": features.magnet_score_up,
                 "magnet_score_down": features.magnet_score_down,
-                "pressure_score_semantics": "positive=upside_buy_side, negative=downside_sell_side",
+                "pressure_score_semantics": (
+                    "positive=upside_buy_side, negative=downside_sell_side"
+                ),
             },
         )
 
@@ -541,12 +539,7 @@ class LiquidityMap:
         candidate: LiquidityLevel,
     ) -> int | None:
         for index, level in enumerate(levels):
-            same_scope = (
-                level.exchange == candidate.exchange
-                and level.market_type == candidate.market_type
-                and level.symbol == candidate.symbol
-                and level.timeframe == candidate.timeframe
-            )
+            same_scope = level.liquidity_key == candidate.liquidity_key
             same_type = level.level_type == candidate.level_type
             same_side = level.side == candidate.side
             near = (
@@ -580,8 +573,8 @@ class LiquidityMap:
 
     def _merge_clusters(
         self,
-        primary: list[StopCluster],
-        extra: list[StopCluster],
+        primary: Sequence[StopCluster],
+        extra: Sequence[StopCluster],
         current_price: float,
     ) -> list[StopCluster]:
         all_clusters = [
@@ -609,12 +602,7 @@ class LiquidityMap:
         for cluster in all_clusters[1:]:
             previous = merged[-1]
 
-            same_scope = (
-                cluster.exchange == previous.exchange
-                and cluster.market_type == previous.market_type
-                and cluster.symbol == previous.symbol
-                and cluster.timeframe == previous.timeframe
-            )
+            same_scope = cluster.liquidity_key == previous.liquidity_key
 
             if not same_scope or cluster.side != previous.side:
                 merged.append(cluster)
@@ -636,6 +624,9 @@ class LiquidityMap:
         left: StopCluster,
         right: StopCluster,
     ) -> bool:
+        if left.liquidity_key != right.liquidity_key:
+            return False
+
         if left.overlaps(right):
             return True
 
@@ -650,6 +641,12 @@ class LiquidityMap:
         right: StopCluster,
         current_price: float,
     ) -> StopCluster:
+        if left.liquidity_key != right.liquidity_key:
+            raise ValueError(
+                "Cannot merge stop clusters from different scopes: "
+                f"left={left.scope}, right={right.scope}"
+            )
+
         source_levels = self._deduplicate_source_levels(
             [*left.source_levels, *right.source_levels]
         )
@@ -689,6 +686,8 @@ class LiquidityMap:
             source_levels=source_levels,
             metadata={
                 "merged": True,
+                "scope": left.scope,
+                "scope_key": left.scope_key,
                 "left_metadata": dict(left.metadata),
                 "right_metadata": dict(right.metadata),
                 "source_count": len(source_levels),
@@ -754,14 +753,13 @@ class LiquidityMap:
 
     def _build_liquidity_zones(
         self,
-        exchange: str,
-        market_type: str,
-        symbol: str,
-        timeframe: str,
+        key: LiquidityKey,
         current_price: float,
         levels: Sequence[LiquidityLevel],
         clusters: Sequence[StopCluster],
     ) -> list[LiquidityZone]:
+        scope = liquidity_key_to_dict(key)
+
         ranges: list[tuple[float, float]] = []
 
         for level in levels:
@@ -824,10 +822,10 @@ class LiquidityMap:
 
             zones.append(
                 LiquidityZone(
-                    exchange=exchange,
-                    market_type=market_type,
-                    symbol=symbol,
-                    timeframe=timeframe,
+                    exchange=scope["exchange"],
+                    market_type=scope["market_type"],
+                    symbol=scope["symbol"],
+                    timeframe=scope["timeframe"],
                     side=side,
                     low_price=low_price,
                     high_price=high_price,
@@ -835,6 +833,8 @@ class LiquidityMap:
                     label=label,
                     source_types=source_types,
                     metadata={
+                        "scope": scope,
+                        "scope_key": liquidity_key_to_string(key),
                         "levels_count": len(zone_levels),
                         "clusters_count": len(zone_clusters),
                         "distance_from_price_pct": self._distance_from_zone_pct(
@@ -1460,21 +1460,20 @@ class LiquidityMap:
 
     def _build_signal(
         self,
-        exchange: str,
-        market_type: str,
-        symbol: str,
-        timeframe: str,
+        key: LiquidityKey,
         timestamp: datetime,
         features: LiquidityMapFeatures,
     ) -> LiquiditySignal:
+        scope = liquidity_key_to_dict(key)
+
         confidence = self._calculate_signal_confidence(features)
         explanation = self._build_signal_explanation(features)
 
         return LiquiditySignal(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            symbol=scope["symbol"],
+            timeframe=scope["timeframe"],
             timestamp=timestamp,
             bias=features.bias,
             nearest_buy_side_liquidity=features.nearest_above_level,
@@ -1486,12 +1485,16 @@ class LiquidityMap:
             confidence=confidence,
             explanation=explanation,
             metadata={
-                "exchange": exchange,
-                "market_type": market_type,
+                "scope": scope,
+                "scope_key": liquidity_key_to_string(key),
+                "exchange": scope["exchange"],
+                "market_type": scope["market_type"],
                 "above_liquidity_score": features.above_liquidity_score,
                 "below_liquidity_score": features.below_liquidity_score,
                 "pressure_score": features.pressure_score,
-                "pressure_score_semantics": "positive=upside_buy_side, negative=downside_sell_side",
+                "pressure_score_semantics": (
+                    "positive=upside_buy_side, negative=downside_sell_side"
+                ),
                 "strongest_cluster_above_confidence": (
                     features.strongest_cluster_above.confidence
                     if features.strongest_cluster_above
@@ -1586,54 +1589,72 @@ class LiquidityMap:
     # Scope helpers
     # ------------------------------------------------------------------
 
-    def _scope_levels(
+    def _assert_and_scope_levels(
         self,
         *,
         levels: Sequence[LiquidityLevel],
-        exchange: str,
-        market_type: str,
-        symbol: str,
-        timeframe: str,
+        key: LiquidityKey,
     ) -> None:
-        for level in levels:
-            level.exchange = exchange
-            level.market_type = market_type
-            level.symbol = symbol
-            level.timeframe = timeframe
+        scope = liquidity_key_to_dict(key)
 
-    def _scope_clusters(
+        for level in levels:
+            level.exchange = scope["exchange"]
+            level.market_type = scope["market_type"]
+            level.symbol = scope["symbol"]
+            level.timeframe = scope["timeframe"]
+            level.metadata.setdefault("scope", scope)
+            level.metadata.setdefault("scope_key", liquidity_key_to_string(key))
+
+            if level.liquidity_key != key:
+                raise ValueError(
+                    "LiquidityLevel scope mismatch after scoping: "
+                    f"expected={scope}, got={level.scope}"
+                )
+
+    def _assert_and_scope_clusters(
         self,
         *,
         clusters: Sequence[StopCluster],
-        exchange: str,
-        market_type: str,
-        symbol: str,
-        timeframe: str,
+        key: LiquidityKey,
     ) -> None:
+        scope = liquidity_key_to_dict(key)
+
         for cluster in clusters:
-            cluster.exchange = exchange
-            cluster.market_type = market_type
-            cluster.symbol = symbol
-            cluster.timeframe = timeframe
+            cluster.exchange = scope["exchange"]
+            cluster.market_type = scope["market_type"]
+            cluster.symbol = scope["symbol"]
+            cluster.timeframe = scope["timeframe"]
+            cluster.metadata.setdefault("scope", scope)
+            cluster.metadata.setdefault("scope_key", liquidity_key_to_string(key))
 
             for source_level in cluster.source_levels:
-                source_level.exchange = exchange
-                source_level.market_type = market_type
-                source_level.symbol = symbol
-                source_level.timeframe = timeframe
+                source_level.exchange = scope["exchange"]
+                source_level.market_type = scope["market_type"]
+                source_level.symbol = scope["symbol"]
+                source_level.timeframe = scope["timeframe"]
+                source_level.metadata.setdefault("scope", scope)
+                source_level.metadata.setdefault("scope_key", liquidity_key_to_string(key))
+
+            if cluster.liquidity_key != key:
+                raise ValueError(
+                    "StopCluster scope mismatch after scoping: "
+                    f"expected={scope}, got={cluster.scope}"
+                )
 
     @staticmethod
-    def _normalize_scope_value(value: Any, default: str) -> str:
-        normalized = str(value or default).strip()
-        return normalized if normalized else default
-
-    @staticmethod
-    def _normalize_symbol(value: Any) -> str:
-        return str(value or "").strip().upper()
-
-    @staticmethod
-    def _normalize_timeframe(value: Any) -> str:
-        return str(value or "").strip()
+    def _make_key(
+        *,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=normalize_exchange(exchange),
+            market_type=normalize_market_type(market_type),
+            symbol=normalize_symbol(symbol),
+            timeframe=normalize_timeframe(timeframe),
+        )
 
     # ------------------------------------------------------------------
     # Timestamp / parsing helpers
@@ -1664,7 +1685,7 @@ class LiquidityMap:
             if parsed is not None:
                 return parsed
 
-        return datetime.now(timezone.utc)
+        return utc_now()
 
     def _parse_datetime(
         self,
@@ -1680,7 +1701,7 @@ class LiquidityMap:
             try:
                 return datetime.fromtimestamp(
                     value / 1000 if value > 1e12 else value,
-                    tz=timezone.utc,
+                    tz=utc_now().tzinfo,
                 )
             except (OSError, OverflowError, ValueError):
                 return None
@@ -1696,17 +1717,13 @@ class LiquidityMap:
 
         return None
 
+    @staticmethod
     def _normalize_timestamp(
-        self,
         value: datetime | None,
     ) -> datetime | None:
         if value is None:
             return None
-
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-
-        return value.astimezone(timezone.utc)
+        return ensure_utc(value)
 
     def _min_datetime(
         self,
@@ -1744,8 +1761,8 @@ class LiquidityMap:
     # Generic helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
     def _reference_price(
-        self,
         item: LiquidityLevel | StopCluster,
     ) -> float:
         if isinstance(item, StopCluster):
@@ -1753,8 +1770,8 @@ class LiquidityMap:
 
         return item.price
 
+    @staticmethod
     def _validate_symbol_timeframe(
-        self,
         *,
         symbol: str,
         timeframe: str,
@@ -1764,3 +1781,9 @@ class LiquidityMap:
 
         if not timeframe:
             raise ValueError("timeframe is required")
+
+
+__all__ = [
+    "LiquidityMapFeatures",
+    "LiquidityMap",
+]

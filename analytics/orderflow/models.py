@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, Mapping, TypeAlias
 
 from .enums import (
     OrderFlowMetricType,
@@ -13,6 +13,7 @@ from .enums import (
 )
 
 
+DEFAULT_EXCHANGE = "unknown"
 DEFAULT_MARKET_TYPE = "perpetual"
 DEFAULT_TIMEFRAME = "1m"
 
@@ -20,22 +21,27 @@ OrderFlowKey: TypeAlias = tuple[str, str, str, str]
 # exchange, market_type, symbol, timeframe
 
 
-# ---------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------
+# =============================================================================
+# Numeric helpers
+# =============================================================================
 
 
-def _safe_float(value: object, default: float | None = None) -> float | None:
+def safe_float(value: object, default: float | None = None) -> float | None:
     if value is None:
         return default
 
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
 
+    if result != result:  # NaN
+        return default
 
-def _safe_int(value: object, default: int | None = None) -> int | None:
+    return result
+
+
+def safe_int(value: object, default: int | None = None) -> int | None:
     if value is None:
         return default
 
@@ -45,37 +51,46 @@ def _safe_int(value: object, default: int | None = None) -> int | None:
         return default
 
 
-def _clamp(value: object, low: float = 0.0, high: float = 1.0) -> float:
-    parsed = _safe_float(value, default=0.0)
+def clamp(value: object, low: float = 0.0, high: float = 1.0) -> float:
+    parsed = safe_float(value, default=0.0)
     assert parsed is not None
     return max(low, min(high, parsed))
 
 
-def _normalize_symbol(symbol: object) -> str:
+# Backward-compatible aliases.
+_safe_float = safe_float
+_safe_int = safe_int
+_clamp = clamp
+
+
+# =============================================================================
+# Scope helpers
+# =============================================================================
+
+
+def normalize_symbol(symbol: object) -> str:
     normalized = str(symbol or "").strip().upper()
     if not normalized:
         raise ValueError("symbol must not be empty")
     return normalized
 
 
-def _normalize_exchange(exchange: object) -> str:
-    normalized = str(exchange or "").strip().lower()
-    if not normalized:
-        raise ValueError("exchange must not be empty")
-    return normalized
+def normalize_exchange(exchange: object) -> str:
+    normalized = str(exchange or DEFAULT_EXCHANGE).strip().lower()
+    return normalized or DEFAULT_EXCHANGE
 
 
-def _normalize_market_type(market_type: object) -> str:
+def normalize_market_type(market_type: object) -> str:
     normalized = str(market_type or DEFAULT_MARKET_TYPE).strip().lower()
-    return normalized if normalized else DEFAULT_MARKET_TYPE
+    return normalized or DEFAULT_MARKET_TYPE
 
 
-def _normalize_timeframe(timeframe: object) -> str:
+def normalize_timeframe(timeframe: object) -> str:
     normalized = str(timeframe or DEFAULT_TIMEFRAME).strip()
-    return normalized if normalized else DEFAULT_TIMEFRAME
+    return normalized or DEFAULT_TIMEFRAME
 
 
-def _normalize_exchange_symbol(
+def normalize_exchange_symbol(
     exchange_symbol: object,
     *,
     fallback_symbol: str,
@@ -86,16 +101,16 @@ def _normalize_exchange_symbol(
 
 def make_orderflow_key(
     *,
-    exchange: object,
+    exchange: object = DEFAULT_EXCHANGE,
     market_type: object = DEFAULT_MARKET_TYPE,
     symbol: object,
     timeframe: object = DEFAULT_TIMEFRAME,
 ) -> OrderFlowKey:
     return (
-        _normalize_exchange(exchange),
-        _normalize_market_type(market_type),
-        _normalize_symbol(symbol),
-        _normalize_timeframe(timeframe),
+        normalize_exchange(exchange),
+        normalize_market_type(market_type),
+        normalize_symbol(symbol),
+        normalize_timeframe(timeframe),
     )
 
 
@@ -107,6 +122,76 @@ def orderflow_key_to_dict(key: OrderFlowKey) -> dict[str, str]:
         "symbol": symbol,
         "timeframe": timeframe,
     }
+
+
+def orderflow_key_to_string(key: OrderFlowKey) -> str:
+    scope = orderflow_key_to_dict(key)
+    return (
+        f"{scope['exchange']}:"
+        f"{scope['market_type']}:"
+        f"{scope['symbol']}:"
+        f"{scope['timeframe']}"
+    )
+
+
+def make_scope_payload(
+    *,
+    exchange: object = DEFAULT_EXCHANGE,
+    market_type: object = DEFAULT_MARKET_TYPE,
+    symbol: object,
+    timeframe: object = DEFAULT_TIMEFRAME,
+    exchange_symbol: object | None = None,
+) -> dict[str, Any]:
+    key = make_orderflow_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    scope = orderflow_key_to_dict(key)
+
+    normalized_exchange_symbol = normalize_exchange_symbol(
+        exchange_symbol,
+        fallback_symbol=scope["symbol"],
+    )
+
+    return {
+        "exchange": scope["exchange"],
+        "market_type": scope["market_type"],
+        "symbol": scope["symbol"],
+        "timeframe": scope["timeframe"],
+        "exchange_symbol": normalized_exchange_symbol,
+        "scope": scope,
+        "scope_key": orderflow_key_to_string(key),
+        "orderflow_key": key,
+        "key": list(key),
+    }
+
+
+def normalize_scope_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    key: OrderFlowKey,
+    exchange_symbol: str,
+) -> dict[str, Any]:
+    result = dict(metadata or {})
+    result.setdefault("scope", orderflow_key_to_dict(key))
+    result.setdefault("scope_key", orderflow_key_to_string(key))
+    result.setdefault("exchange_symbol", exchange_symbol)
+    return result
+
+
+# Backward-compatible private aliases.
+_normalize_symbol = normalize_symbol
+_normalize_exchange = normalize_exchange
+_normalize_market_type = normalize_market_type
+_normalize_timeframe = normalize_timeframe
+_normalize_exchange_symbol = normalize_exchange_symbol
+
+
+# =============================================================================
+# Enum helpers / serialization
+# =============================================================================
 
 
 def _coerce_metric_type(value: OrderFlowMetricType | str) -> OrderFlowMetricType:
@@ -166,9 +251,80 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
+# Base scoped model
+# =============================================================================
+
+
+@dataclass(slots=True)
+class OrderFlowScopedModel:
+    """
+    Shared scope behavior for order-flow models.
+
+    Canonical scope:
+        exchange + market_type + symbol + timeframe
+
+    This is a pure model mixin:
+    - no EventBus;
+    - no Scheduler;
+    - no logger;
+    - no IO.
+    """
+
+    symbol: str
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+    @property
+    def key(self) -> OrderFlowKey:
+        return make_orderflow_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
+
+    @property
+    def market_key(self) -> tuple[str, str, str]:
+        return self.exchange, self.market_type, self.symbol
+
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+
+# =============================================================================
 # Base input models
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @dataclass(slots=True)
@@ -194,7 +350,7 @@ class NormalizedTrade:
     notional: float
     timestamp: float
 
-    exchange: str
+    exchange: str = DEFAULT_EXCHANGE
     market_type: str = DEFAULT_MARKET_TYPE
     timeframe: str = DEFAULT_TIMEFRAME
     exchange_symbol: str | None = None
@@ -204,11 +360,11 @@ class NormalizedTrade:
     raw: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -221,7 +377,11 @@ class NormalizedTrade:
 
         self.trade_id = str(self.trade_id) if self.trade_id is not None else None
         self.is_aggressive = bool(self.is_aggressive)
-        self.raw = dict(self.raw or {})
+        self.raw = normalize_scope_metadata(
+            self.raw,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
 
         if self.price <= 0:
             raise ValueError("NormalizedTrade.price must be > 0")
@@ -242,6 +402,18 @@ class NormalizedTrade:
         )
 
     @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
+
+    @property
     def market_key(self) -> tuple[str, str, str]:
         return self.exchange, self.market_type, self.symbol
 
@@ -254,7 +426,7 @@ class NormalizedTrade:
         price: float,
         quantity: float,
         timestamp: float,
-        exchange: str,
+        exchange: str = DEFAULT_EXCHANGE,
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
         exchange_symbol: str | None = None,
@@ -286,17 +458,29 @@ class NormalizedTrade:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NormalizedTrade:
+        timestamp = (
+            data.get("timestamp")
+            if data.get("timestamp") is not None
+            else data.get("timestamp_ms", time.time())
+        )
+        if isinstance(timestamp, (int, float)) and float(timestamp) > 10_000_000_000:
+            timestamp = float(timestamp) / 1000.0
+
+        quantity = data.get("quantity", data.get("qty", data.get("size")))
+        if quantity is None:
+            raise ValueError("NormalizedTrade payload must contain quantity/qty/size")
+
         return cls.create(
-            exchange=str(data["exchange"]),
+            exchange=str(data.get("exchange") or DEFAULT_EXCHANGE),
             market_type=str(data.get("market_type") or DEFAULT_MARKET_TYPE),
             symbol=str(data["symbol"]),
             exchange_symbol=data.get("exchange_symbol"),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             side=data.get("side"),
             price=float(data["price"]),
-            quantity=float(data.get("quantity", data.get("qty", data.get("size")))),
+            quantity=float(quantity),
             notional=data.get("notional") or data.get("quote_qty"),
-            timestamp=float(data.get("timestamp", data.get("timestamp_ms", time.time()))),
+            timestamp=float(timestamp),
             trade_id=data.get("trade_id"),
             is_aggressive=bool(data.get("is_aggressive", False)),
             raw=dict(data.get("raw") or {}),
@@ -330,9 +514,18 @@ class NormalizedTrade:
             and self.timestamp > 0
         )
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = model_to_dict(self)
-        payload["key"] = list(self.key)
+        payload.update(self.scope_payload())
         return payload
 
 
@@ -355,8 +548,8 @@ class OrderbookLevel:
             return None
 
         if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-            price = _safe_float(raw[0])
-            size = _safe_float(raw[1])
+            price = safe_float(raw[0])
+            size = safe_float(raw[1])
 
             if price is None or size is None:
                 return None
@@ -364,8 +557,8 @@ class OrderbookLevel:
             return cls(price=price, size=size)
 
         if isinstance(raw, dict):
-            price = _safe_float(raw.get("price", raw.get("p")))
-            size = _safe_float(
+            price = safe_float(raw.get("price", raw.get("p")))
+            size = safe_float(
                 raw.get(
                     "size",
                     raw.get("quantity", raw.get("qty", raw.get("q"))),
@@ -411,7 +604,7 @@ class OrderbookSnapshot:
     asks: list[OrderbookLevel]
     timestamp: float
 
-    exchange: str
+    exchange: str = DEFAULT_EXCHANGE
     market_type: str = DEFAULT_MARKET_TYPE
     timeframe: str = DEFAULT_TIMEFRAME
     exchange_symbol: str | None = None
@@ -420,18 +613,22 @@ class OrderbookSnapshot:
     raw: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
 
         self.timestamp = float(self.timestamp)
         self.sequence_id = str(self.sequence_id) if self.sequence_id is not None else None
-        self.raw = dict(self.raw or {})
+        self.raw = normalize_scope_metadata(
+            self.raw,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
 
         self.bids = [
             level if isinstance(level, OrderbookLevel) else OrderbookLevel.from_raw(level)
@@ -461,6 +658,18 @@ class OrderbookSnapshot:
         )
 
     @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
+
+    @property
     def market_key(self) -> tuple[str, str, str]:
         return self.exchange, self.market_type, self.symbol
 
@@ -471,7 +680,7 @@ class OrderbookSnapshot:
         symbol: str,
         bids: list[Any],
         asks: list[Any],
-        exchange: str,
+        exchange: str = DEFAULT_EXCHANGE,
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
         exchange_symbol: str | None = None,
@@ -502,20 +711,22 @@ class OrderbookSnapshot:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> OrderbookSnapshot:
+        timestamp = data.get(
+            "timestamp",
+            data.get("timestamp_ms", data.get("last_update_ts_ms", time.time())),
+        )
+        if isinstance(timestamp, (int, float)) and float(timestamp) > 10_000_000_000:
+            timestamp = float(timestamp) / 1000.0
+
         return cls.create(
-            exchange=str(data["exchange"]),
+            exchange=str(data.get("exchange") or DEFAULT_EXCHANGE),
             market_type=str(data.get("market_type") or DEFAULT_MARKET_TYPE),
             symbol=str(data["symbol"]),
             exchange_symbol=data.get("exchange_symbol"),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             bids=list(data.get("bids") or []),
             asks=list(data.get("asks") or []),
-            timestamp=float(
-                data.get(
-                    "timestamp",
-                    data.get("timestamp_ms", data.get("last_update_ts_ms", time.time())),
-                )
-            ),
+            timestamp=float(timestamp),
             sequence_id=data.get("sequence_id") or data.get("sequence"),
             raw=dict(data.get("raw") or {}),
         )
@@ -559,9 +770,18 @@ class OrderbookSnapshot:
             and self.timestamp > 0
         )
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = model_to_dict(self)
-        payload["key"] = list(self.key)
+        payload.update(self.scope_payload())
         payload["best_bid"] = self.best_bid
         payload["best_ask"] = self.best_ask
         payload["spread"] = self.spread
@@ -569,9 +789,9 @@ class OrderbookSnapshot:
         return payload
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Base output models
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @dataclass(slots=True)
@@ -587,7 +807,7 @@ class BaseOrderFlowStats:
     metric: OrderFlowMetricType
     source_type: OrderFlowSourceType
 
-    exchange: str
+    exchange: str = DEFAULT_EXCHANGE
     market_type: str = DEFAULT_MARKET_TYPE
     timeframe: str = DEFAULT_TIMEFRAME
     exchange_symbol: str | None = None
@@ -596,11 +816,11 @@ class BaseOrderFlowStats:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -608,7 +828,11 @@ class BaseOrderFlowStats:
         self.metric = _coerce_metric_type(self.metric)
         self.source_type = _coerce_source_type(self.source_type)
         self.timestamp = float(self.timestamp)
-        self.metadata = dict(self.metadata or {})
+        self.metadata = normalize_scope_metadata(
+            self.metadata,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
 
         if self.timestamp <= 0:
             raise ValueError("BaseOrderFlowStats.timestamp must be > 0")
@@ -622,9 +846,30 @@ class BaseOrderFlowStats:
             timeframe=self.timeframe,
         )
 
+    @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
+
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = model_to_dict(self)
-        payload["key"] = list(self.key)
+        payload.update(self.scope_payload())
         return payload
 
 
@@ -639,7 +884,7 @@ class OrderFlowUpdate:
     source_type: OrderFlowSourceType
     stats: dict[str, Any]
 
-    exchange: str
+    exchange: str = DEFAULT_EXCHANGE
     market_type: str = DEFAULT_MARKET_TYPE
     timeframe: str = DEFAULT_TIMEFRAME
     exchange_symbol: str | None = None
@@ -647,11 +892,11 @@ class OrderFlowUpdate:
     timestamp: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -659,6 +904,8 @@ class OrderFlowUpdate:
         self.metric = _coerce_metric_type(self.metric)
         self.source_type = _coerce_source_type(self.source_type)
         self.stats = dict(self.stats or {})
+        self.stats.setdefault("scope", self.scope)
+        self.stats.setdefault("scope_key", self.scope_key)
         self.timestamp = float(self.timestamp)
 
         if self.timestamp <= 0:
@@ -672,6 +919,18 @@ class OrderFlowUpdate:
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
+
+    @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
 
     @classmethod
     def from_stats(cls, stats: BaseOrderFlowStats) -> OrderFlowUpdate:
@@ -687,9 +946,18 @@ class OrderFlowUpdate:
             timestamp=stats.timestamp,
         )
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = model_to_dict(self)
-        payload["key"] = list(self.key)
+        payload.update(self.scope_payload())
         return payload
 
 
@@ -717,7 +985,7 @@ class OrderFlowSignal:
     strength: float
     reason: str
 
-    exchange: str
+    exchange: str = DEFAULT_EXCHANGE
     market_type: str = DEFAULT_MARKET_TYPE
     timeframe: str = DEFAULT_TIMEFRAME
     exchange_symbol: str | None = None
@@ -726,11 +994,11 @@ class OrderFlowSignal:
     timestamp: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -739,9 +1007,13 @@ class OrderFlowSignal:
         self.source_type = _coerce_source_type(self.source_type)
         self.signal_type = _coerce_signal_type(self.signal_type)
         self.side = _coerce_side(self.side)
-        self.strength = _clamp(self.strength)
+        self.strength = clamp(self.strength)
         self.reason = str(self.reason or "").strip()
-        self.context = dict(self.context or {})
+        self.context = normalize_scope_metadata(
+            self.context,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         self.timestamp = float(self.timestamp)
 
         if not self.reason:
@@ -759,18 +1031,39 @@ class OrderFlowSignal:
         )
 
     @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
+
+    @property
     def is_directional(self) -> bool:
         return self.signal_type.is_directional
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = model_to_dict(self)
-        payload["key"] = list(self.key)
+        payload.update(self.scope_payload())
         return payload
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Metric-specific models
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 @dataclass(slots=True)
@@ -778,26 +1071,26 @@ class CvdPoint:
     timestamp: float
     value: float
 
-    exchange: str
-    market_type: str
-    symbol: str
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
+    symbol: str = ""
     timeframe: str = DEFAULT_TIMEFRAME
     exchange_symbol: str | None = None
 
     price: float | None = None
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.symbol = _normalize_symbol(self.symbol)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
         self.timestamp = float(self.timestamp)
         self.value = float(self.value)
-        self.price = _safe_float(self.price)
+        self.price = safe_float(self.price)
 
         if self.timestamp <= 0:
             raise ValueError("CvdPoint.timestamp must be > 0")
@@ -811,9 +1104,30 @@ class CvdPoint:
             timeframe=self.timeframe,
         )
 
+    @property
+    def orderflow_key(self) -> OrderFlowKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return orderflow_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return orderflow_key_to_string(self.key)
+
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         payload = model_to_dict(self)
-        payload["key"] = list(self.key)
+        payload.update(self.scope_payload())
         return payload
 
 
@@ -854,9 +1168,9 @@ class CvdStats(BaseOrderFlowStats):
         super().__post_init__()
         self.window_seconds = float(self.window_seconds)
         self.trades_count = int(self.trades_count)
-        self.last_price = _safe_float(self.last_price)
-        self.price_change = _safe_float(self.price_change)
-        self.price_change_pct = _safe_float(self.price_change_pct)
+        self.last_price = safe_float(self.last_price)
+        self.price_change = safe_float(self.price_change)
+        self.price_change_pct = safe_float(self.price_change_pct)
 
 
 @dataclass(slots=True)
@@ -888,7 +1202,7 @@ class VolumeDeltaStats(BaseOrderFlowStats):
         super().__post_init__()
         self.window_seconds = float(self.window_seconds)
         self.trades_count = int(self.trades_count)
-        self.last_price = _safe_float(self.last_price)
+        self.last_price = safe_float(self.last_price)
 
 
 @dataclass(slots=True)
@@ -928,8 +1242,8 @@ class AggressiveTradesStats(BaseOrderFlowStats):
         self.aggressive_sell_count = int(self.aggressive_sell_count)
         self.large_buy_trades = int(self.large_buy_trades)
         self.large_sell_trades = int(self.large_sell_trades)
-        self.burst_score = _clamp(self.burst_score)
-        self.last_price = _safe_float(self.last_price)
+        self.burst_score = clamp(self.burst_score)
+        self.last_price = safe_float(self.last_price)
 
 
 @dataclass(slots=True)
@@ -949,16 +1263,16 @@ class OrderbookImbalanceStats(BaseOrderFlowStats):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.best_bid = _safe_float(self.best_bid)
-        self.best_ask = _safe_float(self.best_ask)
-        self.spread = _safe_float(self.spread)
-        self.mid_price = _safe_float(self.mid_price)
+        self.best_bid = safe_float(self.best_bid)
+        self.best_ask = safe_float(self.best_ask)
+        self.spread = safe_float(self.spread)
+        self.mid_price = safe_float(self.mid_price)
         self.depth_levels_used = int(self.depth_levels_used)
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Serialization helpers
-# ---------------------------------------------------------------------
+# =============================================================================
 
 
 def model_to_dict(model: Any) -> dict[str, Any]:
@@ -972,6 +1286,22 @@ def model_to_dict(model: Any) -> dict[str, Any]:
         key: _serialize_value(value)
         for key, value in asdict(model).items()
     }
+
+
+def model_to_payload(model: Any) -> dict[str, Any]:
+    """
+    Generic payload helper for EventBus/storage/dashboard usage.
+    """
+    if hasattr(model, "to_dict") and callable(model.to_dict):
+        return model.to_dict()
+
+    if isinstance(model, Mapping):
+        return dict(model)
+
+    if is_dataclass(model):
+        return model_to_dict(model)
+
+    raise TypeError(f"Unsupported orderflow model type: {type(model)!r}")
 
 
 def stats_to_dict(stats: BaseOrderFlowStats) -> dict[str, Any]:
@@ -992,3 +1322,58 @@ def orderbook_snapshot_to_dict(snapshot: OrderbookSnapshot) -> dict[str, Any]:
 
 def trade_to_dict(trade: NormalizedTrade) -> dict[str, Any]:
     return trade.to_dict()
+
+
+__all__ = [
+    # defaults / key
+    "DEFAULT_EXCHANGE",
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_TIMEFRAME",
+    "OrderFlowKey",
+
+    # numeric helpers
+    "safe_float",
+    "safe_int",
+    "clamp",
+
+    # scope helpers
+    "normalize_symbol",
+    "normalize_exchange",
+    "normalize_market_type",
+    "normalize_timeframe",
+    "normalize_exchange_symbol",
+    "make_orderflow_key",
+    "orderflow_key_to_dict",
+    "orderflow_key_to_string",
+    "make_scope_payload",
+    "normalize_scope_metadata",
+
+    # base
+    "OrderFlowScopedModel",
+
+    # input models
+    "NormalizedTrade",
+    "OrderbookLevel",
+    "OrderbookSnapshot",
+
+    # output models
+    "BaseOrderFlowStats",
+    "OrderFlowUpdate",
+    "OrderFlowSignal",
+
+    # metric models
+    "CvdPoint",
+    "CvdStats",
+    "VolumeDeltaStats",
+    "AggressiveTradesStats",
+    "OrderbookImbalanceStats",
+
+    # serialization
+    "model_to_dict",
+    "model_to_payload",
+    "stats_to_dict",
+    "signal_to_dict",
+    "update_to_dict",
+    "orderbook_snapshot_to_dict",
+    "trade_to_dict",
+]

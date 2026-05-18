@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, Mapping, TypeAlias
 
 from .enums import (
     OIAnomalyType,
@@ -13,6 +13,7 @@ from .enums import (
 )
 
 
+DEFAULT_EXCHANGE = "unknown"
 DEFAULT_MARKET_TYPE = "perpetual"
 DEFAULT_TIMEFRAME = "1m"
 
@@ -20,17 +21,26 @@ OIKey: TypeAlias = tuple[str, str, str, str]
 # exchange, market_type, symbol, timeframe
 
 
-def _safe_float(value: Any, default: float | None = None) -> float | None:
+# =============================================================================
+# Numeric helpers
+# =============================================================================
+
+def safe_float(value: Any, default: float | None = None) -> float | None:
     if value is None:
         return default
 
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
 
+    if result != result:  # NaN
+        return default
 
-def _safe_int(value: Any, default: int | None = None) -> int | None:
+    return result
+
+
+def safe_int(value: Any, default: int | None = None) -> int | None:
     if value is None:
         return default
 
@@ -40,39 +50,51 @@ def _safe_int(value: Any, default: int | None = None) -> int | None:
         return default
 
 
-def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    if low > high:
+        raise ValueError("low must be <= high")
     return max(low, min(high, float(value)))
 
 
-def _normalize_symbol(symbol: Any) -> str:
+# Backward-compatible aliases.
+_safe_float = safe_float
+_safe_int = safe_int
+_clamp = clamp
+
+
+# =============================================================================
+# Scope helpers
+# =============================================================================
+
+def normalize_symbol(symbol: Any) -> str:
     normalized = str(symbol or "").upper().strip()
     if not normalized:
         raise ValueError("symbol must not be empty")
     return normalized
 
 
-def _normalize_exchange(exchange: Any) -> str:
-    normalized = str(exchange or "").lower().strip()
+def normalize_exchange(exchange: Any) -> str:
+    normalized = str(exchange or DEFAULT_EXCHANGE).lower().strip()
     if not normalized:
-        raise ValueError("exchange must not be empty")
+        return DEFAULT_EXCHANGE
     return normalized
 
 
-def _normalize_market_type(market_type: Any) -> str:
+def normalize_market_type(market_type: Any) -> str:
     normalized = str(market_type or DEFAULT_MARKET_TYPE).lower().strip()
     if not normalized:
         return DEFAULT_MARKET_TYPE
     return normalized
 
 
-def _normalize_timeframe(timeframe: Any) -> str:
+def normalize_timeframe(timeframe: Any) -> str:
     normalized = str(timeframe or DEFAULT_TIMEFRAME).strip()
     if not normalized:
         return DEFAULT_TIMEFRAME
     return normalized
 
 
-def _normalize_exchange_symbol(
+def normalize_exchange_symbol(
     exchange_symbol: Any,
     *,
     fallback_symbol: str,
@@ -83,21 +105,98 @@ def _normalize_exchange_symbol(
 
 def make_oi_key(
     *,
-    exchange: Any,
-    market_type: Any,
+    exchange: Any = DEFAULT_EXCHANGE,
+    market_type: Any = DEFAULT_MARKET_TYPE,
     symbol: Any,
-    timeframe: Any,
+    timeframe: Any = DEFAULT_TIMEFRAME,
 ) -> OIKey:
     return (
-        _normalize_exchange(exchange),
-        _normalize_market_type(market_type),
-        _normalize_symbol(symbol),
-        _normalize_timeframe(timeframe),
+        normalize_exchange(exchange),
+        normalize_market_type(market_type),
+        normalize_symbol(symbol),
+        normalize_timeframe(timeframe),
     )
 
 
+def oi_key_to_dict(key: OIKey) -> dict[str, str]:
+    exchange, market_type, symbol, timeframe = key
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }
+
+
+def oi_key_to_string(key: OIKey) -> str:
+    scope = oi_key_to_dict(key)
+    return (
+        f"{scope['exchange']}:"
+        f"{scope['market_type']}:"
+        f"{scope['symbol']}:"
+        f"{scope['timeframe']}"
+    )
+
+
+def make_scope_payload(
+    *,
+    exchange: Any = DEFAULT_EXCHANGE,
+    market_type: Any = DEFAULT_MARKET_TYPE,
+    symbol: Any,
+    timeframe: Any = DEFAULT_TIMEFRAME,
+    exchange_symbol: Any | None = None,
+) -> dict[str, Any]:
+    key = make_oi_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    scope = oi_key_to_dict(key)
+
+    return {
+        "exchange": scope["exchange"],
+        "market_type": scope["market_type"],
+        "symbol": scope["symbol"],
+        "timeframe": scope["timeframe"],
+        "exchange_symbol": normalize_exchange_symbol(
+            exchange_symbol,
+            fallback_symbol=scope["symbol"],
+        ),
+        "scope": scope,
+        "scope_key": oi_key_to_string(key),
+        "oi_key": key,
+        "key": list(key),
+    }
+
+
+def normalize_scope_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    key: OIKey,
+    exchange_symbol: str,
+) -> dict[str, Any]:
+    result = dict(metadata or {})
+    result.setdefault("scope", oi_key_to_dict(key))
+    result.setdefault("scope_key", oi_key_to_string(key))
+    result.setdefault("exchange_symbol", exchange_symbol)
+    return result
+
+
+# Backward-compatible private aliases.
+_normalize_symbol = normalize_symbol
+_normalize_exchange = normalize_exchange
+_normalize_market_type = normalize_market_type
+_normalize_timeframe = normalize_timeframe
+_normalize_exchange_symbol = normalize_exchange_symbol
+
+
+# =============================================================================
+# Enum coercion helpers
+# =============================================================================
+
 def _confidence_to_band(confidence: float) -> OIConfidenceBand:
-    confidence = _clamp(confidence)
+    confidence = clamp(confidence)
 
     if confidence >= 0.90:
         return OIConfidenceBand.VERY_HIGH
@@ -152,12 +251,80 @@ def _coerce_signal_strength(
     return OISignalStrength(str(value))
 
 
+# =============================================================================
+# Base scoped mixin
+# =============================================================================
+
+@dataclass(slots=True)
+class OIScopedModel:
+    """
+    Shared scope behavior for Open Interest domain models.
+
+    Canonical scope:
+        exchange + market_type + symbol + timeframe
+    """
+
+    symbol: str
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+    @property
+    def key(self) -> OIKey:
+        return make_oi_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def oi_key(self) -> OIKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return oi_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return oi_key_to_string(self.key)
+
+    @property
+    def market_key(self) -> tuple[str, str, str]:
+        return self.exchange, self.market_type, self.symbol
+
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+
+# =============================================================================
+# Core input models
+# =============================================================================
+
 @dataclass(slots=True)
 class OISnapshot:
     """
     Нормалізований futures open-interest snapshot з data layer.
 
-    Джерело:
+    Correct source:
         OpenInterestCache -> market.open_interest.updated -> OIAnalyzer
 
     Scope:
@@ -185,11 +352,11 @@ class OISnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -197,10 +364,9 @@ class OISnapshot:
         self.timestamp = float(self.timestamp)
         self.oi = float(self.oi)
 
-        self.open_interest_value = _safe_float(self.open_interest_value)
-        self.mark_price = _safe_float(self.mark_price)
-        self.index_price = _safe_float(self.index_price)
-        self.metadata = dict(self.metadata or {})
+        self.open_interest_value = safe_float(self.open_interest_value)
+        self.mark_price = safe_float(self.mark_price)
+        self.index_price = safe_float(self.index_price)
 
         if self.timestamp <= 0:
             raise ValueError("OISnapshot.timestamp must be > 0")
@@ -217,6 +383,12 @@ class OISnapshot:
         if self.index_price is not None and self.index_price <= 0:
             raise ValueError("OISnapshot.index_price must be > 0")
 
+        self.metadata = normalize_scope_metadata(
+            self.metadata,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+
     @property
     def key(self) -> OIKey:
         return make_oi_key(
@@ -225,6 +397,18 @@ class OISnapshot:
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
+
+    @property
+    def oi_key(self) -> OIKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return oi_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return oi_key_to_string(self.key)
 
     @property
     def market_key(self) -> tuple[str, str, str]:
@@ -246,7 +430,7 @@ class OISnapshot:
 
         return cls(
             symbol=str(data["symbol"]),
-            exchange=str(data["exchange"]),
+            exchange=str(data.get("exchange") or DEFAULT_EXCHANGE),
             market_type=str(data.get("market_type") or data.get("category") or DEFAULT_MARKET_TYPE),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             exchange_symbol=data.get("exchange_symbol"),
@@ -260,12 +444,8 @@ class OISnapshot:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "market_type": self.market_type,
-            "symbol": self.symbol,
-            "exchange_symbol": self.exchange_symbol,
-            "timeframe": self.timeframe,
+        payload = {
+            **self.scope_payload(),
             "timestamp": self.timestamp,
             "oi": self.oi,
             "open_interest": self.oi,
@@ -273,9 +453,18 @@ class OISnapshot:
             "mark_price": self.mark_price,
             "index_price": self.index_price,
             "source": self.source,
-            "key": list(self.key),
             "metadata": dict(self.metadata),
         }
+        return payload
+
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
 
 
 @dataclass(slots=True)
@@ -284,7 +473,8 @@ class OIMarketContext:
     Futures market context на момент оцінки Open Interest.
 
     Джерела:
-    - CandlesCache -> market.candle.closed
+    - CandlesCache -> market.candle.closed / market.candles.updated
+    - TradesCache -> market.trades.updated
     - FundingCache -> market.funding.updated
     - OrderflowAnalyzer -> analytics.orderflow.updated
     - LiquidationsAnalyzer -> analytics.liquidations.updated
@@ -325,11 +515,11 @@ class OIMarketContext:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -358,9 +548,13 @@ class OIMarketContext:
             "mark_price",
             "index_price",
         ):
-            setattr(self, attr, _safe_float(getattr(self, attr)))
+            setattr(self, attr, safe_float(getattr(self, attr)))
 
-        self.extra = dict(self.extra or {})
+        self.extra = normalize_scope_metadata(
+            self.extra,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
 
     @property
     def key(self) -> OIKey:
@@ -370,6 +564,18 @@ class OIMarketContext:
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
+
+    @property
+    def oi_key(self) -> OIKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return oi_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return oi_key_to_string(self.key)
 
     @property
     def liquidation_imbalance(self) -> float | None:
@@ -408,7 +614,7 @@ class OIMarketContext:
 
         return cls(
             symbol=str(data["symbol"]),
-            exchange=str(data["exchange"]),
+            exchange=str(data.get("exchange") or DEFAULT_EXCHANGE),
             market_type=str(data.get("market_type") or data.get("category") or DEFAULT_MARKET_TYPE),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             exchange_symbol=data.get("exchange_symbol"),
@@ -436,11 +642,7 @@ class OIMarketContext:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "exchange": self.exchange,
-            "market_type": self.market_type,
-            "symbol": self.symbol,
-            "exchange_symbol": self.exchange_symbol,
-            "timeframe": self.timeframe,
+            **self.scope_payload(),
             "timestamp": self.timestamp,
             "price": self.price,
             "price_delta": self.price_delta,
@@ -462,15 +664,29 @@ class OIMarketContext:
             "mark_price": self.mark_price,
             "index_price": self.index_price,
             "source": self.source,
-            "key": list(self.key),
             "extra": dict(self.extra),
         }
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+
+# =============================================================================
+# Feature model
+# =============================================================================
 
 @dataclass(slots=True)
 class OIFeatures:
     """
     Розраховані фічі для інтерпретації futures Open Interest.
+
+    Це pure value object. Він не має EventBus/Scheduler/logger/IO.
     """
 
     oi: float
@@ -526,11 +742,11 @@ class OIFeatures:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.symbol = _normalize_symbol(self.symbol)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -570,7 +786,7 @@ class OIFeatures:
             "oi_price_efficiency",
             "oi_pressure_score",
         ):
-            setattr(self, attr, _safe_float(getattr(self, attr)))
+            setattr(self, attr, safe_float(getattr(self, attr)))
 
         if self.oi is None:
             raise ValueError("OIFeatures.oi must not be None")
@@ -584,7 +800,11 @@ class OIFeatures:
 
         self.oi_direction = _coerce_oi_direction(self.oi_direction)
         self.price_direction = _coerce_oi_direction(self.price_direction)
-        self.metadata = dict(self.metadata or {})
+        self.metadata = normalize_scope_metadata(
+            self.metadata,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
 
     @property
     def key(self) -> OIKey:
@@ -595,6 +815,18 @@ class OIFeatures:
             timeframe=self.timeframe,
         )
 
+    @property
+    def oi_key(self) -> OIKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return oi_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return oi_key_to_string(self.key)
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> OIFeatures:
         timestamp = (
@@ -604,7 +836,7 @@ class OIFeatures:
         )
 
         return cls(
-            exchange=str(data["exchange"]),
+            exchange=str(data.get("exchange") or DEFAULT_EXCHANGE),
             market_type=str(data.get("market_type") or data.get("category") or DEFAULT_MARKET_TYPE),
             symbol=str(data["symbol"]),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
@@ -646,13 +878,8 @@ class OIFeatures:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "exchange": self.exchange,
-            "market_type": self.market_type,
-            "symbol": self.symbol,
-            "exchange_symbol": self.exchange_symbol,
-            "timeframe": self.timeframe,
+            **self.scope_payload(),
             "timestamp": self.timestamp,
-            "key": list(self.key),
             "oi": self.oi,
             "oi_delta": self.oi_delta,
             "oi_delta_pct": self.oi_delta_pct,
@@ -687,6 +914,19 @@ class OIFeatures:
             "metadata": dict(self.metadata),
         }
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+
+# =============================================================================
+# Result models
+# =============================================================================
 
 @dataclass(slots=True)
 class OIRegimeResult:
@@ -697,8 +937,8 @@ class OIRegimeResult:
 
     def __post_init__(self) -> None:
         self.regime = _coerce_oi_regime(self.regime)
-        self.confidence = _clamp(float(self.confidence))
-        self.score = _safe_float(self.score)
+        self.confidence = clamp(float(self.confidence))
+        self.score = safe_float(self.score)
         self.reasons = list(self.reasons or [])
 
     @property
@@ -736,9 +976,9 @@ class OIDivergenceResult:
     def __post_init__(self) -> None:
         self.detected = bool(self.detected)
         self.divergence_type = _coerce_divergence_type(self.divergence_type)
-        self.confidence = _clamp(float(self.confidence))
-        self.window_size = _safe_int(self.window_size)
-        self.score = _safe_float(self.score)
+        self.confidence = clamp(float(self.confidence))
+        self.window_size = safe_int(self.window_size)
+        self.score = safe_float(self.score)
         self.reasons = list(self.reasons or [])
 
         if not self.detected:
@@ -788,8 +1028,8 @@ class OIAnomalyResult:
         self.detected = bool(self.detected)
         self.anomaly_type = _coerce_anomaly_type(self.anomaly_type)
         self.strength = _coerce_signal_strength(self.strength)
-        self.confidence = _clamp(float(self.confidence))
-        self.score = _safe_float(self.score)
+        self.confidence = clamp(float(self.confidence))
+        self.score = safe_float(self.score)
         self.reasons = list(self.reasons or [])
 
         if not self.detected:
@@ -849,11 +1089,11 @@ class OIAnalysisResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
@@ -864,15 +1104,28 @@ class OIAnalysisResult:
             raise ValueError("OIAnalysisResult.timestamp must be > 0")
 
         if self.snapshot.key != self.key:
-            raise ValueError("OIAnalysisResult.snapshot key does not match result key")
+            raise ValueError(
+                "OIAnalysisResult.snapshot key does not match result key: "
+                f"snapshot={oi_key_to_dict(self.snapshot.key)} result={self.scope}"
+            )
 
         if self.context.key != self.key:
-            raise ValueError("OIAnalysisResult.context key does not match result key")
+            raise ValueError(
+                "OIAnalysisResult.context key does not match result key: "
+                f"context={oi_key_to_dict(self.context.key)} result={self.scope}"
+            )
 
         if self.features.key != self.key:
-            raise ValueError("OIAnalysisResult.features key does not match result key")
+            raise ValueError(
+                "OIAnalysisResult.features key does not match result key: "
+                f"features={oi_key_to_dict(self.features.key)} result={self.scope}"
+            )
 
-        self.metadata = dict(self.metadata or {})
+        self.metadata = normalize_scope_metadata(
+            self.metadata,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
 
     @property
     def key(self) -> OIKey:
@@ -882,6 +1135,18 @@ class OIAnalysisResult:
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
+
+    @property
+    def oi_key(self) -> OIKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return oi_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return oi_key_to_string(self.key)
 
     @property
     def has_divergence(self) -> bool:
@@ -913,7 +1178,7 @@ class OIAnalysisResult:
         anomaly_data = data.get("anomaly")
 
         return cls(
-            exchange=str(data["exchange"]),
+            exchange=str(data.get("exchange") or DEFAULT_EXCHANGE),
             market_type=str(data.get("market_type") or data.get("category") or DEFAULT_MARKET_TYPE),
             symbol=str(data["symbol"]),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
@@ -938,13 +1203,8 @@ class OIAnalysisResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "exchange": self.exchange,
-            "market_type": self.market_type,
-            "symbol": self.symbol,
-            "exchange_symbol": self.exchange_symbol,
-            "timeframe": self.timeframe,
+            **self.scope_payload(),
             "timestamp": self.timestamp,
-            "key": list(self.key),
             "snapshot": self.snapshot.to_dict(),
             "context": self.context.to_dict(),
             "features": self.features.to_dict(),
@@ -958,6 +1218,19 @@ class OIAnalysisResult:
             "metadata": dict(self.metadata),
         }
 
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+
+# =============================================================================
+# Runtime state model
+# =============================================================================
 
 @dataclass(slots=True)
 class OIState:
@@ -987,18 +1260,25 @@ class OIState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = _normalize_symbol(self.symbol)
-        self.exchange = _normalize_exchange(self.exchange)
-        self.market_type = _normalize_market_type(self.market_type)
-        self.timeframe = _normalize_timeframe(self.timeframe)
-        self.exchange_symbol = _normalize_exchange_symbol(
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
 
         self.last_regime = _coerce_oi_regime(self.last_regime)
-        self.last_update_ts = _safe_float(self.last_update_ts)
-        self.metadata = dict(self.metadata or {})
+        self.last_update_ts = safe_float(self.last_update_ts)
+
+        self.metadata = normalize_scope_metadata(
+            self.metadata,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+        self._validate_existing_children()
 
     @property
     def key(self) -> OIKey:
@@ -1008,6 +1288,18 @@ class OIState:
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
+
+    @property
+    def oi_key(self) -> OIKey:
+        return self.key
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return oi_key_to_dict(self.key)
+
+    @property
+    def scope_key(self) -> str:
+        return oi_key_to_string(self.key)
 
     @property
     def has_snapshot(self) -> bool:
@@ -1027,30 +1319,47 @@ class OIState:
 
     def apply_snapshot(self, snapshot: OISnapshot) -> None:
         if snapshot.key != self.key:
-            raise ValueError("OISnapshot key does not match OIState key")
+            raise ValueError(
+                "OISnapshot key does not match OIState key: "
+                f"snapshot={oi_key_to_dict(snapshot.key)} state={self.scope}"
+            )
         self.last_snapshot = snapshot
+        self.exchange_symbol = snapshot.exchange_symbol
         self.touch(snapshot.timestamp)
 
     def apply_context(self, context: OIMarketContext) -> None:
         if context.key != self.key:
-            raise ValueError("OIMarketContext key does not match OIState key")
+            raise ValueError(
+                "OIMarketContext key does not match OIState key: "
+                f"context={oi_key_to_dict(context.key)} state={self.scope}"
+            )
         self.last_context = context
+        self.exchange_symbol = context.exchange_symbol
         self.touch(context.timestamp)
 
     def apply_features(self, features: OIFeatures) -> None:
         if features.key != self.key:
-            raise ValueError("OIFeatures key does not match OIState key")
+            raise ValueError(
+                "OIFeatures key does not match OIState key: "
+                f"features={oi_key_to_dict(features.key)} state={self.scope}"
+            )
         self.last_features = features
+        self.exchange_symbol = features.exchange_symbol
         self.touch(features.timestamp)
 
     def apply_analysis(self, analysis: OIAnalysisResult) -> None:
         if analysis.key != self.key:
-            raise ValueError("OIAnalysisResult key does not match OIState key")
+            raise ValueError(
+                "OIAnalysisResult key does not match OIState key: "
+                f"analysis={oi_key_to_dict(analysis.key)} state={self.scope}"
+            )
+
         self.last_analysis = analysis
         self.last_snapshot = analysis.snapshot
         self.last_context = analysis.context
         self.last_features = analysis.features
         self.last_regime = analysis.regime.regime
+        self.exchange_symbol = analysis.exchange_symbol
         self.touch(analysis.timestamp)
 
     def touch(self, timestamp: float) -> None:
@@ -1076,15 +1385,17 @@ class OIState:
         self.last_regime = OIRegime.NEUTRAL
         self.last_update_ts = None
         self.metadata.clear()
+        self.metadata.update(
+            normalize_scope_metadata(
+                {},
+                key=self.key,
+                exchange_symbol=self.exchange_symbol or self.symbol,
+            )
+        )
 
     def to_dict(self, *, include_full_analysis: bool = False) -> dict[str, Any]:
         return {
-            "exchange": self.exchange,
-            "market_type": self.market_type,
-            "symbol": self.symbol,
-            "exchange_symbol": self.exchange_symbol,
-            "timeframe": self.timeframe,
-            "key": list(self.key),
+            **self.scope_payload(),
             "last_regime": self.last_regime.value,
             "last_update_ts": self.last_update_ts,
             "has_snapshot": self.has_snapshot,
@@ -1113,3 +1424,96 @@ class OIState:
             ),
             "metadata": dict(self.metadata),
         }
+
+    def scope_payload(self) -> dict[str, Any]:
+        return make_scope_payload(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+    def _validate_existing_children(self) -> None:
+        if self.last_snapshot is not None and self.last_snapshot.key != self.key:
+            raise ValueError(
+                "last_snapshot key does not match OIState key: "
+                f"snapshot={oi_key_to_dict(self.last_snapshot.key)} state={self.scope}"
+            )
+
+        if self.last_context is not None and self.last_context.key != self.key:
+            raise ValueError(
+                "last_context key does not match OIState key: "
+                f"context={oi_key_to_dict(self.last_context.key)} state={self.scope}"
+            )
+
+        if self.last_features is not None and self.last_features.key != self.key:
+            raise ValueError(
+                "last_features key does not match OIState key: "
+                f"features={oi_key_to_dict(self.last_features.key)} state={self.scope}"
+            )
+
+        if self.last_analysis is not None and self.last_analysis.key != self.key:
+            raise ValueError(
+                "last_analysis key does not match OIState key: "
+                f"analysis={oi_key_to_dict(self.last_analysis.key)} state={self.scope}"
+            )
+
+
+# =============================================================================
+# Generic payload helper
+# =============================================================================
+
+def model_to_payload(model: Any) -> dict[str, Any]:
+    """
+    Єдиний helper для EventBus/storage/dashboard serialization.
+    """
+    if hasattr(model, "to_dict") and callable(model.to_dict):
+        return model.to_dict()
+
+    if hasattr(model, "to_payload") and callable(model.to_payload):
+        payload = model.to_payload()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+
+    if isinstance(model, Mapping):
+        return dict(model)
+
+    raise TypeError(f"Unsupported OI model type: {type(model)!r}")
+
+
+__all__ = [
+    "DEFAULT_EXCHANGE",
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_TIMEFRAME",
+    "OIKey",
+
+    # helpers
+    "safe_float",
+    "safe_int",
+    "clamp",
+    "normalize_symbol",
+    "normalize_exchange",
+    "normalize_market_type",
+    "normalize_timeframe",
+    "normalize_exchange_symbol",
+    "make_oi_key",
+    "oi_key_to_dict",
+    "oi_key_to_string",
+    "make_scope_payload",
+    "normalize_scope_metadata",
+    "model_to_payload",
+
+    # scoped base
+    "OIScopedModel",
+
+    # models
+    "OISnapshot",
+    "OIMarketContext",
+    "OIFeatures",
+    "OIRegimeResult",
+    "OIDivergenceResult",
+    "OIAnomalyResult",
+    "OIAnalysisResult",
+    "OIState",
+]

@@ -18,6 +18,7 @@ from .enums import (
     OrderFlowSourceType,
 )
 from .models import (
+    DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     BaseOrderFlowStats,
@@ -27,7 +28,12 @@ from .models import (
     OrderFlowUpdate,
     OrderbookSnapshot,
     make_orderflow_key,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
     orderflow_key_to_dict,
+    orderflow_key_to_string,
     signal_to_dict,
     update_to_dict,
 )
@@ -84,15 +90,21 @@ class BaseOrderFlowAnalyzer(ABC):
         self._config = config
         self._metric_type = metric_type
         self._source_type = source_type
-        self._source_topic_patterns = list(source_topic_patterns or ())
+        self._source_topic_patterns = list(
+            dict.fromkeys(
+                str(pattern).strip()
+                for pattern in (source_topic_patterns or ())
+                if str(pattern).strip()
+            )
+        )
 
         self._default_exchange = (
-            str(default_exchange).strip().lower()
-            if default_exchange
-            else None
+            normalize_exchange(default_exchange)
+            if default_exchange is not None
+            else DEFAULT_EXCHANGE
         )
-        self._default_market_type = self._normalize_market_type(default_market_type)
-        self._default_timeframe = self._normalize_timeframe(default_timeframe)
+        self._default_market_type = normalize_market_type(default_market_type)
+        self._default_timeframe = normalize_timeframe(default_timeframe)
 
         self._logger = get_logger(
             __name__,
@@ -141,6 +153,8 @@ class BaseOrderFlowAnalyzer(ABC):
             )
 
         for pattern in self._source_topic_patterns:
+            self._assert_input_topic_allowed(pattern)
+
             subscription = self._event_bus.subscribe(
                 pattern=pattern,
                 handler=self._handle_event,
@@ -152,12 +166,17 @@ class BaseOrderFlowAnalyzer(ABC):
         self._running = True
 
         self._logger.info(
-            "%s registered | metric=%s source_type=%s patterns=%s scope=%s",
-            self.__class__.__name__,
-            self._metric_type.value,
-            self._source_type.value,
-            self._source_topic_patterns,
-            "exchange:market_type:symbol:timeframe",
+            "%s registered",
+            extra={
+                "analyzer": self.__class__.__name__,
+                "metric": self._metric_type.value,
+                "source_type": self._source_type.value,
+                "patterns": list(self._source_topic_patterns),
+                "scope": "exchange:market_type:symbol:timeframe",
+                "defaults": self._defaults_payload(),
+                "output_topics": list(self._config.output_topics),
+                "scheduler_job_names": list(self._config.scheduler_job_names),
+            },
         )
 
     def start(self) -> None:
@@ -178,16 +197,25 @@ class BaseOrderFlowAnalyzer(ABC):
                 self._event_bus.unsubscribe(subscription)
             except Exception:
                 self._logger.exception(
-                    "Failed to unsubscribe handler | analyzer=%s pattern=%s",
-                    self.__class__.__name__,
-                    getattr(subscription, "pattern", None),
+                    "Failed to unsubscribe handler",
+                    extra={
+                        "analyzer": self.__class__.__name__,
+                        "pattern": getattr(subscription, "pattern", None),
+                    },
                 )
 
         self._subscriptions.clear()
-        self._disable_scheduler_jobs()
+        self._remove_scheduler_jobs()
         self._running = False
 
-        self._logger.info("%s stopped", self.__class__.__name__)
+        self._logger.info(
+            "%s stopped",
+            extra={
+                "analyzer": self.__class__.__name__,
+                "metric": self._metric_type.value,
+                "source_type": self._source_type.value,
+            },
+        )
 
     @property
     def is_running(self) -> bool:
@@ -222,15 +250,9 @@ class BaseOrderFlowAnalyzer(ABC):
         """
         Backward-compatible wrapper.
 
-        This requires default_exchange to be configured because symbol-only
-        processing is unsafe in multi-exchange futures mode.
+        Symbol-only processing is unsafe in multi-exchange mode, so this uses
+        explicit configured defaults.
         """
-        if not self._default_exchange:
-            raise ValueError(
-                "process_symbol(symbol) requires default_exchange. "
-                "Use process_key(exchange, market_type, symbol, timeframe) instead."
-            )
-
         key = self.make_key(
             exchange=self._default_exchange,
             market_type=self._default_market_type,
@@ -245,12 +267,6 @@ class BaseOrderFlowAnalyzer(ABC):
 
         New code should call get_latest_stats_by_key().
         """
-        if not self._default_exchange:
-            raise ValueError(
-                "get_latest_stats(symbol) requires default_exchange. "
-                "Use get_latest_stats_by_key(key) instead."
-            )
-
         key = self.make_key(
             exchange=self._default_exchange,
             market_type=self._default_market_type,
@@ -264,37 +280,27 @@ class BaseOrderFlowAnalyzer(ABC):
     # ------------------------------------------------------------------
 
     def stats(self) -> dict[str, Any]:
+        config_payload = (
+            self._config.to_dict()
+            if hasattr(self._config, "to_dict")
+            else {
+                "enabled": self._config.enabled,
+                "emit_updates": self._config.emit_updates,
+                "emit_signals": self._config.emit_signals,
+                "source_name": self._config.source_name,
+                "update_topic": self._config.update_topic,
+                "signal_topic": self._config.signal_topic,
+            }
+        )
+
         return {
             "running": self._running,
             "metric": self._metric_type.value,
             "source_type": self._source_type.value,
             "source_topic_patterns": list(self._source_topic_patterns),
             "scope": "exchange:market_type:symbol:timeframe",
-            "defaults": {
-                "exchange": self._default_exchange,
-                "market_type": self._default_market_type,
-                "timeframe": self._default_timeframe,
-            },
-            "config": {
-                "enabled": self._config.enabled,
-                "emit_updates": self._config.emit_updates,
-                "emit_signals": self._config.emit_signals,
-                "min_signal_interval_sec": self._config.min_signal_interval_sec,
-                "health_log_interval_sec": self._config.health_log_interval_sec,
-                "cleanup_interval_sec": self._config.cleanup_interval_sec,
-                "scheduler_job_timeout_sec": self._config.scheduler_job_timeout_sec,
-                "scheduler_job_retry_delay_sec": self._config.scheduler_job_retry_delay_sec,
-                "scheduler_job_max_retries": self._config.scheduler_job_max_retries,
-                "source_name": self._config.source_name,
-                "update_topic": self._config.update_topic,
-                "signal_topic": self._config.signal_topic,
-                "publish_priority": self._config.publish_priority.name,
-                "symbol_allowlist": (
-                    sorted(self._config.symbol_allowlist)
-                    if self._config.symbol_allowlist
-                    else None
-                ),
-            },
+            "defaults": self._defaults_payload(),
+            "config": config_payload,
             "subscriptions": len(self._subscriptions),
             "health_job_id": self._health_job_id,
             "cleanup_job_id": self._cleanup_job_id,
@@ -312,11 +318,15 @@ class BaseOrderFlowAnalyzer(ABC):
     def log_health(self) -> None:
         snapshot = self.stats()
         self._logger.info(
-            "%s health | running=%s subscriptions=%s metrics=%s",
-            self.__class__.__name__,
-            snapshot["running"],
-            snapshot["subscriptions"],
-            snapshot["metrics"],
+            "%s health",
+            extra={
+                "analyzer": self.__class__.__name__,
+                "running": snapshot["running"],
+                "subscriptions": snapshot["subscriptions"],
+                "metrics": snapshot["metrics"],
+                "source_topic_patterns": snapshot["source_topic_patterns"],
+                "scope": snapshot["scope"],
+            },
         )
 
     async def cleanup(self) -> None:
@@ -336,12 +346,19 @@ class BaseOrderFlowAnalyzer(ABC):
         if not self._config.emit_updates:
             return
 
+        if not self.should_process_key(stats.key):
+            self._inc_metric("skipped", stats.key)
+            return
+
         update = OrderFlowUpdate.from_stats(stats)
+        payload = update_to_dict(update)
 
         emitted = await self._safe_emit(
             topic=self._config.update_topic,
-            payload=update_to_dict(update),
+            payload=payload,
             source=self._config.source_name,
+            key=stats.key,
+            event_type="orderflow_update",
         )
 
         if emitted:
@@ -351,14 +368,22 @@ class BaseOrderFlowAnalyzer(ABC):
         if not self._config.emit_signals:
             return
 
+        if not self.should_process_key(signal.key):
+            self._inc_metric("skipped", signal.key)
+            return
+
         if not self._can_emit_signal(signal.key):
             self._inc_metric("skipped", signal.key)
             return
 
+        payload = signal_to_dict(signal)
+
         emitted = await self._safe_emit(
             topic=self._config.signal_topic,
-            payload=signal_to_dict(signal),
+            payload=payload,
             source=self._config.source_name,
+            key=signal.key,
+            event_type="orderflow_signal",
         )
 
         if emitted:
@@ -379,19 +404,35 @@ class BaseOrderFlowAnalyzer(ABC):
         exchange_symbol: str | None = None,
         context: dict[str, Any] | None = None,
     ) -> OrderFlowSignal:
-        return OrderFlowSignal(
+        key = self.make_key(
             exchange=exchange,
             market_type=market_type,
             symbol=symbol,
-            exchange_symbol=exchange_symbol,
             timeframe=timeframe,
+        )
+        scope = orderflow_key_to_dict(key)
+
+        merged_context = {
+            "scope": scope,
+            "scope_key": orderflow_key_to_string(key),
+            "metric": self._metric_type.value,
+            "source_type": self._source_type.value,
+            **dict(context or {}),
+        }
+
+        return OrderFlowSignal(
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            symbol=scope["symbol"],
+            exchange_symbol=exchange_symbol,
+            timeframe=scope["timeframe"],
             metric=self._metric_type,
             source_type=self._source_type,
             signal_type=signal_type,
             side=side,
             strength=max(0.0, min(1.0, float(strength))),
             reason=reason,
-            context=context or {},
+            context=merged_context,
         )
 
     def build_signal_from_stats(
@@ -406,6 +447,8 @@ class BaseOrderFlowAnalyzer(ABC):
     ) -> OrderFlowSignal:
         merged_context = {
             "stats": stats.to_dict(),
+            "scope": stats.scope,
+            "scope_key": stats.scope_key,
             **dict(context or {}),
         }
 
@@ -434,7 +477,7 @@ class BaseOrderFlowAnalyzer(ABC):
         if not exchange or not market_type or not symbol or not timeframe:
             return False
 
-        return self._config.should_process_symbol(symbol)
+        return self._config.should_process_key(key)
 
     def should_process_symbol(self, symbol: str | None) -> bool:
         """
@@ -450,6 +493,12 @@ class BaseOrderFlowAnalyzer(ABC):
         key = self._extract_key_from_payload(payload)
         if key is not None:
             return key
+
+        headers = getattr(event, "headers", None)
+        if isinstance(headers, Mapping):
+            key = self._extract_key_from_mapping(headers)
+            if key is not None:
+                return key
 
         symbol = getattr(event, "symbol", None)
         exchange = getattr(event, "exchange", None) or self._default_exchange
@@ -509,7 +558,9 @@ class BaseOrderFlowAnalyzer(ABC):
             return None
 
         if isinstance(raw_trade, NormalizedTrade):
-            return raw_trade if raw_trade.is_valid else None
+            if not raw_trade.is_valid:
+                return None
+            return raw_trade if self.should_process_key(raw_trade.key) else None
 
         if not isinstance(raw_trade, Mapping):
             return None
@@ -602,7 +653,10 @@ class BaseOrderFlowAnalyzer(ABC):
         except (TypeError, ValueError):
             return None
 
-        return trade if trade.is_valid else None
+        if not trade.is_valid:
+            return None
+
+        return trade if self.should_process_key(trade.key) else None
 
     def normalize_orderbook_snapshot(
         self,
@@ -618,7 +672,9 @@ class BaseOrderFlowAnalyzer(ABC):
             return None
 
         if isinstance(raw_snapshot, OrderbookSnapshot):
-            return raw_snapshot if raw_snapshot.is_valid else None
+            if not raw_snapshot.is_valid:
+                return None
+            return raw_snapshot if self.should_process_key(raw_snapshot.key) else None
 
         if not isinstance(raw_snapshot, Mapping):
             return None
@@ -703,7 +759,10 @@ class BaseOrderFlowAnalyzer(ABC):
         except (TypeError, ValueError):
             return None
 
-        return snapshot if snapshot.is_valid else None
+        if not snapshot.is_valid:
+            return None
+
+        return snapshot if self.should_process_key(snapshot.key) else None
 
     def make_trade_key(self, trade: NormalizedTrade) -> str:
         if trade.trade_id:
@@ -721,7 +780,7 @@ class BaseOrderFlowAnalyzer(ABC):
     @staticmethod
     def make_key(
         *,
-        exchange: str,
+        exchange: str = DEFAULT_EXCHANGE,
         market_type: str = DEFAULT_MARKET_TYPE,
         symbol: str,
         timeframe: str = DEFAULT_TIMEFRAME,
@@ -742,10 +801,35 @@ class BaseOrderFlowAnalyzer(ABC):
             self._config.validate()
         except Exception:
             self._logger.exception(
-                "Invalid analyzer config | analyzer=%s",
-                self.__class__.__name__,
+                "Invalid analyzer config",
+                extra={"analyzer": self.__class__.__name__},
             )
             raise
+
+    def _assert_input_topic_allowed(self, topic: str) -> None:
+        """
+        Best-effort topic guard.
+
+        Top-level OrderFlowConfig owns canonical raw-topic guards. Sub-config
+        can also expose assert_input_topic_allowed() in newer versions.
+        """
+        guard = getattr(self._config, "assert_input_topic_allowed", None)
+        if callable(guard):
+            guard(topic)
+            return
+
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValueError("Orderflow input topic must not be empty")
+
+        if " " in topic:
+            raise ValueError("Orderflow input topic must not contain spaces")
+
+        if topic in {"market.trade", "market.orderbook"}:
+            raise ValueError(
+                f"Raw market topic {topic!r} is not allowed for orderflow analyzer. "
+                "Use data/cache-layer topics such as market.trades.updated "
+                "or market.orderbook.updated."
+            )
 
     def _extract_key_from_payload(self, payload: Any) -> OrderFlowKey | None:
         if not isinstance(payload, Mapping):
@@ -762,6 +846,24 @@ class BaseOrderFlowAnalyzer(ABC):
         return None
 
     def _extract_key_from_mapping(self, data: Mapping[str, Any]) -> OrderFlowKey | None:
+        scope = data.get("scope")
+        if isinstance(scope, Mapping):
+            scoped_key = self._extract_key_from_mapping(scope)
+            if scoped_key is not None:
+                return scoped_key
+
+        raw_key = data.get("orderflow_key") or data.get("key")
+        if isinstance(raw_key, (list, tuple)) and len(raw_key) == 4:
+            try:
+                return self.make_key(
+                    exchange=str(raw_key[0]),
+                    market_type=str(raw_key[1]),
+                    symbol=str(raw_key[2]),
+                    timeframe=str(raw_key[3]),
+                )
+            except ValueError:
+                return None
+
         exchange = (
             data.get("exchange")
             or data.get("venue")
@@ -843,14 +945,41 @@ class BaseOrderFlowAnalyzer(ABC):
         topic: str,
         payload: dict[str, Any],
         source: str,
+        key: OrderFlowKey | None = None,
+        event_type: str | None = None,
     ) -> bool:
         if not topic:
             self._logger.warning(
-                "Emit skipped because topic is empty | analyzer=%s",
-                self.__class__.__name__,
+                "Emit skipped because topic is empty",
+                extra={"analyzer": self.__class__.__name__},
             )
-            self._inc_metric("emit_errors")
+            self._inc_metric("emit_errors", key)
             return False
+
+        headers: dict[str, str] = {}
+
+        if key is not None:
+            scope = orderflow_key_to_dict(key)
+            headers.update(
+                {
+                    "exchange": scope["exchange"],
+                    "market_type": scope["market_type"],
+                    "symbol": scope["symbol"],
+                    "timeframe": scope["timeframe"],
+                    "scope_key": orderflow_key_to_string(key),
+                }
+            )
+
+            payload.setdefault("scope", scope)
+            payload.setdefault("scope_key", orderflow_key_to_string(key))
+            payload.setdefault("orderflow_key", key)
+            payload.setdefault("key", list(key))
+
+        if event_type:
+            headers["event_type"] = event_type
+
+        headers.setdefault("metric", self._metric_type.value)
+        headers.setdefault("source_type", self._source_type.value)
 
         try:
             return await self._event_bus.emit(
@@ -858,13 +987,18 @@ class BaseOrderFlowAnalyzer(ABC):
                 payload,
                 priority=self._config.publish_priority,
                 source=source,
+                headers=headers,
             )
         except Exception:
-            self._inc_metric("emit_errors")
+            self._inc_metric("emit_errors", key)
             self._logger.exception(
-                "Failed to emit EventBus event | analyzer=%s topic=%s",
-                self.__class__.__name__,
-                topic,
+                "Failed to emit EventBus event",
+                extra={
+                    "analyzer": self.__class__.__name__,
+                    "topic": topic,
+                    "scope": orderflow_key_to_dict(key) if key is not None else None,
+                    "scope_key": orderflow_key_to_string(key) if key is not None else None,
+                },
             )
             return False
 
@@ -883,12 +1017,16 @@ class BaseOrderFlowAnalyzer(ABC):
             return
 
         key_payload = orderflow_key_to_dict(key)
-        key_label = ":".join(key)
+        key_label = orderflow_key_to_string(key)
 
         key_metrics = self._metrics["keys"].setdefault(
             key_label,
             {
                 **key_payload,
+                "scope": key_payload,
+                "scope_key": key_label,
+                "orderflow_key": key,
+                "key": list(key),
                 "processed": 0,
                 "signals_emitted": 0,
                 "updates_emitted": 0,
@@ -926,13 +1064,18 @@ class BaseOrderFlowAnalyzer(ABC):
 
     @staticmethod
     def _normalize_market_type(value: Any) -> str:
-        normalized = str(value or DEFAULT_MARKET_TYPE).strip().lower()
-        return normalized if normalized else DEFAULT_MARKET_TYPE
+        return normalize_market_type(value)
 
     @staticmethod
     def _normalize_timeframe(value: Any) -> str:
-        normalized = str(value or DEFAULT_TIMEFRAME).strip()
-        return normalized if normalized else DEFAULT_TIMEFRAME
+        return normalize_timeframe(value)
+
+    def _defaults_payload(self) -> dict[str, str]:
+        return {
+            "exchange": self._default_exchange,
+            "market_type": self._default_market_type,
+            "timeframe": self._default_timeframe,
+        }
 
     # ------------------------------------------------------------------
     # Scheduler integration
@@ -942,36 +1085,66 @@ class BaseOrderFlowAnalyzer(ABC):
         if self._scheduler is None:
             return
 
-        self._health_job_id = self._scheduler.add_interval_job(
-            name=f"analytics.orderflow.{self._config.source_name}.health",
-            func=self._safe_health_job,
-            interval=float(self._config.health_log_interval_sec),
-            max_retries=int(self._config.scheduler_job_max_retries),
-            retry_delay=float(self._config.scheduler_job_retry_delay_sec),
-            timeout=float(self._config.scheduler_job_timeout_sec),
-            allow_overlap=False,
-            enabled=True,
+        job_names = list(getattr(self._config, "scheduler_job_names", ()) or ())
+        health_name = (
+            job_names[0]
+            if len(job_names) >= 1
+            else f"analytics.orderflow.{self._config.source_name}.health"
+        )
+        cleanup_name = (
+            job_names[1]
+            if len(job_names) >= 2
+            else f"analytics.orderflow.{self._config.source_name}.cleanup"
         )
 
-        self._cleanup_job_id = self._scheduler.add_interval_job(
-            name=f"analytics.orderflow.{self._config.source_name}.cleanup",
+        self._health_job_id = self._add_interval_job_once(
+            name=health_name,
+            func=self._safe_health_job,
+            interval=float(self._config.health_log_interval_sec),
+        )
+
+        self._cleanup_job_id = self._add_interval_job_once(
+            name=cleanup_name,
             func=self._safe_cleanup_job,
             interval=float(self._config.cleanup_interval_sec),
-            max_retries=int(self._config.scheduler_job_max_retries),
-            retry_delay=float(self._config.scheduler_job_retry_delay_sec),
-            timeout=float(self._config.scheduler_job_timeout_sec),
-            allow_overlap=False,
-            enabled=True,
         )
 
         self._logger.info(
-            "Scheduler jobs registered | analyzer=%s health_job_id=%s cleanup_job_id=%s",
-            self.__class__.__name__,
-            self._health_job_id,
-            self._cleanup_job_id,
+            "Scheduler jobs registered",
+            extra={
+                "analyzer": self.__class__.__name__,
+                "health_job_id": self._health_job_id,
+                "cleanup_job_id": self._cleanup_job_id,
+                "health_job_name": health_name,
+                "cleanup_job_name": cleanup_name,
+            },
         )
 
-    def _disable_scheduler_jobs(self) -> None:
+    def _add_interval_job_once(
+        self,
+        *,
+        name: str,
+        func: Any,
+        interval: float,
+    ) -> str:
+        assert self._scheduler is not None
+
+        existing = self._scheduler.get_job_by_name(name)
+        if existing is not None:
+            return existing.job_id
+
+        return self._scheduler.add_interval_job(
+            name=name,
+            func=func,
+            interval=interval,
+            max_retries=int(self._config.scheduler_job_max_retries),
+            retry_delay=float(self._config.scheduler_job_retry_delay_sec),
+            timeout=float(self._config.scheduler_job_timeout_sec),
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    def _remove_scheduler_jobs(self) -> None:
         if self._scheduler is None:
             self._health_job_id = None
             self._cleanup_job_id = None
@@ -984,18 +1157,41 @@ class BaseOrderFlowAnalyzer(ABC):
             try:
                 remove_job = getattr(self._scheduler, "remove_job", None)
                 if callable(remove_job):
-                    remove_job(job_id)
+                    result = remove_job(job_id)
+                    if inspect.isawaitable(result):
+                        self._logger.warning(
+                            "Scheduler.remove_job returned awaitable; "
+                            "job may require explicit async cleanup by caller",
+                            extra={
+                                "analyzer": self.__class__.__name__,
+                                "job_id": job_id,
+                            },
+                        )
                 else:
                     self._scheduler.disable_job(job_id)
+            except KeyError:
+                self._logger.debug(
+                    "Scheduler job already removed",
+                    extra={
+                        "analyzer": self.__class__.__name__,
+                        "job_id": job_id,
+                    },
+                )
             except Exception:
                 self._logger.exception(
-                    "Failed to cleanup scheduler job | analyzer=%s job_id=%s",
-                    self.__class__.__name__,
-                    job_id,
+                    "Failed to cleanup scheduler job",
+                    extra={
+                        "analyzer": self.__class__.__name__,
+                        "job_id": job_id,
+                    },
                 )
 
         self._health_job_id = None
         self._cleanup_job_id = None
+
+    # Backward-compatible alias.
+    def _disable_scheduler_jobs(self) -> None:
+        self._remove_scheduler_jobs()
 
     async def _safe_cleanup_job(self) -> None:
         try:
@@ -1005,8 +1201,8 @@ class BaseOrderFlowAnalyzer(ABC):
         except Exception:
             self._inc_metric("errors")
             self._logger.exception(
-                "Cleanup job failed | analyzer=%s",
-                self.__class__.__name__,
+                "Cleanup job failed",
+                extra={"analyzer": self.__class__.__name__},
             )
 
     async def _safe_health_job(self) -> None:
@@ -1017,6 +1213,6 @@ class BaseOrderFlowAnalyzer(ABC):
         except Exception:
             self._inc_metric("errors")
             self._logger.exception(
-                "Health job failed | analyzer=%s",
-                self.__class__.__name__,
+                "Health job failed",
+                extra={"analyzer": self.__class__.__name__},
             )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeAlias
 
 from .enums import (
     ClusterStrength,
@@ -16,23 +16,49 @@ from .enums import (
 
 DEFAULT_EXCHANGE = "unknown"
 DEFAULT_MARKET_TYPE = "perpetual"
+DEFAULT_TIMEFRAME = "1m"
+
+LiquidityKey: TypeAlias = tuple[str, str, str, str]
+# exchange, market_type, symbol, timeframe
 
 
-def _utcnow() -> datetime:
+# =============================================================================
+# Time / numeric helpers
+# =============================================================================
+
+def utc_now() -> datetime:
     """
     Timezone-aware UTC timestamp for model state transitions.
 
-    The models module intentionally stays free of core dependencies:
+    Models module intentionally stays free of core dependencies:
     no EventBus, no Scheduler, no logger, no IO.
     """
     return datetime.now(timezone.utc)
 
 
+def ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _utcnow() -> datetime:
+    """
+    Backward-compatible alias.
+    """
+    return utc_now()
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return default
+
+    if result != result:  # NaN
+        return default
+
+    return result
 
 
 def _clamp01(value: Any) -> float:
@@ -50,10 +76,140 @@ def _clamp_signed(value: Any) -> float:
     return max(-1.0, min(_safe_float(value), 1.0))
 
 
-def _normalize_scope_value(value: Any, default: str) -> str:
+# =============================================================================
+# Scope helpers
+# =============================================================================
+
+def normalize_exchange(value: Any, default: str = DEFAULT_EXCHANGE) -> str:
+    normalized = str(value or default).strip().lower()
+    return normalized if normalized else default
+
+
+def normalize_market_type(value: Any, default: str = DEFAULT_MARKET_TYPE) -> str:
+    normalized = str(value or default).strip().lower()
+    return normalized if normalized else default
+
+
+def normalize_symbol(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        raise ValueError("symbol must not be empty")
+    return normalized
+
+
+def normalize_timeframe(value: Any, default: str = DEFAULT_TIMEFRAME) -> str:
     normalized = str(value or default).strip()
     return normalized if normalized else default
 
+
+def make_liquidity_key(
+    *,
+    exchange: Any = DEFAULT_EXCHANGE,
+    market_type: Any = DEFAULT_MARKET_TYPE,
+    symbol: Any,
+    timeframe: Any = DEFAULT_TIMEFRAME,
+) -> LiquidityKey:
+    return (
+        normalize_exchange(exchange),
+        normalize_market_type(market_type),
+        normalize_symbol(symbol),
+        normalize_timeframe(timeframe),
+    )
+
+
+def liquidity_key_to_dict(key: LiquidityKey) -> dict[str, str]:
+    exchange, market_type, symbol, timeframe = key
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }
+
+
+def liquidity_key_to_string(key: LiquidityKey) -> str:
+    scope = liquidity_key_to_dict(key)
+    return (
+        f"{scope['exchange']}:"
+        f"{scope['market_type']}:"
+        f"{scope['symbol']}:"
+        f"{scope['timeframe']}"
+    )
+
+
+def make_scope_payload(
+    *,
+    exchange: Any,
+    market_type: Any,
+    symbol: Any,
+    timeframe: Any,
+) -> dict[str, str]:
+    return liquidity_key_to_dict(
+        make_liquidity_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+    )
+
+
+def _normalize_scope_value(value: Any, default: str) -> str:
+    """
+    Backward-compatible alias for older model code.
+
+    New code should prefer normalize_exchange / normalize_market_type /
+    normalize_timeframe.
+    """
+    normalized = str(value or default).strip()
+    return normalized if normalized else default
+
+
+# =============================================================================
+# Base scoped mixin
+# =============================================================================
+
+@dataclass(slots=True)
+class LiquidityScopedModel:
+    """
+    Shared scope behavior for liquidity domain models.
+
+    Canonical scope:
+        exchange + market_type + symbol + timeframe
+    """
+
+    symbol: str
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = DEFAULT_MARKET_TYPE
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+
+    @property
+    def liquidity_key(self) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return liquidity_key_to_dict(self.liquidity_key)
+
+    @property
+    def scope_key(self) -> str:
+        return liquidity_key_to_string(self.liquidity_key)
+
+
+# =============================================================================
+# Domain models
+# =============================================================================
 
 @dataclass(slots=True)
 class LiquidityLevel:
@@ -75,9 +231,7 @@ class LiquidityLevel:
     - містить тільки стан і прості domain-helper методи.
 
     Multi-exchange scope:
-    - exchange + market_type + symbol + timeframe мають формувати повний scope;
-    - exchange/market_type мають default-и для backward compatibility з detector-ами,
-      які ще створюють рівні тільки через symbol/timeframe.
+        exchange + market_type + symbol + timeframe
     """
 
     symbol: str
@@ -106,24 +260,46 @@ class LiquidityLevel:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
-        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
-        self.symbol = str(self.symbol).strip().upper()
-        self.timeframe = str(self.timeframe).strip()
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
 
         self.price = _safe_float(self.price)
         self.confidence = _clamp01(self.confidence)
         self.touches_count = max(0, int(self.touches_count))
         self.reaction_count = max(0, int(self.reaction_count))
 
+        if self.first_seen_at is not None:
+            self.first_seen_at = ensure_utc(self.first_seen_at)
+        if self.last_seen_at is not None:
+            self.last_seen_at = ensure_utc(self.last_seen_at)
+        if self.swept_at is not None:
+            self.swept_at = ensure_utc(self.swept_at)
+        if self.invalidated_at is not None:
+            self.invalidated_at = ensure_utc(self.invalidated_at)
+        if self.expired_at is not None:
+            self.expired_at = ensure_utc(self.expired_at)
+
+        self.metadata = dict(self.metadata or {})
+        self.metadata.setdefault("scope", self.scope)
+
+    @property
+    def liquidity_key(self) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return liquidity_key_to_dict(self.liquidity_key)
+
     @property
     def scope_key(self) -> str:
-        return (
-            f"{self.exchange.lower()}:"
-            f"{self.market_type.lower()}:"
-            f"{self.symbol}:"
-            f"{self.timeframe}"
-        )
+        return liquidity_key_to_string(self.liquidity_key)
 
     @property
     def key(self) -> str:
@@ -175,7 +351,7 @@ class LiquidityLevel:
         }
 
     def mark_swept(self, swept_at: datetime | None = None) -> None:
-        event_ts = swept_at or _utcnow()
+        event_ts = ensure_utc(swept_at or utc_now())
         self.sweep_status = SweepStatus.SWEPT
         self.status = LiquidityStatus.SWEPT
         self.swept_at = event_ts
@@ -185,7 +361,7 @@ class LiquidityLevel:
             self.first_seen_at = event_ts
 
     def mark_partially_swept(self, swept_at: datetime | None = None) -> None:
-        event_ts = swept_at or _utcnow()
+        event_ts = ensure_utc(swept_at or utc_now())
         self.sweep_status = SweepStatus.PARTIALLY_SWEPT
 
         if self.status != LiquidityStatus.INVALIDATED:
@@ -198,13 +374,13 @@ class LiquidityLevel:
             self.first_seen_at = event_ts
 
     def mark_invalidated(self, invalidated_at: datetime | None = None) -> None:
-        event_ts = invalidated_at or _utcnow()
+        event_ts = ensure_utc(invalidated_at or utc_now())
         self.status = LiquidityStatus.INVALIDATED
         self.invalidated_at = event_ts
         self.last_seen_at = event_ts
 
     def mark_expired(self, expired_at: datetime | None = None) -> None:
-        event_ts = expired_at or _utcnow()
+        event_ts = ensure_utc(expired_at or utc_now())
         self.status = LiquidityStatus.EXPIRED
         self.expired_at = event_ts
         self.last_seen_at = event_ts
@@ -214,7 +390,7 @@ class LiquidityLevel:
             self.status = LiquidityStatus.WEAK
 
     def touch(self, seen_at: datetime | None = None) -> None:
-        event_ts = seen_at or _utcnow()
+        event_ts = ensure_utc(seen_at or utc_now())
         self.touches_count += 1
         self.last_seen_at = event_ts
 
@@ -222,7 +398,7 @@ class LiquidityLevel:
             self.first_seen_at = event_ts
 
     def register_reaction(self, seen_at: datetime | None = None) -> None:
-        event_ts = seen_at or _utcnow()
+        event_ts = ensure_utc(seen_at or utc_now())
         self.reaction_count += 1
         self.last_seen_at = event_ts
 
@@ -244,7 +420,9 @@ class LiquidityLevel:
             "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope": self.scope,
             "scope_key": self.scope_key,
+            "liquidity_key": self.liquidity_key,
             "level_type": self.level_type.value,
             "side": self.side.value,
             "price": self.price,
@@ -373,10 +551,10 @@ class StopCluster:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
-        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
-        self.symbol = str(self.symbol).strip().upper()
-        self.timeframe = str(self.timeframe).strip()
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
 
         self.low_price = _safe_float(self.low_price)
         self.high_price = _safe_float(self.high_price)
@@ -392,14 +570,34 @@ class StopCluster:
         self.estimated_stop_density = _clamp01(self.estimated_stop_density)
         self.touches_count = max(0, int(self.touches_count))
 
+        if self.created_at is not None:
+            self.created_at = ensure_utc(self.created_at)
+        if self.updated_at is not None:
+            self.updated_at = ensure_utc(self.updated_at)
+        if self.invalidated_at is not None:
+            self.invalidated_at = ensure_utc(self.invalidated_at)
+        if self.swept_at is not None:
+            self.swept_at = ensure_utc(self.swept_at)
+
+        self.metadata = dict(self.metadata or {})
+        self.metadata.setdefault("scope", self.scope)
+
+    @property
+    def liquidity_key(self) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return liquidity_key_to_dict(self.liquidity_key)
+
     @property
     def scope_key(self) -> str:
-        return (
-            f"{self.exchange.lower()}:"
-            f"{self.market_type.lower()}:"
-            f"{self.symbol}:"
-            f"{self.timeframe}"
-        )
+        return liquidity_key_to_string(self.liquidity_key)
 
     @property
     def key(self) -> str:
@@ -443,6 +641,8 @@ class StopCluster:
         return self.low_price <= price <= self.high_price
 
     def overlaps(self, other: StopCluster) -> bool:
+        if self.liquidity_key != other.liquidity_key:
+            return False
         return not (
             self.high_price < other.low_price
             or other.high_price < self.low_price
@@ -455,12 +655,12 @@ class StopCluster:
         return abs(self.center_price - current_price) / abs(current_price)
 
     def mark_invalidated(self, invalidated_at: datetime | None = None) -> None:
-        event_ts = invalidated_at or _utcnow()
+        event_ts = ensure_utc(invalidated_at or utc_now())
         self.invalidated_at = event_ts
         self.updated_at = event_ts
 
     def mark_swept(self, swept_at: datetime | None = None) -> None:
-        event_ts = swept_at or _utcnow()
+        event_ts = ensure_utc(swept_at or utc_now())
         self.swept_at = event_ts
         self.updated_at = event_ts
 
@@ -470,7 +670,9 @@ class StopCluster:
             "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope": self.scope,
             "scope_key": self.scope_key,
+            "liquidity_key": self.liquidity_key,
             "side": self.side.value,
             "low_price": self.low_price,
             "high_price": self.high_price,
@@ -529,10 +731,10 @@ class LiquidityZone:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
-        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
-        self.symbol = str(self.symbol).strip().upper()
-        self.timeframe = str(self.timeframe).strip()
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
 
         self.low_price = _safe_float(self.low_price)
         self.high_price = _safe_float(self.high_price)
@@ -542,14 +744,25 @@ class LiquidityZone:
 
         self.score = _clamp01(self.score)
 
+        self.metadata = dict(self.metadata or {})
+        self.metadata.setdefault("scope", self.scope)
+
+    @property
+    def liquidity_key(self) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return liquidity_key_to_dict(self.liquidity_key)
+
     @property
     def scope_key(self) -> str:
-        return (
-            f"{self.exchange.lower()}:"
-            f"{self.market_type.lower()}:"
-            f"{self.symbol}:"
-            f"{self.timeframe}"
-        )
+        return liquidity_key_to_string(self.liquidity_key)
 
     @property
     def center_price(self) -> float:
@@ -579,7 +792,9 @@ class LiquidityZone:
             "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope": self.scope,
             "scope_key": self.scope_key,
+            "liquidity_key": self.liquidity_key,
             "side": self.side.value,
             "low_price": self.low_price,
             "high_price": self.high_price,
@@ -625,30 +840,37 @@ class LiquiditySignal:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
-        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
-        self.symbol = str(self.symbol).strip().upper()
-        self.timeframe = str(self.timeframe).strip()
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
 
         self.sweep_risk_up = _clamp01(self.sweep_risk_up)
         self.sweep_risk_down = _clamp01(self.sweep_risk_down)
         self.magnet_score_up = _clamp01(self.magnet_score_up)
         self.magnet_score_down = _clamp01(self.magnet_score_down)
         self.confidence = _clamp01(self.confidence)
+        self.timestamp = ensure_utc(self.timestamp)
 
-        if self.timestamp.tzinfo is None:
-            self.timestamp = self.timestamp.replace(tzinfo=timezone.utc)
-        else:
-            self.timestamp = self.timestamp.astimezone(timezone.utc)
+        self.metadata = dict(self.metadata or {})
+        self.metadata.setdefault("scope", self.scope)
+
+    @property
+    def liquidity_key(self) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return liquidity_key_to_dict(self.liquidity_key)
 
     @property
     def scope_key(self) -> str:
-        return (
-            f"{self.exchange.lower()}:"
-            f"{self.market_type.lower()}:"
-            f"{self.symbol}:"
-            f"{self.timeframe}"
-        )
+        return liquidity_key_to_string(self.liquidity_key)
 
     @property
     def is_directional(self) -> bool:
@@ -660,7 +882,9 @@ class LiquiditySignal:
             "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope": self.scope,
             "scope_key": self.scope_key,
+            "liquidity_key": self.liquidity_key,
             "timestamp": self.timestamp.isoformat(),
             "bias": self.bias.value,
             "sweep_risk_up": self.sweep_risk_up,
@@ -726,15 +950,12 @@ class LiquidityMapSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.exchange = _normalize_scope_value(self.exchange, DEFAULT_EXCHANGE)
-        self.market_type = _normalize_scope_value(self.market_type, DEFAULT_MARKET_TYPE)
-        self.symbol = str(self.symbol).strip().upper()
-        self.timeframe = str(self.timeframe).strip()
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
 
-        if self.timestamp.tzinfo is None:
-            self.timestamp = self.timestamp.replace(tzinfo=timezone.utc)
-        else:
-            self.timestamp = self.timestamp.astimezone(timezone.utc)
+        self.timestamp = ensure_utc(self.timestamp)
 
         self.current_price = _safe_float(self.current_price)
         self.above_liquidity_score = _clamp01(self.above_liquidity_score)
@@ -745,16 +966,27 @@ class LiquidityMapSnapshot:
         # is lost before strategy layer consumes the snapshot.
         self.liquidity_pressure_score = _clamp_signed(self.liquidity_pressure_score)
 
+        self.metadata = dict(self.metadata or {})
+        self.metadata.setdefault("scope", self.scope)
+
         self._apply_scope_to_children()
 
     @property
-    def scope_key(self) -> str:
-        return (
-            f"{self.exchange.lower()}:"
-            f"{self.market_type.lower()}:"
-            f"{self.symbol}:"
-            f"{self.timeframe}"
+    def liquidity_key(self) -> LiquidityKey:
+        return make_liquidity_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
         )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return liquidity_key_to_dict(self.liquidity_key)
+
+    @property
+    def scope_key(self) -> str:
+        return liquidity_key_to_string(self.liquidity_key)
 
     def _apply_scope_to_children(self) -> None:
         """
@@ -796,18 +1028,21 @@ class LiquidityMapSnapshot:
             self.signal.market_type = self.market_type
             self.signal.symbol = self.symbol
             self.signal.timeframe = self.timeframe
+            self.signal.metadata.setdefault("scope", self.scope)
 
     def _scope_level(self, level: LiquidityLevel) -> None:
         level.exchange = self.exchange
         level.market_type = self.market_type
         level.symbol = self.symbol
         level.timeframe = self.timeframe
+        level.metadata.setdefault("scope", self.scope)
 
     def _scope_cluster(self, cluster: StopCluster) -> None:
         cluster.exchange = self.exchange
         cluster.market_type = self.market_type
         cluster.symbol = self.symbol
         cluster.timeframe = self.timeframe
+        cluster.metadata.setdefault("scope", self.scope)
 
         for source_level in cluster.source_levels:
             self._scope_level(source_level)
@@ -817,6 +1052,7 @@ class LiquidityMapSnapshot:
         zone.market_type = self.market_type
         zone.symbol = self.symbol
         zone.timeframe = self.timeframe
+        zone.metadata.setdefault("scope", self.scope)
 
     def has_levels(self) -> bool:
         return bool(
@@ -899,7 +1135,9 @@ class LiquidityMapSnapshot:
             "market_type": self.market_type,
             "symbol": self.symbol,
             "timeframe": self.timeframe,
+            "scope": self.scope,
             "scope_key": self.scope_key,
+            "liquidity_key": self.liquidity_key,
             "timestamp": self.timestamp.isoformat(),
             "current_price": self.current_price,
             "active_levels": [
@@ -933,6 +1171,7 @@ class LiquidityMapSnapshot:
             "signal": self.signal.to_event_payload() if self.signal else None,
             "metadata": {
                 **dict(self.metadata),
+                "scope": self.scope,
                 "active_levels_count": len(self.active_levels),
                 "equal_levels_count": len(self.equal_levels),
                 "stop_clusters_count": len(self.stop_clusters),
@@ -955,3 +1194,42 @@ class LiquidityMapSnapshot:
         if value is None:
             return None
         return value.to_event_payload()
+
+
+def model_to_payload(model: Any) -> dict[str, Any]:
+    """
+    Єдиний helper для EventBus/storage/dashboard serialization.
+    """
+    if hasattr(model, "to_event_payload") and callable(model.to_event_payload):
+        return model.to_event_payload()
+
+    if isinstance(model, dict):
+        return dict(model)
+
+    raise TypeError(f"Unsupported liquidity model type: {type(model)!r}")
+
+
+__all__ = [
+    "DEFAULT_EXCHANGE",
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_TIMEFRAME",
+    "LiquidityKey",
+    "utc_now",
+    "ensure_utc",
+    "normalize_exchange",
+    "normalize_market_type",
+    "normalize_symbol",
+    "normalize_timeframe",
+    "make_liquidity_key",
+    "liquidity_key_to_dict",
+    "liquidity_key_to_string",
+    "make_scope_payload",
+    "LiquidityScopedModel",
+    "LiquidityLevel",
+    "EqualLevel",
+    "StopCluster",
+    "LiquidityZone",
+    "LiquiditySignal",
+    "LiquidityMapSnapshot",
+    "model_to_payload",
+]

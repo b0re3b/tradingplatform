@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import inspect
 import math
 import time
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from core.event_bus import Event, EventBus, EventPriority, Subscription
@@ -12,8 +13,9 @@ from core.logger import get_logger
 from core.scheduler import Scheduler
 
 from .config import OIAnalyzerConfig
-from .enums import OIAnomalyType, OIEventType, OIMarketEventType, OIRegime
+from .enums import OIAnomalyType, OIRegime
 from .models import (
+    DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     OIAnalysisResult,
@@ -23,6 +25,12 @@ from .models import (
     OISnapshot,
     OIState,
     make_oi_key,
+    oi_key_to_dict,
+    oi_key_to_string,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
 )
 from .oi_anomaly_detector import OIAnomalyDetector
 from .oi_divergence import OIDivergenceDetector
@@ -65,6 +73,87 @@ class OIInstrumentBuffers:
         self.volume_timestamps.append(float(timestamp))
 
 
+@dataclass(slots=True)
+class OIAnalyzerRuntimeStats:
+    """
+    Runtime diagnostics для OIAnalyzer.
+
+    Це lightweight state без EventBus/Scheduler/logger.
+    """
+
+    open_interest_events_processed: int = 0
+    candle_events_processed: int = 0
+    candles_updated_events_processed: int = 0
+    trades_events_processed: int = 0
+    funding_events_processed: int = 0
+    liquidations_events_processed: int = 0
+    orderflow_events_processed: int = 0
+
+    analyses_built: int = 0
+
+    emitted_updates: int = 0
+    emitted_regime_changes: int = 0
+    emitted_divergences: int = 0
+    emitted_anomalies: int = 0
+    emitted_squeeze_setups: int = 0
+    emitted_capitulations: int = 0
+    emitted_metrics: int = 0
+    emitted_state_cleaned: int = 0
+
+    skipped_by_scope_filter: int = 0
+    skipped_invalid_payload: int = 0
+    skipped_missing_oi: int = 0
+    skipped_missing_context: int = 0
+
+    cleanup_runs: int = 0
+    cleanup_removed_states: int = 0
+
+    errors_count: int = 0
+    last_error: str | None = None
+    last_error_at: float | None = None
+
+    processed_by_topic: dict[str, int] = field(default_factory=dict)
+
+    def record_topic(self, topic: str | None) -> None:
+        key = topic or "unknown"
+        self.processed_by_topic[key] = self.processed_by_topic.get(key, 0) + 1
+
+    def record_error(self, error: Exception, timestamp: float) -> None:
+        self.errors_count += 1
+        self.last_error = repr(error)
+        self.last_error_at = float(timestamp)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "open_interest_events_processed": self.open_interest_events_processed,
+            "candle_events_processed": self.candle_events_processed,
+            "candles_updated_events_processed": self.candles_updated_events_processed,
+            "trades_events_processed": self.trades_events_processed,
+            "funding_events_processed": self.funding_events_processed,
+            "liquidations_events_processed": self.liquidations_events_processed,
+            "orderflow_events_processed": self.orderflow_events_processed,
+            "analyses_built": self.analyses_built,
+            "emitted_updates": self.emitted_updates,
+            "emitted_regime_changes": self.emitted_regime_changes,
+            "emitted_divergences": self.emitted_divergences,
+            "emitted_anomalies": self.emitted_anomalies,
+            "emitted_squeeze_setups": self.emitted_squeeze_setups,
+            "emitted_capitulations": self.emitted_capitulations,
+            "emitted_metrics": self.emitted_metrics,
+            "emitted_state_cleaned": self.emitted_state_cleaned,
+            "skipped_by_scope_filter": self.skipped_by_scope_filter,
+            "skipped_invalid_payload": self.skipped_invalid_payload,
+            "skipped_missing_oi": self.skipped_missing_oi,
+            "skipped_missing_context": self.skipped_missing_context,
+            "cleanup_runs": self.cleanup_runs,
+            "cleanup_removed_states": self.cleanup_removed_states,
+            "errors_count": self.errors_count,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
+            "processed_by_topic": dict(self.processed_by_topic),
+        }
+
+
 class OIAnalyzer:
     """
     Event-driven orchestration layer for futures Open Interest analytics.
@@ -80,12 +169,12 @@ class OIAnalyzer:
     This class is infrastructure-aware and is the only Open Interest analytics
     class that should depend on core.EventBus / core.Scheduler.
 
-    Data flow:
-        OpenInterestCache   -> market.open_interest.updated
-        CandlesCache        -> market.candle.closed / market.candles.updated
-        TradesCache         -> market.trades.updated
-        FundingCache        -> market.funding.updated
-        OrderflowAnalyzer   -> analytics.orderflow.updated
+    Correct data flow:
+        OpenInterestCache    -> market.open_interest.updated
+        CandlesCache         -> market.candle.closed / market.candles.updated
+        TradesCache          -> market.trades.updated
+        FundingCache         -> market.funding.updated
+        OrderflowAnalyzer    -> analytics.orderflow.updated
         LiquidationsAnalyzer -> analytics.liquidations.updated
 
         OIAnalyzer -> analytics.oi.*
@@ -93,11 +182,12 @@ class OIAnalyzer:
     Scope:
         exchange + market_type + symbol + timeframe
 
-    Futures-only examples:
-        ("binance", "usdm_futures", "BTCUSDT", "1m")
-        ("bybit", "linear", "BTCUSDT", "1m")
-        ("okx", "swap", "BTCUSDT", "1m")
-        ("mexc", "usdm_futures", "BTCUSDT", "1m")
+    This class does NOT:
+    - read exchange WebSocket/REST directly;
+    - subscribe to raw market.open_interest / market.candle / market.trade;
+    - call strategy/risk/execution directly;
+    - own EventBus/Scheduler lifecycle;
+    - start uncontrolled background loops.
     """
 
     def __init__(
@@ -106,10 +196,16 @@ class OIAnalyzer:
         event_bus: EventBus,
         scheduler: Scheduler | None = None,
         config: OIAnalyzerConfig | None = None,
+        feature_builder: OIFeatureBuilder | None = None,
+        regime_detector: OIRegimeDetector | None = None,
+        divergence_detector: OIDivergenceDetector | None = None,
+        anomaly_detector: OIAnomalyDetector | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.scheduler = scheduler
         self.config = config or OIAnalyzerConfig()
+        self.config.validate()
+        self.config.assert_production_topics_allowed()
 
         self.logger = get_logger(
             __name__,
@@ -117,10 +213,10 @@ class OIAnalyzer:
             event_type="analytics_open_interest",
         )
 
-        self.feature_builder = OIFeatureBuilder(self.config)
-        self.regime_detector = OIRegimeDetector(self.config)
-        self.divergence_detector = OIDivergenceDetector(self.config)
-        self.anomaly_detector = OIAnomalyDetector(self.config)
+        self.feature_builder = feature_builder or OIFeatureBuilder(self.config)
+        self.regime_detector = regime_detector or OIRegimeDetector(self.config)
+        self.divergence_detector = divergence_detector or OIDivergenceDetector(self.config)
+        self.anomaly_detector = anomaly_detector or OIAnomalyDetector(self.config)
 
         self._history_size = self.config.windows.history_size
 
@@ -134,6 +230,7 @@ class OIAnalyzer:
         self._metrics_job_id: str | None = None
 
         self._registered = False
+        self._stats = OIAnalyzerRuntimeStats()
 
     # ------------------------------------------------------------------
     # Lifecycle / registration
@@ -150,46 +247,13 @@ class OIAnalyzer:
             self.logger.warning("OIAnalyzer already registered")
             return
 
-        self._subscriptions.extend(
-            [
-                self.event_bus.subscribe(
-                    OIMarketEventType.OPEN_INTEREST_UPDATED.topic,
-                    self.on_open_interest,
-                    name="oi_analyzer.on_open_interest_updated",
-                ),
-                self.event_bus.subscribe(
-                    OIMarketEventType.CANDLE_CLOSED.topic,
-                    self.on_candle,
-                    name="oi_analyzer.on_candle_closed",
-                ),
-                self.event_bus.subscribe(
-                    OIMarketEventType.CANDLES_UPDATED.topic,
-                    self.on_candles_updated,
-                    name="oi_analyzer.on_candles_updated",
-                ),
-                self.event_bus.subscribe(
-                    OIMarketEventType.TRADES_UPDATED.topic,
-                    self.on_trades_updated,
-                    name="oi_analyzer.on_trades_updated",
-                ),
-                self.event_bus.subscribe(
-                    OIMarketEventType.FUNDING_UPDATED.topic,
-                    self.on_funding,
-                    name="oi_analyzer.on_funding_updated",
-                ),
-                self.event_bus.subscribe(
-                    OIMarketEventType.LIQUIDATIONS_UPDATED.topic,
-                    self.on_liquidation,
-                    name="oi_analyzer.on_liquidations_updated",
-                ),
-                self.event_bus.subscribe(
-                    OIMarketEventType.ORDERFLOW_UPDATED.topic,
-                    self.on_orderflow_update,
-                    name="oi_analyzer.on_orderflow_update",
-                ),
-            ]
-        )
+        if not self.config.enabled:
+            self.logger.info("OIAnalyzer registration skipped: disabled by config")
+            return
 
+        self.config.assert_production_topics_allowed()
+
+        self._register_event_subscriptions()
         self._register_scheduler_jobs()
 
         self._registered = True
@@ -198,31 +262,89 @@ class OIAnalyzer:
             extra={
                 "subscriptions": len(self._subscriptions),
                 "scheduler_enabled": self.scheduler is not None,
+                "input_topics": list(self.config.production_input_topics),
+                "output_topics": list(self.config.output_topics),
+                "scope": "exchange:market_type:symbol:timeframe",
             },
         )
 
     def unregister(self) -> None:
         """
-        Remove EventBus subscriptions.
+        Remove EventBus subscriptions and scheduler jobs.
 
-        Scheduler jobs are disabled if Scheduler is available. The Scheduler
-        remains owned by the application container.
+        Scheduler itself remains owned by the application container.
         """
-        for subscription in self._subscriptions:
-            self.event_bus.unsubscribe(subscription)
+        for subscription in list(self._subscriptions):
+            try:
+                self.event_bus.unsubscribe(subscription)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to unsubscribe OIAnalyzer subscription",
+                    extra={
+                        "subscription": repr(subscription),
+                        "error": repr(exc),
+                    },
+                )
 
         self._subscriptions.clear()
+        self._unregister_scheduler_jobs()
 
-        if self.scheduler is not None:
-            for job_id in (self._cleanup_job_id, self._metrics_job_id):
-                if job_id is not None and self.scheduler.get_job(job_id) is not None:
-                    self.scheduler.disable_job(job_id)
-
-        self._cleanup_job_id = None
-        self._metrics_job_id = None
         self._registered = False
-
         self.logger.info("OIAnalyzer unregistered")
+
+    def _register_event_subscriptions(self) -> None:
+        self._subscribe_topics(
+            self.config.open_interest_topics,
+            self.on_open_interest,
+            name_prefix="oi_analyzer.on_open_interest_updated",
+        )
+        self._subscribe_topics(
+            self.config.candle_topics,
+            self.on_candle,
+            name_prefix="oi_analyzer.on_candle_closed",
+        )
+        self._subscribe_topics(
+            self.config.candles_updated_topics,
+            self.on_candles_updated,
+            name_prefix="oi_analyzer.on_candles_updated",
+        )
+        self._subscribe_topics(
+            self.config.trades_topics,
+            self.on_trades_updated,
+            name_prefix="oi_analyzer.on_trades_updated",
+        )
+        self._subscribe_topics(
+            self.config.funding_topics,
+            self.on_funding,
+            name_prefix="oi_analyzer.on_funding_updated",
+        )
+        self._subscribe_topics(
+            self.config.liquidations_topics,
+            self.on_liquidation,
+            name_prefix="oi_analyzer.on_liquidations_updated",
+        )
+        self._subscribe_topics(
+            self.config.orderflow_topics,
+            self.on_orderflow_update,
+            name_prefix="oi_analyzer.on_orderflow_updated",
+        )
+
+    def _subscribe_topics(
+        self,
+        topics: tuple[str, ...],
+        handler: Any,
+        *,
+        name_prefix: str,
+    ) -> None:
+        for topic in topics:
+            self.config.assert_input_topic_allowed(topic)
+            self._subscriptions.append(
+                self.event_bus.subscribe(
+                    topic,
+                    handler,
+                    name=f"{name_prefix}:{topic}",
+                )
+            )
 
     def _register_scheduler_jobs(self) -> None:
         if self.scheduler is None:
@@ -238,28 +360,77 @@ class OIAnalyzer:
         maintenance = self.config.maintenance
 
         if maintenance.enable_periodic_cleanup:
-            self._cleanup_job_id = self.scheduler.add_interval_job(
+            self._cleanup_job_id = self._add_interval_job_once(
                 name=maintenance.cleanup_job_name,
                 func=self.cleanup_stale_state,
                 interval=maintenance.cleanup_interval_sec,
-                run_immediately=False,
                 timeout=maintenance.cleanup_job_timeout_sec,
-                max_retries=1,
-                retry_delay=1.0,
-                allow_overlap=False,
             )
 
         if maintenance.enable_metrics_emit:
-            self._metrics_job_id = self.scheduler.add_interval_job(
+            self._metrics_job_id = self._add_interval_job_once(
                 name=maintenance.metrics_job_name,
                 func=self.emit_metrics,
                 interval=maintenance.metrics_interval_sec,
-                run_immediately=False,
                 timeout=maintenance.metrics_job_timeout_sec,
-                max_retries=1,
-                retry_delay=1.0,
-                allow_overlap=False,
             )
+
+    def _add_interval_job_once(
+        self,
+        *,
+        name: str,
+        func: Any,
+        interval: float,
+        timeout: float | None,
+    ) -> str:
+        assert self.scheduler is not None
+
+        existing = self.scheduler.get_job_by_name(name)
+        if existing is not None:
+            return existing.job_id
+
+        return self.scheduler.add_interval_job(
+            name=name,
+            func=func,
+            interval=interval,
+            run_immediately=False,
+            timeout=timeout,
+            max_retries=self.config.maintenance.scheduler_job_max_retries,
+            retry_delay=self.config.maintenance.scheduler_job_retry_delay_sec,
+            allow_overlap=False,
+        )
+
+    def _unregister_scheduler_jobs(self) -> None:
+        if self.scheduler is None:
+            self._cleanup_job_id = None
+            self._metrics_job_id = None
+            return
+
+        for job_id in (self._cleanup_job_id, self._metrics_job_id):
+            if job_id is None:
+                continue
+
+            try:
+                result = self.scheduler.remove_job(job_id)
+                if inspect.isawaitable(result):
+                    self.logger.warning(
+                        "Scheduler.remove_job returned awaitable; "
+                        "job may require explicit async cleanup by caller",
+                        extra={"job_id": job_id},
+                    )
+            except KeyError:
+                self.logger.debug(
+                    "OIAnalyzer scheduler job already removed",
+                    extra={"job_id": job_id},
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to remove OIAnalyzer scheduler job",
+                    extra={"job_id": job_id, "error": repr(exc)},
+                )
+
+        self._cleanup_job_id = None
+        self._metrics_job_id = None
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -271,12 +442,11 @@ class OIAnalyzer:
 
         Expected source:
             OpenInterestCache -> market.open_interest.updated
-
-        Expected payload:
-            exchange, market_type, symbol, open_interest, timestamp_ms/received_at_ms
         """
         if not self.config.enabled:
             return
+
+        self._stats.record_topic(getattr(event, "topic", None))
 
         try:
             payload = self._extract_payload(event)
@@ -285,6 +455,11 @@ class OIAnalyzer:
                 return
 
             key = snapshot.key
+            if not self._should_process_key(key):
+                return
+
+            self._stats.open_interest_events_processed += 1
+
             buffers = self._get_or_create_buffers(key)
             state = self._get_or_create_state(key)
 
@@ -293,6 +468,7 @@ class OIAnalyzer:
 
             context = self._get_context_for_key(key)
             if self.config.require_price_context and context is None:
+                self._stats.skipped_missing_context += 1
                 self.logger.debug(
                     "Skipping OI analysis: price context is required but missing",
                     extra=self._key_payload(key),
@@ -333,6 +509,8 @@ class OIAnalyzer:
                 divergence=divergence_result,
                 anomaly=anomaly_result,
                 metadata={
+                    "scope": oi_key_to_dict(key),
+                    "scope_key": oi_key_to_string(key),
                     "feature_history_size": len(buffers.feature_history),
                     "oi_history_size": len(buffers.oi_values),
                     "price_history_size": len(buffers.price_values),
@@ -346,6 +524,7 @@ class OIAnalyzer:
 
             previous_regime = state.last_regime
             state.apply_analysis(analysis_result)
+            self._stats.analyses_built += 1
 
             await self._emit_analysis_events(
                 key=key,
@@ -355,13 +534,10 @@ class OIAnalyzer:
             )
 
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process market.open_interest.updated event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process open interest event",
+                exc,
+                event=event,
             )
 
     async def on_candle(self, event: Event) -> None:
@@ -374,18 +550,19 @@ class OIAnalyzer:
         if not self.config.enabled:
             return
 
+        self._stats.record_topic(getattr(event, "topic", None))
+
         try:
             payload = self._extract_payload(event)
-            await self._apply_candle_payload(payload)
+            applied = await self._apply_candle_payload(payload)
+            if applied:
+                self._stats.candle_events_processed += 1
 
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process market.candle.closed event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process candle event",
+                exc,
+                event=event,
             )
 
     async def on_candles_updated(self, event: Event) -> None:
@@ -400,9 +577,13 @@ class OIAnalyzer:
         if not self.config.enabled:
             return
 
+        self._stats.record_topic(getattr(event, "topic", None))
+
         try:
             payload = self._extract_payload(event)
             candles = payload.get("candles")
+
+            applied_count = 0
 
             if isinstance(candles, list):
                 for candle in candles:
@@ -425,19 +606,20 @@ class OIAnalyzer:
                                 payload.get("exchange_symbol"),
                             ),
                         }
-                        await self._apply_candle_payload(merged)
-                return
+                        if await self._apply_candle_payload(merged):
+                            applied_count += 1
+            else:
+                if await self._apply_candle_payload(payload):
+                    applied_count += 1
 
-            await self._apply_candle_payload(payload)
+            if applied_count:
+                self._stats.candles_updated_events_processed += applied_count
 
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process market.candles.updated event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process candles updated event",
+                exc,
+                event=event,
             )
 
     async def on_trades_updated(self, event: Event) -> None:
@@ -453,9 +635,13 @@ class OIAnalyzer:
         if not self.config.enabled:
             return
 
+        self._stats.record_topic(getattr(event, "topic", None))
+
         try:
             payload = self._extract_payload(event)
             trades = payload.get("trades")
+
+            applied_count = 0
 
             if isinstance(trades, list):
                 for trade in trades:
@@ -478,19 +664,20 @@ class OIAnalyzer:
                                 payload.get("exchange_symbol"),
                             ),
                         }
-                        self._apply_trade_payload(merged)
-                return
+                        if self._apply_trade_payload(merged):
+                            applied_count += 1
+            else:
+                if self._apply_trade_payload(payload):
+                    applied_count += 1
 
-            self._apply_trade_payload(payload)
+            if applied_count:
+                self._stats.trades_events_processed += applied_count
 
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process market.trades.updated event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process trades updated event",
+                exc,
+                event=event,
             )
 
     async def on_funding(self, event: Event) -> None:
@@ -503,10 +690,16 @@ class OIAnalyzer:
         if not self.config.enabled:
             return
 
+        self._stats.record_topic(getattr(event, "topic", None))
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
             if key is None:
+                self._stats.skipped_invalid_payload += 1
+                return
+
+            if not self._should_process_key(key):
                 return
 
             timestamp = self._extract_timestamp(payload)
@@ -550,14 +743,13 @@ class OIAnalyzer:
             state = self._get_or_create_state(key)
             state.apply_context(context)
 
+            self._stats.funding_events_processed += 1
+
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process market.funding.updated event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process funding updated event",
+                exc,
+                event=event,
             )
 
     async def on_liquidation(self, event: Event) -> None:
@@ -570,10 +762,16 @@ class OIAnalyzer:
         if not self.config.enabled:
             return
 
+        self._stats.record_topic(getattr(event, "topic", None))
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
             if key is None:
+                self._stats.skipped_invalid_payload += 1
+                return
+
+            if not self._should_process_key(key):
                 return
 
             timestamp = self._extract_timestamp(payload)
@@ -616,14 +814,13 @@ class OIAnalyzer:
             state = self._get_or_create_state(key)
             state.apply_context(context)
 
+            self._stats.liquidations_events_processed += 1
+
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process analytics.liquidations.updated event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process liquidations updated event",
+                exc,
+                event=event,
             )
 
     async def on_orderflow_update(self, event: Event) -> None:
@@ -636,10 +833,16 @@ class OIAnalyzer:
         if not self.config.enabled:
             return
 
+        self._stats.record_topic(getattr(event, "topic", None))
+
         try:
             payload = self._extract_payload(event)
             key = self._extract_key_from_payload(payload)
             if key is None:
+                self._stats.skipped_invalid_payload += 1
+                return
+
+            if not self._should_process_key(key):
                 return
 
             timestamp = self._extract_timestamp(payload)
@@ -675,14 +878,13 @@ class OIAnalyzer:
             state = self._get_or_create_state(key)
             state.apply_context(context)
 
+            self._stats.orderflow_events_processed += 1
+
         except Exception as exc:
-            self.logger.exception(
-                "Failed to process analytics.orderflow.updated event",
-                extra={
-                    "error": str(exc),
-                    "topic": getattr(event, "topic", None),
-                    "event_id": getattr(event, "event_id", None),
-                },
+            self._record_exception(
+                "Failed to process orderflow updated event",
+                exc,
+                event=event,
             )
 
     # ------------------------------------------------------------------
@@ -695,6 +897,8 @@ class OIAnalyzer:
 
         This should be run by core.scheduler.Scheduler.add_interval_job().
         """
+        self._stats.cleanup_runs += 1
+
         now_ts = self._now()
         stale_after = self.config.stale_state_cleanup_after_sec
         keys_to_delete: list[OIKey] = []
@@ -713,13 +917,21 @@ class OIAnalyzer:
                 self._cooldowns.pop(cooldown_key, None)
 
         if keys_to_delete:
+            self._stats.cleanup_removed_states += len(keys_to_delete)
+
             self.logger.info(
                 "Cleaned stale OI state",
-                extra={"removed_count": len(keys_to_delete)},
+                extra={
+                    "removed_count": len(keys_to_delete),
+                    "removed_keys": [
+                        self._key_payload(key)
+                        for key in keys_to_delete
+                    ],
+                },
             )
 
-            await self._emit(
-                OIEventType.STATE_CLEANED.topic,
+            accepted = await self._emit(
+                "analytics.oi.state_cleaned",
                 {
                     "timestamp": now_ts,
                     "removed_count": len(keys_to_delete),
@@ -729,7 +941,13 @@ class OIAnalyzer:
                     ],
                 },
                 priority=EventPriority.LOW,
+                headers={
+                    "event_type": "state_cleaned",
+                    "scope": "exchange:market_type:symbol:timeframe",
+                },
             )
+            if accepted:
+                self._stats.emitted_state_cleaned += 1
 
     async def emit_metrics(self) -> None:
         """
@@ -737,15 +955,21 @@ class OIAnalyzer:
 
         This should be run by core.scheduler.Scheduler.add_interval_job().
         """
-        await self._emit(
-            OIEventType.METRICS.topic,
+        accepted = await self._emit(
+            self.config.metrics_topic,
             self.stats(),
             priority=EventPriority.LOW,
+            headers={
+                "event_type": "metrics",
+                "scope": "exchange:market_type:symbol:timeframe",
+            },
         )
+        if accepted:
+            self._stats.emitted_metrics += 1
 
     async def emit_health(self) -> None:
         await self._emit(
-            OIEventType.HEALTH.topic,
+            "analytics.oi.health",
             {
                 "timestamp": self._now(),
                 "registered": self._registered,
@@ -756,9 +980,16 @@ class OIAnalyzer:
                 "scheduler_available": self.scheduler is not None,
                 "cleanup_job_id": self._cleanup_job_id,
                 "metrics_job_id": self._metrics_job_id,
+                "input_topics": list(self.config.production_input_topics),
+                "output_topics": list(self.config.output_topics),
                 "scope": "exchange:market_type:symbol:timeframe",
+                "runtime_stats": self._stats.to_dict(),
             },
             priority=EventPriority.LOW,
+            headers={
+                "event_type": "health",
+                "scope": "exchange:market_type:symbol:timeframe",
+            },
         )
 
     # ------------------------------------------------------------------
@@ -781,6 +1012,9 @@ class OIAnalyzer:
             )
         )
 
+    def get_state_key(self, key: OIKey) -> OIState | None:
+        return self._states.get(key)
+
     def get_last_analysis(
         self,
         exchange: str,
@@ -798,6 +1032,12 @@ class OIAnalyzer:
             return None
         return state.last_analysis
 
+    def get_last_analysis_key(self, key: OIKey) -> OIAnalysisResult | None:
+        state = self._states.get(key)
+        if state is None:
+            return None
+        return state.last_analysis
+
     def get_feature_history(
         self,
         exchange: str,
@@ -811,6 +1051,9 @@ class OIAnalyzer:
             symbol=symbol,
             timeframe=timeframe,
         )
+        return self.get_feature_history_key(key)
+
+    def get_feature_history_key(self, key: OIKey) -> list[OIFeatures]:
         buffers = self._buffers.get(key)
         if buffers is None:
             return []
@@ -828,7 +1071,10 @@ class OIAnalyzer:
             "history_size": self._history_size,
             "cleanup_job_registered": self._cleanup_job_id is not None,
             "metrics_job_registered": self._metrics_job_id is not None,
+            "input_topics": list(self.config.production_input_topics),
+            "output_topics": list(self.config.output_topics),
             "scope": "exchange:market_type:symbol:timeframe",
+            "runtime_stats": self._stats.to_dict(),
             "instruments": [
                 {
                     **self._key_payload(key),
@@ -859,7 +1105,7 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to detect OI divergence",
-                extra={**self._key_payload(key), "error": str(exc)},
+                extra={**self._key_payload(key), "error": repr(exc)},
             )
             return None
 
@@ -979,12 +1225,18 @@ class OIAnalyzer:
         *,
         correlation_id: str | None,
     ) -> None:
-        await self._emit(
-            OIEventType.UPDATED.topic,
+        accepted = await self._emit(
+            self.config.update_topic,
             self._analysis_payload(analysis),
             priority=EventPriority.NORMAL,
             correlation_id=correlation_id,
+            headers=self._headers_for_analysis(
+                analysis,
+                event_type="oi_updated",
+            ),
         )
+        if accepted:
+            self._stats.emitted_updates += 1
 
     async def _emit_regime_changed(
         self,
@@ -993,8 +1245,8 @@ class OIAnalyzer:
         analysis: OIAnalysisResult,
         correlation_id: str | None,
     ) -> None:
-        await self._emit(
-            OIEventType.REGIME_CHANGED.topic,
+        accepted = await self._emit(
+            self.config.regime_change_topic,
             {
                 **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
@@ -1007,7 +1259,13 @@ class OIAnalyzer:
             },
             priority=EventPriority.HIGH,
             correlation_id=correlation_id,
+            headers=self._headers_for_analysis(
+                analysis,
+                event_type="regime_changed",
+            ),
         )
+        if accepted:
+            self._stats.emitted_regime_changes += 1
 
     async def _emit_divergence_detected(
         self,
@@ -1018,8 +1276,8 @@ class OIAnalyzer:
         if analysis.divergence is None:
             return
 
-        await self._emit(
-            OIEventType.DIVERGENCE_DETECTED.topic,
+        accepted = await self._emit(
+            self.config.divergence_topic,
             {
                 **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
@@ -1033,7 +1291,13 @@ class OIAnalyzer:
             },
             priority=EventPriority.HIGH,
             correlation_id=correlation_id,
+            headers=self._headers_for_analysis(
+                analysis,
+                event_type="divergence_detected",
+            ),
         )
+        if accepted:
+            self._stats.emitted_divergences += 1
 
     async def _emit_anomaly_detected(
         self,
@@ -1044,8 +1308,8 @@ class OIAnalyzer:
         if analysis.anomaly is None:
             return
 
-        await self._emit(
-            OIEventType.ANOMALY_DETECTED.topic,
+        accepted = await self._emit(
+            self.config.anomaly_topic,
             {
                 **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
@@ -1059,7 +1323,13 @@ class OIAnalyzer:
             },
             priority=EventPriority.HIGH,
             correlation_id=correlation_id,
+            headers=self._headers_for_analysis(
+                analysis,
+                event_type="anomaly_detected",
+            ),
         )
+        if accepted:
+            self._stats.emitted_anomalies += 1
 
     async def _emit_squeeze_setup(
         self,
@@ -1067,8 +1337,8 @@ class OIAnalyzer:
         *,
         correlation_id: str | None,
     ) -> None:
-        await self._emit(
-            OIEventType.SQUEEZE_SETUP.topic,
+        accepted = await self._emit(
+            self.config.squeeze_setup_topic,
             {
                 **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
@@ -1080,7 +1350,13 @@ class OIAnalyzer:
             },
             priority=EventPriority.HIGH,
             correlation_id=correlation_id,
+            headers=self._headers_for_analysis(
+                analysis,
+                event_type="squeeze_setup",
+            ),
         )
+        if accepted:
+            self._stats.emitted_squeeze_setups += 1
 
     async def _emit_capitulation_detected(
         self,
@@ -1094,8 +1370,8 @@ class OIAnalyzer:
             else None
         )
 
-        await self._emit(
-            OIEventType.CAPITULATION_DETECTED.topic,
+        accepted = await self._emit(
+            self.config.capitulation_topic,
             {
                 **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
@@ -1107,7 +1383,13 @@ class OIAnalyzer:
             },
             priority=EventPriority.CRITICAL,
             correlation_id=correlation_id,
+            headers=self._headers_for_analysis(
+                analysis,
+                event_type="capitulation_detected",
+            ),
         )
+        if accepted:
+            self._stats.emitted_capitulations += 1
 
     async def _emit(
         self,
@@ -1116,6 +1398,7 @@ class OIAnalyzer:
         *,
         priority: EventPriority = EventPriority.NORMAL,
         correlation_id: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> bool:
         return await self.event_bus.emit(
             topic,
@@ -1123,6 +1406,7 @@ class OIAnalyzer:
             priority=priority,
             source=self.config.source_name,
             correlation_id=correlation_id,
+            headers=headers or {},
         )
 
     def _analysis_payload(self, analysis: OIAnalysisResult) -> dict[str, Any]:
@@ -1136,7 +1420,26 @@ class OIAnalyzer:
             "symbol": analysis.symbol,
             "exchange_symbol": analysis.exchange_symbol,
             "timeframe": analysis.timeframe,
+            "scope": analysis.scope,
+            "scope_key": analysis.scope_key,
+            "oi_key": analysis.key,
             "key": list(analysis.key),
+        }
+
+    @staticmethod
+    def _headers_for_analysis(
+        analysis: OIAnalysisResult,
+        *,
+        event_type: str,
+    ) -> dict[str, str]:
+        return {
+            "exchange": analysis.exchange,
+            "market_type": analysis.market_type,
+            "symbol": analysis.symbol,
+            "timeframe": analysis.timeframe,
+            "exchange_symbol": analysis.exchange_symbol or analysis.symbol,
+            "scope": analysis.scope_key,
+            "event_type": event_type,
         }
 
     @staticmethod
@@ -1181,12 +1484,12 @@ class OIAnalyzer:
         if state is not None:
             return state
 
-        exchange, market_type, symbol, timeframe = key
+        scope = oi_key_to_dict(key)
         state = OIState(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            symbol=scope["symbol"],
+            timeframe=scope["timeframe"],
         )
         self._states[key] = state
         return state
@@ -1199,12 +1502,12 @@ class OIAnalyzer:
         state = self._get_or_create_state(key)
 
         if state.last_context is None:
-            exchange, market_type, symbol, timeframe = key
+            scope = oi_key_to_dict(key)
             state.last_context = OIMarketContext(
-                exchange=exchange,
-                market_type=market_type,
-                symbol=symbol,
-                timeframe=timeframe,
+                exchange=scope["exchange"],
+                market_type=scope["market_type"],
+                symbol=scope["symbol"],
+                timeframe=scope["timeframe"],
                 timestamp=timestamp,
             )
 
@@ -1260,10 +1563,14 @@ class OIAnalyzer:
     # Context update helpers
     # ------------------------------------------------------------------
 
-    async def _apply_candle_payload(self, payload: Mapping[str, Any]) -> None:
+    async def _apply_candle_payload(self, payload: Mapping[str, Any]) -> bool:
         key = self._extract_key_from_payload(payload)
         if key is None:
-            return
+            self._stats.skipped_invalid_payload += 1
+            return False
+
+        if not self._should_process_key(key):
+            return False
 
         timestamp = self._extract_timestamp(payload)
         close_price = self._extract_float(
@@ -1318,11 +1625,16 @@ class OIAnalyzer:
 
         state = self._get_or_create_state(key)
         state.apply_context(context)
+        return True
 
-    def _apply_trade_payload(self, payload: Mapping[str, Any]) -> None:
+    def _apply_trade_payload(self, payload: Mapping[str, Any]) -> bool:
         key = self._extract_key_from_payload(payload)
         if key is None:
-            return
+            self._stats.skipped_invalid_payload += 1
+            return False
+
+        if not self._should_process_key(key):
+            return False
 
         timestamp = self._extract_timestamp(payload)
         price = self._extract_float(payload, "price", "p")
@@ -1359,6 +1671,7 @@ class OIAnalyzer:
 
         state = self._get_or_create_state(key)
         state.apply_context(context)
+        return True
 
     def _update_price_context(
         self,
@@ -1427,7 +1740,11 @@ class OIAnalyzer:
     ) -> OISnapshot | None:
         key = self._extract_key_from_payload(payload)
         if key is None:
+            self._stats.skipped_invalid_payload += 1
             self.logger.warning("OI payload missing exchange/market_type/symbol")
+            return None
+
+        if not self._should_process_key(key):
             return None
 
         timestamp = self._extract_timestamp(payload)
@@ -1440,19 +1757,20 @@ class OIAnalyzer:
         )
 
         if oi is None:
+            self._stats.skipped_missing_oi += 1
             self.logger.warning(
                 "OI payload missing OI value",
                 extra=self._key_payload(key),
             )
             return None
 
-        exchange, market_type, symbol, timeframe = key
+        scope = oi_key_to_dict(key)
 
         return OISnapshot(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            symbol=scope["symbol"],
+            timeframe=scope["timeframe"],
             exchange_symbol=self._extract_str(payload, "exchange_symbol"),
             timestamp=timestamp,
             oi=oi,
@@ -1466,6 +1784,8 @@ class OIAnalyzer:
             index_price=self._extract_float(payload, "index_price", "indexPrice"),
             source=self._extract_str(payload, "source") or "open_interest_cache",
             metadata={
+                "scope": scope,
+                "scope_key": oi_key_to_string(key),
                 "raw_topic_source": payload.get("source"),
                 "received_at_ms": payload.get("received_at_ms"),
                 "timestamp_ms": payload.get("timestamp_ms"),
@@ -1496,35 +1816,35 @@ class OIAnalyzer:
         symbol = self._extract_str(payload, "symbol", "instrument", "market")
         timeframe = self._extract_str(payload, "timeframe", "tf", "interval")
 
-        if not exchange or not symbol:
+        if not symbol:
             return None
 
         return self._normalize_key(
-            exchange=exchange,
-            market_type=market_type or DEFAULT_MARKET_TYPE,
+            exchange=exchange or self.config.default_exchange,
+            market_type=market_type or self.config.default_market_type,
             symbol=symbol,
-            timeframe=timeframe or DEFAULT_TIMEFRAME,
+            timeframe=timeframe or self.config.default_timeframe,
         )
 
     def _normalize_key(
         self,
         *,
-        exchange: str,
+        exchange: str = DEFAULT_EXCHANGE,
         market_type: str = DEFAULT_MARKET_TYPE,
         symbol: str,
         timeframe: str = DEFAULT_TIMEFRAME,
     ) -> OIKey:
         normalized_symbol = (
-            symbol.upper().strip()
+            normalize_symbol(symbol)
             if self.config.normalize_symbol
-            else symbol.strip()
+            else str(symbol).strip()
         )
 
         return make_oi_key(
-            exchange=exchange,
-            market_type=market_type,
+            exchange=normalize_exchange(exchange or self.config.default_exchange),
+            market_type=normalize_market_type(market_type or self.config.default_market_type),
             symbol=normalized_symbol,
-            timeframe=timeframe,
+            timeframe=normalize_timeframe(timeframe or self.config.default_timeframe),
         )
 
     def _extract_timestamp(self, payload: Mapping[str, Any]) -> float:
@@ -1584,17 +1904,64 @@ class OIAnalyzer:
 
         return None
 
+    def _should_process_key(self, key: OIKey) -> bool:
+        if self.config.should_process_key(key):
+            return True
+
+        self._stats.skipped_by_scope_filter += 1
+        self.logger.debug(
+            "OI event skipped by scope filter",
+            extra=self._key_payload(key),
+        )
+        return False
+
     @staticmethod
     def _key_payload(key: OIKey) -> dict[str, Any]:
-        exchange, market_type, symbol, timeframe = key
+        scope = oi_key_to_dict(key)
         return {
-            "exchange": exchange,
-            "market_type": market_type,
-            "symbol": symbol,
-            "timeframe": timeframe,
+            **scope,
+            "scope": scope,
+            "scope_key": oi_key_to_string(key),
+            "oi_key": key,
             "key": list(key),
         }
+
+    def _record_exception(
+        self,
+        message: str,
+        exc: Exception,
+        *,
+        event: Event | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        self._stats.record_error(exc, self._now())
+
+        payload: dict[str, Any] = {
+            "error": repr(exc),
+        }
+
+        if event is not None:
+            payload.update(
+                {
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                    "source": getattr(event, "source", None),
+                    "correlation_id": getattr(event, "correlation_id", None),
+                }
+            )
+
+        if extra:
+            payload.update(extra)
+
+        self.logger.exception(message, extra=payload)
 
     @staticmethod
     def _now() -> float:
         return time.time()
+
+
+__all__ = [
+    "OIInstrumentBuffers",
+    "OIAnalyzerRuntimeStats",
+    "OIAnalyzer",
+]
