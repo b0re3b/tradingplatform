@@ -2,6 +2,115 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    SpoofingKey,
+    make_spoofing_key,
+    spoofing_key_to_dict,
+)
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _normalize_exchange(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
+def _normalize_market_type(value: str | None) -> str:
+    normalized = str(value or DEFAULT_MARKET_TYPE).strip().lower()
+    return normalized or DEFAULT_MARKET_TYPE
+
+
+def _normalize_symbol(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = str(value).strip().upper()
+    return normalized or None
+
+
+def _normalize_timeframe(value: str | None) -> str:
+    normalized = str(value or DEFAULT_TIMEFRAME).strip()
+    return normalized or DEFAULT_TIMEFRAME
+
+
+def _normalize_symbol_allowlist(values: list[str] | tuple[str, ...] | set[str] | None) -> set[str] | None:
+    if not values:
+        return None
+
+    normalized = {
+        symbol
+        for item in values
+        if (symbol := _normalize_symbol(str(item))) is not None
+    }
+
+    return normalized or None
+
+
+def _normalize_exchange_allowlist(values: list[str] | tuple[str, ...] | set[str] | None) -> set[str] | None:
+    if not values:
+        return None
+
+    normalized = {
+        exchange
+        for item in values
+        if (exchange := _normalize_exchange(str(item))) is not None
+    }
+
+    return normalized or None
+
+
+def _normalize_market_type_allowlist(values: list[str] | tuple[str, ...] | set[str] | None) -> set[str] | None:
+    if not values:
+        return None
+
+    normalized = {
+        _normalize_market_type(str(item))
+        for item in values
+        if str(item).strip()
+    }
+
+    return normalized or None
+
+
+def _normalize_timeframe_allowlist(values: list[str] | tuple[str, ...] | set[str] | None) -> set[str] | None:
+    if not values:
+        return None
+
+    normalized = {
+        _normalize_timeframe(str(item))
+        for item in values
+        if str(item).strip()
+    }
+
+    return normalized or None
+
+
+def _normalize_topic_patterns(values: list[str] | tuple[str, ...] | set[str]) -> tuple[str, ...]:
+    normalized = tuple(
+        str(item).strip()
+        for item in values
+        if str(item).strip()
+    )
+
+    if not normalized:
+        raise ValueError("topic patterns must not be empty")
+
+    return normalized
+
+
+# =============================================================================
+# Detector configs
+# =============================================================================
+
 
 @dataclass(slots=True)
 class WallDetectionConfig:
@@ -37,7 +146,12 @@ class PersistenceTrackerConfig:
     min_tracking_lifetime_ms: int = 50
     cleanup_interval_ms: int = 2_000
 
+    # New key-first limit.
+    max_walls_per_key: int = 500
+
+    # Backward-compatible legacy name. Не використовувати в новому коді.
     max_walls_per_symbol: int = 500
+
     max_history_events_per_level: int = 200
 
     size_update_epsilon: float = 1e-9
@@ -45,6 +159,13 @@ class PersistenceTrackerConfig:
 
     estimate_fill_from_trade_flow: bool = False
     estimate_fill_on_touch_only: bool = True
+
+    def __post_init__(self) -> None:
+        # Якщо старий config передає тільки max_walls_per_symbol, не ламаємо його.
+        if self.max_walls_per_key == 500 and self.max_walls_per_symbol != 500:
+            self.max_walls_per_key = self.max_walls_per_symbol
+        else:
+            self.max_walls_per_symbol = self.max_walls_per_key
 
 
 @dataclass(slots=True)
@@ -146,7 +267,6 @@ class CandidateTrackingConfig:
     """
     Legacy-compatible candidate tracking config.
 
-    Цей блок замінює параметри зі старого монолітного spoofing_detector.py.
     У новій архітектурі основний state веде PersistenceTracker, але ці
     параметри можуть бути корисні для міграції старої candidate-based логіки,
     cooldown-ів або trade-flow confirmation.
@@ -157,6 +277,10 @@ class CandidateTrackingConfig:
     candidate_ttl_ms: int = 12_000
     cooldown_ms_same_level: int = 15_000
 
+    max_candidates_per_key: int = 200
+    max_trade_events_per_key: int = 2_000
+
+    # Backward-compatible legacy names. Не використовувати в новому коді.
     max_candidates_per_symbol: int = 200
     max_trade_events_per_symbol: int = 2_000
 
@@ -170,6 +294,22 @@ class CandidateTrackingConfig:
 
     emit_raw_candidate_events: bool = False
 
+    def __post_init__(self) -> None:
+        if self.max_candidates_per_key == 200 and self.max_candidates_per_symbol != 200:
+            self.max_candidates_per_key = self.max_candidates_per_symbol
+        else:
+            self.max_candidates_per_symbol = self.max_candidates_per_key
+
+        if self.max_trade_events_per_key == 2_000 and self.max_trade_events_per_symbol != 2_000:
+            self.max_trade_events_per_key = self.max_trade_events_per_symbol
+        else:
+            self.max_trade_events_per_symbol = self.max_trade_events_per_key
+
+
+# =============================================================================
+# Analyzer config
+# =============================================================================
+
 
 @dataclass(slots=True)
 class SpoofingAnalyzerConfig:
@@ -177,9 +317,17 @@ class SpoofingAnalyzerConfig:
     Загальний конфіг SpoofingAnalyzer.
 
     Analyzer є єдиним integration point пакета:
-    - підписується на market.* через EventBus;
+    - підписується на data-layer topics через EventBus;
+    - читає OrderBookCache / TradesCache через scoped key;
     - запускає cleanup через Scheduler;
-    - публікує analytics.spoofing.* події.
+    - публікує тільки analytics.spoofing.* події.
+
+    Production input flow:
+        exchange adapters
+            -> market.orderbook / market.trade
+            -> OrderBookCache / TradesCache
+            -> market.orderbook.updated / market.trades.updated
+            -> analytics.spoofing
     """
 
     enabled: bool = True
@@ -190,11 +338,24 @@ class SpoofingAnalyzerConfig:
     publish_score_updates: bool = True
     publish_errors: bool = True
 
-    max_tracked_walls_per_symbol: int = 500
+    max_tracked_walls_per_key: int = 500
     max_detector_results_per_cycle: int = 50
 
-    event_topic_orderbook: str = "market.orderbook"
-    event_topic_trade: str = "market.trade"
+    # Backward-compatible legacy name. Не використовувати в новому коді.
+    max_tracked_walls_per_symbol: int = 500
+
+    # Production source topics: only data-layer updated events.
+    event_topic_orderbook: str = "market.orderbook.updated"
+    event_topic_trade: str = "market.trades.updated"
+
+    source_topic_patterns_orderbook: tuple[str, ...] = ("market.orderbook.updated",)
+    source_topic_patterns_trade: tuple[str, ...] = ("market.trades.updated",)
+
+    # Legacy/raw topics are intentionally separated and disabled by default.
+    # They may be used only in migration tests/manual tools, not production runtime.
+    legacy_raw_orderbook_topic: str = "market.orderbook"
+    legacy_raw_trade_topic: str = "market.trade"
+    allow_legacy_raw_topics: bool = False
 
     event_topic_lifecycle: str = "analytics.spoofing.lifecycle"
     event_topic_updated: str = "analytics.spoofing.updated"
@@ -205,6 +366,49 @@ class SpoofingAnalyzerConfig:
     scheduler_cleanup_job_name: str = "analytics.spoofing.persistence_cleanup"
     scheduler_cleanup_enabled: bool = True
 
+    def __post_init__(self) -> None:
+        if self.max_tracked_walls_per_key == 500 and self.max_tracked_walls_per_symbol != 500:
+            self.max_tracked_walls_per_key = self.max_tracked_walls_per_symbol
+        else:
+            self.max_tracked_walls_per_symbol = self.max_tracked_walls_per_key
+
+        self.source_topic_patterns_orderbook = _normalize_topic_patterns(
+            self.source_topic_patterns_orderbook
+        )
+        self.source_topic_patterns_trade = _normalize_topic_patterns(
+            self.source_topic_patterns_trade
+        )
+
+        # Keep single-topic fields aligned with production topic patterns.
+        self.event_topic_orderbook = self.source_topic_patterns_orderbook[0]
+        self.event_topic_trade = self.source_topic_patterns_trade[0]
+
+    @property
+    def source_topic_patterns(self) -> tuple[str, ...]:
+        """
+        Усі production source topic patterns для SpoofingAnalyzer.
+        """
+        return (
+            *self.source_topic_patterns_orderbook,
+            *self.source_topic_patterns_trade,
+        )
+
+    @property
+    def legacy_raw_topic_patterns(self) -> tuple[str, ...]:
+        """
+        Legacy/raw topics для міграції або ручних тестів.
+        Не підключати в production, якщо allow_legacy_raw_topics=False.
+        """
+        return (
+            self.legacy_raw_orderbook_topic,
+            self.legacy_raw_trade_topic,
+        )
+
+
+# =============================================================================
+# Root config
+# =============================================================================
+
 
 @dataclass(slots=True)
 class SpoofingConfig:
@@ -214,9 +418,33 @@ class SpoofingConfig:
     Цей config не дублює core.config.Config. Він є доменною typed config-моделлю
     і має передаватися в SpoofingAnalyzer / detector-и через constructor
     dependency injection.
+
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
+    New code should prefer:
+        default_exchange/default_market_type/default_timeframe
+        exchange_allowlist/symbol_allowlist/market_type_allowlist/timeframe_allowlist
+
+    Legacy fields:
+        exchange
+        symbols
     """
 
     enabled: bool = True
+
+    # Scoped defaults. Symbol-only processing is unsafe without default_exchange.
+    default_exchange: str | None = None
+    default_market_type: str = DEFAULT_MARKET_TYPE
+    default_timeframe: str = DEFAULT_TIMEFRAME
+
+    # Scoped allowlists.
+    exchange_allowlist: set[str] | None = None
+    market_type_allowlist: set[str] | None = None
+    symbol_allowlist: set[str] | None = None
+    timeframe_allowlist: set[str] | None = None
+
+    # Legacy-compatible fields.
     exchange: str | None = None
     symbols: list[str] = field(default_factory=list)
 
@@ -230,6 +458,29 @@ class SpoofingConfig:
     candidate_tracking: CandidateTrackingConfig = field(default_factory=CandidateTrackingConfig)
     analyzer: SpoofingAnalyzerConfig = field(default_factory=SpoofingAnalyzerConfig)
 
+    def __post_init__(self) -> None:
+        legacy_exchange = _normalize_exchange(self.exchange)
+        self.default_exchange = _normalize_exchange(self.default_exchange) or legacy_exchange
+        self.exchange = self.default_exchange
+
+        self.default_market_type = _normalize_market_type(self.default_market_type)
+        self.default_timeframe = _normalize_timeframe(self.default_timeframe)
+
+        self.exchange_allowlist = _normalize_exchange_allowlist(self.exchange_allowlist)
+        self.market_type_allowlist = _normalize_market_type_allowlist(self.market_type_allowlist)
+        self.symbol_allowlist = _normalize_symbol_allowlist(self.symbol_allowlist)
+        self.timeframe_allowlist = _normalize_timeframe_allowlist(self.timeframe_allowlist)
+
+        legacy_symbols = _normalize_symbol_allowlist(self.symbols)
+        if self.symbol_allowlist is None and legacy_symbols is not None:
+            self.symbol_allowlist = legacy_symbols
+
+        self.symbols = sorted(self.symbol_allowlist or [])
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
     def validate(self) -> None:
         """
         Перевіряє config на логічну коректність.
@@ -238,6 +489,7 @@ class SpoofingConfig:
         config у SpoofingAnalyzer.
         """
 
+        self._validate_scope_defaults()
         self._validate_wall_detection()
         self._validate_persistence()
         self._validate_pull_detection()
@@ -248,9 +500,24 @@ class SpoofingConfig:
         self._validate_candidate_tracking()
         self._validate_analyzer()
 
-    # ------------------------------------------------------------------
-    # Section validators
-    # ------------------------------------------------------------------
+    def _validate_scope_defaults(self) -> None:
+        if self.default_exchange is not None:
+            self._validate_non_empty_string("default_exchange", self.default_exchange)
+
+        self._validate_non_empty_string("default_market_type", self.default_market_type)
+        self._validate_non_empty_string("default_timeframe", self.default_timeframe)
+
+        for exchange in self.exchange_allowlist or ():
+            self._validate_non_empty_string("exchange_allowlist item", exchange)
+
+        for market_type in self.market_type_allowlist or ():
+            self._validate_non_empty_string("market_type_allowlist item", market_type)
+
+        for symbol in self.symbol_allowlist or ():
+            self._validate_non_empty_string("symbol_allowlist item", symbol)
+
+        for timeframe in self.timeframe_allowlist or ():
+            self._validate_non_empty_string("timeframe_allowlist item", timeframe)
 
     def _validate_wall_detection(self) -> None:
         self._validate_non_negative(
@@ -298,8 +565,8 @@ class SpoofingConfig:
             self.persistence.cleanup_interval_ms,
         )
         self._validate_positive_int(
-            "persistence.max_walls_per_symbol",
-            self.persistence.max_walls_per_symbol,
+            "persistence.max_walls_per_key",
+            self.persistence.max_walls_per_key,
         )
         self._validate_positive_int(
             "persistence.max_history_events_per_level",
@@ -451,12 +718,12 @@ class SpoofingConfig:
             self.candidate_tracking.cooldown_ms_same_level,
         )
         self._validate_positive_int(
-            "candidate_tracking.max_candidates_per_symbol",
-            self.candidate_tracking.max_candidates_per_symbol,
+            "candidate_tracking.max_candidates_per_key",
+            self.candidate_tracking.max_candidates_per_key,
         )
         self._validate_positive_int(
-            "candidate_tracking.max_trade_events_per_symbol",
-            self.candidate_tracking.max_trade_events_per_symbol,
+            "candidate_tracking.max_trade_events_per_key",
+            self.candidate_tracking.max_trade_events_per_key,
         )
         self._validate_non_negative(
             "candidate_tracking.similar_candidate_tolerance_bps",
@@ -481,8 +748,8 @@ class SpoofingConfig:
 
     def _validate_analyzer(self) -> None:
         self._validate_positive_int(
-            "analyzer.max_tracked_walls_per_symbol",
-            self.analyzer.max_tracked_walls_per_symbol,
+            "analyzer.max_tracked_walls_per_key",
+            self.analyzer.max_tracked_walls_per_key,
         )
         self._validate_positive_int(
             "analyzer.max_detector_results_per_cycle",
@@ -493,8 +760,27 @@ class SpoofingConfig:
             if not self.analyzer.scheduler_cleanup_job_name.strip():
                 raise ValueError("analyzer.scheduler_cleanup_job_name must not be empty")
 
-        self._validate_topic("analyzer.event_topic_orderbook", self.analyzer.event_topic_orderbook)
-        self._validate_topic("analyzer.event_topic_trade", self.analyzer.event_topic_trade)
+        for topic in self.analyzer.source_topic_patterns_orderbook:
+            self._validate_topic("analyzer.source_topic_patterns_orderbook item", topic)
+
+        for topic in self.analyzer.source_topic_patterns_trade:
+            self._validate_topic("analyzer.source_topic_patterns_trade item", topic)
+
+        if not self.analyzer.allow_legacy_raw_topics:
+            forbidden = {
+                self.analyzer.legacy_raw_orderbook_topic,
+                self.analyzer.legacy_raw_trade_topic,
+            }
+
+            production_topics = set(self.analyzer.source_topic_patterns)
+            raw_topics_used = production_topics.intersection(forbidden)
+
+            if raw_topics_used:
+                raise ValueError(
+                    "SpoofingAnalyzer production source topics must use data-layer "
+                    f"updated topics, not raw exchange topics: {sorted(raw_topics_used)}"
+                )
+
         self._validate_topic("analyzer.event_topic_lifecycle", self.analyzer.event_topic_lifecycle)
         self._validate_topic("analyzer.event_topic_updated", self.analyzer.event_topic_updated)
         self._validate_topic("analyzer.event_topic_detected", self.analyzer.event_topic_detected)
@@ -524,10 +810,99 @@ class SpoofingConfig:
     def cleanup_interval_seconds(self) -> float:
         return self.persistence.cleanup_interval_ms / 1000.0
 
+    def make_default_key(self, *, symbol: str, timeframe: str | None = None) -> SpoofingKey:
+        """
+        Backward-compatible helper для symbol-based викликів.
+
+        У multi-exchange режимі symbol-only небезпечний, тому default_exchange
+        обов'язковий.
+        """
+        if not self.default_exchange:
+            raise ValueError(
+                "make_default_key(symbol) requires default_exchange. "
+                "Use make_key(exchange=..., market_type=..., symbol=..., timeframe=...) instead."
+            )
+
+        return self.make_key(
+            exchange=self.default_exchange,
+            market_type=self.default_market_type,
+            symbol=symbol,
+            timeframe=timeframe or self.default_timeframe,
+        )
+
+    def make_key(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> SpoofingKey:
+        return make_spoofing_key(
+            exchange=exchange,
+            market_type=market_type or self.default_market_type,
+            symbol=symbol,
+            timeframe=timeframe or self.default_timeframe,
+        )
+
+    def is_key_allowed(self, key: SpoofingKey) -> bool:
+        scope = spoofing_key_to_dict(key)
+
+        return self.is_scope_allowed(
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            symbol=scope["symbol"],
+            timeframe=scope["timeframe"],
+        )
+
+    def is_scope_allowed(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> bool:
+        normalized_exchange = _normalize_exchange(exchange)
+        normalized_market_type = _normalize_market_type(market_type or self.default_market_type)
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_timeframe = _normalize_timeframe(timeframe or self.default_timeframe)
+
+        if normalized_exchange is None or normalized_symbol is None:
+            return False
+
+        if self.exchange_allowlist is not None and normalized_exchange not in self.exchange_allowlist:
+            return False
+
+        if self.market_type_allowlist is not None and normalized_market_type not in self.market_type_allowlist:
+            return False
+
+        if self.symbol_allowlist is not None and normalized_symbol not in self.symbol_allowlist:
+            return False
+
+        if self.timeframe_allowlist is not None and normalized_timeframe not in self.timeframe_allowlist:
+            return False
+
+        return True
+
     def is_symbol_allowed(self, symbol: str) -> bool:
-        if not self.symbols:
+        """
+        Legacy-compatible helper.
+
+        New code should use is_key_allowed() або is_scope_allowed().
+        """
+        normalized_symbol = _normalize_symbol(symbol)
+        if normalized_symbol is None:
+            return False
+
+        if self.symbol_allowlist is None:
             return True
-        return symbol in self.symbols
+
+        return normalized_symbol in self.symbol_allowlist
+
+    @property
+    def production_source_topics(self) -> tuple[str, ...]:
+        return self.analyzer.source_topic_patterns
 
     # ------------------------------------------------------------------
     # Primitive validators
@@ -560,6 +935,11 @@ class SpoofingConfig:
 
     @staticmethod
     def _validate_topic(name: str, value: str) -> None:
+        if not value or not value.strip():
+            raise ValueError(f"{name} must not be empty")
+
+    @staticmethod
+    def _validate_non_empty_string(name: str, value: str) -> None:
         if not value or not value.strip():
             raise ValueError(f"{name} must not be empty")
 

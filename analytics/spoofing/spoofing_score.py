@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from hashlib import sha1
 from typing import Iterable
 
@@ -19,12 +19,17 @@ from .enums import (
     SpoofingType,
 )
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     AggregationContext,
     DetectorResult,
     ScoreContribution,
     SpoofingFeatures,
+    SpoofingKey,
     SpoofingScore,
     SpoofingSignal,
+    make_spoofing_key,
+    spoofing_key_to_dict,
 )
 
 
@@ -41,11 +46,15 @@ class SpoofingScoreEngine(BaseSpoofingModule):
     - визначення severity;
     - побудову фінального SpoofingSignal.
 
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
     Важливо:
     - не виявляє spoofing самостійно;
     - не підписується на EventBus;
     - не публікує події;
     - не запускає Scheduler jobs;
+    - не читає exchange/data cache напряму;
     - працює як pure aggregation/scoring component.
     """
 
@@ -72,19 +81,28 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         self,
         detector_results: Iterable[DetectorResult],
         *,
+        key: SpoofingKey | None = None,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> SpoofingScore | None:
         """
         Рахує фінальний SpoofingScore на основі detector results.
+
+        New code should pass key=SpoofingKey.
+        Legacy filters exchange/symbol/market_type/timeframe залишені для міграції.
         """
         if not self.config.enabled or not self.config.scoring.enabled:
             return None
 
         context = self._build_aggregation_context(
             detector_results=detector_results,
+            key=key,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
         )
         if context is None:
             return None
@@ -107,8 +125,12 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             threshold=threshold,
             passed=passed,
             metadata={
-                "symbol": context.symbol,
+                "scope": spoofing_key_to_dict(context.key),
                 "exchange": context.exchange,
+                "market_type": context.market_type,
+                "symbol": context.symbol,
+                "timeframe": context.timeframe,
+                "exchange_symbol": context.exchange_symbol,
                 "agreement_ratio": context.agreement_ratio,
                 "average_confidence": context.average_confidence,
                 "primary_pattern": context.primary_pattern.value,
@@ -122,35 +144,41 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         self,
         detector_results: Iterable[DetectorResult],
         *,
+        key: SpoofingKey | None = None,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         status: SpoofingStatus = SpoofingStatus.DETECTED,
     ) -> SpoofingSignal | None:
         """
         Будує фінальний SpoofingSignal із detector results.
+
+        New code should pass key=SpoofingKey.
         """
         if not self.config.enabled or not self.config.scoring.enabled:
             return None
 
         context = self._build_aggregation_context(
             detector_results=detector_results,
+            key=key,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
         )
         if context is None:
             return None
 
         score = self.score(
             detector_results=context.detector_results,
-            symbol=context.symbol,
-            exchange=context.exchange,
+            key=context.key,
         )
         if score is None:
             return None
 
         signal_id = self._build_signal_id(
-            exchange=context.exchange,
-            symbol=context.symbol,
+            key=context.key,
             wall_id=context.wall_id,
             spoofing_type=context.spoofing_type,
             pattern=context.primary_pattern,
@@ -167,6 +195,9 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             signal_id=signal_id,
             symbol=context.symbol,
             exchange=context.exchange,
+            market_type=context.market_type,
+            timeframe=context.timeframe,
+            exchange_symbol=context.exchange_symbol,
             side=context.features.side,
             spoofing_type=context.spoofing_type,
             pattern=context.primary_pattern,
@@ -182,6 +213,7 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             detector_results=context.detector_results,
             score_breakdown=score,
             metadata={
+                "scope": spoofing_key_to_dict(context.key),
                 "agreement_ratio": context.agreement_ratio,
                 "average_confidence": context.average_confidence,
                 "detector_count": len(context.detector_results),
@@ -194,16 +226,22 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         self,
         detector_results: Iterable[DetectorResult],
         *,
+        key: SpoofingKey | None = None,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> bool:
         """
         Перевіряє, чи достатній score для detection event.
         """
         score = self.score(
             detector_results=detector_results,
+            key=key,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
         )
         return score.passed if score is not None else False
 
@@ -215,19 +253,28 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         self,
         *,
         detector_results: Iterable[DetectorResult],
+        key: SpoofingKey | None = None,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> AggregationContext | None:
         results = self._filter_positive_results(
             detector_results=detector_results,
+            key=key,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
         )
         if not results:
             return None
 
         features = self._merge_features(results)
         if features is None:
+            return None
+
+        if not self.should_process_key(features.key):
             return None
 
         agreement_ratio = self._compute_agreement_ratio(results)
@@ -242,6 +289,9 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         return AggregationContext(
             symbol=features.symbol,
             exchange=features.exchange,
+            market_type=features.market_type,
+            timeframe=features.timeframe,
+            exchange_symbol=features.exchange_symbol,
             price=features.price,
             features=features,
             detector_results=results,
@@ -252,34 +302,63 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             wall_id=wall_id,
         )
 
-    @staticmethod
     def _filter_positive_results(
+        self,
         *,
         detector_results: Iterable[DetectorResult],
+        key: SpoofingKey | None,
         symbol: str | None,
         exchange: str | None,
+        market_type: str | None,
+        timeframe: str | None,
     ) -> list[DetectorResult]:
-        results = [
-            result
-            for result in detector_results
-            if result is not None
-            and result.decision == DetectorDecision.POSITIVE
-            and result.features is not None
-        ]
+        normalized_exchange = (
+            self.normalize_exchange(exchange)
+            if exchange is not None
+            else None
+        )
+        normalized_symbol = (
+            self.normalize_symbol(symbol)
+            if symbol is not None
+            else None
+        )
+        normalized_market_type = (
+            self.normalize_market_type(market_type)
+            if market_type is not None
+            else None
+        )
+        normalized_timeframe = (
+            self.normalize_timeframe(timeframe)
+            if timeframe is not None
+            else None
+        )
 
-        if symbol is not None:
-            results = [
-                result
-                for result in results
-                if result.features is not None and result.features.symbol == symbol
-            ]
+        results: list[DetectorResult] = []
 
-        if exchange is not None:
-            results = [
-                result
-                for result in results
-                if result.features is not None and result.features.exchange == exchange
-            ]
+        for result in detector_results:
+            if result is None:
+                continue
+            if result.decision != DetectorDecision.POSITIVE:
+                continue
+            if result.features is None:
+                continue
+
+            feature_key = result.features.key
+
+            if key is not None and feature_key != key:
+                continue
+            if normalized_exchange is not None and result.features.exchange != normalized_exchange:
+                continue
+            if normalized_market_type is not None and result.features.market_type != normalized_market_type:
+                continue
+            if normalized_symbol is not None and result.features.symbol != normalized_symbol:
+                continue
+            if normalized_timeframe is not None and result.features.timeframe != normalized_timeframe:
+                continue
+            if not self.should_process_key(feature_key):
+                continue
+
+            results.append(result)
 
         return results
 
@@ -296,38 +375,48 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             return None
 
         base = feature_list[0]
+        base_key = base.key
 
-        wall_size = max((item.wall_size for item in feature_list), default=0.0)
-        wall_size_ratio = max((item.wall_size_ratio for item in feature_list), default=0.0)
+        # Safety: scoring має агрегувати тільки один scoped futures market.
+        scoped_features = [
+            item
+            for item in feature_list
+            if item.key == base_key
+        ]
+        if not scoped_features:
+            return None
+
+        wall_size = max((item.wall_size for item in scoped_features), default=0.0)
+        wall_size_ratio = max((item.wall_size_ratio for item in scoped_features), default=0.0)
 
         distance_values = [
             item.distance_from_mid_bps
-            for item in feature_list
+            for item in scoped_features
             if item.distance_from_mid_bps >= 0
         ]
         distance_from_mid_bps = min(distance_values) if distance_values else 0.0
 
-        lifetime_ms = max((item.lifetime_ms for item in feature_list), default=0.0)
-        updates_count = max((item.updates_count for item in feature_list), default=0)
-        repetition_count = max((item.repetition_count for item in feature_list), default=0)
+        lifetime_ms = max((item.lifetime_ms for item in scoped_features), default=0.0)
+        updates_count = max((item.updates_count for item in scoped_features), default=0)
+        repetition_count = max((item.repetition_count for item in scoped_features), default=0)
 
-        fill_ratio = max((item.fill_ratio for item in feature_list), default=0.0)
-        pull_ratio = max((item.pull_ratio for item in feature_list), default=0.0)
+        fill_ratio = max((item.fill_ratio for item in scoped_features), default=0.0)
+        pull_ratio = max((item.pull_ratio for item in scoped_features), default=0.0)
         cancel_to_fill_ratio = max(
-            (item.cancel_to_fill_ratio for item in feature_list),
+            (item.cancel_to_fill_ratio for item in scoped_features),
             default=0.0,
         )
 
         price_reaction_bps = max(
-            (item.price_reaction_bps for item in feature_list),
+            (item.price_reaction_bps for item in scoped_features),
             default=0.0,
         )
         pressure_flip_strength = max(
-            (item.pressure_flip_strength for item in feature_list),
+            (item.pressure_flip_strength for item in scoped_features),
             default=0.0,
         )
         layering_score = max(
-            (item.layering_score for item in feature_list),
+            (item.layering_score for item in scoped_features),
             default=0.0,
         )
 
@@ -335,17 +424,23 @@ class SpoofingScoreEngine(BaseSpoofingModule):
         detector_names: list[str] = []
 
         for result in results:
+            if result.features is None or result.features.key != base_key:
+                continue
             detector_names.append(result.detector.value)
 
-        for item in feature_list:
+        for item in scoped_features:
             if item.metadata:
                 merged_metadata.update(item.metadata)
 
+        merged_metadata["scope"] = spoofing_key_to_dict(base_key)
         merged_metadata["detectors"] = detector_names
 
         return SpoofingFeatures(
             symbol=base.symbol,
             exchange=base.exchange,
+            market_type=base.market_type,
+            timeframe=base.timeframe,
+            exchange_symbol=base.exchange_symbol,
             side=base.side,
             price=base.price,
             wall_size=wall_size,
@@ -360,10 +455,10 @@ class SpoofingScoreEngine(BaseSpoofingModule):
             price_reaction_bps=price_reaction_bps,
             pressure_flip_strength=pressure_flip_strength,
             layering_score=layering_score,
-            is_near_best_quote=any(item.is_near_best_quote for item in feature_list),
-            is_fast_pull=any(item.is_fast_pull for item in feature_list),
-            is_fake_liquidity=any(item.is_fake_liquidity for item in feature_list),
-            is_layering=any(item.is_layering for item in feature_list),
+            is_near_best_quote=any(item.is_near_best_quote for item in scoped_features),
+            is_fast_pull=any(item.is_fast_pull for item in scoped_features),
+            is_fake_liquidity=any(item.is_fake_liquidity for item in scoped_features),
+            is_layering=any(item.is_layering for item in scoped_features),
             metadata=merged_metadata,
         )
 
@@ -668,9 +763,9 @@ class SpoofingScoreEngine(BaseSpoofingModule):
     @staticmethod
     def _resolve_first_seen_at(
         *,
-        detected_at,
+        detected_at: datetime,
         features: SpoofingFeatures,
-    ):
+    ) -> datetime:
         if features.lifetime_ms <= 0:
             return detected_at
 
@@ -682,15 +777,17 @@ class SpoofingScoreEngine(BaseSpoofingModule):
     @staticmethod
     def _build_signal_id(
         *,
-        exchange: str,
-        symbol: str,
+        key: SpoofingKey,
         wall_id: str | None,
         spoofing_type: SpoofingType,
         pattern: SpoofingPattern,
         price: float,
     ) -> str:
+        scope = spoofing_key_to_dict(key)
         raw = (
-            f"{exchange}|{symbol}|{wall_id or 'none'}|"
+            f"{scope['exchange']}|{scope['market_type']}|"
+            f"{scope['symbol']}|{scope['timeframe']}|"
+            f"{wall_id or 'none'}|"
             f"{spoofing_type.value}|{pattern.value}|{price:.12f}"
         )
         digest = sha1(raw.encode("utf-8")).hexdigest()[:16]

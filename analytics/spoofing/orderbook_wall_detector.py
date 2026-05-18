@@ -15,11 +15,15 @@ from .enums import (
     SpoofingSide,
 )
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     DetectorResult,
     OrderbookLevelSnapshot,
     SpoofingFeatures,
+    SpoofingKey,
     TrackedWall,
     WallCandidateContext,
+    spoofing_key_to_dict,
 )
 from .persistence_tracker import PersistenceTracker
 
@@ -34,11 +38,24 @@ class OrderbookWallDetector(BaseSpoofingDetector):
     - оцінку близькості до mid / best quote;
     - побудову первинних spoofing features для подальших detector-ів.
 
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
+    Correct production input flow:
+        exchange adapters
+            -> market.orderbook
+            -> OrderBookCache
+            -> market.orderbook.updated
+            -> SpoofingAnalyzer
+            -> OrderbookWallDetector
+
     Важливо:
     - detector не визначає spoofing остаточно;
     - не підписується на EventBus;
     - не публікує події;
     - не запускає Scheduler jobs;
+    - не читає exchange adapters напряму;
+    - працює з normalized OrderbookLevelSnapshot;
     - повертає тільки DetectorResult або None.
     """
 
@@ -71,10 +88,10 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         tracked_wall: TrackedWall | None = None,
     ) -> DetectorResult | None:
         """
-        Аналізує один конкретний рівень стакана як кандидата на wall.
+        Аналізує один конкретний normalized orderbook level як wall candidate.
 
-        Цей метод зручний, коли SpoofingAnalyzer уже ітерується по
-        нормалізованих OrderbookLevelSnapshot окремо.
+        Production snapshots мають походити з OrderBookCache /
+        market.orderbook.updated, а не напряму з raw exchange payload.
         """
         candidate = self._evaluate_snapshot_candidate(
             snapshot=snapshot,
@@ -100,6 +117,8 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             wall_id=wall_id,
             pattern=SpoofingPattern.SINGLE_LEVEL_SPOOF,
             metadata={
+                "scope": spoofing_key_to_dict(snapshot.key),
+                "exchange_symbol": snapshot.exchange_symbol,
                 "baseline_size": candidate.baseline_size,
                 "size_ratio": candidate.size_ratio,
                 "distance_from_mid_bps": candidate.distance_from_mid_bps,
@@ -108,24 +127,52 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             },
         )
 
+    def analyze_key(
+        self,
+        snapshots: Iterable[OrderbookLevelSnapshot],
+        *,
+        key: SpoofingKey,
+        side: SpoofingSide | None = None,
+    ) -> list[DetectorResult]:
+        """
+        Key-first API для scoped futures market.
+
+        key:
+            exchange + market_type + symbol + timeframe
+        """
+        return self.analyze_many(
+            snapshots=snapshots,
+            key=key,
+            side=side,
+        )
+
     def analyze_many(
         self,
         snapshots: Iterable[OrderbookLevelSnapshot],
         *,
+        key: SpoofingKey | None = None,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         side: SpoofingSide | None = None,
     ) -> list[DetectorResult]:
         """
         Аналізує набір рівнів стакана та повертає позитивні wall-кандидати.
+
+        New code should pass key=SpoofingKey.
+        Legacy filters exchange/symbol/market_type/timeframe залишені для міграції.
         """
         if not self.config.enabled or not self.config.wall_detection.enabled:
             return []
 
         levels = self._filter_snapshots(
             snapshots=snapshots,
+            key=key,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
             side=side,
         )
         if not levels:
@@ -153,8 +200,11 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         snapshots: Iterable[OrderbookLevelSnapshot],
         *,
         limit: int = 10,
+        key: SpoofingKey | None = None,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         side: SpoofingSide | None = None,
     ) -> list[DetectorResult]:
         """
@@ -165,8 +215,11 @@ class OrderbookWallDetector(BaseSpoofingDetector):
 
         results = self.analyze_many(
             snapshots=snapshots,
+            key=key,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
             side=side,
         )
         return results[:limit]
@@ -192,6 +245,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         exchange: str,
         bids: Iterable[tuple[float, float]],
         asks: Iterable[tuple[float, float]],
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         best_bid: float | None = None,
         best_ask: float | None = None,
         sequence_id: int | None = None,
@@ -199,14 +255,22 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         metadata: dict[str, Any] | None = None,
     ) -> list[OrderbookLevelSnapshot]:
         """
-        Перетворює raw bids/asks у normalized OrderbookLevelSnapshot.
+        Manual/test helper.
 
-        bids/asks очікуються у форматі:
-            [(price, size), ...]
+        Перетворює bids/asks у normalized OrderbookLevelSnapshot.
+
+        Production runtime не має напряму передавати сюди raw exchange payload.
+        Production path:
+            OrderBookCache -> market.orderbook.updated -> SpoofingAnalyzer
         """
         ts = self.ensure_utc(timestamp)
         mid_price = self._resolve_mid_price(best_bid=best_bid, best_ask=best_ask)
         spread = self._resolve_spread(best_bid=best_bid, best_ask=best_ask)
+
+        base_metadata = {
+            **dict(metadata or {}),
+            "source": "manual_or_test_helper",
+        }
 
         levels: list[OrderbookLevelSnapshot] = []
 
@@ -215,6 +279,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
                 self.build_level_snapshot(
                     symbol=symbol,
                     exchange=exchange,
+                    market_type=market_type,
+                    timeframe=timeframe,
+                    exchange_symbol=exchange_symbol,
                     side=SpoofingSide.BID,
                     price=price,
                     size=size,
@@ -224,7 +291,7 @@ class OrderbookWallDetector(BaseSpoofingDetector):
                     spread=spread,
                     sequence_id=sequence_id,
                     timestamp=ts,
-                    metadata=dict(metadata or {}),
+                    metadata=base_metadata,
                 )
             )
 
@@ -233,6 +300,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
                 self.build_level_snapshot(
                     symbol=symbol,
                     exchange=exchange,
+                    market_type=market_type,
+                    timeframe=timeframe,
+                    exchange_symbol=exchange_symbol,
                     side=SpoofingSide.ASK,
                     price=price,
                     size=size,
@@ -242,7 +312,7 @@ class OrderbookWallDetector(BaseSpoofingDetector):
                     spread=spread,
                     sequence_id=sequence_id,
                     timestamp=ts,
-                    metadata=dict(metadata or {}),
+                    metadata=base_metadata,
                 )
             )
 
@@ -255,6 +325,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         exchange: str,
         side: SpoofingSide,
         levels: Iterable[tuple[float, float]],
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         best_bid: float | None = None,
         best_ask: float | None = None,
         sequence_id: int | None = None,
@@ -262,7 +335,10 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         metadata: dict[str, Any] | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналізує одну сторону стакана.
+        Manual/test helper для аналізу однієї сторони стакана.
+
+        New production code should use analyze_key() with snapshots prepared by
+        SpoofingAnalyzer from OrderBookCache.
         """
         resolved_side = self.parse_spoofing_side(side)
         if resolved_side == SpoofingSide.UNKNOWN:
@@ -272,6 +348,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             snapshots = self.build_snapshot_levels_from_orderbook(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 bids=list(levels),
                 asks=[],
                 best_bid=best_bid,
@@ -284,6 +363,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             snapshots = self.build_snapshot_levels_from_orderbook(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 bids=[],
                 asks=list(levels),
                 best_bid=best_bid,
@@ -295,10 +377,16 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         else:
             return []
 
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
         return self.analyze_many(
             snapshots=snapshots,
-            symbol=symbol,
-            exchange=exchange,
+            key=key,
             side=resolved_side,
         )
 
@@ -313,6 +401,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         baseline_size: float | None = None,
     ) -> WallCandidateContext | None:
         if not self.config.enabled or not self.config.wall_detection.enabled:
+            return None
+
+        if not self.should_process_key(snapshot.key):
             return None
 
         if snapshot.side == SpoofingSide.UNKNOWN:
@@ -405,7 +496,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             if self.persistence_tracker is not None:
                 history = self.persistence_tracker.get_recent_history(
                     exchange=tracked_wall.exchange,
+                    market_type=tracked_wall.market_type,
                     symbol=tracked_wall.symbol,
+                    timeframe=tracked_wall.timeframe,
                     side=tracked_wall.side,
                     price=tracked_wall.price,
                     limit=50,
@@ -420,6 +513,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         return SpoofingFeatures(
             symbol=snapshot.symbol,
             exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
+            timeframe=snapshot.timeframe,
+            exchange_symbol=snapshot.exchange_symbol,
             side=snapshot.side,
             price=snapshot.price,
             wall_size=snapshot.size,
@@ -436,9 +532,11 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             is_fake_liquidity=False,
             is_layering=False,
             metadata={
+                "scope": spoofing_key_to_dict(snapshot.key),
                 "notional": candidate.notional,
                 "baseline_size": candidate.baseline_size,
                 "detector": self.component.value,
+                "tracked_wall_id": tracked_wall.wall_id if tracked_wall else None,
             },
         )
 
@@ -534,17 +632,55 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         self,
         *,
         snapshots: Iterable[OrderbookLevelSnapshot],
+        key: SpoofingKey | None = None,
         symbol: str | None,
         exchange: str | None,
+        market_type: str | None,
+        timeframe: str | None,
         side: SpoofingSide | None,
     ) -> list[OrderbookLevelSnapshot]:
-        levels = [
-            item
-            for item in snapshots
-            if (symbol is None or item.symbol == symbol)
-            and (exchange is None or item.exchange == exchange)
-            and (side is None or item.side == side)
-        ]
+        resolved_side = self.parse_spoofing_side(side) if side is not None else None
+
+        normalized_exchange = (
+            self.normalize_exchange(exchange)
+            if exchange is not None
+            else None
+        )
+        normalized_symbol = (
+            self.normalize_symbol(symbol)
+            if symbol is not None
+            else None
+        )
+        normalized_market_type = (
+            self.normalize_market_type(market_type)
+            if market_type is not None
+            else None
+        )
+        normalized_timeframe = (
+            self.normalize_timeframe(timeframe)
+            if timeframe is not None
+            else None
+        )
+
+        levels: list[OrderbookLevelSnapshot] = []
+
+        for item in snapshots:
+            if key is not None and item.key != key:
+                continue
+            if normalized_symbol is not None and item.symbol != normalized_symbol:
+                continue
+            if normalized_exchange is not None and item.exchange != normalized_exchange:
+                continue
+            if normalized_market_type is not None and item.market_type != normalized_market_type:
+                continue
+            if normalized_timeframe is not None and item.timeframe != normalized_timeframe:
+                continue
+            if resolved_side is not None and item.side != resolved_side:
+                continue
+            if not self.should_process_key(item.key):
+                continue
+
+            levels.append(item)
 
         max_levels = self.config.wall_detection.max_levels_to_scan
         if max_levels > 0:
@@ -561,7 +697,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
 
         return self.persistence_tracker.get_wall_by_level(
             exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
             symbol=snapshot.symbol,
+            timeframe=snapshot.timeframe,
             side=snapshot.side,
             price=snapshot.price,
         )
@@ -572,7 +710,9 @@ class OrderbookWallDetector(BaseSpoofingDetector):
 
         return self.persistence_tracker.build_wall_id(
             exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
             symbol=snapshot.symbol,
+            timeframe=snapshot.timeframe,
             side=snapshot.side,
             price=snapshot.price,
         )
@@ -688,6 +828,10 @@ class OrderbookWallDetector(BaseSpoofingDetector):
 
         return (
             f"{side} wall candidate detected: "
+            f"exchange={snapshot.exchange}, "
+            f"market_type={snapshot.market_type}, "
+            f"symbol={snapshot.symbol}, "
+            f"timeframe={snapshot.timeframe}, "
             f"notional={notional:.2f}, "
             f"size_ratio={size_ratio:.2f}, "
             f"distance_from_mid_bps={distance_from_mid_bps:.2f}, "
