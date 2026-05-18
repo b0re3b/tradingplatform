@@ -19,9 +19,11 @@ class OISeriesInput:
     найстаріше -> найновіше.
 
     Важливо:
-    - oi_values / oi_timestamps є обов'язковими.
-    - price_values / price_timestamps є опціональними.
-    - volume_values / volume_timestamps є опціональними.
+    - oi_values / oi_timestamps є обов'язковими;
+    - price_values / price_timestamps є опціональними;
+    - volume_values / volume_timestamps є опціональними;
+    - усі ряди мають бути вже scoped зовнішнім OIAnalyzer по:
+      exchange + market_type + symbol + timeframe.
     """
 
     oi_values: Sequence[float]
@@ -517,16 +519,21 @@ def _pressure_score(
 
 class OIFeatureBuilder:
     """
-    Builder для Open Interest features.
+    Builder для futures Open Interest features.
 
     Це pure calculation service:
-    - не знає про EventBus
-    - не знає про Scheduler
-    - не створює logger
-    - не публікує події
-    - не має lifecycle/register
+    - не знає про EventBus;
+    - не знає про Scheduler;
+    - не створює logger;
+    - не публікує події;
+    - не має lifecycle/register.
 
     Його використовує OIAnalyzer як внутрішній сервіс.
+
+    Важливо:
+    - усі input series вже мають бути розділені analyzer-ом по
+      exchange + market_type + symbol + timeframe;
+    - цей builder тільки рахує features і переносить scope у OIFeatures.
     """
 
     def __init__(self, config: OIAnalyzerConfig) -> None:
@@ -637,6 +644,12 @@ class OIFeatureBuilder:
         Якщо ні — snapshot.oi буде використаний як current_oi, але історія
         все одно має містити хоча б одну OI-точку.
         """
+        if context is not None and context.key != snapshot.key:
+            raise ValueError(
+                "OIMarketContext key must match OISnapshot key: "
+                f"context={context.key}, snapshot={snapshot.key}"
+            )
+
         oi_values, oi_timestamps = _clean_pair_series(
             series.oi_values,
             series.oi_timestamps,
@@ -736,6 +749,8 @@ class OIFeatureBuilder:
         if current_volume is None:
             current_volume = _last(volume_values)
 
+        quote_volume = context.quote_volume if context is not None else None
+
         volume_ma = self.compute_moving_average(
             volume_values,
             self.windows.volume_window,
@@ -748,6 +763,9 @@ class OIFeatureBuilder:
         )
 
         funding_rate = context.funding_rate if context is not None else None
+        predicted_funding_rate = (
+            context.predicted_funding_rate if context is not None else None
+        )
 
         long_liquidations = (
             context.long_liquidations if context is not None else None
@@ -807,9 +825,16 @@ class OIFeatureBuilder:
         )
 
         return OIFeatures(
+            exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
+            symbol=snapshot.symbol,
+            timeframe=snapshot.timeframe,
+            exchange_symbol=snapshot.exchange_symbol,
+            timestamp=snapshot.timestamp,
             oi=current_oi,
             oi_delta=oi_delta,
             oi_delta_pct=oi_delta_pct,
+            open_interest_value=snapshot.open_interest_value,
             oi_ma_fast=oi_ma_fast,
             oi_ma_slow=oi_ma_slow,
             oi_std=oi_std,
@@ -820,9 +845,11 @@ class OIFeatureBuilder:
             price_delta=price_delta,
             price_delta_pct=price_delta_pct,
             volume=current_volume,
+            quote_volume=quote_volume,
             volume_ma=volume_ma,
             volume_ratio=volume_ratio,
             funding_rate=funding_rate,
+            predicted_funding_rate=predicted_funding_rate,
             long_liquidations=long_liquidations,
             short_liquidations=short_liquidations,
             liquidation_imbalance=liquidation_imbalance,
@@ -835,6 +862,17 @@ class OIFeatureBuilder:
             oi_pressure_score=oi_pressure_score,
             oi_direction=oi_direction,
             price_direction=price_direction,
+            metadata={
+                "builder": self.__class__.__name__,
+                "context_present": context is not None,
+                "oi_points": len(oi_values),
+                "price_points": len(price_values),
+                "volume_points": len(volume_values),
+                "snapshot_source": snapshot.source,
+                "context_source": context.source if context is not None else None,
+                "mark_price": snapshot.mark_price,
+                "index_price": snapshot.index_price,
+            },
         )
 
     def build_minimal_features(
@@ -872,7 +910,8 @@ class OIFeatureBuilder:
         Helper для analyzer layer.
 
         Саме цей метод найзручніше викликати з OIAnalyzer після того,
-        як він оновив свої buffers.
+        як він оновив свої buffers для конкретного futures scope:
+        exchange + market_type + symbol + timeframe.
         """
         return self.build_features(
             snapshot=snapshot,

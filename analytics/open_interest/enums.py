@@ -5,12 +5,16 @@ from enum import Enum
 
 class OIRegime(str, Enum):
     """
-    Основний ринковий режим з точки зору взаємодії:
+    Основний futures/perpetual ринковий режим з точки зору взаємодії:
     - price
     - open interest
     - volume
     - liquidations
     - funding
+    - orderflow
+
+    У проєкті open-interest analytics розглядається тільки для futures/perps,
+    не для spot.
     """
 
     NEUTRAL = "NEUTRAL"
@@ -47,6 +51,10 @@ class OIRegime(str, Enum):
             OIRegime.TREND_EXHAUSTION,
         }
 
+    @property
+    def is_neutral(self) -> bool:
+        return self is OIRegime.NEUTRAL
+
 
 class OIDirection(str, Enum):
     UP = "UP"
@@ -61,6 +69,14 @@ class OIDirection(str, Enum):
     @property
     def is_directional(self) -> bool:
         return self in {OIDirection.UP, OIDirection.DOWN}
+
+    @property
+    def sign(self) -> int:
+        if self is OIDirection.UP:
+            return 1
+        if self is OIDirection.DOWN:
+            return -1
+        return 0
 
 
 class OIDivergenceType(str, Enum):
@@ -112,7 +128,7 @@ class OIDivergenceType(str, Enum):
 
 class OIAnomalyType(str, Enum):
     """
-    Аномальні події / стани по open interest.
+    Аномальні події / стани по futures open interest.
     """
 
     NONE = "NONE"
@@ -187,12 +203,14 @@ class OIEventType(str, Enum):
     """
     Уніфіковані EventBus topic names для Open Interest analytics.
 
-    Ці значення використовуються в:
-    - analytics/open_interest/oi_analyzer.py
-    - strategy/open_interest/*
-    - dashboard subscribers
-    - storage subscribers
-    - bots / alert modules
+    Ці події публікує analytics/open_interest/OIAnalyzer.
+
+    Downstream consumers:
+    - strategy
+    - risk context
+    - dashboard
+    - storage
+    - bots / alerts
     """
 
     UPDATED = "analytics.oi.updated"
@@ -215,16 +233,67 @@ class OIEventType(str, Enum):
 
 class OIMarketEventType(str, Enum):
     """
-    Market topics, які OIAnalyzer слухає через EventBus.subscribe().
+    Data-layer / analytics-layer topics, які OIAnalyzer слухає через EventBus.
+
+    Важливо:
+    OIAnalyzer не має слухати raw exchange events напряму.
+    Він має отримувати вже нормалізовані futures events із data cache layer
+    або з інших analytics-пакетів.
+
+    Правильний потік:
+        exchanges -> data caches -> market.*.updated / market.candle.closed
+        -> analytics.open_interest -> analytics.oi.*
+
+    Scope кожного payload:
+        exchange + market_type + symbol + timeframe
+
+    Futures-only market_type examples:
+        binance: usdm_futures
+        bybit: linear
+        okx: swap
+        mexc: usdm_futures
     """
 
-    OPEN_INTEREST = "market.open_interest"
-    CANDLE = "market.candle"
-    TRADE = "market.trade"
-    FUNDING = "market.funding"
-    LIQUIDATION = "market.liquidation"
+    # Main OI trigger from OpenInterestCache.
+    OPEN_INTEREST_UPDATED = "market.open_interest.updated"
+
+    # Price/volume context from CandlesCache.
+    CANDLE_CLOSED = "market.candle.closed"
+    CANDLES_UPDATED = "market.candles.updated"
+
+    # Optional fallback volume/trade context from TradesCache.
+    TRADES_UPDATED = "market.trades.updated"
+
+    # Funding context from FundingCache.
+    FUNDING_UPDATED = "market.funding.updated"
+
+    # Preferred context from analytics packages.
     ORDERFLOW_UPDATED = "analytics.orderflow.updated"
+    LIQUIDATIONS_UPDATED = "analytics.liquidations.updated"
+
+    # Backward-compatible aliases for old OIAnalyzer code.
+    # Після оновлення oi_analyzer.py краще використовувати explicit *_UPDATED names.
+    OPEN_INTEREST = OPEN_INTEREST_UPDATED
+    CANDLE = CANDLE_CLOSED
+    TRADE = TRADES_UPDATED
+    FUNDING = FUNDING_UPDATED
+    LIQUIDATION = LIQUIDATIONS_UPDATED
 
     @property
     def topic(self) -> str:
         return self.value
+
+    @property
+    def is_primary_oi_trigger(self) -> bool:
+        return self is OIMarketEventType.OPEN_INTEREST_UPDATED
+
+    @property
+    def is_context_event(self) -> bool:
+        return self in {
+            OIMarketEventType.CANDLE_CLOSED,
+            OIMarketEventType.CANDLES_UPDATED,
+            OIMarketEventType.TRADES_UPDATED,
+            OIMarketEventType.FUNDING_UPDATED,
+            OIMarketEventType.ORDERFLOW_UPDATED,
+            OIMarketEventType.LIQUIDATIONS_UPDATED,
+        }

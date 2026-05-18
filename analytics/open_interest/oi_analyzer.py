@@ -14,11 +14,15 @@ from core.scheduler import Scheduler
 from .config import OIAnalyzerConfig
 from .enums import OIAnomalyType, OIEventType, OIMarketEventType, OIRegime
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     OIAnalysisResult,
     OIFeatures,
+    OIKey,
     OIMarketContext,
     OISnapshot,
     OIState,
+    make_oi_key,
 )
 from .oi_anomaly_detector import OIAnomalyDetector
 from .oi_divergence import OIDivergenceDetector
@@ -29,10 +33,12 @@ from .oi_regime_detector import OIRegimeDetector
 @dataclass(slots=True)
 class OIInstrumentBuffers:
     """
-    Rolling history for one (exchange, symbol) instrument.
+    Rolling history for one futures scope:
+
+        exchange + market_type + symbol + timeframe
 
     All series are stored in chronological order:
-    oldest -> newest.
+        oldest -> newest.
     """
 
     oi_values: deque[float]
@@ -61,18 +67,37 @@ class OIInstrumentBuffers:
 
 class OIAnalyzer:
     """
-    Event-driven orchestration layer for Open Interest analytics.
+    Event-driven orchestration layer for futures Open Interest analytics.
 
     Responsibilities:
-    - subscribe to market.* and analytics.orderflow.* events
-    - maintain per-instrument context/state/history
-    - build OI features
-    - detect regimes, divergences, and anomalies
-    - emit analytics.oi.* events through EventBus
-    - schedule cleanup/metrics jobs through Scheduler
+    - subscribe to normalized data-layer / analytics-layer events;
+    - maintain per-scope context/state/history;
+    - build OI features;
+    - detect regimes, divergences, and anomalies;
+    - emit analytics.oi.* events through EventBus;
+    - schedule cleanup/metrics jobs through Scheduler.
 
     This class is infrastructure-aware and is the only Open Interest analytics
     class that should depend on core.EventBus / core.Scheduler.
+
+    Data flow:
+        OpenInterestCache   -> market.open_interest.updated
+        CandlesCache        -> market.candle.closed / market.candles.updated
+        TradesCache         -> market.trades.updated
+        FundingCache        -> market.funding.updated
+        OrderflowAnalyzer   -> analytics.orderflow.updated
+        LiquidationsAnalyzer -> analytics.liquidations.updated
+
+        OIAnalyzer -> analytics.oi.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
+
+    Futures-only examples:
+        ("binance", "usdm_futures", "BTCUSDT", "1m")
+        ("bybit", "linear", "BTCUSDT", "1m")
+        ("okx", "swap", "BTCUSDT", "1m")
+        ("mexc", "usdm_futures", "BTCUSDT", "1m")
     """
 
     def __init__(
@@ -99,10 +124,10 @@ class OIAnalyzer:
 
         self._history_size = self.config.windows.history_size
 
-        self._buffers: dict[tuple[str, str], OIInstrumentBuffers] = {}
-        self._states: dict[tuple[str, str], OIState] = {}
-        self._cooldowns: dict[tuple[str, str, str], float] = {}
-        self._last_context_ts: dict[tuple[str, str], float] = {}
+        self._buffers: dict[OIKey, OIInstrumentBuffers] = {}
+        self._states: dict[OIKey, OIState] = {}
+        self._cooldowns: dict[tuple[str, str, str, str, str], float] = {}
+        self._last_context_ts: dict[OIKey, float] = {}
 
         self._subscriptions: list[Subscription] = []
         self._cleanup_job_id: str | None = None
@@ -128,29 +153,34 @@ class OIAnalyzer:
         self._subscriptions.extend(
             [
                 self.event_bus.subscribe(
-                    OIMarketEventType.OPEN_INTEREST.topic,
+                    OIMarketEventType.OPEN_INTEREST_UPDATED.topic,
                     self.on_open_interest,
-                    name="oi_analyzer.on_open_interest",
+                    name="oi_analyzer.on_open_interest_updated",
                 ),
                 self.event_bus.subscribe(
-                    OIMarketEventType.CANDLE.topic,
+                    OIMarketEventType.CANDLE_CLOSED.topic,
                     self.on_candle,
-                    name="oi_analyzer.on_candle",
+                    name="oi_analyzer.on_candle_closed",
                 ),
                 self.event_bus.subscribe(
-                    OIMarketEventType.TRADE.topic,
-                    self.on_trade,
-                    name="oi_analyzer.on_trade",
+                    OIMarketEventType.CANDLES_UPDATED.topic,
+                    self.on_candles_updated,
+                    name="oi_analyzer.on_candles_updated",
                 ),
                 self.event_bus.subscribe(
-                    OIMarketEventType.FUNDING.topic,
+                    OIMarketEventType.TRADES_UPDATED.topic,
+                    self.on_trades_updated,
+                    name="oi_analyzer.on_trades_updated",
+                ),
+                self.event_bus.subscribe(
+                    OIMarketEventType.FUNDING_UPDATED.topic,
                     self.on_funding,
-                    name="oi_analyzer.on_funding",
+                    name="oi_analyzer.on_funding_updated",
                 ),
                 self.event_bus.subscribe(
-                    OIMarketEventType.LIQUIDATION.topic,
+                    OIMarketEventType.LIQUIDATIONS_UPDATED.topic,
                     self.on_liquidation,
-                    name="oi_analyzer.on_liquidation",
+                    name="oi_analyzer.on_liquidations_updated",
                 ),
                 self.event_bus.subscribe(
                     OIMarketEventType.ORDERFLOW_UPDATED.topic,
@@ -164,9 +194,11 @@ class OIAnalyzer:
 
         self._registered = True
         self.logger.info(
-            "OIAnalyzer registered | subscriptions=%s scheduler_enabled=%s",
-            len(self._subscriptions),
-            self.scheduler is not None,
+            "OIAnalyzer registered",
+            extra={
+                "subscriptions": len(self._subscriptions),
+                "scheduler_enabled": self.scheduler is not None,
+            },
         )
 
     def unregister(self) -> None:
@@ -234,6 +266,15 @@ class OIAnalyzer:
     # ------------------------------------------------------------------
 
     async def on_open_interest(self, event: Event) -> None:
+        """
+        Main OI analysis trigger.
+
+        Expected source:
+            OpenInterestCache -> market.open_interest.updated
+
+        Expected payload:
+            exchange, market_type, symbol, open_interest, timestamp_ms/received_at_ms
+        """
         if not self.config.enabled:
             return
 
@@ -248,21 +289,21 @@ class OIAnalyzer:
             state = self._get_or_create_state(key)
 
             buffers.append_oi(snapshot.oi, snapshot.timestamp)
+            state.apply_snapshot(snapshot)
 
             context = self._get_context_for_key(key)
             if self.config.require_price_context and context is None:
-                state.last_snapshot = snapshot
-                state.touch(snapshot.timestamp)
-
                 self.logger.debug(
                     "Skipping OI analysis: price context is required but missing",
-                    extra={"exchange": snapshot.exchange, "symbol": snapshot.symbol},
+                    extra=self._key_payload(key),
                 )
                 return
 
+            analysis_context = context or self._build_empty_context(snapshot)
+
             features = self.feature_builder.build_from_raw_inputs(
                 snapshot=snapshot,
-                context=context,
+                context=analysis_context,
                 oi_values=list(buffers.oi_values),
                 oi_timestamps=list(buffers.oi_timestamps),
                 price_values=list(buffers.price_values),
@@ -272,17 +313,21 @@ class OIAnalyzer:
             )
 
             buffers.feature_history.append(features)
+            state.apply_features(features)
 
             regime_result = self.regime_detector.detect(features)
             divergence_result = self._detect_divergence_if_possible(key)
             anomaly_result = self.anomaly_detector.detect(features)
 
             analysis_result = OIAnalysisResult(
-                symbol=snapshot.symbol,
                 exchange=snapshot.exchange,
+                market_type=snapshot.market_type,
+                symbol=snapshot.symbol,
+                timeframe=snapshot.timeframe,
+                exchange_symbol=snapshot.exchange_symbol,
                 timestamp=snapshot.timestamp,
                 snapshot=snapshot,
-                context=context or self._build_empty_context(snapshot),
+                context=analysis_context,
                 features=features,
                 regime=regime_result,
                 divergence=divergence_result,
@@ -292,151 +337,169 @@ class OIAnalyzer:
                     "oi_history_size": len(buffers.oi_values),
                     "price_history_size": len(buffers.price_values),
                     "volume_history_size": len(buffers.volume_values),
-                    "source_event_id": event.event_id,
-                    "source_topic": event.topic,
-                    "source": event.source,
-                    "correlation_id": event.correlation_id,
+                    "source_event_id": getattr(event, "event_id", None),
+                    "source_topic": getattr(event, "topic", None),
+                    "source": getattr(event, "source", None),
+                    "correlation_id": getattr(event, "correlation_id", None),
                 },
             )
 
             previous_regime = state.last_regime
-
-            state.last_snapshot = snapshot
-            state.last_features = features
-            state.last_analysis = (
-                analysis_result if self.config.store_full_analysis else None
-            )
-            state.last_regime = regime_result.regime
-            state.touch(snapshot.timestamp)
+            state.apply_analysis(analysis_result)
 
             await self._emit_analysis_events(
                 key=key,
                 previous_regime=previous_regime,
                 analysis=analysis_result,
-                correlation_id=event.correlation_id,
+                correlation_id=getattr(event, "correlation_id", None),
             )
 
         except Exception as exc:
             self.logger.exception(
-                "Failed to process market.open_interest event",
+                "Failed to process market.open_interest.updated event",
                 extra={
                     "error": str(exc),
-                    "topic": event.topic,
-                    "event_id": event.event_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
                 },
             )
 
     async def on_candle(self, event: Event) -> None:
+        """
+        Price/volume context from CandlesCache.
+
+        Expected source:
+            CandlesCache -> market.candle.closed
+        """
         if not self.config.enabled:
             return
 
         try:
             payload = self._extract_payload(event)
-            key = self._extract_key_from_payload(payload)
-            if key is None:
-                return
-
-            timestamp = self._extract_timestamp(payload)
-            close_price = self._extract_float(
-                payload,
-                "close",
-                "c",
-                "price",
-                "last_price",
-            )
-            volume = self._extract_float(payload, "volume", "v", "base_volume")
-
-            buffers = self._get_or_create_buffers(key)
-            context = self._get_or_create_context(key, timestamp)
-
-            if close_price is not None:
-                buffers.append_price(close_price, timestamp)
-                self._update_price_context(
-                    context=context,
-                    buffers=buffers,
-                    price=close_price,
-                )
-
-            if volume is not None and volume >= 0:
-                buffers.append_volume(volume, timestamp)
-                self._update_volume_context(
-                    context=context,
-                    buffers=buffers,
-                    volume=volume,
-                )
-
-            context.timestamp = timestamp
-            self._last_context_ts[key] = timestamp
+            await self._apply_candle_payload(payload)
 
         except Exception as exc:
             self.logger.exception(
-                "Failed to process market.candle event",
+                "Failed to process market.candle.closed event",
                 extra={
                     "error": str(exc),
-                    "topic": event.topic,
-                    "event_id": event.event_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
                 },
             )
 
-    async def on_trade(self, event: Event) -> None:
+    async def on_candles_updated(self, event: Event) -> None:
         """
-        Trade event can provide fallback context for:
-        - last price
-        - aggressive buy/sell flow
-        - volume
+        Optional batch/snapshot candle context from CandlesCache.
+
+        Supports:
+            payload["candles"] = [...]
+        or:
+            payload as one candle-like mapping.
         """
         if not self.config.enabled:
             return
 
         try:
             payload = self._extract_payload(event)
-            key = self._extract_key_from_payload(payload)
-            if key is None:
+            candles = payload.get("candles")
+
+            if isinstance(candles, list):
+                for candle in candles:
+                    if isinstance(candle, Mapping):
+                        merged = {
+                            **payload,
+                            **candle,
+                            "exchange": candle.get("exchange", payload.get("exchange")),
+                            "market_type": candle.get(
+                                "market_type",
+                                payload.get("market_type"),
+                            ),
+                            "symbol": candle.get("symbol", payload.get("symbol")),
+                            "timeframe": candle.get(
+                                "timeframe",
+                                payload.get("timeframe"),
+                            ),
+                            "exchange_symbol": candle.get(
+                                "exchange_symbol",
+                                payload.get("exchange_symbol"),
+                            ),
+                        }
+                        await self._apply_candle_payload(merged)
                 return
 
-            timestamp = self._extract_timestamp(payload)
-            price = self._extract_float(payload, "price", "p")
-            qty = self._extract_float(payload, "qty", "quantity", "q", "size")
-            side = self._extract_str(payload, "side", "taker_side")
-
-            buffers = self._get_or_create_buffers(key)
-            context = self._get_or_create_context(key, timestamp)
-
-            if price is not None:
-                buffers.append_price(price, timestamp)
-                self._update_price_context(
-                    context=context,
-                    buffers=buffers,
-                    price=price,
-                )
-
-            if qty is not None and qty >= 0:
-                buffers.append_volume(qty, timestamp)
-                self._update_volume_context(
-                    context=context,
-                    buffers=buffers,
-                    volume=qty,
-                )
-                self._update_aggressive_flow_context(
-                    context=context,
-                    side=side,
-                    qty=qty,
-                )
-
-            context.timestamp = timestamp
-            self._last_context_ts[key] = timestamp
+            await self._apply_candle_payload(payload)
 
         except Exception as exc:
             self.logger.exception(
-                "Failed to process market.trade event",
+                "Failed to process market.candles.updated event",
                 extra={
                     "error": str(exc),
-                    "topic": event.topic,
-                    "event_id": event.event_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                },
+            )
+
+    async def on_trades_updated(self, event: Event) -> None:
+        """
+        Optional fallback context from TradesCache.
+
+        Preferred source for orderflow is analytics.orderflow.updated, but
+        market.trades.updated can still provide:
+        - last price;
+        - volume;
+        - basic aggressive buy/sell flow.
+        """
+        if not self.config.enabled:
+            return
+
+        try:
+            payload = self._extract_payload(event)
+            trades = payload.get("trades")
+
+            if isinstance(trades, list):
+                for trade in trades:
+                    if isinstance(trade, Mapping):
+                        merged = {
+                            **payload,
+                            **trade,
+                            "exchange": trade.get("exchange", payload.get("exchange")),
+                            "market_type": trade.get(
+                                "market_type",
+                                payload.get("market_type"),
+                            ),
+                            "symbol": trade.get("symbol", payload.get("symbol")),
+                            "timeframe": trade.get(
+                                "timeframe",
+                                payload.get("timeframe"),
+                            ),
+                            "exchange_symbol": trade.get(
+                                "exchange_symbol",
+                                payload.get("exchange_symbol"),
+                            ),
+                        }
+                        self._apply_trade_payload(merged)
+                return
+
+            self._apply_trade_payload(payload)
+
+        except Exception as exc:
+            self.logger.exception(
+                "Failed to process market.trades.updated event",
+                extra={
+                    "error": str(exc),
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
                 },
             )
 
     async def on_funding(self, event: Event) -> None:
+        """
+        Funding context from FundingCache.
+
+        Expected source:
+            FundingCache -> market.funding.updated
+        """
         if not self.config.enabled:
             return
 
@@ -453,25 +516,57 @@ class OIAnalyzer:
                 "funding",
                 "rate",
             )
-            if funding_rate is None:
+            predicted_rate = self._extract_float(
+                payload,
+                "predicted_rate",
+                "predicted_funding_rate",
+                "next_funding_rate",
+            )
+            next_funding_time_ms = self._extract_float(
+                payload,
+                "next_funding_time_ms",
+                "nextFundingTime",
+                "funding_time",
+            )
+
+            if funding_rate is None and predicted_rate is None:
                 return
 
             context = self._get_or_create_context(key, timestamp)
-            context.funding_rate = funding_rate
+
+            if funding_rate is not None:
+                context.funding_rate = funding_rate
+
+            if predicted_rate is not None:
+                context.predicted_funding_rate = predicted_rate
+
+            if next_funding_time_ms is not None:
+                context.next_funding_time_ms = next_funding_time_ms
+
             context.timestamp = timestamp
+            context.source = str(payload.get("source") or "funding_cache")
             self._last_context_ts[key] = timestamp
+
+            state = self._get_or_create_state(key)
+            state.apply_context(context)
 
         except Exception as exc:
             self.logger.exception(
-                "Failed to process market.funding event",
+                "Failed to process market.funding.updated event",
                 extra={
                     "error": str(exc),
-                    "topic": event.topic,
-                    "event_id": event.event_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
                 },
             )
 
     async def on_liquidation(self, event: Event) -> None:
+        """
+        Liquidation context from analytics liquidations layer.
+
+        Expected source:
+            LiquidationsAnalyzer -> analytics.liquidations.updated
+        """
         if not self.config.enabled:
             return
 
@@ -496,13 +591,14 @@ class OIAnalyzer:
                 "liquidated_shorts",
             )
 
-            side = self._extract_str(payload, "side")
+            side = self._extract_str(payload, "side", "liquidation_side")
             qty = self._extract_float(payload, "qty", "quantity", "size", "volume")
 
             context = self._get_or_create_context(key, timestamp)
 
             if long_liq is not None:
                 context.long_liquidations = long_liq
+
             if short_liq is not None:
                 context.short_liquidations = short_liq
 
@@ -514,19 +610,29 @@ class OIAnalyzer:
                     context.short_liquidations = qty
 
             context.timestamp = timestamp
+            context.source = str(payload.get("source") or "liquidations_analytics")
             self._last_context_ts[key] = timestamp
+
+            state = self._get_or_create_state(key)
+            state.apply_context(context)
 
         except Exception as exc:
             self.logger.exception(
-                "Failed to process market.liquidation event",
+                "Failed to process analytics.liquidations.updated event",
                 extra={
                     "error": str(exc),
-                    "topic": event.topic,
-                    "event_id": event.event_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
                 },
             )
 
     async def on_orderflow_update(self, event: Event) -> None:
+        """
+        Preferred aggressive flow / CVD context.
+
+        Expected source:
+            OrderflowAnalyzer -> analytics.orderflow.updated
+        """
         if not self.config.enabled:
             return
 
@@ -544,30 +650,38 @@ class OIAnalyzer:
                 payload,
                 "aggressive_buy_volume",
                 "buy_volume",
+                "aggressive_buys",
             )
             aggressive_sell_volume = self._extract_float(
                 payload,
                 "aggressive_sell_volume",
                 "sell_volume",
+                "aggressive_sells",
             )
 
             if cvd_delta is not None:
                 context.cvd_delta = cvd_delta
+
             if aggressive_buy_volume is not None:
                 context.aggressive_buy_volume = aggressive_buy_volume
+
             if aggressive_sell_volume is not None:
                 context.aggressive_sell_volume = aggressive_sell_volume
 
             context.timestamp = timestamp
+            context.source = str(payload.get("source") or "orderflow_analytics")
             self._last_context_ts[key] = timestamp
+
+            state = self._get_or_create_state(key)
+            state.apply_context(context)
 
         except Exception as exc:
             self.logger.exception(
                 "Failed to process analytics.orderflow.updated event",
                 extra={
                     "error": str(exc),
-                    "topic": event.topic,
-                    "event_id": event.event_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
                 },
             )
 
@@ -583,7 +697,7 @@ class OIAnalyzer:
         """
         now_ts = self._now()
         stale_after = self.config.stale_state_cleanup_after_sec
-        keys_to_delete: list[tuple[str, str]] = []
+        keys_to_delete: list[OIKey] = []
 
         for key, state in list(self._states.items()):
             if state.is_stale(now_ts, stale_after):
@@ -594,14 +708,14 @@ class OIAnalyzer:
             self._buffers.pop(key, None)
             self._last_context_ts.pop(key, None)
 
-            cooldown_keys = [cd_key for cd_key in self._cooldowns if cd_key[:2] == key]
+            cooldown_keys = [cd_key for cd_key in self._cooldowns if cd_key[:4] == key]
             for cooldown_key in cooldown_keys:
                 self._cooldowns.pop(cooldown_key, None)
 
         if keys_to_delete:
             self.logger.info(
-                "Cleaned stale OI state | removed_count=%s",
-                len(keys_to_delete),
+                "Cleaned stale OI state",
+                extra={"removed_count": len(keys_to_delete)},
             )
 
             await self._emit(
@@ -610,8 +724,8 @@ class OIAnalyzer:
                     "timestamp": now_ts,
                     "removed_count": len(keys_to_delete),
                     "removed_keys": [
-                        {"exchange": exchange, "symbol": symbol}
-                        for exchange, symbol in keys_to_delete
+                        self._key_payload(key)
+                        for key in keys_to_delete
                     ],
                 },
                 priority=EventPriority.LOW,
@@ -642,6 +756,7 @@ class OIAnalyzer:
                 "scheduler_available": self.scheduler is not None,
                 "cleanup_job_id": self._cleanup_job_id,
                 "metrics_job_id": self._metrics_job_id,
+                "scope": "exchange:market_type:symbol:timeframe",
             },
             priority=EventPriority.LOW,
         )
@@ -650,15 +765,35 @@ class OIAnalyzer:
     # Public helpers
     # ------------------------------------------------------------------
 
-    def get_state(self, exchange: str, symbol: str) -> OIState | None:
-        return self._states.get(self._normalize_key(exchange, symbol))
+    def get_state(
+        self,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> OIState | None:
+        return self._states.get(
+            self._normalize_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        )
 
     def get_last_analysis(
         self,
         exchange: str,
         symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
     ) -> OIAnalysisResult | None:
-        state = self.get_state(exchange, symbol)
+        state = self.get_state(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
         if state is None:
             return None
         return state.last_analysis
@@ -667,8 +802,15 @@ class OIAnalyzer:
         self,
         exchange: str,
         symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
     ) -> list[OIFeatures]:
-        key = self._normalize_key(exchange, symbol)
+        key = self._normalize_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
         buffers = self._buffers.get(key)
         if buffers is None:
             return []
@@ -686,17 +828,17 @@ class OIAnalyzer:
             "history_size": self._history_size,
             "cleanup_job_registered": self._cleanup_job_id is not None,
             "metrics_job_registered": self._metrics_job_id is not None,
+            "scope": "exchange:market_type:symbol:timeframe",
             "instruments": [
                 {
-                    "exchange": exchange,
-                    "symbol": symbol,
+                    **self._key_payload(key),
                     "oi_history_size": len(buffers.oi_values),
                     "price_history_size": len(buffers.price_values),
                     "volume_history_size": len(buffers.volume_values),
                     "feature_history_size": len(buffers.feature_history),
-                    "has_state": (exchange, symbol) in self._states,
+                    "has_state": key in self._states,
                 }
-                for (exchange, symbol), buffers in self._buffers.items()
+                for key, buffers in self._buffers.items()
             ],
         }
 
@@ -706,7 +848,7 @@ class OIAnalyzer:
 
     def _detect_divergence_if_possible(
         self,
-        key: tuple[str, str],
+        key: OIKey,
     ) -> Any | None:
         buffers = self._buffers.get(key)
         if buffers is None or len(buffers.feature_history) < 3:
@@ -717,14 +859,14 @@ class OIAnalyzer:
         except Exception as exc:
             self.logger.exception(
                 "Failed to detect OI divergence",
-                extra={"exchange": key[0], "symbol": key[1], "error": str(exc)},
+                extra={**self._key_payload(key), "error": str(exc)},
             )
             return None
 
     async def _emit_analysis_events(
         self,
         *,
-        key: tuple[str, str],
+        key: OIKey,
         previous_regime: OIRegime,
         analysis: OIAnalysisResult,
         correlation_id: str | None,
@@ -854,8 +996,7 @@ class OIAnalyzer:
         await self._emit(
             OIEventType.REGIME_CHANGED.topic,
             {
-                "symbol": analysis.symbol,
-                "exchange": analysis.exchange,
+                **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
                 "previous_regime": previous_regime.value,
                 "new_regime": analysis.regime.regime.value,
@@ -880,8 +1021,7 @@ class OIAnalyzer:
         await self._emit(
             OIEventType.DIVERGENCE_DETECTED.topic,
             {
-                "symbol": analysis.symbol,
-                "exchange": analysis.exchange,
+                **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
                 "divergence_type": analysis.divergence.divergence_type.value,
                 "confidence": analysis.divergence.confidence,
@@ -907,8 +1047,7 @@ class OIAnalyzer:
         await self._emit(
             OIEventType.ANOMALY_DETECTED.topic,
             {
-                "symbol": analysis.symbol,
-                "exchange": analysis.exchange,
+                **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
                 "anomaly_type": analysis.anomaly.anomaly_type.value,
                 "strength": analysis.anomaly.strength.value,
@@ -931,8 +1070,7 @@ class OIAnalyzer:
         await self._emit(
             OIEventType.SQUEEZE_SETUP.topic,
             {
-                "symbol": analysis.symbol,
-                "exchange": analysis.exchange,
+                **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
                 "regime": analysis.regime.regime.value,
                 "confidence": analysis.regime.confidence,
@@ -959,8 +1097,7 @@ class OIAnalyzer:
         await self._emit(
             OIEventType.CAPITULATION_DETECTED.topic,
             {
-                "symbol": analysis.symbol,
-                "exchange": analysis.exchange,
+                **self._analysis_scope_payload(analysis),
                 "timestamp": analysis.timestamp,
                 "regime": analysis.regime.regime.value,
                 "regime_confidence": analysis.regime.confidence,
@@ -992,6 +1129,17 @@ class OIAnalyzer:
         return analysis.to_dict()
 
     @staticmethod
+    def _analysis_scope_payload(analysis: OIAnalysisResult) -> dict[str, Any]:
+        return {
+            "exchange": analysis.exchange,
+            "market_type": analysis.market_type,
+            "symbol": analysis.symbol,
+            "exchange_symbol": analysis.exchange_symbol,
+            "timeframe": analysis.timeframe,
+            "key": list(analysis.key),
+        }
+
+    @staticmethod
     def _collect_capitulation_reasons(analysis: OIAnalysisResult) -> list[str]:
         reasons: list[str] = []
         reasons.extend(analysis.regime.reasons)
@@ -1007,7 +1155,7 @@ class OIAnalyzer:
 
     def _get_or_create_buffers(
         self,
-        key: tuple[str, str],
+        key: OIKey,
     ) -> OIInstrumentBuffers:
         buffers = self._buffers.get(key)
         if buffers is not None:
@@ -1027,30 +1175,36 @@ class OIAnalyzer:
 
     def _get_or_create_state(
         self,
-        key: tuple[str, str],
+        key: OIKey,
     ) -> OIState:
         state = self._states.get(key)
         if state is not None:
             return state
 
+        exchange, market_type, symbol, timeframe = key
         state = OIState(
-            exchange=key[0],
-            symbol=key[1],
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
         )
         self._states[key] = state
         return state
 
     def _get_or_create_context(
         self,
-        key: tuple[str, str],
+        key: OIKey,
         timestamp: float,
     ) -> OIMarketContext:
         state = self._get_or_create_state(key)
 
         if state.last_context is None:
+            exchange, market_type, symbol, timeframe = key
             state.last_context = OIMarketContext(
-                symbol=key[1],
-                exchange=key[0],
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
                 timestamp=timestamp,
             )
 
@@ -1058,7 +1212,7 @@ class OIAnalyzer:
 
     def _get_context_for_key(
         self,
-        key: tuple[str, str],
+        key: OIKey,
     ) -> OIMarketContext | None:
         state = self._states.get(key)
         if state is None or state.last_context is None:
@@ -1075,19 +1229,25 @@ class OIAnalyzer:
     @staticmethod
     def _build_empty_context(snapshot: OISnapshot) -> OIMarketContext:
         return OIMarketContext(
-            symbol=snapshot.symbol,
             exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
+            symbol=snapshot.symbol,
+            exchange_symbol=snapshot.exchange_symbol,
+            timeframe=snapshot.timeframe,
             timestamp=snapshot.timestamp,
+            mark_price=snapshot.mark_price,
+            index_price=snapshot.index_price,
+            source="empty_context",
         )
 
     def _cooldown_passed(
         self,
-        key: tuple[str, str],
+        key: OIKey,
         event_kind: str,
         cooldown_sec: float,
         now_ts: float,
     ) -> bool:
-        cooldown_key = (key[0], key[1], event_kind)
+        cooldown_key = (*key, event_kind)
         last_ts = self._cooldowns.get(cooldown_key)
 
         if last_ts is None or (now_ts - last_ts) >= cooldown_sec:
@@ -1099,6 +1259,106 @@ class OIAnalyzer:
     # ------------------------------------------------------------------
     # Context update helpers
     # ------------------------------------------------------------------
+
+    async def _apply_candle_payload(self, payload: Mapping[str, Any]) -> None:
+        key = self._extract_key_from_payload(payload)
+        if key is None:
+            return
+
+        timestamp = self._extract_timestamp(payload)
+        close_price = self._extract_float(
+            payload,
+            "close",
+            "c",
+            "price",
+            "last_price",
+        )
+        mark_price = self._extract_float(payload, "mark_price")
+        index_price = self._extract_float(payload, "index_price")
+
+        volume = self._extract_float(payload, "volume", "v", "base_volume")
+        quote_volume = self._extract_float(
+            payload,
+            "quote_volume",
+            "quoteVolume",
+            "quote_volume_24h",
+        )
+
+        buffers = self._get_or_create_buffers(key)
+        context = self._get_or_create_context(key, timestamp)
+
+        if close_price is not None:
+            buffers.append_price(close_price, timestamp)
+            self._update_price_context(
+                context=context,
+                buffers=buffers,
+                price=close_price,
+            )
+
+        if mark_price is not None:
+            context.mark_price = mark_price
+
+        if index_price is not None:
+            context.index_price = index_price
+
+        if volume is not None and volume >= 0:
+            buffers.append_volume(volume, timestamp)
+            self._update_volume_context(
+                context=context,
+                buffers=buffers,
+                volume=volume,
+            )
+
+        if quote_volume is not None and quote_volume >= 0:
+            context.quote_volume = quote_volume
+
+        context.timestamp = timestamp
+        context.source = str(payload.get("source") or "candles_cache")
+        self._last_context_ts[key] = timestamp
+
+        state = self._get_or_create_state(key)
+        state.apply_context(context)
+
+    def _apply_trade_payload(self, payload: Mapping[str, Any]) -> None:
+        key = self._extract_key_from_payload(payload)
+        if key is None:
+            return
+
+        timestamp = self._extract_timestamp(payload)
+        price = self._extract_float(payload, "price", "p")
+        qty = self._extract_float(payload, "qty", "quantity", "q", "size", "volume")
+        side = self._extract_str(payload, "side", "taker_side", "aggressor_side")
+
+        buffers = self._get_or_create_buffers(key)
+        context = self._get_or_create_context(key, timestamp)
+
+        if price is not None:
+            buffers.append_price(price, timestamp)
+            self._update_price_context(
+                context=context,
+                buffers=buffers,
+                price=price,
+            )
+
+        if qty is not None and qty >= 0:
+            buffers.append_volume(qty, timestamp)
+            self._update_volume_context(
+                context=context,
+                buffers=buffers,
+                volume=qty,
+            )
+            self._update_aggressive_flow_context(
+                context=context,
+                side=side,
+                qty=qty,
+            )
+
+        context.timestamp = timestamp
+        context.source = str(payload.get("source") or "trades_cache")
+        self._last_context_ts[key] = timestamp
+
+        state = self._get_or_create_state(key)
+        state.apply_context(context)
 
     def _update_price_context(
         self,
@@ -1167,7 +1427,7 @@ class OIAnalyzer:
     ) -> OISnapshot | None:
         key = self._extract_key_from_payload(payload)
         if key is None:
-            self.logger.warning("OI payload missing exchange/symbol")
+            self.logger.warning("OI payload missing exchange/market_type/symbol")
             return None
 
         timestamp = self._extract_timestamp(payload)
@@ -1182,15 +1442,34 @@ class OIAnalyzer:
         if oi is None:
             self.logger.warning(
                 "OI payload missing OI value",
-                extra={"exchange": key[0], "symbol": key[1]},
+                extra=self._key_payload(key),
             )
             return None
 
+        exchange, market_type, symbol, timeframe = key
+
         return OISnapshot(
-            symbol=key[1],
-            exchange=key[0],
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+            exchange_symbol=self._extract_str(payload, "exchange_symbol"),
             timestamp=timestamp,
             oi=oi,
+            open_interest_value=self._extract_float(
+                payload,
+                "open_interest_value",
+                "oi_value",
+                "notional_value",
+            ),
+            mark_price=self._extract_float(payload, "mark_price", "markPrice"),
+            index_price=self._extract_float(payload, "index_price", "indexPrice"),
+            source=self._extract_str(payload, "source") or "open_interest_cache",
+            metadata={
+                "raw_topic_source": payload.get("source"),
+                "received_at_ms": payload.get("received_at_ms"),
+                "timestamp_ms": payload.get("timestamp_ms"),
+            },
         )
 
     @staticmethod
@@ -1205,32 +1484,62 @@ class OIAnalyzer:
     def _extract_key_from_payload(
         self,
         payload: Mapping[str, Any],
-    ) -> tuple[str, str] | None:
+    ) -> OIKey | None:
         exchange = self._extract_str(payload, "exchange", "venue", "source_exchange")
+        market_type = self._extract_str(
+            payload,
+            "market_type",
+            "category",
+            "inst_type",
+            "instrument_type",
+        )
         symbol = self._extract_str(payload, "symbol", "instrument", "market")
+        timeframe = self._extract_str(payload, "timeframe", "tf", "interval")
 
         if not exchange or not symbol:
             return None
 
-        return self._normalize_key(exchange, symbol)
+        return self._normalize_key(
+            exchange=exchange,
+            market_type=market_type or DEFAULT_MARKET_TYPE,
+            symbol=symbol,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
+        )
 
-    def _normalize_key(self, exchange: str, symbol: str) -> tuple[str, str]:
-        normalized_exchange = exchange.lower().strip()
+    def _normalize_key(
+        self,
+        *,
+        exchange: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> OIKey:
         normalized_symbol = (
             symbol.upper().strip()
             if self.config.normalize_symbol
             else symbol.strip()
         )
-        return normalized_exchange, normalized_symbol
+
+        return make_oi_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+        )
 
     def _extract_timestamp(self, payload: Mapping[str, Any]) -> float:
         timestamp = self._extract_float(
             payload,
             "timestamp",
+            "timestamp_ms",
+            "received_at_ms",
             "ts",
             "time",
             "event_time",
             "T",
+            "close_time_ms",
+            "open_time_ms",
+            "last_update_ts_ms",
         )
 
         if timestamp is None:
@@ -1274,6 +1583,17 @@ class OIAnalyzer:
                 return value
 
         return None
+
+    @staticmethod
+    def _key_payload(key: OIKey) -> dict[str, Any]:
+        exchange, market_type, symbol, timeframe = key
+        return {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "key": list(key),
+        }
 
     @staticmethod
     def _now() -> float:
