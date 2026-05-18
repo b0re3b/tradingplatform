@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime
-from decimal import Decimal
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import Any, Mapping, TypeAlias
 
 from .enums import (
     InstrumentType,
@@ -20,6 +20,14 @@ from .enums import (
 DECIMAL_ZERO = Decimal("0")
 DECIMAL_TWO = Decimal("2")
 
+DEFAULT_TIMEFRAME = "realtime"
+DEFAULT_SPOT_MARKET_TYPE = "spot"
+DEFAULT_PERPETUAL_MARKET_TYPE = "perpetual"
+DEFAULT_FUTURES_MARKET_TYPE = "futures"
+
+SpreadKey: TypeAlias = tuple[str, str, str, str]
+# exchange, market_type, symbol, timeframe
+
 
 # ============================================================
 # Internal helpers
@@ -29,24 +37,93 @@ def _utcnow() -> datetime:
     """
     Єдина точка створення timestamp.
 
-    Залишаємо naive UTC, бо існуючий код пакета вже використовує
-    datetime.utcnow(). Якщо пізніше весь проєкт переводитиметься на
-    timezone-aware datetime, це можна буде змінити централізовано.
+    Залишаємо naive UTC для сумісності з існуючим пакетом.
+    Якщо весь проєкт пізніше переходить на timezone-aware UTC, достатньо
+    змінити цю функцію централізовано.
     """
     return datetime.utcnow()
 
 
-def _normalize_exchange(exchange: str) -> str:
-    return exchange.strip().lower()
+def _normalize_exchange(exchange: object) -> str:
+    value = str(exchange or "").strip().lower()
+    if not value:
+        raise ValueError("exchange must not be empty")
+    return value
 
 
-def _normalize_symbol(symbol: str) -> str:
-    return symbol.replace("-", "").replace("/", "").replace("_", "").upper().strip()
+def _normalize_symbol(symbol: object) -> str:
+    value = str(symbol or "").replace("-", "").replace("/", "").replace("_", "").upper().strip()
+    if not value:
+        raise ValueError("symbol must not be empty")
+    return value
+
+
+def _normalize_exchange_symbol(
+    exchange_symbol: object | None,
+    *,
+    fallback_symbol: str,
+) -> str:
+    value = str(exchange_symbol or "").strip()
+    return value if value else fallback_symbol
+
+
+def _normalize_timeframe(timeframe: object | None = DEFAULT_TIMEFRAME) -> str:
+    value = str(timeframe or DEFAULT_TIMEFRAME).strip()
+    return value if value else DEFAULT_TIMEFRAME
+
+
+def _normalize_market_type(
+    market_type: object | None = None,
+    *,
+    instrument_type: InstrumentType | str | None = None,
+) -> str:
+    if market_type is not None:
+        value = str(market_type).strip().lower()
+        if value:
+            return value
+
+    parsed_instrument = _parse_instrument_type(instrument_type)
+    if parsed_instrument == InstrumentType.SPOT:
+        return DEFAULT_SPOT_MARKET_TYPE
+    if parsed_instrument == InstrumentType.PERPETUAL:
+        return DEFAULT_PERPETUAL_MARKET_TYPE
+    if parsed_instrument == InstrumentType.FUTURES:
+        return DEFAULT_FUTURES_MARKET_TYPE
+
+    return DEFAULT_PERPETUAL_MARKET_TYPE
+
+
+def _parse_instrument_type(value: InstrumentType | str | None) -> InstrumentType:
+    if isinstance(value, InstrumentType):
+        return value
+
+    if value is None:
+        return InstrumentType.UNKNOWN
+
+    raw = str(value).strip().lower()
+    for item in InstrumentType:
+        if item.value == raw:
+            return item
+
+    return InstrumentType.UNKNOWN
 
 
 def _validate_non_empty(name: str, value: str) -> None:
     if not value or not value.strip():
         raise ValueError(f"{name} must not be empty")
+
+
+def _to_decimal(value: Any, *, default: Decimal | None = None) -> Decimal | None:
+    if value is None:
+        return default
+
+    if isinstance(value, Decimal):
+        return value
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
 
 
 def _validate_non_negative_decimal(name: str, value: Decimal | None) -> None:
@@ -67,16 +144,115 @@ def _datetime_to_payload(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _datetime_from_payload(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    return None
+
+
 def _enum_to_payload(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
 
 
-def _metadata_copy(metadata: dict[str, Any]) -> dict[str, Any]:
+def _metadata_copy(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    return dict(metadata or {})
+
+
+def make_spread_key(
+    *,
+    exchange: object,
+    market_type: object,
+    symbol: object,
+    timeframe: object = DEFAULT_TIMEFRAME,
+) -> SpreadKey:
     """
-    Повертає shallow copy metadata, щоб зовнішній код не мутував модель
-    через посилання.
+    Canonical key для spread analytics.
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
-    return dict(metadata)
+    return (
+        _normalize_exchange(exchange),
+        _normalize_market_type(market_type),
+        _normalize_symbol(symbol),
+        _normalize_timeframe(timeframe),
+    )
+
+
+def spread_key_to_dict(key: SpreadKey) -> dict[str, str]:
+    exchange, market_type, symbol, timeframe = key
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }
+
+
+def scoped_metadata(
+    *,
+    exchange: object,
+    market_type: object,
+    symbol: object,
+    timeframe: object = DEFAULT_TIMEFRAME,
+    exchange_symbol: object | None = None,
+) -> dict[str, str]:
+    key = make_spread_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    data = spread_key_to_dict(key)
+    data["exchange_symbol"] = _normalize_exchange_symbol(
+        exchange_symbol,
+        fallback_symbol=data["symbol"],
+    )
+    return data
+
+
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if hasattr(value, "value"):
+        return value.value
+
+    if is_dataclass(value):
+        return {
+            key: _serialize_value(item)
+            for key, item in asdict(value).items()
+        }
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _serialize_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [_serialize_value(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [_serialize_value(item) for item in value]
+
+    if isinstance(value, set):
+        return sorted(_serialize_value(item) for item in value)
+
+    return value
 
 
 # ============================================================
@@ -88,8 +264,16 @@ class QuoteSnapshot:
     """
     Normalized quote snapshot для spread analytics.
 
-    Використовується як payload для market.quote.updated або як внутрішній
-    state analyzer-ів. Модель не залежить від EventBus напряму.
+    Використовується як payload для data-layer події market.quote.updated
+    або як внутрішній state analyzer-ів.
+
+    Correct input flow:
+        exchange adapter -> market.quote / market.orderbook
+        -> QuoteCache / OrderBookCache
+        -> market.quote.updated
+        -> analytics.spreads.*
+
+    Ця модель не залежить від EventBus напряму.
     """
 
     exchange: str
@@ -105,6 +289,10 @@ class QuoteSnapshot:
     mark_price: Decimal | None = None
     index_price: Decimal | None = None
 
+    market_type: str | None = None
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     timestamp: datetime = field(default_factory=_utcnow)
     received_at: datetime = field(default_factory=_utcnow)
 
@@ -112,12 +300,33 @@ class QuoteSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _validate_non_empty("exchange", self.exchange)
-        _validate_non_empty("symbol", self.symbol)
+        self.instrument_type = _parse_instrument_type(self.instrument_type)
+        if self.instrument_type == InstrumentType.UNKNOWN:
+            raise ValueError("instrument_type must not be UNKNOWN for QuoteSnapshot")
 
         self.exchange = _normalize_exchange(self.exchange)
         self.symbol = _normalize_symbol(self.symbol)
+        self.market_type = _normalize_market_type(
+            self.market_type,
+            instrument_type=self.instrument_type,
+        )
+        self.timeframe = _normalize_timeframe(self.timeframe)
+        self.exchange_symbol = _normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+        self.bid = _to_decimal(self.bid)
+        self.ask = _to_decimal(self.ask)
+        self.bid_size = _to_decimal(self.bid_size)
+        self.ask_size = _to_decimal(self.ask_size)
+        self.last_price = _to_decimal(self.last_price)
+        self.mark_price = _to_decimal(self.mark_price)
+        self.index_price = _to_decimal(self.index_price)
+
         self.metadata = _metadata_copy(self.metadata)
+        self.metadata.setdefault("scope", spread_key_to_dict(self.key))
+        self.metadata.setdefault("exchange_symbol", self.exchange_symbol)
 
         _validate_positive_decimal("bid", self.bid)
         _validate_positive_decimal("ask", self.ask)
@@ -132,6 +341,25 @@ class QuoteSnapshot:
 
         if self.sequence_id is not None and self.sequence_id < 0:
             raise ValueError("sequence_id must be >= 0")
+
+    @property
+    def key(self) -> SpreadKey:
+        return make_spread_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return scoped_metadata(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
 
     @property
     def mid_price(self) -> Decimal | None:
@@ -154,10 +382,37 @@ class QuoteSnapshot:
         delta = _utcnow() - self.timestamp
         return max(int(delta.total_seconds() * 1000), 0)
 
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> QuoteSnapshot:
+        instrument_type = _parse_instrument_type(payload.get("instrument_type"))
+
+        return cls(
+            exchange=str(payload["exchange"]),
+            symbol=str(payload["symbol"]),
+            instrument_type=instrument_type,
+            market_type=payload.get("market_type"),
+            timeframe=str(payload.get("timeframe") or DEFAULT_TIMEFRAME),
+            exchange_symbol=payload.get("exchange_symbol"),
+            bid=_to_decimal(payload.get("bid")),
+            ask=_to_decimal(payload.get("ask")),
+            bid_size=_to_decimal(payload.get("bid_size")),
+            ask_size=_to_decimal(payload.get("ask_size")),
+            last_price=_to_decimal(payload.get("last_price")),
+            mark_price=_to_decimal(payload.get("mark_price")),
+            index_price=_to_decimal(payload.get("index_price")),
+            timestamp=_datetime_from_payload(payload.get("timestamp")) or _utcnow(),
+            received_at=_datetime_from_payload(payload.get("received_at")) or _utcnow(),
+            sequence_id=payload.get("sequence_id"),
+            metadata=_metadata_copy(payload.get("metadata")),
+        )
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
             "instrument_type": self.instrument_type.value,
             "bid": _decimal_to_payload(self.bid),
             "ask": _decimal_to_payload(self.ask),
@@ -171,6 +426,7 @@ class QuoteSnapshot:
             "timestamp": _datetime_to_payload(self.timestamp),
             "received_at": _datetime_to_payload(self.received_at),
             "sequence_id": self.sequence_id,
+            "scope": spread_key_to_dict(self.key),
             "metadata": _metadata_copy(self.metadata),
         }
 
@@ -178,12 +434,19 @@ class QuoteSnapshot:
 @dataclass(slots=True)
 class FundingSnapshot:
     """
-    Funding snapshot для spot/futures spread analytics.
+    Funding snapshot для spot/futures або futures basis spread analytics.
+
+    Production source:
+        FundingCache -> market.funding.updated -> analytics.spreads.*
     """
 
     exchange: str
     symbol: str
     funding_rate: Decimal
+
+    market_type: str = DEFAULT_PERPETUAL_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
 
     timestamp: datetime = field(default_factory=_utcnow)
     next_funding_time: datetime | None = None
@@ -193,30 +456,68 @@ class FundingSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _validate_non_empty("exchange", self.exchange)
-        _validate_non_empty("symbol", self.symbol)
-
         self.exchange = _normalize_exchange(self.exchange)
         self.symbol = _normalize_symbol(self.symbol)
+        self.market_type = _normalize_market_type(self.market_type)
+        self.timeframe = _normalize_timeframe(self.timeframe)
+        self.exchange_symbol = _normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+        self.funding_rate = _to_decimal(self.funding_rate, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.predicted_rate = _to_decimal(self.predicted_rate)
+
         self.metadata = _metadata_copy(self.metadata)
+        self.metadata.setdefault("scope", spread_key_to_dict(self.key))
+        self.metadata.setdefault("exchange_symbol", self.exchange_symbol)
 
         if self.interval_hours is not None and self.interval_hours <= 0:
             raise ValueError("interval_hours must be > 0")
+
+    @property
+    def key(self) -> SpreadKey:
+        return make_spread_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     @property
     def age_ms(self) -> int:
         delta = _utcnow() - self.timestamp
         return max(int(delta.total_seconds() * 1000), 0)
 
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> FundingSnapshot:
+        return cls(
+            exchange=str(payload["exchange"]),
+            symbol=str(payload["symbol"]),
+            market_type=str(payload.get("market_type") or DEFAULT_PERPETUAL_MARKET_TYPE),
+            timeframe=str(payload.get("timeframe") or DEFAULT_TIMEFRAME),
+            exchange_symbol=payload.get("exchange_symbol"),
+            funding_rate=_to_decimal(payload.get("funding_rate"), default=DECIMAL_ZERO) or DECIMAL_ZERO,
+            timestamp=_datetime_from_payload(payload.get("timestamp")) or _utcnow(),
+            next_funding_time=_datetime_from_payload(payload.get("next_funding_time")),
+            predicted_rate=_to_decimal(payload.get("predicted_rate")),
+            interval_hours=payload.get("interval_hours"),
+            metadata=_metadata_copy(payload.get("metadata")),
+        )
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
             "funding_rate": _decimal_to_payload(self.funding_rate),
             "timestamp": _datetime_to_payload(self.timestamp),
             "next_funding_time": _datetime_to_payload(self.next_funding_time),
             "predicted_rate": _decimal_to_payload(self.predicted_rate),
             "interval_hours": self.interval_hours,
+            "scope": spread_key_to_dict(self.key),
             "metadata": _metadata_copy(self.metadata),
         }
 
@@ -244,6 +545,15 @@ class RollingStats:
     def __post_init__(self) -> None:
         if self.count < 0:
             raise ValueError("count must be >= 0")
+
+        self.mean = _to_decimal(self.mean)
+        self.std = _to_decimal(self.std)
+        self.min_value = _to_decimal(self.min_value)
+        self.max_value = _to_decimal(self.max_value)
+        self.ema = _to_decimal(self.ema)
+        self.last_value = _to_decimal(self.last_value)
+        self.zscore = _to_decimal(self.zscore)
+        self.percentile_rank = _to_decimal(self.percentile_rank)
 
         _validate_non_negative_decimal("std", self.std)
 
@@ -275,7 +585,7 @@ class SpreadSnapshot:
     """
     Canonical spread analytics snapshot.
 
-    Саме цю модель analyzer-и публікують у:
+    Analyzer-и публікують цю модель у:
     - analytics.spreads.spot_futures.updated
     - analytics.spreads.cross_exchange.updated
     """
@@ -287,6 +597,13 @@ class SpreadSnapshot:
     leg_b_exchange: str
     leg_a_type: InstrumentType
     leg_b_type: InstrumentType
+
+    leg_a_market_type: str | None = None
+    leg_b_market_type: str | None = None
+    timeframe: str = DEFAULT_TIMEFRAME
+
+    leg_a_exchange_symbol: str | None = None
+    leg_b_exchange_symbol: str | None = None
 
     pricing_source: PricingSource = PricingSource.BID_ASK
 
@@ -320,14 +637,58 @@ class SpreadSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _validate_non_empty("symbol", self.symbol)
-        _validate_non_empty("leg_a_exchange", self.leg_a_exchange)
-        _validate_non_empty("leg_b_exchange", self.leg_b_exchange)
+        self.spread_type = self.spread_type if isinstance(self.spread_type, SpreadType) else SpreadType(str(self.spread_type))
+        self.leg_a_type = _parse_instrument_type(self.leg_a_type)
+        self.leg_b_type = _parse_instrument_type(self.leg_b_type)
+
+        if self.leg_a_type == InstrumentType.UNKNOWN:
+            raise ValueError("leg_a_type must not be UNKNOWN")
+        if self.leg_b_type == InstrumentType.UNKNOWN:
+            raise ValueError("leg_b_type must not be UNKNOWN")
 
         self.symbol = _normalize_symbol(self.symbol)
         self.leg_a_exchange = _normalize_exchange(self.leg_a_exchange)
         self.leg_b_exchange = _normalize_exchange(self.leg_b_exchange)
+
+        self.leg_a_market_type = _normalize_market_type(
+            self.leg_a_market_type,
+            instrument_type=self.leg_a_type,
+        )
+        self.leg_b_market_type = _normalize_market_type(
+            self.leg_b_market_type,
+            instrument_type=self.leg_b_type,
+        )
+        self.timeframe = _normalize_timeframe(self.timeframe)
+
+        self.leg_a_exchange_symbol = _normalize_exchange_symbol(
+            self.leg_a_exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.leg_b_exchange_symbol = _normalize_exchange_symbol(
+            self.leg_b_exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+        self.raw_spread = _to_decimal(self.raw_spread)
+        self.spread_pct = _to_decimal(self.spread_pct)
+        self.spread_bps = _to_decimal(self.spread_bps)
+        self.net_spread = _to_decimal(self.net_spread)
+        self.basis = _to_decimal(self.basis)
+        self.funding_adjusted_spread = _to_decimal(self.funding_adjusted_spread)
+
+        self.leg_a_bid = _to_decimal(self.leg_a_bid)
+        self.leg_a_ask = _to_decimal(self.leg_a_ask)
+        self.leg_b_bid = _to_decimal(self.leg_b_bid)
+        self.leg_b_ask = _to_decimal(self.leg_b_ask)
+        self.leg_a_mid = _to_decimal(self.leg_a_mid)
+        self.leg_b_mid = _to_decimal(self.leg_b_mid)
+
+        self.estimated_fees = _to_decimal(self.estimated_fees)
+        self.estimated_slippage = _to_decimal(self.estimated_slippage)
+
         self.metadata = _metadata_copy(self.metadata)
+        self.metadata.setdefault("leg_a_scope", spread_key_to_dict(self.leg_a_key))
+        self.metadata.setdefault("leg_b_scope", spread_key_to_dict(self.leg_b_key))
 
         _validate_non_negative_decimal("estimated_fees", self.estimated_fees)
         _validate_non_negative_decimal("estimated_slippage", self.estimated_slippage)
@@ -339,19 +700,29 @@ class SpreadSnapshot:
         _validate_positive_decimal("leg_a_mid", self.leg_a_mid)
         _validate_positive_decimal("leg_b_mid", self.leg_b_mid)
 
-        if (
-            self.leg_a_bid is not None
-            and self.leg_a_ask is not None
-            and self.leg_a_bid > self.leg_a_ask
-        ):
+        if self.leg_a_bid is not None and self.leg_a_ask is not None and self.leg_a_bid > self.leg_a_ask:
             raise ValueError("leg_a_bid must be <= leg_a_ask")
 
-        if (
-            self.leg_b_bid is not None
-            and self.leg_b_ask is not None
-            and self.leg_b_bid > self.leg_b_ask
-        ):
+        if self.leg_b_bid is not None and self.leg_b_ask is not None and self.leg_b_bid > self.leg_b_ask:
             raise ValueError("leg_b_bid must be <= leg_b_ask")
+
+    @property
+    def leg_a_key(self) -> SpreadKey:
+        return make_spread_key(
+            exchange=self.leg_a_exchange,
+            market_type=self.leg_a_market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def leg_b_key(self) -> SpreadKey:
+        return make_spread_key(
+            exchange=self.leg_b_exchange,
+            market_type=self.leg_b_market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     @property
     def has_edge(self) -> bool:
@@ -362,11 +733,13 @@ class SpreadSnapshot:
         return abs(self.spread_bps) if self.spread_bps is not None else None
 
     @property
-    def pair_key(self) -> tuple[str, str, str, InstrumentType, InstrumentType]:
+    def pair_key(self) -> tuple[str, str, str, str, str, InstrumentType, InstrumentType]:
         return (
             self.symbol,
             self.leg_a_exchange,
             self.leg_b_exchange,
+            self.leg_a_market_type,
+            self.leg_b_market_type,
             self.leg_a_type,
             self.leg_b_type,
         )
@@ -375,10 +748,17 @@ class SpreadSnapshot:
         return {
             "spread_type": self.spread_type.value,
             "symbol": self.symbol,
+            "timeframe": self.timeframe,
             "leg_a_exchange": self.leg_a_exchange,
             "leg_b_exchange": self.leg_b_exchange,
+            "leg_a_market_type": self.leg_a_market_type,
+            "leg_b_market_type": self.leg_b_market_type,
+            "leg_a_exchange_symbol": self.leg_a_exchange_symbol,
+            "leg_b_exchange_symbol": self.leg_b_exchange_symbol,
             "leg_a_type": self.leg_a_type.value,
             "leg_b_type": self.leg_b_type.value,
+            "leg_a_scope": spread_key_to_dict(self.leg_a_key),
+            "leg_b_scope": spread_key_to_dict(self.leg_b_key),
             "pricing_source": self.pricing_source.value,
             "raw_spread": _decimal_to_payload(self.raw_spread),
             "spread_pct": _decimal_to_payload(self.spread_pct),
@@ -414,7 +794,7 @@ class SpreadSignal:
     Canonical spread signal.
 
     Strategy layer може слухати analytics.spreads.signal.generated
-    і отримувати саме цю модель як payload.
+    і отримувати саме цю модель або її payload.
     """
 
     signal_type: SpreadSignalType
@@ -430,6 +810,13 @@ class SpreadSignal:
     exchange_a: str | None = None
     exchange_b: str | None = None
 
+    market_type_a: str | None = None
+    market_type_b: str | None = None
+    timeframe: str = DEFAULT_TIMEFRAME
+
+    exchange_symbol_a: str | None = None
+    exchange_symbol_b: str | None = None
+
     timestamp: datetime = field(default_factory=_utcnow)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -438,29 +825,75 @@ class SpreadSignal:
         _validate_non_empty("message", self.message)
 
         self.symbol = _normalize_symbol(self.symbol)
+        self.timeframe = _normalize_timeframe(self.timeframe)
 
         if self.exchange_a is not None:
             self.exchange_a = _normalize_exchange(self.exchange_a)
+            self.market_type_a = _normalize_market_type(self.market_type_a)
+            self.exchange_symbol_a = _normalize_exchange_symbol(
+                self.exchange_symbol_a,
+                fallback_symbol=self.symbol,
+            )
 
         if self.exchange_b is not None:
             self.exchange_b = _normalize_exchange(self.exchange_b)
+            self.market_type_b = _normalize_market_type(self.market_type_b)
+            self.exchange_symbol_b = _normalize_exchange_symbol(
+                self.exchange_symbol_b,
+                fallback_symbol=self.symbol,
+            )
+
+        self.value = _to_decimal(self.value)
+        self.threshold = _to_decimal(self.threshold)
+        self.confidence = _to_decimal(self.confidence)
 
         self.metadata = _metadata_copy(self.metadata)
+
+        if self.exchange_a and self.market_type_a:
+            self.metadata.setdefault("leg_a_scope", spread_key_to_dict(self.leg_a_key))
+        if self.exchange_b and self.market_type_b:
+            self.metadata.setdefault("leg_b_scope", spread_key_to_dict(self.leg_b_key))
 
         if self.confidence is not None:
             if self.confidence < DECIMAL_ZERO or self.confidence > Decimal("1"):
                 raise ValueError("confidence must be between 0 and 1")
 
     @property
+    def leg_a_key(self) -> SpreadKey:
+        if self.exchange_a is None:
+            raise ValueError("exchange_a is required to build leg_a_key")
+        return make_spread_key(
+            exchange=self.exchange_a,
+            market_type=self.market_type_a,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def leg_b_key(self) -> SpreadKey:
+        if self.exchange_b is None:
+            raise ValueError("exchange_b is required to build leg_b_key")
+        return make_spread_key(
+            exchange=self.exchange_b,
+            market_type=self.market_type_b,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
     def signal_key(self) -> str:
         exchange_a = self.exchange_a or "na"
         exchange_b = self.exchange_b or "na"
+        market_type_a = self.market_type_a or "na"
+        market_type_b = self.market_type_b or "na"
+
         return (
             f"{self.signal_type.value}|"
             f"{self.spread_type.value}|"
             f"{self.symbol}|"
-            f"{exchange_a}|"
-            f"{exchange_b}"
+            f"{exchange_a}|{market_type_a}|"
+            f"{exchange_b}|{market_type_b}|"
+            f"{self.timeframe}"
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -468,12 +901,19 @@ class SpreadSignal:
             "signal_type": self.signal_type.value,
             "spread_type": self.spread_type.value,
             "symbol": self.symbol,
+            "timeframe": self.timeframe,
             "message": self.message,
             "value": _decimal_to_payload(self.value),
             "threshold": _decimal_to_payload(self.threshold),
             "confidence": _decimal_to_payload(self.confidence),
             "exchange_a": self.exchange_a,
             "exchange_b": self.exchange_b,
+            "market_type_a": self.market_type_a,
+            "market_type_b": self.market_type_b,
+            "exchange_symbol_a": self.exchange_symbol_a,
+            "exchange_symbol_b": self.exchange_symbol_b,
+            "leg_a_scope": spread_key_to_dict(self.leg_a_key) if self.exchange_a else None,
+            "leg_b_scope": spread_key_to_dict(self.leg_b_key) if self.exchange_b else None,
             "timestamp": _datetime_to_payload(self.timestamp),
             "metadata": _metadata_copy(self.metadata),
             "signal_key": self.signal_key,
@@ -490,7 +930,7 @@ class ArbitrageOpportunity:
     Cross-exchange arbitrage opportunity.
 
     Публікується analyzer-ом у:
-    analytics.spreads.arbitrage.opportunity
+        analytics.spreads.arbitrage.opportunity
     """
 
     symbol: str
@@ -505,6 +945,13 @@ class ArbitrageOpportunity:
     sell_price: Decimal
 
     gross_edge: Decimal
+
+    buy_market_type: str | None = None
+    sell_market_type: str | None = None
+    timeframe: str = DEFAULT_TIMEFRAME
+
+    buy_exchange_symbol: str | None = None
+    sell_exchange_symbol: str | None = None
 
     estimated_fees: Decimal = Decimal("0")
     estimated_slippage: Decimal = Decimal("0")
@@ -522,14 +969,50 @@ class ArbitrageOpportunity:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        _validate_non_empty("symbol", self.symbol)
-        _validate_non_empty("buy_exchange", self.buy_exchange)
-        _validate_non_empty("sell_exchange", self.sell_exchange)
-
         self.symbol = _normalize_symbol(self.symbol)
         self.buy_exchange = _normalize_exchange(self.buy_exchange)
         self.sell_exchange = _normalize_exchange(self.sell_exchange)
+
+        self.buy_instrument_type = _parse_instrument_type(self.buy_instrument_type)
+        self.sell_instrument_type = _parse_instrument_type(self.sell_instrument_type)
+
+        if self.buy_instrument_type == InstrumentType.UNKNOWN:
+            raise ValueError("buy_instrument_type must not be UNKNOWN")
+        if self.sell_instrument_type == InstrumentType.UNKNOWN:
+            raise ValueError("sell_instrument_type must not be UNKNOWN")
+
+        self.buy_market_type = _normalize_market_type(
+            self.buy_market_type,
+            instrument_type=self.buy_instrument_type,
+        )
+        self.sell_market_type = _normalize_market_type(
+            self.sell_market_type,
+            instrument_type=self.sell_instrument_type,
+        )
+        self.timeframe = _normalize_timeframe(self.timeframe)
+
+        self.buy_exchange_symbol = _normalize_exchange_symbol(
+            self.buy_exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.sell_exchange_symbol = _normalize_exchange_symbol(
+            self.sell_exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+        self.buy_price = _to_decimal(self.buy_price, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.sell_price = _to_decimal(self.sell_price, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.gross_edge = _to_decimal(self.gross_edge, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.estimated_fees = _to_decimal(self.estimated_fees, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.estimated_slippage = _to_decimal(self.estimated_slippage, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.net_edge = _to_decimal(self.net_edge, default=DECIMAL_ZERO) or DECIMAL_ZERO
+        self.spread_pct = _to_decimal(self.spread_pct)
+        self.spread_bps = _to_decimal(self.spread_bps)
+        self.confidence = _to_decimal(self.confidence)
+
         self.metadata = _metadata_copy(self.metadata)
+        self.metadata.setdefault("buy_scope", spread_key_to_dict(self.buy_key))
+        self.metadata.setdefault("sell_scope", spread_key_to_dict(self.sell_key))
 
         _validate_positive_decimal("buy_price", self.buy_price)
         _validate_positive_decimal("sell_price", self.sell_price)
@@ -542,6 +1025,24 @@ class ArbitrageOpportunity:
 
         if self.expires_at is not None and self.expires_at < self.timestamp:
             raise ValueError("expires_at must be >= timestamp")
+
+    @property
+    def buy_key(self) -> SpreadKey:
+        return make_spread_key(
+            exchange=self.buy_exchange,
+            market_type=self.buy_market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def sell_key(self) -> SpreadKey:
+        return make_spread_key(
+            exchange=self.sell_exchange,
+            market_type=self.sell_market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     @property
     def is_profitable(self) -> bool:
@@ -571,10 +1072,11 @@ class ArbitrageOpportunity:
     def opportunity_key(self) -> str:
         return (
             f"{self.symbol}|"
-            f"{self.buy_exchange}|"
-            f"{self.sell_exchange}|"
+            f"{self.buy_exchange}|{self.buy_market_type}|"
+            f"{self.sell_exchange}|{self.sell_market_type}|"
             f"{self.buy_instrument_type.value}|"
-            f"{self.sell_instrument_type.value}"
+            f"{self.sell_instrument_type.value}|"
+            f"{self.timeframe}"
         )
 
     def mark_expired(self) -> None:
@@ -589,8 +1091,15 @@ class ArbitrageOpportunity:
     def to_payload(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "timeframe": self.timeframe,
             "buy_exchange": self.buy_exchange,
             "sell_exchange": self.sell_exchange,
+            "buy_market_type": self.buy_market_type,
+            "sell_market_type": self.sell_market_type,
+            "buy_exchange_symbol": self.buy_exchange_symbol,
+            "sell_exchange_symbol": self.sell_exchange_symbol,
+            "buy_scope": spread_key_to_dict(self.buy_key),
+            "sell_scope": spread_key_to_dict(self.sell_key),
             "buy_instrument_type": self.buy_instrument_type.value,
             "sell_instrument_type": self.sell_instrument_type.value,
             "buy_price": _decimal_to_payload(self.buy_price),
@@ -624,10 +1133,37 @@ def model_to_payload(model: Any) -> dict[str, Any]:
     Універсальний helper для EventBus/storage/dashboard.
 
     Якщо модель має власний to_payload() — використовує його.
-    Якщо ні — fallback через dataclasses.asdict().
+    Якщо ні — fallback через dataclasses.asdict() з безпечною серіалізацією.
     """
     to_payload = getattr(model, "to_payload", None)
     if callable(to_payload):
         return to_payload()
 
-    return asdict(model)
+    if is_dataclass(model):
+        return _serialize_value(asdict(model))
+
+    if isinstance(model, Mapping):
+        return _serialize_value(model)
+
+    raise TypeError(f"Unsupported model type for payload serialization: {type(model)!r}")
+
+
+__all__ = [
+    "DECIMAL_ZERO",
+    "DECIMAL_TWO",
+    "DEFAULT_TIMEFRAME",
+    "DEFAULT_SPOT_MARKET_TYPE",
+    "DEFAULT_PERPETUAL_MARKET_TYPE",
+    "DEFAULT_FUTURES_MARKET_TYPE",
+    "SpreadKey",
+    "make_spread_key",
+    "spread_key_to_dict",
+    "scoped_metadata",
+    "QuoteSnapshot",
+    "FundingSnapshot",
+    "RollingStats",
+    "SpreadSnapshot",
+    "SpreadSignal",
+    "ArbitrageOpportunity",
+    "model_to_payload",
+]

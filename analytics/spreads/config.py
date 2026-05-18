@@ -4,15 +4,30 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Mapping
 
-from .enums import InstrumentType
+from .enums import InstrumentType, parse_instrument_type
+from .models import (
+    DEFAULT_FUTURES_MARKET_TYPE,
+    DEFAULT_PERPETUAL_MARKET_TYPE,
+    DEFAULT_SPOT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    SpreadKey,
+    make_spread_key,
+    spread_key_to_dict,
+)
 
 
 # ============================================================
 # Constants
 # ============================================================
 
+# Production input topics.
+# Важливо: це саме data-layer updated events, а не raw exchange adapter events.
 DEFAULT_QUOTE_EVENT_TOPIC = "market.quote.updated"
 DEFAULT_FUNDING_EVENT_TOPIC = "market.funding.updated"
+
+# Legacy/raw topics. Не використовувати в production analyzer subscriptions.
+DEFAULT_RAW_QUOTE_EVENT_TOPIC = "market.quote"
+DEFAULT_RAW_FUNDING_EVENT_TOPIC = "market.funding"
 
 DEFAULT_SPOT_FUTURES_SNAPSHOT_TOPIC = "analytics.spreads.spot_futures.updated"
 DEFAULT_CROSS_EXCHANGE_SNAPSHOT_TOPIC = "analytics.spreads.cross_exchange.updated"
@@ -30,10 +45,123 @@ DECIMAL_ZERO = Decimal("0")
 # Helpers
 # ============================================================
 
-def _normalize_exchange_set(values: set[str] | list[str] | tuple[str, ...] | None) -> set[str]:
+def _normalize_exchange(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
+def _normalize_symbol(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = (
+        str(value)
+        .replace("-", "")
+        .replace("/", "")
+        .replace("_", "")
+        .upper()
+        .strip()
+    )
+    return normalized or None
+
+
+def _normalize_market_type(
+    value: str | None,
+    *,
+    fallback: str = DEFAULT_PERPETUAL_MARKET_TYPE,
+) -> str:
+    normalized = str(value or fallback).strip().lower()
+    return normalized or fallback
+
+
+def _normalize_timeframe(value: str | None) -> str:
+    normalized = str(value or DEFAULT_TIMEFRAME).strip()
+    return normalized or DEFAULT_TIMEFRAME
+
+
+def _normalize_exchange_set(
+    values: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str]:
     if not values:
         return set()
-    return {value.strip().lower() for value in values if value and value.strip()}
+
+    return {
+        normalized
+        for item in values
+        if (normalized := _normalize_exchange(str(item))) is not None
+    }
+
+
+def _normalize_symbol_set(
+    values: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str]:
+    if not values:
+        return set()
+
+    return {
+        normalized
+        for item in values
+        if (normalized := _normalize_symbol(str(item))) is not None
+    }
+
+
+def _normalize_market_type_set(
+    values: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str]:
+    if not values:
+        return set()
+
+    return {
+        _normalize_market_type(str(item))
+        for item in values
+        if str(item).strip()
+    }
+
+
+def _normalize_timeframe_set(
+    values: set[str] | list[str] | tuple[str, ...] | None,
+) -> set[str]:
+    if not values:
+        return set()
+
+    return {
+        _normalize_timeframe(str(item))
+        for item in values
+        if str(item).strip()
+    }
+
+
+def _normalize_topic_patterns(
+    values: set[str] | list[str] | tuple[str, ...] | None,
+    *,
+    fallback: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not values:
+        return fallback
+
+    normalized = tuple(
+        str(item).strip()
+        for item in values
+        if str(item).strip()
+    )
+
+    return normalized or fallback
+
+
+def _normalize_instrument_type_set(
+    values: set[InstrumentType | str] | list[InstrumentType | str] | tuple[InstrumentType | str, ...] | None,
+) -> set[InstrumentType]:
+    if not values:
+        return set()
+
+    return {
+        parsed
+        for item in values
+        if (parsed := parse_instrument_type(item)) is not InstrumentType.UNKNOWN
+    }
 
 
 def _validate_positive_int(name: str, value: int) -> None:
@@ -61,6 +189,11 @@ def _validate_positive_float(name: str, value: float) -> None:
         raise ValueError(f"{name} must be > 0")
 
 
+def _validate_non_empty_str(name: str, value: str | None) -> None:
+    if value is None or not str(value).strip():
+        raise ValueError(f"{name} must not be empty")
+
+
 # ============================================================
 # Base Config
 # ============================================================
@@ -68,17 +201,18 @@ def _validate_positive_float(name: str, value: float) -> None:
 @dataclass(slots=True)
 class BaseSpreadConfig:
     """
-    Базовий config-контракт для analytics/spreads.
+    Базовий config-контракт для analytics.spreads.
 
     Відповідальність:
     - runtime enable/disable;
-    - topic names для EventBus;
+    - data-layer EventBus topic names;
     - quote freshness / alignment rules;
     - rolling statistics parameters;
     - throttling / cooldown;
-    - scheduler intervals;
+    - Scheduler intervals;
     - cache cleanup limits;
     - signal thresholds;
+    - scoped market filters;
     - metadata для розширення без зміни контракту.
 
     Не відповідає за:
@@ -87,21 +221,44 @@ class BaseSpreadConfig:
     - читання .env напряму;
     - logging;
     - бізнес-логіку analyzer-ів.
+
+    Production input flow:
+        exchange adapters
+            -> market.quote / market.funding
+            -> QuoteCache / FundingCache
+            -> market.quote.updated / market.funding.updated
+            -> analytics.spreads.*
     """
 
     # Runtime
     enabled: bool = True
     service_name: str = "spread_analyzer"
 
-    # Input EventBus topics
+    # Production input EventBus topics: data-layer updated events.
     quote_event_topic: str = DEFAULT_QUOTE_EVENT_TOPIC
     funding_event_topic: str = DEFAULT_FUNDING_EVENT_TOPIC
+
+    quote_event_topic_patterns: tuple[str, ...] = (DEFAULT_QUOTE_EVENT_TOPIC,)
+    funding_event_topic_patterns: tuple[str, ...] = (DEFAULT_FUNDING_EVENT_TOPIC,)
+
+    # Legacy/raw topics. Вимкнені за замовчуванням.
+    raw_quote_event_topic: str = DEFAULT_RAW_QUOTE_EVENT_TOPIC
+    raw_funding_event_topic: str = DEFAULT_RAW_FUNDING_EVENT_TOPIC
+    allow_legacy_raw_topics: bool = False
 
     # Common output EventBus topics
     signal_event_topic: str = DEFAULT_SPREAD_SIGNAL_TOPIC
     analyzer_started_event_topic: str = DEFAULT_ANALYZER_STARTED_TOPIC
     analyzer_stopped_event_topic: str = DEFAULT_ANALYZER_STOPPED_TOPIC
     analyzer_heartbeat_event_topic: str = DEFAULT_ANALYZER_HEARTBEAT_TOPIC
+
+    # Scoped defaults
+    default_timeframe: str = DEFAULT_TIMEFRAME
+
+    # Optional scoped filters
+    allowed_symbols: set[str] = field(default_factory=set)
+    allowed_timeframes: set[str] = field(default_factory=set)
+    allowed_market_types: set[str] = field(default_factory=set)
 
     # Quote freshness / alignment
     max_quote_age_ms: int = 2_000
@@ -133,6 +290,26 @@ class BaseSpreadConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.default_timeframe = _normalize_timeframe(self.default_timeframe)
+
+        self.allowed_symbols = _normalize_symbol_set(self.allowed_symbols)
+        self.allowed_timeframes = _normalize_timeframe_set(self.allowed_timeframes)
+        self.allowed_market_types = _normalize_market_type_set(self.allowed_market_types)
+
+        self.quote_event_topic_patterns = _normalize_topic_patterns(
+            self.quote_event_topic_patterns,
+            fallback=(self.quote_event_topic,),
+        )
+        self.funding_event_topic_patterns = _normalize_topic_patterns(
+            self.funding_event_topic_patterns,
+            fallback=(self.funding_event_topic,),
+        )
+
+        self.quote_event_topic = self.quote_event_topic_patterns[0]
+        self.funding_event_topic = self.funding_event_topic_patterns[0]
+
+        self.metadata = dict(self.metadata or {})
+
         self.validate()
 
     def validate(self) -> None:
@@ -163,11 +340,100 @@ class BaseSpreadConfig:
         self._validate_topic("analyzer_started_event_topic", self.analyzer_started_event_topic)
         self._validate_topic("analyzer_stopped_event_topic", self.analyzer_stopped_event_topic)
         self._validate_topic("analyzer_heartbeat_event_topic", self.analyzer_heartbeat_event_topic)
+        self._validate_topic("raw_quote_event_topic", self.raw_quote_event_topic)
+        self._validate_topic("raw_funding_event_topic", self.raw_funding_event_topic)
+
+        for topic in self.quote_event_topic_patterns:
+            self._validate_topic("quote_event_topic_patterns item", topic)
+
+        for topic in self.funding_event_topic_patterns:
+            self._validate_topic("funding_event_topic_patterns item", topic)
+
+        if not self.allow_legacy_raw_topics:
+            production_topics = {
+                *self.quote_event_topic_patterns,
+                *self.funding_event_topic_patterns,
+            }
+            raw_topics = {
+                self.raw_quote_event_topic,
+                self.raw_funding_event_topic,
+            }
+            used_raw_topics = production_topics.intersection(raw_topics)
+
+            if used_raw_topics:
+                raise ValueError(
+                    "Spread analyzer production input topics must use data-layer "
+                    f"updated topics, not raw topics: {sorted(used_raw_topics)}"
+                )
+
+        _validate_non_empty_str("default_timeframe", self.default_timeframe)
 
     @staticmethod
     def _validate_topic(field_name: str, value: str) -> None:
         if not value or not value.strip():
             raise ValueError(f"{field_name} must not be empty")
+
+    @property
+    def production_input_topics(self) -> tuple[str, ...]:
+        return (
+            *self.quote_event_topic_patterns,
+            *self.funding_event_topic_patterns,
+        )
+
+    @property
+    def legacy_raw_input_topics(self) -> tuple[str, ...]:
+        return (
+            self.raw_quote_event_topic,
+            self.raw_funding_event_topic,
+        )
+
+    def should_process_scope(
+        self,
+        *,
+        symbol: str,
+        market_type: str,
+        timeframe: str | None = None,
+    ) -> bool:
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_market_type = _normalize_market_type(market_type)
+        normalized_timeframe = _normalize_timeframe(timeframe or self.default_timeframe)
+
+        if normalized_symbol is None:
+            return False
+
+        if self.allowed_symbols and normalized_symbol not in self.allowed_symbols:
+            return False
+
+        if self.allowed_market_types and normalized_market_type not in self.allowed_market_types:
+            return False
+
+        if self.allowed_timeframes and normalized_timeframe not in self.allowed_timeframes:
+            return False
+
+        return True
+
+    def should_process_key(self, key: SpreadKey) -> bool:
+        scope = spread_key_to_dict(key)
+        return self.should_process_scope(
+            symbol=scope["symbol"],
+            market_type=scope["market_type"],
+            timeframe=scope["timeframe"],
+        )
+
+    def make_key(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> SpreadKey:
+        return make_spread_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe or self.default_timeframe,
+        )
 
     def with_metadata(self, **metadata: Any) -> BaseSpreadConfig:
         """
@@ -193,6 +459,14 @@ class BaseSpreadConfig:
 class SpotFuturesSpreadConfig(BaseSpreadConfig):
     """
     Config для SpotFuturesSpreadAnalyzer.
+
+    Цей analyzer є дозволеним spot+futures компонентом:
+    - spot leg: InstrumentType.SPOT / market_type="spot";
+    - futures leg: InstrumentType.PERPETUAL або InstrumentType.FUTURES;
+    - funding leg: зазвичай futures/perpetual market_type.
+
+    Він все одно має отримувати quote/funding дані тільки через data-layer
+    updated topics: market.quote.updated / market.funding.updated.
     """
 
     service_name: str = "spot_futures_spread_analyzer"
@@ -211,8 +485,36 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
     default_spot_exchange: str | None = None
     default_futures_exchange: str | None = None
 
+    default_spot_market_type: str = DEFAULT_SPOT_MARKET_TYPE
+    default_futures_market_type: str = DEFAULT_PERPETUAL_MARKET_TYPE
+
     allowed_spot_exchanges: set[str] = field(default_factory=set)
     allowed_futures_exchanges: set[str] = field(default_factory=set)
+
+    allowed_spot_market_types: set[str] = field(
+        default_factory=lambda: {DEFAULT_SPOT_MARKET_TYPE}
+    )
+    allowed_futures_market_types: set[str] = field(
+        default_factory=lambda: {
+            DEFAULT_PERPETUAL_MARKET_TYPE,
+            DEFAULT_FUTURES_MARKET_TYPE,
+            "linear",
+            "inverse",
+            "swap",
+            "usdm_futures",
+            "coinm_futures",
+        }
+    )
+
+    allowed_spot_instrument_types: set[InstrumentType] = field(
+        default_factory=lambda: {InstrumentType.SPOT}
+    )
+    allowed_futures_instrument_types: set[InstrumentType] = field(
+        default_factory=lambda: {
+            InstrumentType.PERPETUAL,
+            InstrumentType.FUTURES,
+        }
+    )
 
     def __post_init__(self) -> None:
         self.allowed_spot_exchanges = _normalize_exchange_set(
@@ -222,15 +524,51 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
             self.allowed_futures_exchanges
         )
 
-        if self.default_spot_exchange:
-            self.default_spot_exchange = self.default_spot_exchange.strip().lower()
+        self.default_spot_exchange = _normalize_exchange(self.default_spot_exchange)
+        self.default_futures_exchange = _normalize_exchange(self.default_futures_exchange)
 
-        if self.default_futures_exchange:
-            self.default_futures_exchange = self.default_futures_exchange.strip().lower()
+        self.default_spot_market_type = _normalize_market_type(
+            self.default_spot_market_type,
+            fallback=DEFAULT_SPOT_MARKET_TYPE,
+        )
+        self.default_futures_market_type = _normalize_market_type(
+            self.default_futures_market_type,
+            fallback=DEFAULT_PERPETUAL_MARKET_TYPE,
+        )
 
-        # Не використовуємо super().__post_init__() у dataclass(slots=True)
-        # inheritance, бо zero-argument super() може падати з:
-        # TypeError: super(type, obj): obj must be an instance or subtype of type
+        self.allowed_spot_market_types = _normalize_market_type_set(
+            self.allowed_spot_market_types
+        )
+        self.allowed_futures_market_types = _normalize_market_type_set(
+            self.allowed_futures_market_types
+        )
+
+        self.allowed_spot_instrument_types = _normalize_instrument_type_set(
+            self.allowed_spot_instrument_types
+        )
+        self.allowed_futures_instrument_types = _normalize_instrument_type_set(
+            self.allowed_futures_instrument_types
+        )
+
+        if not self.allowed_spot_instrument_types:
+            raise ValueError("allowed_spot_instrument_types must not be empty")
+        if not self.allowed_futures_instrument_types:
+            raise ValueError("allowed_futures_instrument_types must not be empty")
+
+        if InstrumentType.SPOT not in self.allowed_spot_instrument_types:
+            raise ValueError("SpotFuturesSpreadConfig must allow InstrumentType.SPOT for spot leg")
+
+        if any(item is InstrumentType.UNKNOWN for item in self.allowed_spot_instrument_types):
+            raise ValueError("allowed_spot_instrument_types must not include UNKNOWN")
+        if any(item is InstrumentType.UNKNOWN for item in self.allowed_futures_instrument_types):
+            raise ValueError("allowed_futures_instrument_types must not include UNKNOWN")
+
+        if any(not item.is_derivative for item in self.allowed_futures_instrument_types):
+            raise ValueError(
+                "allowed_futures_instrument_types must include only derivative instrument types"
+            )
+
+        # Не використовуємо zero-argument super() у dataclass(slots=True) inheritance.
         BaseSpreadConfig.__post_init__(self)
 
         self._validate_topic("snapshot_event_topic", self.snapshot_event_topic)
@@ -251,14 +589,92 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
             )
 
     def is_spot_exchange_allowed(self, exchange: str) -> bool:
-        normalized = exchange.strip().lower()
+        normalized = _normalize_exchange(exchange)
+        if normalized is None:
+            return False
         return not self.allowed_spot_exchanges or normalized in self.allowed_spot_exchanges
 
     def is_futures_exchange_allowed(self, exchange: str) -> bool:
-        normalized = exchange.strip().lower()
+        normalized = _normalize_exchange(exchange)
+        if normalized is None:
+            return False
         return (
             not self.allowed_futures_exchanges
             or normalized in self.allowed_futures_exchanges
+        )
+
+    def is_spot_market_type_allowed(self, market_type: str | None) -> bool:
+        normalized = _normalize_market_type(
+            market_type,
+            fallback=self.default_spot_market_type,
+        )
+        return (
+            not self.allowed_spot_market_types
+            or normalized in self.allowed_spot_market_types
+        )
+
+    def is_futures_market_type_allowed(self, market_type: str | None) -> bool:
+        normalized = _normalize_market_type(
+            market_type,
+            fallback=self.default_futures_market_type,
+        )
+        return (
+            not self.allowed_futures_market_types
+            or normalized in self.allowed_futures_market_types
+        )
+
+    def is_spot_instrument_type_allowed(
+        self,
+        instrument_type: InstrumentType | str | None,
+    ) -> bool:
+        parsed = parse_instrument_type(instrument_type)
+        return parsed in self.allowed_spot_instrument_types
+
+    def is_futures_instrument_type_allowed(
+        self,
+        instrument_type: InstrumentType | str | None,
+    ) -> bool:
+        parsed = parse_instrument_type(instrument_type)
+        return parsed in self.allowed_futures_instrument_types
+
+    def is_spot_quote_allowed(
+        self,
+        *,
+        exchange: str,
+        market_type: str | None,
+        instrument_type: InstrumentType | str | None,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> bool:
+        return (
+            self.is_spot_exchange_allowed(exchange)
+            and self.is_spot_market_type_allowed(market_type)
+            and self.is_spot_instrument_type_allowed(instrument_type)
+            and self.should_process_scope(
+                symbol=symbol,
+                market_type=market_type or self.default_spot_market_type,
+                timeframe=timeframe or self.default_timeframe,
+            )
+        )
+
+    def is_futures_quote_allowed(
+        self,
+        *,
+        exchange: str,
+        market_type: str | None,
+        instrument_type: InstrumentType | str | None,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> bool:
+        return (
+            self.is_futures_exchange_allowed(exchange)
+            and self.is_futures_market_type_allowed(market_type)
+            and self.is_futures_instrument_type_allowed(instrument_type)
+            and self.should_process_scope(
+                symbol=symbol,
+                market_type=market_type or self.default_futures_market_type,
+                timeframe=timeframe or self.default_timeframe,
+            )
         )
 
 
@@ -270,6 +686,11 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
 class CrossExchangeSpreadConfig(BaseSpreadConfig):
     """
     Config для CrossExchangeSpreadAnalyzer.
+
+    За замовчуванням дозволяє spot, perpetual і futures, бо cross-exchange
+    spread/arbitrage може існувати як для spot, так і для derivative venues.
+    Якщо потрібен futures-only режим, передай:
+        allowed_instrument_types={InstrumentType.PERPETUAL, InstrumentType.FUTURES}
     """
 
     service_name: str = "cross_exchange_spread_analyzer"
@@ -304,10 +725,16 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
             InstrumentType.FUTURES,
         }
     )
+    allowed_exchanges: set[str] = field(default_factory=set)
     preferred_exchanges: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
+        self.allowed_exchanges = _normalize_exchange_set(self.allowed_exchanges)
         self.preferred_exchanges = _normalize_exchange_set(self.preferred_exchanges)
+
+        self.allowed_instrument_types = _normalize_instrument_type_set(
+            self.allowed_instrument_types
+        )
 
         if not self.allowed_instrument_types:
             raise ValueError("allowed_instrument_types must not be empty")
@@ -317,9 +744,7 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
                 "allowed_instrument_types must not include InstrumentType.UNKNOWN"
             )
 
-        # Не використовуємо super().__post_init__() у dataclass(slots=True)
-        # inheritance, бо zero-argument super() може падати з:
-        # TypeError: super(type, obj): obj must be an instance or subtype of type
+        # Не використовуємо zero-argument super() у dataclass(slots=True) inheritance.
         BaseSpreadConfig.__post_init__(self)
 
         self._validate_topic("snapshot_event_topic", self.snapshot_event_topic)
@@ -362,12 +787,45 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
             ):
                 raise ValueError("default_trade_size must be <= max_trade_size")
 
+    def is_exchange_allowed(self, exchange: str) -> bool:
+        normalized = _normalize_exchange(exchange)
+        if normalized is None:
+            return False
+
+        return not self.allowed_exchanges or normalized in self.allowed_exchanges
+
     def is_exchange_preferred(self, exchange: str) -> bool:
-        normalized = exchange.strip().lower()
+        normalized = _normalize_exchange(exchange)
+        if normalized is None:
+            return False
+
         return not self.preferred_exchanges or normalized in self.preferred_exchanges
 
-    def is_instrument_type_allowed(self, instrument_type: InstrumentType) -> bool:
-        return instrument_type in self.allowed_instrument_types
+    def is_instrument_type_allowed(
+        self,
+        instrument_type: InstrumentType | str | None,
+    ) -> bool:
+        parsed = parse_instrument_type(instrument_type)
+        return parsed in self.allowed_instrument_types
+
+    def is_quote_allowed(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        instrument_type: InstrumentType | str | None,
+        timeframe: str | None = None,
+    ) -> bool:
+        return (
+            self.is_exchange_allowed(exchange)
+            and self.is_instrument_type_allowed(instrument_type)
+            and self.should_process_scope(
+                symbol=symbol,
+                market_type=market_type,
+                timeframe=timeframe or self.default_timeframe,
+            )
+        )
 
     def fee_rates_from_metadata(self) -> Mapping[str, Any]:
         """
@@ -385,3 +843,21 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
         if isinstance(value, Mapping):
             return value
         return {}
+
+
+__all__ = [
+    "DEFAULT_QUOTE_EVENT_TOPIC",
+    "DEFAULT_FUNDING_EVENT_TOPIC",
+    "DEFAULT_RAW_QUOTE_EVENT_TOPIC",
+    "DEFAULT_RAW_FUNDING_EVENT_TOPIC",
+    "DEFAULT_SPOT_FUTURES_SNAPSHOT_TOPIC",
+    "DEFAULT_CROSS_EXCHANGE_SNAPSHOT_TOPIC",
+    "DEFAULT_SPREAD_SIGNAL_TOPIC",
+    "DEFAULT_ARBITRAGE_OPPORTUNITY_TOPIC",
+    "DEFAULT_ANALYZER_STARTED_TOPIC",
+    "DEFAULT_ANALYZER_STOPPED_TOPIC",
+    "DEFAULT_ANALYZER_HEARTBEAT_TOPIC",
+    "BaseSpreadConfig",
+    "SpotFuturesSpreadConfig",
+    "CrossExchangeSpreadConfig",
+]

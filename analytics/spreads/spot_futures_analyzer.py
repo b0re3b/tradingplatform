@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Iterable
 
 from core.event_bus import Event, EventBus, EventPriority
 from core.scheduler import Scheduler
@@ -9,15 +9,20 @@ from core.scheduler import Scheduler
 from .base import BaseSpreadAnalyzer
 from .config import SpotFuturesSpreadConfig
 from .enums import InstrumentType, PricingSource, QuoteValidity, SpreadType
-from .models import FundingSnapshot, QuoteSnapshot, SpreadSnapshot
+from .models import (
+    DEFAULT_TIMEFRAME,
+    FundingSnapshot,
+    QuoteSnapshot,
+    SpreadKey,
+    SpreadSnapshot,
+    spread_key_to_dict,
+)
 from .spread_utils import (
     RollingDecimalWindow,
     aligned_quotes,
     basis_from_prices,
     funding_adjusted_spread,
     infer_direction,
-    normalize_exchange,
-    normalize_symbol,
     quote_age_ms,
     spread_abs,
     spread_bps,
@@ -30,31 +35,34 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
     """
     Production-grade analyzer для spot/futures spread analytics.
 
-    Відповідальність:
-    - слухати market.quote.updated;
-    - слухати market.funding.updated;
-    - кешувати spot/futures quotes і funding;
-    - будувати SpreadSnapshot;
-    - рахувати basis / spread_pct / spread_bps / funding-adjusted spread;
-    - оновлювати rolling stats;
-    - визначати spread regime;
-    - генерувати SpreadSignal через SpreadSignalEngine;
-    - публікувати analytics.spreads.spot_futures.updated;
-    - публікувати analytics.spreads.signal.generated;
-    - запускати cleanup/heartbeat через core.Scheduler.
+    Дозволений spot+futures компонент:
+    - spot leg: InstrumentType.SPOT / market_type="spot";
+    - futures leg: InstrumentType.PERPETUAL або InstrumentType.FUTURES;
+    - funding leg: futures/perpetual market_type.
 
-    Не відповідає за:
-    - отримання raw market-data з бірж;
-    - execution;
-    - risk approval;
-    - strategy decisions;
-    - storage напряму.
+    Correct production input flow:
+        exchange adapters
+            -> market.quote / market.funding
+            -> QuoteCache / FundingCache
+            -> market.quote.updated / market.funding.updated
+            -> SpotFuturesSpreadAnalyzer
+            -> analytics.spreads.spot_futures.updated
+            -> analytics.spreads.signal.generated
+
+    Важливо:
+    - не читає біржові WS/REST adapters напряму;
+    - не слухає raw market.quote / market.funding у production;
+    - підтримує payload як dataclass або dict від data-cache layer;
+    - state ізольований через SpreadKey:
+      exchange + market_type + symbol + timeframe.
     """
 
     DEFAULT_QUOTE_TOPIC = "market.quote.updated"
     DEFAULT_FUNDING_TOPIC = "market.funding.updated"
     DEFAULT_SNAPSHOT_TOPIC = "analytics.spreads.spot_futures.updated"
     DEFAULT_SIGNAL_TOPIC = "analytics.spreads.signal.generated"
+
+    SnapshotKey = tuple[SpreadKey, SpreadKey]
 
     def __init__(
         self,
@@ -71,12 +79,12 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         )
         self._config: SpotFuturesSpreadConfig = config
 
-        self._spot_quotes: dict[tuple[str, str], QuoteSnapshot] = {}
-        self._futures_quotes: dict[tuple[str, str], QuoteSnapshot] = {}
-        self._funding: dict[tuple[str, str], FundingSnapshot] = {}
+        self._spot_quotes: dict[SpreadKey, QuoteSnapshot] = {}
+        self._futures_quotes: dict[SpreadKey, QuoteSnapshot] = {}
+        self._funding: dict[SpreadKey, FundingSnapshot] = {}
 
-        self._spread_windows: dict[tuple[str, str, str], RollingDecimalWindow] = {}
-        self._latest_snapshots: dict[tuple[str, str, str], SpreadSnapshot] = {}
+        self._spread_windows: dict[SpotFuturesSpreadAnalyzer.SnapshotKey, RollingDecimalWindow] = {}
+        self._latest_snapshots: dict[SpotFuturesSpreadAnalyzer.SnapshotKey, SpreadSnapshot] = {}
 
         self._stats.update(
             {
@@ -99,6 +107,8 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                 "cleanup_removed_funding": 0,
                 "cleanup_removed_snapshots": 0,
                 "cleanup_removed_windows": 0,
+                "events_skipped_scope": 0,
+                "events_skipped_not_running": 0,
             }
         )
 
@@ -110,21 +120,21 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         """
         Реєструє EventBus subscriptions.
 
-        Важливо:
-        - register() синхронний, бо core.EventBus.subscribe() синхронний;
-        - handlers приймають core.event_bus.Event;
-        - повторний register() не дублює subscriptions.
+        Production subscriptions:
+            market.quote.updated
+            market.funding.updated
+
+        Raw topics market.quote / market.funding не використовуються, якщо
+        config.allow_legacy_raw_topics=False.
         """
         if self._registered:
             return
 
-        self._subscribe(
-            self._topic("quote_event_topic", self.DEFAULT_QUOTE_TOPIC),
+        self._subscribe_quote_updates(
             self.on_quote_update,
             name=f"{self._service_name}.on_quote_update",
         )
-        self._subscribe(
-            self._topic("funding_event_topic", self.DEFAULT_FUNDING_TOPIC),
+        self._subscribe_funding_updates(
             self.on_funding_update,
             name=f"{self._service_name}.on_funding_update",
         )
@@ -169,13 +179,35 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         symbol: str,
         spot_exchange: str,
         futures_exchange: str,
+        *,
+        spot_market_type: str | None = None,
+        futures_market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> SpreadSnapshot | None:
-        key = (
-            normalize_symbol(symbol),
-            normalize_exchange(spot_exchange),
-            normalize_exchange(futures_exchange),
+        resolved_timeframe = timeframe or self._config.default_timeframe or DEFAULT_TIMEFRAME
+
+        spot_key = self.make_key(
+            exchange=spot_exchange,
+            market_type=spot_market_type or self._config.default_spot_market_type,
+            symbol=symbol,
+            timeframe=resolved_timeframe,
         )
-        return self._latest_snapshots.get(key)
+        futures_key = self.make_key(
+            exchange=futures_exchange,
+            market_type=futures_market_type or self._config.default_futures_market_type,
+            symbol=symbol,
+            timeframe=resolved_timeframe,
+        )
+
+        return self._latest_snapshots.get((spot_key, futures_key))
+
+    def get_latest_snapshot_by_keys(
+        self,
+        *,
+        spot_key: SpreadKey,
+        futures_key: SpreadKey,
+    ) -> SpreadSnapshot | None:
+        return self._latest_snapshots.get((spot_key, futures_key))
 
     def get_stats(self) -> dict[str, Any]:
         return {
@@ -188,6 +220,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             "funding_cached": len(self._funding),
             "active_windows": len(self._spread_windows),
             "latest_snapshots": len(self._latest_snapshots),
+            "scope": "exchange:market_type:symbol:timeframe",
         }
 
     # ------------------------------------------------------------------
@@ -198,21 +231,23 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         """
         Handler для market.quote.updated.
 
-        core.EventBus завжди передає Event, тому payload дістаємо з event.payload.
+        Payload може бути:
+        - QuoteSnapshot;
+        - dict payload від QuoteCache/data-layer.
         """
         if not self.is_running or not self._config.enabled:
+            self._stats["events_skipped_not_running"] += 1
             return
 
         self._stats["quote_events_received"] += 1
 
-        payload = event.payload
-        if not isinstance(payload, QuoteSnapshot):
+        quote = self.normalize_quote_event(event)
+        if quote is None:
             self._stats["invalid_payloads"] += 1
-            self._logger.warning(
-                "Invalid quote event payload | expected=%s actual=%s topic=%s",
-                "QuoteSnapshot",
-                payload.__class__.__name__ if payload is not None else "None",
-                event.topic,
+            self._mark_invalid_payload(
+                "expected QuoteSnapshot or quote dict payload",
+                payload_type=type(getattr(event, "payload", None)).__name__,
+                topic=getattr(event, "topic", None),
             )
             return
 
@@ -220,7 +255,12 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             try:
                 self._stats["quotes_received"] += 1
 
-                normalized_quote = self._normalize_quote(payload)
+                normalized_quote = self._normalize_quote(quote)
+
+                if not self._is_allowed_quote(normalized_quote):
+                    self._stats["events_skipped_scope"] += 1
+                    return
+
                 validity = validate_quote_snapshot(
                     normalized_quote,
                     max_age_ms=self._config.max_quote_age_ms,
@@ -229,13 +269,16 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                 if validity == QuoteValidity.INVALID:
                     self._stats["invalid_quotes"] += 1
                     self._logger.debug(
-                        "Rejected invalid quote | exchange=%s symbol=%s instrument_type=%s",
+                        "Rejected invalid quote | exchange=%s market_type=%s symbol=%s instrument_type=%s",
                         normalized_quote.exchange,
+                        normalized_quote.market_type,
                         normalized_quote.symbol,
                         normalized_quote.instrument_type.value,
                         extra={
                             "exchange": normalized_quote.exchange,
+                            "market_type": normalized_quote.market_type,
                             "symbol": normalized_quote.symbol,
+                            "timeframe": normalized_quote.timeframe,
                             "event_type": "analytics.spreads.invalid_quote",
                         },
                     )
@@ -249,40 +292,50 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                     self._stats["incomplete_quotes"] += 1
                     return
 
-                self._store_quote(normalized_quote)
+                stored = self._store_quote(normalized_quote)
+                if not stored:
+                    self._stats["events_skipped_scope"] += 1
+                    return
+
                 await self._recalculate_for_quote(
                     normalized_quote,
-                    correlation_id=event.correlation_id,
-                    source_event_id=event.event_id,
+                    correlation_id=getattr(event, "correlation_id", None),
+                    source_event_id=getattr(event, "event_id", None),
                 )
 
             except Exception as exc:
                 self._mark_exception(
                     "Failed to process spot/futures quote update",
                     exc,
-                    exchange=getattr(payload, "exchange", None),
-                    symbol=getattr(payload, "symbol", None),
-                    event_id=event.event_id,
-                    correlation_id=event.correlation_id,
+                    exchange=getattr(quote, "exchange", None),
+                    market_type=getattr(quote, "market_type", None),
+                    symbol=getattr(quote, "symbol", None),
+                    timeframe=getattr(quote, "timeframe", None),
+                    event_id=getattr(event, "event_id", None),
+                    correlation_id=getattr(event, "correlation_id", None),
                 )
 
     async def on_funding_update(self, event: Event) -> None:
         """
         Handler для market.funding.updated.
+
+        Payload може бути:
+        - FundingSnapshot;
+        - dict payload від FundingCache/data-layer.
         """
         if not self.is_running or not self._config.enabled:
+            self._stats["events_skipped_not_running"] += 1
             return
 
         self._stats["funding_events_received"] += 1
 
-        payload = event.payload
-        if not isinstance(payload, FundingSnapshot):
+        funding = self.normalize_funding_event(event)
+        if funding is None:
             self._stats["invalid_payloads"] += 1
-            self._logger.warning(
-                "Invalid funding event payload | expected=%s actual=%s topic=%s",
-                "FundingSnapshot",
-                payload.__class__.__name__ if payload is not None else "None",
-                event.topic,
+            self._mark_invalid_payload(
+                "expected FundingSnapshot or funding dict payload",
+                payload_type=type(getattr(event, "payload", None)).__name__,
+                topic=getattr(event, "topic", None),
             )
             return
 
@@ -290,65 +343,37 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             try:
                 self._stats["funding_updates"] += 1
 
-                normalized_funding = FundingSnapshot(
-                    exchange=normalize_exchange(payload.exchange),
-                    symbol=normalize_symbol(payload.symbol),
-                    funding_rate=payload.funding_rate,
-                    timestamp=payload.timestamp,
-                    next_funding_time=payload.next_funding_time,
-                    predicted_rate=payload.predicted_rate,
-                    interval_hours=payload.interval_hours,
-                    metadata=dict(payload.metadata),
-                )
+                normalized_funding = self._normalize_funding(funding)
 
-                if not self._is_allowed_futures_exchange(normalized_funding.exchange):
+                if not self._is_allowed_funding(normalized_funding):
+                    self._stats["events_skipped_scope"] += 1
                     return
 
-                key = (normalized_funding.exchange, normalized_funding.symbol)
-                self._funding[key] = normalized_funding
+                self._funding[normalized_funding.key] = normalized_funding
                 self._stats["funding_stored"] += 1
+                self._enforce_funding_cache_limit()
 
                 await self._recalculate_for_funding(
                     normalized_funding,
-                    correlation_id=event.correlation_id,
-                    source_event_id=event.event_id,
+                    correlation_id=getattr(event, "correlation_id", None),
+                    source_event_id=getattr(event, "event_id", None),
                 )
 
             except Exception as exc:
                 self._mark_exception(
                     "Failed to process funding update",
                     exc,
-                    exchange=getattr(payload, "exchange", None),
-                    symbol=getattr(payload, "symbol", None),
-                    event_id=event.event_id,
-                    correlation_id=event.correlation_id,
+                    exchange=getattr(funding, "exchange", None),
+                    market_type=getattr(funding, "market_type", None),
+                    symbol=getattr(funding, "symbol", None),
+                    timeframe=getattr(funding, "timeframe", None),
+                    event_id=getattr(event, "event_id", None),
+                    correlation_id=getattr(event, "correlation_id", None),
                 )
 
     # ------------------------------------------------------------------
     # Scheduler jobs
     # ------------------------------------------------------------------
-    def _cleanup_orphan_windows(self) -> int:
-        """
-        Видаляє rolling windows, для яких більше немає актуального latest snapshot.
-
-        Важливо:
-        - _spread_windows не мають власного timestamp;
-        - тому TTL для них застосовується опосередковано через _latest_snapshots;
-        - якщо snapshot був видалений як stale, відповідне rolling window
-          теж не повинно залишатися активним.
-        """
-        if not self._spread_windows:
-            return 0
-
-        active_snapshot_keys = set(self._latest_snapshots.keys())
-
-        removed = 0
-        for key in list(self._spread_windows.keys()):
-            if key not in active_snapshot_keys:
-                self._spread_windows.pop(key, None)
-                removed += 1
-
-        return removed
 
     async def cleanup_stale_state(self) -> None:
         """
@@ -407,6 +432,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                 "analyzer": self.__class__.__name__,
                 "service_name": self._service_name,
                 "stats": self.get_stats(),
+                "scope": "exchange:market_type:symbol:timeframe",
             },
             priority=EventPriority.LOW,
         )
@@ -416,10 +442,17 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
     # ------------------------------------------------------------------
 
     def _normalize_quote(self, quote: QuoteSnapshot) -> QuoteSnapshot:
+        """
+        Rebuild через QuoteSnapshot, щоб гарантувати __post_init__
+        normalization і зберегти market_type/timeframe/exchange_symbol.
+        """
         return QuoteSnapshot(
-            exchange=normalize_exchange(quote.exchange),
-            symbol=normalize_symbol(quote.symbol),
+            exchange=quote.exchange,
+            symbol=quote.symbol,
             instrument_type=quote.instrument_type,
+            market_type=quote.market_type,
+            timeframe=quote.timeframe,
+            exchange_symbol=quote.exchange_symbol,
             bid=quote.bid,
             ask=quote.ask,
             bid_size=quote.bid_size,
@@ -433,23 +466,41 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             metadata=dict(quote.metadata),
         )
 
-    def _store_quote(self, quote: QuoteSnapshot) -> None:
-        key = (quote.exchange, quote.symbol)
+    def _normalize_funding(self, funding: FundingSnapshot) -> FundingSnapshot:
+        return FundingSnapshot(
+            exchange=funding.exchange,
+            symbol=funding.symbol,
+            market_type=funding.market_type,
+            timeframe=funding.timeframe,
+            exchange_symbol=funding.exchange_symbol,
+            funding_rate=funding.funding_rate,
+            timestamp=funding.timestamp,
+            next_funding_time=funding.next_funding_time,
+            predicted_rate=funding.predicted_rate,
+            interval_hours=funding.interval_hours,
+            metadata=dict(funding.metadata),
+        )
 
+    def _store_quote(self, quote: QuoteSnapshot) -> bool:
         if quote.instrument_type == InstrumentType.SPOT:
-            if not self._is_allowed_spot_exchange(quote.exchange):
-                return
-            self._spot_quotes[key] = quote
+            if not self._is_allowed_spot_quote(quote):
+                return False
+
+            self._spot_quotes[quote.key] = quote
             self._stats["quotes_stored"] += 1
             self._enforce_quote_cache_limit(self._spot_quotes)
-            return
+            return True
 
         if quote.instrument_type in InstrumentType.derivatives():
-            if not self._is_allowed_futures_exchange(quote.exchange):
-                return
-            self._futures_quotes[key] = quote
+            if not self._is_allowed_futures_quote(quote):
+                return False
+
+            self._futures_quotes[quote.key] = quote
             self._stats["quotes_stored"] += 1
             self._enforce_quote_cache_limit(self._futures_quotes)
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Recalculation
@@ -462,13 +513,11 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         correlation_id: str | None = None,
         source_event_id: str | None = None,
     ) -> None:
-        symbol = quote.symbol
-
         if quote.instrument_type == InstrumentType.SPOT:
             futures_candidates = [
-                fut
-                for (exchange, sym), fut in self._futures_quotes.items()
-                if sym == symbol and self._is_allowed_futures_exchange(exchange)
+                futures_quote
+                for futures_quote in self._futures_quotes.values()
+                if self._quotes_can_pair(quote, futures_quote)
             ]
 
             for futures_quote in futures_candidates:
@@ -481,13 +530,13 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             return
 
         if quote.instrument_type in InstrumentType.derivatives():
-            if not self._is_allowed_futures_exchange(quote.exchange):
+            if not self._is_allowed_futures_quote(quote):
                 return
 
             spot_candidates = [
-                spot
-                for (exchange, sym), spot in self._spot_quotes.items()
-                if sym == symbol and self._is_allowed_spot_exchange(exchange)
+                spot_quote
+                for spot_quote in self._spot_quotes.values()
+                if self._quotes_can_pair(spot_quote, quote)
             ]
 
             for spot_quote in spot_candidates:
@@ -505,20 +554,17 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         correlation_id: str | None = None,
         source_event_id: str | None = None,
     ) -> None:
-        symbol = funding.symbol
-        futures_exchange = funding.exchange
-
-        if not self._is_allowed_futures_exchange(futures_exchange):
-            return
-
-        futures_quote = self._futures_quotes.get((futures_exchange, symbol))
+        futures_quote = self._futures_quotes.get(funding.key)
         if futures_quote is None:
             return
 
+        if not self._is_allowed_futures_quote(futures_quote):
+            return
+
         spot_candidates = [
-            spot
-            for (exchange, sym), spot in self._spot_quotes.items()
-            if sym == symbol and self._is_allowed_spot_exchange(exchange)
+            spot_quote
+            for spot_quote in self._spot_quotes.values()
+            if self._quotes_can_pair(spot_quote, futures_quote)
         ]
 
         for spot_quote in spot_candidates:
@@ -543,7 +589,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         if futures_quote.instrument_type not in InstrumentType.derivatives():
             return
 
-        if spot_quote.symbol != futures_quote.symbol:
+        if not self._quotes_can_pair(spot_quote, futures_quote):
             return
 
         spot_validity = validate_quote_snapshot(
@@ -579,7 +625,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         key = self._snapshot_key(snapshot)
         previous_snapshot = self._latest_snapshots.get(key)
 
-        if self._should_skip_emit(key, snapshot.timestamp):
+        if self._should_skip_snapshot_emit(snapshot):
             self._stats["emit_skips"] += 1
             return
 
@@ -595,6 +641,8 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.SPOT_FUTURES.value,
+                "spot_key": str(spread_key_to_dict(spot_quote.key)),
+                "futures_key": str(spread_key_to_dict(futures_quote.key)),
             },
         )
 
@@ -612,6 +660,8 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.SPOT_FUTURES.value,
+                "spot_key": str(spread_key_to_dict(spot_quote.key)),
+                "futures_key": str(spread_key_to_dict(futures_quote.key)),
             },
         )
 
@@ -639,7 +689,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         spread_bps_value = spread_bps(raw_spread, spot_mid)
         basis = basis_from_prices(futures_mid, spot_mid)
 
-        funding_snapshot = self._funding.get((futures_exchange, symbol))
+        funding_snapshot = self._funding.get(futures_quote.key)
         funding_rate = funding_snapshot.funding_rate if funding_snapshot is not None else None
 
         funding_adjusted = funding_adjusted_spread(
@@ -648,7 +698,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             notional=self._config.notional_for_funding_adjustment,
         )
 
-        window_key = (symbol, spot_exchange, futures_exchange)
+        window_key = self._pair_key(spot_quote, futures_quote)
         window = self._get_or_create_window(window_key)
         window.append(raw_spread)
 
@@ -660,10 +710,15 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         return SpreadSnapshot(
             spread_type=SpreadType.SPOT_FUTURES,
             symbol=symbol,
+            timeframe=spot_quote.timeframe,
             leg_a_exchange=spot_exchange,
             leg_b_exchange=futures_exchange,
             leg_a_type=InstrumentType.SPOT,
             leg_b_type=futures_quote.instrument_type,
+            leg_a_market_type=spot_quote.market_type,
+            leg_b_market_type=futures_quote.market_type,
+            leg_a_exchange_symbol=spot_quote.exchange_symbol,
+            leg_b_exchange_symbol=futures_quote.exchange_symbol,
             pricing_source=PricingSource.BID_ASK,
             raw_spread=raw_spread,
             spread_pct=spread_percent,
@@ -688,11 +743,20 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                 "spot_age_ms": quote_age_ms(spot_quote),
                 "futures_age_ms": quote_age_ms(futures_quote),
                 "funding_rate": str(funding_rate) if funding_rate is not None else None,
-                "funding_timestamp": funding_snapshot.timestamp.isoformat()
-                if funding_snapshot is not None
-                else None,
+                "funding_timestamp": (
+                    funding_snapshot.timestamp.isoformat()
+                    if funding_snapshot is not None
+                    else None
+                ),
                 "spot_exchange": spot_exchange,
                 "futures_exchange": futures_exchange,
+                "spot_market_type": spot_quote.market_type,
+                "futures_market_type": futures_quote.market_type,
+                "timeframe": spot_quote.timeframe,
+                "spot_exchange_symbol": spot_quote.exchange_symbol,
+                "futures_exchange_symbol": futures_quote.exchange_symbol,
+                "spot_key": spread_key_to_dict(spot_quote.key),
+                "futures_key": spread_key_to_dict(futures_quote.key),
                 "spot_sequence_id": spot_quote.sequence_id,
                 "futures_sequence_id": futures_quote.sequence_id,
                 "regime": regime_result.regime.value,
@@ -706,7 +770,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
     def _get_or_create_window(
         self,
-        key: tuple[str, str, str],
+        key: SnapshotKey,
     ) -> RollingDecimalWindow:
         window = self._spread_windows.get(key)
         if window is not None:
@@ -726,6 +790,60 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
     # Filtering
     # ------------------------------------------------------------------
 
+    def _is_allowed_quote(self, quote: QuoteSnapshot) -> bool:
+        if quote.instrument_type == InstrumentType.SPOT:
+            return self._is_allowed_spot_quote(quote)
+
+        if quote.instrument_type in InstrumentType.derivatives():
+            return self._is_allowed_futures_quote(quote)
+
+        return False
+
+    def _is_allowed_spot_quote(self, quote: QuoteSnapshot) -> bool:
+        checker = getattr(self._config, "is_spot_quote_allowed", None)
+        if callable(checker):
+            return bool(
+                checker(
+                    exchange=quote.exchange,
+                    market_type=quote.market_type,
+                    instrument_type=quote.instrument_type,
+                    symbol=quote.symbol,
+                    timeframe=quote.timeframe,
+                )
+            )
+
+        return (
+            quote.instrument_type == InstrumentType.SPOT
+            and self._is_allowed_spot_exchange(quote.exchange)
+            and self.should_process_key(quote.key)
+        )
+
+    def _is_allowed_futures_quote(self, quote: QuoteSnapshot) -> bool:
+        checker = getattr(self._config, "is_futures_quote_allowed", None)
+        if callable(checker):
+            return bool(
+                checker(
+                    exchange=quote.exchange,
+                    market_type=quote.market_type,
+                    instrument_type=quote.instrument_type,
+                    symbol=quote.symbol,
+                    timeframe=quote.timeframe,
+                )
+            )
+
+        return (
+            quote.instrument_type in InstrumentType.derivatives()
+            and self._is_allowed_futures_exchange(quote.exchange)
+            and self.should_process_key(quote.key)
+        )
+
+    def _is_allowed_funding(self, funding: FundingSnapshot) -> bool:
+        return (
+            self._config.is_futures_exchange_allowed(funding.exchange)
+            and self._config.is_futures_market_type_allowed(funding.market_type)
+            and self._config.should_process_key(funding.key)
+        )
+
     def _is_allowed_spot_exchange(self, exchange: str) -> bool:
         checker = getattr(self._config, "is_spot_exchange_allowed", None)
         if callable(checker):
@@ -734,7 +852,9 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         if self._config.default_spot_exchange is None:
             return True
 
-        return normalize_exchange(exchange) == normalize_exchange(self._config.default_spot_exchange)
+        return self.normalize_exchange(exchange) == self.normalize_exchange(
+            self._config.default_spot_exchange
+        )
 
     def _is_allowed_futures_exchange(self, exchange: str) -> bool:
         checker = getattr(self._config, "is_futures_exchange_allowed", None)
@@ -744,7 +864,28 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         if self._config.default_futures_exchange is None:
             return True
 
-        return normalize_exchange(exchange) == normalize_exchange(self._config.default_futures_exchange)
+        return self.normalize_exchange(exchange) == self.normalize_exchange(
+            self._config.default_futures_exchange
+        )
+
+    @staticmethod
+    def _quotes_can_pair(
+        spot_quote: QuoteSnapshot,
+        futures_quote: QuoteSnapshot,
+    ) -> bool:
+        if spot_quote.instrument_type != InstrumentType.SPOT:
+            return False
+
+        if futures_quote.instrument_type not in InstrumentType.derivatives():
+            return False
+
+        if spot_quote.symbol != futures_quote.symbol:
+            return False
+
+        if spot_quote.timeframe != futures_quote.timeframe:
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Cleanup helpers
@@ -752,7 +893,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
     def _cleanup_quote_cache(
         self,
-        cache: dict[tuple[str, str], QuoteSnapshot],
+        cache: dict[SpreadKey, QuoteSnapshot],
         *,
         now: datetime,
         ttl: timedelta,
@@ -802,9 +943,26 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
         return len(stale_keys)
 
+    def _cleanup_orphan_windows(self) -> int:
+        """
+        Видаляє rolling windows, для яких більше немає актуального latest snapshot.
+        """
+        if not self._spread_windows:
+            return 0
+
+        active_snapshot_keys = set(self._latest_snapshots.keys())
+
+        removed = 0
+        for key in list(self._spread_windows.keys()):
+            if key not in active_snapshot_keys:
+                self._spread_windows.pop(key, None)
+                removed += 1
+
+        return removed
+
     def _enforce_quote_cache_limit(
         self,
-        cache: dict[tuple[str, str], QuoteSnapshot],
+        cache: dict[SpreadKey, QuoteSnapshot],
     ) -> None:
         max_items = self._config.max_cached_quotes
         if len(cache) <= max_items:
@@ -818,6 +976,20 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         overflow = len(cache) - max_items
         for key, _ in sorted_items[:overflow]:
             cache.pop(key, None)
+
+    def _enforce_funding_cache_limit(self) -> None:
+        max_items = self._config.max_cached_quotes
+        if len(self._funding) <= max_items:
+            return
+
+        sorted_items = sorted(
+            self._funding.items(),
+            key=lambda item: item[1].timestamp,
+        )
+
+        overflow = len(self._funding) - max_items
+        for key, _ in sorted_items[:overflow]:
+            self._funding.pop(key, None)
 
     def _enforce_window_cache_limit(self) -> int:
         max_items = self._config.max_cached_windows
@@ -844,24 +1016,17 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _snapshot_key(snapshot: SpreadSnapshot) -> tuple[str, str, str]:
-        return (
-            snapshot.symbol,
-            snapshot.leg_a_exchange,
-            snapshot.leg_b_exchange,
-        )
+    def _pair_key(
+        spot_quote: QuoteSnapshot,
+        futures_quote: QuoteSnapshot,
+    ) -> SnapshotKey:
+        return (spot_quote.key, futures_quote.key)
 
     @staticmethod
-    def _topic(config_attr: str, fallback: str) -> str:
-        """
-        Placeholder for instance override safety.
+    def _snapshot_key(snapshot: SpreadSnapshot) -> SnapshotKey:
+        return (snapshot.leg_a_key, snapshot.leg_b_key)
 
-        This method is intentionally static in signature style compatibility,
-        but actual config access is implemented below through instance binding.
-        """
-        raise NotImplementedError("Use instance _topic method")
-
-    def _topic(self, config_attr: str, fallback: str) -> str:  # type: ignore[no-redef]
+    def _topic(self, config_attr: str, fallback: str) -> str:
         value = getattr(self._config, config_attr, None)
         if isinstance(value, str) and value.strip():
             return value

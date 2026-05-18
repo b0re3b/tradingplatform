@@ -10,7 +10,13 @@ from core.scheduler import Scheduler
 from .base import BaseSpreadAnalyzer
 from .config import CrossExchangeSpreadConfig
 from .enums import InstrumentType, PricingSource, QuoteValidity, SpreadType
-from .models import ArbitrageOpportunity, QuoteSnapshot, SpreadSnapshot
+from .models import (
+    ArbitrageOpportunity,
+    QuoteSnapshot,
+    SpreadKey,
+    SpreadSnapshot,
+    spread_key_to_dict,
+)
 from .spread_opportunity_detector import (
     OpportunityDetectionResult,
     SpreadOpportunityDetector,
@@ -20,8 +26,6 @@ from .spread_utils import (
     RollingDecimalWindow,
     aligned_quotes,
     infer_direction,
-    normalize_exchange,
-    normalize_symbol,
     quote_age_ms,
     spread_abs,
     spread_bps,
@@ -30,14 +34,18 @@ from .spread_utils import (
 )
 
 
+SnapshotKey = tuple[SpreadKey, SpreadKey]
+
+
 class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
     """
     Production-grade analyzer для cross-exchange spread analytics.
 
     Відповідальність:
-    - слухати market.quote.updated;
+    - слухати data-layer market.quote.updated;
+    - приймати QuoteSnapshot або dict payload від QuoteCache;
     - кешувати quotes з різних бірж;
-    - порівнювати один symbol/instrument_type між біржами;
+    - порівнювати один symbol/instrument_type/market_type/timeframe між біржами;
     - будувати SpreadSnapshot;
     - оновлювати rolling stats;
     - визначати spread regime;
@@ -48,13 +56,20 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
     - публікувати analytics.spreads.arbitrage.opportunity;
     - запускати cleanup/heartbeat через core.Scheduler.
 
-    Не відповідає за:
-    - отримання raw market-data з бірж;
-    - execution;
-    - risk approval;
-    - strategy decisions;
-    - storage напряму;
-    - прямі виклики strategy/risk/execution.
+    Correct production input flow:
+        exchange adapters
+            -> market.quote / market.orderbook
+            -> QuoteCache / OrderBookCache
+            -> market.quote.updated
+            -> CrossExchangeSpreadAnalyzer
+            -> analytics.spreads.*
+
+    Важливо:
+    - не отримує raw market-data з бірж напряму;
+    - не слухає raw market.quote у production;
+    - не викликає strategy/risk/execution напряму;
+    - state ізольований через SpreadKey:
+      exchange + market_type + symbol + timeframe.
     """
 
     DEFAULT_QUOTE_TOPIC = "market.quote.updated"
@@ -78,19 +93,10 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         self._config: CrossExchangeSpreadConfig = config
         self._opportunity_detector = SpreadOpportunityDetector(config)
 
-        self._quotes: dict[tuple[str, str, InstrumentType], QuoteSnapshot] = {}
-        self._spread_windows: dict[
-            tuple[str, str, str, InstrumentType],
-            RollingDecimalWindow,
-        ] = {}
-        self._latest_snapshots: dict[
-            tuple[str, str, str, InstrumentType],
-            SpreadSnapshot,
-        ] = {}
-        self._latest_opportunities: dict[
-            tuple[str, str, str, InstrumentType],
-            ArbitrageOpportunity,
-        ] = {}
+        self._quotes: dict[SpreadKey, QuoteSnapshot] = {}
+        self._spread_windows: dict[SnapshotKey, RollingDecimalWindow] = {}
+        self._latest_snapshots: dict[SnapshotKey, SpreadSnapshot] = {}
+        self._latest_opportunities: dict[SnapshotKey, ArbitrageOpportunity] = {}
 
         self._stats.update(
             {
@@ -102,7 +108,8 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "stale_quotes": 0,
                 "unaligned_quotes": 0,
                 "instrument_type_skips": 0,
-                "preferred_exchange_skips": 0,
+                "exchange_pair_skips": 0,
+                "scope_skips": 0,
                 "quotes_stored": 0,
                 "snapshots_built": 0,
                 "snapshots_skipped": 0,
@@ -116,6 +123,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "cleanup_removed_snapshots": 0,
                 "cleanup_removed_windows": 0,
                 "cleanup_removed_opportunities": 0,
+                "events_skipped_not_running": 0,
             }
         )
 
@@ -127,14 +135,18 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         """
         Реєструє EventBus subscriptions.
 
-        core.EventBus.subscribe() синхронний, тому register() теж синхронний.
-        Handler-и приймають core.event_bus.Event.
+        Production topic:
+            market.quote.updated
+
+        Raw topic:
+            market.quote
+
+        не використовується, якщо config.allow_legacy_raw_topics=False.
         """
         if self._registered:
             return
 
-        self._subscribe(
-            self._topic("quote_event_topic", self.DEFAULT_QUOTE_TOPIC),
+        self._subscribe_quote_updates(
             self.on_quote_update,
             name=f"{self._service_name}.on_quote_update",
         )
@@ -180,22 +192,51 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         exchange_a: str,
         exchange_b: str,
         instrument_type: InstrumentType,
+        *,
+        market_type: str,
+        timeframe: str | None = None,
     ) -> SpreadSnapshot | None:
-        normalized_a = normalize_exchange(exchange_a)
-        normalized_b = normalize_exchange(exchange_b)
+        normalized_timeframe = timeframe or self._config.default_timeframe
 
-        key = self._snapshot_key_from_values(
-            symbol=normalize_symbol(symbol),
-            exchange_a=min(normalized_a, normalized_b),
-            exchange_b=max(normalized_a, normalized_b),
-            instrument_type=instrument_type,
+        key_a = self.make_key(
+            exchange=exchange_a,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=normalized_timeframe,
         )
-        return self._latest_snapshots.get(key)
+        key_b = self.make_key(
+            exchange=exchange_b,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=normalized_timeframe,
+        )
+
+        normalized_key = self._canonical_pair_key(key_a, key_b)
+        snapshot = self._latest_snapshots.get(normalized_key)
+        if snapshot is None:
+            return None
+
+        if snapshot.leg_a_type != instrument_type or snapshot.leg_b_type != instrument_type:
+            return None
+
+        return snapshot
+
+    def get_latest_snapshot_by_keys(
+        self,
+        *,
+        quote_a_key: SpreadKey,
+        quote_b_key: SpreadKey,
+    ) -> SpreadSnapshot | None:
+        return self._latest_snapshots.get(
+            self._canonical_pair_key(quote_a_key, quote_b_key)
+        )
 
     def get_best_opportunities(
         self,
         symbol: str | None = None,
         instrument_type: InstrumentType | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         profitable_only: bool = True,
         active_only: bool = True,
         limit: int | None = None,
@@ -203,7 +244,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         opportunities = list(self._latest_opportunities.values())
 
         if symbol is not None:
-            normalized_symbol = normalize_symbol(symbol)
+            normalized_symbol = self.normalize_symbol(symbol)
             opportunities = [
                 opportunity
                 for opportunity in opportunities
@@ -218,6 +259,23 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 and opportunity.sell_instrument_type == instrument_type
             ]
 
+        if market_type is not None:
+            normalized_market_type = self.normalize_market_type(market_type)
+            opportunities = [
+                opportunity
+                for opportunity in opportunities
+                if opportunity.buy_market_type == normalized_market_type
+                and opportunity.sell_market_type == normalized_market_type
+            ]
+
+        if timeframe is not None:
+            normalized_timeframe = self.normalize_timeframe(timeframe)
+            opportunities = [
+                opportunity
+                for opportunity in opportunities
+                if opportunity.timeframe == normalized_timeframe
+            ]
+
         if profitable_only:
             opportunities = [
                 opportunity
@@ -227,10 +285,13 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
         if active_only:
             active_opportunities: list[ArbitrageOpportunity] = []
+            now = datetime.utcnow()
+
             for opportunity in opportunities:
-                self._opportunity_detector.expire_opportunity(opportunity)
-                if self._opportunity_detector.is_opportunity_active(opportunity):
+                self._opportunity_detector.expire_opportunity(opportunity, now=now)
+                if self._opportunity_detector.is_opportunity_active(opportunity, now=now):
                     active_opportunities.append(opportunity)
+
             opportunities = active_opportunities
 
         opportunities.sort(key=lambda item: item.net_edge, reverse=True)
@@ -250,6 +311,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             "active_windows": len(self._spread_windows),
             "latest_snapshots": len(self._latest_snapshots),
             "latest_opportunities": len(self._latest_opportunities),
+            "scope": "exchange:market_type:symbol:timeframe",
         }
 
     # ------------------------------------------------------------------
@@ -260,21 +322,23 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         """
         Handler для market.quote.updated.
 
-        core.EventBus передає Event, тому payload дістаємо через event.payload.
+        Payload може бути:
+        - QuoteSnapshot;
+        - dict payload від QuoteCache/data-layer.
         """
         if not self.is_running or not self._config.enabled:
+            self._stats["events_skipped_not_running"] += 1
             return
 
         self._stats["quote_events_received"] += 1
 
-        payload = event.payload
-        if not isinstance(payload, QuoteSnapshot):
+        quote = self.normalize_quote_event(event)
+        if quote is None:
             self._stats["invalid_payloads"] += 1
-            self._logger.warning(
-                "Invalid quote event payload | expected=%s actual=%s topic=%s",
-                "QuoteSnapshot",
-                payload.__class__.__name__ if payload is not None else "None",
-                event.topic,
+            self._mark_invalid_payload(
+                "expected QuoteSnapshot or quote dict payload",
+                payload_type=type(getattr(event, "payload", None)).__name__,
+                topic=getattr(event, "topic", None),
             )
             return
 
@@ -282,10 +346,10 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             try:
                 self._stats["quotes_received"] += 1
 
-                normalized_quote = self._normalize_quote(payload)
+                normalized_quote = self._normalize_quote(quote)
 
-                if not self._is_instrument_type_allowed(normalized_quote.instrument_type):
-                    self._stats["instrument_type_skips"] += 1
+                if not self._is_quote_allowed(normalized_quote):
+                    self._stats["scope_skips"] += 1
                     return
 
                 validity = validate_quote_snapshot(
@@ -309,44 +373,25 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
                 await self._recalculate_for_quote(
                     normalized_quote,
-                    correlation_id=event.correlation_id,
-                    source_event_id=event.event_id,
+                    correlation_id=getattr(event, "correlation_id", None),
+                    source_event_id=getattr(event, "event_id", None),
                 )
 
             except Exception as exc:
                 self._mark_exception(
                     "Failed to process cross-exchange quote update",
                     exc,
-                    exchange=getattr(payload, "exchange", None),
-                    symbol=getattr(payload, "symbol", None),
-                    event_id=event.event_id,
-                    correlation_id=event.correlation_id,
+                    exchange=getattr(quote, "exchange", None),
+                    market_type=getattr(quote, "market_type", None),
+                    symbol=getattr(quote, "symbol", None),
+                    timeframe=getattr(quote, "timeframe", None),
+                    event_id=getattr(event, "event_id", None),
+                    correlation_id=getattr(event, "correlation_id", None),
                 )
 
     # ------------------------------------------------------------------
     # Scheduler jobs
     # ------------------------------------------------------------------
-    def _cleanup_orphan_windows(self) -> int:
-        """
-        Видаляє rolling windows, для яких більше немає актуального latest snapshot.
-
-        RollingDecimalWindow не має власного timestamp, тому TTL-cleanup
-        застосовується опосередковано через _latest_snapshots.
-        Якщо snapshot видалений як stale, відповідне rolling window теж
-        не повинно залишатися активним.
-        """
-        if not self._spread_windows:
-            return 0
-
-        active_snapshot_keys = set(self._latest_snapshots.keys())
-
-        removed = 0
-        for key in list(self._spread_windows.keys()):
-            if key not in active_snapshot_keys:
-                self._spread_windows.pop(key, None)
-                removed += 1
-
-        return removed
 
     async def cleanup_stale_state(self) -> None:
         """
@@ -363,7 +408,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
             removed_quotes = self._cleanup_quote_cache(now=now, ttl=ttl)
             removed_snapshots = self._cleanup_snapshot_cache(now=now, ttl=ttl)
-            removed_opportunities = self._cleanup_opportunity_cache(now=now)
+            removed_opportunities = self._cleanup_opportunities(now=now)
 
             removed_orphan_windows = self._cleanup_orphan_windows()
             removed_limit_windows = self._enforce_window_cache_limit()
@@ -403,6 +448,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "analyzer": self.__class__.__name__,
                 "service_name": self._service_name,
                 "stats": self.get_stats(),
+                "scope": "exchange:market_type:symbol:timeframe",
             },
             priority=EventPriority.LOW,
         )
@@ -412,10 +458,17 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
     # ------------------------------------------------------------------
 
     def _normalize_quote(self, quote: QuoteSnapshot) -> QuoteSnapshot:
+        """
+        Rebuild через QuoteSnapshot, щоб гарантувати __post_init__
+        normalization і зберегти market_type/timeframe/exchange_symbol.
+        """
         return QuoteSnapshot(
-            exchange=normalize_exchange(quote.exchange),
-            symbol=normalize_symbol(quote.symbol),
+            exchange=quote.exchange,
+            symbol=quote.symbol,
             instrument_type=quote.instrument_type,
+            market_type=quote.market_type,
+            timeframe=quote.timeframe,
+            exchange_symbol=quote.exchange_symbol,
             bid=quote.bid,
             ask=quote.ask,
             bid_size=quote.bid_size,
@@ -430,8 +483,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         )
 
     def _store_quote(self, quote: QuoteSnapshot) -> None:
-        key = self._quote_key(quote)
-        self._quotes[key] = quote
+        self._quotes[quote.key] = quote
         self._stats["quotes_stored"] += 1
         self._enforce_quote_cache_limit()
 
@@ -448,15 +500,13 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
     ) -> None:
         candidates = [
             other
-            for (exchange, symbol, instrument_type), other in self._quotes.items()
-            if symbol == quote.symbol
-            and instrument_type == quote.instrument_type
-            and exchange != quote.exchange
+            for other in self._quotes.values()
+            if self._quotes_can_pair(quote, other)
         ]
 
         for other_quote in candidates:
             if not self._is_exchange_pair_allowed(quote.exchange, other_quote.exchange):
-                self._stats["preferred_exchange_skips"] += 1
+                self._stats["exchange_pair_skips"] += 1
                 continue
 
             await self._try_build_and_publish(
@@ -474,10 +524,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         correlation_id: str | None = None,
         source_event_id: str | None = None,
     ) -> None:
-        if quote_a.symbol != quote_b.symbol:
-            return
-
-        if quote_a.instrument_type != quote_b.instrument_type:
+        if not self._quotes_can_pair(quote_a, quote_b):
             return
 
         validity_a = validate_quote_snapshot(
@@ -515,7 +562,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         key = self._snapshot_key(snapshot)
         previous_snapshot = self._latest_snapshots.get(key)
 
-        if self._should_skip_emit(key, snapshot.timestamp):
+        if self._should_skip_snapshot_emit(snapshot):
             self._stats["emit_skips"] += 1
             return
 
@@ -538,6 +585,8 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
+                "leg_a_key": str(spread_key_to_dict(snapshot.leg_a_key)),
+                "leg_b_key": str(spread_key_to_dict(snapshot.leg_b_key)),
             },
         )
 
@@ -556,6 +605,8 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
+                "leg_a_key": str(spread_key_to_dict(snapshot.leg_a_key)),
+                "leg_b_key": str(spread_key_to_dict(snapshot.leg_b_key)),
             },
         )
 
@@ -589,12 +640,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         spread_percent = spread_pct(raw_spread, mid_a)
         spread_bps_value = spread_bps(raw_spread, mid_a)
 
-        window_key = (
-            symbol,
-            quote_a.exchange,
-            quote_b.exchange,
-            instrument_type,
-        )
+        window_key = self._pair_key(quote_a, quote_b)
         window = self._get_or_create_window(window_key)
         window.append(raw_spread)
 
@@ -612,10 +658,15 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         return SpreadSnapshot(
             spread_type=SpreadType.CROSS_EXCHANGE,
             symbol=symbol,
+            timeframe=quote_a.timeframe,
             leg_a_exchange=quote_a.exchange,
             leg_b_exchange=quote_b.exchange,
             leg_a_type=instrument_type,
             leg_b_type=instrument_type,
+            leg_a_market_type=quote_a.market_type,
+            leg_b_market_type=quote_b.market_type,
+            leg_a_exchange_symbol=quote_a.exchange_symbol,
+            leg_b_exchange_symbol=quote_b.exchange_symbol,
             pricing_source=PricingSource.BID_ASK,
             raw_spread=raw_spread,
             spread_pct=spread_percent,
@@ -642,6 +693,10 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "quote_b_age_ms": quote_age_ms(quote_b),
                 "quote_a_sequence_id": quote_a.sequence_id,
                 "quote_b_sequence_id": quote_b.sequence_id,
+                "quote_a_scope": spread_key_to_dict(quote_a.key),
+                "quote_b_scope": spread_key_to_dict(quote_b.key),
+                "quote_a_exchange_symbol": quote_a.exchange_symbol,
+                "quote_b_exchange_symbol": quote_b.exchange_symbol,
                 "regime": regime_result.regime.value,
                 "regime_reason": regime_result.reason,
                 "is_compressed": regime_result.is_compressed,
@@ -652,9 +707,11 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "sell_exchange": sell_exchange,
                 "buy_price": str(buy_price) if buy_price is not None else None,
                 "sell_price": str(sell_price) if sell_price is not None else None,
-                "gross_edge": str(gross_edge_per_unit)
-                if gross_edge_per_unit is not None
-                else None,
+                "gross_edge": (
+                    str(gross_edge_per_unit)
+                    if gross_edge_per_unit is not None
+                    else None
+                ),
             },
         )
 
@@ -680,6 +737,12 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
         opportunity = result.opportunity
         self._stats["opportunities_detected"] += 1
+
+        self._enrich_opportunity_scope(
+            opportunity=opportunity,
+            quote_a=quote_a,
+            quote_b=quote_b,
+        )
 
         if result.costs is not None:
             snapshot.estimated_fees = result.costs.estimated_fees
@@ -722,6 +785,8 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "symbol": opportunity.symbol,
                 "buy_exchange": opportunity.buy_exchange,
                 "sell_exchange": opportunity.sell_exchange,
+                "buy_market_type": opportunity.buy_market_type,
+                "sell_market_type": opportunity.sell_market_type,
             },
         )
 
@@ -744,15 +809,61 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 ),
                 "buy_exchange": opportunity.buy_exchange,
                 "sell_exchange": opportunity.sell_exchange,
+                "buy_market_type": opportunity.buy_market_type,
+                "sell_market_type": opportunity.sell_market_type,
+                "timeframe": opportunity.timeframe,
                 "gross_edge": str(opportunity.gross_edge),
                 "net_edge": str(opportunity.net_edge),
-                "spread_bps": str(opportunity.spread_bps)
-                if opportunity.spread_bps is not None
-                else None,
+                "spread_bps": (
+                    str(opportunity.spread_bps)
+                    if opportunity.spread_bps is not None
+                    else None
+                ),
                 "status": opportunity.status.value,
             },
         )
         return True
+
+    def _enrich_opportunity_scope(
+        self,
+        *,
+        opportunity: ArbitrageOpportunity,
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> None:
+        """
+        Якщо OpportunityDetector створив opportunity без нових scoped fields,
+        дозаповнюємо їх на основі quote legs.
+
+        Це дає backward compatibility з detector-ом, який ще може не знати
+        про market_type/timeframe/exchange_symbol.
+        """
+        quotes_by_exchange = {
+            quote_a.exchange: quote_a,
+            quote_b.exchange: quote_b,
+        }
+
+        buy_quote = quotes_by_exchange.get(opportunity.buy_exchange)
+        sell_quote = quotes_by_exchange.get(opportunity.sell_exchange)
+
+        if buy_quote is not None:
+            opportunity.buy_market_type = buy_quote.market_type
+            opportunity.timeframe = buy_quote.timeframe
+            opportunity.buy_exchange_symbol = buy_quote.exchange_symbol
+
+        if sell_quote is not None:
+            opportunity.sell_market_type = sell_quote.market_type
+            opportunity.timeframe = sell_quote.timeframe
+            opportunity.sell_exchange_symbol = sell_quote.exchange_symbol
+
+        opportunity.metadata.setdefault(
+            "buy_scope",
+            spread_key_to_dict(opportunity.buy_key),
+        )
+        opportunity.metadata.setdefault(
+            "sell_scope",
+            spread_key_to_dict(opportunity.sell_key),
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -763,8 +874,22 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         quote_a: QuoteSnapshot,
         quote_b: QuoteSnapshot,
     ) -> tuple[QuoteSnapshot, QuoteSnapshot]:
-        if quote_a.exchange <= quote_b.exchange:
+        key_a = (
+            quote_a.exchange,
+            quote_a.market_type,
+            quote_a.symbol,
+            quote_a.timeframe,
+        )
+        key_b = (
+            quote_b.exchange,
+            quote_b.market_type,
+            quote_b.symbol,
+            quote_b.timeframe,
+        )
+
+        if key_a <= key_b:
             return quote_a, quote_b
+
         return quote_b, quote_a
 
     def _best_arbitrage_legs(
@@ -803,7 +928,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
     def _get_or_create_window(
         self,
-        key: tuple[str, str, str, InstrumentType],
+        key: SnapshotKey,
     ) -> RollingDecimalWindow:
         window = self._spread_windows.get(key)
         if window is not None:
@@ -819,6 +944,28 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         self._spread_windows[key] = window
         return window
 
+    def _is_quote_allowed(self, quote: QuoteSnapshot) -> bool:
+        if not self._is_instrument_type_allowed(quote.instrument_type):
+            self._stats["instrument_type_skips"] += 1
+            return False
+
+        checker = getattr(self._config, "is_quote_allowed", None)
+        if callable(checker):
+            return bool(
+                checker(
+                    exchange=quote.exchange,
+                    market_type=quote.market_type,
+                    symbol=quote.symbol,
+                    instrument_type=quote.instrument_type,
+                    timeframe=quote.timeframe,
+                )
+            )
+
+        return (
+            self._is_exchange_allowed(quote.exchange)
+            and self.should_process_key(quote.key)
+        )
+
     def _is_instrument_type_allowed(self, instrument_type: InstrumentType) -> bool:
         checker = getattr(self._config, "is_instrument_type_allowed", None)
         if callable(checker):
@@ -826,18 +973,46 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
         return instrument_type in self._config.allowed_instrument_types
 
-    def _is_exchange_pair_allowed(self, exchange_a: str, exchange_b: str) -> bool:
-        checker = getattr(self._config, "is_exchange_preferred", None)
+    def _is_exchange_allowed(self, exchange: str) -> bool:
+        checker = getattr(self._config, "is_exchange_allowed", None)
         if callable(checker):
-            return bool(checker(exchange_a)) and bool(checker(exchange_b))
+            return bool(checker(exchange))
 
-        if not self._config.preferred_exchanges:
+        if not self._config.allowed_exchanges:
             return True
 
-        return (
-            normalize_exchange(exchange_a) in self._config.preferred_exchanges
-            and normalize_exchange(exchange_b) in self._config.preferred_exchanges
-        )
+        return self.normalize_exchange(exchange) in self._config.allowed_exchanges
+
+    def _is_exchange_pair_allowed(self, exchange_a: str, exchange_b: str) -> bool:
+        if exchange_a == exchange_b:
+            return False
+
+        return self._is_exchange_allowed(exchange_a) and self._is_exchange_allowed(exchange_b)
+
+    @staticmethod
+    def _quotes_can_pair(
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> bool:
+        if quote_a.key == quote_b.key:
+            return False
+
+        if quote_a.exchange == quote_b.exchange:
+            return False
+
+        if quote_a.symbol != quote_b.symbol:
+            return False
+
+        if quote_a.instrument_type != quote_b.instrument_type:
+            return False
+
+        if quote_a.market_type != quote_b.market_type:
+            return False
+
+        if quote_a.timeframe != quote_b.timeframe:
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Cleanup helpers
@@ -875,7 +1050,25 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         for key in stale_keys:
             self._latest_snapshots.pop(key, None)
 
-        return len(stale_keys)
+        removed_by_limit = self._enforce_snapshot_cache_limit()
+        return len(stale_keys) + removed_by_limit
+
+    def _cleanup_orphan_windows(self) -> int:
+        """
+        Видаляє rolling windows, для яких більше немає актуального latest snapshot.
+        """
+        if not self._spread_windows:
+            return 0
+
+        active_snapshot_keys = set(self._latest_snapshots.keys())
+
+        removed = 0
+        for key in list(self._spread_windows.keys()):
+            if key not in active_snapshot_keys:
+                self._spread_windows.pop(key, None)
+                removed += 1
+
+        return removed
 
     def _cleanup_opportunities(self, *, now: datetime) -> int:
         removed = 0
@@ -890,8 +1083,8 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 if opportunity.status.value == "expired":
                     self._stats["opportunities_expired"] += 1
 
-        self._enforce_opportunity_cache_limit()
-        return removed
+        removed_by_limit = self._enforce_opportunity_cache_limit()
+        return removed + removed_by_limit
 
     def _enforce_quote_cache_limit(self) -> None:
         max_items = self._config.max_cached_quotes
@@ -964,35 +1157,29 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _quote_key(quote: QuoteSnapshot) -> tuple[str, str, InstrumentType]:
-        return (
-            quote.exchange,
-            quote.symbol,
-            quote.instrument_type,
+    def _canonical_pair_key(
+        key_a: SpreadKey,
+        key_b: SpreadKey,
+    ) -> SnapshotKey:
+        if key_a <= key_b:
+            return key_a, key_b
+        return key_b, key_a
+
+    @staticmethod
+    def _pair_key(
+        quote_a: QuoteSnapshot,
+        quote_b: QuoteSnapshot,
+    ) -> SnapshotKey:
+        return CrossExchangeSpreadAnalyzer._canonical_pair_key(
+            quote_a.key,
+            quote_b.key,
         )
 
     @staticmethod
-    def _snapshot_key(snapshot: SpreadSnapshot) -> tuple[str, str, str, InstrumentType]:
-        return (
-            snapshot.symbol,
-            snapshot.leg_a_exchange,
-            snapshot.leg_b_exchange,
-            snapshot.leg_a_type,
-        )
-
-    @staticmethod
-    def _snapshot_key_from_values(
-        *,
-        symbol: str,
-        exchange_a: str,
-        exchange_b: str,
-        instrument_type: InstrumentType,
-    ) -> tuple[str, str, str, InstrumentType]:
-        return (
-            symbol,
-            exchange_a,
-            exchange_b,
-            instrument_type,
+    def _snapshot_key(snapshot: SpreadSnapshot) -> SnapshotKey:
+        return CrossExchangeSpreadAnalyzer._canonical_pair_key(
+            snapshot.leg_a_key,
+            snapshot.leg_b_key,
         )
 
     def _topic(self, config_attr: str, fallback: str) -> str:

@@ -4,38 +4,57 @@ import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any, Final, Mapping
 
-from core.event_bus import EventBus, EventPriority, Subscription
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
 from .config import BaseSpreadConfig
-from .models import SpreadSignal, SpreadSnapshot
+from .models import (
+    DEFAULT_TIMEFRAME,
+    FundingSnapshot,
+    QuoteSnapshot,
+    SpreadKey,
+    SpreadSignal,
+    SpreadSnapshot,
+    make_spread_key,
+    model_to_payload,
+    spread_key_to_dict,
+)
 from .spread_regime_detector import SpreadRegimeDetector
 from .spread_signal_engine import SpreadSignalEngine
 
 
 class BaseSpreadAnalyzer(ABC):
     """
-    Production-grade базовий клас для analytics/spreads analyzer-компонентів.
+    Production-grade базовий клас для analytics.spreads analyzer-компонентів.
 
     Відповідальність:
-    - dependency injection через core.EventBus / core.Scheduler / BaseSpreadConfig;
+    - constructor dependency injection через core.EventBus / core.Scheduler / BaseSpreadConfig;
     - register()/unregister() для EventBus subscriptions;
     - lifecycle start()/stop();
     - EventBus.emit() helpers;
     - Scheduler job registration helpers;
     - cooldown/throttling для сигналів і snapshot emit;
+    - shared scoped multi-market helpers;
+    - dict/dataclass payload normalization для data-layer events;
     - спільні stats;
     - production-grade logging через core.logger.get_logger;
     - shared SpreadRegimeDetector / SpreadSignalEngine.
 
-    Не відповідає за:
-    - конкретну бізнес-логіку spread-аналізу;
-    - побудову конкретних SpreadSnapshot;
-    - специфічну обробку market.quote / market.funding payload;
-    - пряме execution/risk/strategy управління.
+    Correct input flow:
+        exchange adapters
+            -> market.quote / market.funding
+            -> QuoteCache / FundingCache
+            -> market.quote.updated / market.funding.updated
+            -> analytics.spreads.*
+
+    Важливо:
+    - analyzer-и не мають напряму читати біржові WS/REST adapters;
+    - production subscriptions мають слухати data-layer updated topics;
+    - raw market.quote / market.funding дозволені тільки якщо config.allow_legacy_raw_topics=True;
+    - цей base class не містить spread business logic.
     """
 
     DEFAULT_SNAPSHOT_PRIORITY: Final[EventPriority] = EventPriority.NORMAL
@@ -87,18 +106,11 @@ class BaseSpreadAnalyzer(ABC):
         """
         Конкретний analyzer має підписатись на потрібні EventBus topics.
 
-        Приклад у дочірньому класі:
+        Production subscriptions мають використовувати:
+            self._subscribe_quote_updates(...)
+            self._subscribe_funding_updates(...)
 
-            def register(self) -> None:
-                if self._registered:
-                    return
-
-                self._subscribe(
-                    self._config.quote_event_topic,
-                    self.on_quote_update,
-                    name="spot_futures.on_quote_update",
-                )
-                self._registered = True
+        або self._subscribe(...) тільки для topics із config.production_input_topics.
         """
         raise NotImplementedError
 
@@ -118,13 +130,20 @@ class BaseSpreadAnalyzer(ABC):
         Вмикає analyzer.
 
         Важливо:
-        - start() не робить EventBus.subscribe();
+        - start() не робить EventBus.subscribe() напряму;
         - підписки мають створюватись через register();
         - periodic jobs запускаються через Scheduler, якщо він переданий.
         """
         if self._running:
             self._logger.warning(
                 "Analyzer already started | analyzer=%s",
+                self.__class__.__name__,
+            )
+            return
+
+        if not self._config.enabled:
+            self._logger.warning(
+                "Analyzer start skipped because config.enabled=False | analyzer=%s",
                 self.__class__.__name__,
             )
             return
@@ -142,10 +161,12 @@ class BaseSpreadAnalyzer(ABC):
         )
 
         await self._emit_lifecycle_event(
-            "analytics.spreads.analyzer.started",
+            self._config.analyzer_started_event_topic,
             {
                 "analyzer": self.__class__.__name__,
                 "service_name": self._service_name,
+                "production_input_topics": list(self._config.production_input_topics),
+                "scope": "exchange:market_type:symbol:timeframe",
             },
         )
 
@@ -154,10 +175,7 @@ class BaseSpreadAnalyzer(ABC):
         Вимикає analyzer.
 
         За замовчуванням stop() не видаляє EventBus subscriptions, а лише
-        переводить analyzer у неактивний стан. Це дозволяє повторно start()
-        без повторної реєстрації підписок.
-
-        Якщо треба повністю прибрати підписки — викликати unregister().
+        переводить analyzer у неактивний стан. Для повної відписки викликати unregister().
         """
         if not self._running:
             self._logger.warning(
@@ -176,7 +194,7 @@ class BaseSpreadAnalyzer(ABC):
         )
 
         await self._emit_lifecycle_event(
-            "analytics.spreads.analyzer.stopped",
+            self._config.analyzer_stopped_event_topic,
             {
                 "analyzer": self.__class__.__name__,
                 "service_name": self._service_name,
@@ -223,8 +241,267 @@ class BaseSpreadAnalyzer(ABC):
         return self._registered
 
     # ------------------------------------------------------------------
+    # Scoped key helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def normalize_exchange(exchange: object) -> str:
+        normalized = str(exchange or "").strip().lower()
+        if not normalized:
+            raise ValueError("exchange must not be empty")
+        return normalized
+
+    @staticmethod
+    def normalize_symbol(symbol: object) -> str:
+        normalized = (
+            str(symbol or "")
+            .replace("-", "")
+            .replace("/", "")
+            .replace("_", "")
+            .upper()
+            .strip()
+        )
+        if not normalized:
+            raise ValueError("symbol must not be empty")
+        return normalized
+
+    @staticmethod
+    def normalize_market_type(market_type: object) -> str:
+        normalized = str(market_type or "").strip().lower()
+        if not normalized:
+            raise ValueError("market_type must not be empty")
+        return normalized
+
+    @staticmethod
+    def normalize_timeframe(timeframe: object = DEFAULT_TIMEFRAME) -> str:
+        normalized = str(timeframe or DEFAULT_TIMEFRAME).strip()
+        return normalized if normalized else DEFAULT_TIMEFRAME
+
+    def make_key(
+        self,
+        *,
+        exchange: object,
+        market_type: object,
+        symbol: object,
+        timeframe: object | None = None,
+    ) -> SpreadKey:
+        return make_spread_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe or self._config.default_timeframe,
+        )
+
+    def key_to_dict(self, key: SpreadKey) -> dict[str, str]:
+        return spread_key_to_dict(key)
+
+    def should_process_key(self, key: SpreadKey) -> bool:
+        return self._config.should_process_key(key)
+
+    def should_process_scope(
+        self,
+        *,
+        symbol: object,
+        market_type: object,
+        timeframe: object | None = None,
+    ) -> bool:
+        return self._config.should_process_scope(
+            symbol=self.normalize_symbol(symbol),
+            market_type=self.normalize_market_type(market_type),
+            timeframe=self.normalize_timeframe(timeframe or self._config.default_timeframe),
+        )
+
+    def extract_key_from_quote(self, quote: QuoteSnapshot) -> SpreadKey:
+        return quote.key
+
+    def extract_key_from_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        default_timeframe: str | None = None,
+    ) -> SpreadKey | None:
+        """
+        Витягує SpreadKey із data-layer payload.
+
+        Мінімальні поля:
+            exchange, market_type, symbol
+
+        timeframe optional, default = config.default_timeframe.
+        """
+        exchange = payload.get("exchange")
+        market_type = payload.get("market_type")
+        symbol = payload.get("symbol")
+        timeframe = payload.get("timeframe") or default_timeframe or self._config.default_timeframe
+
+        if not exchange or not market_type or not symbol:
+            return None
+
+        try:
+            return self.make_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        except ValueError:
+            return None
+
+    def extract_key_from_event(self, event: Event) -> SpreadKey | None:
+        payload = getattr(event, "payload", None)
+
+        if isinstance(payload, QuoteSnapshot):
+            return payload.key
+
+        if isinstance(payload, FundingSnapshot):
+            return payload.key
+
+        if isinstance(payload, Mapping):
+            return self.extract_key_from_payload(payload)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Payload normalization helpers
+    # ------------------------------------------------------------------
+
+    def normalize_quote_payload(
+        self,
+        payload: QuoteSnapshot | Mapping[str, Any],
+    ) -> QuoteSnapshot | None:
+        """
+        Підтримує обидва production-compatible payload styles:
+        - QuoteSnapshot;
+        - dict payload від QuoteCache / data-layer.
+        """
+        try:
+            if isinstance(payload, QuoteSnapshot):
+                return payload
+
+            if isinstance(payload, Mapping):
+                return QuoteSnapshot.from_payload(payload)
+
+            return None
+
+        except Exception as exc:
+            self._mark_exception(
+                "Failed to normalize quote payload",
+                exc,
+                payload_type=type(payload).__name__,
+            )
+            return None
+
+    def normalize_funding_payload(
+        self,
+        payload: FundingSnapshot | Mapping[str, Any],
+    ) -> FundingSnapshot | None:
+        """
+        Підтримує обидва production-compatible payload styles:
+        - FundingSnapshot;
+        - dict payload від FundingCache / data-layer.
+        """
+        try:
+            if isinstance(payload, FundingSnapshot):
+                return payload
+
+            if isinstance(payload, Mapping):
+                return FundingSnapshot.from_payload(payload)
+
+            return None
+
+        except Exception as exc:
+            self._mark_exception(
+                "Failed to normalize funding payload",
+                exc,
+                payload_type=type(payload).__name__,
+            )
+            return None
+
+    def normalize_quote_event(self, event: Event) -> QuoteSnapshot | None:
+        return self.normalize_quote_payload(getattr(event, "payload", None))
+
+    def normalize_funding_event(self, event: Event) -> FundingSnapshot | None:
+        return self.normalize_funding_payload(getattr(event, "payload", None))
+
+    # ------------------------------------------------------------------
     # EventBus helpers
     # ------------------------------------------------------------------
+
+    def _subscribe_quote_updates(
+        self,
+        handler: Any,
+        *,
+        name: str | None = None,
+    ) -> list[Subscription]:
+        """
+        Підписка на production quote updates із data-layer.
+        """
+        return [
+            self._subscribe(
+                topic,
+                handler,
+                name=name or f"{self.__class__.__name__}.on_quote_update",
+            )
+            for topic in self._config.quote_event_topic_patterns
+        ]
+
+    def _subscribe_funding_updates(
+        self,
+        handler: Any,
+        *,
+        name: str | None = None,
+    ) -> list[Subscription]:
+        """
+        Підписка на production funding updates із data-layer.
+        """
+        return [
+            self._subscribe(
+                topic,
+                handler,
+                name=name or f"{self.__class__.__name__}.on_funding_update",
+            )
+            for topic in self._config.funding_event_topic_patterns
+        ]
+
+    def _subscribe_legacy_raw_inputs(
+        self,
+        quote_handler: Any | None = None,
+        funding_handler: Any | None = None,
+    ) -> list[Subscription]:
+        """
+        Legacy/raw subscriptions.
+
+        Не використовувати в production, якщо allow_legacy_raw_topics=False.
+        """
+        if not self._config.allow_legacy_raw_topics:
+            self._logger.warning(
+                "Legacy raw input subscription skipped because allow_legacy_raw_topics=False | analyzer=%s",
+                self.__class__.__name__,
+            )
+            return []
+
+        subscriptions: list[Subscription] = []
+
+        if quote_handler is not None:
+            subscriptions.append(
+                self._subscribe(
+                    self._config.raw_quote_event_topic,
+                    quote_handler,
+                    name=f"{self.__class__.__name__}.on_raw_quote",
+                    allow_raw=True,
+                )
+            )
+
+        if funding_handler is not None:
+            subscriptions.append(
+                self._subscribe(
+                    self._config.raw_funding_event_topic,
+                    funding_handler,
+                    name=f"{self.__class__.__name__}.on_raw_funding",
+                    allow_raw=True,
+                )
+            )
+
+        return subscriptions
 
     def _subscribe(
         self,
@@ -232,10 +509,21 @@ class BaseSpreadAnalyzer(ABC):
         handler: Any,
         *,
         name: str | None = None,
+        allow_raw: bool = False,
     ) -> Subscription:
         """
         Реєструє EventBus subscription і зберігає Subscription для unregister().
+
+        За замовчуванням блокує raw topics:
+            market.quote
+            market.funding
+
+        Production topics мають бути:
+            market.quote.updated
+            market.funding.updated
         """
+        self._validate_subscription_topic(topic_pattern, allow_raw=allow_raw)
+
         subscription = self._event_bus.subscribe(
             topic_pattern,
             handler,
@@ -252,6 +540,26 @@ class BaseSpreadAnalyzer(ABC):
 
         return subscription
 
+    def _validate_subscription_topic(
+        self,
+        topic_pattern: str,
+        *,
+        allow_raw: bool = False,
+    ) -> None:
+        raw_topics = set(self._config.legacy_raw_input_topics)
+
+        if topic_pattern in raw_topics and not allow_raw:
+            raise ValueError(
+                f"{self.__class__.__name__} tried to subscribe to raw topic "
+                f"{topic_pattern!r}. Use data-layer updated topics instead."
+            )
+
+        if topic_pattern in raw_topics and allow_raw and not self._config.allow_legacy_raw_topics:
+            raise ValueError(
+                f"{self.__class__.__name__} tried to subscribe to raw topic "
+                f"{topic_pattern!r}, but config.allow_legacy_raw_topics=False."
+            )
+
     async def _emit(
         self,
         topic: str,
@@ -264,13 +572,12 @@ class BaseSpreadAnalyzer(ABC):
         """
         Єдиний helper для EventBus.emit().
 
-        Саме emit(), а не publish(topic, payload), бо core.EventBus.publish()
-        очікує готовий Event object.
+        Payload серіалізується в dict, якщо модель має to_payload().
         """
         try:
             accepted = await self._event_bus.emit(
                 topic,
-                payload,
+                self._payload_for_eventbus(payload),
                 priority=priority,
                 source=self._service_name,
                 correlation_id=correlation_id,
@@ -309,7 +616,7 @@ class BaseSpreadAnalyzer(ABC):
         try:
             await self._event_bus.emit(
                 topic,
-                payload,
+                self._payload_for_eventbus(payload),
                 priority=EventPriority.LOW,
                 source=self._service_name,
             )
@@ -389,6 +696,31 @@ class BaseSpreadAnalyzer(ABC):
             )
             return job_id
 
+        except TypeError:
+            try:
+                job_id = self._scheduler.add_interval_job(
+                    name=name,
+                    callback=func,
+                    interval_seconds=interval,
+                    run_immediately=run_immediately,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    timeout=timeout,
+                    allow_overlap=allow_overlap,
+                    enabled=enabled,
+                )
+                self._scheduler_job_ids.append(job_id)
+                return job_id
+            except Exception as exc:
+                self._mark_exception(
+                    "Failed to add scheduler interval job with fallback signature",
+                    exc,
+                    job_name=name,
+                    interval=interval,
+                    analyzer=self.__class__.__name__,
+                )
+                return None
+
         except Exception as exc:
             self._mark_exception(
                 "Failed to add scheduler interval job",
@@ -436,6 +768,9 @@ class BaseSpreadAnalyzer(ABC):
                 "spread_type": snapshot.spread_type.value,
                 "exchange_a": snapshot.leg_a_exchange,
                 "exchange_b": snapshot.leg_b_exchange,
+                "market_type_a": snapshot.leg_a_market_type,
+                "market_type_b": snapshot.leg_b_market_type,
+                "timeframe": snapshot.timeframe,
                 "spread_bps": self._to_str(snapshot.spread_bps),
                 "net_spread": self._to_str(snapshot.net_spread),
                 "regime": snapshot.regime.value,
@@ -481,6 +816,9 @@ class BaseSpreadAnalyzer(ABC):
                 "spread_type": signal.spread_type.value,
                 "exchange_a": signal.exchange_a,
                 "exchange_b": signal.exchange_b,
+                "market_type_a": signal.market_type_a,
+                "market_type_b": signal.market_type_b,
+                "timeframe": signal.timeframe,
                 "value": self._to_str(signal.value),
                 "threshold": self._to_str(signal.threshold),
                 "confidence": self._to_str(signal.confidence),
@@ -547,6 +885,23 @@ class BaseSpreadAnalyzer(ABC):
         self._last_emit_times[key] = timestamp
         return False
 
+    def _should_skip_snapshot_emit(
+        self,
+        snapshot: SpreadSnapshot,
+    ) -> bool:
+        return self._should_skip_emit(
+            key=(
+                snapshot.spread_type.value,
+                snapshot.symbol,
+                snapshot.leg_a_exchange,
+                snapshot.leg_a_market_type,
+                snapshot.leg_b_exchange,
+                snapshot.leg_b_market_type,
+                snapshot.timeframe,
+            ),
+            timestamp=snapshot.timestamp,
+        )
+
     def _should_skip_signal(
         self,
         signal: SpreadSignal,
@@ -569,13 +924,16 @@ class BaseSpreadAnalyzer(ABC):
     def _build_signal_key(self, signal: SpreadSignal) -> str:
         exchange_a = signal.exchange_a or "na"
         exchange_b = signal.exchange_b or "na"
+        market_type_a = signal.market_type_a or "na"
+        market_type_b = signal.market_type_b or "na"
 
         return (
             f"{signal.signal_type.value}|"
             f"{signal.spread_type.value}|"
             f"{signal.symbol}|"
-            f"{exchange_a}|"
-            f"{exchange_b}"
+            f"{exchange_a}|{market_type_a}|"
+            f"{exchange_b}|{market_type_b}|"
+            f"{signal.timeframe}"
         )
 
     # ------------------------------------------------------------------
@@ -591,6 +949,10 @@ class BaseSpreadAnalyzer(ABC):
             "emit_skips": 0,
             "events_rejected": 0,
             "events_failed": 0,
+            "invalid_payloads": 0,
+            "events_skipped_not_running": 0,
+            "events_skipped_scope": 0,
+            "legacy_raw_events": 0,
             "exceptions": 0,
         }
 
@@ -604,6 +966,9 @@ class BaseSpreadAnalyzer(ABC):
             "cooldown_seconds": self._config.cooldown_seconds,
             "subscriptions": len(self._subscriptions),
             "scheduler_jobs": len(self._scheduler_job_ids),
+            "production_input_topics": list(self._config.production_input_topics),
+            "allow_legacy_raw_topics": self._config.allow_legacy_raw_topics,
+            "scope": "exchange:market_type:symbol:timeframe",
         }
 
     def _build_stop_log_extra(self) -> dict[str, Any]:
@@ -629,6 +994,22 @@ class BaseSpreadAnalyzer(ABC):
             },
         )
 
+    def _mark_invalid_payload(
+        self,
+        reason: str,
+        *,
+        payload_type: str | None = None,
+        topic: str | None = None,
+    ) -> None:
+        self._stats["invalid_payloads"] += 1
+        self._logger.warning(
+            "Invalid spread analyzer payload | analyzer=%s reason=%s payload_type=%s topic=%s",
+            self.__class__.__name__,
+            reason,
+            payload_type,
+            topic,
+        )
+
     def _clear_runtime_state_on_stop(self) -> None:
         """
         Очищає runtime-only throttling state.
@@ -641,3 +1022,28 @@ class BaseSpreadAnalyzer(ABC):
     @staticmethod
     def _to_str(value: Decimal | None) -> str | None:
         return str(value) if value is not None else None
+
+    @staticmethod
+    def _payload_for_eventbus(payload: Any) -> Any:
+        if hasattr(payload, "to_payload") and callable(payload.to_payload):
+            return payload.to_payload()
+
+        if isinstance(payload, Mapping):
+            return {
+                str(key): BaseSpreadAnalyzer._payload_for_eventbus(value)
+                for key, value in payload.items()
+            }
+
+        if isinstance(payload, list):
+            return [BaseSpreadAnalyzer._payload_for_eventbus(item) for item in payload]
+
+        if isinstance(payload, tuple):
+            return [BaseSpreadAnalyzer._payload_for_eventbus(item) for item in payload]
+
+        if isinstance(payload, set):
+            return sorted(BaseSpreadAnalyzer._payload_for_eventbus(item) for item in payload)
+
+        try:
+            return model_to_payload(payload)
+        except Exception:
+            return payload
