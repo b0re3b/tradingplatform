@@ -16,11 +16,15 @@ from .enums import (
     SpoofingSide,
 )
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     DetectorResult,
     LayeringCandidateContext,
     LayeringCluster,
     SpoofingFeatures,
+    SpoofingKey,
     TrackedWall,
+    spoofing_key_to_dict,
 )
 from .persistence_tracker import PersistenceTracker
 
@@ -35,8 +39,22 @@ class LayeringDetector(BaseSpoofingDetector):
     - сумарна ліквідність велика;
     - значна частина рівнів знімається/слабшає в близькому часовому вікні.
 
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
+    Correct production input flow:
+        exchange adapters
+            -> market.orderbook
+            -> OrderBookCache
+            -> market.orderbook.updated
+            -> SpoofingAnalyzer
+            -> PersistenceTracker
+            -> LayeringDetector
+
     Важливо:
     - працює поверх PersistenceTracker state;
+    - не аналізує raw orderbook напряму;
+    - не читає exchange adapters напряму;
     - не підписується на EventBus;
     - не публікує події;
     - не запускає Scheduler jobs;
@@ -90,24 +108,56 @@ class LayeringDetector(BaseSpoofingDetector):
 
         return self._build_result(candidate)
 
+    def analyze_key(
+        self,
+        *,
+        key: SpoofingKey,
+        current_mid_price: float | None = None,
+    ) -> list[DetectorResult]:
+        """
+        Key-first API для scoped futures market.
+
+        key:
+            exchange + market_type + symbol + timeframe
+        """
+        if not self.config.enabled or not self.config.layering.enabled:
+            return []
+
+        walls = self.persistence_tracker.get_walls_for_key(key)
+
+        return self.analyze_many(
+            walls=walls,
+            key=key,
+            current_mid_price=current_mid_price,
+        )
+
     def analyze_many(
         self,
         walls: Iterable[TrackedWall],
         *,
+        key: SpoofingKey | None = None,
         exchange: str | None = None,
         symbol: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
         Аналізує набір tracked walls і повертає позитивні layering candidates.
+
+        New code should pass key=SpoofingKey.
+        Legacy filters exchange/symbol/market_type/timeframe залишені для міграції.
         """
         if not self.config.enabled or not self.config.layering.enabled:
             return []
 
         filtered = self._filter_walls(
             walls=walls,
+            key=key,
             exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
+            timeframe=timeframe,
         )
         if not filtered:
             return []
@@ -140,24 +190,59 @@ class LayeringDetector(BaseSpoofingDetector):
         results.sort(key=lambda item: (item.score, item.confidence), reverse=True)
         return results
 
+    def analyze_scope(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        current_mid_price: float | None = None,
+    ) -> list[DetectorResult]:
+        """
+        Аналізує всі tracked walls одного scoped futures market.
+        """
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+        return self.analyze_key(
+            key=key,
+            current_mid_price=current_mid_price,
+        )
+
     def analyze_symbol(
         self,
         *,
         exchange: str,
         symbol: str,
         current_mid_price: float | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналізує всі tracked walls одного символу.
+        Backward-compatible helper.
+
+        New code should use analyze_key() або analyze_scope().
+        Якщо market_type/timeframe не передані, аналізує всі scope-и для
+        exchange + symbol.
         """
         walls = self.persistence_tracker.get_walls_for_symbol(
             exchange=exchange,
             symbol=symbol,
+            market_type=market_type,
+            timeframe=timeframe,
         )
+
         return self.analyze_many(
             walls=walls,
             exchange=exchange,
             symbol=symbol,
+            market_type=market_type,
+            timeframe=timeframe,
             current_mid_price=current_mid_price,
         )
 
@@ -186,7 +271,7 @@ class LayeringDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> list[LayeringCluster]:
         """
-        Будує потенційні layering-кластери для кожної сторони окремо.
+        Будує потенційні layering-кластери для кожного scoped market + side окремо.
         """
         if not self.config.enabled or not self.config.layering.enabled:
             return []
@@ -205,7 +290,8 @@ class LayeringDetector(BaseSpoofingDetector):
         clusters: list[LayeringCluster] = []
         groups = self._group_walls_by_market_side(relevant)
 
-        for (exchange, symbol, side), side_walls in groups.items():
+        for key, side_walls in groups.items():
+            exchange, market_type, symbol, timeframe, side = key
             ordered = self._sort_walls_for_side(side_walls, side)
             current_group: list[TrackedWall] = []
 
@@ -223,7 +309,9 @@ class LayeringDetector(BaseSpoofingDetector):
 
                 cluster = self._make_cluster(
                     exchange=exchange,
+                    market_type=market_type,
                     symbol=symbol,
+                    timeframe=timeframe,
                     side=side,
                     walls=current_group,
                     current_mid_price=current_mid_price,
@@ -236,7 +324,9 @@ class LayeringDetector(BaseSpoofingDetector):
             if current_group:
                 cluster = self._make_cluster(
                     exchange=exchange,
+                    market_type=market_type,
                     symbol=symbol,
+                    timeframe=timeframe,
                     side=side,
                     walls=current_group,
                     current_mid_price=current_mid_price,
@@ -252,9 +342,11 @@ class LayeringDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None = None,
     ) -> LayeringCluster | None:
-        symbol_walls = self.persistence_tracker.get_walls_for_symbol(
-            exchange=wall.exchange,
-            symbol=wall.symbol,
+        if not self.should_process_key(wall.key):
+            return None
+
+        symbol_walls = self.persistence_tracker.get_walls_for_key(
+            wall.key,
             side=wall.side,
         )
         clusters = self._build_clusters(
@@ -275,37 +367,60 @@ class LayeringDetector(BaseSpoofingDetector):
         symbol: str,
         side: SpoofingSide,
         walls: list[TrackedWall],
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
         current_mid_price: float | None = None,
     ) -> LayeringCluster | None:
         if len(walls) < self.config.layering.min_layers:
             return None
 
-        total_notional = sum(wall.price * wall.max_size for wall in walls)
+        if not walls:
+            return None
+
+        first_wall = walls[0]
+        key = first_wall.key
+
+        if not self.should_process_key(key):
+            return None
+
+        # Safety: кластер не має змішувати різні exchange/market_type/symbol/timeframe/side.
+        scoped_walls = [
+            wall
+            for wall in walls
+            if wall.key == key and wall.side == side
+        ]
+        if len(scoped_walls) < self.config.layering.min_layers:
+            return None
+
+        total_notional = sum(wall.price * wall.max_size for wall in scoped_walls)
         if total_notional < self.config.layering.min_total_layer_notional:
             return None
 
-        average_pull_ratio = self._mean_or_zero(wall.pull_ratio for wall in walls)
-        average_fill_ratio = self._mean_or_zero(wall.fill_ratio for wall in walls)
-        average_lifetime_ms = self._mean_or_zero(wall.lifetime_ms for wall in walls)
-        synchronized_pull_ratio = self._estimate_synchronized_pull_ratio(walls)
-        price_span_bps = self._estimate_price_span_bps(walls)
+        average_pull_ratio = self._mean_or_zero(wall.pull_ratio for wall in scoped_walls)
+        average_fill_ratio = self._mean_or_zero(wall.fill_ratio for wall in scoped_walls)
+        average_lifetime_ms = self._mean_or_zero(wall.lifetime_ms for wall in scoped_walls)
+        synchronized_pull_ratio = self._estimate_synchronized_pull_ratio(scoped_walls)
+        price_span_bps = self._estimate_price_span_bps(scoped_walls)
 
         layering_score = self._estimate_layering_score(
-            walls=walls,
+            walls=scoped_walls,
             total_notional=total_notional,
             synchronized_pull_ratio=synchronized_pull_ratio,
             price_span_bps=price_span_bps,
             current_mid_price=current_mid_price,
         )
 
-        cluster_price = self._mean_or_zero(wall.price for wall in walls)
-        cluster_wall_id = self._resolve_cluster_wall_id(walls)
+        cluster_price = self._mean_or_zero(wall.price for wall in scoped_walls)
+        cluster_wall_id = self._resolve_cluster_wall_id(scoped_walls)
 
         return LayeringCluster(
-            exchange=exchange,
-            symbol=symbol,
+            exchange=first_wall.exchange,
+            market_type=first_wall.market_type,
+            symbol=first_wall.symbol,
+            timeframe=first_wall.timeframe,
+            exchange_symbol=first_wall.exchange_symbol,
             side=side,
-            walls=walls,
+            walls=scoped_walls,
             total_notional=total_notional,
             average_pull_ratio=average_pull_ratio,
             average_fill_ratio=average_fill_ratio,
@@ -327,6 +442,9 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         current_mid_price: float | None = None,
     ) -> LayeringCandidateContext | None:
+        if not self.should_process_key(cluster.key):
+            return None
+
         if not self._passes_cluster_filters(cluster):
             return None
 
@@ -386,6 +504,7 @@ class LayeringDetector(BaseSpoofingDetector):
         candidate: LayeringCandidateContext,
     ) -> DetectorResult:
         features = self._build_features(candidate)
+        cluster = candidate.cluster
 
         return DetectorResult(
             detector=self.component,
@@ -394,18 +513,21 @@ class LayeringDetector(BaseSpoofingDetector):
             confidence=candidate.confidence,
             reason=candidate.reason,
             features=features,
-            wall_id=candidate.cluster.cluster_wall_id,
+            wall_id=cluster.cluster_wall_id,
             pattern=SpoofingPattern.MULTI_LEVEL_LAYERING,
             metadata={
-                "layers": len(candidate.cluster.walls),
-                "total_notional": candidate.cluster.total_notional,
-                "average_pull_ratio": candidate.cluster.average_pull_ratio,
-                "average_fill_ratio": candidate.cluster.average_fill_ratio,
-                "average_lifetime_ms": candidate.cluster.average_lifetime_ms,
-                "synchronized_pull_ratio": candidate.cluster.synchronized_pull_ratio,
-                "price_span_bps": candidate.cluster.price_span_bps,
+                "scope": spoofing_key_to_dict(cluster.key),
+                "exchange_symbol": cluster.exchange_symbol,
+                "layers": len(cluster.walls),
+                "total_notional": cluster.total_notional,
+                "average_pull_ratio": cluster.average_pull_ratio,
+                "average_fill_ratio": cluster.average_fill_ratio,
+                "average_lifetime_ms": cluster.average_lifetime_ms,
+                "synchronized_pull_ratio": cluster.synchronized_pull_ratio,
+                "price_span_bps": cluster.price_span_bps,
                 "price_reaction_bps": candidate.price_reaction_bps,
-                "layering_score": candidate.cluster.layering_score,
+                "layering_score": cluster.layering_score,
+                "wall_ids": [wall.wall_id for wall in cluster.walls],
             },
         )
 
@@ -431,6 +553,9 @@ class LayeringDetector(BaseSpoofingDetector):
         return SpoofingFeatures(
             symbol=cluster.symbol,
             exchange=cluster.exchange,
+            market_type=cluster.market_type,
+            timeframe=cluster.timeframe,
+            exchange_symbol=cluster.exchange_symbol,
             side=cluster.side,
             price=cluster.cluster_price,
             wall_size=sum(wall.max_size for wall in cluster.walls),
@@ -450,6 +575,7 @@ class LayeringDetector(BaseSpoofingDetector):
             is_fake_liquidity=False,
             is_layering=True,
             metadata={
+                "scope": spoofing_key_to_dict(cluster.key),
                 "layers": len(cluster.walls),
                 "total_notional": cluster.total_notional,
                 "synchronized_pull_ratio": cluster.synchronized_pull_ratio,
@@ -669,19 +795,56 @@ class LayeringDetector(BaseSpoofingDetector):
     # Filters / helpers
     # -------------------------------------------------------------------------
 
-    @staticmethod
     def _filter_walls(
+        self,
         *,
         walls: Iterable[TrackedWall],
+        key: SpoofingKey | None = None,
         exchange: str | None,
         symbol: str | None,
+        market_type: str | None,
+        timeframe: str | None,
     ) -> list[TrackedWall]:
-        return [
-            wall
-            for wall in walls
-            if (exchange is None or wall.exchange == exchange)
-            and (symbol is None or wall.symbol == symbol)
-        ]
+        normalized_exchange = (
+            self.normalize_exchange(exchange)
+            if exchange is not None
+            else None
+        )
+        normalized_symbol = (
+            self.normalize_symbol(symbol)
+            if symbol is not None
+            else None
+        )
+        normalized_market_type = (
+            self.normalize_market_type(market_type)
+            if market_type is not None
+            else None
+        )
+        normalized_timeframe = (
+            self.normalize_timeframe(timeframe)
+            if timeframe is not None
+            else None
+        )
+
+        filtered: list[TrackedWall] = []
+
+        for wall in walls:
+            if key is not None and wall.key != key:
+                continue
+            if normalized_exchange is not None and wall.exchange != normalized_exchange:
+                continue
+            if normalized_market_type is not None and wall.market_type != normalized_market_type:
+                continue
+            if normalized_symbol is not None and wall.symbol != normalized_symbol:
+                continue
+            if normalized_timeframe is not None and wall.timeframe != normalized_timeframe:
+                continue
+            if not self.should_process_key(wall.key):
+                continue
+
+            filtered.append(wall)
+
+        return filtered
 
     def _is_relevant_wall(
         self,
@@ -689,6 +852,9 @@ class LayeringDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None = None,
     ) -> bool:
+        if not self.should_process_key(wall.key):
+            return False
+
         if wall.max_size <= 0 or wall.price <= 0:
             return False
 
@@ -711,11 +877,17 @@ class LayeringDetector(BaseSpoofingDetector):
     @staticmethod
     def _group_walls_by_market_side(
         walls: Iterable[TrackedWall],
-    ) -> dict[tuple[str, str, SpoofingSide], list[TrackedWall]]:
-        groups: dict[tuple[str, str, SpoofingSide], list[TrackedWall]] = {}
+    ) -> dict[tuple[str, str, str, str, SpoofingSide], list[TrackedWall]]:
+        groups: dict[tuple[str, str, str, str, SpoofingSide], list[TrackedWall]] = {}
 
         for wall in walls:
-            key = (wall.exchange, wall.symbol, wall.side)
+            key = (
+                wall.exchange,
+                wall.market_type,
+                wall.symbol,
+                wall.timeframe,
+                wall.side,
+            )
             groups.setdefault(key, []).append(wall)
 
         return groups
@@ -783,7 +955,9 @@ class LayeringDetector(BaseSpoofingDetector):
         for wall in cluster.walls:
             history = self.persistence_tracker.get_recent_history(
                 exchange=wall.exchange,
+                market_type=wall.market_type,
                 symbol=wall.symbol,
+                timeframe=wall.timeframe,
                 side=wall.side,
                 price=wall.price,
                 limit=50,
@@ -795,7 +969,11 @@ class LayeringDetector(BaseSpoofingDetector):
     @staticmethod
     def _cluster_key(cluster: LayeringCluster) -> str:
         wall_ids = sorted(wall.wall_id for wall in cluster.walls)
-        return f"{cluster.exchange}:{cluster.symbol}:{cluster.side.value}:{'|'.join(wall_ids)}"
+        scope = spoofing_key_to_dict(cluster.key)
+        return (
+            f"{scope['exchange']}:{scope['market_type']}:{scope['symbol']}:"
+            f"{scope['timeframe']}:{cluster.side.value}:{'|'.join(wall_ids)}"
+        )
 
     @staticmethod
     def _candidate_wall_states() -> set[OrderbookWallState]:
@@ -847,6 +1025,10 @@ class LayeringDetector(BaseSpoofingDetector):
     ) -> str:
         return (
             f"layering candidate detected for {cluster.side.value.upper()} side, "
+            f"exchange={cluster.exchange}, "
+            f"market_type={cluster.market_type}, "
+            f"symbol={cluster.symbol}, "
+            f"timeframe={cluster.timeframe}, "
             f"layers={len(cluster.walls)}, "
             f"total_notional={cluster.total_notional:.2f}, "
             f"avg_pull_ratio={cluster.average_pull_ratio:.4f}, "

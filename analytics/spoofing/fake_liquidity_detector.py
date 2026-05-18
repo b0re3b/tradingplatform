@@ -15,10 +15,14 @@ from .enums import (
     SpoofingSide,
 )
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     DetectorResult,
     FakeLiquidityCandidateContext,
     SpoofingFeatures,
+    SpoofingKey,
     TrackedWall,
+    spoofing_key_to_dict,
 )
 from .persistence_tracker import PersistenceTracker
 
@@ -34,9 +38,22 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
     - значною мірою була знята;
     - після цього ринок відреагував у релевантний бік.
 
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
+    Correct production input flow:
+        exchange adapters
+            -> market.orderbook
+            -> OrderBookCache
+            -> market.orderbook.updated
+            -> SpoofingAnalyzer
+            -> PersistenceTracker
+            -> FakeLiquidityDetector
+
     Важливо:
     - працює поверх PersistenceTracker state;
     - не працює як raw orderbook parser;
+    - не читає exchange adapters напряму;
     - не підписується на EventBus;
     - не публікує події;
     - не запускає Scheduler jobs;
@@ -96,6 +113,8 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             wall_id=wall.wall_id,
             pattern=SpoofingPattern.FAKE_ABSORPTION,
             metadata={
+                "scope": spoofing_key_to_dict(wall.key),
+                "exchange_symbol": wall.exchange_symbol,
                 "wall_notional": candidate.wall_notional,
                 "pulled_notional": candidate.pulled_notional,
                 "lifetime_ms": candidate.lifetime_ms,
@@ -111,26 +130,84 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             },
         )
 
-    def analyze_many(
+    def analyze_key(
         self,
-        walls: Iterable[TrackedWall],
         *,
-        exchange: str | None = None,
-        symbol: str | None = None,
+        key: SpoofingKey,
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналізує набір tracked walls і повертає позитивні fake-liquidity candidates.
+        Key-first API для scoped futures market.
+
+        key:
+            exchange + market_type + symbol + timeframe
         """
         if not self.config.enabled or not self.config.fake_liquidity.enabled:
             return []
 
+        walls = self.persistence_tracker.get_walls_for_key(key)
+
+        return self.analyze_many(
+            walls=walls,
+            key=key,
+            current_mid_price=current_mid_price,
+        )
+
+    def analyze_many(
+        self,
+        walls: Iterable[TrackedWall],
+        *,
+        key: SpoofingKey | None = None,
+        exchange: str | None = None,
+        symbol: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+        current_mid_price: float | None = None,
+    ) -> list[DetectorResult]:
+        """
+        Аналізує набір tracked walls і повертає позитивні fake-liquidity candidates.
+
+        New code should pass key=SpoofingKey.
+        Legacy filters exchange/symbol/market_type/timeframe залишені для міграції.
+        """
+        if not self.config.enabled or not self.config.fake_liquidity.enabled:
+            return []
+
+        normalized_exchange = (
+            self.normalize_exchange(exchange)
+            if exchange is not None
+            else None
+        )
+        normalized_symbol = (
+            self.normalize_symbol(symbol)
+            if symbol is not None
+            else None
+        )
+        normalized_market_type = (
+            self.normalize_market_type(market_type)
+            if market_type is not None
+            else None
+        )
+        normalized_timeframe = (
+            self.normalize_timeframe(timeframe)
+            if timeframe is not None
+            else None
+        )
+
         results: list[DetectorResult] = []
 
         for wall in walls:
-            if exchange is not None and wall.exchange != exchange:
+            if key is not None and wall.key != key:
                 continue
-            if symbol is not None and wall.symbol != symbol:
+            if normalized_exchange is not None and wall.exchange != normalized_exchange:
+                continue
+            if normalized_market_type is not None and wall.market_type != normalized_market_type:
+                continue
+            if normalized_symbol is not None and wall.symbol != normalized_symbol:
+                continue
+            if normalized_timeframe is not None and wall.timeframe != normalized_timeframe:
+                continue
+            if not self.should_process_key(wall.key):
                 continue
 
             repetition_count = self._estimate_repetition_count(wall)
@@ -145,24 +222,59 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         results.sort(key=lambda item: (item.score, item.confidence), reverse=True)
         return results
 
+    def analyze_scope(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        current_mid_price: float | None = None,
+    ) -> list[DetectorResult]:
+        """
+        Аналізує всі tracked walls одного scoped futures market.
+        """
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+        return self.analyze_key(
+            key=key,
+            current_mid_price=current_mid_price,
+        )
+
     def analyze_symbol(
         self,
         *,
         exchange: str,
         symbol: str,
         current_mid_price: float | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> list[DetectorResult]:
         """
-        Аналізує всі tracked walls одного символу.
+        Backward-compatible helper.
+
+        New code should use analyze_key() або analyze_scope().
+        Якщо market_type/timeframe не передані, аналізує всі scope-и для
+        exchange + symbol.
         """
         walls = self.persistence_tracker.get_walls_for_symbol(
             exchange=exchange,
             symbol=symbol,
+            market_type=market_type,
+            timeframe=timeframe,
         )
+
         return self.analyze_many(
             walls=walls,
             exchange=exchange,
             symbol=symbol,
+            market_type=market_type,
+            timeframe=timeframe,
             current_mid_price=current_mid_price,
         )
 
@@ -191,6 +303,9 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         current_mid_price: float | None = None,
     ) -> FakeLiquidityCandidateContext | None:
         if not self.config.enabled or not self.config.fake_liquidity.enabled:
+            return None
+
+        if not self.should_process_key(wall.key):
             return None
 
         if wall.max_size <= 0.0 or wall.price <= 0.0:
@@ -342,6 +457,9 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
         return SpoofingFeatures(
             symbol=wall.symbol,
             exchange=wall.exchange,
+            market_type=wall.market_type,
+            timeframe=wall.timeframe,
+            exchange_symbol=wall.exchange_symbol,
             side=wall.side,
             price=wall.price,
             wall_size=wall.max_size,
@@ -361,6 +479,8 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
             is_fake_liquidity=True,
             is_layering=False,
             metadata={
+                "scope": spoofing_key_to_dict(wall.key),
+                "wall_id": wall.wall_id,
                 "wall_notional": candidate.wall_notional,
                 "pulled_notional": candidate.pulled_notional,
                 "estimated_pulled_size": wall.estimated_pulled_size,
@@ -520,7 +640,9 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
     def _estimate_repetition_count(self, wall: TrackedWall) -> int:
         history = self.persistence_tracker.get_recent_history(
             exchange=wall.exchange,
+            market_type=wall.market_type,
             symbol=wall.symbol,
+            timeframe=wall.timeframe,
             side=wall.side,
             price=wall.price,
             limit=100,
@@ -554,6 +676,10 @@ class FakeLiquidityDetector(BaseSpoofingDetector):
     ) -> str:
         parts = [
             f"fake liquidity candidate detected for {wall.side.value.upper()} wall",
+            f"exchange={wall.exchange}",
+            f"market_type={wall.market_type}",
+            f"symbol={wall.symbol}",
+            f"timeframe={wall.timeframe}",
             f"pulled_notional={pulled_notional:.2f}",
             f"pull_ratio={pull_ratio:.4f}",
             f"fill_ratio={fill_ratio:.4f}",

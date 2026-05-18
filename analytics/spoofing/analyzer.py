@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Mapping, Protocol
 
-from core.event_bus import Event, EventBus, EventPriority
+from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.scheduler import Scheduler
 
-from .base import BaseSpoofingModule
+from .base import BaseSpoofingAnalyzer
 from .config import SpoofingConfig
 from .enums import SpoofingComponent, SpoofingSide, SpoofingStatus
 from .fake_liquidity_detector import FakeLiquidityDetector
 from .flip_pressure_detector import FlipPressureDetector
 from .layering_detector import LayeringDetector
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     AnalyzerOutput,
     DetectorResult,
     LiquidityLifecycleEvent,
     OrderbookLevelSnapshot,
+    SpoofingKey,
     SpoofingSignal,
     TrackedWall,
+    spoofing_key_to_dict,
 )
 from .order_pull_detector import OrderPullDetector
 from .orderbook_wall_detector import OrderbookWallDetector
@@ -26,34 +30,66 @@ from .persistence_tracker import PersistenceTracker
 from .spoofing_score import SpoofingScoreEngine
 
 
+class SupportsOrderBookCache(Protocol):
+    """
+    Мінімальний read-only contract для data/orderbook_cache.py.
+
+    Реальна реалізація OrderBookCache може мати ширший API. Analyzer
+    використовує duck typing, щоб не створювати жорстку залежність
+    analytics -> data.
+    """
+
+    def get_book(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        depth: int | None = None,
+    ) -> Any: ...
+
+
 class SupportsTrackedWallAnalyzeMany(Protocol):
     def analyze_many(
         self,
         walls: Iterable[TrackedWall],
         *,
+        key: SpoofingKey | None = None,
         exchange: str | None = None,
         symbol: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         current_mid_price: float | None = None,
     ) -> list[DetectorResult]: ...
 
 
-class SpoofingAnalyzer(BaseSpoofingModule):
+class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     """
     Центральний orchestrator для analytics.spoofing.
 
     Відповідає за:
-    - підписку на market.orderbook events через EventBus;
-    - нормалізацію raw orderbook payload у OrderbookLevelSnapshot;
+    - підписку на data-layer topics через EventBus;
+    - роботу зі scoped key: exchange + market_type + symbol + timeframe;
+    - читання normalized orderbook state з OrderBookCache або payload
+      market.orderbook.updated;
     - оновлення PersistenceTracker;
     - запуск wall / pull / advanced detector-ів;
     - агрегацію результатів через SpoofingScoreEngine;
-    - публікацію analytics.spoofing.* подій;
-    - реєстрацію periodic cleanup через Scheduler.
+    - публікацію тільки analytics.spoofing.* подій;
+    - cleanup через Scheduler.
+
+    Correct production flow:
+        exchange adapters
+            -> market.orderbook
+            -> data.OrderBookCache
+            -> market.orderbook.updated
+            -> SpoofingAnalyzer
+            -> analytics.spoofing.*
 
     Важливо:
-    - analyzer не містить складну spoofing-логіку;
-    - detector/scoring/tracker логіка лишається в окремих класах;
-    - analyzer є integration boundary між EventBus/Scheduler і доменною логікою.
+    - analyzer не ходить у біржові адаптери;
+    - raw market.orderbook / raw bids/asks не є production path;
+    - detector/scoring/tracker логіка лишається в окремих класах.
     """
 
     component = SpoofingComponent.ANALYZER
@@ -61,9 +97,10 @@ class SpoofingAnalyzer(BaseSpoofingModule):
     def __init__(
         self,
         *,
-        event_bus: EventBus | None,
+        event_bus: EventBus,
         scheduler: Scheduler | None,
         config: SpoofingConfig,
+        orderbook_cache: SupportsOrderBookCache | None = None,
         persistence_tracker: PersistenceTracker | None = None,
         wall_detector: OrderbookWallDetector | None = None,
         pull_detector: OrderPullDetector | None = None,
@@ -79,6 +116,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         )
 
         self.config.validate()
+        self.orderbook_cache = orderbook_cache
 
         self.persistence_tracker = persistence_tracker or PersistenceTracker(
             event_bus=event_bus,
@@ -119,6 +157,9 @@ class SpoofingAnalyzer(BaseSpoofingModule):
             else self._create_layering_detector_if_enabled()
         )
 
+        self._latest_output_by_key: dict[SpoofingKey, AnalyzerOutput] = {}
+        self._latest_signal_by_key: dict[SpoofingKey, SpoofingSignal] = {}
+        self._subscriptions: list[Subscription] = []
         self._cleanup_job_id: str | None = None
         self._registered = False
 
@@ -163,8 +204,18 @@ class SpoofingAnalyzer(BaseSpoofingModule):
     def register(self) -> None:
         """
         Реєструє analyzer у core infrastructure:
-        - EventBus subscription на orderbook topic;
+        - EventBus subscriptions на data-layer topics;
         - Scheduler interval job для cleanup PersistenceTracker.
+
+        Production topics:
+            market.orderbook.updated
+            market.trades.updated
+
+        Raw topics:
+            market.orderbook
+            market.trade
+
+        не підписуються, якщо allow_legacy_raw_topics=False.
         """
         if self._registered:
             self.log_warning("SpoofingAnalyzer already registered")
@@ -181,21 +232,30 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
         self.log_info(
             "SpoofingAnalyzer registered",
-            orderbook_topic=self.config.analyzer.event_topic_orderbook,
+            source_topics=list(self.config.production_source_topics),
             cleanup_job_id=self._cleanup_job_id,
             publish_updates=self.config.analyzer.publish_updates,
             publish_detected_only=self.config.analyzer.publish_detected_only,
+            scope="exchange:market_type:symbol:timeframe",
         )
 
     def _register_eventbus_subscriptions(self) -> None:
-        if self.event_bus is None:
-            self.log_warning("EventBus subscription skipped: event_bus is None")
-            return
+        event_bus = self.require_event_bus()
 
-        self.event_bus.subscribe(
-            self.config.analyzer.event_topic_orderbook,
-            self.on_orderbook_event,
-        )
+        for topic in self.config.production_source_topics:
+            subscription = event_bus.subscribe(
+                topic,
+                self._handle_event,
+            )
+            self._subscriptions.append(subscription)
+
+        if self.config.analyzer.allow_legacy_raw_topics:
+            for topic in self.config.analyzer.legacy_raw_topic_patterns:
+                subscription = event_bus.subscribe(
+                    topic,
+                    self._handle_legacy_raw_event,
+                )
+                self._subscriptions.append(subscription)
 
     def _register_scheduler_jobs(self) -> None:
         if self.scheduler is None:
@@ -217,30 +277,69 @@ class SpoofingAnalyzer(BaseSpoofingModule):
             enabled=True,
         )
 
-    async def on_orderbook_event(self, event: Event) -> None:
+    async def _handle_event(self, event: Event) -> None:
         """
-        EventBus callback для market.orderbook.
+        Production EventBus callback для data-layer events.
 
-        Очікується, що event.payload містить:
-        - або snapshots;
-        - або raw bids/asks + top-of-book metadata.
+        Очікувані topics:
+            market.orderbook.updated
+            market.trades.updated
+
+        Основний processing path для orderbook:
+            extract SpoofingKey -> load/build snapshots -> process_key/process_snapshots
         """
         payload = getattr(event, "payload", None)
-        if not isinstance(payload, dict):
-            self.log_warning("Orderbook event payload is not a dict")
+        if not isinstance(payload, Mapping):
+            self.log_warning("Spoofing event payload is not a mapping")
             return
 
+        correlation_id = self._extract_event_correlation_id(event)
+
         try:
-            output = await self.process_event_payload(
-                payload,
-                correlation_id=self._extract_event_correlation_id(event),
-            )
+            key = self.extract_key_from_payload(payload)
+            if key is None:
+                self.log_warning(
+                    "Spoofing event skipped: cannot extract key",
+                    topic=getattr(event, "topic", None),
+                    payload_keys=list(payload.keys()),
+                )
+                return
+
+            if not self.should_process_key(key):
+                return
+
+            topic = str(getattr(event, "topic", ""))
+
+            if topic in self.config.analyzer.source_topic_patterns_orderbook:
+                output = await self.process_event_payload(
+                    dict(payload),
+                    key=key,
+                    correlation_id=correlation_id,
+                )
+            elif topic in self.config.analyzer.source_topic_patterns_trade:
+                output = await self.process_key(
+                    key,
+                    current_mid_price=self._extract_current_mid_price(dict(payload)),
+                    correlation_id=correlation_id,
+                    metadata={
+                        "source_topic": topic,
+                        "reason": "trade_update_confirmation_reprocess",
+                    },
+                )
+            else:
+                output = await self.process_event_payload(
+                    dict(payload),
+                    key=key,
+                    correlation_id=correlation_id,
+                )
 
             if output.signal is not None:
                 self.log_debug(
                     "Spoofing signal processed from event",
                     symbol=output.symbol,
                     exchange=output.exchange,
+                    market_type=output.market_type,
+                    timeframe=output.timeframe,
                     signal_id=output.signal.signal_id,
                     score=output.signal.score,
                     confidence=output.signal.confidence,
@@ -248,7 +347,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
         except Exception as exc:
             self.log_exception(
-                "Failed to process orderbook event",
+                "Failed to process spoofing event",
                 error=str(exc),
                 payload_keys=list(payload.keys()),
             )
@@ -256,8 +355,43 @@ class SpoofingAnalyzer(BaseSpoofingModule):
             if self.config.analyzer.publish_errors:
                 await self._publish_error(
                     error=exc,
-                    payload=payload,
-                    context={"handler": "on_orderbook_event"},
+                    payload=dict(payload),
+                    context={"handler": "_handle_event"},
+                    correlation_id=correlation_id,
+                )
+            raise
+
+    async def _handle_legacy_raw_event(self, event: Event) -> None:
+        """
+        Legacy/manual raw callback.
+
+        Не використовується у production, якщо allow_legacy_raw_topics=False.
+        """
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, Mapping):
+            return
+
+        correlation_id = self._extract_event_correlation_id(event)
+
+        try:
+            await self.process_event_payload(
+                dict(payload),
+                correlation_id=correlation_id,
+                metadata={"source": "legacy_raw_event"},
+                allow_raw_payload=True,
+            )
+        except Exception as exc:
+            self.log_exception(
+                "Failed to process legacy raw spoofing event",
+                error=str(exc),
+                payload_keys=list(payload.keys()),
+            )
+            if self.config.analyzer.publish_errors:
+                await self._publish_error(
+                    error=exc,
+                    payload=dict(payload),
+                    context={"handler": "_handle_legacy_raw_event"},
+                    correlation_id=correlation_id,
                 )
             raise
 
@@ -265,33 +399,108 @@ class SpoofingAnalyzer(BaseSpoofingModule):
     # Main processing API
     # -------------------------------------------------------------------------
 
+    async def process_key(
+        self,
+        key: SpoofingKey,
+        *,
+        current_mid_price: float | None = None,
+        metadata: dict[str, Any] | None = None,
+        correlation_id: str | None = None,
+    ) -> AnalyzerOutput:
+        """
+        Основний production API.
+
+        key:
+            exchange + market_type + symbol + timeframe
+
+        Якщо orderbook_cache переданий, analyzer читає actual book state
+        через read-only cache API. Якщо ні — повертає output із reason.
+        """
+        if not self.config.enabled or not self.config.analyzer.enabled:
+            return self._empty_output(
+                key=key,
+                reason="analyzer_disabled",
+                metadata=metadata,
+            )
+
+        if not self.should_process_key(key):
+            return self._empty_output(
+                key=key,
+                reason="key_not_allowed",
+                metadata=metadata,
+            )
+
+        snapshots = self._load_snapshots_from_orderbook_cache(key)
+        if not snapshots:
+            return self._empty_output(
+                key=key,
+                reason="empty_orderbook_cache_snapshot",
+                metadata=metadata,
+            )
+
+        return await self.process_snapshots(
+            snapshots=snapshots,
+            key=key,
+            current_mid_price=current_mid_price,
+            metadata=metadata,
+            correlation_id=correlation_id,
+        )
+
     async def process_event_payload(
         self,
         payload: dict[str, Any],
         *,
+        key: SpoofingKey | None = None,
         correlation_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        allow_raw_payload: bool = False,
     ) -> AnalyzerOutput:
         """
-        Обробляє payload orderbook event.
+        Обробляє EventBus payload.
 
-        Підтримує:
-        1. payload["snapshots"] з уже нормалізованими snapshots;
-        2. raw payload із bids/asks/top-of-book metadata.
+        Production payload очікується від OrderBookCache:
+            market.orderbook.updated
+
+        Підтримується:
+        1. payload["snapshots"] з normalized snapshots;
+        2. payload із cached bids/asks лише якщо topic уже data-layer updated;
+        3. raw bids/asks тільки якщо allow_raw_payload=True.
         """
-        snapshots = self._extract_or_build_snapshots_from_payload(payload)
+        resolved_key = key or self.extract_key_from_payload(payload)
+        if resolved_key is None:
+            fallback_key = self._fallback_key_from_payload(payload)
+            return self._empty_output(
+                key=fallback_key,
+                reason="cannot_extract_key",
+                metadata={
+                    "payload_keys": list(payload.keys()),
+                    **self._safe_metadata(metadata),
+                },
+            )
+
+        snapshots = self._extract_or_build_snapshots_from_payload(
+            payload,
+            key=resolved_key,
+            allow_raw_payload=allow_raw_payload,
+        )
+
+        if not snapshots and self.orderbook_cache is not None:
+            snapshots = self._load_snapshots_from_orderbook_cache(resolved_key)
 
         return await self.process_snapshots(
             snapshots=snapshots,
-            symbol=self._optional_str(payload.get("symbol")),
-            exchange=self._optional_str(payload.get("exchange")),
+            key=resolved_key,
             current_mid_price=self._extract_current_mid_price(payload),
             correlation_id=correlation_id,
             metadata={
                 "event_payload": {
                     "symbol": payload.get("symbol"),
                     "exchange": payload.get("exchange"),
+                    "market_type": payload.get("market_type"),
+                    "timeframe": payload.get("timeframe"),
                     "sequence_id": payload.get("sequence_id"),
-                }
+                },
+                **self._safe_metadata(metadata),
             },
         )
 
@@ -302,6 +511,9 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         exchange: str,
         bids: Iterable[tuple[float, float]],
         asks: Iterable[tuple[float, float]],
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         best_bid: float | None = None,
         best_ask: float | None = None,
         sequence_id: int | None = None,
@@ -311,18 +523,34 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         correlation_id: str | None = None,
     ) -> AnalyzerOutput:
         """
-        Helper для прямої роботи із сирими bids/asks без EventBus.
+        Manual/test helper для прямої роботи із bids/asks без EventBus.
+
+        Production runtime має використовувати:
+            market.orderbook.updated -> process_event_payload/process_key
         """
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
         snapshots = self.wall_detector.build_snapshot_levels_from_orderbook(
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
             bids=bids,
             asks=asks,
             best_bid=best_bid,
             best_ask=best_ask,
             sequence_id=sequence_id,
             timestamp=timestamp,
-            metadata=metadata,
+            metadata={
+                **self._safe_metadata(metadata),
+                "source": "manual_or_test_process_orderbook",
+            },
         )
 
         resolved_mid = current_mid_price
@@ -332,8 +560,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
         return await self.process_snapshots(
             snapshots=snapshots,
-            symbol=symbol,
-            exchange=exchange,
+            key=key,
             current_mid_price=resolved_mid,
             metadata=metadata,
             correlation_id=correlation_id,
@@ -343,80 +570,67 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         self,
         *,
         snapshots: Iterable[OrderbookLevelSnapshot],
-        symbol: str | None = None,
-        exchange: str | None = None,
+        key: SpoofingKey,
         current_mid_price: float | None = None,
         metadata: dict[str, Any] | None = None,
         correlation_id: str | None = None,
     ) -> AnalyzerOutput:
         """
-        Основна точка входу для вже нормалізованих orderbook snapshots.
+        Основна точка входу для normalized orderbook snapshots одного scoped key.
         """
         if not self.config.enabled or not self.config.analyzer.enabled:
-            return AnalyzerOutput(
-                symbol=symbol or "unknown",
-                exchange=exchange or "unknown",
-                signal=None,
-                metadata={"reason": "analyzer_disabled", **self._safe_metadata(metadata)},
+            return self._empty_output(
+                key=key,
+                reason="analyzer_disabled",
+                metadata=metadata,
             )
 
-        levels = list(snapshots)
+        if not self.should_process_key(key):
+            return self._empty_output(
+                key=key,
+                reason="key_not_allowed",
+                metadata=metadata,
+            )
+
+        levels = [level for level in snapshots if level.key == key]
         if not levels:
-            return AnalyzerOutput(
-                symbol=symbol or "unknown",
-                exchange=exchange or "unknown",
-                signal=None,
-                metadata={"reason": "empty_snapshots", **self._safe_metadata(metadata)},
+            output = self._empty_output(
+                key=key,
+                reason="no_levels_for_key",
+                metadata=metadata,
             )
+            self._latest_output_by_key[key] = output
+            return output
 
-        resolved_symbol, resolved_exchange = self._resolve_market_identity(
-            levels=levels,
-            symbol=symbol,
-            exchange=exchange,
-        )
         resolved_mid_price = current_mid_price or self._resolve_mid_price_from_levels(levels)
 
-        scoped_levels = self._filter_levels_by_market(
-            levels=levels,
-            symbol=resolved_symbol,
-            exchange=resolved_exchange,
-        )
-        if not scoped_levels:
-            return AnalyzerOutput(
-                symbol=resolved_symbol,
-                exchange=resolved_exchange,
-                signal=None,
-                metadata={"reason": "no_levels_for_resolved_market", **self._safe_metadata(metadata)},
-            )
+        self.persistence_tracker.maybe_cleanup(now=levels[0].timestamp)
 
-        self.persistence_tracker.maybe_cleanup(now=scoped_levels[0].timestamp)
-
-        filtered_levels = self._filter_levels_for_analysis(scoped_levels)
+        filtered_levels = self._filter_levels_for_analysis(levels, key=key)
         if not filtered_levels:
-            return AnalyzerOutput(
-                symbol=resolved_symbol,
-                exchange=resolved_exchange,
-                signal=None,
-                metadata={"reason": "no_levels_after_filtering", **self._safe_metadata(metadata)},
+            output = self._empty_output(
+                key=key,
+                reason="no_levels_after_filtering",
+                metadata={
+                    "input_levels_count": len(levels),
+                    **self._safe_metadata(metadata),
+                },
             )
+            self._latest_output_by_key[key] = output
+            return output
 
         tracked_walls, lifecycle_events = self._update_tracker(filtered_levels)
 
         detector_results = self._run_base_detectors(
             snapshots=filtered_levels,
-            exchange=resolved_exchange,
-            symbol=resolved_symbol,
+            key=key,
             current_mid_price=resolved_mid_price,
         )
 
         detector_results.extend(
             self._run_optional_detectors(
-                tracked_walls=self.persistence_tracker.get_walls_for_symbol(
-                    exchange=resolved_exchange,
-                    symbol=resolved_symbol,
-                ),
-                exchange=resolved_exchange,
-                symbol=resolved_symbol,
+                tracked_walls=self.persistence_tracker.get_walls_for_key(key),
+                key=key,
                 current_mid_price=resolved_mid_price,
             )
         )
@@ -425,21 +639,25 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
         signal = self._build_signal(
             detector_results=detector_results,
-            exchange=resolved_exchange,
-            symbol=resolved_symbol,
+            key=key,
         )
 
+        if signal is not None:
+            self._latest_signal_by_key[key] = signal
+
+        scope = spoofing_key_to_dict(key)
+
         output = AnalyzerOutput(
-            symbol=resolved_symbol,
-            exchange=resolved_exchange,
+            symbol=scope["symbol"],
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            timeframe=scope["timeframe"],
             signal=signal,
             detector_results=detector_results,
-            tracked_walls=self.persistence_tracker.snapshot_state(
-                exchange=resolved_exchange,
-                symbol=resolved_symbol,
-            ),
+            tracked_walls=self.persistence_tracker.snapshot_state(key=key),
             lifecycle_events=lifecycle_events,
             metadata={
+                "scope": scope,
                 "lifecycle_events_count": len(lifecycle_events),
                 "input_levels_count": len(levels),
                 "filtered_levels_count": len(filtered_levels),
@@ -447,6 +665,8 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 **self._safe_metadata(metadata),
             },
         )
+
+        self._latest_output_by_key[key] = output
 
         await self._publish_outputs(
             output=output,
@@ -463,9 +683,6 @@ class SpoofingAnalyzer(BaseSpoofingModule):
     def cleanup(self) -> int:
         """
         Синхронний cleanup для ручного виклику або тестів.
-
-        Scheduler не отримує цей method напряму, бо він повертає int,
-        а core.scheduler очікує job-callback із return type None або Awaitable[None].
         """
         expired_count = self.persistence_tracker.cleanup()
         self.log_debug(
@@ -476,7 +693,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
     async def cleanup_job(self) -> None:
         """
-        Async-safe Scheduler callback із сумісним return type.
+        Async-safe Scheduler callback.
         """
         self.cleanup()
         return None
@@ -490,49 +707,28 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         event_id = getattr(event, "event_id", None)
         return event_id if isinstance(event_id, str) and event_id else None
 
-    @staticmethod
-    def _resolve_market_identity(
-        *,
-        levels: list[OrderbookLevelSnapshot],
-        symbol: str | None,
-        exchange: str | None,
-    ) -> tuple[str, str]:
-        resolved_symbol = symbol if symbol is not None and symbol else levels[0].symbol
-        resolved_exchange = exchange if exchange is not None and exchange else levels[0].exchange
-        return resolved_symbol, resolved_exchange
-
-    @staticmethod
-    def _filter_levels_by_market(
-        *,
-        levels: list[OrderbookLevelSnapshot],
-        symbol: str,
-        exchange: str,
-    ) -> list[OrderbookLevelSnapshot]:
-        return [
-            level
-            for level in levels
-            if level.symbol == symbol and level.exchange == exchange
-        ]
-
     def _filter_levels_for_analysis(
         self,
         levels: list[OrderbookLevelSnapshot],
+        *,
+        key: SpoofingKey,
     ) -> list[OrderbookLevelSnapshot]:
         """
         Попередній фільтр рівнів.
 
         Залишає:
         - валідні bid/ask рівні;
+        - дозволений scoped key;
         - top-N levels per side according to wall_detection.max_levels_to_scan.
         """
         valid = [
             level
             for level in levels
-            if level.price > 0
+            if level.key == key
+            and level.price > 0
             and level.size > 0
             and level.side in {SpoofingSide.BID, SpoofingSide.ASK}
-            and self.config.is_symbol_allowed(level.symbol)
-            and (self.config.exchange is None or level.exchange == self.config.exchange)
+            and self.should_process_key(level.key)
         ]
 
         if not valid:
@@ -554,6 +750,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 "Orderbook levels skipped: below min_levels_to_scan",
                 levels_count=len(valid),
                 min_levels_to_scan=min_levels,
+                key=spoofing_key_to_dict(key),
             )
             return []
 
@@ -568,17 +765,15 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         levels: list[OrderbookLevelSnapshot],
     ) -> tuple[list[TrackedWall], list[LiquidityLifecycleEvent]]:
         """
-        Оновлює PersistenceTracker по релевантних рівнях.
+        Оновлює PersistenceTracker по релевантних normalized рівнях.
         """
-        tracked_walls, lifecycle_events = self.persistence_tracker.upsert_many(levels)
-        return tracked_walls, lifecycle_events
+        return self.persistence_tracker.upsert_many(levels)
 
     def _run_base_detectors(
         self,
         *,
         snapshots: list[OrderbookLevelSnapshot],
-        exchange: str,
-        symbol: str,
+        key: SpoofingKey,
         current_mid_price: float | None,
     ) -> list[DetectorResult]:
         """
@@ -586,21 +781,14 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         """
         detector_results: list[DetectorResult] = []
 
-        wall_results = self.wall_detector.analyze_many(
+        wall_results = self.wall_detector.analyze_key(
             snapshots=snapshots,
-            symbol=symbol,
-            exchange=exchange,
+            key=key,
         )
         detector_results.extend(wall_results)
 
-        symbol_walls = self.persistence_tracker.get_walls_for_symbol(
-            exchange=exchange,
-            symbol=symbol,
-        )
-        pull_results = self.pull_detector.analyze_many(
-            walls=symbol_walls,
-            exchange=exchange,
-            symbol=symbol,
+        pull_results = self.pull_detector.analyze_key(
+            key=key,
             current_mid_price=current_mid_price,
         )
         detector_results.extend(pull_results)
@@ -611,8 +799,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         self,
         *,
         tracked_walls: list[TrackedWall],
-        exchange: str,
-        symbol: str,
+        key: SpoofingKey,
         current_mid_price: float | None,
     ) -> list[DetectorResult]:
         """
@@ -625,8 +812,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 self._safe_run_detector(
                     detector=self.fake_liquidity_detector,
                     tracked_walls=tracked_walls,
-                    exchange=exchange,
-                    symbol=symbol,
+                    key=key,
                     current_mid_price=current_mid_price,
                     detector_name="fake_liquidity_detector",
                 )
@@ -637,8 +823,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 self._safe_run_detector(
                     detector=self.flip_pressure_detector,
                     tracked_walls=tracked_walls,
-                    exchange=exchange,
-                    symbol=symbol,
+                    key=key,
                     current_mid_price=current_mid_price,
                     detector_name="flip_pressure_detector",
                 )
@@ -649,8 +834,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 self._safe_run_detector(
                     detector=self.layering_detector,
                     tracked_walls=tracked_walls,
-                    exchange=exchange,
-                    symbol=symbol,
+                    key=key,
                     current_mid_price=current_mid_price,
                     detector_name="layering_detector",
                 )
@@ -663,8 +847,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         *,
         detector: SupportsTrackedWallAnalyzeMany,
         tracked_walls: list[TrackedWall],
-        exchange: str,
-        symbol: str,
+        key: SpoofingKey,
         current_mid_price: float | None,
         detector_name: str,
     ) -> list[DetectorResult]:
@@ -674,8 +857,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         try:
             result = detector.analyze_many(
                 tracked_walls,
-                exchange=exchange,
-                symbol=symbol,
+                key=key,
                 current_mid_price=current_mid_price,
             )
 
@@ -690,6 +872,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 "Detector failed",
                 detector_name=detector_name,
                 error=str(exc),
+                key=spoofing_key_to_dict(key),
             )
             return []
 
@@ -697,8 +880,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         self,
         *,
         detector_results: list[DetectorResult],
-        exchange: str,
-        symbol: str,
+        key: SpoofingKey,
     ) -> SpoofingSignal | None:
         """
         Будує фінальний signal через score engine.
@@ -708,8 +890,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
         return self.score_engine.build_signal(
             detector_results=detector_results,
-            exchange=exchange,
-            symbol=symbol,
+            key=key,
             status=SpoofingStatus.DETECTED,
         )
 
@@ -790,6 +971,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         error: Exception,
         payload: dict[str, Any],
         context: dict[str, Any],
+        correlation_id: str | None = None,
     ) -> None:
         if self.event_bus is None:
             return
@@ -804,6 +986,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 "context": context,
             },
             priority=EventPriority.HIGH,
+            correlation_id=correlation_id,
         )
 
     def _build_lifecycle_payload(
@@ -814,6 +997,9 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         return {
             "symbol": output.symbol,
             "exchange": output.exchange,
+            "market_type": output.market_type,
+            "timeframe": output.timeframe,
+            "scope": spoofing_key_to_dict(output.key),
             "lifecycle_events": [
                 self.serialize_dataclass(item)
                 for item in lifecycle_events
@@ -829,6 +1015,9 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         return {
             "symbol": output.symbol,
             "exchange": output.exchange,
+            "market_type": output.market_type,
+            "timeframe": output.timeframe,
+            "scope": spoofing_key_to_dict(output.key),
             "signal": self._serialize_signal(output.signal) if output.signal is not None else None,
             "detector_results": [
                 self.detector_result_payload(item)
@@ -855,6 +1044,9 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         return {
             "symbol": output.symbol,
             "exchange": output.exchange,
+            "market_type": output.market_type,
+            "timeframe": output.timeframe,
+            "scope": spoofing_key_to_dict(output.key),
             "signal": self._serialize_signal(signal),
             "score": signal.score,
             "confidence": signal.confidence,
@@ -875,6 +1067,9 @@ class SpoofingAnalyzer(BaseSpoofingModule):
             "signal_id": signal.signal_id,
             "symbol": signal.symbol,
             "exchange": signal.exchange,
+            "market_type": signal.market_type,
+            "timeframe": signal.timeframe,
+            "scope": spoofing_key_to_dict(signal.key),
             "score": score.total_score,
             "confidence": score.confidence,
             "severity": score.severity.value,
@@ -894,35 +1089,55 @@ class SpoofingAnalyzer(BaseSpoofingModule):
     def _extract_or_build_snapshots_from_payload(
         self,
         payload: dict[str, Any],
+        *,
+        key: SpoofingKey,
+        allow_raw_payload: bool = False,
     ) -> list[OrderbookLevelSnapshot]:
         """
-        Підтримує:
-        - payload["snapshots"] -> list[OrderbookLevelSnapshot | dict];
-        - payload["bids"], payload["asks"] -> raw orderbook tuples/lists.
+        Production:
+            payload["snapshots"] або normalized/cache-level bids/asks з
+            market.orderbook.updated.
+
+        Raw bids/asks з exchange adapter дозволені тільки якщо allow_raw_payload=True.
         """
         if "snapshots" in payload:
-            return self._normalize_snapshot_list(payload["snapshots"])
+            return self._normalize_snapshot_list(payload["snapshots"], key=key)
 
-        required = {"symbol", "exchange"}
-        missing = [key for key in required if key not in payload]
-        if missing:
-            raise ValueError(f"Missing required orderbook payload keys: {missing}")
+        has_book_sides = "bids" in payload or "asks" in payload
+        if not has_book_sides:
+            return []
+
+        if not allow_raw_payload and payload.get("source") == "exchange_adapter":
+            raise ValueError(
+                "Raw exchange adapter orderbook payload is not allowed in SpoofingAnalyzer "
+                "production path. Use OrderBookCache -> market.orderbook.updated."
+            )
+
+        scope = spoofing_key_to_dict(key)
 
         return self.wall_detector.build_snapshot_levels_from_orderbook(
-            symbol=str(payload["symbol"]),
-            exchange=str(payload["exchange"]),
+            symbol=scope["symbol"],
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            timeframe=scope["timeframe"],
+            exchange_symbol=self._optional_str(payload.get("exchange_symbol")),
             bids=self._normalize_book_side(payload.get("bids", [])),
             asks=self._normalize_book_side(payload.get("asks", [])),
             best_bid=self._optional_float(payload.get("best_bid")),
             best_ask=self._optional_float(payload.get("best_ask")),
             sequence_id=self._optional_int(payload.get("sequence_id")),
             timestamp=self._optional_datetime(payload.get("timestamp")),
-            metadata=self._optional_metadata(payload.get("metadata")),
+            metadata={
+                **self._optional_metadata(payload.get("metadata")),
+                "payload_source": payload.get("source", "data_layer_updated_event"),
+            },
         )
 
     def _normalize_snapshot_list(
         self,
         raw_snapshots: Any,
+        *,
+        key: SpoofingKey,
     ) -> list[OrderbookLevelSnapshot]:
         """
         Нормалізує list[OrderbookLevelSnapshot | dict] у list[OrderbookLevelSnapshot].
@@ -932,18 +1147,24 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         if not isinstance(raw_snapshots, list):
             return snapshots
 
+        scope = spoofing_key_to_dict(key)
+
         for item in raw_snapshots:
             if isinstance(item, OrderbookLevelSnapshot):
-                snapshots.append(item)
+                if item.key == key:
+                    snapshots.append(item)
                 continue
 
-            if not isinstance(item, dict):
+            if not isinstance(item, Mapping):
                 continue
 
             try:
                 snapshot = self.build_level_snapshot(
-                    symbol=str(item["symbol"]),
-                    exchange=str(item["exchange"]),
+                    symbol=str(item.get("symbol") or scope["symbol"]),
+                    exchange=str(item.get("exchange") or scope["exchange"]),
+                    market_type=str(item.get("market_type") or scope["market_type"]),
+                    timeframe=str(item.get("timeframe") or scope["timeframe"]),
+                    exchange_symbol=self._optional_str(item.get("exchange_symbol")),
                     side=item["side"],
                     price=self.safe_float(item["price"]),
                     size=self.safe_float(item["size"]),
@@ -955,7 +1176,8 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                     timestamp=self._optional_datetime(item.get("timestamp")),
                     metadata=self._optional_metadata(item.get("metadata")),
                 )
-                snapshots.append(snapshot)
+                if snapshot.key == key:
+                    snapshots.append(snapshot)
 
             except Exception as exc:
                 self.log_warning(
@@ -965,6 +1187,94 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 )
 
         return snapshots
+
+    def _load_snapshots_from_orderbook_cache(
+        self,
+        key: SpoofingKey,
+    ) -> list[OrderbookLevelSnapshot]:
+        """
+        Best-effort read-only access до OrderBookCache без жорсткої залежності
+        analytics -> data.
+        """
+        if self.orderbook_cache is None:
+            return []
+
+        scope = spoofing_key_to_dict(key)
+
+        try:
+            book = self.orderbook_cache.get_book(
+                exchange=scope["exchange"],
+                market_type=scope["market_type"],
+                symbol=scope["symbol"],
+                depth=self.config.wall_detection.max_levels_to_scan,
+            )
+        except TypeError:
+            try:
+                book = self.orderbook_cache.get_book(
+                    exchange=scope["exchange"],
+                    symbol=scope["symbol"],
+                    depth=self.config.wall_detection.max_levels_to_scan,
+                )
+            except Exception:
+                self.log_exception(
+                    "Failed to read orderbook cache",
+                    key=scope,
+                )
+                return []
+        except Exception:
+            self.log_exception(
+                "Failed to read orderbook cache",
+                key=scope,
+            )
+            return []
+
+        payload = self._orderbook_cache_snapshot_to_payload(book, key=key)
+        return self._extract_or_build_snapshots_from_payload(
+            payload,
+            key=key,
+            allow_raw_payload=False,
+        )
+
+    def _orderbook_cache_snapshot_to_payload(
+        self,
+        book: Any,
+        *,
+        key: SpoofingKey,
+    ) -> dict[str, Any]:
+        scope = spoofing_key_to_dict(key)
+
+        if isinstance(book, Mapping):
+            return {
+                "exchange": book.get("exchange", scope["exchange"]),
+                "market_type": book.get("market_type", scope["market_type"]),
+                "symbol": book.get("symbol", scope["symbol"]),
+                "timeframe": book.get("timeframe", scope["timeframe"]),
+                "exchange_symbol": book.get("exchange_symbol"),
+                "bids": book.get("bids", []),
+                "asks": book.get("asks", []),
+                "best_bid": book.get("best_bid"),
+                "best_ask": book.get("best_ask"),
+                "sequence_id": book.get("sequence_id"),
+                "timestamp": book.get("timestamp"),
+                "metadata": book.get("metadata", {}),
+                "source": "orderbook_cache",
+            }
+
+        return {
+            "exchange": getattr(book, "exchange", scope["exchange"]),
+            "market_type": getattr(book, "market_type", scope["market_type"]),
+            "symbol": getattr(book, "symbol", scope["symbol"]),
+            "timeframe": getattr(book, "timeframe", scope["timeframe"]),
+            "exchange_symbol": getattr(book, "exchange_symbol", None),
+            "bids": getattr(book, "bids", []),
+            "asks": getattr(book, "asks", []),
+            "best_bid": getattr(book, "best_bid", None),
+            "best_ask": getattr(book, "best_ask", None),
+            "sequence_id": getattr(book, "sequence_id", None),
+            "timestamp": getattr(book, "timestamp", None),
+            "metadata": getattr(book, "metadata", {}),
+            "source": "orderbook_cache",
+        }
 
     @staticmethod
     def _normalize_book_side(raw_levels: Any) -> list[tuple[float, float]]:
@@ -983,7 +1293,7 @@ class SpoofingAnalyzer(BaseSpoofingModule):
 
         for item in iterator:
             try:
-                if isinstance(item, dict):
+                if isinstance(item, Mapping):
                     raw_price = item.get("price")
                     raw_size = item.get("size", item.get("qty", item.get("quantity")))
                     if raw_price is None or raw_size is None:
@@ -1000,6 +1310,18 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 continue
 
         return levels
+
+    def _fallback_key_from_payload(self, payload: Mapping[str, Any]) -> SpoofingKey:
+        exchange = payload.get("exchange") or self.config.default_exchange or "unknown"
+        symbol = payload.get("symbol") or "UNKNOWN"
+        market_type = payload.get("market_type") or self.config.default_market_type
+        timeframe = payload.get("timeframe") or self.config.default_timeframe
+        return self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
 
     @staticmethod
     def _optional_str(value: Any) -> str | None:
@@ -1024,10 +1346,10 @@ class SpoofingAnalyzer(BaseSpoofingModule):
         return value if isinstance(value, datetime) else None
 
     @staticmethod
-    def _optional_metadata(value: Any) -> dict[str, Any] | None:
-        if isinstance(value, dict):
+    def _optional_metadata(value: Any) -> dict[str, Any]:
+        if isinstance(value, Mapping):
             return dict(value)
-        return None
+        return {}
 
     @staticmethod
     def _safe_metadata(value: dict[str, Any] | None) -> dict[str, Any]:
@@ -1078,6 +1400,53 @@ class SpoofingAnalyzer(BaseSpoofingModule):
             return None
 
     # -------------------------------------------------------------------------
+    # Output helpers
+    # -------------------------------------------------------------------------
+
+    def _empty_output(
+        self,
+        *,
+        key: SpoofingKey,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> AnalyzerOutput:
+        scope = spoofing_key_to_dict(key)
+        return AnalyzerOutput(
+            symbol=scope["symbol"],
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            timeframe=scope["timeframe"],
+            signal=None,
+            metadata={
+                "scope": scope,
+                "reason": reason,
+                **self._safe_metadata(metadata),
+            },
+        )
+
+    def get_latest_output_by_key(self, key: SpoofingKey) -> AnalyzerOutput | None:
+        return self._latest_output_by_key.get(key)
+
+    def get_latest_signal_by_key(self, key: SpoofingKey) -> SpoofingSignal | None:
+        return self._latest_signal_by_key.get(key)
+
+    def get_latest_output(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> AnalyzerOutput | None:
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return self.get_latest_output_by_key(key)
+
+    # -------------------------------------------------------------------------
     # Serialization helpers
     # -------------------------------------------------------------------------
 
@@ -1116,6 +1485,8 @@ class SpoofingAnalyzer(BaseSpoofingModule):
             "registered": self._registered,
             "cleanup_job_id": self._cleanup_job_id,
             "tracker": self.persistence_tracker.stats(),
+            "latest_outputs": len(self._latest_output_by_key),
+            "latest_signals": len(self._latest_signal_by_key),
             "config": {
                 "enabled": self.config.enabled,
                 "analyzer_enabled": self.config.analyzer.enabled,
@@ -1123,17 +1494,22 @@ class SpoofingAnalyzer(BaseSpoofingModule):
                 "publish_detected_only": self.config.analyzer.publish_detected_only,
                 "publish_lifecycle_events": self.config.analyzer.publish_lifecycle_events,
                 "publish_score_updates": self.config.analyzer.publish_score_updates,
-                "orderbook_topic": self.config.analyzer.event_topic_orderbook,
+                "production_source_topics": list(self.config.production_source_topics),
+                "allow_legacy_raw_topics": self.config.analyzer.allow_legacy_raw_topics,
                 "updated_topic": self.config.analyzer.event_topic_updated,
                 "detected_topic": self.config.analyzer.event_topic_detected,
                 "score_topic": self.config.analyzer.event_topic_score_updated,
                 "lifecycle_topic": self.config.analyzer.event_topic_lifecycle,
                 "error_topic": self.config.analyzer.event_topic_error,
+                "scope": "exchange:market_type:symbol:timeframe",
             },
             "optional_detectors": {
                 "fake_liquidity": self.fake_liquidity_detector is not None,
                 "flip_pressure": self.flip_pressure_detector is not None,
                 "layering": self.layering_detector is not None,
+            },
+            "dependencies": {
+                "orderbook_cache": self.orderbook_cache is not None,
             },
         }
 
