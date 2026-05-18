@@ -8,8 +8,14 @@ from typing import Any
 from core.event_bus import Event, EventBus, EventPriority
 from core.scheduler import Scheduler
 
-from analytics.liquidations.enums import CascadeDirection, CascadeSeverity
-from analytics.liquidations.models import CascadeDetectionResult
+from analytics.liquidations.enums import CascadeDirection, CascadeSeverity, LiquidationStatus
+from analytics.liquidations.models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    CascadeDetectionResult,
+    LiquidationKey,
+    liquidation_key_to_dict,
+)
 
 from strategy.strategies.liquidations.base import (
     BaseAnalyticsStrategy,
@@ -19,7 +25,13 @@ from strategy.strategies.liquidations.base import (
     StrategyRejection,
     clamp_float,
     ensure_utc,
+    make_strategy_scope_key,
+    normalize_exchange,
+    normalize_exchange_symbol,
+    normalize_market_type,
     normalize_symbol,
+    normalize_timeframe,
+    scoped_key_to_string,
     serialize_value,
     utc_now,
 )
@@ -41,16 +53,6 @@ def _safe_decimal(value: Any, default: Decimal = DECIMAL_ZERO) -> Decimal:
         return default
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 # ============================================================================
 # Config
 # ============================================================================
@@ -59,20 +61,27 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 @dataclass(slots=True)
 class SqueezeReversalStrategyConfig:
     """
-    Exhaustion/reversal strategy поверх analytics.liquidation.exhaustion_detected.
+    Exhaustion/reversal strategy поверх analytics.liquidations.exhaustion_detected.
 
-    Ідея:
-    - analytics уже визначив exhaustion-сценарій після liquidation cascade;
-    - strategy перевіряє якість exhaustion-сигналу;
-    - використовує cluster, bias delta, imbalance, acceleration, severity, freshness;
-    - ставить candidate у pending-confirmation;
-    - після затримки підтверджує reversal, якщо сигнал не застарів і не був перебитий
-      новішим/сильнішим analytics result.
+    Strategy:
+    - слухає analytics.liquidations.exhaustion_detected;
+    - приймає CascadeDetectionResult;
+    - працює тільки з повним futures/liquidation scope:
+        exchange + market_type + symbol + timeframe;
+    - перевіряє exhaustion quality;
+    - створює pending reversal candidate;
+    - після confirmation delay генерує reversal signal;
+    - не викликає risk/execution напряму.
+
+    Reversal direction:
+    - CascadeDirection.DOWN -> LONG
+    - CascadeDirection.UP   -> SHORT
     """
 
     enabled: bool = True
 
-    subscribe_topic: str = "analytics.liquidation.exhaustion_detected"
+    # Важливо: plural namespace, як у новому CascadeDetector.
+    subscribe_topic: str = "analytics.liquidations.exhaustion_detected"
     publish_topic_signal_generated: str = "signal.generated"
     publish_topic_signal_rejected: str = "signal.rejected"
 
@@ -97,23 +106,32 @@ class SqueezeReversalStrategyConfig:
     pending_priority: EventPriority = EventPriority.LOW
     diagnostics_priority: EventPriority = EventPriority.LOW
 
+    # Full-scope filters.
     allowed_exchanges: tuple[str, ...] = ()
+    allowed_market_types: tuple[str, ...] = ()
     allowed_symbols: tuple[str, ...] = ()
+    allowed_timeframes: tuple[str, ...] = ()
+
+    blocked_market_types: tuple[str, ...] = ()
     blocked_symbols: tuple[str, ...] = ()
+    blocked_timeframes: tuple[str, ...] = ()
 
     allowed_severities: tuple[CascadeSeverity, ...] = (
         CascadeSeverity.HIGH,
         CascadeSeverity.EXTREME,
     )
 
-    # Base quality filters
+    # Base quality filters.
+    require_confirmed_result: bool = True
+    require_actionable_direction: bool = True
+
     min_confidence: float = 0.65
     min_intensity_score: float = 0.60
     min_total_notional_usd: Decimal = Decimal("400000")
     min_event_count: int = 6
     max_price_range_pct: float | None = None
 
-    # Exhaustion-specific filters
+    # Exhaustion-specific filters.
     require_favors_exhaustion: bool = True
     require_high_confidence_only: bool = False
     require_actionable_severity: bool = True
@@ -122,27 +140,27 @@ class SqueezeReversalStrategyConfig:
     min_bias_delta: float = 0.12
     max_continuation_bias_after_exhaustion: float | None = 0.55
 
-    # Detector metadata filters
+    # Detector metadata filters.
     min_side_imbalance_ratio: float | None = 0.70
     min_event_imbalance_ratio: float | None = None
     min_climax_acceleration_ratio: float | None = 1.10
 
-    # Cluster-shape filters
+    # Cluster-shape filters.
     max_cluster_duration_seconds: float | None = 12.0
     min_avg_notional_per_event: Decimal | None = Decimal("50000")
 
-    # Freshness / clock skew
+    # Freshness / clock skew.
     max_result_age_seconds: float = 20.0
     max_future_detected_at_seconds: float = 5.0
 
-    # Pending confirmation model
+    # Pending confirmation model.
     enable_pending_confirmation: bool = True
     confirmation_delay_seconds: float = 2.0
     pending_ttl_seconds: float = 8.0
     min_pending_age_seconds: float = 1.5
     pending_scan_interval_seconds: float = 0.5
 
-    # Якщо після candidate прийшов новіший analytics result по тому ж символу,
+    # Якщо після candidate прийшов новіший analytics result по тому ж full scope,
     # старий reversal candidate краще скасувати.
     cancel_if_newer_detected_at: bool = True
 
@@ -165,15 +183,39 @@ class SqueezeReversalStrategyConfig:
 
     hot_symbols_window_seconds: int | None = 300
 
-    # Scoring
-    score_confidence_weight: float = 0.25
-    score_exhaustion_bias_weight: float = 0.30
-    score_bias_delta_weight: float = 0.15
+    # Scoring.
+    score_confidence_weight: float = 0.23
+    score_exhaustion_bias_weight: float = 0.28
+    score_bias_delta_weight: float = 0.14
     score_intensity_weight: float = 0.12
-    score_severity_weight: float = 0.10
+    score_severity_weight: float = 0.08
     score_cluster_quality_weight: float = 0.08
+    score_imbalance_weight: float = 0.04
+    score_acceleration_weight: float = 0.03
 
     def validate(self) -> None:
+        if not self.subscribe_topic:
+            raise ValueError("subscribe_topic must not be empty")
+
+        if not self.publish_topic_signal_generated:
+            raise ValueError("publish_topic_signal_generated must not be empty")
+
+        if not self.publish_topic_signal_rejected:
+            raise ValueError("publish_topic_signal_rejected must not be empty")
+
+        if not self.diagnostics_topic:
+            raise ValueError("diagnostics_topic must not be empty")
+
+        pending_topics = {
+            "publish_topic_pending_created": self.publish_topic_pending_created,
+            "publish_topic_pending_expired": self.publish_topic_pending_expired,
+            "publish_topic_pending_replaced": self.publish_topic_pending_replaced,
+            "publish_topic_pending_confirmed": self.publish_topic_pending_confirmed,
+        }
+        for name, topic in pending_topics.items():
+            if not topic:
+                raise ValueError(f"{name} must not be empty")
+
         bounded = {
             "min_confidence": self.min_confidence,
             "min_intensity_score": self.min_intensity_score,
@@ -231,6 +273,12 @@ class SqueezeReversalStrategyConfig:
         if self.pending_scan_interval_seconds <= 0:
             raise ValueError("pending_scan_interval_seconds must be > 0")
 
+        if self.pending_ttl_seconds <= self.confirmation_delay_seconds:
+            raise ValueError("pending_ttl_seconds must be greater than confirmation_delay_seconds")
+
+        if self.min_pending_age_seconds > self.pending_ttl_seconds:
+            raise ValueError("min_pending_age_seconds must be <= pending_ttl_seconds")
+
         if self.symbol_cooldown_seconds < 0:
             raise ValueError("symbol_cooldown_seconds must be >= 0")
 
@@ -246,8 +294,53 @@ class SqueezeReversalStrategyConfig:
         if self.diagnostics_interval_seconds <= 0:
             raise ValueError("diagnostics_interval_seconds must be > 0")
 
+        if self.recent_pending_limit <= 0:
+            raise ValueError("recent_pending_limit must be > 0")
+
         if self.hot_symbols_window_seconds is not None and self.hot_symbols_window_seconds <= 0:
             raise ValueError("hot_symbols_window_seconds must be > 0 or None")
+
+        normalized_allowed_market_types = {
+            normalize_market_type(item)
+            for item in self.allowed_market_types
+            if str(item).strip()
+        }
+        normalized_blocked_market_types = {
+            normalize_market_type(item)
+            for item in self.blocked_market_types
+            if str(item).strip()
+        }
+        overlap_market_types = normalized_allowed_market_types & normalized_blocked_market_types
+        if overlap_market_types:
+            raise ValueError(f"allowed_market_types and blocked_market_types overlap: {sorted(overlap_market_types)}")
+
+        normalized_allowed_timeframes = {
+            normalize_timeframe(item)
+            for item in self.allowed_timeframes
+            if str(item).strip()
+        }
+        normalized_blocked_timeframes = {
+            normalize_timeframe(item)
+            for item in self.blocked_timeframes
+            if str(item).strip()
+        }
+        overlap_timeframes = normalized_allowed_timeframes & normalized_blocked_timeframes
+        if overlap_timeframes:
+            raise ValueError(f"allowed_timeframes and blocked_timeframes overlap: {sorted(overlap_timeframes)}")
+
+        normalized_allowed_symbols = {
+            normalize_symbol(item)
+            for item in self.allowed_symbols
+            if str(item).strip()
+        }
+        normalized_blocked_symbols = {
+            normalize_symbol(item)
+            for item in self.blocked_symbols
+            if str(item).strip()
+        }
+        overlap_symbols = normalized_allowed_symbols & normalized_blocked_symbols
+        if overlap_symbols:
+            raise ValueError(f"allowed_symbols and blocked_symbols overlap: {sorted(overlap_symbols)}")
 
         weights = {
             "score_confidence_weight": self.score_confidence_weight,
@@ -256,6 +349,8 @@ class SqueezeReversalStrategyConfig:
             "score_intensity_weight": self.score_intensity_weight,
             "score_severity_weight": self.score_severity_weight,
             "score_cluster_quality_weight": self.score_cluster_quality_weight,
+            "score_imbalance_weight": self.score_imbalance_weight,
+            "score_acceleration_weight": self.score_acceleration_weight,
         }
 
         for name, weight in weights.items():
@@ -305,6 +400,13 @@ class SqueezeReversalSignal:
     cluster_duration_seconds: float
     cluster_avg_notional_per_event: Decimal
 
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
+    event_type: str | None = None
+    status: str | None = None
+
     side_imbalance_ratio: float | None = None
     event_imbalance_ratio: float | None = None
     acceleration_ratio: float | None = None
@@ -315,6 +417,52 @@ class SqueezeReversalSignal:
     correlation_id: str | None = None
     source_event_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.symbol = normalize_symbol(self.symbol)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.side = self.side.upper()
+
+        self.confidence = clamp_float(self.confidence)
+        self.score = clamp_float(self.score)
+        self.intensity_score = clamp_float(self.intensity_score)
+        self.continuation_bias = clamp_float(self.continuation_bias)
+        self.exhaustion_bias = clamp_float(self.exhaustion_bias)
+        self.bias_delta = clamp_float(self.bias_delta)
+
+        self.generated_at = ensure_utc(self.generated_at)
+        self.detected_at = ensure_utc(self.detected_at)
+
+        if self.pending_started_at is not None:
+            self.pending_started_at = ensure_utc(self.pending_started_at)
+
+        if self.pending_confirmed_at is not None:
+            self.pending_confirmed_at = ensure_utc(self.pending_confirmed_at)
+
+    @property
+    def key(self) -> LiquidationKey:
+        return make_strategy_scope_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        scope = liquidation_key_to_dict(self.key)
+        scope["exchange_symbol"] = self.exchange_symbol or self.symbol
+        return scope
+
+    @property
+    def scope_key(self) -> str:
+        return scoped_key_to_string(self.key)
 
     @property
     def is_pending_confirmed(self) -> bool:
@@ -332,15 +480,17 @@ class SqueezeReversalSignal:
 
     @property
     def is_long(self) -> bool:
-        return self.side.upper() == "LONG"
+        return self.side == "LONG"
 
     @property
     def is_short(self) -> bool:
-        return self.side.upper() == "SHORT"
+        return self.side == "SHORT"
 
     def to_dict(self, *, serialize: bool = True) -> dict[str, Any]:
         data = asdict(self)
 
+        data["scope"] = self.scope
+        data["scope_key"] = self.scope_key
         data["is_pending_confirmed"] = self.is_pending_confirmed
         data["confirmation_delay_seconds"] = self.confirmation_delay_seconds
         data["is_long"] = self.is_long
@@ -367,19 +517,80 @@ class PendingReversalCandidate:
     score_at_creation: float
     quality_snapshot: dict[str, Any] = field(default_factory=dict)
 
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     cancelled: bool = False
     cancel_reason: str | None = None
 
     candidate_detected_at: datetime = field(init=False)
 
     def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.symbol = normalize_symbol(self.symbol)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+        self.created_at = ensure_utc(self.created_at)
+        self.confirm_after = ensure_utc(self.confirm_after)
+        self.expires_at = ensure_utc(self.expires_at)
         self.candidate_detected_at = ensure_utc(self.result.detected_at)
+        self.score_at_creation = clamp_float(self.score_at_creation)
+
+    @property
+    def key(self) -> LiquidationKey:
+        return make_strategy_scope_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        scope = liquidation_key_to_dict(self.key)
+        scope["exchange_symbol"] = self.exchange_symbol or self.symbol
+        return scope
+
+    @property
+    def scope_key(self) -> str:
+        return scoped_key_to_string(self.key)
 
     def is_ready(self, now: datetime) -> bool:
-        return ensure_utc(now) >= ensure_utc(self.confirm_after)
+        return ensure_utc(now) >= self.confirm_after
 
     def is_expired(self, now: datetime) -> bool:
-        return ensure_utc(now) > ensure_utc(self.expires_at)
+        return ensure_utc(now) > self.expires_at
+
+    def to_dict(self, *, serialize: bool = True) -> dict[str, Any]:
+        data = {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "scope": self.scope,
+            "scope_key": self.scope_key,
+            "source_topic": self.source_topic,
+            "source_event_id": self.source_event_id,
+            "correlation_id": self.correlation_id,
+            "created_at": self.created_at,
+            "confirm_after": self.confirm_after,
+            "expires_at": self.expires_at,
+            "candidate_detected_at": self.candidate_detected_at,
+            "cluster_signature": self.cluster_signature,
+            "score_at_creation": self.score_at_creation,
+            "quality_snapshot": self.quality_snapshot,
+            "cancelled": self.cancelled,
+            "cancel_reason": self.cancel_reason,
+        }
+
+        return serialize_value(data) if serialize else data
 
 
 @dataclass(slots=True)
@@ -399,7 +610,23 @@ class SymbolSqueezeStrategyState(BaseSymbolStrategyState):
 
         if self.latest_seen_detected_at is None or ts > ensure_utc(self.latest_seen_detected_at):
             self.latest_seen_detected_at = ts
-            self.latest_seen_score = score
+            self.latest_seen_score = clamp_float(score)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = super().to_dict()
+        data.update(
+            {
+                "latest_seen_detected_at": (
+                    self.latest_seen_detected_at.isoformat()
+                    if self.latest_seen_detected_at
+                    else None
+                ),
+                "latest_seen_score": self.latest_seen_score,
+                "has_pending": self.pending is not None,
+                "pending": self.pending.to_dict() if self.pending is not None else None,
+            }
+        )
+        return data
 
 
 @dataclass(slots=True)
@@ -441,8 +668,8 @@ class SqueezeReversalStrategy(
     Exhaustion reversal strategy.
 
     Pipeline:
-        analytics.liquidation.exhaustion_detected
-            -> common filters
+        analytics.liquidations.exhaustion_detected
+            -> common full-scope filters
             -> exhaustion-specific analytics filters
             -> pending confirmation
             -> SqueezeReversalSignal
@@ -472,7 +699,7 @@ class SqueezeReversalStrategy(
 
         self._stats = SqueezeReversalStrategyStats()
         self._pending_scan_job_id: str | None = None
-        self._pending_keys: set[tuple[str, str]] = set()
+        self._pending_keys: set[LiquidationKey] = set()
         self._recent_pending: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
@@ -484,10 +711,16 @@ class SqueezeReversalStrategy(
         *,
         exchange: str,
         symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
     ) -> SymbolSqueezeStrategyState:
         return SymbolSqueezeStrategyState(
-            exchange=exchange.lower(),
-            symbol=normalize_symbol(symbol),
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
         )
 
     def direction_to_trade_side(self, result: CascadeDetectionResult) -> str:
@@ -505,7 +738,7 @@ class SqueezeReversalStrategy(
         *,
         bus_event: Event,
     ) -> None:
-        state = self.get_or_create_state(result.exchange, result.symbol)
+        state = self.get_or_create_state_for_result(result)
         now = utc_now()
 
         current_score = self.compute_strategy_score(result)
@@ -550,6 +783,61 @@ class SqueezeReversalStrategy(
         )
 
     # ------------------------------------------------------------------
+    # Scheduler
+    # ------------------------------------------------------------------
+
+    def _register_scheduler_jobs(self) -> None:
+        super()._register_scheduler_jobs()
+
+        if self.scheduler is None:
+            return
+
+        if not self.config.enable_pending_confirmation:
+            return
+
+        if self._pending_scan_job_id is not None:
+            return
+
+        self._pending_scan_job_id = self.scheduler.add_interval_job(
+            name=f"{self.config.strategy_name}:pending_scan",
+            func=self.process_pending_candidates,
+            interval=self.config.pending_scan_interval_seconds,
+            run_immediately=False,
+            max_retries=0,
+            retry_delay=1.0,
+            timeout=max(1.0, self.config.pending_scan_interval_seconds),
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    def _remove_scheduler_jobs(self) -> None:
+        super()._remove_scheduler_jobs()
+
+        if self.scheduler is None:
+            self._pending_scan_job_id = None
+            return
+
+        if self._pending_scan_job_id is None:
+            return
+
+        try:
+            self.scheduler.remove_job(self._pending_scan_job_id)
+        except KeyError:
+            pass
+        except Exception as exc:
+            self._record_error(exc)
+            self.logger.warning(
+                "Failed to remove pending scan scheduler job",
+                extra={
+                    "strategy": self.config.strategy_name,
+                    "job_id": self._pending_scan_job_id,
+                    "error": repr(exc),
+                },
+            )
+        finally:
+            self._pending_scan_job_id = None
+
+    # ------------------------------------------------------------------
     # Filters
     # ------------------------------------------------------------------
 
@@ -585,9 +873,17 @@ class SqueezeReversalStrategy(
         result: CascadeDetectionResult,
         now: datetime,
     ) -> str | None:
-        if not result.is_confirmed:
+        if self.config.require_confirmed_result and not result.is_confirmed:
             self._stats.filter_skips += 1
             return "result_not_confirmed"
+
+        if self.config.require_confirmed_result and result.status is not LiquidationStatus.CONFIRMED:
+            self._stats.filter_skips += 1
+            return "status_not_confirmed"
+
+        if self.config.require_actionable_direction and not result.direction.is_known:
+            self._stats.filter_skips += 1
+            return "direction_not_actionable"
 
         if self.config.require_actionable_severity and not result.is_actionable_severity:
             self._stats.filter_skips += 1
@@ -708,11 +1004,14 @@ class SqueezeReversalStrategy(
 
         candidate = PendingReversalCandidate(
             exchange=result.exchange,
+            market_type=result.market_type,
             symbol=result.symbol,
+            timeframe=result.timeframe,
+            exchange_symbol=result.exchange_symbol,
             result=result,
             source_topic=bus_event.topic,
             source_event_id=bus_event.event_id,
-            correlation_id=bus_event.correlation_id,
+            correlation_id=bus_event.correlation_id or result.correlation_id,
             created_at=ensure_utc(now),
             confirm_after=ensure_utc(now) + timedelta(seconds=self.config.confirmation_delay_seconds),
             expires_at=ensure_utc(now) + timedelta(seconds=self.config.pending_ttl_seconds),
@@ -722,7 +1021,7 @@ class SqueezeReversalStrategy(
         )
 
         state.pending = candidate
-        self._pending_keys.add(self.state_key(result.exchange, result.symbol))
+        self._pending_keys.add(candidate.key)
 
         self._stats.pending_created += 1
         self.remember_pending(candidate, state="created")
@@ -732,7 +1031,11 @@ class SqueezeReversalStrategy(
             extra={
                 "strategy": self.config.strategy_name,
                 "exchange": result.exchange,
+                "market_type": result.market_type,
                 "symbol": result.symbol,
+                "timeframe": result.timeframe,
+                "exchange_symbol": result.exchange_symbol,
+                "scope": result.scope,
                 "score": score,
                 "confidence": result.confidence,
                 "severity": result.severity.value,
@@ -741,7 +1044,7 @@ class SqueezeReversalStrategy(
                 "confirm_after": candidate.confirm_after.isoformat(),
                 "expires_at": candidate.expires_at.isoformat(),
                 "event_id": bus_event.event_id,
-                "correlation_id": bus_event.correlation_id,
+                "correlation_id": candidate.correlation_id,
             },
         )
 
@@ -788,14 +1091,14 @@ class SqueezeReversalStrategy(
             if not candidate.is_ready(now):
                 continue
 
-            age_seconds = (ensure_utc(now) - ensure_utc(candidate.created_at)).total_seconds()
+            age_seconds = (ensure_utc(now) - candidate.created_at).total_seconds()
             if age_seconds < self.config.min_pending_age_seconds:
                 continue
 
             if (
                 self.config.cancel_if_newer_detected_at
                 and state.latest_seen_detected_at is not None
-                and ensure_utc(state.latest_seen_detected_at) > ensure_utc(candidate.candidate_detected_at)
+                and ensure_utc(state.latest_seen_detected_at) > candidate.candidate_detected_at
             ):
                 await self.expire_pending_candidate(
                     state=state,
@@ -823,12 +1126,18 @@ class SqueezeReversalStrategy(
                 priority=EventPriority.NORMAL,
                 source=self.config.strategy_name,
                 correlation_id=candidate.correlation_id,
-                headers={"source_event_id": candidate.source_event_id}
-                if candidate.source_event_id
-                else {},
+                headers={
+                    "source_event_id": candidate.source_event_id,
+                    "exchange": candidate.exchange,
+                    "market_type": candidate.market_type,
+                    "symbol": candidate.symbol,
+                    "timeframe": candidate.timeframe,
+                    "exchange_symbol": candidate.exchange_symbol,
+                    "scope": candidate.scope_key,
+                },
             )
 
-            await self.emit_confirmed_signal(
+            emitted = await self.emit_confirmed_signal(
                 result=candidate.result,
                 bus_event=synthetic_event,
                 state=state,
@@ -838,6 +1147,9 @@ class SqueezeReversalStrategy(
                 source_event_id=candidate.source_event_id,
                 pending_confirmation=True,
             )
+
+            if not emitted:
+                continue
 
             self._stats.pending_confirmed += 1
 
@@ -865,14 +1177,19 @@ class SqueezeReversalStrategy(
         candidate.cancel_reason = reason
 
         state.pending = None
-        self._pending_keys.discard(self.state_key(candidate.exchange, candidate.symbol))
+        self._pending_keys.discard(candidate.key)
+        self.remember_pending(candidate, state=reason)
 
         self.logger.info(
             "Pending squeeze reversal candidate expired",
             extra={
                 "strategy": self.config.strategy_name,
                 "exchange": candidate.exchange,
+                "market_type": candidate.market_type,
                 "symbol": candidate.symbol,
+                "timeframe": candidate.timeframe,
+                "exchange_symbol": candidate.exchange_symbol,
+                "scope": candidate.scope,
                 "reason": reason,
                 "created_at": candidate.created_at.isoformat(),
                 "expires_at": candidate.expires_at.isoformat(),
@@ -901,16 +1218,24 @@ class SqueezeReversalStrategy(
             "strategy_name": self.config.strategy_name,
             "signal_type": self.config.signal_type,
             "exchange": candidate.exchange,
+            "market_type": candidate.market_type,
             "symbol": candidate.symbol,
+            "timeframe": candidate.timeframe,
+            "exchange_symbol": candidate.exchange_symbol,
+            "scope": candidate.scope,
+            "scope_key": candidate.scope_key,
             "state": reason,
             "created_at": candidate.created_at,
             "confirm_after": candidate.confirm_after,
             "expires_at": candidate.expires_at,
+            "candidate_detected_at": candidate.candidate_detected_at,
             "score_at_creation": candidate.score_at_creation,
             "source_event_id": candidate.source_event_id,
             "correlation_id": candidate.correlation_id,
             "cluster_signature": candidate.cluster_signature,
             "quality_snapshot": candidate.quality_snapshot,
+            "cancelled": candidate.cancelled,
+            "cancel_reason": candidate.cancel_reason,
         }
 
         return await self.emit_event(
@@ -922,7 +1247,11 @@ class SqueezeReversalStrategy(
                 "strategy": self.config.strategy_name,
                 "signal_type": self.config.signal_type,
                 "exchange": candidate.exchange,
+                "market_type": candidate.market_type,
                 "symbol": candidate.symbol,
+                "timeframe": candidate.timeframe,
+                "exchange_symbol": candidate.exchange_symbol,
+                "scope": candidate.scope_key,
                 "state": reason,
             },
         )
@@ -954,6 +1283,8 @@ class SqueezeReversalStrategy(
         headers = {
             "pending_confirmation": "true" if pending_confirmation else "false",
             "analytics_event_type": result.event_type.value,
+            "analytics_status": result.status.value,
+            "analytics_scope": scoped_key_to_string(result.key),
         }
 
         emitted = await self.emit_signal(
@@ -979,7 +1310,11 @@ class SqueezeReversalStrategy(
             extra={
                 "strategy": self.config.strategy_name,
                 "exchange": signal.exchange,
+                "market_type": signal.market_type,
                 "symbol": signal.symbol,
+                "timeframe": signal.timeframe,
+                "exchange_symbol": signal.exchange_symbol,
+                "scope": signal.scope,
                 "side": signal.side,
                 "score": signal.score,
                 "confidence": signal.confidence,
@@ -1012,9 +1347,11 @@ class SqueezeReversalStrategy(
 
         reason = (
             "squeeze reversal after liquidation exhaustion: "
+            f"scope={scoped_key_to_string(result.key)}, "
             f"direction={result.direction.value}, "
             f"side={result.side.value}, "
             f"severity={result.severity.value}, "
+            f"status={result.status.value}, "
             f"exhaustion_bias={result.exhaustion_bias:.3f}, "
             f"continuation_bias={result.continuation_bias:.3f}, "
             f"bias_delta={result.bias_delta:.3f}, "
@@ -1027,11 +1364,18 @@ class SqueezeReversalStrategy(
         )
 
         metadata["squeeze_reversal"] = {
+            "strategy_model": "exhaustion_reversal",
             "analytics_event_type": result.event_type.value,
+            "analytics_status": result.status.value,
             "favors_exhaustion": result.favors_exhaustion,
+            "favors_continuation": result.favors_continuation,
             "bias_delta": result.bias_delta,
             "score": score,
             "quality_snapshot": self.build_quality_snapshot(result),
+            "trade_side_mapping": {
+                "cascade_down": "LONG",
+                "cascade_up": "SHORT",
+            },
             "pending": {
                 "enabled": self.config.enable_pending_confirmation,
                 "pending_started_at": pending_started_at.isoformat() if pending_started_at else None,
@@ -1043,7 +1387,10 @@ class SqueezeReversalStrategy(
             strategy_name=self.config.strategy_name,
             signal_type=self.config.signal_type,
             exchange=result.exchange,
+            market_type=result.market_type,
             symbol=result.symbol,
+            timeframe=result.timeframe,
+            exchange_symbol=result.exchange_symbol,
             side=trade_side,
             confidence=clamp_float(result.confidence),
             score=score,
@@ -1054,6 +1401,8 @@ class SqueezeReversalStrategy(
             severity=result.severity.value,
             cascade_direction=result.direction.value,
             liquidation_side=result.side.value,
+            event_type=result.event_type.value,
+            status=result.status.value,
             event_count=result.event_count,
             total_notional_usd=result.total_notional_usd,
             intensity_score=clamp_float(result.intensity_score),
@@ -1086,12 +1435,23 @@ class SqueezeReversalStrategy(
             + self.config.score_intensity_weight
             + self.config.score_severity_weight
             + self.config.score_cluster_quality_weight
+            + self.config.score_imbalance_weight
+            + self.config.score_acceleration_weight
         )
 
         if total_weight <= 0:
             return 0.0
 
         cluster_quality = self.compute_cluster_quality_score(result)
+        analytics_meta = self.extract_analytics_metadata(result)
+
+        imbalance_score = analytics_meta["side_imbalance_ratio"]
+        if imbalance_score is None:
+            imbalance_score = analytics_meta["event_imbalance_ratio"]
+        if imbalance_score is None:
+            imbalance_score = 0.5
+
+        acceleration_score = self.acceleration_to_score(analytics_meta["acceleration_ratio"])
 
         weighted_score = (
             clamp_float(result.confidence) * self.config.score_confidence_weight
@@ -1100,6 +1460,8 @@ class SqueezeReversalStrategy(
             + clamp_float(result.intensity_score) * self.config.score_intensity_weight
             + self.severity_to_score(result.severity) * self.config.score_severity_weight
             + cluster_quality * self.config.score_cluster_quality_weight
+            + clamp_float(imbalance_score) * self.config.score_imbalance_weight
+            + acceleration_score * self.config.score_acceleration_weight
         ) / total_weight
 
         return clamp_float(weighted_score)
@@ -1135,7 +1497,10 @@ class SqueezeReversalStrategy(
         return {
             "side_imbalance_ratio": self.optional_float(metadata.get("side_imbalance_ratio")),
             "event_imbalance_ratio": self.optional_float(metadata.get("event_imbalance_ratio")),
-            "acceleration_ratio": self.optional_float(metadata.get("acceleration_ratio")),
+            "acceleration_ratio": self.optional_float(
+                metadata.get("acceleration_ratio")
+                or metadata.get("climax_acceleration_ratio")
+            ),
             "long_events": self.optional_float(metadata.get("long_events")),
             "short_events": self.optional_float(metadata.get("short_events")),
             "long_notional_usd": self.optional_float(metadata.get("long_notional_usd")),
@@ -1152,6 +1517,17 @@ class SqueezeReversalStrategy(
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def acceleration_to_score(value: float | None) -> float:
+        if value is None:
+            return 0.5
+
+        if value <= 0:
+            return 0.0
+
+        # 1.0 = neutral, 2.0+ = strong climax acceleration.
+        return clamp_float((value - 1.0) / 1.0)
+
     def build_quality_snapshot(
         self,
         result: CascadeDetectionResult,
@@ -1159,18 +1535,33 @@ class SqueezeReversalStrategy(
         analytics_meta = self.extract_analytics_metadata(result)
 
         return {
+            "exchange": result.exchange,
+            "market_type": result.market_type,
+            "symbol": result.symbol,
+            "timeframe": result.timeframe,
+            "exchange_symbol": result.exchange_symbol,
+            "scope": liquidation_key_to_dict(result.key),
+            "scope_key": scoped_key_to_string(result.key),
             "confidence": result.confidence,
             "intensity_score": result.intensity_score,
             "continuation_bias": result.continuation_bias,
             "exhaustion_bias": result.exhaustion_bias,
             "bias_delta": result.bias_delta,
             "severity": result.severity.value,
+            "status": result.status.value,
             "event_type": result.event_type.value,
             "event_count": result.event_count,
             "total_notional_usd": str(result.total_notional_usd),
             "window_seconds": result.window_seconds,
             "price_range_pct": result.price_range_pct,
             "cluster": {
+                "exchange": result.cluster.exchange,
+                "market_type": result.cluster.market_type,
+                "symbol": result.cluster.symbol,
+                "timeframe": result.cluster.timeframe,
+                "exchange_symbol": result.cluster.exchange_symbol,
+                "scope": liquidation_key_to_dict(result.cluster.key),
+                "scope_key": scoped_key_to_string(result.cluster.key),
                 "duration_seconds": result.cluster.duration_seconds,
                 "avg_notional_per_event": str(result.cluster.avg_notional_per_event),
                 "price_range_pct": result.cluster.price_range_pct,
@@ -1178,49 +1569,12 @@ class SqueezeReversalStrategy(
                 "total_notional_usd": str(result.cluster.total_notional_usd),
             },
             "analytics_metadata": analytics_meta,
+            "computed_score": self.compute_strategy_score(result),
+            "cluster_quality_score": self.compute_cluster_quality_score(result),
         }
 
     # ------------------------------------------------------------------
-    # Scheduler
-    # ------------------------------------------------------------------
-
-    def _register_scheduler_jobs(self) -> None:
-        super()._register_scheduler_jobs()
-
-        if self.scheduler is None:
-            return
-
-        self._pending_scan_job_id = self.scheduler.add_interval_job(
-            name=f"{self.config.strategy_name}:pending_scan",
-            func=self.process_pending_candidates,
-            interval=self.config.pending_scan_interval_seconds,
-            run_immediately=False,
-            max_retries=0,
-            retry_delay=1.0,
-            timeout=10.0,
-            allow_overlap=False,
-            enabled=True,
-        )
-
-    def _remove_scheduler_jobs(self) -> None:
-        super()._remove_scheduler_jobs()
-
-        if self.scheduler is None:
-            self._pending_scan_job_id = None
-            return
-
-        if self._pending_scan_job_id is None:
-            return
-
-        try:
-            self.scheduler.remove_job(self._pending_scan_job_id)
-        except KeyError:
-            pass
-        finally:
-            self._pending_scan_job_id = None
-
-    # ------------------------------------------------------------------
-    # Query / diagnostics
+    # Pending diagnostics / memory
     # ------------------------------------------------------------------
 
     def remember_pending(
@@ -1229,140 +1583,130 @@ class SqueezeReversalStrategy(
         *,
         state: str,
     ) -> None:
-        self._recent_pending.append(
-            serialize_value(
-                {
-                    "state": state,
-                    "exchange": candidate.exchange,
-                    "symbol": candidate.symbol,
-                    "created_at": candidate.created_at,
-                    "confirm_after": candidate.confirm_after,
-                    "expires_at": candidate.expires_at,
-                    "score_at_creation": candidate.score_at_creation,
-                    "source_event_id": candidate.source_event_id,
-                    "correlation_id": candidate.correlation_id,
-                    "quality_snapshot": candidate.quality_snapshot,
-                }
-            )
-        )
+        item = {
+            "state": state,
+            "created_at": utc_now().isoformat(),
+            "candidate": candidate.to_dict(),
+        }
 
-        if len(self._recent_pending) > self.config.recent_pending_limit:
-            self._recent_pending = self._recent_pending[-self.config.recent_pending_limit :]
+        self._recent_pending.append(item)
+
+        limit = max(1, self.config.recent_pending_limit)
+        if len(self._recent_pending) > limit:
+            self._recent_pending = self._recent_pending[-limit:]
 
     def get_recent_pending(
         self,
         *,
         exchange: str | None = None,
         symbol: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        target_exchange = exchange.lower() if exchange else None
-        target_symbol = normalize_symbol(symbol) if symbol else None
+        if limit <= 0:
+            return []
 
-        rows: list[dict[str, Any]] = []
+        target_exchange = normalize_exchange(exchange) if exchange else None
+        target_symbol = normalize_symbol(symbol) if symbol else None
+        target_market_type = normalize_market_type(market_type) if market_type else None
+        target_timeframe = normalize_timeframe(timeframe) if timeframe else None
+
+        result: list[dict[str, Any]] = []
 
         for item in reversed(self._recent_pending):
-            if target_exchange and str(item.get("exchange", "")).lower() != target_exchange:
+            candidate = item.get("candidate", {})
+
+            if target_exchange is not None and candidate.get("exchange") != target_exchange:
                 continue
 
-            if target_symbol and normalize_symbol(str(item.get("symbol", ""))) != target_symbol:
+            if target_market_type is not None and candidate.get("market_type") != target_market_type:
                 continue
 
-            rows.append(item)
+            if target_symbol is not None and candidate.get("symbol") != target_symbol:
+                continue
 
-            if len(rows) >= limit:
+            if target_timeframe is not None and candidate.get("timeframe") != target_timeframe:
+                continue
+
+            result.append(item)
+
+            if len(result) >= limit:
                 break
 
-        return rows
+        return result
 
-    def get_symbol_state_snapshot(
+    # ------------------------------------------------------------------
+    # Public diagnostics overrides
+    # ------------------------------------------------------------------
+
+    def get_hot_symbols(
         self,
-        exchange: str,
-        symbol: str,
-    ) -> dict[str, Any]:
-        key = self.state_key(exchange, symbol)
-        state = self._states.get(key)
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
 
-        if state is None:
-            return {
-                "exchange": exchange.lower(),
-                "symbol": normalize_symbol(symbol),
-                "exists": False,
-            }
-
-        now = utc_now()
-        state.prune_old_signal_timestamps(now, self.config.signal_window_seconds)
-
-        pending = None
-        if state.pending is not None:
-            pending = serialize_value(
-                {
-                    "created_at": state.pending.created_at,
-                    "confirm_after": state.pending.confirm_after,
-                    "expires_at": state.pending.expires_at,
-                    "cancelled": state.pending.cancelled,
-                    "cancel_reason": state.pending.cancel_reason,
-                    "source_event_id": state.pending.source_event_id,
-                    "correlation_id": state.pending.correlation_id,
-                    "cluster_signature": state.pending.cluster_signature,
-                    "score_at_creation": state.pending.score_at_creation,
-                    "quality_snapshot": state.pending.quality_snapshot,
-                }
-            )
-
-        return serialize_value(
-            {
-                "exchange": state.exchange,
-                "symbol": state.symbol,
-                "exists": True,
-                "last_signal_at": state.last_signal_at,
-                "cooldown_until": state.cooldown_until,
-                "last_signal_side": state.last_signal_side,
-                "last_detected_at": state.last_detected_at,
-                "latest_seen_detected_at": state.latest_seen_detected_at,
-                "latest_seen_score": state.latest_seen_score,
-                "last_cluster_signature": state.last_cluster_signature,
-                "last_signal_score": state.last_signal_score,
-                "total_signals_emitted": state.total_signals_emitted,
-                "signals_in_window": len(state.signal_timestamps),
-                "is_in_cooldown": state.is_in_cooldown(now),
-                "pending": pending,
-            }
-        )
-
-    def get_hot_symbols(self, *, limit: int = 20) -> list[dict[str, Any]]:
         now = utc_now()
         min_ts = None
 
         if self.config.hot_symbols_window_seconds is not None:
             min_ts = now - timedelta(seconds=self.config.hot_symbols_window_seconds)
 
-        latest_by_key: dict[tuple[str, str], SqueezeReversalSignal] = {}
+        target_exchange = normalize_exchange(exchange) if exchange else None
+        target_market_type = normalize_market_type(market_type) if market_type else None
+        target_timeframe = normalize_timeframe(timeframe) if timeframe else None
+
+        latest_by_key: dict[LiquidationKey, SqueezeReversalSignal] = {}
 
         for signal in self._recent_signals:
             if min_ts is not None and ensure_utc(signal.generated_at) < min_ts:
                 continue
 
-            key = (signal.exchange.lower(), normalize_symbol(signal.symbol))
-            previous = latest_by_key.get(key)
+            if target_exchange is not None and signal.exchange != target_exchange:
+                continue
+
+            if target_market_type is not None and signal.market_type != target_market_type:
+                continue
+
+            if target_timeframe is not None and signal.timeframe != target_timeframe:
+                continue
+
+            previous = latest_by_key.get(signal.key)
 
             if previous is None or ensure_utc(signal.generated_at) > ensure_utc(previous.generated_at):
-                latest_by_key[key] = signal
+                latest_by_key[signal.key] = signal
 
         rows = [
             {
                 "exchange": signal.exchange,
+                "market_type": signal.market_type,
                 "symbol": signal.symbol,
+                "timeframe": signal.timeframe,
+                "exchange_symbol": signal.exchange_symbol,
+                "scope": liquidation_key_to_dict(signal.key),
+                "scope_key": signal.scope_key,
                 "side": signal.side,
                 "score": signal.score,
                 "confidence": signal.confidence,
                 "severity": signal.severity,
+                "cascade_direction": signal.cascade_direction,
+                "liquidation_side": signal.liquidation_side,
                 "intensity_score": signal.intensity_score,
+                "continuation_bias": signal.continuation_bias,
                 "exhaustion_bias": signal.exhaustion_bias,
                 "bias_delta": signal.bias_delta,
-                "acceleration_ratio": signal.acceleration_ratio,
                 "side_imbalance_ratio": signal.side_imbalance_ratio,
+                "event_imbalance_ratio": signal.event_imbalance_ratio,
+                "acceleration_ratio": signal.acceleration_ratio,
+                "pending_confirmed": signal.is_pending_confirmed,
+                "confirmation_delay_seconds": signal.confirmation_delay_seconds,
                 "generated_at": signal.generated_at.isoformat(),
+                "detected_at": signal.detected_at.isoformat(),
                 "total_notional_usd": str(signal.total_notional_usd),
             }
             for signal in latest_by_key.values()
@@ -1378,120 +1722,81 @@ class SqueezeReversalStrategy(
             reverse=True,
         )
 
-        return rows[: max(0, limit)]
+        return rows[:limit]
 
-    def get_stats(self) -> dict[str, Any]:
-        data = super().get_stats()
-        data.update(
-            {
-                "active_pending": len(self._pending_keys),
-                "recent_pending": len(self._recent_pending),
-                "pending_scan_job_registered": self._pending_scan_job_id is not None,
-            }
+    def get_symbol_state(
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        key = self.state_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
         )
-        return data
-
-    async def publish_diagnostics_snapshot(self) -> None:
-        if not self._running:
-            return
-
-        snapshot = {
-            "strategy_name": self.config.strategy_name,
-            "signal_type": self.config.signal_type,
-            "created_at": utc_now().isoformat(),
-            "stats": self.get_stats(),
-            "hot_symbols": self.get_hot_symbols(limit=10),
-            "pending": self.get_recent_pending(limit=10),
-        }
-
-        await self.emit_event(
-            self.config.diagnostics_topic,
-            snapshot,
-            priority=self.config.diagnostics_priority,
-            correlation_id=None,
-            headers={
-                "strategy": self.config.strategy_name,
-                "signal_type": self.config.signal_type,
-                "snapshot_type": "diagnostics",
-            },
-        )
-
-    def _start_log_extra(self) -> dict[str, Any]:
-        data = super()._start_log_extra()
-        data.update(
-            {
-                "min_exhaustion_bias": self.config.min_exhaustion_bias,
-                "min_bias_delta": self.config.min_bias_delta,
-                "max_continuation_bias_after_exhaustion": self.config.max_continuation_bias_after_exhaustion,
-                "min_side_imbalance_ratio": self.config.min_side_imbalance_ratio,
-                "min_climax_acceleration_ratio": self.config.min_climax_acceleration_ratio,
-                "enable_pending_confirmation": self.config.enable_pending_confirmation,
-                "confirmation_delay_seconds": self.config.confirmation_delay_seconds,
-                "pending_ttl_seconds": self.config.pending_ttl_seconds,
-                "allowed_severities": [
-                    severity.value for severity in self.config.allowed_severities
-                ],
-            }
-        )
-        return data
-
-    def get_symbol_state(self, exchange: str, symbol: str) -> dict[str, Any]:
-        key = self.state_key(exchange, symbol)
         state = self._states.get(key)
 
-        normalized_exchange, normalized_symbol = key
+        normalized_exchange = normalize_exchange(exchange)
+        normalized_symbol = normalize_symbol(symbol)
+        normalized_market_type = normalize_market_type(market_type)
+        normalized_timeframe = normalize_timeframe(timeframe)
 
         if state is None:
             return {
-                "exists": False,
                 "exchange": normalized_exchange,
+                "market_type": normalized_market_type,
                 "symbol": normalized_symbol,
+                "timeframe": normalized_timeframe,
+                "scope": liquidation_key_to_dict(key),
+                "scope_key": scoped_key_to_string(key),
+                "exists": False,
             }
 
         now = utc_now()
-
-        pending = None
-        if state.pending is not None:
-            pending_candidate = state.pending
-            pending = {
-                "exchange": pending_candidate.exchange,
-                "symbol": pending_candidate.symbol,
-                "created_at": pending_candidate.created_at.isoformat(),
-                "confirm_after": pending_candidate.confirm_after.isoformat(),
-                "expires_at": pending_candidate.expires_at.isoformat(),
-                "cluster_signature": pending_candidate.cluster_signature,
-                "score_at_creation": pending_candidate.score_at_creation,
-                "candidate_detected_at": pending_candidate.candidate_detected_at.isoformat(),
-                "cancelled": pending_candidate.cancelled,
-                "cancel_reason": pending_candidate.cancel_reason,
-                "is_ready": pending_candidate.is_ready(now),
-                "is_expired": pending_candidate.is_expired(now),
-                "quality_snapshot": serialize_value(pending_candidate.quality_snapshot),
-                "source_event_id": pending_candidate.source_event_id,
-                "correlation_id": pending_candidate.correlation_id,
-            }
+        state.prune_old_signal_timestamps(now, self.config.signal_window_seconds)
 
         return {
-            "exists": True,
             "exchange": state.exchange,
+            "market_type": state.market_type,
             "symbol": state.symbol,
+            "timeframe": state.timeframe,
+            "exchange_symbol": state.exchange_symbol,
+            "scope": state.scope,
+            "scope_key": state.scope_key,
+            "exists": True,
             "last_signal_at": state.last_signal_at.isoformat() if state.last_signal_at else None,
             "cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None,
+            "in_cooldown": state.is_in_cooldown(now),
             "last_signal_side": state.last_signal_side,
             "last_detected_at": state.last_detected_at.isoformat() if state.last_detected_at else None,
             "last_cluster_signature": state.last_cluster_signature,
             "last_signal_score": state.last_signal_score,
-            "total_signals_emitted": state.total_signals_emitted,
-            "signals_in_window": state.signals_in_window(
-                now=now,
-                window_seconds=self.config.signal_window_seconds,
-            ),
-            "is_in_cooldown": state.is_in_cooldown(now),
-            "pending": pending,
             "latest_seen_detected_at": (
                 state.latest_seen_detected_at.isoformat()
                 if state.latest_seen_detected_at
                 else None
             ),
             "latest_seen_score": state.latest_seen_score,
+            "total_signals_emitted": state.total_signals_emitted,
+            "signals_in_window": state.signals_in_window(
+                now=now,
+                window_seconds=self.config.signal_window_seconds,
+            ),
+            "pending": state.pending.to_dict() if state.pending is not None else None,
         }
+
+    def get_stats(self) -> dict[str, Any]:
+        data = super().get_stats()
+        data.update(
+            {
+                "pending_scan_job_registered": self._pending_scan_job_id is not None,
+                "pending_scan_job_id": self._pending_scan_job_id,
+                "pending_active": len(self._pending_keys),
+                "recent_pending": len(self._recent_pending),
+            }
+        )
+        return data

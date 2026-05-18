@@ -13,6 +13,19 @@ from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
+from analytics.liquidations.models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    LiquidationKey,
+    liquidation_key_to_dict,
+    make_liquidation_key,
+    normalize_exchange as _normalize_exchange,
+    normalize_exchange_symbol as _normalize_exchange_symbol,
+    normalize_market_type as _normalize_market_type,
+    normalize_symbol as _normalize_symbol,
+    normalize_timeframe as _normalize_timeframe,
+)
+
 
 # ============================================================================
 # Small shared helpers
@@ -29,8 +42,56 @@ def ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def normalize_exchange(exchange: str) -> str:
+    return _normalize_exchange(exchange)
+
+
 def normalize_symbol(symbol: str) -> str:
-    return symbol.strip().upper().replace("-", "").replace("/", "")
+    return _normalize_symbol(symbol)
+
+
+def normalize_market_type(market_type: str | None = None) -> str:
+    return _normalize_market_type(market_type)
+
+
+def normalize_timeframe(timeframe: str | None = None) -> str:
+    return _normalize_timeframe(timeframe)
+
+
+def normalize_exchange_symbol(
+    exchange_symbol: str | None,
+    *,
+    fallback_symbol: str,
+) -> str:
+    return _normalize_exchange_symbol(
+        exchange_symbol,
+        fallback_symbol=fallback_symbol,
+    )
+
+
+def make_strategy_scope_key(
+    *,
+    exchange: str,
+    market_type: str | None,
+    symbol: str,
+    timeframe: str | None,
+) -> LiquidationKey:
+    return make_liquidation_key(
+        exchange=exchange,
+        market_type=market_type or DEFAULT_MARKET_TYPE,
+        symbol=symbol,
+        timeframe=timeframe or DEFAULT_TIMEFRAME,
+    )
+
+
+def scoped_key_to_string(key: LiquidationKey) -> str:
+    scope = liquidation_key_to_dict(key)
+    return (
+        f"{scope['exchange']}:"
+        f"{scope['market_type']}:"
+        f"{scope['symbol']}:"
+        f"{scope['timeframe']}"
+    )
 
 
 def clamp_float(
@@ -51,18 +112,86 @@ def serialize_value(value: Any) -> Any:
         return ensure_utc(value).isoformat()
 
     if isinstance(value, dict):
-        return {key: serialize_value(item) for key, item in value.items()}
+        return {
+            str(key): serialize_value(item)
+            for key, item in value.items()
+        }
 
     if isinstance(value, list):
         return [serialize_value(item) for item in value]
 
     if isinstance(value, tuple):
-        return tuple(serialize_value(item) for item in value)
+        return [serialize_value(item) for item in value]
 
     if hasattr(value, "value"):
         return value.value
 
     return value
+
+
+def result_scope(result: Any) -> dict[str, str]:
+    exchange = normalize_exchange(getattr(result, "exchange"))
+    symbol = normalize_symbol(getattr(result, "symbol"))
+    market_type = normalize_market_type(
+        getattr(result, "market_type", DEFAULT_MARKET_TYPE)
+    )
+    timeframe = normalize_timeframe(
+        getattr(result, "timeframe", DEFAULT_TIMEFRAME)
+    )
+    exchange_symbol = normalize_exchange_symbol(
+        getattr(result, "exchange_symbol", None),
+        fallback_symbol=symbol,
+    )
+
+    scope = liquidation_key_to_dict(
+        make_strategy_scope_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+    )
+    scope["exchange_symbol"] = exchange_symbol
+    scope["scope_key"] = scoped_key_to_string(
+        (
+            scope["exchange"],
+            scope["market_type"],
+            scope["symbol"],
+            scope["timeframe"],
+        )
+    )
+    return scope
+
+
+def signal_scope(signal: Any) -> dict[str, str]:
+    exchange = normalize_exchange(getattr(signal, "exchange"))
+    symbol = normalize_symbol(getattr(signal, "symbol"))
+    market_type = normalize_market_type(
+        getattr(signal, "market_type", DEFAULT_MARKET_TYPE)
+    )
+    timeframe = normalize_timeframe(
+        getattr(signal, "timeframe", DEFAULT_TIMEFRAME)
+    )
+    exchange_symbol = normalize_exchange_symbol(
+        getattr(signal, "exchange_symbol", None),
+        fallback_symbol=symbol,
+    )
+
+    scope_key = make_strategy_scope_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "exchange_symbol": exchange_symbol,
+        "scope_key": scoped_key_to_string(scope_key),
+    }
 
 
 # ============================================================================
@@ -72,14 +201,10 @@ def serialize_value(value: Any) -> Any:
 
 class AnalyticsStrategyConfigProtocol(Protocol):
     """
-    Мінімальний контракт config-а для будь-якої strategy поверх analytics events.
+    Мінімальний контракт config-а для liquidation strategy поверх analytics events.
 
-    Конкретні config-и можуть мати додаткові поля:
-    - min_continuation_bias
-    - min_exhaustion_bias
-    - confirmation_delay_seconds
-    - pending_ttl_seconds
-    - etc.
+    Canonical scope:
+        exchange + market_type + symbol + timeframe
     """
 
     enabled: bool
@@ -105,6 +230,12 @@ class AnalyticsStrategyConfigProtocol(Protocol):
     allowed_exchanges: tuple[str, ...]
     allowed_symbols: tuple[str, ...]
     blocked_symbols: tuple[str, ...]
+
+    # New full-scope filters.
+    allowed_market_types: tuple[str, ...]
+    blocked_market_types: tuple[str, ...]
+    allowed_timeframes: tuple[str, ...]
+    blocked_timeframes: tuple[str, ...]
 
     min_confidence: float
     min_intensity_score: float
@@ -132,15 +263,17 @@ class AnalyticsStrategyConfigProtocol(Protocol):
 
 class AnalyticsResultProtocol(Protocol):
     """
-    Мінімальний контракт analytics result-а, який strategy може перетворити в signal.
+    Мінімальний контракт analytics result-а.
 
-    Для liquidation strategy це CascadeDetectionResult.
-    Для майбутніх orderflow/liquidity/funding strategy можна зробити окремі
-    analytics result models з таким самим набором ключових полів або adapter.
+    Для liquidation strategies це CascadeDetectionResult.
     """
 
     exchange: str
+    market_type: str
     symbol: str
+    timeframe: str
+    exchange_symbol: str | None
+
     detected_at: datetime
 
     confidence: float
@@ -155,6 +288,10 @@ class AnalyticsResultProtocol(Protocol):
 
     correlation_id: str | None
     metadata: dict[str, Any]
+
+    @property
+    def key(self) -> LiquidationKey:
+        ...
 
     @property
     def is_high_confidence(self) -> bool:
@@ -215,14 +352,53 @@ class StrategyRejection:
     strategy_name: str
     signal_type: str
 
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     correlation_id: str | None = None
     source_event_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.symbol = normalize_symbol(self.symbol)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.rejected_at = ensure_utc(self.rejected_at)
+
+    @property
+    def key(self) -> LiquidationKey:
+        return make_strategy_scope_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        scope = liquidation_key_to_dict(self.key)
+        scope["exchange_symbol"] = self.exchange_symbol or self.symbol
+        return scope
+
+    @property
+    def scope_key(self) -> str:
+        return scoped_key_to_string(self.key)
+
     def to_dict(self, *, serialize: bool = True) -> dict[str, Any]:
         data = {
             "exchange": self.exchange,
+            "market_type": self.market_type,
             "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "scope": self.scope,
+            "scope_key": self.scope_key,
             "rejected_at": self.rejected_at,
             "reason": self.reason,
             "source_topic": self.source_topic,
@@ -240,6 +416,10 @@ class BaseSymbolStrategyState:
     exchange: str
     symbol: str
 
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     last_signal_at: datetime | None = None
     cooldown_until: datetime | None = None
     last_signal_side: str | None = None
@@ -249,6 +429,35 @@ class BaseSymbolStrategyState:
 
     total_signals_emitted: int = 0
     signal_timestamps: Deque[datetime] = field(default_factory=deque)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.symbol = normalize_symbol(self.symbol)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+    @property
+    def key(self) -> LiquidationKey:
+        return make_strategy_scope_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        scope = liquidation_key_to_dict(self.key)
+        scope["exchange_symbol"] = self.exchange_symbol or self.symbol
+        return scope
+
+    @property
+    def scope_key(self) -> str:
+        return scoped_key_to_string(self.key)
 
     def is_in_cooldown(self, now: datetime) -> bool:
         return self.cooldown_until is not None and ensure_utc(now) < ensure_utc(self.cooldown_until)
@@ -300,6 +509,25 @@ class BaseSymbolStrategyState:
         self.prune_old_signal_timestamps(now, window_seconds)
         return len(self.signal_timestamps)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "scope": self.scope,
+            "scope_key": self.scope_key,
+            "last_signal_at": self.last_signal_at.isoformat() if self.last_signal_at else None,
+            "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "last_signal_side": self.last_signal_side,
+            "last_detected_at": self.last_detected_at.isoformat() if self.last_detected_at else None,
+            "last_cluster_signature": self.last_cluster_signature,
+            "last_signal_score": self.last_signal_score,
+            "total_signals_emitted": self.total_signals_emitted,
+            "signals_in_memory_window": len(self.signal_timestamps),
+        }
+
 
 # ============================================================================
 # Generic base strategy
@@ -320,26 +548,24 @@ class FilterResult:
 
 class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
     """
-    Базовий клас для strategy, які працюють поверх analytics events.
+    Базовий клас для liquidation strategies поверх analytics events.
 
-    Відповідальність base-класу:
+    Canonical scope:
+        exchange + market_type + symbol + timeframe
+
+    Base відповідає за:
     - lifecycle start/stop/restart;
     - EventBus subscribe/unsubscribe;
     - Scheduler diagnostics job;
     - common stats;
     - recent signals/rejections;
-    - common emit wrapper;
+    - common EventBus emit wrapper;
     - common reject publishing;
-    - common symbol state;
-    - common filters: exchange/symbol, confidence, intensity, notional,
-      event_count, severity, price_range, cooldown, dedup, rate limit.
-
-    Відповідальність subclass-а:
-    - визначити payload_type;
-    - побудувати domain-specific signal;
-    - визначити напрям угоди;
-    - додати domain-specific filters;
-    - за потреби перевизначити scoring / signature / diagnostics.
+    - full-scope state;
+    - common filters:
+        exchange / market_type / symbol / timeframe;
+        confidence / intensity / notional / event_count / severity / price_range;
+        cooldown / dedup / rate-limit.
     """
 
     payload_type: type[ResultT]
@@ -377,7 +603,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         self._subscription: Subscription | None = None
         self._diagnostics_job_id: str | None = None
 
-        self._states: dict[tuple[str, str], StateT] = {}
+        self._states: dict[LiquidationKey, StateT] = {}
 
         self._recent_signals: Deque[SignalT] = deque(
             maxlen=max(1, self.config.recent_signals_limit)
@@ -391,6 +617,14 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def is_registered(self) -> bool:
+        return self._subscription is not None
 
     async def start(self) -> None:
         if self._running:
@@ -504,6 +738,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
                     "topic": bus_event.topic,
                     "event_id": bus_event.event_id,
                     "correlation_id": bus_event.correlation_id,
+                    "scope": result_scope(payload),
                     "error": repr(exc),
                 },
             )
@@ -517,7 +752,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
     ) -> None:
         """
         Subclass реалізує domain-specific pipeline:
-        - get/create state;
+        - get/create full-scope state;
         - common + custom filters;
         - build signal;
         - emit signal;
@@ -557,23 +792,70 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         state: StateT,
         now: datetime,
     ) -> str | None:
-        if self.config.allowed_exchanges:
-            allowed = {item.lower() for item in self.config.allowed_exchanges}
-            if result.exchange.lower() not in allowed:
-                self._stats.filter_skips += 1
-                return "exchange_not_allowed"
+        scope = result_scope(result)
 
-        if self.config.allowed_symbols:
-            allowed_symbols = {normalize_symbol(item) for item in self.config.allowed_symbols}
-            if normalize_symbol(result.symbol) not in allowed_symbols:
-                self._stats.filter_skips += 1
-                return "symbol_not_allowed"
+        allowed_exchanges = {
+            normalize_exchange(item)
+            for item in getattr(self.config, "allowed_exchanges", ())
+            if str(item).strip()
+        }
+        if allowed_exchanges and scope["exchange"] not in allowed_exchanges:
+            self._stats.filter_skips += 1
+            return "exchange_not_allowed"
 
-        if self.config.blocked_symbols:
-            blocked_symbols = {normalize_symbol(item) for item in self.config.blocked_symbols}
-            if normalize_symbol(result.symbol) in blocked_symbols:
-                self._stats.filter_skips += 1
-                return "symbol_blocked"
+        allowed_market_types = {
+            normalize_market_type(item)
+            for item in getattr(self.config, "allowed_market_types", ())
+            if str(item).strip()
+        }
+        if allowed_market_types and scope["market_type"] not in allowed_market_types:
+            self._stats.filter_skips += 1
+            return "market_type_not_allowed"
+
+        blocked_market_types = {
+            normalize_market_type(item)
+            for item in getattr(self.config, "blocked_market_types", ())
+            if str(item).strip()
+        }
+        if blocked_market_types and scope["market_type"] in blocked_market_types:
+            self._stats.filter_skips += 1
+            return "market_type_blocked"
+
+        allowed_symbols = {
+            normalize_symbol(item)
+            for item in getattr(self.config, "allowed_symbols", ())
+            if str(item).strip()
+        }
+        if allowed_symbols and scope["symbol"] not in allowed_symbols:
+            self._stats.filter_skips += 1
+            return "symbol_not_allowed"
+
+        blocked_symbols = {
+            normalize_symbol(item)
+            for item in getattr(self.config, "blocked_symbols", ())
+            if str(item).strip()
+        }
+        if blocked_symbols and scope["symbol"] in blocked_symbols:
+            self._stats.filter_skips += 1
+            return "symbol_blocked"
+
+        allowed_timeframes = {
+            normalize_timeframe(item)
+            for item in getattr(self.config, "allowed_timeframes", ())
+            if str(item).strip()
+        }
+        if allowed_timeframes and scope["timeframe"] not in allowed_timeframes:
+            self._stats.filter_skips += 1
+            return "timeframe_not_allowed"
+
+        blocked_timeframes = {
+            normalize_timeframe(item)
+            for item in getattr(self.config, "blocked_timeframes", ())
+            if str(item).strip()
+        }
+        if blocked_timeframes and scope["timeframe"] in blocked_timeframes:
+            self._stats.filter_skips += 1
+            return "timeframe_blocked"
 
         direction = getattr(result, "direction", None)
         if direction is not None and getattr(direction, "value", direction) == "unknown":
@@ -614,7 +896,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
 
         if state.is_in_cooldown(now):
             self._stats.cooldown_skips += 1
-            return "symbol_in_cooldown"
+            return "scope_in_cooldown"
 
         detected_at = ensure_utc(result.detected_at)
 
@@ -646,7 +928,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
             )
             if signals_in_window >= self.config.max_signals_per_symbol_window:
                 self._stats.rate_limit_skips += 1
-                return "symbol_signal_rate_limited"
+                return "scope_signal_rate_limited"
 
         return None
 
@@ -692,21 +974,22 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         bus_event: Event,
         headers: dict[str, Any] | None = None,
     ) -> bool:
+        scope = signal_scope(signal)
+
         signal_headers = {
             "strategy": self.config.strategy_name,
             "signal_type": self.config.signal_type,
             "source_event_id": bus_event.event_id,
             "source_topic": bus_event.topic,
+            "exchange": scope["exchange"],
+            "market_type": scope["market_type"],
+            "symbol": scope["symbol"],
+            "timeframe": scope["timeframe"],
+            "exchange_symbol": scope["exchange_symbol"],
+            "scope": scope["scope_key"],
         }
 
-        exchange = getattr(signal, "exchange", None)
-        symbol = getattr(signal, "symbol", None)
         side = getattr(signal, "side", None)
-
-        if exchange is not None:
-            signal_headers["exchange"] = str(exchange)
-        if symbol is not None:
-            signal_headers["symbol"] = str(symbol)
         if side is not None:
             signal_headers["side"] = str(side)
 
@@ -731,9 +1014,14 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
     ) -> None:
         self._stats.rejected_events += 1
 
+        scope = result_scope(result)
+
         rejection = StrategyRejection(
-            exchange=result.exchange,
-            symbol=result.symbol,
+            exchange=scope["exchange"],
+            market_type=scope["market_type"],
+            symbol=scope["symbol"],
+            timeframe=scope["timeframe"],
+            exchange_symbol=scope["exchange_symbol"],
             rejected_at=utc_now(),
             reason=reason,
             source_topic=bus_event.topic,
@@ -750,8 +1038,12 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
             "Analytics result rejected by strategy filters",
             extra={
                 "strategy": self.config.strategy_name,
-                "exchange": result.exchange,
-                "symbol": result.symbol,
+                "exchange": scope["exchange"],
+                "market_type": scope["market_type"],
+                "symbol": scope["symbol"],
+                "timeframe": scope["timeframe"],
+                "exchange_symbol": scope["exchange_symbol"],
+                "scope": scope["scope_key"],
                 "reason": reason,
                 "event_id": bus_event.event_id,
                 "correlation_id": bus_event.correlation_id,
@@ -767,8 +1059,12 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
                 headers={
                     "strategy": self.config.strategy_name,
                     "signal_type": self.config.signal_type,
-                    "exchange": result.exchange,
-                    "symbol": result.symbol,
+                    "exchange": scope["exchange"],
+                    "market_type": scope["market_type"],
+                    "symbol": scope["symbol"],
+                    "timeframe": scope["timeframe"],
+                    "exchange_symbol": scope["exchange_symbol"],
+                    "scope": scope["scope_key"],
                     "reason": reason,
                     "source_event_id": bus_event.event_id,
                     "source_topic": bus_event.topic,
@@ -807,26 +1103,99 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def state_key(exchange: str, symbol: str) -> tuple[str, str]:
-        return exchange.lower(), normalize_symbol(symbol)
+    def state_key(
+        exchange: str,
+        symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> LiquidationKey:
+        return make_strategy_scope_key(
+            exchange=exchange,
+            market_type=market_type or DEFAULT_MARKET_TYPE,
+            symbol=symbol,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
+        )
 
-    def get_or_create_state(self, exchange: str, symbol: str) -> StateT:
-        key = self.state_key(exchange, symbol)
+    @staticmethod
+    def state_key_from_result(result: AnalyticsResultProtocol) -> LiquidationKey:
+        return make_strategy_scope_key(
+            exchange=result.exchange,
+            market_type=getattr(result, "market_type", DEFAULT_MARKET_TYPE),
+            symbol=result.symbol,
+            timeframe=getattr(result, "timeframe", DEFAULT_TIMEFRAME),
+        )
+
+    def get_or_create_state(
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+        exchange_symbol: str | None = None,
+    ) -> StateT:
+        key = self.state_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
         state = self._states.get(key)
 
         if state is None:
-            state = self.create_symbol_state(exchange=exchange, symbol=symbol)
+            state = self.create_symbol_state(
+                exchange=exchange,
+                market_type=market_type or DEFAULT_MARKET_TYPE,
+                symbol=symbol,
+                timeframe=timeframe or DEFAULT_TIMEFRAME,
+                exchange_symbol=exchange_symbol,
+            )
             self._states[key] = state
 
         return state
 
-    @abstractmethod
-    def create_symbol_state(self, *, exchange: str, symbol: str) -> StateT:
-        """
-        Subclass повертає свій state.
+    def get_or_create_state_for_result(self, result: ResultT) -> StateT:
+        return self.get_or_create_state(
+            exchange=result.exchange,
+            market_type=getattr(result, "market_type", DEFAULT_MARKET_TYPE),
+            symbol=result.symbol,
+            timeframe=getattr(result, "timeframe", DEFAULT_TIMEFRAME),
+            exchange_symbol=getattr(result, "exchange_symbol", None),
+        )
 
-        Для простих стратегій можна повертати BaseSymbolStrategyState.
-        Для pending/reversal strategy — subclass із pending-полями.
+    def get_state(
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> StateT | None:
+        return self._states.get(
+            self.state_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        )
+
+    def get_state_for_result(self, result: ResultT) -> StateT | None:
+        return self._states.get(self.state_key_from_result(result))
+
+    @abstractmethod
+    def create_symbol_state(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
+    ) -> StateT:
+        """
+        Subclass повертає свій full-scope state.
         """
 
     # ------------------------------------------------------------------
@@ -885,6 +1254,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
             "strategy_name": self.config.strategy_name,
             "signal_type": self.config.signal_type,
             "created_at": utc_now().isoformat(),
+            "scope": "exchange:market_type:symbol:timeframe",
             "stats": self.get_stats(),
             "hot_symbols": self.get_hot_symbols(limit=10),
         }
@@ -910,21 +1280,33 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         *,
         exchange: str | None = None,
         symbol: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         limit: int = 50,
     ) -> list[SignalT]:
-        target_exchange = exchange.lower() if exchange else None
+        if limit <= 0:
+            return []
+
+        target_exchange = normalize_exchange(exchange) if exchange else None
         target_symbol = normalize_symbol(symbol) if symbol else None
+        target_market_type = normalize_market_type(market_type) if market_type else None
+        target_timeframe = normalize_timeframe(timeframe) if timeframe else None
 
         result: list[SignalT] = []
 
         for signal in reversed(self._recent_signals):
-            signal_exchange = getattr(signal, "exchange", "").lower()
-            signal_symbol = normalize_symbol(getattr(signal, "symbol", ""))
+            scope = signal_scope(signal)
 
-            if target_exchange is not None and signal_exchange != target_exchange:
+            if target_exchange is not None and scope["exchange"] != target_exchange:
                 continue
 
-            if target_symbol is not None and signal_symbol != target_symbol:
+            if target_market_type is not None and scope["market_type"] != target_market_type:
+                continue
+
+            if target_symbol is not None and scope["symbol"] != target_symbol:
+                continue
+
+            if target_timeframe is not None and scope["timeframe"] != target_timeframe:
                 continue
 
             result.append(signal)
@@ -939,18 +1321,31 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         *,
         exchange: str | None = None,
         symbol: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         limit: int = 50,
     ) -> list[StrategyRejection]:
-        target_exchange = exchange.lower() if exchange else None
+        if limit <= 0:
+            return []
+
+        target_exchange = normalize_exchange(exchange) if exchange else None
         target_symbol = normalize_symbol(symbol) if symbol else None
+        target_market_type = normalize_market_type(market_type) if market_type else None
+        target_timeframe = normalize_timeframe(timeframe) if timeframe else None
 
         result: list[StrategyRejection] = []
 
         for rejection in reversed(self._recent_rejections):
-            if target_exchange is not None and rejection.exchange.lower() != target_exchange:
+            if target_exchange is not None and rejection.exchange != target_exchange:
                 continue
 
-            if target_symbol is not None and normalize_symbol(rejection.symbol) != target_symbol:
+            if target_market_type is not None and rejection.market_type != target_market_type:
+                continue
+
+            if target_symbol is not None and rejection.symbol != target_symbol:
+                continue
+
+            if target_timeframe is not None and rejection.timeframe != target_timeframe:
                 continue
 
             result.append(rejection)
@@ -960,13 +1355,41 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
 
         return result
 
-    def get_hot_symbols(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        latest_by_key: dict[tuple[str, str], SignalT] = {}
+    def get_hot_symbols(
+        self,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+
+        target_exchange = normalize_exchange(exchange) if exchange else None
+        target_market_type = normalize_market_type(market_type) if market_type else None
+        target_timeframe = normalize_timeframe(timeframe) if timeframe else None
+
+        latest_by_key: dict[LiquidationKey, SignalT] = {}
 
         for signal in self._recent_signals:
-            exchange = getattr(signal, "exchange", "").lower()
-            symbol = normalize_symbol(getattr(signal, "symbol", ""))
-            key = (exchange, symbol)
+            scope = signal_scope(signal)
+
+            if target_exchange is not None and scope["exchange"] != target_exchange:
+                continue
+
+            if target_market_type is not None and scope["market_type"] != target_market_type:
+                continue
+
+            if target_timeframe is not None and scope["timeframe"] != target_timeframe:
+                continue
+
+            key = make_strategy_scope_key(
+                exchange=scope["exchange"],
+                market_type=scope["market_type"],
+                symbol=scope["symbol"],
+                timeframe=scope["timeframe"],
+            )
 
             previous = latest_by_key.get(key)
             if previous is None:
@@ -984,9 +1407,9 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
 
         rows.sort(
             key=lambda row: (
-                float(row.get("score", 0.0)),
-                float(row.get("confidence", 0.0)),
-                float(row.get("intensity_score", 0.0)),
+                float(row.get("score", 0.0) or 0.0),
+                float(row.get("confidence", 0.0) or 0.0),
+                float(row.get("intensity_score", 0.0) or 0.0),
             ),
             reverse=True,
         )
@@ -994,16 +1417,28 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         return rows[:limit]
 
     def signal_to_hot_symbol_row(self, signal: SignalT) -> dict[str, Any]:
+        scope = signal_scope(signal)
+
         return {
-            "exchange": getattr(signal, "exchange", None),
-            "symbol": getattr(signal, "symbol", None),
+            "exchange": scope["exchange"],
+            "market_type": scope["market_type"],
+            "symbol": scope["symbol"],
+            "timeframe": scope["timeframe"],
+            "exchange_symbol": scope["exchange_symbol"],
+            "scope": {
+                "exchange": scope["exchange"],
+                "market_type": scope["market_type"],
+                "symbol": scope["symbol"],
+                "timeframe": scope["timeframe"],
+            },
+            "scope_key": scope["scope_key"],
             "side": getattr(signal, "side", None),
             "score": getattr(signal, "score", None),
             "confidence": getattr(signal, "confidence", None),
             "severity": getattr(signal, "severity", None),
             "intensity_score": getattr(signal, "intensity_score", None),
             "generated_at": (
-                getattr(signal, "generated_at").isoformat()
+                ensure_utc(getattr(signal, "generated_at")).isoformat()
                 if getattr(signal, "generated_at", None)
                 else None
             ),
@@ -1015,13 +1450,22 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         data.update(
             {
                 "running": self._running,
+                "registered": self._subscription is not None,
                 "strategy_name": self.config.strategy_name,
                 "signal_type": self.config.signal_type,
                 "subscribe_topic": self.config.subscribe_topic,
-                "tracked_symbols": len(self._states),
+                "scope": "exchange:market_type:symbol:timeframe",
+                "tracked_scopes": len(self._states),
+                "tracked_symbols": len(
+                    {
+                        (state.exchange, state.symbol)
+                        for state in self._states.values()
+                    }
+                ),
                 "recent_signals": len(self._recent_signals),
                 "recent_rejections": len(self._recent_rejections),
                 "diagnostics_job_registered": self._diagnostics_job_id is not None,
+                "diagnostics_job_id": self._diagnostics_job_id,
             }
         )
         return data
@@ -1031,9 +1475,25 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
     # ------------------------------------------------------------------
 
     def build_rejection_details(self, result: ResultT) -> dict[str, Any]:
+        scope = result_scope(result)
+
         return {
+            "exchange": scope["exchange"],
+            "market_type": scope["market_type"],
+            "symbol": scope["symbol"],
+            "timeframe": scope["timeframe"],
+            "exchange_symbol": scope["exchange_symbol"],
+            "scope": {
+                "exchange": scope["exchange"],
+                "market_type": scope["market_type"],
+                "symbol": scope["symbol"],
+                "timeframe": scope["timeframe"],
+            },
+            "scope_key": scope["scope_key"],
             "severity": serialize_value(getattr(result, "severity", None)),
             "direction": serialize_value(getattr(result, "direction", None)),
+            "event_type": serialize_value(getattr(result, "event_type", None)),
+            "status": serialize_value(getattr(result, "status", None)),
             "confidence": getattr(result, "confidence", None),
             "intensity_score": getattr(result, "intensity_score", None),
             "continuation_bias": getattr(result, "continuation_bias", None),
@@ -1041,23 +1501,33 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
             "event_count": getattr(result, "event_count", None),
             "total_notional_usd": str(getattr(result, "total_notional_usd", "")),
             "price_range_pct": getattr(result, "price_range_pct", None),
+            "metadata": serialize_value(getattr(result, "metadata", {}) or {}),
         }
 
     def build_cluster_signature(self, result: ResultT) -> str:
         """
-        Стабільна signature для dedup.
+        Stable signature для dedup.
 
-        Працює з liquidation CascadeDetectionResult і з майбутніми analytics
-        result-ами, якщо в них є cluster або близькі поля.
+        Важливо:
+        signature включає повний futures/liquidation scope, щоб не змішувати:
+        - usdm_futures / coinm_futures;
+        - linear / inverse / swap;
+        - realtime / 1m.
         """
+        scope = result_scope(result)
         cluster = getattr(result, "cluster", None)
 
-        parts = {
+        parts: dict[str, Any] = {
             "strategy_name": self.config.strategy_name,
-            "exchange": result.exchange.lower(),
-            "symbol": normalize_symbol(result.symbol),
+            "exchange": scope["exchange"],
+            "market_type": scope["market_type"],
+            "symbol": scope["symbol"],
+            "timeframe": scope["timeframe"],
+            "exchange_symbol": scope["exchange_symbol"],
             "direction": serialize_value(getattr(result, "direction", None)),
             "severity": serialize_value(getattr(result, "severity", None)),
+            "event_type": serialize_value(getattr(result, "event_type", None)),
+            "status": serialize_value(getattr(result, "status", None)),
             "detected_at": ensure_utc(result.detected_at).isoformat(),
             "event_count": result.event_count,
             "total_notional_usd": str(result.total_notional_usd),
@@ -1065,6 +1535,11 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
 
         if cluster is not None:
             parts["cluster"] = {
+                "exchange": getattr(cluster, "exchange", scope["exchange"]),
+                "market_type": getattr(cluster, "market_type", scope["market_type"]),
+                "symbol": getattr(cluster, "symbol", scope["symbol"]),
+                "timeframe": getattr(cluster, "timeframe", scope["timeframe"]),
+                "exchange_symbol": getattr(cluster, "exchange_symbol", scope["exchange_symbol"]),
                 "start_time": serialize_value(getattr(cluster, "start_time", None)),
                 "end_time": serialize_value(getattr(cluster, "end_time", None)),
                 "event_count": getattr(cluster, "event_count", None),
@@ -1087,9 +1562,18 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
         result: ResultT,
         bus_event: Event,
     ) -> dict[str, Any]:
+        scope = result_scope(result)
         cluster = getattr(result, "cluster", None)
 
         metadata: dict[str, Any] = {
+            "scope": {
+                "exchange": scope["exchange"],
+                "market_type": scope["market_type"],
+                "symbol": scope["symbol"],
+                "timeframe": scope["timeframe"],
+            },
+            "scope_key": scope["scope_key"],
+            "exchange_symbol": scope["exchange_symbol"],
             "strategy": {
                 "strategy_name": self.config.strategy_name,
                 "signal_type": self.config.signal_type,
@@ -1097,8 +1581,13 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
                 "min_intensity_score": self.config.min_intensity_score,
                 "min_total_notional_usd": str(self.config.min_total_notional_usd),
                 "min_event_count": self.config.min_event_count,
-                "allowed_symbols": self.config.allowed_symbols,
-                "blocked_symbols": self.config.blocked_symbols,
+                "allowed_exchanges": getattr(self.config, "allowed_exchanges", ()),
+                "allowed_market_types": getattr(self.config, "allowed_market_types", ()),
+                "allowed_symbols": getattr(self.config, "allowed_symbols", ()),
+                "allowed_timeframes": getattr(self.config, "allowed_timeframes", ()),
+                "blocked_market_types": getattr(self.config, "blocked_market_types", ()),
+                "blocked_symbols": getattr(self.config, "blocked_symbols", ()),
+                "blocked_timeframes": getattr(self.config, "blocked_timeframes", ()),
             },
             "bus_event": {
                 "topic": bus_event.topic,
@@ -1108,11 +1597,29 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
                 "correlation_id": bus_event.correlation_id,
                 "headers": dict(bus_event.headers),
             },
-            "analytics_metadata": dict(getattr(result, "metadata", {}) or {}),
+            "analytics": {
+                "event_type": serialize_value(getattr(result, "event_type", None)),
+                "status": serialize_value(getattr(result, "status", None)),
+                "severity": serialize_value(getattr(result, "severity", None)),
+                "direction": serialize_value(getattr(result, "direction", None)),
+                "confidence": getattr(result, "confidence", None),
+                "intensity_score": getattr(result, "intensity_score", None),
+                "continuation_bias": getattr(result, "continuation_bias", None),
+                "exhaustion_bias": getattr(result, "exhaustion_bias", None),
+                "event_count": getattr(result, "event_count", None),
+                "total_notional_usd": str(getattr(result, "total_notional_usd", "")),
+                "price_range_pct": getattr(result, "price_range_pct", None),
+                "metadata": serialize_value(getattr(result, "metadata", {}) or {}),
+            },
         }
 
         if cluster is not None:
             metadata["cluster"] = {
+                "exchange": getattr(cluster, "exchange", scope["exchange"]),
+                "market_type": getattr(cluster, "market_type", scope["market_type"]),
+                "symbol": getattr(cluster, "symbol", scope["symbol"]),
+                "timeframe": getattr(cluster, "timeframe", scope["timeframe"]),
+                "exchange_symbol": getattr(cluster, "exchange_symbol", scope["exchange_symbol"]),
                 "start_time": serialize_value(getattr(cluster, "start_time", None)),
                 "end_time": serialize_value(getattr(cluster, "end_time", None)),
                 "event_count": getattr(cluster, "event_count", None),
@@ -1122,6 +1629,7 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
                 "max_price": str(getattr(cluster, "max_price", "")),
                 "duration_seconds": getattr(cluster, "duration_seconds", None),
                 "avg_notional_per_event": str(getattr(cluster, "avg_notional_per_event", "")),
+                "metadata": serialize_value(getattr(cluster, "metadata", {}) or {}),
             }
 
         return metadata
@@ -1139,10 +1647,25 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
             return 0.4
 
         rank = getattr(severity, "rank", None)
-        if isinstance(rank, int | float):
+        if isinstance(rank, (int, float)):
             return clamp_float(float(rank) / 4.0)
 
         return 0.0
+
+    def extract_analytics_metadata(self, result: ResultT) -> dict[str, Any]:
+        metadata = dict(getattr(result, "metadata", {}) or {})
+
+        return {
+            "side_imbalance_ratio": metadata.get("side_imbalance_ratio"),
+            "event_imbalance_ratio": metadata.get("event_imbalance_ratio"),
+            "acceleration_ratio": (
+                metadata.get("acceleration_ratio")
+                or metadata.get("climax_acceleration_ratio")
+            ),
+            "scope": metadata.get("scope") or result_scope(result),
+            "scope_key": metadata.get("scope_key") or result_scope(result)["scope_key"],
+            "raw": metadata,
+        }
 
     # ------------------------------------------------------------------
     # Hooks
@@ -1153,6 +1676,11 @@ class BaseAnalyticsStrategy(Generic[ResultT, SignalT, StateT, ConfigT], ABC):
             "strategy": self.config.strategy_name,
             "signal_type": self.config.signal_type,
             "topic": self.config.subscribe_topic,
+            "scope": "exchange:market_type:symbol:timeframe",
+            "allowed_exchanges": getattr(self.config, "allowed_exchanges", ()),
+            "allowed_market_types": getattr(self.config, "allowed_market_types", ()),
+            "allowed_symbols": getattr(self.config, "allowed_symbols", ()),
+            "allowed_timeframes": getattr(self.config, "allowed_timeframes", ()),
             "min_confidence": self.config.min_confidence,
             "min_intensity_score": self.config.min_intensity_score,
             "min_total_notional_usd": str(self.config.min_total_notional_usd),
