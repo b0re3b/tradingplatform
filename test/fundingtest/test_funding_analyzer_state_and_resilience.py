@@ -9,41 +9,40 @@ from typing import Any, Callable
 
 import pytest
 
+from analytics.funding.config import FundingAnalyzerConfig
 from analytics.funding.enums import (
     FundingDataSource,
+    FundingEventType,
     FundingTimeframe,
 )
-from analytics.funding.funding_analyzer import (
-    FundingAnalyzer,
-    FundingAnalyzerConfig,
-    FundingMarketContext,
-)
+from analytics.funding.funding_analyzer import FundingAnalyzer, FundingMarketContext
 from analytics.funding.models import (
     FundingSnapshot,
     FundingStatistics,
+    funding_key_to_dict,
 )
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Local helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
 
-
-def _make_pressure_stub_signal_compatible(stub_pressure_analyzer: Any) -> None:
-    """
-    Backward-compatible helper for StubPressureAnalyzer from conftest.py.
-
-    FundingAnalyzer._build_signals() may call:
-    - is_high_pressure(...)
-    - is_squeeze_risk(...)
-    - build_summary(...)
-    """
-    if not hasattr(stub_pressure_analyzer, "is_squeeze_risk"):
-        stub_pressure_analyzer.is_squeeze_risk = lambda pressure_state, threshold=0.65: True
-
-
-def _published_topics(event_bus: Any) -> list[str]:
+def _topics(event_bus: Any) -> list[str]:
     return [event.topic for event in event_bus.published]
+
+
+def _payloads_for(event_bus: Any, topic: str) -> list[dict[str, Any]]:
+    return [event.payload for event in event_bus.published if event.topic == topic]
+
+
+def _last_payload_for(event_bus: Any, topic: str) -> dict[str, Any]:
+    payloads = _payloads_for(event_bus, topic)
+    assert payloads, f"No payloads for topic={topic!r}. Published topics={_topics(event_bus)}"
+    return payloads[-1]
+
+
+def _event_count(event_bus: Any, topic: str) -> int:
+    return _topics(event_bus).count(topic)
 
 
 async def _run_funding_update(
@@ -51,56 +50,32 @@ async def _run_funding_update(
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
     *,
-    symbol: str = "BTCUSDT",
-    exchange: str = "binance",
-    funding_rate: float | str = 0.0001,
-    mark_price: float | str | None = 50_000.0,
-    open_interest: float | str | None = 1_000_000.0,
-    correlation_id: str = "corr-resilience",
+    topic: str | None = None,
+    correlation_id: str | None = "corr-state-resilience",
+    **payload_overrides: Any,
 ) -> None:
     await analyzer.on_funding(
         make_event(
-            make_funding_payload(
-                symbol=symbol,
-                exchange=exchange,
-                funding_rate=funding_rate,
-                mark_price=mark_price,
-                open_interest=open_interest,
-            ),
-            topic=analyzer.config.funding_event_name,
+            make_funding_payload(**payload_overrides),
+            topic=topic or analyzer.config.funding_event_name,
             correlation_id=correlation_id,
         )
     )
 
 
-def _make_analyzer(
-    *,
-    fake_event_bus: Any,
-    fake_scheduler: Any | None,
-    config: FundingAnalyzerConfig,
-    stub_regime_detector: Any,
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
-) -> FundingAnalyzer:
-    _make_pressure_stub_signal_compatible(stub_pressure_analyzer)
-
-    return FundingAnalyzer(
-        event_bus=fake_event_bus,  # type: ignore[arg-type]
-        scheduler=fake_scheduler,  # type: ignore[arg-type]
-        config=config,
-        regime_detector=stub_regime_detector,  # type: ignore[arg-type]
-        pressure_analyzer=stub_pressure_analyzer,  # type: ignore[arg-type]
-        flip_detector=stub_flip_detector,  # type: ignore[arg-type]
-        extremes_detector=stub_extremes_detector,  # type: ignore[arg-type]
-        divergence_detector=stub_divergence_detector,  # type: ignore[arg-type]
+def _get_lock_for_default_key(analyzer: FundingAnalyzer) -> asyncio.Lock:
+    key = analyzer._make_key(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
     )
+    return analyzer._locks[key]
 
 
-class FaultyRegimeDetector:
+class FaultyDetector:
     def __init__(self, exc: Exception | None = None) -> None:
-        self.exc = exc or RuntimeError("regime detector failed")
+        self.exc = exc or RuntimeError("detector failed intentionally")
         self.calls: list[dict[str, Any]] = []
 
     def detect(self, **kwargs: Any) -> Any:
@@ -108,196 +83,205 @@ class FaultyRegimeDetector:
         raise self.exc
 
 
-class FaultyEmitEventBus:
-    """
-    EventBus fake that fails during emit.
+class FaultyAnalyzeDetector:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.exc = exc or RuntimeError("pressure analyzer failed intentionally")
+        self.calls: list[dict[str, Any]] = []
 
-    Використовується для перевірки, що lock буде release-нутий навіть тоді,
-    коли помилка сталася на стадії publish.
-    """
+    def analyze(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        raise self.exc
 
+    def is_high_pressure(self, *_: Any, **__: Any) -> bool:
+        return False
+
+    def is_squeeze_risk(self, *_: Any, **__: Any) -> bool:
+        return False
+
+    def build_summary(self, *_: Any, **__: Any) -> str:
+        return "faulty pressure analyzer"
+
+
+class ExplodingParquetStorage:
     def __init__(self) -> None:
-        self.subscriptions: list[Any] = []
-        self.unsubscribed: list[Any] = []
-        self.published_attempts: list[tuple[str, dict[str, Any] | None, dict[str, Any]]] = []
+        self.append_calls: list[dict[str, Any]] = []
+        self.read_calls: list[dict[str, Any]] = []
 
-    def subscribe(self, topic: str, handler: Callable[..., Any], *, name: str | None = None) -> Any:
-        subscription = type(
-            "FakeSubscription",
-            (),
-            {
-                "topic": topic,
-                "handler": handler,
-                "name": name,
-            },
-        )()
-        self.subscriptions.append(subscription)
-        return subscription
+    def append_records(self, *, dataset: str, records: list[dict[str, Any]]) -> None:
+        self.append_calls.append({"dataset": dataset, "records": records})
+        raise RuntimeError("parquet append failed intentionally")
 
-    def unsubscribe(self, subscription: Any) -> None:
-        self.unsubscribed.append(subscription)
-
-    async def emit(
-        self,
-        topic: str,
-        payload: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        self.published_attempts.append((topic, payload, kwargs))
-        raise RuntimeError("emit failed")
+    def read_records(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.read_calls.append(kwargs)
+        return []
 
 
-# ---------------------------------------------------------------------------
-# Parsing and utility helpers
-# ---------------------------------------------------------------------------
+class RecordingParquetStorage:
+    def __init__(self) -> None:
+        self.append_calls: list[dict[str, Any]] = []
+        self.read_calls: list[dict[str, Any]] = []
+
+    def append_records(self, *, dataset: str, records: list[dict[str, Any]]) -> None:
+        self.append_calls.append({"dataset": dataset, "records": list(records)})
+
+    def read_records(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.read_calls.append(kwargs)
+        return []
 
 
-def test_make_key_normalizes_symbol_and_exchange(
+# =============================================================================
+# Parsing / low-level utility behavior
+# =============================================================================
+
+def test_make_key_is_full_futures_scope_not_legacy_symbol_exchange_string(
     funding_analyzer: FundingAnalyzer,
 ) -> None:
-    assert funding_analyzer._make_key(" btcusdt ", " BINANCE ") == "BTCUSDT::binance"
-    assert funding_analyzer._make_key("EthUsdt", "ByBit") == "ETHUSDT::bybit"
+    key = funding_analyzer._make_key(
+        symbol=" btc/usdt ",
+        exchange=" BINANCE ",
+        market_type="USDM_FUTURES",
+        timeframe="1h",
+    )
+
+    assert key == ("binance", "usdm_futures", "BTCUSDT", "1h")
+    assert isinstance(key, tuple)
+    assert len(key) == 4
 
 
-def test_extract_payload_requires_dict(
+def test_make_key_uses_config_defaults_for_market_type_and_timeframe(
+    funding_analyzer: FundingAnalyzer,
+) -> None:
+    key = funding_analyzer._make_key(
+        symbol="ETHUSDT",
+        exchange="bybit",
+    )
+
+    assert key == (
+        "bybit",
+        funding_analyzer.config.default_market_type,
+        "ETHUSDT",
+        funding_analyzer.config.default_timeframe.value,
+    )
+
+
+def test_extract_payload_requires_mapping_payload(
     funding_analyzer: FundingAnalyzer,
     make_event: Callable[..., Any],
 ) -> None:
-    valid_event = make_event({"symbol": "BTCUSDT"})
-    assert funding_analyzer._extract_payload(valid_event) == {"symbol": "BTCUSDT"}
-
-    invalid_event = make_event({"symbol": "BTCUSDT"})
-    invalid_event.payload = ["not", "dict"]
+    assert funding_analyzer._extract_payload(make_event({"symbol": "BTCUSDT"})) == {
+        "symbol": "BTCUSDT"
+    }
 
     with pytest.raises(TypeError):
-        funding_analyzer._extract_payload(invalid_event)
+        funding_analyzer._extract_payload(make_event(["not", "dict"]))
+
+    with pytest.raises(TypeError):
+        funding_analyzer._extract_payload(make_event(None))
 
 
-def test_to_optional_float_handles_valid_and_invalid_values(
+def test_first_present_does_not_drop_zero_or_empty_string(
     funding_analyzer: FundingAnalyzer,
 ) -> None:
-    assert funding_analyzer._to_optional_float(None) is None
-    assert funding_analyzer._to_optional_float("0.0001") == pytest.approx(0.0001)
-    assert funding_analyzer._to_optional_float(123) == pytest.approx(123.0)
-    assert funding_analyzer._to_optional_float("not-a-number") is None
-    assert funding_analyzer._to_optional_float(object()) is None
+    assert funding_analyzer._first_present({"a": 0, "b": 1}, "a", "b") == 0
+    assert funding_analyzer._first_present({"a": 0.0, "b": 1.0}, "a", "b") == 0.0
+    assert funding_analyzer._first_present({"a": "", "b": "fallback"}, "a", "b") == ""
+    assert funding_analyzer._first_present({"a": None, "b": 2}, "a", "b") == 2
+    assert funding_analyzer._first_present({}, "missing") is None
 
 
-def test_parse_exchange_falls_back_to_unknown(
+def test_parse_datetime_handles_naive_aware_seconds_milliseconds_and_zulu(
     funding_analyzer: FundingAnalyzer,
 ) -> None:
-    assert funding_analyzer._parse_exchange("binance") == FundingDataSource.BINANCE
-    assert funding_analyzer._parse_exchange(" BINANCE ") == FundingDataSource.BINANCE
-    assert funding_analyzer._parse_exchange("not-supported") == FundingDataSource.UNKNOWN
+    naive = datetime(2026, 1, 1, 12, 0, 0)
+    aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
+    assert funding_analyzer._parse_datetime(naive) == aware
+    assert funding_analyzer._parse_datetime(aware) == aware
+    assert funding_analyzer._parse_datetime(1_767_268_800) == aware
+    assert funding_analyzer._parse_datetime(1_767_268_800_000) == aware
+    assert funding_analyzer._parse_datetime("2026-01-01T12:00:00Z") == aware
 
-def test_parse_datetime_supports_datetime_seconds_milliseconds_and_iso_strings(
-    funding_analyzer: FundingAnalyzer,
-) -> None:
-    naive_dt = datetime(2026, 1, 1, 12, 0, 0)
-    aware_dt = datetime(2026, 1, 1, 14, 0, 0, tzinfo=timezone.utc)
-
-    parsed_naive = funding_analyzer._parse_datetime(naive_dt)
-    parsed_aware = funding_analyzer._parse_datetime(aware_dt)
-    parsed_seconds = funding_analyzer._parse_datetime(1_767_268_800)
-    parsed_millis = funding_analyzer._parse_datetime(1_767_268_800_000)
-    parsed_iso_z = funding_analyzer._parse_datetime("2026-01-01T12:00:00Z")
-
-    assert parsed_naive.tzinfo is not None
-    assert parsed_naive == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert parsed_aware == aware_dt
-    assert parsed_seconds == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert parsed_millis == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert parsed_iso_z == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-
-def test_parse_datetime_rejects_unsupported_value(
-    funding_analyzer: FundingAnalyzer,
-) -> None:
     with pytest.raises(TypeError):
         funding_analyzer._parse_datetime(object())
 
 
-def test_parse_funding_snapshot_normalizes_and_converts_values(
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("0", 0.0),
+        (0, 0.0),
+        (0.0, 0.0),
+        ("0.0001", 0.0001),
+        ("not-a-number", None),
+        (object(), None),
+    ],
+)
+def test_to_optional_float_is_strict_but_accepts_zero(
     funding_analyzer: FundingAnalyzer,
+    value: Any,
+    expected: float | None,
+) -> None:
+    result = funding_analyzer._to_optional_float(value)
+
+    if expected is None:
+        assert result is None
+    else:
+        assert result == pytest.approx(expected)
+
+
+def test_parse_funding_snapshot_preserves_zero_values_and_full_scope(
+    funding_analyzer: FundingAnalyzer,
+    now_utc: datetime,
 ) -> None:
     snapshot = funding_analyzer._parse_funding_snapshot(
         {
-            "symbol": " btcusdt ",
             "exchange": "binance",
-            "funding_rate": "0.0001",
-            "predicted_funding_rate": "0.0002",
-            "mark_price": "50000.5",
-            "index_price": "49990.5",
-            "open_interest": "1000000",
-            "volume_24h": "250000000",
-            "next_funding_time": "2026-01-01T16:00:00Z",
-            "event_time": "2026-01-01T12:00:00Z",
-            "received_at": "2026-01-01T12:00:01Z",
-            "metadata": {"source": "unit-test"},
+            "market_type": "usdm_futures",
+            "symbol": "btc/usdt",
+            "timeframe": "1h",
+            "exchange_symbol": "BTC/USDT:USDT",
+            "funding_rate": "0",
+            "predicted_funding_rate": 0,
+            "mark_price": 0,
+            "index_price": 0,
+            "open_interest": 0,
+            "volume_24h": 0,
+            "event_time": now_utc,
+            "received_at": now_utc,
+            "metadata": {"source": "hard-test"},
         }
     )
 
-    assert snapshot.symbol == "BTCUSDT"
+    assert snapshot.key == ("binance", "usdm_futures", "BTCUSDT", "1h")
     assert snapshot.exchange == FundingDataSource.BINANCE
-    assert snapshot.funding_rate == pytest.approx(0.0001)
-    assert snapshot.predicted_funding_rate == pytest.approx(0.0002)
-    assert snapshot.mark_price == pytest.approx(50_000.5)
-    assert snapshot.index_price == pytest.approx(49_990.5)
-    assert snapshot.open_interest == pytest.approx(1_000_000.0)
-    assert snapshot.volume_24h == pytest.approx(250_000_000.0)
-    assert snapshot.next_funding_time == datetime(2026, 1, 1, 16, 0, 0, tzinfo=timezone.utc)
-    assert snapshot.event_time == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert snapshot.received_at == datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc)
-    assert snapshot.metadata == {"source": "unit-test"}
-
-
-def test_parse_funding_snapshot_supports_ts_and_timestamp_fallbacks(
-    funding_analyzer: FundingAnalyzer,
-) -> None:
-    snapshot_from_ts = funding_analyzer._parse_funding_snapshot(
-        {
-            "symbol": "BTCUSDT",
-            "exchange": "binance",
-            "funding_rate": 0.0001,
-            "ts": 1_767_268_800_000,
-        }
-    )
-    snapshot_from_timestamp = funding_analyzer._parse_funding_snapshot(
-        {
-            "symbol": "ETHUSDT",
-            "exchange": "bybit",
-            "funding_rate": 0.0002,
-            "timestamp": 1_767_268_800,
-        }
-    )
-
-    assert snapshot_from_ts.event_time == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    assert snapshot_from_timestamp.event_time == datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-
-def test_parse_funding_snapshot_uses_safe_metadata_default(
-    funding_analyzer: FundingAnalyzer,
-) -> None:
-    snapshot = funding_analyzer._parse_funding_snapshot(
-        {
-            "symbol": "BTCUSDT",
-            "exchange": "binance",
-            "funding_rate": 0.0001,
-            "metadata": "not-a-dict",
-        }
-    )
-
-    assert snapshot.metadata == {}
+    assert snapshot.market_type == "usdm_futures"
+    assert snapshot.symbol == "BTCUSDT"
+    assert snapshot.timeframe == FundingTimeframe.H1
+    assert snapshot.exchange_symbol == "BTC/USDT:USDT"
+    assert snapshot.funding_rate == pytest.approx(0.0)
+    assert snapshot.predicted_funding_rate == pytest.approx(0.0)
+    assert snapshot.mark_price == pytest.approx(0.0)
+    assert snapshot.index_price == pytest.approx(0.0)
+    assert snapshot.open_interest == pytest.approx(0.0)
+    assert snapshot.volume_24h == pytest.approx(0.0)
+    assert snapshot.metadata["scope"] == {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "1h",
+    }
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         {},
-        {"exchange": "binance", "funding_rate": 0.0001},
-        {"symbol": "BTCUSDT", "exchange": "binance", "funding_rate": "bad"},
-        {"symbol": "BTCUSDT", "exchange": "binance", "funding_rate": 0.0001, "event_time": object()},
+        {"exchange": "binance", "market_type": "usdm_futures", "funding_rate": 0.0001},
+        {"exchange": "binance", "market_type": "usdm_futures", "symbol": "", "funding_rate": 0.0001},
+        {"exchange": "binance", "market_type": "usdm_futures", "symbol": "BTCUSDT"},
+        {"exchange": "binance", "market_type": "usdm_futures", "symbol": "BTCUSDT", "funding_rate": "bad"},
+        {"exchange": "binance", "market_type": "usdm_futures", "symbol": "BTCUSDT", "funding_rate": 0.1, "event_time": object()},
     ],
 )
 def test_parse_funding_snapshot_rejects_malformed_payloads(
@@ -308,67 +292,56 @@ def test_parse_funding_snapshot_rejects_malformed_payloads(
         funding_analyzer._parse_funding_snapshot(payload)
 
 
-def test_numeric_change_helpers_are_safe(
+def test_key_from_payload_supports_nested_fallback_scope(
     funding_analyzer: FundingAnalyzer,
 ) -> None:
-    assert funding_analyzer._calc_change_pct(None, 10.0) is None
-    assert funding_analyzer._calc_change_pct(0.0, 10.0) is None
-    assert funding_analyzer._calc_change_pct(100.0, 110.0) == pytest.approx(0.10)
+    key = funding_analyzer._key_from_payload(
+        {"price": 50_000},
+        fallback_payload={
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+        },
+    )
 
-    assert funding_analyzer._calc_price_change_pct(50_000.0, 50_100.0) == pytest.approx(0.002)
-    assert funding_analyzer._calc_delta(None, 10.0) is None
-    assert funding_analyzer._calc_delta(10.0, 25.0) == pytest.approx(15.0)
+    assert key == ("binance", "usdm_futures", "BTCUSDT", "1h")
 
 
-def test_percentile_helper_handles_empty_values_duplicates_and_bounds(
+def test_key_from_payload_returns_none_when_symbol_missing(
     funding_analyzer: FundingAnalyzer,
 ) -> None:
-    assert funding_analyzer._calc_percentile([], 0.0) is None
-    assert funding_analyzer._calc_percentile([1.0], 1.0) == pytest.approx(100.0)
-    assert funding_analyzer._calc_percentile([1.0, 1.0, 1.0], 1.0) == pytest.approx(100.0)
-    assert funding_analyzer._calc_percentile([-1.0, 0.0, 1.0], -1.0) == pytest.approx(100.0 / 3.0)
-    assert funding_analyzer._calc_percentile([-1.0, 0.0, 1.0], 0.0) == pytest.approx(200.0 / 3.0)
-    assert funding_analyzer._calc_percentile([-1.0, 0.0, 1.0], 1.0) == pytest.approx(100.0)
+    assert funding_analyzer._key_from_payload({"exchange": "binance"}) is None
 
 
-# ---------------------------------------------------------------------------
-# Statistics builder edge cases
-# ---------------------------------------------------------------------------
-
+# =============================================================================
+# Statistics hard behavior
+# =============================================================================
 
 def test_build_statistics_rejects_empty_history(
     funding_analyzer: FundingAnalyzer,
+    make_snapshot: Callable[..., FundingSnapshot],
 ) -> None:
     with pytest.raises(ValueError, match="history must not be empty"):
         funding_analyzer._build_statistics(
-            symbol="BTCUSDT",
-            exchange="binance",
+            snapshot=make_snapshot(),
             history=deque(),
-            timeframe=FundingTimeframe.H1,
         )
 
 
-def test_build_statistics_for_single_snapshot_has_zero_std_and_no_zscore(
+def test_build_statistics_single_snapshot_has_zero_std_and_no_zscore(
     funding_analyzer: FundingAnalyzer,
     make_snapshot: Callable[..., FundingSnapshot],
     now_utc: datetime,
 ) -> None:
-    snapshot = make_snapshot(
-        funding_rate=0.0001,
-        event_time=now_utc,
-    )
-    history = deque([snapshot])
+    snapshot = make_snapshot(funding_rate=0.0001, event_time=now_utc)
 
     statistics = funding_analyzer._build_statistics(
-        symbol="btcusdt",
-        exchange="binance",
-        history=history,
-        timeframe=FundingTimeframe.H1,
+        snapshot=snapshot,
+        history=deque([snapshot]),
     )
 
-    assert statistics.symbol == "BTCUSDT"
-    assert statistics.exchange == FundingDataSource.BINANCE
-    assert statistics.timeframe == FundingTimeframe.H1
+    assert statistics.key == snapshot.key
     assert statistics.current_rate == pytest.approx(0.0001)
     assert statistics.mean_rate == pytest.approx(0.0001)
     assert statistics.median_rate == pytest.approx(0.0001)
@@ -380,40 +353,23 @@ def test_build_statistics_for_single_snapshot_has_zero_std_and_no_zscore(
     assert statistics.window_end == now_utc
 
 
-def test_build_statistics_for_equal_rates_has_zero_std_and_no_zscore(
-    funding_analyzer: FundingAnalyzer,
+def test_build_statistics_uses_statistics_window_size_not_full_history(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
     make_snapshot: Callable[..., FundingSnapshot],
     now_utc: datetime,
 ) -> None:
-    history = deque(
-        [
-            make_snapshot(funding_rate=0.0001, event_time=now_utc + timedelta(minutes=i))
-            for i in range(5)
-        ]
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        statistics_window_size=3,
+        max_history_per_key=10,
+        emit_signals=False,
+        enable_parquet_history=False,
+        load_history_from_parquet_on_start=False,
     )
+    analyzer = make_funding_analyzer(config=config)
 
-    statistics = funding_analyzer._build_statistics(
-        symbol="BTCUSDT",
-        exchange="binance",
-        history=history,
-        timeframe=FundingTimeframe.H1,
-    )
-
-    assert statistics.current_rate == pytest.approx(0.0001)
-    assert statistics.mean_rate == pytest.approx(0.0001)
-    assert statistics.median_rate == pytest.approx(0.0001)
-    assert statistics.std_rate == pytest.approx(0.0)
-    assert statistics.zscore is None
-    assert statistics.percentile == pytest.approx(100.0)
-    assert statistics.sample_size == 5
-
-
-def test_build_statistics_for_mixed_rates_calculates_window_and_distribution(
-    funding_analyzer: FundingAnalyzer,
-    make_snapshot: Callable[..., FundingSnapshot],
-    now_utc: datetime,
-) -> None:
-    rates = [-0.0002, -0.0001, 0.0, 0.0001, 0.0003]
+    rates = [-0.01, -0.01, 0.0001, 0.0002, 0.0003]
     history = deque(
         [
             make_snapshot(
@@ -421,62 +377,69 @@ def test_build_statistics_for_mixed_rates_calculates_window_and_distribution(
                 event_time=now_utc + timedelta(minutes=index),
             )
             for index, rate in enumerate(rates)
-        ]
+        ],
+        maxlen=10,
     )
 
-    statistics = funding_analyzer._build_statistics(
-        symbol="BTCUSDT",
-        exchange="binance",
+    statistics = analyzer._build_statistics(
+        snapshot=history[-1],
         history=history,
-        timeframe=FundingTimeframe.H1,
     )
 
+    assert statistics.sample_size == 3
     assert statistics.current_rate == pytest.approx(0.0003)
-    assert statistics.mean_rate == pytest.approx(0.00002)
-    assert statistics.median_rate == pytest.approx(0.0)
-    assert statistics.min_rate == pytest.approx(-0.0002)
+    assert statistics.mean_rate == pytest.approx((0.0001 + 0.0002 + 0.0003) / 3)
+    assert statistics.min_rate == pytest.approx(0.0001)
     assert statistics.max_rate == pytest.approx(0.0003)
-    assert statistics.std_rate > 0.0
-    assert statistics.zscore is not None
-    assert statistics.zscore > 0.0
-    assert statistics.percentile == pytest.approx(100.0)
-    assert statistics.sample_size == 5
-    assert statistics.window_start == now_utc
-    assert statistics.window_end == now_utc + timedelta(minutes=4)
+    assert statistics.window_start == history[-3].event_time
+    assert statistics.window_end == history[-1].event_time
 
 
-# ---------------------------------------------------------------------------
-# State/cache/history behavior
-# ---------------------------------------------------------------------------
+def test_percentile_helper_uses_less_or_equal_semantics(
+    funding_analyzer: FundingAnalyzer,
+) -> None:
+    assert funding_analyzer._calc_percentile([], 1.0) is None
+    assert funding_analyzer._calc_percentile([1.0], 1.0) == pytest.approx(100.0)
+    assert funding_analyzer._calc_percentile([1.0, 1.0, 1.0], 1.0) == pytest.approx(100.0)
+    assert funding_analyzer._calc_percentile([-1.0, 0.0, 1.0], -1.0) == pytest.approx(100.0 / 3.0)
+    assert funding_analyzer._calc_percentile([-1.0, 0.0, 1.0], 0.0) == pytest.approx(200.0 / 3.0)
+    assert funding_analyzer._calc_percentile([-1.0, 0.0, 1.0], 1.0) == pytest.approx(100.0)
 
+
+def test_numeric_change_helpers_are_none_safe(
+    funding_analyzer: FundingAnalyzer,
+) -> None:
+    assert funding_analyzer._calc_change_pct(None, 10.0) is None
+    assert funding_analyzer._calc_change_pct(0.0, 10.0) is None
+    assert funding_analyzer._calc_change_pct(100.0, 110.0) == pytest.approx(0.10)
+
+    assert funding_analyzer._calc_price_change_pct(50_000.0, 50_100.0) == pytest.approx(0.002)
+    assert funding_analyzer._calc_delta(None, 1.0) is None
+    assert funding_analyzer._calc_delta(10.0, 25.0) == pytest.approx(15.0)
+
+
+# =============================================================================
+# State behavior / bounded history
+# =============================================================================
 
 @pytest.mark.asyncio
-async def test_on_funding_keeps_bounded_history_maxlen(
-    fake_event_bus: Any,
-    fake_scheduler: Any,
+async def test_on_funding_keeps_bounded_history_per_full_futures_key(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
-    stub_regime_detector: Any,
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
 ) -> None:
-    analyzer = _make_analyzer(
-        fake_event_bus=fake_event_bus,
-        fake_scheduler=fake_scheduler,
-        config=FundingAnalyzerConfig(
-            history_size=3,
-            publish_signal_event=False,
-            enable_cleanup_job=False,
-            state_lock_timeout_sec=0.05,
-        ),
-        stub_regime_detector=stub_regime_detector,
-        stub_pressure_analyzer=stub_pressure_analyzer,
-        stub_flip_detector=stub_flip_detector,
-        stub_extremes_detector=stub_extremes_detector,
-        stub_divergence_detector=stub_divergence_detector,
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        max_history_per_key=3,
+        statistics_window_size=3,
+        signal_cooldown_sec=0.0,
+        min_emit_interval_ms=0,
+        emit_signals=False,
+        enable_parquet_history=False,
+        load_history_from_parquet_on_start=False,
     )
+    analyzer = make_funding_analyzer(config=config)
 
     rates = [0.00001, 0.00002, 0.00003, 0.00004, 0.00005]
 
@@ -488,510 +451,532 @@ async def test_on_funding_keeps_bounded_history_maxlen(
             funding_rate=rate,
         )
 
-    key = analyzer._make_key("BTCUSDT", "binance")
-    history = analyzer._history[key]
-    statistics = analyzer.get_statistics("BTCUSDT", "binance")
+    key = analyzer._make_key(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    )
 
-    assert len(history) == 3
-    assert [snapshot.funding_rate for snapshot in history] == pytest.approx(rates[-3:])
+    assert len(analyzer._history[key]) == 3
+    assert [item.funding_rate for item in analyzer._history[key]] == pytest.approx(rates[-3:])
 
-    assert analyzer.get_latest_snapshot("btcusdt", "BINANCE") is history[-1]
-    assert analyzer.get_latest_snapshot("BTCUSDT", "binance").funding_rate == pytest.approx(0.00005)
+    latest = analyzer.get_latest_snapshot(
+        "BTCUSDT",
+        "binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    )
+    statistics = analyzer.get_statistics(
+        "BTCUSDT",
+        "binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    )
+
+    assert latest is analyzer._history[key][-1]
+    assert latest.funding_rate == pytest.approx(0.00005)
 
     assert statistics is not None
     assert statistics.sample_size == 3
     assert statistics.current_rate == pytest.approx(0.00005)
-    assert statistics.min_rate == pytest.approx(0.00003)
-    assert statistics.max_rate == pytest.approx(0.00005)
+    assert statistics.mean_rate == pytest.approx(sum(rates[-3:]) / 3)
 
 
 @pytest.mark.asyncio
-async def test_getters_are_key_normalized_and_return_latest_cached_objects(
+async def test_on_funding_state_isolated_by_exchange_market_type_symbol_and_timeframe(
     funding_analyzer: FundingAnalyzer,
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
-    stub_pressure_analyzer: Any,
 ) -> None:
-    _make_pressure_stub_signal_compatible(stub_pressure_analyzer)
+    cases = [
+        {
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "funding_rate": 0.0001,
+        },
+        {
+            "exchange": "binance",
+            "market_type": "coinm_futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "funding_rate": 0.0002,
+        },
+        {
+            "exchange": "bybit",
+            "market_type": "linear",
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "funding_rate": -0.0003,
+        },
+        {
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "symbol": "ETHUSDT",
+            "timeframe": "1h",
+            "funding_rate": 0.0004,
+        },
+        {
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "funding_rate": 0.0005,
+        },
+    ]
 
-    await _run_funding_update(
-        funding_analyzer,
-        make_event,
-        make_funding_payload,
-        symbol="btcusdt",
-        exchange="BINANCE",
-        funding_rate=0.0001,
-    )
-
-    assert funding_analyzer.get_latest_snapshot(" BTCUSDT ", " binance ") is not None
-    assert funding_analyzer.get_statistics("btcusdt", "BINANCE") is not None
-    assert funding_analyzer.get_regime_state("btcusdt", "BINANCE") is not None
-    assert funding_analyzer.get_pressure_state("btcusdt", "BINANCE") is not None
-
-    stats = funding_analyzer.stats()
-
-    assert stats["symbols_tracked"] == 1
-    assert stats["latest_statistics"] == 1
-    assert stats["latest_regime_states"] == 1
-    assert stats["latest_pressure_states"] == 1
-
-
-@pytest.mark.asyncio
-async def test_symbol_exchange_state_isolated_between_markets(
-    funding_analyzer: FundingAnalyzer,
-    make_event: Callable[..., Any],
-    make_funding_payload: Callable[..., dict[str, Any]],
-    stub_pressure_analyzer: Any,
-) -> None:
-    _make_pressure_stub_signal_compatible(stub_pressure_analyzer)
-
-    await _run_funding_update(
-        funding_analyzer,
-        make_event,
-        make_funding_payload,
-        symbol="BTCUSDT",
-        exchange="binance",
-        funding_rate=0.0001,
-    )
-    await _run_funding_update(
-        funding_analyzer,
-        make_event,
-        make_funding_payload,
-        symbol="BTCUSDT",
-        exchange="bybit",
-        funding_rate=-0.0002,
-    )
-    await _run_funding_update(
-        funding_analyzer,
-        make_event,
-        make_funding_payload,
-        symbol="ETHUSDT",
-        exchange="binance",
-        funding_rate=0.0003,
-    )
-
-    assert funding_analyzer.stats()["symbols_tracked"] == 3
-
-    btc_binance = funding_analyzer.get_latest_snapshot("BTCUSDT", "binance")
-    btc_bybit = funding_analyzer.get_latest_snapshot("BTCUSDT", "bybit")
-    eth_binance = funding_analyzer.get_latest_snapshot("ETHUSDT", "binance")
-
-    assert btc_binance is not None
-    assert btc_bybit is not None
-    assert eth_binance is not None
-
-    assert btc_binance.funding_rate == pytest.approx(0.0001)
-    assert btc_bybit.funding_rate == pytest.approx(-0.0002)
-    assert eth_binance.funding_rate == pytest.approx(0.0003)
-
-
-@pytest.mark.asyncio
-async def test_snapshot_is_enriched_from_context_when_payload_fields_are_missing(
-    funding_analyzer: FundingAnalyzer,
-    make_event: Callable[..., Any],
-    make_funding_payload: Callable[..., dict[str, Any]],
-    make_market_context: Callable[..., FundingMarketContext],
-    stub_pressure_analyzer: Any,
-) -> None:
-    _make_pressure_stub_signal_compatible(stub_pressure_analyzer)
-
-    key = funding_analyzer._make_key("BTCUSDT", "binance")
-    funding_analyzer._market_context[key] = make_market_context(
-        latest_open_interest=1_234_567.0,
-        latest_price=51_000.0,
-        previous_open_interest=1_000_000.0,
-        previous_price=50_900.0,
-    )
-
-    await _run_funding_update(
-        funding_analyzer,
-        make_event,
-        make_funding_payload,
-        mark_price=None,
-        open_interest=None,
-    )
-
-    snapshot = funding_analyzer.get_latest_snapshot("BTCUSDT", "binance")
-
-    assert snapshot is not None
-    assert snapshot.open_interest == pytest.approx(1_234_567.0)
-    assert snapshot.mark_price == pytest.approx(51_000.0)
-
-
-# ---------------------------------------------------------------------------
-# Cleanup stale state
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_cleanup_removes_stale_context_without_history(
-    funding_analyzer: FundingAnalyzer,
-    make_market_context: Callable[..., FundingMarketContext],
-    now_utc: datetime,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(funding_analyzer, "_utc_now", lambda: now_utc)
-
-    stale_key = funding_analyzer._make_key("BTCUSDT", "binance")
-    funding_analyzer._market_context[stale_key] = make_market_context(
-        updated_at=now_utc - timedelta(seconds=funding_analyzer.config.stale_context_ttl_sec + 1),
-        liquidation_updated_at=None,
-    )
-
-    await funding_analyzer.cleanup_stale_state()
-
-    assert stale_key not in funding_analyzer._market_context
-    assert funding_analyzer.get_market_context("BTCUSDT", "binance") is None
-
-
-@pytest.mark.asyncio
-async def test_cleanup_keeps_stale_context_when_history_exists(
-    funding_analyzer: FundingAnalyzer,
-    make_market_context: Callable[..., FundingMarketContext],
-    make_snapshot: Callable[..., FundingSnapshot],
-    now_utc: datetime,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(funding_analyzer, "_utc_now", lambda: now_utc)
-
-    key = funding_analyzer._make_key("BTCUSDT", "binance")
-    funding_analyzer._market_context[key] = make_market_context(
-        updated_at=now_utc - timedelta(seconds=funding_analyzer.config.stale_context_ttl_sec + 1),
-        liquidation_updated_at=None,
-    )
-    funding_analyzer._history[key].append(make_snapshot(symbol="BTCUSDT"))
-
-    await funding_analyzer.cleanup_stale_state()
-
-    assert key in funding_analyzer._market_context
-    assert funding_analyzer.get_market_context("BTCUSDT", "binance") is not None
-
-
-@pytest.mark.asyncio
-async def test_cleanup_clears_stale_liquidation_values_without_removing_context(
-    funding_analyzer: FundingAnalyzer,
-    make_market_context: Callable[..., FundingMarketContext],
-    now_utc: datetime,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(funding_analyzer, "_utc_now", lambda: now_utc)
-
-    key = funding_analyzer._make_key("BTCUSDT", "binance")
-    funding_analyzer._market_context[key] = make_market_context(
-        updated_at=now_utc,
-        long_liquidations=100_000.0,
-        short_liquidations=200_000.0,
-        liquidation_updated_at=now_utc
-        - timedelta(seconds=funding_analyzer.config.stale_liquidation_ttl_sec + 1),
-    )
-
-    await funding_analyzer.cleanup_stale_state()
-
-    context = funding_analyzer.get_market_context("BTCUSDT", "binance")
-
-    assert context is not None
-    assert context.long_liquidations is None
-    assert context.short_liquidations is None
-    assert context.liquidation_updated_at is None
-    assert key in funding_analyzer._market_context
-
-
-@pytest.mark.asyncio
-async def test_cleanup_does_not_modify_fresh_context_or_fresh_liquidations(
-    funding_analyzer: FundingAnalyzer,
-    make_market_context: Callable[..., FundingMarketContext],
-    now_utc: datetime,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(funding_analyzer, "_utc_now", lambda: now_utc)
-
-    key = funding_analyzer._make_key("BTCUSDT", "binance")
-    funding_analyzer._market_context[key] = make_market_context(
-        updated_at=now_utc - timedelta(seconds=1),
-        long_liquidations=100_000.0,
-        short_liquidations=200_000.0,
-        liquidation_updated_at=now_utc - timedelta(seconds=1),
-    )
-
-    await funding_analyzer.cleanup_stale_state()
-
-    context = funding_analyzer.get_market_context("BTCUSDT", "binance")
-
-    assert context is not None
-    assert context.long_liquidations == pytest.approx(100_000.0)
-    assert context.short_liquidations == pytest.approx(200_000.0)
-    assert context.liquidation_updated_at is not None
-
-
-@pytest.mark.asyncio
-async def test_cleanup_handles_context_with_none_timestamps(
-    funding_analyzer: FundingAnalyzer,
-) -> None:
-    key = funding_analyzer._make_key("BTCUSDT", "binance")
-    funding_analyzer._market_context[key] = FundingMarketContext(
-        latest_open_interest=1_000_000.0,
-        latest_price=50_000.0,
-        long_liquidations=100_000.0,
-        short_liquidations=200_000.0,
-        updated_at=None,
-        liquidation_updated_at=None,
-    )
-
-    await funding_analyzer.cleanup_stale_state()
-
-    context = funding_analyzer.get_market_context("BTCUSDT", "binance")
-
-    assert context is not None
-    assert context.latest_open_interest == pytest.approx(1_000_000.0)
-    assert context.latest_price == pytest.approx(50_000.0)
-    assert context.long_liquidations == pytest.approx(100_000.0)
-    assert context.short_liquidations == pytest.approx(200_000.0)
-
-
-# ---------------------------------------------------------------------------
-# Lock timeout / release / failure resilience
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_on_funding_returns_without_state_mutation_when_lock_times_out(
-    fake_event_bus: Any,
-    fake_scheduler: Any,
-    make_event: Callable[..., Any],
-    make_funding_payload: Callable[..., dict[str, Any]],
-    stub_regime_detector: Any,
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
-) -> None:
-    analyzer = _make_analyzer(
-        fake_event_bus=fake_event_bus,
-        fake_scheduler=fake_scheduler,
-        config=FundingAnalyzerConfig(
-            history_size=10,
-            publish_signal_event=False,
-            enable_cleanup_job=False,
-            state_lock_timeout_sec=0.01,
-        ),
-        stub_regime_detector=stub_regime_detector,
-        stub_pressure_analyzer=stub_pressure_analyzer,
-        stub_flip_detector=stub_flip_detector,
-        stub_extremes_detector=stub_extremes_detector,
-        stub_divergence_detector=stub_divergence_detector,
-    )
-
-    key = analyzer._make_key("BTCUSDT", "binance")
-    lock = analyzer._locks[key]
-
-    await lock.acquire()
-
-    try:
+    for case in cases:
         await _run_funding_update(
-            analyzer,
+            funding_analyzer,
             make_event,
             make_funding_payload,
-            funding_rate=0.0001,
+            **case,
         )
-    finally:
-        lock.release()
 
-    assert analyzer.stats()["symbols_tracked"] == 0
-    assert analyzer.stats()["latest_statistics"] == 0
-    assert fake_event_bus.published == []
-    assert len(stub_regime_detector.calls) == 0
-    assert len(stub_pressure_analyzer.calls) == 0
-    assert len(stub_flip_detector.calls) == 0
-    assert len(stub_extremes_detector.calls) == 0
-    assert len(stub_divergence_detector.calls) == 0
+    assert funding_analyzer.stats()["keys_tracked"] == 5
+    assert funding_analyzer.stats()["latest_statistics"] == 5
+    assert funding_analyzer.stats()["latest_regime_states"] == 5
+    assert funding_analyzer.stats()["latest_pressure_states"] == 5
+
+    for case in cases:
+        snapshot = funding_analyzer.get_latest_snapshot(
+            case["symbol"],
+            case["exchange"],
+            market_type=case["market_type"],
+            timeframe=case["timeframe"],
+        )
+        assert snapshot is not None
+        assert snapshot.funding_rate == pytest.approx(case["funding_rate"])
 
 
 @pytest.mark.asyncio
-async def test_on_funding_releases_lock_when_detector_raises(
-    fake_event_bus: Any,
-    fake_scheduler: Any,
+async def test_max_tracked_keys_blocks_new_keys_but_does_not_block_existing_key_updates(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
+    fake_event_bus: Any,
 ) -> None:
-    faulty_regime_detector = FaultyRegimeDetector()
-
-    analyzer = _make_analyzer(
-        fake_event_bus=fake_event_bus,
-        fake_scheduler=fake_scheduler,
-        config=FundingAnalyzerConfig(
-            history_size=10,
-            publish_signal_event=False,
-            enable_cleanup_job=False,
-            state_lock_timeout_sec=0.05,
-        ),
-        stub_regime_detector=faulty_regime_detector,
-        stub_pressure_analyzer=stub_pressure_analyzer,
-        stub_flip_detector=stub_flip_detector,
-        stub_extremes_detector=stub_extremes_detector,
-        stub_divergence_detector=stub_divergence_detector,
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        max_tracked_keys=1,
+        signal_cooldown_sec=0.0,
+        min_emit_interval_ms=0,
+        emit_signals=False,
+        enable_parquet_history=False,
+        load_history_from_parquet_on_start=False,
     )
+    analyzer = make_funding_analyzer(config=config)
 
     await _run_funding_update(
         analyzer,
         make_event,
         make_funding_payload,
+        symbol="BTCUSDT",
         funding_rate=0.0001,
+        correlation_id="corr-max-key-1",
+    )
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        symbol="ETHUSDT",
+        funding_rate=0.0002,
+        correlation_id="corr-max-key-2",
+    )
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        symbol="BTCUSDT",
+        funding_rate=0.0003,
+        correlation_id="corr-max-key-3",
     )
 
-    key = analyzer._make_key("BTCUSDT", "binance")
-    lock = analyzer._locks[key]
+    assert analyzer.stats()["keys_tracked"] == 1
+
+    assert analyzer.get_latest_snapshot(
+        "BTCUSDT",
+        "binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    ).funding_rate == pytest.approx(0.0003)
+
+    assert analyzer.get_latest_snapshot(
+        "ETHUSDT",
+        "binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    ) is None
+
+    assert _event_count(fake_event_bus, analyzer.config.analytics_event_name) == 2
+
+
+@pytest.mark.asyncio
+async def test_enrich_snapshot_uses_context_only_when_snapshot_fields_are_missing(
+    funding_analyzer: FundingAnalyzer,
+    make_snapshot: Callable[..., FundingSnapshot],
+) -> None:
+    context = FundingMarketContext(
+        latest_open_interest=2_000_000.0,
+        latest_price=55_000.0,
+    )
+
+    missing = make_snapshot(open_interest=None, mark_price=None)
+    funding_analyzer._enrich_snapshot(missing, context)
+
+    assert missing.open_interest == pytest.approx(2_000_000.0)
+    assert missing.mark_price == pytest.approx(55_000.0)
+
+    explicit = make_snapshot(open_interest=1_000_000.0, mark_price=50_000.0)
+    funding_analyzer._enrich_snapshot(explicit, context)
+
+    assert explicit.open_interest == pytest.approx(1_000_000.0)
+    assert explicit.mark_price == pytest.approx(50_000.0)
+
+
+# =============================================================================
+# Context state and raw-topic guards
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_context_updates_keep_previous_latest_values_per_key(
+    funding_analyzer: FundingAnalyzer,
+    make_event: Callable[..., Any],
+    make_context_payload: Callable[..., dict[str, Any]],
+) -> None:
+    await funding_analyzer.on_open_interest(
+        make_event(make_context_payload(open_interest=1_000_000.0))
+    )
+    await funding_analyzer.on_open_interest(
+        make_event(make_context_payload(open_interest=1_100_000.0))
+    )
+
+    await funding_analyzer.on_candle(
+        make_event(make_context_payload(close=50_000.0, price=1.0))
+    )
+    await funding_analyzer.on_trade(
+        make_event(make_context_payload(price=50_100.0))
+    )
+
+    await funding_analyzer.on_cvd_update(
+        make_event(make_context_payload(cvd=10_000.0))
+    )
+    await funding_analyzer.on_cvd_update(
+        make_event(make_context_payload(cvd=None, cumulative_volume_delta=25_000.0))
+    )
+
+    context = funding_analyzer.get_market_context(
+        "BTCUSDT",
+        "binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    )
+
+    assert context is not None
+    assert context.previous_open_interest == pytest.approx(1_000_000.0)
+    assert context.latest_open_interest == pytest.approx(1_100_000.0)
+    assert context.previous_price == pytest.approx(50_000.0)
+    assert context.latest_price == pytest.approx(50_100.0)
+    assert context.previous_cvd == pytest.approx(10_000.0)
+    assert context.latest_cvd == pytest.approx(25_000.0)
+
+
+@pytest.mark.asyncio
+async def test_context_handlers_ignore_raw_topics_when_legacy_mode_disabled(
+    funding_analyzer: FundingAnalyzer,
+    make_event: Callable[..., Any],
+    make_context_payload: Callable[..., dict[str, Any]],
+) -> None:
+    await funding_analyzer.on_open_interest(
+        make_event(
+            make_context_payload(open_interest=1_000_000.0),
+            topic=funding_analyzer.config.raw_open_interest_event_name,
+        )
+    )
+    await funding_analyzer.on_candle(
+        make_event(
+            make_context_payload(close=50_000.0),
+            topic=funding_analyzer.config.raw_candle_event_name,
+        )
+    )
+    await funding_analyzer.on_trade(
+        make_event(
+            make_context_payload(price=50_100.0),
+            topic=funding_analyzer.config.raw_trade_event_name,
+        )
+    )
+    await funding_analyzer.on_liquidation(
+        make_event(
+            make_context_payload(side="long", notional=100_000.0),
+            topic=funding_analyzer.config.raw_liquidation_event_name,
+        )
+    )
+
+    assert funding_analyzer.stats()["contexts_tracked"] == 0
+
+
+@pytest.mark.asyncio
+async def test_raw_funding_topic_is_blocked_even_with_direct_handler_call_by_default(
+    funding_analyzer: FundingAnalyzer,
+    fake_event_bus: Any,
+    make_event: Callable[..., Any],
+    make_funding_payload: Callable[..., dict[str, Any]],
+) -> None:
+    await _run_funding_update(
+        funding_analyzer,
+        make_event,
+        make_funding_payload,
+        topic=funding_analyzer.config.raw_funding_event_name,
+        funding_rate=0.00035,
+    )
+
+    assert funding_analyzer.stats()["keys_tracked"] == 0
+    assert fake_event_bus.published == []
+
+
+@pytest.mark.asyncio
+async def test_raw_funding_topic_is_allowed_in_legacy_mode(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    fake_event_bus: Any,
+    make_event: Callable[..., Any],
+    make_funding_payload: Callable[..., dict[str, Any]],
+) -> None:
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        allow_legacy_raw_topics=True,
+        min_samples_for_statistics=1,
+        signal_cooldown_sec=0.0,
+        min_emit_interval_ms=0,
+        emit_signals=False,
+        enable_parquet_history=False,
+        load_history_from_parquet_on_start=False,
+    )
+    analyzer = make_funding_analyzer(config=config)
+
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        topic=analyzer.config.raw_funding_event_name,
+        funding_rate=0.00035,
+    )
+
+    assert analyzer.stats()["keys_tracked"] == 1
+    assert analyzer.config.analytics_event_name in _topics(fake_event_bus)
+
+
+@pytest.mark.asyncio
+async def test_malformed_context_payloads_do_not_create_contexts(
+    funding_analyzer: FundingAnalyzer,
+    make_event: Callable[..., Any],
+) -> None:
+    malformed = make_event({})
+
+    await funding_analyzer.on_open_interest(malformed)
+    await funding_analyzer.on_candle(malformed)
+    await funding_analyzer.on_trade(malformed)
+    await funding_analyzer.on_cvd_update(malformed)
+    await funding_analyzer.on_liquidation(malformed)
+
+    assert funding_analyzer.stats()["contexts_tracked"] == 0
+
+
+# =============================================================================
+# Failure / resilience
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_malformed_funding_payload_does_not_mutate_state_or_publish(
+    funding_analyzer: FundingAnalyzer,
+    fake_event_bus: Any,
+    make_event: Callable[..., Any],
+) -> None:
+    malformed_payloads = [
+        [],
+        {},
+        {
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "funding_rate": 0.0001,
+        },
+        {
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "symbol": "BTCUSDT",
+            "funding_rate": "not-a-number",
+        },
+        {
+            "exchange": "binance",
+            "market_type": "usdm_futures",
+            "symbol": "BTCUSDT",
+            "funding_rate": 0.0001,
+            "event_time": object(),
+        },
+    ]
+
+    for payload in malformed_payloads:
+        await funding_analyzer.on_funding(make_event(payload))
+
+    assert funding_analyzer.stats()["keys_tracked"] == 0
+    assert funding_analyzer.stats()["latest_statistics"] == 0
+    assert funding_analyzer.stats()["latest_regime_states"] == 0
+    assert funding_analyzer.stats()["latest_pressure_states"] == 0
+    assert fake_event_bus.published == []
+
+
+@pytest.mark.asyncio
+async def test_detector_failure_releases_lock_and_does_not_publish_events(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    fake_event_bus: Any,
+    make_event: Callable[..., Any],
+    make_funding_payload: Callable[..., dict[str, Any]],
+) -> None:
+    faulty_regime_detector = FaultyDetector(RuntimeError("regime detector exploded"))
+    analyzer = make_funding_analyzer(regime_detector=faulty_regime_detector)
+
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        funding_rate=0.00035,
+    )
+
+    lock = _get_lock_for_default_key(analyzer)
 
     assert lock.locked() is False
-    assert len(faulty_regime_detector.calls) == 1
+    assert faulty_regime_detector.calls
 
-    # Snapshot/history уже були оновлені до помилки detector-а.
-    assert analyzer.stats()["symbols_tracked"] == 1
-
-    # Але downstream latest-state не має кешуватись після failure.
+    # Поточний FundingAnalyzer додає snapshot у history до detector pipeline.
+    # Це не атомарно. Тест робить цей contract явним.
+    assert analyzer.stats()["keys_tracked"] == 1
     assert analyzer.stats()["latest_statistics"] == 0
     assert analyzer.stats()["latest_regime_states"] == 0
     assert analyzer.stats()["latest_pressure_states"] == 0
     assert fake_event_bus.published == []
 
-    await asyncio.wait_for(lock.acquire(), timeout=0.05)
-    lock.release()
-
 
 @pytest.mark.asyncio
-async def test_on_funding_releases_lock_when_event_emit_raises(
-    fake_scheduler: Any,
+async def test_pressure_analyzer_failure_releases_lock_and_keeps_partial_state_explicit(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    fake_event_bus: Any,
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
     stub_regime_detector: Any,
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
 ) -> None:
-    event_bus = FaultyEmitEventBus()
-
-    analyzer = _make_analyzer(
-        fake_event_bus=event_bus,
-        fake_scheduler=fake_scheduler,
-        config=FundingAnalyzerConfig(
-            history_size=10,
-            publish_signal_event=False,
-            enable_cleanup_job=False,
-            state_lock_timeout_sec=0.05,
-        ),
-        stub_regime_detector=stub_regime_detector,
-        stub_pressure_analyzer=stub_pressure_analyzer,
-        stub_flip_detector=stub_flip_detector,
-        stub_extremes_detector=stub_extremes_detector,
-        stub_divergence_detector=stub_divergence_detector,
+    faulty_pressure = FaultyAnalyzeDetector(RuntimeError("pressure analyzer exploded"))
+    analyzer = make_funding_analyzer(
+        regime_detector=stub_regime_detector,
+        pressure_analyzer=faulty_pressure,
     )
 
     await _run_funding_update(
         analyzer,
         make_event,
         make_funding_payload,
-        funding_rate=0.0001,
+        funding_rate=0.00035,
     )
 
-    key = analyzer._make_key("BTCUSDT", "binance")
-    lock = analyzer._locks[key]
+    lock = _get_lock_for_default_key(analyzer)
 
     assert lock.locked() is False
-    assert event_bus.published_attempts
+    assert faulty_pressure.calls
 
-    # State був порахований до publish failure, тому latest caches вже є.
-    assert analyzer.stats()["symbols_tracked"] == 1
+    # Regime detector уже відпрацював локально, але latest maps оновлюються нижче
+    # після всього detector pipeline, тому вони мають залишитись порожніми.
+    assert analyzer.stats()["keys_tracked"] == 1
+    assert analyzer.stats()["latest_statistics"] == 0
+    assert analyzer.stats()["latest_regime_states"] == 0
+    assert analyzer.stats()["latest_pressure_states"] == 0
+    assert fake_event_bus.published == []
+
+
+@pytest.mark.asyncio
+async def test_emit_failure_releases_lock_but_state_is_already_committed(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    failing_event_bus: Any,
+    fake_scheduler: Any,
+    make_event: Callable[..., Any],
+    make_funding_payload: Callable[..., dict[str, Any]],
+) -> None:
+    analyzer = make_funding_analyzer(
+        event_bus=failing_event_bus,
+        scheduler=fake_scheduler,
+    )
+
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        funding_rate=0.00035,
+    )
+
+    lock = _get_lock_for_default_key(analyzer)
+
+    assert lock.locked() is False
+    assert failing_event_bus.emit_attempts
+
+    # Publish failure occurs after detector/state commit.
+    assert analyzer.stats()["keys_tracked"] == 1
     assert analyzer.stats()["latest_statistics"] == 1
     assert analyzer.stats()["latest_regime_states"] == 1
     assert analyzer.stats()["latest_pressure_states"] == 1
 
-    await asyncio.wait_for(lock.acquire(), timeout=0.05)
-    lock.release()
-
 
 @pytest.mark.asyncio
-async def test_on_funding_ignores_parse_error_before_lock_creation_for_invalid_symbol(
+async def test_lock_timeout_skips_processing_without_mutating_state(
     funding_analyzer: FundingAnalyzer,
     fake_event_bus: Any,
-    make_event: Callable[..., Any],
-) -> None:
-    event = make_event(
-        {
-            "exchange": "binance",
-            "funding_rate": 0.0001,
-        },
-        topic=funding_analyzer.config.funding_event_name,
-    )
-
-    await funding_analyzer.on_funding(event)
-
-    assert funding_analyzer.stats()["symbols_tracked"] == 0
-    assert funding_analyzer.stats()["latest_statistics"] == 0
-    assert len(funding_analyzer._locks) == 0
-    assert fake_event_bus.published == []
-
-
-@pytest.mark.asyncio
-async def test_on_funding_invalid_numeric_rate_does_not_pollute_state(
-    funding_analyzer: FundingAnalyzer,
-    fake_event_bus: Any,
-    make_event: Callable[..., Any],
-) -> None:
-    event = make_event(
-        {
-            "symbol": "BTCUSDT",
-            "exchange": "binance",
-            "funding_rate": "invalid-rate",
-        },
-        topic=funding_analyzer.config.funding_event_name,
-    )
-
-    await funding_analyzer.on_funding(event)
-
-    assert funding_analyzer.get_latest_snapshot("BTCUSDT", "binance") is None
-    assert funding_analyzer.get_statistics("BTCUSDT", "binance") is None
-    assert funding_analyzer.stats()["symbols_tracked"] == 0
-    assert fake_event_bus.published == []
-
-
-# ---------------------------------------------------------------------------
-# Concurrent updates
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_concurrent_funding_updates_for_same_symbol_are_serialized_by_lock(
-    fake_event_bus: Any,
-    fake_scheduler: Any,
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
-    stub_regime_detector: Any,
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
 ) -> None:
-    analyzer = _make_analyzer(
-        fake_event_bus=fake_event_bus,
-        fake_scheduler=fake_scheduler,
-        config=FundingAnalyzerConfig(
-            history_size=20,
-            publish_signal_event=False,
-            enable_cleanup_job=False,
-            state_lock_timeout_sec=1.0,
-        ),
-        stub_regime_detector=stub_regime_detector,
-        stub_pressure_analyzer=stub_pressure_analyzer,
-        stub_flip_detector=stub_flip_detector,
-        stub_extremes_detector=stub_extremes_detector,
-        stub_divergence_detector=stub_divergence_detector,
+    key = funding_analyzer._make_key(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
     )
+    lock = funding_analyzer._locks[key]
 
-    rates = [index * 0.00001 for index in range(1, 11)]
+    await lock.acquire()
+
+    try:
+        await _run_funding_update(
+            funding_analyzer,
+            make_event,
+            make_funding_payload,
+            funding_rate=0.00035,
+        )
+    finally:
+        lock.release()
+
+    assert funding_analyzer.stats()["keys_tracked"] == 0
+    assert funding_analyzer.stats()["latest_statistics"] == 0
+    assert fake_event_bus.published == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_updates_do_not_corrupt_bounded_history(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    make_event: Callable[..., Any],
+    make_funding_payload: Callable[..., dict[str, Any]],
+) -> None:
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        max_history_per_key=10,
+        statistics_window_size=10,
+        signal_cooldown_sec=0.0,
+        min_emit_interval_ms=0,
+        emit_signals=False,
+        enable_parquet_history=False,
+        load_history_from_parquet_on_start=False,
+    )
+    analyzer = make_funding_analyzer(config=config)
+
+    rates = [0.00001 * index for index in range(1, 21)]
 
     await asyncio.gather(
         *[
@@ -1000,227 +985,346 @@ async def test_concurrent_funding_updates_for_same_symbol_are_serialized_by_lock
                 make_event,
                 make_funding_payload,
                 funding_rate=rate,
+                event_time=datetime(2026, 1, 1, 12, index, tzinfo=timezone.utc),
                 correlation_id=f"corr-concurrent-{index}",
             )
             for index, rate in enumerate(rates)
         ]
     )
 
-    key = analyzer._make_key("BTCUSDT", "binance")
-    history = analyzer._history[key]
-    statistics = analyzer.get_statistics("BTCUSDT", "binance")
+    key = analyzer._make_key(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    )
 
-    assert len(history) == len(rates)
-    assert sorted(snapshot.funding_rate for snapshot in history) == pytest.approx(sorted(rates))
-
-    assert statistics is not None
-    assert statistics.sample_size == len(rates)
-
-    assert len(stub_regime_detector.calls) == len(rates)
-    assert len(stub_pressure_analyzer.calls) == len(rates)
-    assert len(stub_flip_detector.calls) == len(rates)
-    assert len(stub_extremes_detector.calls) == len(rates)
-    assert len(stub_divergence_detector.calls) == len(rates)
-
+    assert len(analyzer._history[key]) == 10
+    assert analyzer.stats()["keys_tracked"] == 1
+    assert analyzer.stats()["latest_statistics"] == 1
     assert analyzer._locks[key].locked() is False
 
 
+# =============================================================================
+# Cleanup
+# =============================================================================
+
 @pytest.mark.asyncio
-async def test_concurrent_funding_updates_for_different_symbols_keep_separate_locks_and_state(
+async def test_cleanup_removes_stale_context_without_history_and_removes_lock(
+    funding_analyzer: FundingAnalyzer,
+    make_key: Callable[..., tuple[str, str, str, str]],
+    now_utc: datetime,
+) -> None:
+    key = make_key(symbol="BTCUSDT")
+    stale_time = now_utc - timedelta(seconds=funding_analyzer.config.stale_state_ttl_sec + 10)
+
+    funding_analyzer._market_context[key] = FundingMarketContext(
+        latest_price=50_000.0,
+        updated_at=stale_time,
+    )
+    _ = funding_analyzer._locks[key]
+
+    assert key in funding_analyzer._market_context
+    assert key in funding_analyzer._locks
+
+    await funding_analyzer.cleanup_stale_state()
+
+    assert key not in funding_analyzer._market_context
+    assert key not in funding_analyzer._locks
+
+
+@pytest.mark.asyncio
+async def test_cleanup_does_not_remove_context_when_history_exists(
+    funding_analyzer: FundingAnalyzer,
+    make_key: Callable[..., tuple[str, str, str, str]],
+    make_snapshot: Callable[..., FundingSnapshot],
+    now_utc: datetime,
+) -> None:
+    key = make_key(symbol="BTCUSDT")
+    stale_time = now_utc - timedelta(seconds=funding_analyzer.config.stale_state_ttl_sec + 10)
+
+    funding_analyzer._market_context[key] = FundingMarketContext(
+        latest_price=50_000.0,
+        updated_at=stale_time,
+    )
+    funding_analyzer._history[key].append(make_snapshot())
+
+    await funding_analyzer.cleanup_stale_state()
+
+    assert key in funding_analyzer._market_context
+    assert key in funding_analyzer._history
+
+
+@pytest.mark.asyncio
+async def test_cleanup_clears_stale_liquidations_but_keeps_context(
+    funding_analyzer: FundingAnalyzer,
+    make_key: Callable[..., tuple[str, str, str, str]],
+    now_utc: datetime,
+) -> None:
+    key = make_key(symbol="BTCUSDT")
+    stale_time = now_utc - timedelta(seconds=funding_analyzer.config.stale_state_ttl_sec + 10)
+
+    funding_analyzer._market_context[key] = FundingMarketContext(
+        latest_price=50_000.0,
+        updated_at=now_utc,
+        long_liquidations=100_000.0,
+        short_liquidations=50_000.0,
+        liquidation_updated_at=stale_time,
+    )
+
+    await funding_analyzer.cleanup_stale_state()
+
+    context = funding_analyzer._market_context[key]
+    assert context.latest_price == pytest.approx(50_000.0)
+    assert context.long_liquidations is None
+    assert context.short_liquidations is None
+    assert context.liquidation_updated_at is None
+
+
+# =============================================================================
+# Emit cooldown and signal state
+# =============================================================================
+
+def test_should_skip_emit_is_scoped_by_event_name_and_full_key(
+    funding_analyzer: FundingAnalyzer,
+) -> None:
+    key_a = funding_analyzer._make_key(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+    )
+    key_b = funding_analyzer._make_key(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="coinm_futures",
+        timeframe="1h",
+    )
+
+    assert funding_analyzer._should_skip_emit(
+        event_name=funding_analyzer.config.signal_event_name,
+        key=key_a,
+    ) is False
+    assert funding_analyzer._should_skip_emit(
+        event_name=funding_analyzer.config.signal_event_name,
+        key=key_a,
+    ) is True
+
+    assert funding_analyzer._should_skip_emit(
+        event_name=funding_analyzer.config.regime_event_name,
+        key=key_a,
+    ) is False
+
+    assert funding_analyzer._should_skip_emit(
+        event_name=funding_analyzer.config.signal_event_name,
+        key=key_b,
+    ) is False
+
+
+# =============================================================================
+# Parquet resilience
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_parquet_buffer_uses_configured_batch_size_and_dataset_name(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
     fake_event_bus: Any,
     fake_scheduler: Any,
     make_event: Callable[..., Any],
     make_funding_payload: Callable[..., dict[str, Any]],
-    stub_regime_detector: Any,
-    stub_pressure_analyzer: Any,
-    stub_flip_detector: Any,
-    stub_extremes_detector: Any,
-    stub_divergence_detector: Any,
 ) -> None:
-    analyzer = _make_analyzer(
-        fake_event_bus=fake_event_bus,
-        fake_scheduler=fake_scheduler,
-        config=FundingAnalyzerConfig(
-            history_size=20,
-            publish_signal_event=False,
-            enable_cleanup_job=False,
-            state_lock_timeout_sec=1.0,
-        ),
-        stub_regime_detector=stub_regime_detector,
-        stub_pressure_analyzer=stub_pressure_analyzer,
-        stub_flip_detector=stub_flip_detector,
-        stub_extremes_detector=stub_extremes_detector,
-        stub_divergence_detector=stub_divergence_detector,
+    storage = RecordingParquetStorage()
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        enable_parquet_history=True,
+        load_history_from_parquet_on_start=False,
+        parquet_dataset_name="custom_funding_dataset",
+        parquet_flush_batch_size=2,
+        signal_cooldown_sec=0.0,
+        min_emit_interval_ms=0,
+        emit_signals=False,
     )
-
-    await asyncio.gather(
-        _run_funding_update(
-            analyzer,
-            make_event,
-            make_funding_payload,
-            symbol="BTCUSDT",
-            exchange="binance",
-            funding_rate=0.0001,
-            correlation_id="corr-btc-binance",
-        ),
-        _run_funding_update(
-            analyzer,
-            make_event,
-            make_funding_payload,
-            symbol="ETHUSDT",
-            exchange="binance",
-            funding_rate=0.0002,
-            correlation_id="corr-eth-binance",
-        ),
-        _run_funding_update(
-            analyzer,
-            make_event,
-            make_funding_payload,
-            symbol="BTCUSDT",
-            exchange="bybit",
-            funding_rate=-0.0003,
-            correlation_id="corr-btc-bybit",
-        ),
+    analyzer = make_funding_analyzer(
+        event_bus=fake_event_bus,
+        scheduler=fake_scheduler,
+        config=config,
+        parquet_storage=storage,
     )
-
-    btc_binance_key = analyzer._make_key("BTCUSDT", "binance")
-    eth_binance_key = analyzer._make_key("ETHUSDT", "binance")
-    btc_bybit_key = analyzer._make_key("BTCUSDT", "bybit")
-
-    assert set(analyzer._history.keys()) == {
-        btc_binance_key,
-        eth_binance_key,
-        btc_bybit_key,
-    }
-
-    assert len(analyzer._history[btc_binance_key]) == 1
-    assert len(analyzer._history[eth_binance_key]) == 1
-    assert len(analyzer._history[btc_bybit_key]) == 1
-
-    assert analyzer._history[btc_binance_key][-1].funding_rate == pytest.approx(0.0001)
-    assert analyzer._history[eth_binance_key][-1].funding_rate == pytest.approx(0.0002)
-    assert analyzer._history[btc_bybit_key][-1].funding_rate == pytest.approx(-0.0003)
-
-    assert analyzer.stats()["symbols_tracked"] == 3
-    assert analyzer.stats()["latest_statistics"] == 3
-    assert analyzer.stats()["latest_regime_states"] == 3
-    assert analyzer.stats()["latest_pressure_states"] == 3
-
-    assert analyzer._locks[btc_binance_key].locked() is False
-    assert analyzer._locks[eth_binance_key].locked() is False
-    assert analyzer._locks[btc_bybit_key].locked() is False
-
-
-# ---------------------------------------------------------------------------
-# End-to-end malformed/context resilience
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_malformed_context_events_do_not_block_later_valid_funding_update(
-    funding_analyzer: FundingAnalyzer,
-    fake_event_bus: Any,
-    make_event: Callable[..., Any],
-    make_funding_payload: Callable[..., dict[str, Any]],
-    stub_pressure_analyzer: Any,
-) -> None:
-    _make_pressure_stub_signal_compatible(stub_pressure_analyzer)
-
-    malformed_event = make_event({}, topic="malformed")
-
-    await funding_analyzer.on_open_interest(malformed_event)
-    await funding_analyzer.on_candle(malformed_event)
-    await funding_analyzer.on_trade(malformed_event)
-    await funding_analyzer.on_cvd_update(malformed_event)
-    await funding_analyzer.on_liquidation(malformed_event)
-
-    assert funding_analyzer.stats()["contexts_tracked"] == 0
 
     await _run_funding_update(
-        funding_analyzer,
+        analyzer,
         make_event,
         make_funding_payload,
         funding_rate=0.0001,
+        correlation_id="corr-parquet-1",
+    )
+    assert storage.append_calls == []
+    assert analyzer.stats()["parquet_buffer_size"] == 1
+
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        funding_rate=0.0002,
+        correlation_id="corr-parquet-2",
     )
 
-    assert funding_analyzer.get_latest_snapshot("BTCUSDT", "binance") is not None
-    assert funding_analyzer.get_statistics("BTCUSDT", "binance") is not None
-    assert funding_analyzer.config.analytics_updated_event_name in _published_topics(fake_event_bus)
+    assert len(storage.append_calls) == 1
+    assert storage.append_calls[0]["dataset"] == "custom_funding_dataset"
+    assert len(storage.append_calls[0]["records"]) == 2
+    assert analyzer.stats()["parquet_buffer_size"] == 0
 
 
 @pytest.mark.asyncio
-async def test_invalid_context_values_are_ignored_but_valid_values_later_work(
-    funding_analyzer: FundingAnalyzer,
+async def test_parquet_flush_failure_restores_buffer(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    fake_event_bus: Any,
+    fake_scheduler: Any,
     make_event: Callable[..., Any],
-    make_context_payload: Callable[..., dict[str, Any]],
+    make_funding_payload: Callable[..., dict[str, Any]],
 ) -> None:
-    await funding_analyzer.on_open_interest(
-        make_event(
-            make_context_payload(open_interest="bad"),
-            topic=funding_analyzer.config.open_interest_event_name,
-        )
+    storage = ExplodingParquetStorage()
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        enable_parquet_history=True,
+        load_history_from_parquet_on_start=False,
+        parquet_dataset_name="custom_funding_dataset",
+        parquet_flush_batch_size=1,
+        signal_cooldown_sec=0.0,
+        min_emit_interval_ms=0,
+        emit_signals=False,
     )
-    await funding_analyzer.on_candle(
-        make_event(
-            make_context_payload(close="bad", price="also-bad"),
-            topic=funding_analyzer.config.candle_event_name,
-        )
-    )
-    await funding_analyzer.on_trade(
-        make_event(
-            make_context_payload(price="bad"),
-            topic=funding_analyzer.config.trade_event_name,
-        )
-    )
-    await funding_analyzer.on_cvd_update(
-        make_event(
-            make_context_payload(cvd="bad", cumulative_volume_delta="also-bad"),
-            topic=funding_analyzer.config.cvd_event_name,
-        )
+    analyzer = make_funding_analyzer(
+        event_bus=fake_event_bus,
+        scheduler=fake_scheduler,
+        config=config,
+        parquet_storage=storage,
     )
 
-    assert funding_analyzer.stats()["contexts_tracked"] == 0
-
-    await funding_analyzer.on_open_interest(
-        make_event(
-            make_context_payload(open_interest="1000000"),
-            topic=funding_analyzer.config.open_interest_event_name,
-        )
-    )
-    await funding_analyzer.on_candle(
-        make_event(
-            make_context_payload(close="50000"),
-            topic=funding_analyzer.config.candle_event_name,
-        )
-    )
-    await funding_analyzer.on_cvd_update(
-        make_event(
-            make_context_payload(cvd="12345"),
-            topic=funding_analyzer.config.cvd_event_name,
-        )
+    await _run_funding_update(
+        analyzer,
+        make_event,
+        make_funding_payload,
+        funding_rate=0.0001,
+        correlation_id="corr-parquet-fail",
     )
 
-    context = funding_analyzer.get_market_context("BTCUSDT", "binance")
-
-    assert context is not None
-    assert context.latest_open_interest == pytest.approx(1_000_000.0)
-    assert context.latest_price == pytest.approx(50_000.0)
-    assert context.latest_cvd == pytest.approx(12_345.0)
+    assert len(storage.append_calls) == 1
+    assert analyzer.stats()["parquet_buffer_size"] == 1
 
 
-def test_stats_returns_stable_shape(
+def test_parquet_root_uses_config_not_hardcoded_path(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+) -> None:
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        enable_parquet_history=True,
+        parquet_base_path="/tmp/custom-parquet-root",
+        parquet_dataset_name="custom_dataset_name",
+        load_history_from_parquet_on_start=False,
+    )
+    analyzer = make_funding_analyzer(config=config)
+
+    assert str(analyzer._parquet_root()) == "/tmp/custom-parquet-root/custom_dataset_name"
+
+
+# =============================================================================
+# History API
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_get_history_returns_recent_in_memory_snapshots_in_order(
+    make_funding_analyzer: Callable[..., FundingAnalyzer],
+    make_event: Callable[..., Any],
+    make_funding_payload: Callable[..., dict[str, Any]],
+) -> None:
+    config = FundingAnalyzerConfig(
+        default_market_type="usdm_futures",
+        min_samples_for_statistics=1,
+        max_history_per_key=10,
+        emit_signals=False,
+        enable_parquet_history=False,
+        load_history_from_parquet_on_start=False,
+    )
+    analyzer = make_funding_analyzer(config=config)
+
+    rates = [0.0001, 0.0002, 0.0003, 0.0004]
+
+    for index, rate in enumerate(rates):
+        await _run_funding_update(
+            analyzer,
+            make_event,
+            make_funding_payload,
+            funding_rate=rate,
+            event_time=datetime(2026, 1, 1, 12, index, tzinfo=timezone.utc),
+        )
+
+    history = await analyzer.get_history(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+        limit=2,
+        include_parquet=False,
+    )
+
+    assert [item.funding_rate for item in history] == pytest.approx([0.0003, 0.0004])
+
+
+@pytest.mark.asyncio
+async def test_get_history_with_non_positive_limit_returns_empty(
     funding_analyzer: FundingAnalyzer,
 ) -> None:
-    assert funding_analyzer.stats() == {
-        "registered": False,
-        "subscriptions": 0,
-        "cleanup_job_id": None,
-        "symbols_tracked": 0,
-        "contexts_tracked": 0,
-        "latest_statistics": 0,
-        "latest_regime_states": 0,
-        "latest_pressure_states": 0,
-        "latest_flip_events": 0,
-        "latest_extreme_events": 0,
-        "latest_divergence_events": 0,
-    }
+    assert await funding_analyzer.get_history(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+        limit=0,
+    ) == []
+
+    assert await funding_analyzer.get_history(
+        symbol="BTCUSDT",
+        exchange="binance",
+        market_type="usdm_futures",
+        timeframe="1h",
+        limit=-10,
+    ) == []
+
+
+# =============================================================================
+# Model scope copy
+# =============================================================================
+
+def test_copy_scope_forces_detector_result_scope_to_snapshot_scope(
+    funding_analyzer: FundingAnalyzer,
+    make_snapshot: Callable[..., FundingSnapshot],
+    make_regime_state: Callable[..., Any],
+) -> None:
+    snapshot = make_snapshot(
+        exchange=FundingDataSource.BINANCE,
+        market_type="usdm_futures",
+        symbol="BTCUSDT",
+        timeframe=FundingTimeframe.H1,
+        exchange_symbol="BTC/USDT:USDT",
+    )
+    regime_state = make_regime_state(
+        exchange=FundingDataSource.BYBIT,
+        market_type="linear",
+        symbol="ETHUSDT",
+        timeframe=FundingTimeframe.M5,
+        exchange_symbol="ETHUSDT",
+        metadata={},
+    )
+
+    result = funding_analyzer._copy_scope(regime_state, snapshot)
+
+    assert result.exchange == snapshot.exchange
+    assert result.market_type == snapshot.market_type
+    assert result.symbol == snapshot.symbol
+    assert result.timeframe == snapshot.timeframe
+    assert result.exchange_symbol == snapshot.exchange_symbol
+    assert result.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert result.metadata["exchange_symbol"] == snapshot.exchange_symbol

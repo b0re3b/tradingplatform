@@ -239,9 +239,11 @@ class FundingAnalyzer:
         self._registered = True
 
         self.logger.info(
-            "FundingAnalyzer registered | subscriptions=%s cleanup_job=%s parquet_flush_job=%s",
+            "FundingAnalyzer registered | subscriptions=%s cleanup_job=%s "
+            "heartbeat_job=%s parquet_flush_job=%s",
             len(self._subscriptions),
             self._cleanup_job_id,
+            self._heartbeat_job_id,
             self._parquet_flush_job_id,
             extra={
                 "production_input_topics": list(self.config.production_input_topics),
@@ -360,14 +362,26 @@ class FundingAnalyzer:
 
     def _subscribe_legacy_raw_topics(self) -> None:
         raw_subscriptions = (
-            (self.config.raw_funding_event_name, self.on_funding, "funding_analyzer.on_raw_funding"),
+            (
+                self.config.raw_funding_event_name,
+                self.on_funding,
+                "funding_analyzer.on_raw_funding",
+            ),
             (
                 self.config.raw_open_interest_event_name,
                 self.on_open_interest,
                 "funding_analyzer.on_raw_open_interest",
             ),
-            (self.config.raw_candle_event_name, self.on_candle, "funding_analyzer.on_raw_candle"),
-            (self.config.raw_trade_event_name, self.on_trade, "funding_analyzer.on_raw_trade"),
+            (
+                self.config.raw_candle_event_name,
+                self.on_candle,
+                "funding_analyzer.on_raw_candle",
+            ),
+            (
+                self.config.raw_trade_event_name,
+                self.on_trade,
+                "funding_analyzer.on_raw_trade",
+            ),
             (
                 self.config.raw_liquidation_event_name,
                 self.on_liquidation,
@@ -509,6 +523,13 @@ class FundingAnalyzer:
     # ------------------------------------------------------------------
 
     async def on_funding(self, event: Event) -> None:
+        if self._is_legacy_raw_event_blocked(event):
+            self.logger.warning(
+                "Funding raw topic ignored because legacy raw topics are disabled | topic=%s",
+                getattr(event, "topic", None),
+            )
+            return
+
         try:
             payload = self._extract_payload(event)
             snapshot = self._parse_funding_snapshot(payload)
@@ -525,6 +546,7 @@ class FundingAnalyzer:
             self.logger.warning(
                 "FundingAnalyzer max_tracked_keys reached; funding event skipped | key=%s",
                 key,
+                extra={"scope": funding_key_to_dict(key)},
             )
             return
 
@@ -649,7 +671,10 @@ class FundingAnalyzer:
                 divergence_event=divergence_event,
                 correlation_id=correlation_id,
             )
-
+            await self._publish_snapshot_event(
+                snapshot=snapshot,
+                correlation_id=correlation_id,
+            )
             await self._publish_regime_event(regime_state, correlation_id)
             await self._publish_pressure_event(pressure_state, correlation_id)
             await self._publish_flip_event(flip_event, correlation_id)
@@ -672,12 +697,20 @@ class FundingAnalyzer:
                 snapshot.exchange.value,
                 snapshot.market_type,
                 snapshot.timeframe.value,
+                extra={"scope": funding_key_to_dict(snapshot.key)},
             )
         finally:
             if lock_acquired:
                 lock.release()
 
     async def on_open_interest(self, event: Event) -> None:
+        if self._is_legacy_raw_event_blocked(event):
+            self.logger.warning(
+                "Open interest raw topic ignored because legacy raw topics are disabled | topic=%s",
+                getattr(event, "topic", None),
+            )
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._key_from_payload(payload)
@@ -685,9 +718,12 @@ class FundingAnalyzer:
                 return
 
             new_oi = self._to_optional_float(
-                payload.get("open_interest")
-                or payload.get("open_interest_value")
-                or payload.get("value")
+                self._first_present(
+                    payload,
+                    "open_interest",
+                    "open_interest_value",
+                    "value",
+                )
             )
             if new_oi is None:
                 return
@@ -700,15 +736,22 @@ class FundingAnalyzer:
             self.logger.exception("Failed to process open interest event")
 
     async def on_candle(self, event: Event) -> None:
+        if self._is_legacy_raw_event_blocked(event):
+            self.logger.warning(
+                "Candle raw topic ignored because legacy raw topics are disabled | topic=%s",
+                getattr(event, "topic", None),
+            )
+            return
+
         try:
             payload = self._extract_payload(event)
             key = self._key_from_payload(payload)
             if key is None or not self.config.should_process_key(key):
                 return
 
-            price = self._to_optional_float(payload.get("close"))
-            if price is None:
-                price = self._to_optional_float(payload.get("price"))
+            price = self._to_optional_float(
+                self._first_present(payload, "close", "price")
+            )
             if price is None:
                 return
 
@@ -720,6 +763,13 @@ class FundingAnalyzer:
             self.logger.exception("Failed to process candle event")
 
     async def on_trade(self, event: Event) -> None:
+        if self._is_legacy_raw_event_blocked(event):
+            self.logger.warning(
+                "Trade raw topic ignored because legacy raw topics are disabled | topic=%s",
+                getattr(event, "topic", None),
+            )
+            return
+
         try:
             payload = self._extract_payload(event)
             trade_payload = self._extract_nested_payload(payload, "trade", "trades")
@@ -729,8 +779,7 @@ class FundingAnalyzer:
                 return
 
             price = self._to_optional_float(
-                trade_payload.get("price")
-                or trade_payload.get("p")
+                self._first_present(trade_payload, "price", "p")
             )
             if price is None:
                 return
@@ -745,15 +794,23 @@ class FundingAnalyzer:
     async def on_cvd_update(self, event: Event) -> None:
         try:
             payload = self._extract_payload(event)
-            inner_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+            inner_payload = (
+                payload.get("payload")
+                if isinstance(payload.get("payload"), dict)
+                else payload
+            )
 
             key = self._key_from_payload(inner_payload, fallback_payload=payload)
             if key is None or not self.config.should_process_key(key):
                 return
 
-            cvd_value = self._to_optional_float(inner_payload.get("cvd"))
-            if cvd_value is None:
-                cvd_value = self._to_optional_float(inner_payload.get("cumulative_volume_delta"))
+            cvd_value = self._to_optional_float(
+                self._first_present(
+                    inner_payload,
+                    "cvd",
+                    "cumulative_volume_delta",
+                )
+            )
             if cvd_value is None:
                 return
 
@@ -765,27 +822,48 @@ class FundingAnalyzer:
             self.logger.exception("Failed to process CVD update event")
 
     async def on_liquidation(self, event: Event) -> None:
+        if self._is_legacy_raw_event_blocked(event):
+            self.logger.warning(
+                "Liquidation raw topic ignored because legacy raw topics are disabled | topic=%s",
+                getattr(event, "topic", None),
+            )
+            return
+
         try:
             payload = self._extract_payload(event)
-            liquidation_payload = self._extract_nested_payload(payload, "liquidation", "liquidations")
+            liquidation_payload = self._extract_nested_payload(
+                payload,
+                "liquidation",
+                "liquidations",
+            )
 
             key = self._key_from_payload(liquidation_payload, fallback_payload=payload)
             if key is None or not self.config.should_process_key(key):
                 return
 
             side = str(
-                liquidation_payload.get("side")
-                or liquidation_payload.get("position_side")
+                self._first_present(
+                    liquidation_payload,
+                    "side",
+                    "position_side",
+                )
                 or ""
             ).lower().strip()
 
             quantity = self._to_optional_float(
-                liquidation_payload.get("qty")
-                or liquidation_payload.get("quantity")
-                or liquidation_payload.get("size")
+                self._first_present(
+                    liquidation_payload,
+                    "qty",
+                    "quantity",
+                    "size",
+                )
             )
-            price = self._to_optional_float(liquidation_payload.get("price"))
-            notional = self._to_optional_float(liquidation_payload.get("notional"))
+            price = self._to_optional_float(
+                self._first_present(liquidation_payload, "price")
+            )
+            notional = self._to_optional_float(
+                self._first_present(liquidation_payload, "notional")
+            )
 
             liquidation_value = notional
             if liquidation_value is None and quantity is not None and price is not None:
@@ -801,13 +879,20 @@ class FundingAnalyzer:
 
             if side not in {"long", "short", "buy", "sell"}:
                 long_liq = self._to_optional_float(
-                    liquidation_payload.get("long_liquidations")
-                    or liquidation_payload.get("long_liquidation_notional")
+                    self._first_present(
+                        liquidation_payload,
+                        "long_liquidations",
+                        "long_liquidation_notional",
+                    )
                 )
                 short_liq = self._to_optional_float(
-                    liquidation_payload.get("short_liquidations")
-                    or liquidation_payload.get("short_liquidation_notional")
+                    self._first_present(
+                        liquidation_payload,
+                        "short_liquidations",
+                        "short_liquidation_notional",
+                    )
                 )
+
                 if long_liq is not None:
                     context.long_liquidations = long_liq
                 if short_liq is not None:
@@ -831,7 +916,10 @@ class FundingAnalyzer:
         if not history:
             raise ValueError("history must not be empty")
 
-        rates = [item.funding_rate for item in history]
+        window_size = max(1, int(self.config.statistics_window_size))
+        window = list(history)[-window_size:]
+
+        rates = [item.funding_rate for item in window]
         current_rate = rates[-1]
         mean_rate = sum(rates) / len(rates)
         median_rate = median(rates)
@@ -860,8 +948,8 @@ class FundingAnalyzer:
             zscore=zscore,
             percentile=percentile,
             sample_size=len(rates),
-            window_start=history[0].event_time,
-            window_end=history[-1].event_time,
+            window_start=window[0].event_time,
+            window_end=window[-1].event_time,
         )
 
     def _enrich_snapshot(
@@ -877,15 +965,18 @@ class FundingAnalyzer:
     @staticmethod
     def _copy_scope(model: Any, snapshot: FundingSnapshot) -> Any:
         """
-        Backward-compatible scope propagation для detector-ів, які ще можуть
-        створювати result-моделі без market_type/exchange_symbol.
+        Force detector result scope to match the canonical FundingSnapshot scope.
+
+        Detector-и можуть бути pure-компонентами й іноді повертати модель зі
+        старим або неповним scope. FundingAnalyzer є orchestrator-ом, тому саме
+        він нормалізує final analytics model перед cache/publish.
         """
         for attr, value in (
-            ("exchange", snapshot.exchange),
-            ("market_type", snapshot.market_type),
-            ("symbol", snapshot.symbol),
-            ("timeframe", snapshot.timeframe),
-            ("exchange_symbol", snapshot.exchange_symbol),
+                ("exchange", snapshot.exchange),
+                ("market_type", snapshot.market_type),
+                ("symbol", snapshot.symbol),
+                ("timeframe", snapshot.timeframe),
+                ("exchange_symbol", snapshot.exchange_symbol),
         ):
             if hasattr(model, attr):
                 try:
@@ -895,8 +986,8 @@ class FundingAnalyzer:
 
         metadata = getattr(model, "metadata", None)
         if isinstance(metadata, dict):
-            metadata.setdefault("scope", funding_key_to_dict(snapshot.key))
-            metadata.setdefault("exchange_symbol", snapshot.exchange_symbol)
+            metadata["scope"] = funding_key_to_dict(snapshot.key)
+            metadata["exchange_symbol"] = snapshot.exchange_symbol
 
         return model
 
@@ -905,16 +996,16 @@ class FundingAnalyzer:
     # ------------------------------------------------------------------
 
     async def _publish_updated_event(
-        self,
-        *,
-        snapshot: FundingSnapshot,
-        statistics: FundingStatistics,
-        regime_state: FundingRegimeState,
-        pressure_state: FundingPressureState,
-        flip_event: FundingFlipEvent | None,
-        extreme_event: FundingExtremeEvent | None,
-        divergence_event: FundingDivergenceEvent | None,
-        correlation_id: str | None,
+            self,
+            *,
+            snapshot: FundingSnapshot,
+            statistics: FundingStatistics,
+            regime_state: FundingRegimeState,
+            pressure_state: FundingPressureState,
+            flip_event: FundingFlipEvent | None,
+            extreme_event: FundingExtremeEvent | None,
+            divergence_event: FundingDivergenceEvent | None,
+            correlation_id: str | None,
     ) -> None:
         if not self.config.emit_analytics_events:
             return
@@ -927,6 +1018,12 @@ class FundingAnalyzer:
             timeframe=snapshot.timeframe,
             exchange_symbol=snapshot.exchange_symbol,
             payload={
+                "symbol": snapshot.symbol,
+                "exchange": snapshot.exchange.value,
+                "market_type": snapshot.market_type,
+                "timeframe": snapshot.timeframe.value,
+                "exchange_symbol": snapshot.exchange_symbol,
+                "scope": funding_key_to_dict(snapshot.key),
                 "snapshot": snapshot.to_dict(),
                 "statistics": statistics.to_dict(),
                 "regime_state": regime_state.to_dict(),
@@ -938,8 +1035,43 @@ class FundingAnalyzer:
             event_time=snapshot.event_time,
             source=self.SOURCE,
         )
+
         await self._emit_analytics_event(
             topic=self.config.analytics_event_name,
+            payload=event.to_dict(),
+            correlation_id=correlation_id,
+            key=snapshot.key,
+        )
+
+    async def _publish_snapshot_event(
+        self,
+        *,
+        snapshot: FundingSnapshot,
+        correlation_id: str | None,
+    ) -> None:
+        """
+        Окремий analytics.funding.snapshot event.
+
+        analytics.funding.updated є aggregate event, але config має окремий
+        snapshot_event_name + emit_snapshots, тому snapshot має виходити окремо.
+        """
+        if not self.config.emit_snapshots:
+            return
+
+        event = FundingAnalyticsEvent(
+            event_type=FundingEventType.SNAPSHOT,
+            symbol=snapshot.symbol,
+            exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
+            timeframe=snapshot.timeframe,
+            exchange_symbol=snapshot.exchange_symbol,
+            payload=model_to_payload(snapshot),
+            event_time=snapshot.event_time,
+            source=self.SOURCE,
+        )
+
+        await self._emit_analytics_event(
+            topic=self.config.snapshot_event_name,
             payload=event.to_dict(),
             correlation_id=correlation_id,
             key=snapshot.key,
@@ -1157,7 +1289,11 @@ class FundingAnalyzer:
         signals: list[FundingSignal] = []
 
         if self.config.signal_on_regime_change and regime_state.changed:
-            previous_regime = regime_state.previous_regime.value if regime_state.previous_regime else "unknown"
+            previous_regime = (
+                regime_state.previous_regime.value
+                if regime_state.previous_regime
+                else "unknown"
+            )
             signals.append(
                 FundingSignal(
                     symbol=snapshot.symbol,
@@ -1176,15 +1312,23 @@ class FundingAnalyzer:
                     ),
                     supporting_factors=[
                         f"funding_rate={snapshot.funding_rate:.8f}",
-                        f"percentile={regime_state.percentile:.2f}"
-                        if regime_state.percentile is not None
-                        else "percentile=None",
-                        f"zscore={regime_state.zscore:.4f}"
-                        if regime_state.zscore is not None
-                        else "zscore=None",
+                        (
+                            f"percentile={regime_state.percentile:.2f}"
+                            if regime_state.percentile is not None
+                            else "percentile=None"
+                        ),
+                        (
+                            f"zscore={regime_state.zscore:.4f}"
+                            if regime_state.zscore is not None
+                            else "zscore=None"
+                        ),
                     ],
                     tags=["funding", "regime"],
                     event_time=snapshot.event_time,
+                    metadata=self._merge_signal_metadata(
+                        origin="regime",
+                        snapshot=snapshot,
+                    ),
                 )
             )
 
@@ -1194,6 +1338,7 @@ class FundingAnalyzer:
                 if self.pressure_analyzer.is_squeeze_risk(pressure_state)
                 else FundingSignalType.CROWDING_WARNING
             )
+
             signals.append(
                 FundingSignal(
                     symbol=snapshot.symbol,
@@ -1208,21 +1353,69 @@ class FundingAnalyzer:
                     confidence=max(
                         pressure_state.squeeze_probability or 0.0,
                         pressure_state.mean_reversion_probability or 0.0,
+                        pressure_state.pressure_score,
                     ),
                     description=self.pressure_analyzer.build_summary(pressure_state),
                     supporting_factors=[
                         f"pressure_score={pressure_state.pressure_score:.4f}",
-                        f"squeeze_probability={pressure_state.squeeze_probability:.4f}"
-                        if pressure_state.squeeze_probability is not None
-                        else "squeeze_probability=None",
-                        f"mean_reversion_probability={pressure_state.mean_reversion_probability:.4f}"
-                        if pressure_state.mean_reversion_probability is not None
-                        else "mean_reversion_probability=None",
+                        (
+                            f"squeeze_probability={pressure_state.squeeze_probability:.4f}"
+                            if pressure_state.squeeze_probability is not None
+                            else "squeeze_probability=None"
+                        ),
+                        (
+                            f"mean_reversion_probability={pressure_state.mean_reversion_probability:.4f}"
+                            if pressure_state.mean_reversion_probability is not None
+                            else "mean_reversion_probability=None"
+                        ),
                     ],
                     tags=["funding", "pressure", pressure_state.level.value],
                     event_time=snapshot.event_time,
+                    metadata=self._merge_signal_metadata(
+                        origin="pressure",
+                        snapshot=snapshot,
+                        extra={
+                            "pressure_level": pressure_state.level.value,
+                            "pressure_direction": pressure_state.direction.value,
+                        },
+                    ),
                 )
             )
+
+            if (
+                pressure_state.mean_reversion_probability is not None
+                and pressure_state.mean_reversion_probability >= self.config.signal_min_confidence
+            ):
+                signals.append(
+                    FundingSignal(
+                        symbol=snapshot.symbol,
+                        exchange=snapshot.exchange,
+                        market_type=snapshot.market_type,
+                        timeframe=snapshot.timeframe,
+                        exchange_symbol=snapshot.exchange_symbol,
+                        signal_type=FundingSignalType.REVERSION_SETUP,
+                        bias=pressure_state.bias,
+                        regime=regime_state.regime,
+                        score=-self._pressure_signal_score(pressure_state),
+                        confidence=pressure_state.mean_reversion_probability,
+                        description=(
+                            "Funding mean-reversion setup detected from pressure state | "
+                            f"probability={pressure_state.mean_reversion_probability:.4f}"
+                        ),
+                        supporting_factors=[
+                            f"pressure_score={pressure_state.pressure_score:.4f}",
+                            f"mean_reversion_probability={pressure_state.mean_reversion_probability:.4f}",
+                            f"price_stall_confirmation={pressure_state.price_stall_confirmation}",
+                            f"oi_confirmation={pressure_state.oi_confirmation}",
+                        ],
+                        tags=["funding", "pressure", "mean_reversion"],
+                        event_time=snapshot.event_time,
+                        metadata=self._merge_signal_metadata(
+                            origin="pressure_reversion",
+                            snapshot=snapshot,
+                        ),
+                    )
+                )
 
         if self.config.signal_on_flip and flip_event is not None:
             signals.append(
@@ -1245,10 +1438,22 @@ class FundingAnalyzer:
                     ],
                     tags=["funding", "flip", flip_event.flip_type.value],
                     event_time=snapshot.event_time,
+                    metadata=self._merge_signal_metadata(
+                        origin="flip",
+                        snapshot=snapshot,
+                        extra={"flip_type": flip_event.flip_type.value},
+                    ),
                 )
             )
 
         if self.config.signal_on_extreme and extreme_event is not None:
+            base_extreme_factors = [
+                f"extreme_type={extreme_event.extreme_type.value}",
+                f"severity={extreme_event.severity:.4f}",
+                f"reversal_risk={extreme_event.is_reversal_risk}",
+                f"squeeze_risk={extreme_event.is_squeeze_risk}",
+            ]
+
             signals.append(
                 FundingSignal(
                     symbol=snapshot.symbol,
@@ -1256,26 +1461,78 @@ class FundingAnalyzer:
                     market_type=snapshot.market_type,
                     timeframe=snapshot.timeframe,
                     exchange_symbol=snapshot.exchange_symbol,
-                    signal_type=(
-                        FundingSignalType.SQUEEZE_WARNING
-                        if extreme_event.is_squeeze_risk
-                        else FundingSignalType.REVERSION_SETUP
-                    ),
+                    signal_type=FundingSignalType.EXTREME_DETECTED,
                     bias=regime_state.bias,
                     regime=regime_state.regime,
                     score=self._extreme_signal_score(extreme_event),
                     confidence=extreme_event.severity,
                     description=self.extremes_detector.build_summary(extreme_event),
-                    supporting_factors=[
-                        f"extreme_type={extreme_event.extreme_type.value}",
-                        f"severity={extreme_event.severity:.4f}",
-                        f"reversal_risk={extreme_event.is_reversal_risk}",
-                        f"squeeze_risk={extreme_event.is_squeeze_risk}",
-                    ],
+                    supporting_factors=base_extreme_factors,
                     tags=["funding", "extreme", extreme_event.extreme_type.value],
                     event_time=snapshot.event_time,
+                    metadata=self._merge_signal_metadata(
+                        origin="extreme",
+                        snapshot=snapshot,
+                        extra={"extreme_type": extreme_event.extreme_type.value},
+                    ),
                 )
             )
+
+            if extreme_event.is_squeeze_risk:
+                signals.append(
+                    FundingSignal(
+                        symbol=snapshot.symbol,
+                        exchange=snapshot.exchange,
+                        market_type=snapshot.market_type,
+                        timeframe=snapshot.timeframe,
+                        exchange_symbol=snapshot.exchange_symbol,
+                        signal_type=FundingSignalType.SQUEEZE_WARNING,
+                        bias=regime_state.bias,
+                        regime=regime_state.regime,
+                        score=self._extreme_signal_score(extreme_event),
+                        confidence=extreme_event.severity,
+                        description=(
+                            "Funding squeeze risk from extreme funding state | "
+                            f"{self.extremes_detector.build_summary(extreme_event)}"
+                        ),
+                        supporting_factors=base_extreme_factors,
+                        tags=["funding", "extreme", "squeeze"],
+                        event_time=snapshot.event_time,
+                        metadata=self._merge_signal_metadata(
+                            origin="extreme_squeeze",
+                            snapshot=snapshot,
+                            extra={"extreme_type": extreme_event.extreme_type.value},
+                        ),
+                    )
+                )
+
+            if extreme_event.is_reversal_risk:
+                signals.append(
+                    FundingSignal(
+                        symbol=snapshot.symbol,
+                        exchange=snapshot.exchange,
+                        market_type=snapshot.market_type,
+                        timeframe=snapshot.timeframe,
+                        exchange_symbol=snapshot.exchange_symbol,
+                        signal_type=FundingSignalType.REVERSION_SETUP,
+                        bias=regime_state.bias,
+                        regime=regime_state.regime,
+                        score=-self._extreme_signal_score(extreme_event),
+                        confidence=extreme_event.severity,
+                        description=(
+                            "Funding reversion setup from extreme funding state | "
+                            f"{self.extremes_detector.build_summary(extreme_event)}"
+                        ),
+                        supporting_factors=base_extreme_factors,
+                        tags=["funding", "extreme", "reversion"],
+                        event_time=snapshot.event_time,
+                        metadata=self._merge_signal_metadata(
+                            origin="extreme_reversion",
+                            snapshot=snapshot,
+                            extra={"extreme_type": extreme_event.extreme_type.value},
+                        ),
+                    )
+                )
 
         if self.config.signal_on_divergence and divergence_event is not None:
             signals.append(
@@ -1293,18 +1550,31 @@ class FundingAnalyzer:
                     description=self.divergence_detector.build_summary(divergence_event),
                     supporting_factors=[
                         f"type={divergence_event.divergence_type.value}",
-                        f"price_change_pct={divergence_event.price_change_pct}"
-                        if divergence_event.price_change_pct is not None
-                        else "price_change_pct=None",
-                        f"oi_change_pct={divergence_event.oi_change_pct}"
-                        if divergence_event.oi_change_pct is not None
-                        else "oi_change_pct=None",
-                        f"cvd_change={divergence_event.cvd_change}"
-                        if divergence_event.cvd_change is not None
-                        else "cvd_change=None",
+                        (
+                            f"price_change_pct={divergence_event.price_change_pct}"
+                            if divergence_event.price_change_pct is not None
+                            else "price_change_pct=None"
+                        ),
+                        (
+                            f"oi_change_pct={divergence_event.oi_change_pct}"
+                            if divergence_event.oi_change_pct is not None
+                            else "oi_change_pct=None"
+                        ),
+                        (
+                            f"cvd_change={divergence_event.cvd_change}"
+                            if divergence_event.cvd_change is not None
+                            else "cvd_change=None"
+                        ),
                     ],
                     tags=["funding", "divergence", divergence_event.divergence_type.value],
                     event_time=snapshot.event_time,
+                    metadata=self._merge_signal_metadata(
+                        origin="divergence",
+                        snapshot=snapshot,
+                        extra={
+                            "divergence_type": divergence_event.divergence_type.value,
+                        },
+                    ),
                 )
             )
 
@@ -1358,13 +1628,13 @@ class FundingAnalyzer:
             self.logger.info("FundingAnalyzer cleanup job disabled: scheduler not provided")
             return
 
-        existing_job = self.scheduler.get_job_by_name("analytics.funding.cleanup")
+        existing_job = self.scheduler.get_job_by_name(self.config.cleanup_job_name)
         if existing_job is not None:
             self._cleanup_job_id = existing_job.job_id
             return
 
         self._cleanup_job_id = self.scheduler.add_interval_job(
-            name="analytics.funding.cleanup",
+            name=self.config.cleanup_job_name,
             func=self.cleanup_stale_state,
             interval=self.config.cleanup_interval_sec,
             timeout=min(30.0, max(1.0, self.config.cleanup_interval_sec)),
@@ -1377,20 +1647,21 @@ class FundingAnalyzer:
 
     def _register_heartbeat_job(self) -> None:
         if self.scheduler is None:
+            self.logger.info("FundingAnalyzer heartbeat job disabled: scheduler not provided")
             return
 
-        existing_job = self.scheduler.get_job_by_name("analytics.funding.heartbeat")
+        existing_job = self.scheduler.get_job_by_name(self.config.heartbeat_job_name)
         if existing_job is not None:
             self._heartbeat_job_id = existing_job.job_id
             return
 
         self._heartbeat_job_id = self.scheduler.add_interval_job(
-            name="analytics.funding.heartbeat",
+            name=self.config.heartbeat_job_name,
             func=self.emit_heartbeat,
             interval=self.config.heartbeat_interval_sec,
             timeout=5.0,
             max_retries=0,
-            retry_delay=1.0,
+            retry_delay=0.0,
             allow_overlap=False,
             run_immediately=False,
             enabled=True,
@@ -1404,16 +1675,16 @@ class FundingAnalyzer:
             self.logger.info("FundingAnalyzer parquet flush job disabled: scheduler not provided")
             return
 
-        existing_job = self.scheduler.get_job_by_name("analytics.funding.parquet_flush")
+        existing_job = self.scheduler.get_job_by_name(self.config.parquet_flush_job_name)
         if existing_job is not None:
             self._parquet_flush_job_id = existing_job.job_id
             return
 
         self._parquet_flush_job_id = self.scheduler.add_interval_job(
-            name="analytics.funding.parquet_flush",
+            name=self.config.parquet_flush_job_name,
             func=self.flush_history_to_parquet,
-            interval=30.0,
-            timeout=10.0,
+            interval=self.config.parquet_flush_interval_sec,
+            timeout=self.config.parquet_flush_timeout_sec,
             max_retries=1,
             retry_delay=1.0,
             allow_overlap=False,
@@ -1452,6 +1723,7 @@ class FundingAnalyzer:
                 age = (now - context.updated_at).total_seconds()
                 if age >= self.config.stale_state_ttl_sec and key not in self._history:
                     self._market_context.pop(key, None)
+                    self._locks.pop(key, None)
                     removed_contexts += 1
                     continue
 
@@ -1565,7 +1837,7 @@ class FundingAnalyzer:
                 continue
 
             key = snapshot.key
-            if per_key_loaded[key] >= 500:
+            if per_key_loaded[key] >= self.config.parquet_max_load_records_per_key:
                 continue
 
             self._history[key].append(snapshot)
@@ -1630,7 +1902,9 @@ class FundingAnalyzer:
         should_flush = False
         async with self._history_buffer_lock:
             self._history_write_buffer.append(row)
-            should_flush = len(self._history_write_buffer) >= 250
+            should_flush = (
+                len(self._history_write_buffer) >= self.config.parquet_flush_batch_size
+            )
 
         if should_flush:
             await self.flush_history_to_parquet()
@@ -1697,7 +1971,7 @@ class FundingAnalyzer:
             or getattr(self.parquet_storage, "write_records", None)
         )
         if external_writer is not None:
-            external_writer(dataset="analytics_funding", records=rows)
+            external_writer(dataset=self.config.parquet_dataset_name, records=rows)
             return len(rows)
 
         pd = self._import_pandas_for_parquet()
@@ -1751,7 +2025,7 @@ class FundingAnalyzer:
         external_reader = getattr(self.parquet_storage, "read_records", None)
         if external_reader is not None:
             rows = external_reader(
-                dataset="analytics_funding",
+                dataset=self.config.parquet_dataset_name,
                 symbol=symbol,
                 exchange=exchange,
                 market_type=market_type,
@@ -1858,11 +2132,15 @@ class FundingAnalyzer:
             return None
 
     def _parquet_root(self) -> Path:
-        return Path("data/parquet").expanduser() / "analytics_funding"
+        return (
+            Path(self.config.parquet_base_path).expanduser()
+            / self.config.parquet_dataset_name
+        )
 
     def _import_pandas_for_parquet(self):
         try:
             import pandas as pd  # type: ignore
+
             return pd
         except Exception:
             if not self._parquet_unavailable_logged:
@@ -1881,24 +2159,34 @@ class FundingAnalyzer:
         symbol = normalize_symbol(payload["symbol"])
         exchange = normalize_exchange(payload.get("exchange", "unknown"))
         market_type = normalize_market_type(
-            payload.get("market_type")
-            or payload.get("category")
-            or payload.get("market")
+            self._first_present(
+                payload,
+                "market_type",
+                "category",
+                "market",
+            )
             or self.config.default_market_type
         )
-        timeframe = normalize_timeframe(payload.get("timeframe") or self.config.default_timeframe)
+        timeframe = normalize_timeframe(
+            self._first_present(payload, "timeframe")
+            or self.config.default_timeframe
+        )
         exchange_symbol = normalize_exchange_symbol(
-            payload.get("exchange_symbol")
-            or payload.get("raw_symbol")
-            or payload.get("instrument")
-            or payload.get("s"),
+            self._first_present(
+                payload,
+                "exchange_symbol",
+                "raw_symbol",
+                "instrument",
+                "s",
+            ),
             fallback_symbol=symbol,
         )
 
-        next_funding_time_raw = (
-            payload.get("next_funding_time")
-            or payload.get("next_funding_time_ms")
-            or payload.get("next_funding_timestamp")
+        next_funding_time_raw = self._first_present(
+            payload,
+            "next_funding_time",
+            "next_funding_time_ms",
+            "next_funding_timestamp",
         )
         next_funding_time = (
             self._parse_datetime(next_funding_time_raw)
@@ -1906,14 +2194,19 @@ class FundingAnalyzer:
             else None
         )
 
-        event_time_raw = (
-            payload.get("event_time")
-            or payload.get("timestamp_ms")
-            or payload.get("timestamp")
-            or payload.get("ts")
-            or payload.get("funding_time")
+        event_time_raw = self._first_present(
+            payload,
+            "event_time",
+            "timestamp_ms",
+            "timestamp",
+            "ts",
+            "funding_time",
         )
-        received_at_raw = payload.get("received_at") or payload.get("received_at_ms")
+        received_at_raw = self._first_present(
+            payload,
+            "received_at",
+            "received_at_ms",
+        )
 
         event_time = (
             self._parse_datetime(event_time_raw)
@@ -1939,6 +2232,11 @@ class FundingAnalyzer:
                 )
             ),
         )
+        metadata.setdefault("exchange_symbol", exchange_symbol)
+
+        funding_rate_raw = self._first_present(payload, "funding_rate", "rate")
+        if funding_rate_raw is None:
+            raise ValueError("funding_rate is required")
 
         return FundingSnapshot(
             symbol=symbol,
@@ -1946,19 +2244,30 @@ class FundingAnalyzer:
             market_type=market_type,
             timeframe=timeframe,
             exchange_symbol=exchange_symbol,
-            funding_rate=float(payload.get("funding_rate", payload.get("rate", 0.0))),
+            funding_rate=float(funding_rate_raw),
             predicted_funding_rate=self._to_optional_float(
-                payload.get("predicted_funding_rate")
-                if payload.get("predicted_funding_rate") is not None
-                else payload.get("predicted_rate")
+                self._first_present(
+                    payload,
+                    "predicted_funding_rate",
+                    "predicted_rate",
+                )
             ),
-            mark_price=self._to_optional_float(payload.get("mark_price")),
-            index_price=self._to_optional_float(payload.get("index_price")),
+            mark_price=self._to_optional_float(
+                self._first_present(payload, "mark_price")
+            ),
+            index_price=self._to_optional_float(
+                self._first_present(payload, "index_price")
+            ),
             open_interest=self._to_optional_float(
-                payload.get("open_interest")
-                or payload.get("open_interest_value")
+                self._first_present(
+                    payload,
+                    "open_interest",
+                    "open_interest_value",
+                )
             ),
-            volume_24h=self._to_optional_float(payload.get("volume_24h")),
+            volume_24h=self._to_optional_float(
+                self._first_present(payload, "volume_24h")
+            ),
             next_funding_time=next_funding_time,
             event_time=event_time,
             received_at=received_at,
@@ -1973,19 +2282,26 @@ class FundingAnalyzer:
     ) -> FundingKey | None:
         fallback_payload = fallback_payload or {}
 
-        symbol = payload.get("symbol") or payload.get("s") or fallback_payload.get("symbol")
+        symbol = (
+            self._first_present(payload, "symbol", "s")
+            or self._first_present(fallback_payload, "symbol", "s")
+        )
         if not symbol:
             return None
 
-        exchange = payload.get("exchange") or fallback_payload.get("exchange") or "unknown"
+        exchange = (
+            self._first_present(payload, "exchange")
+            or self._first_present(fallback_payload, "exchange")
+            or "unknown"
+        )
         market_type = (
-            payload.get("market_type")
-            or fallback_payload.get("market_type")
+            self._first_present(payload, "market_type")
+            or self._first_present(fallback_payload, "market_type")
             or self.config.default_market_type
         )
         timeframe = (
-            payload.get("timeframe")
-            or fallback_payload.get("timeframe")
+            self._first_present(payload, "timeframe")
+            or self._first_present(fallback_payload, "timeframe")
             or self.config.default_timeframe
         )
 
@@ -2046,6 +2362,49 @@ class FundingAnalyzer:
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
+
+    def _is_legacy_raw_event_blocked(self, event: Event) -> bool:
+        topic = getattr(event, "topic", None)
+
+        if topic is None:
+            return False
+
+        return (
+            topic in self.config.legacy_raw_input_topics
+            and not self.config.allow_legacy_raw_topics
+        )
+
+    @staticmethod
+    def _first_present(
+        payload: Mapping[str, Any],
+        *keys: str,
+    ) -> Any:
+        for key in keys:
+            if key in payload and payload[key] is not None:
+                return payload[key]
+        return None
+
+    @staticmethod
+    def _merge_signal_metadata(
+        *,
+        origin: str,
+        snapshot: FundingSnapshot,
+        base: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata = dict(base or {})
+        metadata.update(
+            {
+                "signal_origin": origin,
+                "scope": funding_key_to_dict(snapshot.key),
+                "exchange_symbol": snapshot.exchange_symbol,
+            }
+        )
+
+        if extra:
+            metadata.update(extra)
+
+        return metadata
 
     @staticmethod
     def _parse_datetime(value: Any) -> datetime:

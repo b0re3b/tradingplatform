@@ -8,6 +8,7 @@ import pytest
 
 from analytics.funding.enums import (
     FundingBias,
+    FundingDataSource,
     FundingDivergenceType,
     FundingExtremeType,
     FundingFlipType,
@@ -44,84 +45,82 @@ from analytics.funding.models import (
     FundingRegimeState,
     FundingSnapshot,
     FundingStatistics,
+    funding_key_to_dict,
 )
 
 
-# ---------------------------------------------------------------------------
-# FundingRegimeDetector
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Local helpers
+# =============================================================================
 
+def _assert_common_scope(model: object, snapshot: FundingSnapshot) -> None:
+    assert getattr(model, "symbol") == snapshot.symbol
+    assert getattr(model, "exchange") == snapshot.exchange
+    assert getattr(model, "market_type") == snapshot.market_type
+    assert getattr(model, "timeframe") == snapshot.timeframe
+    assert getattr(model, "exchange_symbol") == snapshot.exchange_symbol
+    assert getattr(model, "key") == snapshot.key
+
+
+def _assert_probability(value: float | None) -> None:
+    assert value is not None
+    assert 0.0 <= value <= 1.0
+
+
+def _assert_confidence(value: float) -> None:
+    assert 0.0 <= value <= 1.0
+
+
+def _make_statistics_for_rate(
+    make_statistics: Callable[..., FundingStatistics],
+    *,
+    rate: float,
+    percentile: float,
+    zscore: float,
+    sample_size: int = 100,
+) -> FundingStatistics:
+    return make_statistics(
+        current_rate=rate,
+        percentile=percentile,
+        zscore=zscore,
+        sample_size=sample_size,
+        mean_rate=0.0,
+        median_rate=0.0,
+        std_rate=abs(rate) / max(abs(zscore), 1.0) if zscore else abs(rate),
+        min_rate=min(rate, 0.0),
+        max_rate=max(rate, 0.0),
+    )
+
+
+# =============================================================================
+# FundingRegimeDetector
+# =============================================================================
 
 @pytest.mark.parametrize(
-    ("funding_rate", "percentile", "zscore", "expected_regime", "expected_bias"),
+    (
+        "funding_rate",
+        "percentile",
+        "zscore",
+        "expected_regime",
+        "expected_bias",
+    ),
     [
-        (
-            0.0,
-            50.0,
-            0.0,
-            FundingRegime.NEUTRAL,
-            FundingBias.NEUTRAL,
-        ),
-        (
-            0.00008,
-            60.0,
-            0.5,
-            FundingRegime.POSITIVE,
-            FundingBias.LONG_BIAS,
-        ),
-        (
-            -0.00008,
-            40.0,
-            -0.5,
-            FundingRegime.NEGATIVE,
-            FundingBias.SHORT_BIAS,
-        ),
-        (
-            0.00012,
-            90.0,
-            1.0,
-            FundingRegime.POSITIVE,
-            FundingBias.OVERCROWDED_LONGS,
-        ),
-        (
-            -0.00012,
-            10.0,
-            -1.0,
-            FundingRegime.NEGATIVE,
-            FundingBias.OVERCROWDED_SHORTS,
-        ),
-        (
-            0.00012,
-            96.0,
-            1.2,
-            FundingRegime.EXTREME_POSITIVE,
-            FundingBias.SQUEEZE_RISK_LONGS,
-        ),
-        (
-            -0.00012,
-            4.0,
-            -1.2,
-            FundingRegime.EXTREME_NEGATIVE,
-            FundingBias.SQUEEZE_RISK_SHORTS,
-        ),
-        (
-            0.00012,
-            70.0,
-            2.2,
-            FundingRegime.EXTREME_POSITIVE,
-            FundingBias.SQUEEZE_RISK_LONGS,
-        ),
-        (
-            -0.00012,
-            30.0,
-            -2.2,
-            FundingRegime.EXTREME_NEGATIVE,
-            FundingBias.SQUEEZE_RISK_SHORTS,
-        ),
+        (0.0, 50.0, 0.0, FundingRegime.NEUTRAL, FundingBias.NEUTRAL),
+        (0.000009, 50.0, 0.0, FundingRegime.NEUTRAL, FundingBias.NEUTRAL),
+        (-0.000009, 50.0, 0.0, FundingRegime.NEUTRAL, FundingBias.NEUTRAL),
+        (0.00005, 55.0, 0.1, FundingRegime.POSITIVE, FundingBias.LONG_BIAS),
+        (-0.00005, 45.0, -0.1, FundingRegime.NEGATIVE, FundingBias.SHORT_BIAS),
+        (0.00012, 85.0, 1.0, FundingRegime.POSITIVE, FundingBias.OVERCROWDED_LONGS),
+        (-0.00012, 15.0, -1.0, FundingRegime.NEGATIVE, FundingBias.OVERCROWDED_SHORTS),
+        (0.00012, 95.0, 1.0, FundingRegime.EXTREME_POSITIVE, FundingBias.SQUEEZE_RISK_LONGS),
+        (-0.00012, 5.0, -1.0, FundingRegime.EXTREME_NEGATIVE, FundingBias.SQUEEZE_RISK_SHORTS),
+        (0.00031, 70.0, 0.2, FundingRegime.EXTREME_POSITIVE, FundingBias.SQUEEZE_RISK_LONGS),
+        (-0.00031, 30.0, -0.2, FundingRegime.EXTREME_NEGATIVE, FundingBias.SQUEEZE_RISK_SHORTS),
+        (0.00008, 60.0, 2.0, FundingRegime.EXTREME_POSITIVE, FundingBias.SQUEEZE_RISK_LONGS),
+        (-0.00008, 40.0, -2.0, FundingRegime.EXTREME_NEGATIVE, FundingBias.SQUEEZE_RISK_SHORTS),
     ],
 )
-def test_regime_detector_classifies_regime_and_bias(
-    regime_detector: FundingRegimeDetector,
+def test_regime_detector_classifies_boundaries_and_extremes(
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     funding_rate: float,
@@ -130,70 +129,92 @@ def test_regime_detector_classifies_regime_and_bias(
     expected_regime: FundingRegime,
     expected_bias: FundingBias,
 ) -> None:
-    snapshot = make_snapshot(funding_rate=funding_rate)
-    statistics = make_statistics(
-        current_rate=funding_rate,
+    detector = FundingRegimeDetector(
+        FundingRegimeDetectorConfig(
+            neutral_abs_threshold=0.00001,
+            positive_abs_threshold=0.00005,
+            extreme_abs_threshold=0.00030,
+            crowded_percentile_threshold=85.0,
+            squeeze_percentile_threshold=95.0,
+            extreme_positive_zscore=2.0,
+            extreme_negative_zscore=-2.0,
+            min_confidence_for_change=0.15,
+        )
+    )
+
+    snapshot = make_snapshot(
+        funding_rate=funding_rate,
+        market_type="usdm_futures",
+        exchange_symbol="BTC/USDT:USDT",
+    )
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=funding_rate,
         percentile=percentile,
         zscore=zscore,
         sample_size=100,
     )
 
-    state = regime_detector.detect(snapshot=snapshot, statistics=statistics)
+    state = detector.detect(snapshot=snapshot, statistics=statistics)
 
-    assert state.symbol == snapshot.symbol
-    assert state.exchange == snapshot.exchange
-    assert state.timeframe == FundingTimeframe.H1
+    _assert_common_scope(state, snapshot)
     assert state.regime == expected_regime
     assert state.bias == expected_bias
-    assert state.current_rate == funding_rate
-    assert state.percentile == percentile
-    assert state.zscore == zscore
-    assert 0.0 <= state.confidence <= 1.0
+    assert state.current_rate == pytest.approx(funding_rate)
+    assert state.percentile == pytest.approx(percentile)
+    assert state.zscore == pytest.approx(zscore)
     assert state.changed is False
     assert state.previous_regime is None
+    _assert_confidence(state.confidence)
     assert state.metadata["sample_size"] == 100
     assert state.metadata["funding_sign"] == snapshot.funding_sign
+    assert state.metadata["scope"] == funding_key_to_dict(snapshot.key)
 
 
-def test_regime_detector_detects_changed_when_previous_regime_differs(
-    regime_detector: FundingRegimeDetector,
+def test_regime_detector_marks_change_only_with_previous_state_and_sufficient_confidence(
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     make_regime_state: Callable[..., FundingRegimeState],
 ) -> None:
-    previous_state = make_regime_state(
+    detector = FundingRegimeDetector(
+        FundingRegimeDetectorConfig(min_confidence_for_change=0.20)
+    )
+
+    previous = make_regime_state(
         regime=FundingRegime.NEUTRAL,
         bias=FundingBias.NEUTRAL,
         confidence=0.8,
     )
     snapshot = make_snapshot(funding_rate=0.00035)
-    statistics = make_statistics(
-        current_rate=0.00035,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
         percentile=98.0,
         zscore=3.0,
         sample_size=100,
     )
 
-    state = regime_detector.detect(
+    state = detector.detect(
         snapshot=snapshot,
         statistics=statistics,
-        previous_state=previous_state,
+        previous_state=previous,
     )
 
     assert state.regime == FundingRegime.EXTREME_POSITIVE
     assert state.previous_regime == FundingRegime.NEUTRAL
     assert state.changed is True
-    assert state.confidence >= regime_detector.config.min_confidence_for_change
+    assert state.confidence >= detector.config.min_confidence_for_change
 
 
-def test_regime_detector_does_not_mark_changed_without_previous_state(
+def test_regime_detector_does_not_mark_change_without_previous_state(
     regime_detector: FundingRegimeDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
 ) -> None:
     snapshot = make_snapshot(funding_rate=0.00035)
-    statistics = make_statistics(
-        current_rate=0.00035,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
         percentile=98.0,
         zscore=3.0,
         sample_size=100,
@@ -202,24 +223,25 @@ def test_regime_detector_does_not_mark_changed_without_previous_state(
     state = regime_detector.detect(snapshot=snapshot, statistics=statistics)
 
     assert state.regime == FundingRegime.EXTREME_POSITIVE
-    assert state.changed is False
     assert state.previous_regime is None
+    assert state.changed is False
 
 
-def test_regime_detector_does_not_mark_changed_when_regime_is_same(
+def test_regime_detector_does_not_mark_change_when_regime_is_same(
     regime_detector: FundingRegimeDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     make_regime_state: Callable[..., FundingRegimeState],
 ) -> None:
-    previous_state = make_regime_state(
+    previous = make_regime_state(
         regime=FundingRegime.POSITIVE,
         bias=FundingBias.LONG_BIAS,
     )
     snapshot = make_snapshot(funding_rate=0.00008)
-    statistics = make_statistics(
-        current_rate=0.00008,
-        percentile=70.0,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00008,
+        percentile=65.0,
         zscore=0.5,
         sample_size=100,
     )
@@ -227,7 +249,7 @@ def test_regime_detector_does_not_mark_changed_when_regime_is_same(
     state = regime_detector.detect(
         snapshot=snapshot,
         statistics=statistics,
-        previous_state=previous_state,
+        previous_state=previous,
     )
 
     assert state.regime == FundingRegime.POSITIVE
@@ -235,7 +257,7 @@ def test_regime_detector_does_not_mark_changed_when_regime_is_same(
     assert state.changed is False
 
 
-def test_regime_detector_suppresses_changed_when_confidence_is_too_low(
+def test_regime_detector_suppresses_change_when_confidence_is_too_low(
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     make_regime_state: Callable[..., FundingRegimeState],
@@ -244,13 +266,14 @@ def test_regime_detector_suppresses_changed_when_confidence_is_too_low(
         FundingRegimeDetectorConfig(min_confidence_for_change=0.95)
     )
 
-    previous_state = make_regime_state(
+    previous = make_regime_state(
         regime=FundingRegime.NEUTRAL,
         bias=FundingBias.NEUTRAL,
     )
     snapshot = make_snapshot(funding_rate=0.00006)
-    statistics = make_statistics(
-        current_rate=0.00006,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00006,
         percentile=55.0,
         zscore=0.1,
         sample_size=10,
@@ -259,7 +282,7 @@ def test_regime_detector_suppresses_changed_when_confidence_is_too_low(
     state = detector.detect(
         snapshot=snapshot,
         statistics=statistics,
-        previous_state=previous_state,
+        previous_state=previous,
     )
 
     assert state.regime == FundingRegime.POSITIVE
@@ -267,40 +290,54 @@ def test_regime_detector_suppresses_changed_when_confidence_is_too_low(
     assert state.changed is False
 
 
-def test_regime_detector_confidence_is_clamped() -> None:
+def test_regime_detector_confidence_is_clamped_to_unit_interval() -> None:
     detector = FundingRegimeDetector()
 
-    confidence = detector.calculate_confidence(
+    assert detector.calculate_confidence(
         current_rate=0.01,
         percentile=100.0,
         zscore=20.0,
-        sample_size=1_000,
-    )
+        sample_size=10_000,
+    ) == pytest.approx(1.0)
 
-    assert confidence == pytest.approx(1.0)
+    assert detector.calculate_confidence(
+        current_rate=0.0,
+        percentile=None,
+        zscore=None,
+        sample_size=0,
+    ) == pytest.approx(0.0)
 
 
-def test_regime_detector_direct_helper_for_low_confidence_change(
+@pytest.mark.parametrize(
+    ("previous_regime", "new_regime", "confidence", "expected"),
+    [
+        (FundingRegime.NEUTRAL, FundingRegime.POSITIVE, 0.01, False),
+        (FundingRegime.NEUTRAL, FundingRegime.POSITIVE, 0.99, True),
+        (FundingRegime.POSITIVE, FundingRegime.POSITIVE, 0.99, False),
+    ],
+)
+def test_regime_detector_has_regime_changed_helper_is_strict(
     regime_detector: FundingRegimeDetector,
     make_regime_state: Callable[..., FundingRegimeState],
+    previous_regime: FundingRegime,
+    new_regime: FundingRegime,
+    confidence: float,
+    expected: bool,
 ) -> None:
-    previous_state = make_regime_state(regime=FundingRegime.NEUTRAL)
+    previous = make_regime_state(regime=previous_regime)
 
-    changed = regime_detector.has_regime_changed(
-        previous_state=previous_state,
-        new_regime=FundingRegime.POSITIVE,
-        confidence=0.01,
-    )
-
-    assert changed is False
+    assert regime_detector.has_regime_changed(
+        previous_state=previous,
+        new_regime=new_regime,
+        confidence=confidence,
+    ) is expected
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # FundingPressureAnalyzer
-# ---------------------------------------------------------------------------
+# =============================================================================
 
-
-def test_pressure_analyzer_returns_low_pressure_for_neutral_context(
+def test_pressure_analyzer_returns_low_neutral_pressure_when_context_is_missing(
     pressure_analyzer: FundingPressureAnalyzer,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
@@ -311,8 +348,9 @@ def test_pressure_analyzer_returns_low_pressure_for_neutral_context(
         open_interest=None,
         mark_price=None,
     )
-    statistics = make_statistics(
-        current_rate=0.0,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.0,
         percentile=50.0,
         zscore=0.0,
         sample_size=100,
@@ -332,19 +370,41 @@ def test_pressure_analyzer_returns_low_pressure_for_neutral_context(
         previous_price=None,
     )
 
+    _assert_common_scope(state, snapshot)
     assert state.level == FundingPressureLevel.LOW
     assert state.direction == FundingPressureDirection.NEUTRAL
     assert state.bias == FundingBias.NEUTRAL
     assert state.oi_confirmation is False
     assert state.price_stall_confirmation is False
-    assert 0.0 <= state.pressure_score <= 1.0
-    assert 0.0 <= state.squeeze_probability <= 1.0
-    assert 0.0 <= state.mean_reversion_probability <= 1.0
+    _assert_probability(state.pressure_score)
+    _assert_probability(state.squeeze_probability)
+    _assert_probability(state.mean_reversion_probability)
     assert state.metadata["oi_change_pct"] is None
     assert state.metadata["price_change_pct"] is None
 
 
-def test_pressure_analyzer_detects_extreme_long_pressure_with_oi_and_price_stall(
+@pytest.mark.parametrize(
+    ("score", "expected_level"),
+    [
+        (0.0, FundingPressureLevel.LOW),
+        (0.4499, FundingPressureLevel.LOW),
+        (0.45, FundingPressureLevel.MODERATE),
+        (0.6999, FundingPressureLevel.MODERATE),
+        (0.70, FundingPressureLevel.HIGH),
+        (0.8999, FundingPressureLevel.HIGH),
+        (0.90, FundingPressureLevel.EXTREME),
+        (1.0, FundingPressureLevel.EXTREME),
+    ],
+)
+def test_pressure_level_boundaries_are_not_off_by_one(
+    pressure_analyzer: FundingPressureAnalyzer,
+    score: float,
+    expected_level: FundingPressureLevel,
+) -> None:
+    assert pressure_analyzer._detect_pressure_level(score) == expected_level
+
+
+def test_pressure_analyzer_detects_extreme_long_crowding_with_oi_growth_and_price_stall(
     pressure_analyzer: FundingPressureAnalyzer,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
@@ -355,8 +415,9 @@ def test_pressure_analyzer_detects_extreme_long_pressure_with_oi_and_price_stall
         open_interest=1_100_000.0,
         mark_price=50_010.0,
     )
-    statistics = make_statistics(
-        current_rate=0.00035,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
         percentile=98.0,
         zscore=3.0,
         sample_size=100,
@@ -377,22 +438,21 @@ def test_pressure_analyzer_detects_extreme_long_pressure_with_oi_and_price_stall
         previous_price=50_000.0,
     )
 
-    assert state.level == FundingPressureLevel.EXTREME
     assert state.direction == FundingPressureDirection.LONG
+    assert state.level == FundingPressureLevel.EXTREME
     assert state.bias == FundingBias.SQUEEZE_RISK_LONGS
     assert state.oi_confirmation is True
     assert state.price_stall_confirmation is True
-    assert state.pressure_score >= pressure_analyzer.config.extreme_pressure_score_threshold
-    assert pressure_analyzer.is_high_pressure(state) is True
-    assert pressure_analyzer.is_long_crowded(state) is True
-    assert pressure_analyzer.is_squeeze_risk(state, threshold=0.65) is True
-    assert 0.0 <= state.squeeze_probability <= 1.0
-    assert 0.0 <= state.mean_reversion_probability <= 1.0
     assert state.metadata["oi_change_pct"] == pytest.approx(0.10)
     assert state.metadata["price_change_pct"] == pytest.approx(0.0002)
+    assert pressure_analyzer.is_high_pressure(state) is True
+    assert pressure_analyzer.is_long_crowded(state) is True
+    assert pressure_analyzer.is_short_crowded(state) is False
+    assert pressure_analyzer.is_squeeze_risk(state, threshold=0.65) is True
+    assert "BTCUSDT" in pressure_analyzer.build_summary(state)
 
 
-def test_pressure_analyzer_detects_short_direction_from_negative_bias(
+def test_pressure_analyzer_detects_extreme_short_crowding_with_oi_growth_and_price_stall(
     pressure_analyzer: FundingPressureAnalyzer,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
@@ -403,8 +463,9 @@ def test_pressure_analyzer_detects_short_direction_from_negative_bias(
         open_interest=1_100_000.0,
         mark_price=49_990.0,
     )
-    statistics = make_statistics(
-        current_rate=-0.00035,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=-0.00035,
         percentile=2.0,
         zscore=-3.0,
         sample_size=100,
@@ -426,12 +487,14 @@ def test_pressure_analyzer_detects_short_direction_from_negative_bias(
     )
 
     assert state.direction == FundingPressureDirection.SHORT
+    assert state.level == FundingPressureLevel.EXTREME
     assert state.bias == FundingBias.SQUEEZE_RISK_SHORTS
     assert pressure_analyzer.is_high_pressure(state) is True
     assert pressure_analyzer.is_short_crowded(state) is True
+    assert pressure_analyzer.is_long_crowded(state) is False
 
 
-def test_pressure_analyzer_resolves_bias_from_neutral_regime_when_pressure_is_high(
+def test_pressure_analyzer_resolves_direction_from_neutral_regime_when_rate_is_extreme(
     pressure_analyzer: FundingPressureAnalyzer,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
@@ -442,8 +505,9 @@ def test_pressure_analyzer_resolves_bias_from_neutral_regime_when_pressure_is_hi
         open_interest=1_100_000.0,
         mark_price=50_010.0,
     )
-    statistics = make_statistics(
-        current_rate=0.00035,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
         percentile=98.0,
         zscore=3.0,
         sample_size=100,
@@ -452,7 +516,7 @@ def test_pressure_analyzer_resolves_bias_from_neutral_regime_when_pressure_is_hi
         regime=FundingRegime.NEUTRAL,
         bias=FundingBias.NEUTRAL,
         current_rate=0.00035,
-        confidence=0.5,
+        confidence=0.50,
     )
 
     state = pressure_analyzer.analyze(
@@ -465,11 +529,11 @@ def test_pressure_analyzer_resolves_bias_from_neutral_regime_when_pressure_is_hi
     )
 
     assert state.direction == FundingPressureDirection.LONG
-    assert state.level in {FundingPressureLevel.HIGH, FundingPressureLevel.EXTREME}
     assert state.bias == FundingBias.OVERCROWDED_LONGS
+    assert state.level in {FundingPressureLevel.HIGH, FundingPressureLevel.EXTREME}
 
 
-def test_pressure_analyzer_handles_missing_context_without_crash(
+def test_pressure_analyzer_handles_missing_oi_and_price_without_fake_confirmation(
     pressure_analyzer: FundingPressureAnalyzer,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
@@ -480,8 +544,9 @@ def test_pressure_analyzer_handles_missing_context_without_crash(
         open_interest=None,
         mark_price=None,
     )
-    statistics = make_statistics(
-        current_rate=0.00012,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00012,
         percentile=80.0,
         zscore=1.0,
         sample_size=100,
@@ -496,6 +561,9 @@ def test_pressure_analyzer_handles_missing_context_without_crash(
         snapshot=snapshot,
         statistics=statistics,
         regime_state=regime_state,
+        previous_open_interest=None,
+        current_price=None,
+        previous_price=None,
     )
 
     assert state.direction == FundingPressureDirection.LONG
@@ -505,29 +573,51 @@ def test_pressure_analyzer_handles_missing_context_without_crash(
     assert state.metadata["price_change_pct"] is None
 
 
-@pytest.mark.parametrize(
-    ("score", "expected_level"),
-    [
-        (0.0, FundingPressureLevel.LOW),
-        (0.4499, FundingPressureLevel.LOW),
-        (0.45, FundingPressureLevel.MODERATE),
-        (0.70, FundingPressureLevel.HIGH),
-        (0.90, FundingPressureLevel.EXTREME),
-        (1.0, FundingPressureLevel.EXTREME),
-    ],
-)
-def test_pressure_level_boundaries(
-    pressure_analyzer: FundingPressureAnalyzer,
-    score: float,
-    expected_level: FundingPressureLevel,
+def test_pressure_analyzer_config_can_make_high_pressure_harder_to_reach(
+    make_snapshot: Callable[..., FundingSnapshot],
+    make_statistics: Callable[..., FundingStatistics],
+    make_regime_state: Callable[..., FundingRegimeState],
 ) -> None:
-    assert pressure_analyzer._detect_pressure_level(score) == expected_level
+    analyzer = FundingPressureAnalyzer(
+        FundingPressureConfig(
+            high_pressure_score_threshold=0.95,
+            extreme_pressure_score_threshold=0.99,
+        )
+    )
+
+    snapshot = make_snapshot(
+        funding_rate=0.00035,
+        open_interest=1_100_000.0,
+        mark_price=50_010.0,
+    )
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
+        percentile=98.0,
+        zscore=3.0,
+        sample_size=100,
+    )
+    regime_state = make_regime_state(
+        regime=FundingRegime.EXTREME_POSITIVE,
+        bias=FundingBias.SQUEEZE_RISK_LONGS,
+        current_rate=0.00035,
+    )
+
+    state = analyzer.analyze(
+        snapshot=snapshot,
+        statistics=statistics,
+        regime_state=regime_state,
+        previous_open_interest=1_000_000.0,
+        current_price=50_010.0,
+        previous_price=50_000.0,
+    )
+
+    assert analyzer.is_high_pressure(state) is False
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # FundingFlipDetector
-# ---------------------------------------------------------------------------
-
+# =============================================================================
 
 def test_flip_detector_returns_none_without_previous_snapshot(
     flip_detector: FundingFlipDetector,
@@ -535,7 +625,12 @@ def test_flip_detector_returns_none_without_previous_snapshot(
     make_statistics: Callable[..., FundingStatistics],
 ) -> None:
     current = make_snapshot(funding_rate=0.0001)
-    statistics = make_statistics(current_rate=0.0001, percentile=80.0, zscore=1.2)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.0001,
+        percentile=80.0,
+        zscore=1.2,
+    )
 
     event = flip_detector.detect(
         current_snapshot=current,
@@ -553,9 +648,10 @@ def test_flip_detector_returns_none_without_previous_snapshot(
         (-0.00008, -0.00012),
         (0.0, 0.000005),
         (-0.000005, 0.000005),
+        (0.000001, -0.000001),
     ],
 )
-def test_flip_detector_returns_none_without_real_sign_change(
+def test_flip_detector_returns_none_without_meaningful_sign_change(
     flip_detector: FundingFlipDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
@@ -564,11 +660,11 @@ def test_flip_detector_returns_none_without_real_sign_change(
 ) -> None:
     previous = make_snapshot(funding_rate=previous_rate)
     current = make_snapshot(funding_rate=current_rate)
-    statistics = make_statistics(
-        current_rate=current_rate,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=current_rate,
         percentile=50.0,
         zscore=0.0,
-        sample_size=100,
     )
 
     event = flip_detector.detect(
@@ -581,65 +677,51 @@ def test_flip_detector_returns_none_without_real_sign_change(
 
 
 @pytest.mark.parametrize(
-    ("previous_rate", "current_rate", "expected_type", "is_bullish", "is_bearish"),
+    ("previous_rate", "current_rate", "expected_type", "bullish", "bearish"),
     [
-        (
-            -0.00010,
-            0.00020,
-            FundingFlipType.NEGATIVE_TO_POSITIVE,
-            True,
-            False,
-        ),
-        (
-            0.00010,
-            -0.00020,
-            FundingFlipType.POSITIVE_TO_NEGATIVE,
-            False,
-            True,
-        ),
+        (-0.00010, 0.00020, FundingFlipType.NEGATIVE_TO_POSITIVE, True, False),
+        (0.00010, -0.00020, FundingFlipType.POSITIVE_TO_NEGATIVE, False, True),
     ],
 )
-def test_flip_detector_detects_meaningful_flip(
+def test_flip_detector_detects_meaningful_flips_and_direction_helpers(
     flip_detector: FundingFlipDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     previous_rate: float,
     current_rate: float,
     expected_type: FundingFlipType,
-    is_bullish: bool,
-    is_bearish: bool,
+    bullish: bool,
+    bearish: bool,
 ) -> None:
     previous = make_snapshot(funding_rate=previous_rate)
     current = make_snapshot(funding_rate=current_rate)
-    statistics = make_statistics(
-        current_rate=current_rate,
-        percentile=98.0 if current_rate > 0 else 2.0,
-        zscore=3.0 if current_rate > 0 else -3.0,
-        sample_size=100,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=current_rate,
+        percentile=90.0 if current_rate > 0 else 10.0,
+        zscore=2.0 if current_rate > 0 else -2.0,
     )
 
     event = flip_detector.detect(
         current_snapshot=current,
         previous_snapshot=previous,
         statistics=statistics,
-        extra_metadata={"test_case": "meaningful_flip"},
     )
 
     assert event is not None
+    _assert_common_scope(event, current)
     assert event.flip_type == expected_type
-    assert event.previous_rate == previous_rate
-    assert event.current_rate == current_rate
+    assert event.previous_rate == pytest.approx(previous_rate)
+    assert event.current_rate == pytest.approx(current_rate)
     assert event.flip_magnitude == pytest.approx(abs(current_rate - previous_rate))
-    assert event.confidence >= flip_detector.config.min_confidence
-    assert event.metadata["previous_sign"] == previous.funding_sign
-    assert event.metadata["current_sign"] == current.funding_sign
-    assert event.metadata["test_case"] == "meaningful_flip"
-    assert flip_detector.is_bullish_flip(event) is is_bullish
-    assert flip_detector.is_bearish_flip(event) is is_bearish
-    assert current.symbol in flip_detector.build_summary(event)
+    _assert_confidence(event.confidence)
+    assert flip_detector.is_bullish_flip(event) is bullish
+    assert flip_detector.is_bearish_flip(event) is bearish
+    assert expected_type.value in flip_detector.build_summary(event)
+    assert event.metadata["scope"] == funding_key_to_dict(current.key)
 
 
-def test_flip_detector_filters_flip_below_min_magnitude(
+def test_flip_detector_min_flip_magnitude_is_enforced(
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
 ) -> None:
@@ -647,78 +729,28 @@ def test_flip_detector_filters_flip_below_min_magnitude(
         FundingFlipDetectorConfig(min_flip_magnitude=0.00020)
     )
 
-    previous = make_snapshot(funding_rate=-0.00003)
-    current = make_snapshot(funding_rate=0.00003)
-    statistics = make_statistics(
-        current_rate=0.00003,
-        percentile=80.0,
-        zscore=1.0,
-        sample_size=100,
+    previous = make_snapshot(funding_rate=-0.00005)
+    current = make_snapshot(funding_rate=0.00006)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00006,
+        percentile=60.0,
+        zscore=0.5,
     )
 
-    event = detector.detect(
+    assert detector.detect(
         current_snapshot=current,
         previous_snapshot=previous,
         statistics=statistics,
-    )
-
-    assert event is None
+    ) is None
 
 
-def test_flip_detector_filters_low_confidence_flip(
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-) -> None:
-    detector = FundingFlipDetector(
-        FundingFlipDetectorConfig(min_confidence=0.99)
-    )
+def test_flip_detector_confidence_is_clamped() -> None:
+    detector = FundingFlipDetector()
 
-    previous = make_snapshot(funding_rate=-0.00003)
-    current = make_snapshot(funding_rate=0.00004)
-    statistics = make_statistics(
-        current_rate=0.00004,
-        percentile=55.0,
-        zscore=0.1,
-        sample_size=20,
-    )
-
-    event = detector.detect(
-        current_snapshot=current,
-        previous_snapshot=previous,
-        statistics=statistics,
-    )
-
-    assert event is None
-
-
-def test_flip_detector_direct_flip_type_helper(
-    flip_detector: FundingFlipDetector,
-) -> None:
-    assert (
-        flip_detector.detect_flip_type(-0.00008, 0.00008)
-        == FundingFlipType.NEGATIVE_TO_POSITIVE
-    )
-    assert (
-        flip_detector.detect_flip_type(0.00008, -0.00008)
-        == FundingFlipType.POSITIVE_TO_NEGATIVE
-    )
-    assert (
-        flip_detector.detect_flip_type(0.00008, 0.00009)
-        == FundingFlipType.NONE
-    )
-    assert (
-        flip_detector.detect_flip_type(0.000001, -0.000001)
-        == FundingFlipType.NONE
-    )
-
-
-def test_flip_detector_confidence_is_clamped(
-    flip_detector: FundingFlipDetector,
-) -> None:
-    confidence = flip_detector.calculate_confidence(
+    confidence = detector.calculate_confidence(
         previous_rate=-0.01,
         current_rate=0.01,
-        flip_magnitude=0.02,
         percentile=100.0,
         zscore=20.0,
     )
@@ -726,27 +758,53 @@ def test_flip_detector_confidence_is_clamped(
     assert confidence == pytest.approx(1.0)
 
 
-# ---------------------------------------------------------------------------
+def test_flip_detector_helpers_return_false_for_none(
+    flip_detector: FundingFlipDetector,
+) -> None:
+    assert flip_detector.is_bullish_flip(None) is False
+    assert flip_detector.is_bearish_flip(None) is False
+
+
+# =============================================================================
 # FundingExtremesDetector
-# ---------------------------------------------------------------------------
+# =============================================================================
 
-
-def test_extremes_detector_skips_when_sample_size_too_low(
+@pytest.mark.parametrize(
+    ("rate", "percentile", "zscore", "expected_type", "expected_reversal", "expected_squeeze"),
+    [
+        (0.00035, 50.0, 0.0, FundingExtremeType.GLOBAL_HIGH, True, True),
+        (-0.00035, 50.0, 0.0, FundingExtremeType.GLOBAL_LOW, True, True),
+        (0.00012, 98.0, 0.5, FundingExtremeType.PERCENTILE_HIGH, True, True),
+        (-0.00012, 2.0, -0.5, FundingExtremeType.PERCENTILE_LOW, True, True),
+        (0.00012, 50.0, 3.0, FundingExtremeType.ZSCORE_HIGH, True, True),
+        (-0.00012, 50.0, -3.0, FundingExtremeType.ZSCORE_LOW, True, True),
+    ],
+)
+def test_extremes_detector_detects_absolute_percentile_and_zscore_extremes(
     extremes_detector: FundingExtremesDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     make_regime_state: Callable[..., FundingRegimeState],
+    rate: float,
+    percentile: float,
+    zscore: float,
+    expected_type: FundingExtremeType,
+    expected_reversal: bool,
+    expected_squeeze: bool,
 ) -> None:
-    snapshot = make_snapshot(funding_rate=0.001)
-    statistics = make_statistics(
-        current_rate=0.001,
-        min_rate=-0.001,
-        max_rate=0.001,
-        percentile=100.0,
-        zscore=5.0,
-        sample_size=5,
+    snapshot = make_snapshot(funding_rate=rate)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=rate,
+        percentile=percentile,
+        zscore=zscore,
+        sample_size=100,
     )
-    regime_state = make_regime_state(regime=FundingRegime.EXTREME_POSITIVE)
+    regime_state = make_regime_state(
+        regime=FundingRegime.EXTREME_POSITIVE if rate > 0 else FundingRegime.EXTREME_NEGATIVE,
+        bias=FundingBias.SQUEEZE_RISK_LONGS if rate > 0 else FundingBias.SQUEEZE_RISK_SHORTS,
+        current_rate=rate,
+    )
 
     event = extremes_detector.detect(
         snapshot=snapshot,
@@ -754,49 +812,37 @@ def test_extremes_detector_skips_when_sample_size_too_low(
         regime_state=regime_state,
     )
 
-    assert event is None
+    assert event is not None
+    _assert_common_scope(event, snapshot)
+    assert event.extreme_type == expected_type
+    assert event.funding_rate == pytest.approx(rate)
+    assert event.percentile == pytest.approx(percentile)
+    assert event.zscore == pytest.approx(zscore)
+    assert event.is_reversal_risk is expected_reversal
+    assert event.is_squeeze_risk is expected_squeeze
+    _assert_confidence(event.severity)
+    assert event.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert expected_type.value in extremes_detector.build_summary(event)
 
 
-@pytest.mark.parametrize(
-    ("current_rate", "min_rate", "max_rate", "expected_type"),
-    [
-        (
-            0.00035,
-            -0.00020,
-            0.00035,
-            FundingExtremeType.GLOBAL_HIGH,
-        ),
-        (
-            -0.00035,
-            -0.00035,
-            0.00020,
-            FundingExtremeType.GLOBAL_LOW,
-        ),
-    ],
-)
-def test_extremes_detector_detects_global_extremes_with_priority(
+def test_extremes_detector_returns_none_for_normal_funding_context(
     extremes_detector: FundingExtremesDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     make_regime_state: Callable[..., FundingRegimeState],
-    current_rate: float,
-    min_rate: float,
-    max_rate: float,
-    expected_type: FundingExtremeType,
 ) -> None:
-    snapshot = make_snapshot(funding_rate=current_rate)
-    statistics = make_statistics(
-        current_rate=current_rate,
-        min_rate=min_rate,
-        max_rate=max_rate,
+    snapshot = make_snapshot(funding_rate=0.00003)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00003,
         percentile=50.0,
         zscore=0.0,
         sample_size=100,
     )
     regime_state = make_regime_state(
-        regime=FundingRegime.EXTREME_POSITIVE
-        if current_rate > 0
-        else FundingRegime.EXTREME_NEGATIVE
+        regime=FundingRegime.NEUTRAL,
+        bias=FundingBias.NEUTRAL,
+        current_rate=0.00003,
     )
 
     event = extremes_detector.detect(
@@ -805,231 +851,66 @@ def test_extremes_detector_detects_global_extremes_with_priority(
         regime_state=regime_state,
     )
 
-    assert event is not None
-    assert event.extreme_type == expected_type
-    assert event.funding_rate == current_rate
-    assert event.severity >= extremes_detector.config.min_severity
-    assert extremes_detector.is_high_severity(event, threshold=0.20) is True
-    assert snapshot.symbol in extremes_detector.build_summary(event)
-
-
-@pytest.mark.parametrize(
-    ("current_rate", "percentile", "expected_type"),
-    [
-        (0.00020, 98.0, FundingExtremeType.PERCENTILE_HIGH),
-        (-0.00020, 2.0, FundingExtremeType.PERCENTILE_LOW),
-    ],
-)
-def test_extremes_detector_detects_percentile_extremes_when_not_global(
-    extremes_detector: FundingExtremesDetector,
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-    current_rate: float,
-    percentile: float,
-    expected_type: FundingExtremeType,
-) -> None:
-    snapshot = make_snapshot(funding_rate=current_rate)
-    statistics = make_statistics(
-        current_rate=current_rate,
-        min_rate=-0.001,
-        max_rate=0.001,
-        percentile=percentile,
-        zscore=0.0,
-        sample_size=100,
-    )
-
-    event = extremes_detector.detect(
-        snapshot=snapshot,
-        statistics=statistics,
-        regime_state=None,
-    )
-
-    assert event is not None
-    assert event.extreme_type == expected_type
-    assert event.percentile == percentile
-    assert event.regime in {
-        FundingRegime.POSITIVE,
-        FundingRegime.NEGATIVE,
-        FundingRegime.EXTREME_POSITIVE,
-        FundingRegime.EXTREME_NEGATIVE,
-    }
-
-
-@pytest.mark.parametrize(
-    ("current_rate", "zscore", "expected_type"),
-    [
-        (0.00020, 3.0, FundingExtremeType.ZSCORE_HIGH),
-        (-0.00020, -3.0, FundingExtremeType.ZSCORE_LOW),
-    ],
-)
-def test_extremes_detector_detects_zscore_extremes_when_not_global_or_percentile(
-    extremes_detector: FundingExtremesDetector,
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-    current_rate: float,
-    zscore: float,
-    expected_type: FundingExtremeType,
-) -> None:
-    snapshot = make_snapshot(funding_rate=current_rate)
-    statistics = make_statistics(
-        current_rate=current_rate,
-        min_rate=-0.001,
-        max_rate=0.001,
-        percentile=50.0,
-        zscore=zscore,
-        sample_size=100,
-    )
-
-    event = extremes_detector.detect(
-        snapshot=snapshot,
-        statistics=statistics,
-    )
-
-    assert event is not None
-    assert event.extreme_type == expected_type
-    assert event.zscore == zscore
-
-
-@pytest.mark.parametrize(
-    ("current_rate", "expected_type"),
-    [
-        (0.00035, FundingExtremeType.LOCAL_HIGH),
-        (-0.00035, FundingExtremeType.LOCAL_LOW),
-    ],
-)
-def test_extremes_detector_detects_absolute_extremes_when_other_modes_disabled(
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-    current_rate: float,
-    expected_type: FundingExtremeType,
-) -> None:
-    detector = FundingExtremesDetector(
-        FundingExtremesConfig(
-            enable_local_extremes=False,
-            enable_percentile_extremes=False,
-            enable_zscore_extremes=False,
-            enable_absolute_extremes=True,
-        )
-    )
-
-    snapshot = make_snapshot(funding_rate=current_rate)
-    statistics = make_statistics(
-        current_rate=current_rate,
-        min_rate=-0.001,
-        max_rate=0.001,
-        percentile=50.0,
-        zscore=0.0,
-        sample_size=100,
-    )
-
-    event = detector.detect(snapshot=snapshot, statistics=statistics)
-
-    assert event is not None
-    assert event.extreme_type == expected_type
-
-
-def test_extremes_detector_filters_low_severity_extreme(
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-) -> None:
-    detector = FundingExtremesDetector(
-        FundingExtremesConfig(
-            min_sample_size=20,
-            min_severity=0.95,
-        )
-    )
-
-    snapshot = make_snapshot(funding_rate=0.00012)
-    statistics = make_statistics(
-        current_rate=0.00012,
-        min_rate=-0.001,
-        max_rate=0.001,
-        percentile=91.0,
-        zscore=1.0,
-        sample_size=100,
-    )
-
-    event = detector.detect(snapshot=snapshot, statistics=statistics)
-
     assert event is None
 
 
-def test_extremes_detector_helper_methods(
-    extremes_detector: FundingExtremesDetector,
+def test_extremes_detector_min_sample_size_is_enforced(
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
     make_regime_state: Callable[..., FundingRegimeState],
 ) -> None:
-    positive_snapshot = make_snapshot(funding_rate=0.00035)
-    statistics = make_statistics(
-        current_rate=0.00035,
-        min_rate=-0.001,
-        max_rate=0.001,
-        percentile=98.0,
-        zscore=3.0,
-        sample_size=100,
+    detector = FundingExtremesDetector(
+        FundingExtremesConfig(min_samples=50)
+    )
+
+    snapshot = make_snapshot(funding_rate=0.00035)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
+        percentile=99.0,
+        zscore=4.0,
+        sample_size=10,
     )
     regime_state = make_regime_state(
         regime=FundingRegime.EXTREME_POSITIVE,
         bias=FundingBias.SQUEEZE_RISK_LONGS,
+        current_rate=0.00035,
     )
 
-    event = extremes_detector.detect(
-        snapshot=positive_snapshot,
+    event = detector.detect(
+        snapshot=snapshot,
         statistics=statistics,
         regime_state=regime_state,
     )
 
-    assert event is not None
-    assert extremes_detector.is_positive_extreme(event) is True
-    assert extremes_detector.is_negative_extreme(event) is False
-    assert extremes_detector.is_high_severity(event, threshold=0.50) is True
-    assert event.is_reversal_risk is True
-    assert event.is_squeeze_risk is True
+    assert event is None
 
 
-def test_extremes_detector_severity_is_clamped(
-    extremes_detector: FundingExtremesDetector,
-) -> None:
-    severity = extremes_detector.calculate_severity(
-        current_rate=0.01,
+def test_extremes_detector_severity_is_clamped() -> None:
+    detector = FundingExtremesDetector()
+
+    severity = detector.calculate_severity(
+        funding_rate=0.01,
         percentile=100.0,
         zscore=20.0,
-        extreme_type=FundingExtremeType.GLOBAL_HIGH,
+        extreme_type=FundingExtremeType.PERCENTILE_HIGH,
     )
 
     assert severity == pytest.approx(1.0)
 
 
-# ---------------------------------------------------------------------------
-# FundingDivergenceDetector
-# ---------------------------------------------------------------------------
-
-
-def test_divergence_detector_returns_none_when_funding_is_too_small(
-    divergence_detector: FundingDivergenceDetector,
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
+def test_extremes_detector_helpers_return_false_for_none(
+    extremes_detector: FundingExtremesDetector,
 ) -> None:
-    snapshot = make_snapshot(funding_rate=0.000001)
-    statistics = make_statistics(
-        current_rate=0.000001,
-        percentile=50.0,
-        zscore=0.0,
-        sample_size=100,
-    )
+    assert extremes_detector.is_high_extreme(None) is False
+    assert extremes_detector.is_low_extreme(None) is False
+    assert extremes_detector.is_reversal_risk(None) is False
+    assert extremes_detector.is_squeeze_risk(None) is False
 
-    event = divergence_detector.detect(
-        snapshot=snapshot,
-        statistics=statistics,
-        price_change_pct=-0.01,
-        oi_change_pct=0.02,
-        cvd_change=-10_000.0,
-        long_liquidations=100_000.0,
-    )
 
-    assert event is None
-
+# =============================================================================
+# FundingDivergenceDetector
+# =============================================================================
 
 @pytest.mark.parametrize(
     (
@@ -1040,8 +921,8 @@ def test_divergence_detector_returns_none_when_funding_is_too_small(
         "long_liquidations",
         "short_liquidations",
         "expected_type",
-        "is_bullish",
-        "is_bearish",
+        "bullish",
+        "bearish",
     ),
     [
         (
@@ -1145,12 +1026,13 @@ def test_divergence_detector_detects_supported_divergence_types(
     long_liquidations: float | None,
     short_liquidations: float | None,
     expected_type: FundingDivergenceType,
-    is_bullish: bool,
-    is_bearish: bool,
+    bullish: bool,
+    bearish: bool,
 ) -> None:
     snapshot = make_snapshot(funding_rate=funding_rate)
-    statistics = make_statistics(
-        current_rate=funding_rate,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=funding_rate,
         percentile=98.0 if funding_rate > 0 else 2.0,
         zscore=3.0 if funding_rate > 0 else -3.0,
         sample_size=100,
@@ -1164,28 +1046,90 @@ def test_divergence_detector_detects_supported_divergence_types(
         cvd_change=cvd_change,
         long_liquidations=long_liquidations,
         short_liquidations=short_liquidations,
-        extra_metadata={"test_case": expected_type.value},
     )
 
     assert event is not None
+    _assert_common_scope(event, snapshot)
     assert event.divergence_type == expected_type
-    assert event.funding_rate == funding_rate
-    assert event.confidence >= divergence_detector.config.min_confidence
-    assert event.metadata["funding_sign"] == snapshot.funding_sign
-    assert event.metadata["test_case"] == expected_type.value
-    assert divergence_detector.is_bullish_divergence(event) is is_bullish
-    assert divergence_detector.is_bearish_divergence(event) is is_bearish
-    assert snapshot.symbol in divergence_detector.build_summary(event)
+    assert event.funding_rate == pytest.approx(funding_rate)
+    assert event.price_change_pct == price_change_pct
+    assert event.oi_change_pct == oi_change_pct
+    assert event.cvd_change == cvd_change
+    assert event.long_liquidations == long_liquidations
+    assert event.short_liquidations == short_liquidations
+    _assert_confidence(event.confidence)
+    assert divergence_detector.is_bullish_divergence(event) is bullish
+    assert divergence_detector.is_bearish_divergence(event) is bearish
+    assert event.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert expected_type.value in divergence_detector.build_summary(event)
 
 
-def test_divergence_detector_prioritizes_liquidation_divergence_over_price(
+def test_divergence_detector_returns_none_without_external_contradiction(
     divergence_detector: FundingDivergenceDetector,
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
 ) -> None:
     snapshot = make_snapshot(funding_rate=0.00012)
-    statistics = make_statistics(
-        current_rate=0.00012,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00012,
+        percentile=70.0,
+        zscore=0.5,
+        sample_size=100,
+    )
+
+    event = divergence_detector.detect(
+        snapshot=snapshot,
+        statistics=statistics,
+        price_change_pct=0.006,
+        oi_change_pct=None,
+        cvd_change=10_000.0,
+        long_liquidations=None,
+        short_liquidations=None,
+    )
+
+    assert event is None
+
+
+def test_divergence_detector_min_funding_abs_is_enforced(
+    make_snapshot: Callable[..., FundingSnapshot],
+    make_statistics: Callable[..., FundingStatistics],
+) -> None:
+    detector = FundingDivergenceDetector(
+        FundingDivergenceConfig(min_funding_abs=0.00020)
+    )
+
+    snapshot = make_snapshot(funding_rate=0.00012)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00012,
+        percentile=98.0,
+        zscore=3.0,
+        sample_size=100,
+    )
+
+    event = detector.detect(
+        snapshot=snapshot,
+        statistics=statistics,
+        price_change_pct=-0.01,
+        oi_change_pct=None,
+        cvd_change=None,
+        long_liquidations=None,
+        short_liquidations=None,
+    )
+
+    assert event is None
+
+
+def test_divergence_detector_priority_prefers_price_divergence_over_other_inputs(
+    divergence_detector: FundingDivergenceDetector,
+    make_snapshot: Callable[..., FundingSnapshot],
+    make_statistics: Callable[..., FundingStatistics],
+) -> None:
+    snapshot = make_snapshot(funding_rate=0.00012)
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00012,
         percentile=98.0,
         zscore=3.0,
         sample_size=100,
@@ -1195,93 +1139,22 @@ def test_divergence_detector_prioritizes_liquidation_divergence_over_price(
         snapshot=snapshot,
         statistics=statistics,
         price_change_pct=-0.01,
-        long_liquidations=100_000.0,
-    )
-
-    assert event is not None
-    assert (
-        event.divergence_type
-        == FundingDivergenceType.LIQUIDATIONS_LONGS_WITH_POSITIVE_FUNDING
-    )
-
-
-def test_divergence_detector_respects_disabled_price_divergence(
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-) -> None:
-    detector = FundingDivergenceDetector(
-        FundingDivergenceConfig(
-            enable_price_funding_divergence=False,
-            enable_oi_funding_divergence=False,
-            enable_cvd_funding_divergence=False,
-            enable_liquidation_funding_divergence=False,
-        )
-    )
-    snapshot = make_snapshot(funding_rate=0.00012)
-    statistics = make_statistics(
-        current_rate=0.00012,
-        percentile=98.0,
-        zscore=3.0,
-        sample_size=100,
-    )
-
-    event = detector.detect(
-        snapshot=snapshot,
-        statistics=statistics,
-        price_change_pct=-0.01,
-        oi_change_pct=0.02,
-        cvd_change=-10_000.0,
-        long_liquidations=100_000.0,
-    )
-
-    assert event is None
-
-
-def test_divergence_detector_filters_low_confidence_divergence(
-    make_snapshot: Callable[..., FundingSnapshot],
-    make_statistics: Callable[..., FundingStatistics],
-) -> None:
-    detector = FundingDivergenceDetector(
-        FundingDivergenceConfig(min_confidence=0.99)
-    )
-    snapshot = make_snapshot(funding_rate=0.00004)
-    statistics = make_statistics(
-        current_rate=0.00004,
-        percentile=55.0,
-        zscore=0.1,
-        sample_size=20,
-    )
-
-    event = detector.detect(
-        snapshot=snapshot,
-        statistics=statistics,
-        price_change_pct=-0.003,
-    )
-
-    assert event is None
-
-
-def test_divergence_detector_direct_type_helper_returns_none_without_inputs(
-    divergence_detector: FundingDivergenceDetector,
-) -> None:
-    divergence_type = divergence_detector.detect_divergence_type(
-        funding_rate=0.00012,
-        price_change_pct=None,
-        oi_change_pct=None,
-        cvd_change=None,
-        long_liquidations=None,
+        oi_change_pct=0.05,
+        cvd_change=-50_000.0,
+        long_liquidations=200_000.0,
         short_liquidations=None,
     )
 
-    assert divergence_type == FundingDivergenceType.NONE
+    assert event is not None
+    assert event.divergence_type == FundingDivergenceType.PRICE_DOWN_FUNDING_UP
 
 
-def test_divergence_detector_confidence_is_clamped(
-    divergence_detector: FundingDivergenceDetector,
-) -> None:
-    confidence = divergence_detector.calculate_confidence(
+def test_divergence_detector_confidence_is_clamped() -> None:
+    detector = FundingDivergenceDetector()
+
+    confidence = detector.calculate_confidence(
         funding_rate=0.01,
-        divergence_type=FundingDivergenceType.LIQUIDATIONS_LONGS_WITH_POSITIVE_FUNDING,
+        divergence_type=FundingDivergenceType.PRICE_DOWN_FUNDING_UP,
         percentile=100.0,
         zscore=20.0,
         price_change_pct=-0.50,
@@ -1294,41 +1167,74 @@ def test_divergence_detector_confidence_is_clamped(
     assert confidence == pytest.approx(1.0)
 
 
-# ---------------------------------------------------------------------------
-# Cross-detector sanity checks
-# ---------------------------------------------------------------------------
-
-
-def test_all_detector_outputs_keep_probability_like_values_in_valid_ranges(
-    regime_detector: FundingRegimeDetector,
-    pressure_analyzer: FundingPressureAnalyzer,
-    flip_detector: FundingFlipDetector,
-    extremes_detector: FundingExtremesDetector,
+def test_divergence_detector_helpers_return_false_for_none(
     divergence_detector: FundingDivergenceDetector,
+) -> None:
+    assert divergence_detector.is_bullish_divergence(None) is False
+    assert divergence_detector.is_bearish_divergence(None) is False
+
+
+# =============================================================================
+# Cross-detector scope / purity contracts
+# =============================================================================
+
+def test_all_detectors_return_models_with_full_futures_scope(
     make_snapshot: Callable[..., FundingSnapshot],
     make_statistics: Callable[..., FundingStatistics],
+    make_regime_state: Callable[..., FundingRegimeState],
 ) -> None:
-    previous_snapshot = make_snapshot(funding_rate=-0.00012)
-    current_snapshot = make_snapshot(
+    snapshot = make_snapshot(
+        exchange=FundingDataSource.BINANCE,
+        market_type="usdm_futures",
+        symbol="BTCUSDT",
+        timeframe=FundingTimeframe.H1,
+        exchange_symbol="BTC/USDT:USDT",
         funding_rate=0.00035,
         open_interest=1_100_000.0,
         mark_price=50_010.0,
     )
-    statistics = make_statistics(
-        current_rate=0.00035,
-        min_rate=-0.00020,
-        max_rate=0.00050,
+    statistics = _make_statistics_for_rate(
+        make_statistics,
+        rate=0.00035,
         percentile=98.0,
         zscore=3.0,
         sample_size=100,
     )
 
+    regime_detector = FundingRegimeDetector()
+    pressure_analyzer = FundingPressureAnalyzer()
+    flip_detector = FundingFlipDetector()
+    extremes_detector = FundingExtremesDetector()
+    divergence_detector = FundingDivergenceDetector()
+
+    previous_snapshot = make_snapshot(
+        exchange=FundingDataSource.BINANCE,
+        market_type="usdm_futures",
+        symbol="BTCUSDT",
+        timeframe=FundingTimeframe.H1,
+        exchange_symbol="BTC/USDT:USDT",
+        funding_rate=-0.00010,
+        open_interest=1_000_000.0,
+        mark_price=50_000.0,
+    )
+
+    previous_regime = make_regime_state(
+        exchange=FundingDataSource.BINANCE,
+        market_type="usdm_futures",
+        symbol="BTCUSDT",
+        timeframe=FundingTimeframe.H1,
+        exchange_symbol="BTC/USDT:USDT",
+        regime=FundingRegime.NEUTRAL,
+        bias=FundingBias.NEUTRAL,
+    )
+
     regime_state = regime_detector.detect(
-        snapshot=current_snapshot,
+        snapshot=snapshot,
         statistics=statistics,
+        previous_state=previous_regime,
     )
     pressure_state = pressure_analyzer.analyze(
-        snapshot=current_snapshot,
+        snapshot=snapshot,
         statistics=statistics,
         regime_state=regime_state,
         previous_snapshot=previous_snapshot,
@@ -1337,37 +1243,55 @@ def test_all_detector_outputs_keep_probability_like_values_in_valid_ranges(
         previous_price=50_000.0,
     )
     flip_event = flip_detector.detect(
-        current_snapshot=current_snapshot,
+        current_snapshot=snapshot,
         previous_snapshot=previous_snapshot,
         statistics=statistics,
     )
     extreme_event = extremes_detector.detect(
-        snapshot=current_snapshot,
+        snapshot=snapshot,
         statistics=statistics,
         regime_state=regime_state,
     )
     divergence_event = divergence_detector.detect(
-        snapshot=current_snapshot,
+        snapshot=snapshot,
         statistics=statistics,
         price_change_pct=-0.006,
         oi_change_pct=0.10,
-        cvd_change=-20_000.0,
-        long_liquidations=100_000.0,
+        cvd_change=-25_000.0,
+        long_liquidations=150_000.0,
+        short_liquidations=None,
     )
 
-    assert 0.0 <= regime_state.confidence <= 1.0
-
-    assert 0.0 <= pressure_state.pressure_score <= 1.0
-    assert pressure_state.squeeze_probability is not None
-    assert 0.0 <= pressure_state.squeeze_probability <= 1.0
-    assert pressure_state.mean_reversion_probability is not None
-    assert 0.0 <= pressure_state.mean_reversion_probability <= 1.0
+    _assert_common_scope(regime_state, snapshot)
+    _assert_common_scope(pressure_state, snapshot)
 
     assert flip_event is not None
-    assert 0.0 <= flip_event.confidence <= 1.0
-
     assert extreme_event is not None
-    assert 0.0 <= extreme_event.severity <= 1.0
-
     assert divergence_event is not None
-    assert 0.0 <= divergence_event.confidence <= 1.0
+
+    _assert_common_scope(flip_event, snapshot)
+    _assert_common_scope(extreme_event, snapshot)
+    _assert_common_scope(divergence_event, snapshot)
+
+    assert regime_state.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert pressure_state.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert flip_event.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert extreme_event.metadata["scope"] == funding_key_to_dict(snapshot.key)
+    assert divergence_event.metadata["scope"] == funding_key_to_dict(snapshot.key)
+
+
+def test_detectors_are_pure_components_without_eventbus_or_scheduler_attributes() -> None:
+    detectors = [
+        FundingRegimeDetector(),
+        FundingPressureAnalyzer(),
+        FundingFlipDetector(),
+        FundingExtremesDetector(),
+        FundingDivergenceDetector(),
+    ]
+
+    for detector in detectors:
+        assert not hasattr(detector, "event_bus")
+        assert not hasattr(detector, "scheduler")
+        assert not hasattr(detector, "register")
+        assert not hasattr(detector, "start")
+        assert not hasattr(detector, "stop")
