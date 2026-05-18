@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.logger import get_logger
+
 from .enums import (
     FundingBias,
     FundingPressureDirection,
@@ -15,78 +16,213 @@ from .models import (
     FundingRegimeState,
     FundingSnapshot,
     FundingStatistics,
+    funding_key_to_dict,
 )
 
 
 @dataclass(slots=True)
 class FundingPressureConfig:
     """
-    Конфігурація аналізатора funding pressure.
+    Конфігурація pure analyzer-а funding pressure.
 
-    Pressure тут трактується як міра перекосу та скупчення позиціонування,
-    яке може призводити до:
-    - squeeze
-    - crowding
-    - pain move
-    - mean reversion
+    FundingPressureAnalyzer не є runtime-компонентом:
+    - не слухає EventBus;
+    - не має Scheduler jobs;
+    - не читає exchange/data cache напряму;
+    - не зберігає історію.
+
+    Runtime orchestration виконує FundingAnalyzer.
     """
 
     default_timeframe: FundingTimeframe = FundingTimeframe.H1
 
-    # Абсолютні пороги funding magnitude
+    # Абсолютні пороги funding magnitude.
     neutral_abs_threshold: float = 0.00001
     elevated_abs_threshold: float = 0.00008
     extreme_abs_threshold: float = 0.00030
 
-    # Порогові значення рівнів pressure score
+    # Pressure score thresholds.
     moderate_pressure_score_threshold: float = 0.45
     high_pressure_score_threshold: float = 0.70
     extreme_pressure_score_threshold: float = 0.90
 
-    # Додаткові пороги
+    # Distribution thresholds.
     crowded_percentile_threshold: float = 85.0
     squeeze_percentile_threshold: float = 95.0
     elevated_zscore_threshold: float = 1.5
     extreme_zscore_threshold: float = 2.5
 
-    # Price stall detection
+    # Price/OI context thresholds.
     price_stall_threshold_pct: float = 0.0010
-
-    # OI growth detection
     oi_growth_threshold_pct: float = 0.005
 
-    # Ваги скорингу
+    # Pressure score weights.
     weight_magnitude: float = 0.30
     weight_percentile: float = 0.25
     weight_zscore: float = 0.15
     weight_oi_confirmation: float = 0.15
     weight_price_stall: float = 0.15
 
-    # Ваги ймовірностей
+    # Squeeze probability weights.
     squeeze_pressure_weight: float = 0.50
     squeeze_percentile_weight: float = 0.20
     squeeze_oi_weight: float = 0.15
     squeeze_stall_weight: float = 0.15
 
+    # Mean-reversion probability weights.
     mean_reversion_pressure_weight: float = 0.45
     mean_reversion_percentile_weight: float = 0.20
     mean_reversion_zscore_weight: float = 0.20
     mean_reversion_stall_weight: float = 0.15
 
+    service_name: str = "funding_pressure_analyzer"
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.neutral_abs_threshold < 0:
+            raise ValueError("neutral_abs_threshold must be >= 0")
+        if self.elevated_abs_threshold < 0:
+            raise ValueError("elevated_abs_threshold must be >= 0")
+        if self.extreme_abs_threshold < 0:
+            raise ValueError("extreme_abs_threshold must be >= 0")
+
+        if self.neutral_abs_threshold > self.elevated_abs_threshold:
+            raise ValueError("neutral_abs_threshold must be <= elevated_abs_threshold")
+        if self.elevated_abs_threshold > self.extreme_abs_threshold:
+            raise ValueError("elevated_abs_threshold must be <= extreme_abs_threshold")
+
+        self._validate_ratio(
+            "moderate_pressure_score_threshold",
+            self.moderate_pressure_score_threshold,
+        )
+        self._validate_ratio(
+            "high_pressure_score_threshold",
+            self.high_pressure_score_threshold,
+        )
+        self._validate_ratio(
+            "extreme_pressure_score_threshold",
+            self.extreme_pressure_score_threshold,
+        )
+
+        if self.moderate_pressure_score_threshold > self.high_pressure_score_threshold:
+            raise ValueError(
+                "moderate_pressure_score_threshold must be <= high_pressure_score_threshold"
+            )
+        if self.high_pressure_score_threshold > self.extreme_pressure_score_threshold:
+            raise ValueError(
+                "high_pressure_score_threshold must be <= extreme_pressure_score_threshold"
+            )
+
+        self._validate_percentile(
+            "crowded_percentile_threshold",
+            self.crowded_percentile_threshold,
+        )
+        self._validate_percentile(
+            "squeeze_percentile_threshold",
+            self.squeeze_percentile_threshold,
+        )
+
+        if self.crowded_percentile_threshold > self.squeeze_percentile_threshold:
+            raise ValueError(
+                "crowded_percentile_threshold must be <= squeeze_percentile_threshold"
+            )
+
+        if self.elevated_zscore_threshold < 0:
+            raise ValueError("elevated_zscore_threshold must be >= 0")
+        if self.extreme_zscore_threshold < 0:
+            raise ValueError("extreme_zscore_threshold must be >= 0")
+        if self.elevated_zscore_threshold > self.extreme_zscore_threshold:
+            raise ValueError("elevated_zscore_threshold must be <= extreme_zscore_threshold")
+
+        if self.price_stall_threshold_pct < 0:
+            raise ValueError("price_stall_threshold_pct must be >= 0")
+        if self.oi_growth_threshold_pct < 0:
+            raise ValueError("oi_growth_threshold_pct must be >= 0")
+
+        self._validate_weight_group(
+            {
+                "weight_magnitude": self.weight_magnitude,
+                "weight_percentile": self.weight_percentile,
+                "weight_zscore": self.weight_zscore,
+                "weight_oi_confirmation": self.weight_oi_confirmation,
+                "weight_price_stall": self.weight_price_stall,
+            },
+            expected_sum=1.0,
+        )
+
+        self._validate_weight_group(
+            {
+                "squeeze_pressure_weight": self.squeeze_pressure_weight,
+                "squeeze_percentile_weight": self.squeeze_percentile_weight,
+                "squeeze_oi_weight": self.squeeze_oi_weight,
+                "squeeze_stall_weight": self.squeeze_stall_weight,
+            },
+            expected_sum=1.0,
+        )
+
+        self._validate_weight_group(
+            {
+                "mean_reversion_pressure_weight": self.mean_reversion_pressure_weight,
+                "mean_reversion_percentile_weight": self.mean_reversion_percentile_weight,
+                "mean_reversion_zscore_weight": self.mean_reversion_zscore_weight,
+                "mean_reversion_stall_weight": self.mean_reversion_stall_weight,
+            },
+            expected_sum=1.0,
+        )
+
+    @staticmethod
+    def _validate_ratio(name: str, value: float) -> None:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1]")
+
+    @staticmethod
+    def _validate_percentile(name: str, value: float) -> None:
+        if not 0.0 <= value <= 100.0:
+            raise ValueError(f"{name} must be in [0, 100]")
+
+    @staticmethod
+    def _validate_weight_group(
+        values: dict[str, float],
+        *,
+        expected_sum: float,
+    ) -> None:
+        for name, value in values.items():
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0")
+
+        total = sum(values.values())
+        if abs(total - expected_sum) > 1e-9:
+            names = ", ".join(values.keys())
+            raise ValueError(f"weights must sum to {expected_sum}: {names}")
+
 
 class FundingPressureAnalyzer:
     """
-    Аналізатор funding pressure.
+    Pure analyzer для funding pressure.
 
-    Клас відповідає за побудову FundingPressureState на основі:
-    - snapshot
-    - statistics
-    - regime state
-    - OI context
-    - price context
+    Відповідальність:
+    - будує FundingPressureState на основі snapshot/statistics/regime/context;
+    - оцінює OI confirmation;
+    - оцінює price stall;
+    - рахує pressure_score;
+    - оцінює squeeze_probability;
+    - оцінює mean_reversion_probability;
+    - повертає FundingPressureState з повним futures scope.
 
-    Він не працює з EventBus і не зберігає історію —
-    це pure analytics/service layer для FundingAnalyzer.
+    Correct architecture:
+        FundingAnalyzer
+            -> FundingPressureAnalyzer.analyze(...)
+            -> FundingPressureState
+            -> FundingAnalyzer публікує analytics.funding.*
+
+    Важливо:
+    - не слухає EventBus;
+    - не публікує EventBus events;
+    - не має Scheduler jobs;
+    - не читає exchange/data caches напряму;
+    - не зберігає історію самостійно.
     """
 
     def __init__(
@@ -94,7 +230,13 @@ class FundingPressureAnalyzer:
         config: FundingPressureConfig | None = None,
     ) -> None:
         self.config = config or FundingPressureConfig()
-        self.logger = get_logger(__name__)
+        self.config.validate()
+
+        self.logger = get_logger(
+            __name__,
+            service_name=self.config.service_name,
+            event_type="funding_pressure_analyzer",
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -115,32 +257,24 @@ class FundingPressureAnalyzer:
         """
         Побудова FundingPressureState для поточного funding snapshot.
 
-        Parameters
-        ----------
-        snapshot:
-            Поточний funding snapshot.
-        statistics:
-            Статистика funding на вікні історії.
-        regime_state:
-            Поточний regime state.
-        previous_snapshot:
-            Попередній funding snapshot для додаткового контексту.
-        previous_open_interest:
-            Попереднє значення OI.
-        current_price:
-            Поточна ціна.
-        previous_price:
-            Попередня ціна.
-        timeframe:
-            Таймфрейм аналізу.
-        extra_metadata:
-            Додаткові службові поля metadata.
+        Очікується, що snapshot/statistics/regime_state належать одному scope:
+            exchange + market_type + symbol + timeframe
 
-        Returns
-        -------
-        FundingPressureState
+        FundingAnalyzer відповідає за:
+        - EventBus subscriptions;
+        - context cache;
+        - previous_snapshot;
+        - previous_open_interest;
+        - publish output events.
         """
-        tf = timeframe or statistics.timeframe or self.config.default_timeframe
+        self._validate_input_scope(
+            snapshot=snapshot,
+            statistics=statistics,
+            regime_state=regime_state,
+            previous_snapshot=previous_snapshot,
+        )
+
+        tf = timeframe or statistics.timeframe or snapshot.timeframe or self.config.default_timeframe
 
         oi_confirmation, oi_change_pct = self._detect_oi_confirmation(
             current_open_interest=snapshot.open_interest,
@@ -148,9 +282,19 @@ class FundingPressureAnalyzer:
         )
 
         price_stall_confirmation, price_change_pct = self._detect_price_stall(
-            current_price=current_price if current_price is not None else snapshot.mark_price,
-            previous_price=previous_price if previous_price is not None else (
-                previous_snapshot.mark_price if previous_snapshot else None
+            current_price=(
+                current_price
+                if current_price is not None
+                else snapshot.mark_price
+            ),
+            previous_price=(
+                previous_price
+                if previous_price is not None
+                else (
+                    previous_snapshot.mark_price
+                    if previous_snapshot is not None
+                    else None
+                )
             ),
         )
 
@@ -188,8 +332,11 @@ class FundingPressureAnalyzer:
         )
 
         metadata: dict[str, Any] = {
+            "scope": funding_key_to_dict(snapshot.key),
+            "exchange_symbol": snapshot.exchange_symbol,
             "regime": regime_state.regime.value,
             "regime_confidence": regime_state.confidence,
+            "regime_bias": regime_state.bias.value,
             "percentile": statistics.percentile,
             "zscore": statistics.zscore,
             "sample_size": statistics.sample_size,
@@ -198,11 +345,29 @@ class FundingPressureAnalyzer:
             "magnitude_score": magnitude_score,
             "percentile_score": percentile_score,
             "zscore_score": zscore_score,
+            "current_open_interest": snapshot.open_interest,
+            "previous_open_interest": previous_open_interest,
+            "current_price": (
+                current_price
+                if current_price is not None
+                else snapshot.mark_price
+            ),
+            "previous_price": (
+                previous_price
+                if previous_price is not None
+                else (
+                    previous_snapshot.mark_price
+                    if previous_snapshot is not None
+                    else None
+                )
+            ),
         }
 
         if previous_snapshot is not None:
             metadata["previous_funding_rate"] = previous_snapshot.funding_rate
-            metadata["funding_rate_delta"] = snapshot.funding_rate - previous_snapshot.funding_rate
+            metadata["funding_rate_delta"] = (
+                snapshot.funding_rate - previous_snapshot.funding_rate
+            )
 
         if extra_metadata:
             metadata.update(extra_metadata)
@@ -210,7 +375,9 @@ class FundingPressureAnalyzer:
         state = FundingPressureState(
             symbol=snapshot.symbol,
             exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
             timeframe=tf,
+            exchange_symbol=snapshot.exchange_symbol,
             direction=direction,
             level=level,
             bias=self._resolve_pressure_bias(regime_state, direction, level),
@@ -225,18 +392,28 @@ class FundingPressureAnalyzer:
         )
 
         self.logger.debug(
-            "Funding pressure analyzed: symbol=%s exchange=%s level=%s direction=%s "
-            "score=%.4f squeeze_prob=%.4f mean_reversion_prob=%.4f "
-            "oi_confirmation=%s price_stall=%s",
-            state.symbol,
+            "Funding pressure analyzed | exchange=%s market_type=%s symbol=%s "
+            "timeframe=%s level=%s direction=%s score=%.4f squeeze_prob=%.4f "
+            "mean_reversion_prob=%.4f oi_confirmation=%s price_stall=%s",
             state.exchange.value,
+            state.market_type,
+            state.symbol,
+            state.timeframe.value,
             state.level.value,
             state.direction.value,
             state.pressure_score,
             state.squeeze_probability if state.squeeze_probability is not None else 0.0,
-            state.mean_reversion_probability if state.mean_reversion_probability is not None else 0.0,
+            (
+                state.mean_reversion_probability
+                if state.mean_reversion_probability is not None
+                else 0.0
+            ),
             state.oi_confirmation,
             state.price_stall_confirmation,
+            extra={
+                "scope": funding_key_to_dict(state.key),
+                "exchange_symbol": state.exchange_symbol,
+            },
         )
 
         return state
@@ -269,20 +446,30 @@ class FundingPressureAnalyzer:
 
         if funding_rate > 0:
             return FundingPressureDirection.LONG
+
         if funding_rate < 0:
             return FundingPressureDirection.SHORT
+
         return FundingPressureDirection.NEUTRAL
 
-    def _detect_pressure_level(self, pressure_score: float) -> FundingPressureLevel:
+    def _detect_pressure_level(
+        self,
+        pressure_score: float,
+    ) -> FundingPressureLevel:
         """
         Визначає рівень funding pressure.
         """
+        pressure_score = self._clamp_0_1(pressure_score)
+
         if pressure_score >= self.config.extreme_pressure_score_threshold:
             return FundingPressureLevel.EXTREME
+
         if pressure_score >= self.config.high_pressure_score_threshold:
             return FundingPressureLevel.HIGH
+
         if pressure_score >= self.config.moderate_pressure_score_threshold:
             return FundingPressureLevel.MODERATE
+
         return FundingPressureLevel.LOW
 
     def _resolve_pressure_bias(
@@ -295,8 +482,7 @@ class FundingPressureAnalyzer:
         Остаточна інтерпретація bias для pressure state.
 
         Якщо regime вже дав сильний bias — зберігаємо його.
-        Якщо regime слабкий/neutral, але pressure direction є,
-        то підтягуємо bias із direction.
+        Якщо regime neutral, але pressure direction є, підтягуємо bias із direction.
         """
         if regime_state.bias != FundingBias.NEUTRAL:
             return regime_state.bias
@@ -333,7 +519,8 @@ class FundingPressureAnalyzer:
             return False, None
 
         oi_change_pct = (
-            (current_open_interest - previous_open_interest) / previous_open_interest
+            (float(current_open_interest) - float(previous_open_interest))
+            / float(previous_open_interest)
         )
 
         return oi_change_pct >= self.config.oi_growth_threshold_pct, oi_change_pct
@@ -347,14 +534,13 @@ class FundingPressureAnalyzer:
         Якщо funding/OI перегріваються, а ціна майже не рухається,
         це часто ознака накопичення pressure.
         """
-        if (
-            current_price is None
-            or previous_price is None
-            or previous_price <= 0
-        ):
+        if current_price is None or previous_price is None or previous_price <= 0:
             return False, None
 
-        price_change_pct = abs((current_price - previous_price) / previous_price)
+        price_change_pct = abs(
+            (float(current_price) - float(previous_price))
+            / float(previous_price)
+        )
         is_stalled = price_change_pct <= self.config.price_stall_threshold_pct
 
         return is_stalled, price_change_pct
@@ -375,17 +561,20 @@ class FundingPressureAnalyzer:
         Головний агрегований pressure score в діапазоні [0, 1].
         """
         score = (
-            self.config.weight_magnitude * magnitude_score
-            + self.config.weight_percentile * percentile_score
-            + self.config.weight_zscore * zscore_score
+            self.config.weight_magnitude * self._clamp_0_1(magnitude_score)
+            + self.config.weight_percentile * self._clamp_0_1(percentile_score)
+            + self.config.weight_zscore * self._clamp_0_1(zscore_score)
             + self.config.weight_oi_confirmation * float(oi_confirmation)
             + self.config.weight_price_stall * float(price_stall_confirmation)
         )
 
-        return max(0.0, min(1.0, score))
+        return self._clamp_0_1(score)
 
-    def _calc_magnitude_score(self, funding_rate: float) -> float:
-        abs_rate = abs(funding_rate)
+    def _calc_magnitude_score(
+        self,
+        funding_rate: float,
+    ) -> float:
+        abs_rate = abs(float(funding_rate))
 
         if abs_rate <= self.config.neutral_abs_threshold:
             return 0.0
@@ -395,21 +584,29 @@ class FundingPressureAnalyzer:
             1e-12,
         )
         normalized = (abs_rate - self.config.neutral_abs_threshold) / denominator
-        return max(0.0, min(1.0, normalized))
+        return self._clamp_0_1(normalized)
 
-    def _calc_percentile_score(self, percentile: float | None) -> float:
+    def _calc_percentile_score(
+        self,
+        percentile: float | None,
+    ) -> float:
         if percentile is None:
             return 0.0
 
-        distance_from_center = abs(percentile - 50.0) / 50.0
-        return max(0.0, min(1.0, distance_from_center))
+        normalized_percentile = self._clamp(float(percentile), 0.0, 100.0)
+        distance_from_center = abs(normalized_percentile - 50.0) / 50.0
+        return self._clamp_0_1(distance_from_center)
 
-    def _calc_zscore_score(self, zscore: float | None) -> float:
+    def _calc_zscore_score(
+        self,
+        zscore: float | None,
+    ) -> float:
         if zscore is None:
             return 0.0
 
-        normalized = abs(zscore) / max(self.config.extreme_zscore_threshold, 1e-12)
-        return max(0.0, min(1.0, normalized))
+        denominator = max(self.config.extreme_zscore_threshold, 1e-12)
+        normalized = abs(float(zscore)) / denominator
+        return self._clamp_0_1(normalized)
 
     # ------------------------------------------------------------------
     # Probability estimates
@@ -425,13 +622,13 @@ class FundingPressureAnalyzer:
         percentile_component = self._calc_percentile_score(percentile)
 
         probability = (
-            self.config.squeeze_pressure_weight * pressure_score
+            self.config.squeeze_pressure_weight * self._clamp_0_1(pressure_score)
             + self.config.squeeze_percentile_weight * percentile_component
             + self.config.squeeze_oi_weight * float(oi_confirmation)
             + self.config.squeeze_stall_weight * float(price_stall_confirmation)
         )
 
-        return max(0.0, min(1.0, probability))
+        return self._clamp_0_1(probability)
 
     def _estimate_mean_reversion_probability(
         self,
@@ -444,31 +641,50 @@ class FundingPressureAnalyzer:
         zscore_component = self._calc_zscore_score(zscore)
 
         probability = (
-            self.config.mean_reversion_pressure_weight * pressure_score
+            self.config.mean_reversion_pressure_weight * self._clamp_0_1(pressure_score)
             + self.config.mean_reversion_percentile_weight * percentile_component
             + self.config.mean_reversion_zscore_weight * zscore_component
             + self.config.mean_reversion_stall_weight * float(price_stall_confirmation)
         )
 
-        return max(0.0, min(1.0, probability))
+        return self._clamp_0_1(probability)
 
     # ------------------------------------------------------------------
     # Optional helper methods for analyzer / strategies
     # ------------------------------------------------------------------
 
-    def is_high_pressure(self, state: FundingPressureState) -> bool:
+    def is_high_pressure(
+        self,
+        state: FundingPressureState,
+    ) -> bool:
         return state.level in {
             FundingPressureLevel.HIGH,
             FundingPressureLevel.EXTREME,
         }
 
-    def is_long_crowded(self, state: FundingPressureState) -> bool:
-        return state.direction == FundingPressureDirection.LONG and self.is_high_pressure(state)
+    def is_long_crowded(
+        self,
+        state: FundingPressureState,
+    ) -> bool:
+        return (
+            state.direction == FundingPressureDirection.LONG
+            and self.is_high_pressure(state)
+        )
 
-    def is_short_crowded(self, state: FundingPressureState) -> bool:
-        return state.direction == FundingPressureDirection.SHORT and self.is_high_pressure(state)
+    def is_short_crowded(
+        self,
+        state: FundingPressureState,
+    ) -> bool:
+        return (
+            state.direction == FundingPressureDirection.SHORT
+            and self.is_high_pressure(state)
+        )
 
-    def is_squeeze_risk(self, state: FundingPressureState, threshold: float = 0.65) -> bool:
+    def is_squeeze_risk(
+        self,
+        state: FundingPressureState,
+        threshold: float = 0.65,
+    ) -> bool:
         if state.squeeze_probability is None:
             return False
         return state.squeeze_probability >= threshold
@@ -482,15 +698,83 @@ class FundingPressureAnalyzer:
             return False
         return state.mean_reversion_probability >= threshold
 
-    def build_summary(self, state: FundingPressureState) -> str:
+    def build_summary(
+        self,
+        state: FundingPressureState,
+    ) -> str:
         """
-        Короткий текстовий summary, корисний для signal layer / dashboard / logs.
+        Короткий summary для signal layer / dashboard / logs.
         """
+        squeeze_probability = (
+            state.squeeze_probability
+            if state.squeeze_probability is not None
+            else 0.0
+        )
+        mean_reversion_probability = (
+            state.mean_reversion_probability
+            if state.mean_reversion_probability is not None
+            else 0.0
+        )
+
         return (
-            f"Funding pressure for {state.symbol}: "
+            f"Funding pressure for "
+            f"{state.exchange.value}:{state.market_type}:{state.symbol}:{state.timeframe.value}: "
             f"level={state.level.value}, "
             f"direction={state.direction.value}, "
             f"score={state.pressure_score:.4f}, "
-            f"squeeze_probability={state.squeeze_probability:.4f} "
-            f"mean_reversion_probability={state.mean_reversion_probability:.4f}"
+            f"squeeze_probability={squeeze_probability:.4f}, "
+            f"mean_reversion_probability={mean_reversion_probability:.4f}"
         )
+
+    # ------------------------------------------------------------------
+    # Validation / helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_input_scope(
+        *,
+        snapshot: FundingSnapshot,
+        statistics: FundingStatistics,
+        regime_state: FundingRegimeState,
+        previous_snapshot: FundingSnapshot | None,
+    ) -> None:
+        """
+        Funding pressure не можна рахувати на змішаних scope-ах.
+
+        Всі основні моделі мають належати одному:
+            exchange + market_type + symbol + timeframe
+        """
+        if snapshot.key != statistics.key:
+            raise ValueError(
+                "FundingSnapshot and FundingStatistics scope mismatch: "
+                f"snapshot={funding_key_to_dict(snapshot.key)} "
+                f"statistics={funding_key_to_dict(statistics.key)}"
+            )
+
+        if snapshot.key != regime_state.key:
+            raise ValueError(
+                "FundingSnapshot and FundingRegimeState scope mismatch: "
+                f"snapshot={funding_key_to_dict(snapshot.key)} "
+                f"regime_state={funding_key_to_dict(regime_state.key)}"
+            )
+
+        if previous_snapshot is not None and snapshot.key != previous_snapshot.key:
+            raise ValueError(
+                "FundingSnapshot and previous_snapshot scope mismatch: "
+                f"snapshot={funding_key_to_dict(snapshot.key)} "
+                f"previous_snapshot={funding_key_to_dict(previous_snapshot.key)}"
+            )
+
+    @staticmethod
+    def _clamp_0_1(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, float(value)))
+
+
+__all__ = [
+    "FundingPressureConfig",
+    "FundingPressureAnalyzer",
+]

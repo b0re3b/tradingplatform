@@ -14,16 +14,21 @@ from .models import (
     FundingRegimeState,
     FundingSnapshot,
     FundingStatistics,
+    funding_key_to_dict,
 )
 
 
 @dataclass(slots=True)
 class FundingRegimeDetectorConfig:
     """
-    Конфігурація детектора funding regime.
+    Конфігурація pure detector-а funding regime.
 
-    Порогові значення можна потім винести у central Config,
-    але вже зараз клас повністю готовий до роботи.
+    Цей config не містить EventBus/Scheduler налаштувань, бо FundingRegimeDetector
+    не є runtime-компонентом. Runtime lifecycle, subscriptions і publish logic
+    належать FundingAnalyzer.
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     neutral_abs_threshold: float = 0.00001
@@ -39,21 +44,76 @@ class FundingRegimeDetectorConfig:
     min_confidence_for_change: float = 0.15
     default_timeframe: FundingTimeframe = FundingTimeframe.H1
 
+    service_name: str = "funding_regime_detector"
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.neutral_abs_threshold < 0:
+            raise ValueError("neutral_abs_threshold must be >= 0")
+
+        if self.positive_abs_threshold < 0:
+            raise ValueError("positive_abs_threshold must be >= 0")
+
+        if self.extreme_abs_threshold < 0:
+            raise ValueError("extreme_abs_threshold must be >= 0")
+
+        if self.neutral_abs_threshold > self.positive_abs_threshold:
+            raise ValueError(
+                "neutral_abs_threshold must be <= positive_abs_threshold"
+            )
+
+        if self.positive_abs_threshold > self.extreme_abs_threshold:
+            raise ValueError(
+                "positive_abs_threshold must be <= extreme_abs_threshold"
+            )
+
+        if not 0.0 <= self.crowded_percentile_threshold <= 100.0:
+            raise ValueError("crowded_percentile_threshold must be in [0, 100]")
+
+        if not 0.0 <= self.squeeze_percentile_threshold <= 100.0:
+            raise ValueError("squeeze_percentile_threshold must be in [0, 100]")
+
+        if self.crowded_percentile_threshold > self.squeeze_percentile_threshold:
+            raise ValueError(
+                "crowded_percentile_threshold must be <= squeeze_percentile_threshold"
+            )
+
+        if self.extreme_negative_zscore > 0:
+            raise ValueError("extreme_negative_zscore must be <= 0")
+
+        if self.extreme_positive_zscore < 0:
+            raise ValueError("extreme_positive_zscore must be >= 0")
+
+        if not 0.0 <= self.min_confidence_for_change <= 1.0:
+            raise ValueError("min_confidence_for_change must be in [0, 1]")
+
 
 class FundingRegimeDetector:
     """
-    Детектор режимів funding rate.
+    Pure detector для класифікації funding regime.
 
-    Основна відповідальність:
-    - інтерпретувати snapshot + statistics
-    - визначати regime
-    - визначати bias
-    - обчислювати confidence
-    - визначати факт regime change
-    - повертати FundingRegimeState
+    Відповідальність:
+    - інтерпретує FundingSnapshot + FundingStatistics;
+    - визначає FundingRegime;
+    - визначає FundingBias;
+    - рахує confidence;
+    - визначає changed / previous_regime;
+    - повертає FundingRegimeState з повним futures scope.
 
-    Клас не зберігає історію самостійно.
-    Історію та попередній state має підтримувати analyzer.
+    Correct architecture:
+        FundingAnalyzer
+            -> FundingRegimeDetector.detect(...)
+            -> FundingRegimeState
+            -> FundingAnalyzer публікує analytics.funding.*
+
+    Важливо:
+    - не слухає EventBus;
+    - не публікує EventBus events;
+    - не має Scheduler jobs;
+    - не читає exchange/data caches напряму;
+    - не зберігає історію самостійно.
     """
 
     def __init__(
@@ -61,11 +121,17 @@ class FundingRegimeDetector:
         config: FundingRegimeDetectorConfig | None = None,
     ) -> None:
         self.config = config or FundingRegimeDetectorConfig()
-        self.logger = get_logger(__name__)
+        self.config.validate()
 
-    # ---------------------------------------------------------------------
+        self.logger = get_logger(
+            __name__,
+            service_name=self.config.service_name,
+            event_type="funding_regime_detector",
+        )
+
+    # ------------------------------------------------------------------
     # Public API
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def detect(
         self,
@@ -78,24 +144,21 @@ class FundingRegimeDetector:
         """
         Побудова FundingRegimeState на основі snapshot + statistics.
 
-        Parameters
-        ----------
-        snapshot:
-            Поточний funding snapshot.
-        statistics:
-            Агрегована статистика по funding.
-        previous_state:
-            Попередній regime state для визначення changed / previous_regime.
-        timeframe:
-            Таймфрейм аналізу. Якщо не заданий, береться з config.
-        extra_metadata:
-            Додаткові службові поля для metadata.
+        Очікується, що snapshot і statistics вже належать одному scope:
+            exchange + market_type + symbol + timeframe
 
-        Returns
-        -------
-        FundingRegimeState
+        FundingAnalyzer відповідає за:
+        - збереження history;
+        - передачу previous_state;
+        - EventBus publish;
+        - cleanup.
         """
-        tf = timeframe or statistics.timeframe or self.config.default_timeframe
+        self._validate_snapshot_statistics_scope(
+            snapshot=snapshot,
+            statistics=statistics,
+        )
+
+        tf = timeframe or statistics.timeframe or snapshot.timeframe or self.config.default_timeframe
 
         regime = self.detect_regime(
             current_rate=snapshot.funding_rate,
@@ -124,6 +187,8 @@ class FundingRegimeDetector:
         )
 
         metadata: dict[str, Any] = {
+            "scope": funding_key_to_dict(snapshot.key),
+            "exchange_symbol": snapshot.exchange_symbol,
             "sample_size": statistics.sample_size,
             "mean_rate": statistics.mean_rate,
             "median_rate": statistics.median_rate,
@@ -133,6 +198,16 @@ class FundingRegimeDetector:
             "current_rate_abs": abs(snapshot.funding_rate),
             "basis": snapshot.basis,
             "funding_sign": snapshot.funding_sign,
+            "statistics_window_start": (
+                statistics.window_start.isoformat()
+                if statistics.window_start is not None
+                else None
+            ),
+            "statistics_window_end": (
+                statistics.window_end.isoformat()
+                if statistics.window_end is not None
+                else None
+            ),
         }
 
         if extra_metadata:
@@ -141,7 +216,9 @@ class FundingRegimeDetector:
         state = FundingRegimeState(
             symbol=snapshot.symbol,
             exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
             timeframe=tf,
+            exchange_symbol=snapshot.exchange_symbol,
             regime=regime,
             bias=bias,
             current_rate=snapshot.funding_rate,
@@ -156,10 +233,13 @@ class FundingRegimeDetector:
         )
 
         self.logger.debug(
-            "Funding regime detected: symbol=%s exchange=%s regime=%s bias=%s "
-            "rate=%.8f percentile=%s zscore=%s confidence=%.4f changed=%s",
-            state.symbol,
+            "Funding regime detected | exchange=%s market_type=%s symbol=%s "
+            "timeframe=%s regime=%s bias=%s rate=%.8f percentile=%s "
+            "zscore=%s confidence=%.4f changed=%s",
             state.exchange.value,
+            state.market_type,
+            state.symbol,
+            state.timeframe.value,
             state.regime.value,
             state.bias.value,
             state.current_rate,
@@ -167,6 +247,10 @@ class FundingRegimeDetector:
             f"{state.zscore:.4f}" if state.zscore is not None else "None",
             state.confidence,
             state.changed,
+            extra={
+                "scope": funding_key_to_dict(state.key),
+                "exchange_symbol": state.exchange_symbol,
+            },
         )
 
         return state
@@ -178,59 +262,45 @@ class FundingRegimeDetector:
         zscore: float | None,
     ) -> FundingRegime:
         """
-        Визначає режим funding.
+        Визначає funding regime.
 
         Пріоритет:
-        1. Percentile extremes
-        2. Z-score extremes
-        3. Absolute thresholds
+        1. percentile extremes;
+        2. z-score extremes;
+        3. absolute thresholds.
         """
-        abs_rate = abs(current_rate)
+        rate = float(current_rate)
+        abs_rate = abs(rate)
 
-        # 1. Percentile-based extremes
         if percentile is not None:
-            if (
-                current_rate > 0
-                and percentile >= self.config.squeeze_percentile_threshold
-            ):
+            percentile = self._clamp(percentile, 0.0, 100.0)
+
+            if rate > 0 and percentile >= self.config.squeeze_percentile_threshold:
                 return FundingRegime.EXTREME_POSITIVE
 
-            if (
-                current_rate < 0
-                and percentile <= (100.0 - self.config.squeeze_percentile_threshold)
-            ):
+            if rate < 0 and percentile <= (100.0 - self.config.squeeze_percentile_threshold):
                 return FundingRegime.EXTREME_NEGATIVE
 
-        # 2. Z-score-based extremes
         if zscore is not None:
-            if (
-                current_rate > 0
-                and zscore >= self.config.extreme_positive_zscore
-            ):
+            zscore = float(zscore)
+
+            if rate > 0 and zscore >= self.config.extreme_positive_zscore:
                 return FundingRegime.EXTREME_POSITIVE
 
-            if (
-                current_rate < 0
-                and zscore <= self.config.extreme_negative_zscore
-            ):
+            if rate < 0 and zscore <= self.config.extreme_negative_zscore:
                 return FundingRegime.EXTREME_NEGATIVE
 
-        # 3. Absolute thresholds
         if abs_rate <= self.config.neutral_abs_threshold:
             return FundingRegime.NEUTRAL
 
-        if current_rate > 0:
+        if rate > 0:
             if abs_rate >= self.config.extreme_abs_threshold:
                 return FundingRegime.EXTREME_POSITIVE
-            if abs_rate >= self.config.positive_abs_threshold:
-                return FundingRegime.POSITIVE
             return FundingRegime.POSITIVE
 
-        if current_rate < 0:
+        if rate < 0:
             if abs_rate >= self.config.extreme_abs_threshold:
                 return FundingRegime.EXTREME_NEGATIVE
-            if abs_rate >= self.config.positive_abs_threshold:
-                return FundingRegime.NEGATIVE
             return FundingRegime.NEGATIVE
 
         return FundingRegime.UNKNOWN
@@ -242,33 +312,49 @@ class FundingRegimeDetector:
         regime: FundingRegime,
     ) -> FundingBias:
         """
-        Визначає ринковий bias на основі funding regime та положення в розподілі.
+        Визначає ринковий bias на основі funding regime і позиції
+        в історичному розподілі.
+
+        Positive funding:
+            long crowding / long squeeze risk.
+
+        Negative funding:
+            short crowding / short squeeze risk.
         """
-        abs_rate = abs(current_rate)
+        rate = float(current_rate)
+        abs_rate = abs(rate)
 
         if regime == FundingRegime.NEUTRAL or abs_rate <= self.config.neutral_abs_threshold:
             return FundingBias.NEUTRAL
 
-        if current_rate > 0:
+        normalized_percentile = (
+            self._clamp(percentile, 0.0, 100.0)
+            if percentile is not None
+            else None
+        )
+
+        if rate > 0:
             if regime == FundingRegime.EXTREME_POSITIVE:
                 return FundingBias.SQUEEZE_RISK_LONGS
 
-            if percentile is not None:
-                if percentile >= self.config.squeeze_percentile_threshold:
+            if normalized_percentile is not None:
+                if normalized_percentile >= self.config.squeeze_percentile_threshold:
                     return FundingBias.SQUEEZE_RISK_LONGS
-                if percentile >= self.config.crowded_percentile_threshold:
+
+                if normalized_percentile >= self.config.crowded_percentile_threshold:
                     return FundingBias.OVERCROWDED_LONGS
 
             return FundingBias.LONG_BIAS
 
-        if current_rate < 0:
+        if rate < 0:
             if regime == FundingRegime.EXTREME_NEGATIVE:
                 return FundingBias.SQUEEZE_RISK_SHORTS
 
-            if percentile is not None:
-                if percentile <= (100.0 - self.config.squeeze_percentile_threshold):
+            if normalized_percentile is not None:
+                if normalized_percentile <= (100.0 - self.config.squeeze_percentile_threshold):
                     return FundingBias.SQUEEZE_RISK_SHORTS
-                if percentile <= (100.0 - self.config.crowded_percentile_threshold):
+
+                if normalized_percentile <= (100.0 - self.config.crowded_percentile_threshold):
                     return FundingBias.OVERCROWDED_SHORTS
 
             return FundingBias.SHORT_BIAS
@@ -283,13 +369,13 @@ class FundingRegimeDetector:
         sample_size: int,
     ) -> float:
         """
-        Обчислює впевненість у regime classification.
+        Обчислює confidence класифікації regime.
 
         Компоненти:
-        - absolute magnitude funding
-        - position in historical distribution
-        - z-score abnormality
-        - sample size quality
+        - absolute magnitude funding;
+        - position in historical distribution;
+        - z-score abnormality;
+        - sample size quality.
         """
         magnitude_score = self._calc_magnitude_score(current_rate)
         percentile_score = self._calc_percentile_score(percentile)
@@ -303,7 +389,7 @@ class FundingRegimeDetector:
             + 0.15 * sample_quality_score
         )
 
-        return max(0.0, min(1.0, confidence))
+        return self._clamp(confidence, 0.0, 1.0)
 
     def has_regime_changed(
         self,
@@ -312,8 +398,8 @@ class FundingRegimeDetector:
         confidence: float,
     ) -> bool:
         """
-        Визначає, чи є новий regime справжньою зміною,
-        а не шумом на межі порогів.
+        Визначає, чи є новий regime реальною зміною, а не шумом
+        на межі порогів.
         """
         if previous_state is None:
             return False
@@ -326,12 +412,12 @@ class FundingRegimeDetector:
 
         return True
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Internal scoring helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _calc_magnitude_score(self, current_rate: float) -> float:
-        abs_rate = abs(current_rate)
+        abs_rate = abs(float(current_rate))
 
         if abs_rate <= self.config.neutral_abs_threshold:
             return 0.0
@@ -341,29 +427,62 @@ class FundingRegimeDetector:
             1e-12,
         )
         normalized = (abs_rate - self.config.neutral_abs_threshold) / denominator
-        return max(0.0, min(1.0, normalized))
+        return self._clamp(normalized, 0.0, 1.0)
 
     def _calc_percentile_score(self, percentile: float | None) -> float:
         if percentile is None:
             return 0.0
 
-        distance_from_center = abs(percentile - 50.0) / 50.0
-        return max(0.0, min(1.0, distance_from_center))
+        normalized_percentile = self._clamp(float(percentile), 0.0, 100.0)
+        distance_from_center = abs(normalized_percentile - 50.0) / 50.0
+        return self._clamp(distance_from_center, 0.0, 1.0)
 
     def _calc_zscore_score(self, zscore: float | None) -> float:
         if zscore is None:
             return 0.0
 
-        normalized = abs(zscore) / 3.0
-        return max(0.0, min(1.0, normalized))
+        normalized = abs(float(zscore)) / 3.0
+        return self._clamp(normalized, 0.0, 1.0)
 
     def _calc_sample_quality_score(self, sample_size: int) -> float:
         """
-        Оцінка якості статистики по розміру історії.
+        Оцінка якості статистики за розміром історії.
         """
+        sample_size = max(0, int(sample_size))
+
         if sample_size <= 1:
             return 0.0
+
         if sample_size >= 100:
             return 1.0
 
-        return max(0.0, min(1.0, sample_size / 100.0))
+        return self._clamp(sample_size / 100.0, 0.0, 1.0)
+
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, float(value)))
+
+    @staticmethod
+    def _validate_snapshot_statistics_scope(
+        *,
+        snapshot: FundingSnapshot,
+        statistics: FundingStatistics,
+    ) -> None:
+        """
+        FundingAnalyzer має передавати snapshot/statistics одного scope.
+
+        Тут робимо fail-fast, бо змішування різних exchange/market_type/timeframe
+        у funding regime дасть некоректний сигнал для strategy.
+        """
+        if snapshot.key != statistics.key:
+            raise ValueError(
+                "FundingSnapshot and FundingStatistics scope mismatch: "
+                f"snapshot={funding_key_to_dict(snapshot.key)} "
+                f"statistics={funding_key_to_dict(statistics.key)}"
+            )
+
+
+__all__ = [
+    "FundingRegimeDetectorConfig",
+    "FundingRegimeDetector",
+]

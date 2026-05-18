@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping, TypeAlias
 
 from .enums import (
     FundingBias,
@@ -19,6 +19,19 @@ from .enums import (
 )
 
 
+DEFAULT_MARKET_TYPE = "perpetual"
+DEFAULT_EXCHANGE_SYMBOL = ""
+DEFAULT_TIMEFRAME = FundingTimeframe.H1
+
+FundingKey: TypeAlias = tuple[str, str, str, str]
+# exchange, market_type, symbol, timeframe
+
+
+# =============================================================================
+# Time helpers
+# =============================================================================
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -29,14 +42,277 @@ def ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+# =============================================================================
+# Scope / normalization helpers
+# =============================================================================
+
+
+def normalize_symbol(symbol: object) -> str:
+    value = (
+        str(symbol or "")
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .upper()
+        .strip()
+    )
+    if not value:
+        raise ValueError("symbol must not be empty")
+    return value
+
+
+def normalize_exchange_symbol(
+    exchange_symbol: object | None,
+    *,
+    fallback_symbol: str,
+) -> str:
+    value = str(exchange_symbol or "").strip()
+    return value or fallback_symbol
+
+
+def normalize_market_type(market_type: object | None = None) -> str:
+    value = str(market_type or DEFAULT_MARKET_TYPE).strip().lower()
+    return value or DEFAULT_MARKET_TYPE
+
+
+def normalize_timeframe(
+    timeframe: FundingTimeframe | str | None = None,
+) -> FundingTimeframe:
+    if isinstance(timeframe, FundingTimeframe):
+        return timeframe
+
+    if timeframe is None:
+        return DEFAULT_TIMEFRAME
+
+    raw = str(timeframe).strip()
+    if not raw:
+        return DEFAULT_TIMEFRAME
+
+    for item in FundingTimeframe:
+        if item.value == raw:
+            return item
+
+    raise ValueError(f"Unsupported funding timeframe: {timeframe!r}")
+
+
+def normalize_exchange(
+    exchange: FundingDataSource | str | None = None,
+) -> FundingDataSource:
+    if isinstance(exchange, FundingDataSource):
+        return exchange
+
+    if exchange is None:
+        return FundingDataSource.UNKNOWN
+
+    raw = str(exchange).strip().lower()
+    if not raw:
+        return FundingDataSource.UNKNOWN
+
+    for item in FundingDataSource:
+        if item.value == raw:
+            return item
+
+    return FundingDataSource.UNKNOWN
+
+
+def exchange_value(exchange: FundingDataSource | str | None) -> str:
+    if isinstance(exchange, FundingDataSource):
+        return exchange.value
+    return normalize_exchange(exchange).value
+
+
+def make_funding_key(
+    *,
+    exchange: FundingDataSource | str | None,
+    market_type: str | None,
+    symbol: str,
+    timeframe: FundingTimeframe | str | None = None,
+) -> FundingKey:
+    normalized_timeframe = normalize_timeframe(timeframe)
+    return (
+        exchange_value(exchange),
+        normalize_market_type(market_type),
+        normalize_symbol(symbol),
+        normalized_timeframe.value,
+    )
+
+
+def funding_key_to_dict(key: FundingKey) -> dict[str, str]:
+    exchange, market_type, symbol, timeframe = key
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }
+
+
+def scoped_metadata(
+    *,
+    exchange: FundingDataSource | str | None,
+    market_type: str | None,
+    symbol: str,
+    timeframe: FundingTimeframe | str | None,
+    exchange_symbol: str | None = None,
+) -> dict[str, str]:
+    key = make_funding_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    payload = funding_key_to_dict(key)
+    payload["exchange_symbol"] = normalize_exchange_symbol(
+        exchange_symbol,
+        fallback_symbol=payload["symbol"],
+    )
+    return payload
+
+
+def _enum_value(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
+
+
+def _datetime_to_payload(value: datetime | None) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _metadata_copy(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    return dict(metadata or {})
+
+
+def _inject_scope(
+    payload: dict[str, Any],
+    *,
+    key: FundingKey,
+    exchange_symbol: str,
+) -> dict[str, Any]:
+    scope = funding_key_to_dict(key)
+    payload.update(scope)
+    payload["exchange_symbol"] = exchange_symbol
+    payload["scope"] = scope
+    return payload
+
+
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if hasattr(value, "value"):
+        return value.value
+
+    if is_dataclass(value):
+        return {
+            key: _serialize_value(item)
+            for key, item in asdict(value).items()
+        }
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _serialize_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        return [_serialize_value(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [_serialize_value(item) for item in value]
+
+    return value
+
+
+# =============================================================================
+# Base scoped model
+# =============================================================================
+
+
 @dataclass(slots=True)
-class FundingSnapshot:
+class FundingScopedModel:
     """
-    Сирий або вже нормалізований funding snapshot для одного символу.
+    Базовий scoped model для analytics.funding.
+
+    Scope:
+        exchange + market_type + symbol + timeframe
+
+    Важливо:
+    - exchange лишається FundingDataSource для backward compatibility;
+    - market_type є string, бо це біржовий futures/perpetual scope:
+      perpetual, futures, linear, inverse, swap, usdm_futures, coinm_futures;
+    - exchange_symbol зберігає нативний символ біржі.
     """
 
     symbol: str
     exchange: FundingDataSource = FundingDataSource.UNKNOWN
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: FundingTimeframe = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.metadata = _metadata_copy(self.metadata)
+        self.metadata.setdefault("scope", funding_key_to_dict(self.key))
+        self.metadata.setdefault("exchange_symbol", self.exchange_symbol)
+
+    @property
+    def key(self) -> FundingKey:
+        return make_funding_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return scoped_metadata(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+    def _base_payload(self) -> dict[str, Any]:
+        payload = {
+            "symbol": self.symbol,
+            "exchange": self.exchange.value,
+            "market_type": self.market_type,
+            "timeframe": self.timeframe.value,
+            "exchange_symbol": self.exchange_symbol,
+            "metadata": dict(self.metadata),
+        }
+        payload["scope"] = funding_key_to_dict(self.key)
+        return payload
+
+
+# =============================================================================
+# Funding data models
+# =============================================================================
+
+
+@dataclass(slots=True)
+class FundingSnapshot(FundingScopedModel):
+    """
+    Нормалізований funding snapshot для одного futures/perpetual instrument.
+
+    Production source:
+        exchange adapter -> market.funding
+        -> FundingCache
+        -> market.funding.updated
+        -> FundingAnalyzer
+
+    Ця модель не має напряму залежати від EventBus.
+    """
+
     funding_rate: float = 0.0
     predicted_funding_rate: float | None = None
     mark_price: float | None = None
@@ -46,10 +322,27 @@ class FundingSnapshot:
     next_funding_time: datetime | None = None
     event_time: datetime = field(default_factory=utc_now)
     received_at: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.funding_rate = float(self.funding_rate)
+
+        if self.predicted_funding_rate is not None:
+            self.predicted_funding_rate = float(self.predicted_funding_rate)
+
+        if self.mark_price is not None:
+            self.mark_price = float(self.mark_price)
+
+        if self.index_price is not None:
+            self.index_price = float(self.index_price)
+
+        if self.open_interest is not None:
+            self.open_interest = float(self.open_interest)
+
+        if self.volume_24h is not None:
+            self.volume_24h = float(self.volume_24h)
+
         self.event_time = ensure_utc(self.event_time)
         self.received_at = ensure_utc(self.received_at)
 
@@ -74,29 +367,30 @@ class FundingSnapshot:
         return 0
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange",):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        for key in ("event_time", "received_at", "next_funding_time"):
-            value = data.get(key)
-            if isinstance(value, datetime):
-                data[key] = value.isoformat()
-        data["basis"] = self.basis
-        data["funding_sign"] = self.funding_sign
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "funding_rate": self.funding_rate,
+                "predicted_funding_rate": self.predicted_funding_rate,
+                "mark_price": self.mark_price,
+                "index_price": self.index_price,
+                "open_interest": self.open_interest,
+                "volume_24h": self.volume_24h,
+                "next_funding_time": _datetime_to_payload(self.next_funding_time),
+                "event_time": _datetime_to_payload(self.event_time),
+                "received_at": _datetime_to_payload(self.received_at),
+                "basis": self.basis,
+                "funding_sign": self.funding_sign,
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingStatistics:
+class FundingStatistics(FundingScopedModel):
     """
     Агрегована статистика funding на заданому вікні.
     """
-
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
 
     current_rate: float = 0.0
     mean_rate: float = 0.0
@@ -114,7 +408,21 @@ class FundingStatistics:
     updated_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.current_rate = float(self.current_rate)
+        self.mean_rate = float(self.mean_rate)
+        self.median_rate = float(self.median_rate)
+        self.std_rate = max(0.0, float(self.std_rate))
+        self.min_rate = float(self.min_rate)
+        self.max_rate = float(self.max_rate)
+        self.sample_size = max(0, int(self.sample_size))
+
+        if self.zscore is not None:
+            self.zscore = float(self.zscore)
+        if self.percentile is not None:
+            self.percentile = max(0.0, min(100.0, float(self.percentile)))
+
         self.updated_at = ensure_utc(self.updated_at)
 
         if self.window_start is not None:
@@ -123,27 +431,31 @@ class FundingStatistics:
             self.window_end = ensure_utc(self.window_end)
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        for key in ("window_start", "window_end", "updated_at"):
-            value = data.get(key)
-            if isinstance(value, datetime):
-                data[key] = value.isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "current_rate": self.current_rate,
+                "mean_rate": self.mean_rate,
+                "median_rate": self.median_rate,
+                "std_rate": self.std_rate,
+                "min_rate": self.min_rate,
+                "max_rate": self.max_rate,
+                "zscore": self.zscore,
+                "percentile": self.percentile,
+                "sample_size": self.sample_size,
+                "window_start": _datetime_to_payload(self.window_start),
+                "window_end": _datetime_to_payload(self.window_end),
+                "updated_at": _datetime_to_payload(self.updated_at),
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingRegimeState:
+class FundingRegimeState(FundingScopedModel):
     """
-    Стан funding regime для символу.
+    Стан funding regime для одного scoped futures/perpetual instrument.
     """
-
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
 
     regime: FundingRegime = FundingRegime.UNKNOWN
     bias: FundingBias = FundingBias.NEUTRAL
@@ -158,33 +470,50 @@ class FundingRegimeState:
     previous_regime: FundingRegime | None = None
 
     event_time: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.current_rate = float(self.current_rate)
+
+        if self.mean_rate is not None:
+            self.mean_rate = float(self.mean_rate)
+        if self.zscore is not None:
+            self.zscore = float(self.zscore)
+        if self.percentile is not None:
+            self.percentile = max(0.0, min(100.0, float(self.percentile)))
+
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
         self.event_time = ensure_utc(self.event_time)
-        self.confidence = max(0.0, min(1.0, self.confidence))
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe", "regime", "bias", "previous_regime"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "regime": self.regime.value,
+                "bias": self.bias.value,
+                "current_rate": self.current_rate,
+                "mean_rate": self.mean_rate,
+                "zscore": self.zscore,
+                "percentile": self.percentile,
+                "confidence": self.confidence,
+                "changed": self.changed,
+                "previous_regime": (
+                    self.previous_regime.value
+                    if self.previous_regime is not None
+                    else None
+                ),
+                "event_time": _datetime_to_payload(self.event_time),
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingExtremeEvent:
+class FundingExtremeEvent(FundingScopedModel):
     """
     Подія екстремального funding.
     """
-
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
 
     extreme_type: FundingExtremeType = FundingExtremeType.NONE
     regime: FundingRegime = FundingRegime.UNKNOWN
@@ -198,33 +527,41 @@ class FundingExtremeEvent:
     is_squeeze_risk: bool = False
 
     event_time: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.funding_rate = float(self.funding_rate)
+        if self.zscore is not None:
+            self.zscore = float(self.zscore)
+        if self.percentile is not None:
+            self.percentile = max(0.0, min(100.0, float(self.percentile)))
+        self.severity = max(0.0, min(1.0, float(self.severity)))
         self.event_time = ensure_utc(self.event_time)
-        self.severity = max(0.0, min(1.0, self.severity))
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe", "extreme_type", "regime"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "extreme_type": self.extreme_type.value,
+                "regime": self.regime.value,
+                "funding_rate": self.funding_rate,
+                "zscore": self.zscore,
+                "percentile": self.percentile,
+                "severity": self.severity,
+                "is_reversal_risk": self.is_reversal_risk,
+                "is_squeeze_risk": self.is_squeeze_risk,
+                "event_time": _datetime_to_payload(self.event_time),
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingDivergenceEvent:
+class FundingDivergenceEvent(FundingScopedModel):
     """
     Подія дивергенції funding з ціною, OI, CVD або ліквідаціями.
     """
-
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
 
     divergence_type: FundingDivergenceType = FundingDivergenceType.NONE
     funding_rate: float = 0.0
@@ -237,33 +574,49 @@ class FundingDivergenceEvent:
 
     confidence: float = 0.0
     event_time: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.funding_rate = float(self.funding_rate)
+
+        if self.price_change_pct is not None:
+            self.price_change_pct = float(self.price_change_pct)
+        if self.oi_change_pct is not None:
+            self.oi_change_pct = float(self.oi_change_pct)
+        if self.cvd_change is not None:
+            self.cvd_change = float(self.cvd_change)
+        if self.long_liquidations is not None:
+            self.long_liquidations = max(0.0, float(self.long_liquidations))
+        if self.short_liquidations is not None:
+            self.short_liquidations = max(0.0, float(self.short_liquidations))
+
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
         self.event_time = ensure_utc(self.event_time)
-        self.confidence = max(0.0, min(1.0, self.confidence))
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe", "divergence_type"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "divergence_type": self.divergence_type.value,
+                "funding_rate": self.funding_rate,
+                "price_change_pct": self.price_change_pct,
+                "oi_change_pct": self.oi_change_pct,
+                "cvd_change": self.cvd_change,
+                "long_liquidations": self.long_liquidations,
+                "short_liquidations": self.short_liquidations,
+                "confidence": self.confidence,
+                "event_time": _datetime_to_payload(self.event_time),
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingFlipEvent:
+class FundingFlipEvent(FundingScopedModel):
     """
     Подія зміни знаку funding.
     """
-
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
 
     flip_type: FundingFlipType = FundingFlipType.NONE
     previous_rate: float = 0.0
@@ -273,34 +626,36 @@ class FundingFlipEvent:
     confidence: float = 0.0
 
     event_time: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
-        self.event_time = ensure_utc(self.event_time)
-        self.confidence = max(0.0, min(1.0, self.confidence))
+        FundingScopedModel.__post_init__(self)
+
+        self.previous_rate = float(self.previous_rate)
+        self.current_rate = float(self.current_rate)
         self.flip_magnitude = abs(self.current_rate - self.previous_rate)
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe", "flip_type"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "flip_type": self.flip_type.value,
+                "previous_rate": self.previous_rate,
+                "current_rate": self.current_rate,
+                "flip_magnitude": self.flip_magnitude,
+                "confidence": self.confidence,
+                "event_time": _datetime_to_payload(self.event_time),
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingPressureState:
+class FundingPressureState(FundingScopedModel):
     """
     Оцінка накопиченого funding pressure / crowded positioning.
     """
-
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
 
     direction: FundingPressureDirection = FundingPressureDirection.NEUTRAL
     level: FundingPressureLevel = FundingPressureLevel.UNKNOWN
@@ -315,40 +670,50 @@ class FundingPressureState:
     mean_reversion_probability: float | None = None
 
     event_time: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
-        self.event_time = ensure_utc(self.event_time)
-        self.pressure_score = max(0.0, min(1.0, self.pressure_score))
+        FundingScopedModel.__post_init__(self)
+
+        self.funding_rate = float(self.funding_rate)
+        self.pressure_score = max(0.0, min(1.0, float(self.pressure_score)))
 
         if self.squeeze_probability is not None:
-            self.squeeze_probability = max(0.0, min(1.0, self.squeeze_probability))
+            self.squeeze_probability = max(0.0, min(1.0, float(self.squeeze_probability)))
         if self.mean_reversion_probability is not None:
             self.mean_reversion_probability = max(
-                0.0, min(1.0, self.mean_reversion_probability)
+                0.0,
+                min(1.0, float(self.mean_reversion_probability)),
             )
 
+        self.event_time = ensure_utc(self.event_time)
+
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe", "direction", "level", "bias"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "direction": self.direction.value,
+                "level": self.level.value,
+                "bias": self.bias.value,
+                "funding_rate": self.funding_rate,
+                "pressure_score": self.pressure_score,
+                "oi_confirmation": self.oi_confirmation,
+                "price_stall_confirmation": self.price_stall_confirmation,
+                "squeeze_probability": self.squeeze_probability,
+                "mean_reversion_probability": self.mean_reversion_probability,
+                "event_time": _datetime_to_payload(self.event_time),
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingSignal:
+class FundingSignal(FundingScopedModel):
     """
-    Нормалізований funding-сигнал для strategies layer.
-    """
+    Нормалізований funding-сигнал для strategy layer.
 
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
+    Strategy має слухати analytics.funding.signal і отримувати payload
+    з повним exchange + market_type + symbol + timeframe scope.
+    """
 
     signal_type: FundingSignalType = FundingSignalType.REGIME_CHANGE
     bias: FundingBias = FundingBias.NEUTRAL
@@ -362,13 +727,15 @@ class FundingSignal:
     tags: list[str] = field(default_factory=list)
 
     event_time: datetime = field(default_factory=utc_now)
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.score = max(-1.0, min(1.0, float(self.score)))
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        self.supporting_factors = list(self.supporting_factors or [])
+        self.tags = list(self.tags or [])
         self.event_time = ensure_utc(self.event_time)
-        self.score = max(-1.0, min(1.0, self.score))
-        self.confidence = max(0.0, min(1.0, self.confidence))
 
     @property
     def bullish(self) -> bool:
@@ -383,41 +750,107 @@ class FundingSignal:
         return self.score == 0
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("exchange", "timeframe", "signal_type", "bias", "regime"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "signal_type": self.signal_type.value,
+                "bias": self.bias.value,
+                "regime": self.regime.value,
+                "score": self.score,
+                "confidence": self.confidence,
+                "description": self.description,
+                "supporting_factors": list(self.supporting_factors),
+                "tags": list(self.tags),
+                "event_time": _datetime_to_payload(self.event_time),
+                "bullish": self.bullish,
+                "bearish": self.bearish,
+                "neutral": self.neutral,
+            }
+        )
+        return payload
 
 
 @dataclass(slots=True)
-class FundingAnalyticsEvent:
+class FundingAnalyticsEvent(FundingScopedModel):
     """
     Уніфікована обгортка для подій, які можна напряму публікувати в EventBus.
     """
 
-    event_type: FundingEventType
-    symbol: str
-    exchange: FundingDataSource = FundingDataSource.UNKNOWN
-    timeframe: FundingTimeframe = FundingTimeframe.H1
+    event_type: FundingEventType = FundingEventType.SNAPSHOT
     payload: dict[str, Any] = field(default_factory=dict)
     event_time: datetime = field(default_factory=utc_now)
     source: str = "analytics.funding"
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
+        FundingScopedModel.__post_init__(self)
+
+        self.payload = dict(self.payload or {})
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        for key in ("event_type", "exchange", "timeframe"):
-            value = data.get(key)
-            if value is not None:
-                data[key] = value.value
-        if isinstance(data.get("event_time"), datetime):
-            data["event_time"] = data["event_time"].isoformat()
-        return data
+        payload = self._base_payload()
+        payload.update(
+            {
+                "event_type": self.event_type.value,
+                "payload": _serialize_value(self.payload),
+                "event_time": _datetime_to_payload(self.event_time),
+                "source": self.source,
+            }
+        )
+        return payload
+
+
+# =============================================================================
+# Generic serialization helper
+# =============================================================================
+
+
+def model_to_payload(model: Any) -> dict[str, Any]:
+    """
+    Єдиний helper для EventBus/storage/dashboard payload serialization.
+    """
+    if hasattr(model, "to_dict") and callable(model.to_dict):
+        return model.to_dict()
+
+    if hasattr(model, "to_payload") and callable(model.to_payload):
+        payload = model.to_payload()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+
+    if is_dataclass(model):
+        return _serialize_value(asdict(model))
+
+    if isinstance(model, Mapping):
+        return _serialize_value(model)
+
+    raise TypeError(f"Unsupported funding model type: {type(model)!r}")
+
+
+__all__ = [
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_EXCHANGE_SYMBOL",
+    "DEFAULT_TIMEFRAME",
+    "FundingKey",
+    "utc_now",
+    "ensure_utc",
+    "normalize_symbol",
+    "normalize_exchange_symbol",
+    "normalize_market_type",
+    "normalize_timeframe",
+    "normalize_exchange",
+    "exchange_value",
+    "make_funding_key",
+    "funding_key_to_dict",
+    "scoped_metadata",
+    "FundingScopedModel",
+    "FundingSnapshot",
+    "FundingStatistics",
+    "FundingRegimeState",
+    "FundingExtremeEvent",
+    "FundingDivergenceEvent",
+    "FundingFlipEvent",
+    "FundingPressureState",
+    "FundingSignal",
+    "FundingAnalyticsEvent",
+    "model_to_payload",
+]
