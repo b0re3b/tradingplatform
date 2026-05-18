@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from analytics.funding.enums import (
@@ -21,6 +21,7 @@ from .base import (
     BaseFundingStrategyConfig,
     FundingSetupStatus,
     FundingStrategyDirection,
+    FundingStrategyScope,
     FundingStrategyState,
 )
 
@@ -33,19 +34,21 @@ _PRESSURE_RELEASE_TARGET_CONFIDENCE: float = 0.85
 _EXTREME_ALIGNMENT_WEIGHT: float = 0.08
 _SIGNAL_ALIGNMENT_WEIGHT: float = 0.07
 _SIGNAL_CONFIRMATION_WEIGHT: float = 0.35
-_EXTREME_CONFIRMATION_WEIGHT: float = 0.30
 
 
 @dataclass(slots=True)
 class FundingDivergenceStrategyConfig(BaseFundingStrategyConfig):
     """
-    Production-grade funding divergence strategy config.
+    Funding divergence strategy config.
 
     Strategy idea:
     - detect directional funding dislocation from analytics.funding.divergence;
     - use regime and pressure as context filters;
     - use flip, repeated divergence, pressure release, regime shift, extreme context,
-      and normalized funding signal as confirmation/invalidation layers.
+      and normalized funding.signal as confirmation/invalidation layers.
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     strategy_namespace: str = "strategy.funding.divergence"
@@ -112,12 +115,61 @@ class FundingDivergenceStrategyConfig(BaseFundingStrategyConfig):
     tag_extreme: str = "funding_extreme"
     tag_signal: str = "funding_signal"
     tag_atomic_context: str = "atomic_funding_context"
+    tag_liquidation: str = "liquidation_divergence"
+    tag_cvd: str = "cvd_divergence"
+    tag_oi: str = "open_interest_divergence"
+    tag_price: str = "price_divergence"
+
     tag_confirmed_by_flip: str = "confirmed_by_flip"
     tag_confirmed_by_repeat: str = "confirmed_by_repeat_divergence"
     tag_confirmed_by_release: str = "confirmed_by_pressure_release"
     tag_confirmed_by_regime: str = "confirmed_by_regime_shift"
     tag_confirmed_by_extreme: str = "confirmed_by_extreme"
     tag_confirmed_by_signal: str = "confirmed_by_funding_signal"
+
+    price_divergence_bonus: float = 0.04
+    oi_divergence_bonus: float = 0.06
+    cvd_divergence_bonus: float = 0.08
+    liquidation_divergence_bonus: float = 0.12
+
+    preferred_signal_origins_for_confirmation: tuple[str, ...] = (
+        "divergence",
+        "pressure_reversion",
+        "extreme_reversion",
+        "flip",
+    )
+    preferred_signal_origins_for_invalidation: tuple[str, ...] = (
+        "divergence",
+        "pressure",
+        "extreme_squeeze",
+        "flip",
+        "regime",
+    )
+
+    signal_origin_confirmation_weight: dict[str, float] = field(
+        default_factory=lambda: {
+            "divergence": 1.00,
+            "pressure_reversion": 0.90,
+            "extreme_reversion": 0.85,
+            "flip": 0.80,
+            "regime": 0.60,
+            "pressure": 0.50,
+            "extreme": 0.45,
+            "extreme_squeeze": 0.35,
+        }
+    )
+    signal_origin_alignment_weight: dict[str, float] = field(
+        default_factory=lambda: {
+            "divergence": 1.00,
+            "pressure_reversion": 0.90,
+            "extreme_reversion": 0.85,
+            "flip": 0.75,
+            "regime": 0.55,
+            "pressure": 0.45,
+            "extreme": 0.40,
+            "extreme_squeeze": 0.30,
+        }
+    )
 
     def validate(self) -> None:
         BaseFundingStrategyConfig.validate(self)
@@ -133,6 +185,10 @@ class FundingDivergenceStrategyConfig(BaseFundingStrategyConfig):
             "regime_shift_confirmation_bonus": self.regime_shift_confirmation_bonus,
             "extreme_confirmation_bonus": self.extreme_confirmation_bonus,
             "pressure_release_min_score_drop": self.pressure_release_min_score_drop,
+            "price_divergence_bonus": self.price_divergence_bonus,
+            "oi_divergence_bonus": self.oi_divergence_bonus,
+            "cvd_divergence_bonus": self.cvd_divergence_bonus,
+            "liquidation_divergence_bonus": self.liquidation_divergence_bonus,
         }
         for field_name, value in bounded_fields.items():
             if not 0.0 <= float(value) <= 1.0:
@@ -142,21 +198,32 @@ class FundingDivergenceStrategyConfig(BaseFundingStrategyConfig):
             raise ValueError("confirm_on_pressure_drop_levels must be >= 0")
 
         for attr in (
-                "score_weight_divergence",
-                "score_weight_pressure",
-                "score_weight_regime",
-                "score_weight_alignment",
-                "score_weight_extreme_alignment",
-                "score_weight_signal_alignment",
+            "score_weight_divergence",
+            "score_weight_pressure",
+            "score_weight_regime",
+            "score_weight_alignment",
+            "score_weight_extreme_alignment",
+            "score_weight_signal_alignment",
         ):
             value = getattr(self, attr)
             if value < 0.0:
                 raise ValueError(f"{attr} must be >= 0")
 
+        for mapping_name in (
+            "signal_origin_confirmation_weight",
+            "signal_origin_alignment_weight",
+        ):
+            mapping = getattr(self, mapping_name)
+            for key, value in mapping.items():
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError(f"{mapping_name} keys must be non-empty strings")
+                if not 0.0 <= float(value) <= 1.0:
+                    raise ValueError(f"{mapping_name}[{key!r}] must be between 0 and 1")
+
 
 class FundingDivergenceStrategy(BaseFundingStrategy):
     """
-    Event-driven strategy for funding divergence setups.
+    Event-driven funding divergence strategy.
 
     Runtime flow:
     - divergence creates directional setup;
@@ -164,6 +231,9 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
     - flip, repeat divergence, pressure release, regime shift, extreme alignment,
       and funding.signal may confirm;
     - opposite analytics context invalidates stale setups.
+
+    Full scope:
+        exchange + market_type + symbol + timeframe
     """
 
     def __init__(
@@ -173,6 +243,7 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
         config: FundingDivergenceStrategyConfig | None = None,
         scheduler: Scheduler | None = None,
         service_name: str | None = None,
+        parquet_storage: Any | None = None,
     ) -> None:
         resolved_config = config or FundingDivergenceStrategyConfig()
         super().__init__(
@@ -180,6 +251,7 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             config=resolved_config,
             scheduler=scheduler,
             service_name=service_name or resolved_config.service_name,
+            parquet_storage=parquet_storage,
         )
         self.config: FundingDivergenceStrategyConfig = resolved_config
 
@@ -249,7 +321,10 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
         if self.is_stale_event(event_time):
             return
 
-        if not self._can_create_setup_from_divergence(state=state, divergence_event=divergence_event):
+        if not self._can_create_setup_from_divergence(
+            state=state,
+            divergence_event=divergence_event,
+        ):
             return
 
         setup_candidate = self._build_setup_from_divergence(
@@ -286,7 +361,11 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                 state,
                 reason="opposite_funding_signal_invalidated_divergence_setup",
                 cooldown=True,
-                metadata={"invalidation_source": "funding_signal"},
+                metadata={
+                    "invalidation_source": "funding_signal",
+                    "signal_origin": self._signal_origin(signal),
+                    "scope": state.scope.to_dict(),
+                },
             )
             await self.emit_invalidated(
                 state,
@@ -305,7 +384,11 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                 reason="funding_signal_confirmed_divergence_setup",
                 tags=[self.config.tag_confirmed_by_signal, self.config.tag_signal],
                 event_time=self._extract_event_time_from_normalized(signal),
-                metadata={"confirmation_source": "funding_signal"},
+                metadata={
+                    "confirmation_source": "funding_signal",
+                    "signal_origin": self._signal_origin(signal),
+                    "scope": state.scope.to_dict(),
+                },
             )
             await self.emit_confirmed(
                 state,
@@ -316,32 +399,21 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             )
 
     # ------------------------------------------------------------------
-    # Event handlers
+    # Scoped event handlers
     # ------------------------------------------------------------------
-    def _is_opposite_divergence_direction_for_state(
-            self,
-            state: FundingStrategyState,
-            divergence_event: Any,
-    ) -> bool:
-        direction = self._derive_direction_from_divergence(divergence_event)
-        return (
-                direction != FundingStrategyDirection.NEUTRAL
-                and state.direction != FundingStrategyDirection.NEUTRAL
-                and direction != state.direction
-        )
 
     async def on_regime(self, event: Event) -> None:
         payload = self.extract_payload(event)
-        symbol, exchange = self.extract_symbol_exchange(payload)
-        if not symbol:
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             previous_regime = state.last_regime
             regime_state = self._normalize_regime_payload(payload)
 
@@ -356,11 +428,17 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     state,
                     reason="regime_context_invalidated_divergence_setup",
                     cooldown=True,
-                    metadata={"invalidation_source": "regime"},
+                    metadata={
+                        "invalidation_source": "regime",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_invalidated(
                     state,
-                    extra_payload={"trigger": "regime", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "regime",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
                 return
 
@@ -382,34 +460,40 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     reason="regime_shift_confirmed_divergence_setup",
                     tags=[self.config.tag_confirmed_by_regime],
                     event_time=self._extract_event_time_from_normalized(regime_state),
-                    metadata={"confirmation_source": "regime_shift"},
+                    metadata={
+                        "confirmation_source": "regime_shift",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_confirmed(
                     state,
-                    extra_payload={"trigger": "regime_shift", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "regime_shift",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
 
         except Exception:
             self.logger.exception(
-                "Failed to process funding divergence regime event | symbol=%s exchange=%s",
-                symbol,
-                exchange,
+                "Failed to process funding divergence regime event | strategy=%s scope=%s",
+                self.strategy_name,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
 
     async def on_pressure(self, event: Event) -> None:
         payload = self.extract_payload(event)
-        symbol, exchange = self.extract_symbol_exchange(payload)
-        if not symbol:
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             previous_pressure = state.last_pressure
             pressure_state = self._normalize_pressure_payload(payload)
 
@@ -424,11 +508,17 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     state,
                     reason="pressure_context_invalidated_divergence_setup",
                     cooldown=True,
-                    metadata={"invalidation_source": "pressure"},
+                    metadata={
+                        "invalidation_source": "pressure",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_invalidated(
                     state,
-                    extra_payload={"trigger": "pressure", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "pressure",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
                 return
 
@@ -450,34 +540,40 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     reason="pressure_release_confirmed_divergence_setup",
                     tags=[self.config.tag_confirmed_by_release],
                     event_time=self._extract_event_time_from_normalized(pressure_state),
-                    metadata={"confirmation_source": "pressure_release"},
+                    metadata={
+                        "confirmation_source": "pressure_release",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_confirmed(
                     state,
-                    extra_payload={"trigger": "pressure_release", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "pressure_release",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
 
         except Exception:
             self.logger.exception(
-                "Failed to process funding divergence pressure event | symbol=%s exchange=%s",
-                symbol,
-                exchange,
+                "Failed to process funding divergence pressure event | strategy=%s scope=%s",
+                self.strategy_name,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
 
     async def on_divergence(self, event: Event) -> None:
         payload = self.extract_payload(event)
-        symbol, exchange = self.extract_symbol_exchange(payload)
-        if not symbol:
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             previous_divergence = state.last_divergence
             divergence_event = self._normalize_divergence_payload(payload)
 
@@ -490,9 +586,9 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             event_time = self._extract_event_time_from_normalized(divergence_event)
             if self.is_stale_event(event_time):
                 self.logger.debug(
-                    "Stale funding divergence event ignored | symbol=%s exchange=%s",
-                    symbol,
-                    exchange,
+                    "Stale funding divergence event ignored | strategy=%s scope=%s",
+                    self.strategy_name,
+                    state.scope.to_dict(),
                 )
                 return
 
@@ -500,15 +596,6 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             if current_direction == FundingStrategyDirection.NEUTRAL:
                 return
 
-            # ------------------------------------------------------------------
-            # Active setup handling must happen BEFORE setup creation.
-            #
-            # Production rule:
-            # - aligned repeat divergence confirms an active setup;
-            # - opposite divergence invalidates if enabled;
-            # - opposite divergence is ignored if invalidation is disabled;
-            # - active setup is never silently flipped LONG -> SHORT or SHORT -> LONG.
-            # ------------------------------------------------------------------
             if state.is_active():
                 if self._is_opposite_divergence_direction_for_state(state, divergence_event):
                     if self.config.invalidate_on_opposite_divergence:
@@ -516,7 +603,10 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                             state,
                             reason="opposite_divergence_invalidated_setup",
                             cooldown=True,
-                            metadata={"invalidation_source": "divergence"},
+                            metadata={
+                                "invalidation_source": "divergence",
+                                "scope": state.scope.to_dict(),
+                            },
                         )
                         await self.emit_invalidated(
                             state,
@@ -528,9 +618,9 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     return
 
                 if self._can_confirm_by_repeat_divergence(
-                        state=state,
-                        previous_divergence=previous_divergence,
-                        current_divergence=divergence_event,
+                    state=state,
+                    previous_divergence=previous_divergence,
+                    current_divergence=divergence_event,
                 ):
                     self.set_confirmed(
                         state,
@@ -545,7 +635,10 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                         reason="repeat_divergence_confirmed_setup",
                         tags=[self.config.tag_confirmed_by_repeat],
                         event_time=event_time,
-                        metadata={"confirmation_source": "repeat_divergence"},
+                        metadata={
+                            "confirmation_source": "repeat_divergence",
+                            "scope": state.scope.to_dict(),
+                        },
                     )
                     await self.emit_confirmed(
                         state,
@@ -556,14 +649,11 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     )
                     return
 
-                # Active setup exists, divergence is aligned, but not strong/valid enough
-                # to confirm. Do not refresh setup repeatedly because that hides lifecycle
-                # transitions and can extend TTL without a confirmation event.
                 return
 
             if self._can_create_setup_from_divergence(
-                    state=state,
-                    divergence_event=divergence_event,
+                state=state,
+                divergence_event=divergence_event,
             ):
                 setup_candidate = self._build_setup_from_divergence(
                     state=state,
@@ -585,25 +675,25 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
 
         except Exception:
             self.logger.exception(
-                "Failed to process funding divergence event | symbol=%s exchange=%s",
-                symbol,
-                exchange,
+                "Failed to process funding divergence event | strategy=%s scope=%s",
+                self.strategy_name,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
 
     async def on_flip(self, event: Event) -> None:
         payload = self.extract_payload(event)
-        symbol, exchange = self.extract_symbol_exchange(payload)
-        if not symbol:
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             flip_event = self._normalize_flip_payload(payload)
 
             self.attach_flip(state, flip_event)
@@ -617,51 +707,70 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     state,
                     reason="opposite_flip_invalidated_divergence_setup",
                     cooldown=True,
-                    metadata={"invalidation_source": "flip"},
+                    metadata={
+                        "invalidation_source": "flip",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_invalidated(
                     state,
-                    extra_payload={"trigger": "flip", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "flip",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
                 return
 
             if self._can_confirm_by_flip(state, flip_event):
                 self.set_confirmed(
                     state,
-                    score=self._compute_confirmation_score_from_flip(state=state, flip_event=flip_event),
-                    confidence=self._compute_confirmation_confidence_from_flip(state=state, flip_event=flip_event),
+                    score=self._compute_confirmation_score_from_flip(
+                        state=state,
+                        flip_event=flip_event,
+                    ),
+                    confidence=self._compute_confirmation_confidence_from_flip(
+                        state=state,
+                        flip_event=flip_event,
+                    ),
                     reason="flip_confirmed_divergence_setup",
                     tags=[self.config.tag_confirmed_by_flip],
                     event_time=self._extract_event_time_from_normalized(flip_event),
-                    metadata={"confirmation_source": "flip"},
+                    metadata={
+                        "confirmation_source": "flip",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_confirmed(
                     state,
-                    extra_payload={"trigger": "flip", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "flip",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
 
         except Exception:
             self.logger.exception(
-                "Failed to process funding divergence flip event | symbol=%s exchange=%s",
-                symbol,
-                exchange,
+                "Failed to process funding divergence flip event | strategy=%s scope=%s",
+                self.strategy_name,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
 
     async def on_extreme(self, event: Event) -> None:
         payload = self.extract_payload(event)
-        symbol, exchange = self.extract_symbol_exchange(payload)
-        if not symbol:
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             extreme_event = self._normalize_extreme_payload(payload)
+
             self.attach_extreme(state, extreme_event)
             self._expire_state_if_needed(state)
 
@@ -677,35 +786,52 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
                     state,
                     reason="opposite_extreme_invalidated_divergence_setup",
                     cooldown=True,
-                    metadata={"invalidation_source": "extreme"},
+                    metadata={
+                        "invalidation_source": "extreme",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_invalidated(
                     state,
-                    extra_payload={"trigger": "extreme", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "extreme",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
                 return
 
             if self._can_confirm_by_extreme(state, extreme_event):
                 self.set_confirmed(
                     state,
-                    score=self._compute_confirmation_score_from_extreme(state, extreme_event),
-                    confidence=self._compute_confirmation_confidence_from_extreme(state, extreme_event),
+                    score=self._compute_confirmation_score_from_extreme(
+                        state,
+                        extreme_event,
+                    ),
+                    confidence=self._compute_confirmation_confidence_from_extreme(
+                        state,
+                        extreme_event,
+                    ),
                     reason="extreme_context_confirmed_divergence_setup",
                     tags=[self.config.tag_confirmed_by_extreme, self.config.tag_extreme],
                     event_time=event_time,
-                    metadata={"confirmation_source": "extreme"},
+                    metadata={
+                        "confirmation_source": "extreme",
+                        "scope": state.scope.to_dict(),
+                    },
                 )
                 await self.emit_confirmed(
                     state,
-                    extra_payload={"trigger": "extreme", "correlation_id": event.correlation_id},
+                    extra_payload={
+                        "trigger": "extreme",
+                        "correlation_id": event.correlation_id,
+                    },
                 )
 
         except Exception:
             self.logger.exception(
-                "Failed to process funding extreme event | strategy=%s symbol=%s exchange=%s",
+                "Failed to process funding extreme event | strategy=%s scope=%s",
                 self.strategy_name,
-                symbol,
-                exchange,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
@@ -714,8 +840,15 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
     # Setup creation
     # ------------------------------------------------------------------
 
-    def _can_create_setup_from_divergence(self, state: FundingStrategyState, divergence_event: Any) -> bool:
-        divergence_confidence = self._to_float(self._get_value(divergence_event, "confidence"), default=0.0)
+    def _can_create_setup_from_divergence(
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
+    ) -> bool:
+        divergence_confidence = self._to_float(
+            self._get_value(divergence_event, "confidence"),
+            default=0.0,
+        )
         if divergence_confidence < self.config.min_divergence_confidence:
             return False
 
@@ -727,43 +860,78 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
         if self.config.require_non_neutral_regime:
             if regime is None:
                 return False
+
             regime_name = self._enum_str(self._get_value(regime, "regime"))
-            regime_confidence = self._to_float(self._get_value(regime, "confidence"), default=0.0)
+            regime_confidence = self._to_float(
+                self._get_value(regime, "confidence"),
+                default=0.0,
+            )
             if regime_confidence < self.config.min_regime_confidence:
                 return False
-            if regime_name in {FundingRegime.NEUTRAL.value, FundingRegime.UNKNOWN.value}:
+
+            if regime_name in {
+                FundingRegime.NEUTRAL.value,
+                FundingRegime.UNKNOWN.value,
+            }:
                 return False
 
         pressure = state.last_pressure
         if pressure is None:
             return not self.config.require_pressure_present
 
-        pressure_score = self._to_float(self._get_value(pressure, "pressure_score"), default=0.0)
+        pressure_score = self._to_float(
+            self._get_value(pressure, "pressure_score"),
+            default=0.0,
+        )
         if pressure_score < self.config.min_pressure_score:
             return False
 
         if self.config.require_pressure_alignment:
-            direction = self._enum_str(self._get_value(pressure, "direction"))
+            pressure_direction = self._enum_str(self._get_value(pressure, "direction"))
+
             if target_direction == FundingStrategyDirection.LONG:
-                return direction in {FundingPressureDirection.SHORT.value, FundingPressureDirection.NEUTRAL.value}
+                return pressure_direction in {
+                    FundingPressureDirection.SHORT.value,
+                    FundingPressureDirection.NEUTRAL.value,
+                }
+
             if target_direction == FundingStrategyDirection.SHORT:
-                return direction in {FundingPressureDirection.LONG.value, FundingPressureDirection.NEUTRAL.value}
+                return pressure_direction in {
+                    FundingPressureDirection.LONG.value,
+                    FundingPressureDirection.NEUTRAL.value,
+                }
 
         return True
 
-    def _build_setup_from_divergence(self, state: FundingStrategyState, divergence_event: Any) -> dict[str, Any] | None:
-        divergence_type = self._enum_str(self._get_value(divergence_event, "divergence_type"))
+    def _build_setup_from_divergence(
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
+    ) -> dict[str, Any] | None:
+        divergence_type = self._enum_str(
+            self._get_value(divergence_event, "divergence_type")
+        )
         target_direction = self._derive_direction_from_divergence(divergence_event)
         if target_direction == FundingStrategyDirection.NEUTRAL:
             return None
 
-        divergence_confidence = self._to_float(self._get_value(divergence_event, "confidence"), default=0.0)
+        divergence_confidence = self._to_float(
+            self._get_value(divergence_event, "confidence"),
+            default=0.0,
+        )
         regime = state.last_regime
         pressure = state.last_pressure
 
-        regime_confidence = self._to_float(self._get_value(regime, "confidence"), default=0.0)
+        regime_confidence = self._to_float(
+            self._get_value(regime, "confidence"),
+            default=0.0,
+        )
         bias = self._enum_str(self._get_value(regime, "bias"))
-        pressure_score = self._to_float(self._get_value(pressure, "pressure_score"), default=0.0)
+
+        pressure_score = self._to_float(
+            self._get_value(pressure, "pressure_score"),
+            default=0.0,
+        )
         pressure_direction = self._enum_str(self._get_value(pressure, "direction"))
 
         directional_alignment_bonus = self._calc_directional_alignment_bonus(
@@ -771,11 +939,22 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             regime_bias=bias,
             pressure_direction=pressure_direction,
         )
-        extreme_alignment_bonus = self._calc_extreme_alignment_bonus(state, target_direction)
-        signal_alignment_bonus = self._calc_signal_alignment_bonus(state, target_direction)
+        extreme_alignment_bonus = self._calc_extreme_alignment_bonus(
+            state,
+            target_direction,
+        )
+        signal_alignment_bonus = self._calc_signal_alignment_bonus(
+            state,
+            target_direction,
+        )
+        divergence_type_bonus = self._divergence_type_bonus(divergence_event)
+
+        adjusted_divergence_confidence = self._clip_score(
+            divergence_confidence + divergence_type_bonus
+        )
 
         score = self._compute_setup_score(
-            divergence_confidence=divergence_confidence,
+            divergence_confidence=adjusted_divergence_confidence,
             pressure_score=pressure_score,
             regime_confidence=regime_confidence,
             directional_alignment_bonus=directional_alignment_bonus,
@@ -784,12 +963,20 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
         )
         confidence = self._compute_setup_confidence(
             score=score,
-            divergence_confidence=divergence_confidence,
+            divergence_confidence=adjusted_divergence_confidence,
             regime_confidence=regime_confidence,
         )
 
-        setup_type = self.config.bullish_setup_type if target_direction == FundingStrategyDirection.LONG else self.config.bearish_setup_type
-        side_label = "bullish_funding_divergence_setup" if target_direction == FundingStrategyDirection.LONG else "bearish_funding_divergence_setup"
+        setup_type = (
+            self.config.bullish_setup_type
+            if target_direction == FundingStrategyDirection.LONG
+            else self.config.bearish_setup_type
+        )
+        side_label = (
+            "bullish_funding_divergence_setup"
+            if target_direction == FundingStrategyDirection.LONG
+            else "bearish_funding_divergence_setup"
+        )
 
         return {
             "direction": target_direction,
@@ -797,20 +984,33 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             "score": score,
             "confidence": confidence,
             "reason": side_label,
-            "reasons": [side_label, f"divergence_type:{divergence_type}"],
-            "tags": self._build_setup_tags(state),
+            "reasons": [
+                side_label,
+                f"divergence_type:{divergence_type}",
+                f"scope:{state.scope.key}",
+            ],
+            "tags": self._build_setup_tags(state, divergence_event),
             "metadata": {
+                "scope": state.scope.to_dict(),
                 "funding_context": self._build_divergence_context(
                     divergence_event=divergence_event,
                     regime=regime,
                     pressure=pressure,
                 ),
+                "divergence_type_bonus": divergence_type_bonus,
                 "extreme_alignment_bonus": extreme_alignment_bonus,
                 "signal_alignment_bonus": signal_alignment_bonus,
+                "signal_origins_available": sorted(state.last_signals_by_origin.keys()),
             },
         }
 
-    def _apply_setup_candidate(self, *, state: FundingStrategyState, setup_candidate: dict[str, Any], event_time: Any) -> None:
+    def _apply_setup_candidate(
+        self,
+        *,
+        state: FundingStrategyState,
+        setup_candidate: dict[str, Any],
+        event_time: Any,
+    ) -> None:
         self.set_setup_detected(
             state,
             direction=setup_candidate["direction"],
@@ -828,12 +1028,21 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
     # Confirmation guards
     # ------------------------------------------------------------------
 
-    def _can_confirm_by_flip(self, state: FundingStrategyState, flip_event: Any) -> bool:
+    def _can_confirm_by_flip(
+        self,
+        state: FundingStrategyState,
+        flip_event: Any,
+    ) -> bool:
         if not self.config.allow_flip_confirmation:
             return False
-        if state.status not in {FundingSetupStatus.SETUP_DETECTED, FundingSetupStatus.CONFIRMED}:
+        if state.status not in {
+            FundingSetupStatus.SETUP_DETECTED,
+            FundingSetupStatus.CONFIRMED,
+        }:
             return False
+
         flip_type = self._enum_str(self._get_value(flip_event, "flip_type"))
+
         return (
             state.direction == FundingStrategyDirection.LONG
             and flip_type == FundingFlipType.NEGATIVE_TO_POSITIVE.value
@@ -842,76 +1051,163 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             and flip_type == FundingFlipType.POSITIVE_TO_NEGATIVE.value
         )
 
-    def _can_confirm_by_repeat_divergence(self, state: FundingStrategyState, previous_divergence: Any | None, current_divergence: Any) -> bool:
+    def _can_confirm_by_repeat_divergence(
+        self,
+        state: FundingStrategyState,
+        previous_divergence: Any | None,
+        current_divergence: Any,
+    ) -> bool:
         if not self.config.allow_repeat_divergence_confirmation:
             return False
         if state.status != FundingSetupStatus.SETUP_DETECTED or previous_divergence is None:
             return False
+
         prev_direction = self._derive_direction_from_divergence(previous_divergence)
         curr_direction = self._derive_direction_from_divergence(current_divergence)
+
         if prev_direction == FundingStrategyDirection.NEUTRAL:
             return False
         if curr_direction != prev_direction or curr_direction != state.direction:
             return False
-        curr_confidence = self._to_float(self._get_value(current_divergence, "confidence"), default=0.0)
+
+        curr_confidence = self._to_float(
+            self._get_value(current_divergence, "confidence"),
+            default=0.0,
+        )
         return curr_confidence >= self.config.min_divergence_confidence
 
-    def _can_confirm_by_pressure_release(self, state: FundingStrategyState, previous_pressure: Any | None, current_pressure: Any) -> bool:
+    def _can_confirm_by_pressure_release(
+        self,
+        state: FundingStrategyState,
+        previous_pressure: Any | None,
+        current_pressure: Any,
+    ) -> bool:
         if not self.config.allow_pressure_release_confirmation:
             return False
         if state.status != FundingSetupStatus.SETUP_DETECTED or previous_pressure is None:
             return False
-        prev_score = self._to_float(self._get_value(previous_pressure, "pressure_score"), default=0.0)
-        curr_score = self._to_float(self._get_value(current_pressure, "pressure_score"), default=0.0)
+
+        prev_score = self._to_float(
+            self._get_value(previous_pressure, "pressure_score"),
+            default=0.0,
+        )
+        curr_score = self._to_float(
+            self._get_value(current_pressure, "pressure_score"),
+            default=0.0,
+        )
+
         if prev_score <= curr_score:
             return False
+
         if (prev_score - curr_score) < self.config.pressure_release_min_score_drop:
             return False
+
         prev_level = self._enum_str(self._get_value(previous_pressure, "level"))
         curr_level = self._enum_str(self._get_value(current_pressure, "level"))
-        return self._has_pressure_level_dropped_enough(prev_level, curr_level)
 
-    def _can_confirm_by_regime_shift(self, state: FundingStrategyState, previous_regime: Any | None, current_regime: Any) -> bool:
+        previous_rank = self._pressure_level_rank(prev_level)
+        current_rank = self._pressure_level_rank(curr_level)
+
+        return (previous_rank - current_rank) >= self.config.confirm_on_pressure_drop_levels
+
+    def _can_confirm_by_regime_shift(
+        self,
+        state: FundingStrategyState,
+        previous_regime: Any | None,
+        current_regime: Any,
+    ) -> bool:
         if not self.config.allow_regime_shift_confirmation:
             return False
         if state.status != FundingSetupStatus.SETUP_DETECTED or previous_regime is None:
             return False
+
         curr_bias = self._enum_str(self._get_value(current_regime, "bias"))
+
         if state.direction == FundingStrategyDirection.LONG:
-            return curr_bias in {FundingBias.SHORT_BIAS.value, FundingBias.OVERCROWDED_SHORTS.value, FundingBias.SQUEEZE_RISK_SHORTS.value}
+            return curr_bias in {
+                FundingBias.SHORT_BIAS.value,
+                FundingBias.OVERCROWDED_SHORTS.value,
+                FundingBias.SQUEEZE_RISK_SHORTS.value,
+            }
+
         if state.direction == FundingStrategyDirection.SHORT:
-            return curr_bias in {FundingBias.LONG_BIAS.value, FundingBias.OVERCROWDED_LONGS.value, FundingBias.SQUEEZE_RISK_LONGS.value}
+            return curr_bias in {
+                FundingBias.LONG_BIAS.value,
+                FundingBias.OVERCROWDED_LONGS.value,
+                FundingBias.SQUEEZE_RISK_LONGS.value,
+            }
+
         return False
 
-    def _can_confirm_by_extreme(self, state: FundingStrategyState, extreme_event: Any) -> bool:
+    def _can_confirm_by_extreme(
+        self,
+        state: FundingStrategyState,
+        extreme_event: Any,
+    ) -> bool:
         if not self.config.allow_extreme_confirmation:
             return False
         if state.status != FundingSetupStatus.SETUP_DETECTED:
             return False
-        severity = self._to_float(self._get_value(extreme_event, "severity"), default=0.0)
+
+        severity = self._to_float(
+            self._get_value(extreme_event, "severity"),
+            default=0.0,
+        )
         if severity < self.config.min_extreme_severity:
             return False
+
         return self._extreme_direction(extreme_event) == state.direction
 
-    def _can_confirm_by_signal(self, state: FundingStrategyState, signal: Any) -> bool:
+    def _can_confirm_by_signal(
+        self,
+        state: FundingStrategyState,
+        signal: Any,
+    ) -> bool:
         if not self.config.allow_signal_confirmation:
             return False
         if state.status != FundingSetupStatus.SETUP_DETECTED:
             return False
-        confidence = self._to_float(self._get_value(signal, "confidence"), default=0.0)
-        score = self._to_float(self._get_value(signal, "score"), default=0.0)
-        if confidence < self.config.min_signal_confidence or abs(score) < self.config.min_signal_abs_score:
+
+        confidence = self._to_float(
+            self._get_value(signal, "confidence"),
+            default=0.0,
+        )
+        score = self._to_float(
+            self._get_value(signal, "score"),
+            default=0.0,
+        )
+
+        if confidence < self.config.min_signal_confidence:
             return False
+        if abs(score) < self.config.min_signal_abs_score:
+            return False
+
+        origin = self._signal_origin(signal)
+        if (
+            self.config.preferred_signal_origins_for_confirmation
+            and origin
+            and origin not in self.config.preferred_signal_origins_for_confirmation
+        ):
+            origin_weight = self.config.signal_origin_confirmation_weight.get(origin, 0.0)
+            if origin_weight < 0.50:
+                return False
+
         return self._signal_direction(signal) == state.direction
 
     # ------------------------------------------------------------------
     # Invalidation guards
     # ------------------------------------------------------------------
 
-    def _should_invalidate_by_flip(self, state: FundingStrategyState, flip_event: Any) -> bool:
+    def _should_invalidate_by_flip(
+        self,
+        state: FundingStrategyState,
+        flip_event: Any,
+    ) -> bool:
         if not self.config.invalidate_on_opposite_flip:
             return False
+
         flip_type = self._enum_str(self._get_value(flip_event, "flip_type"))
+
         return (
             state.direction == FundingStrategyDirection.LONG
             and flip_type == FundingFlipType.POSITIVE_TO_NEGATIVE.value
@@ -920,53 +1216,123 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             and flip_type == FundingFlipType.NEGATIVE_TO_POSITIVE.value
         )
 
-    def _should_invalidate_by_pressure(self, state: FundingStrategyState, pressure_state: Any) -> bool:
+    def _should_invalidate_by_pressure(
+        self,
+        state: FundingStrategyState,
+        pressure_state: Any,
+    ) -> bool:
         if not self.config.invalidate_on_pressure_breakdown:
             return False
-        pressure_score = self._to_float(self._get_value(pressure_state, "pressure_score"), default=0.0)
+
+        pressure_score = self._to_float(
+            self._get_value(pressure_state, "pressure_score"),
+            default=0.0,
+        )
         level = self._enum_str(self._get_value(pressure_state, "level"))
-        if level in {FundingPressureLevel.UNKNOWN.value, FundingPressureLevel.LOW.value} and pressure_score < (self.config.min_pressure_score * _PRESSURE_BREAKDOWN_THRESHOLD_RATIO):
+
+        if (
+            level in {
+                FundingPressureLevel.UNKNOWN.value,
+                FundingPressureLevel.LOW.value,
+            }
+            and pressure_score
+            < (self.config.min_pressure_score * _PRESSURE_BREAKDOWN_THRESHOLD_RATIO)
+        ):
             return True
+
         direction = self._enum_str(self._get_value(pressure_state, "direction"))
+
         if state.direction == FundingStrategyDirection.LONG:
             return direction == FundingPressureDirection.LONG.value
+
         if state.direction == FundingStrategyDirection.SHORT:
             return direction == FundingPressureDirection.SHORT.value
+
         return False
 
-    def _should_invalidate_by_regime(self, state: FundingStrategyState, regime_state: Any) -> bool:
+    def _should_invalidate_by_regime(
+        self,
+        state: FundingStrategyState,
+        regime_state: Any,
+    ) -> bool:
         if not self.config.invalidate_on_regime_conflict:
             return False
+
         bias = self._enum_str(self._get_value(regime_state, "bias"))
         regime_name = self._enum_str(self._get_value(regime_state, "regime"))
+
         if regime_name == FundingRegime.UNKNOWN.value:
             return True
+
         if state.direction == FundingStrategyDirection.LONG:
-            return bias in {FundingBias.LONG_BIAS.value, FundingBias.OVERCROWDED_LONGS.value, FundingBias.SQUEEZE_RISK_LONGS.value}
+            return bias in {
+                FundingBias.LONG_BIAS.value,
+                FundingBias.OVERCROWDED_LONGS.value,
+                FundingBias.SQUEEZE_RISK_LONGS.value,
+            }
+
         if state.direction == FundingStrategyDirection.SHORT:
-            return bias in {FundingBias.SHORT_BIAS.value, FundingBias.OVERCROWDED_SHORTS.value, FundingBias.SQUEEZE_RISK_SHORTS.value}
+            return bias in {
+                FundingBias.SHORT_BIAS.value,
+                FundingBias.OVERCROWDED_SHORTS.value,
+                FundingBias.SQUEEZE_RISK_SHORTS.value,
+            }
+
         return False
 
+    def _should_invalidate_by_signal(
+        self,
+        state: FundingStrategyState,
+        signal: Any,
+    ) -> bool:
+        if not self.config.invalidate_on_opposite_signal:
+            return False
+
+        direction = self._signal_direction(signal)
+        if direction == FundingStrategyDirection.NEUTRAL:
+            return False
+
+        origin = self._signal_origin(signal)
+        if (
+            self.config.preferred_signal_origins_for_invalidation
+            and origin
+            and origin not in self.config.preferred_signal_origins_for_invalidation
+        ):
+            return False
+
+        return direction != state.direction
+
+    def _should_invalidate_by_extreme(
+        self,
+        state: FundingStrategyState,
+        extreme_event: Any,
+    ) -> bool:
+        if not self.config.invalidate_on_opposite_extreme:
+            return False
+
+        direction = self._extreme_direction(extreme_event)
+        return direction != FundingStrategyDirection.NEUTRAL and direction != state.direction
+
+    def _is_opposite_divergence_direction_for_state(
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
+    ) -> bool:
+        direction = self._derive_direction_from_divergence(divergence_event)
+        return (
+            direction != FundingStrategyDirection.NEUTRAL
+            and state.direction != FundingStrategyDirection.NEUTRAL
+            and direction != state.direction
+        )
+
     def _is_opposite_divergence_for_state(
-            self,
-            state: FundingStrategyState,
-            divergence_event: Any,
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
     ) -> bool:
         if not self.config.invalidate_on_opposite_divergence:
             return False
         return self._is_opposite_divergence_direction_for_state(state, divergence_event)
-
-    def _should_invalidate_by_signal(self, state: FundingStrategyState, signal: Any) -> bool:
-        if not self.config.invalidate_on_opposite_signal:
-            return False
-        direction = self._signal_direction(signal)
-        return direction != FundingStrategyDirection.NEUTRAL and direction != state.direction
-
-    def _should_invalidate_by_extreme(self, state: FundingStrategyState, extreme_event: Any) -> bool:
-        if not self.config.invalidate_on_opposite_extreme:
-            return False
-        direction = self._extreme_direction(extreme_event)
-        return direction != FundingStrategyDirection.NEUTRAL and direction != state.direction
 
     # ------------------------------------------------------------------
     # Score / confidence computation
@@ -996,110 +1362,367 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             )
         )
 
-    def _compute_setup_confidence(self, *, score: float, divergence_confidence: float, regime_confidence: float) -> float:
-        return self._clip_score(self._average_scores(score, divergence_confidence, regime_confidence))
+    def _compute_setup_confidence(
+        self,
+        *,
+        score: float,
+        divergence_confidence: float,
+        regime_confidence: float,
+    ) -> float:
+        return self._clip_score(
+            self._average_scores(score, divergence_confidence, regime_confidence)
+        )
 
-    def _boost_metric(self, base: float, signal: float, bonus: float) -> float:
-        return self._clip_score(self._average_scores(base, signal, min(1.0, base + bonus)))
+    def _boost_metric(
+        self,
+        *,
+        base: float,
+        signal: float,
+        bonus: float,
+    ) -> float:
+        return self._clip_score(
+            self._average_scores(base, signal, min(1.0, base + bonus))
+        )
 
-    def _compute_confirmation_score_from_flip(self, state: FundingStrategyState, flip_event: Any) -> float:
-        flip_confidence = self._to_float(self._get_value(flip_event, "confidence"), default=0.0)
-        return self._clip_score(self._average_scores(state.score, flip_confidence, _FLIP_CONFIRMATION_PERFECT_WEIGHT))
+    def _compute_confirmation_score_from_flip(
+        self,
+        state: FundingStrategyState,
+        flip_event: Any,
+    ) -> float:
+        flip_confidence = self._to_float(
+            self._get_value(flip_event, "confidence"),
+            default=0.0,
+        )
+        return self._clip_score(
+            self._average_scores(
+                state.score,
+                flip_confidence,
+                _FLIP_CONFIRMATION_PERFECT_WEIGHT,
+            )
+        )
 
-    def _compute_confirmation_confidence_from_flip(self, state: FundingStrategyState, flip_event: Any) -> float:
-        flip_confidence = self._to_float(self._get_value(flip_event, "confidence"), default=0.0)
-        return self._clip_score(self._average_scores(state.confidence, flip_confidence, _FLIP_CONFIRMATION_PERFECT_WEIGHT))
+    def _compute_confirmation_confidence_from_flip(
+        self,
+        state: FundingStrategyState,
+        flip_event: Any,
+    ) -> float:
+        flip_confidence = self._to_float(
+            self._get_value(flip_event, "confidence"),
+            default=0.0,
+        )
+        return self._clip_score(
+            self._average_scores(
+                state.confidence,
+                flip_confidence,
+                _FLIP_CONFIRMATION_PERFECT_WEIGHT,
+            )
+        )
 
-    def _compute_confirmation_score_from_repeat_divergence(self, state: FundingStrategyState, divergence_event: Any) -> float:
-        divergence_confidence = self._to_float(self._get_value(divergence_event, "confidence"), default=0.0)
-        return self._boost_metric(base=state.score, signal=divergence_confidence, bonus=self.config.repeat_divergence_confirmation_bonus)
+    def _compute_confirmation_score_from_repeat_divergence(
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
+    ) -> float:
+        divergence_confidence = self._to_float(
+            self._get_value(divergence_event, "confidence"),
+            default=0.0,
+        )
+        divergence_bonus = self._divergence_type_bonus(divergence_event)
 
-    def _compute_confirmation_confidence_from_repeat_divergence(self, state: FundingStrategyState, divergence_event: Any) -> float:
-        divergence_confidence = self._to_float(self._get_value(divergence_event, "confidence"), default=0.0)
-        return self._boost_metric(base=state.confidence, signal=divergence_confidence, bonus=self.config.repeat_divergence_confirmation_bonus)
+        return self._boost_metric(
+            base=state.score,
+            signal=self._clip_score(divergence_confidence + divergence_bonus),
+            bonus=self.config.repeat_divergence_confirmation_bonus,
+        )
 
-    def _compute_confirmation_score_from_pressure_release(self, state: FundingStrategyState, pressure_state: Any) -> float:
-        curr_pressure_score = self._to_float(self._get_value(pressure_state, "pressure_score"), default=0.0)
-        return self._clip_score(self._average_scores(state.score, 1.0 - min(curr_pressure_score, 1.0), _PRESSURE_RELEASE_TARGET_CONFIDENCE))
+    def _compute_confirmation_confidence_from_repeat_divergence(
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
+    ) -> float:
+        divergence_confidence = self._to_float(
+            self._get_value(divergence_event, "confidence"),
+            default=0.0,
+        )
+        return self._boost_metric(
+            base=state.confidence,
+            signal=divergence_confidence,
+            bonus=self.config.repeat_divergence_confirmation_bonus,
+        )
 
-    def _compute_confirmation_confidence_from_pressure_release(self, state: FundingStrategyState, pressure_state: Any) -> float:
-        mean_reversion_probability = self._to_float(self._get_value(pressure_state, "mean_reversion_probability"), default=0.0)
-        squeeze_probability = self._to_float(self._get_value(pressure_state, "squeeze_probability"), default=0.0)
-        return self._clip_score(self._average_scores(state.confidence, mean_reversion_probability, squeeze_probability))
+    def _compute_confirmation_score_from_pressure_release(
+        self,
+        state: FundingStrategyState,
+        pressure_state: Any,
+    ) -> float:
+        curr_pressure_score = self._to_float(
+            self._get_value(pressure_state, "pressure_score"),
+            default=0.0,
+        )
+        return self._clip_score(
+            self._average_scores(
+                state.score,
+                1.0 - min(curr_pressure_score, 1.0),
+                _PRESSURE_RELEASE_TARGET_CONFIDENCE,
+            )
+        )
 
-    def _compute_confirmation_score_from_regime_shift(self, state: FundingStrategyState, regime_state: Any) -> float:
-        regime_confidence = self._to_float(self._get_value(regime_state, "confidence"), default=0.0)
-        return self._boost_metric(base=state.score, signal=regime_confidence, bonus=self.config.regime_shift_confirmation_bonus)
+    def _compute_confirmation_confidence_from_pressure_release(
+        self,
+        state: FundingStrategyState,
+        pressure_state: Any,
+    ) -> float:
+        mean_reversion_probability = self._to_float(
+            self._get_value(pressure_state, "mean_reversion_probability"),
+            default=0.0,
+        )
+        squeeze_probability = self._to_float(
+            self._get_value(pressure_state, "squeeze_probability"),
+            default=0.0,
+        )
+        return self._clip_score(
+            self._average_scores(
+                state.confidence,
+                mean_reversion_probability,
+                squeeze_probability,
+            )
+        )
 
-    def _compute_confirmation_confidence_from_regime_shift(self, state: FundingStrategyState, regime_state: Any) -> float:
-        regime_confidence = self._to_float(self._get_value(regime_state, "confidence"), default=0.0)
-        return self._boost_metric(base=state.confidence, signal=regime_confidence, bonus=self.config.regime_shift_confirmation_bonus)
+    def _compute_confirmation_score_from_regime_shift(
+        self,
+        state: FundingStrategyState,
+        regime_state: Any,
+    ) -> float:
+        regime_confidence = self._to_float(
+            self._get_value(regime_state, "confidence"),
+            default=0.0,
+        )
+        return self._boost_metric(
+            base=state.score,
+            signal=regime_confidence,
+            bonus=self.config.regime_shift_confirmation_bonus,
+        )
 
-    def _compute_confirmation_score_from_extreme(self, state: FundingStrategyState, extreme_event: Any) -> float:
-        severity = self._to_float(self._get_value(extreme_event, "severity"), default=0.0)
-        return self._boost_metric(base=state.score, signal=severity, bonus=self.config.extreme_confirmation_bonus)
+    def _compute_confirmation_confidence_from_regime_shift(
+        self,
+        state: FundingStrategyState,
+        regime_state: Any,
+    ) -> float:
+        regime_confidence = self._to_float(
+            self._get_value(regime_state, "confidence"),
+            default=0.0,
+        )
+        return self._boost_metric(
+            base=state.confidence,
+            signal=regime_confidence,
+            bonus=self.config.regime_shift_confirmation_bonus,
+        )
 
-    def _compute_confirmation_confidence_from_extreme(self, state: FundingStrategyState, extreme_event: Any) -> float:
-        severity = self._to_float(self._get_value(extreme_event, "severity"), default=0.0)
-        return self._boost_metric(base=state.confidence, signal=severity, bonus=self.config.extreme_confirmation_bonus)
+    def _compute_confirmation_score_from_extreme(
+        self,
+        state: FundingStrategyState,
+        extreme_event: Any,
+    ) -> float:
+        severity = self._to_float(
+            self._get_value(extreme_event, "severity"),
+            default=0.0,
+        )
+        return self._boost_metric(
+            base=state.score,
+            signal=severity,
+            bonus=self.config.extreme_confirmation_bonus,
+        )
 
-    def _compute_confirmation_score_from_signal(self, state: FundingStrategyState, signal: Any) -> float:
-        signal_score = abs(self._to_float(self._get_value(signal, "score"), default=0.0))
-        return self._weighted_average([(state.score, 1.0 - _SIGNAL_CONFIRMATION_WEIGHT), (signal_score, _SIGNAL_CONFIRMATION_WEIGHT)])
+    def _compute_confirmation_confidence_from_extreme(
+        self,
+        state: FundingStrategyState,
+        extreme_event: Any,
+    ) -> float:
+        severity = self._to_float(
+            self._get_value(extreme_event, "severity"),
+            default=0.0,
+        )
+        return self._boost_metric(
+            base=state.confidence,
+            signal=severity,
+            bonus=self.config.extreme_confirmation_bonus,
+        )
 
-    def _compute_confirmation_confidence_from_signal(self, state: FundingStrategyState, signal: Any) -> float:
-        signal_confidence = self._to_float(self._get_value(signal, "confidence"), default=0.0)
-        return self._weighted_average([(state.confidence, 0.45), (signal_confidence, 0.55)])
+    def _compute_confirmation_score_from_signal(
+        self,
+        state: FundingStrategyState,
+        signal: Any,
+    ) -> float:
+        signal_score = abs(
+            self._to_float(self._get_value(signal, "score"), default=0.0)
+        )
+        origin_weight = self._signal_origin_confirmation_weight(signal)
+
+        return self._weighted_average(
+            [
+                (state.score, 1.0 - _SIGNAL_CONFIRMATION_WEIGHT),
+                (signal_score * origin_weight, _SIGNAL_CONFIRMATION_WEIGHT),
+            ]
+        )
+
+    def _compute_confirmation_confidence_from_signal(
+        self,
+        state: FundingStrategyState,
+        signal: Any,
+    ) -> float:
+        signal_confidence = self._to_float(
+            self._get_value(signal, "confidence"),
+            default=0.0,
+        )
+        origin_weight = self._signal_origin_confirmation_weight(signal)
+
+        return self._weighted_average(
+            [
+                (state.confidence, 0.45),
+                (signal_confidence * origin_weight, 0.55),
+            ]
+        )
 
     # ------------------------------------------------------------------
     # Atomic update evaluation
     # ------------------------------------------------------------------
 
-    async def _evaluate_active_state_after_atomic_update(self, *, state: FundingStrategyState, correlation_id: str | None) -> None:
-        if state.last_signal is not None and self._should_invalidate_by_signal(state, state.last_signal):
-            self.set_invalidated(state, reason="atomic_update_opposite_signal_invalidated_divergence_setup", cooldown=True, metadata={"invalidation_source": "funding_updated.signal"})
-            await self.emit_invalidated(state, extra_payload={"trigger": "funding_updated", "correlation_id": correlation_id})
+    async def _evaluate_active_state_after_atomic_update(
+        self,
+        *,
+        state: FundingStrategyState,
+        correlation_id: str | None,
+    ) -> None:
+        best_opposite_signal = self._best_signal_for_direction(
+            state,
+            target_direction=self._opposite_direction(state.direction),
+        )
+        if best_opposite_signal is not None and self._should_invalidate_by_signal(
+            state,
+            best_opposite_signal,
+        ):
+            self.set_invalidated(
+                state,
+                reason="atomic_update_opposite_signal_invalidated_divergence_setup",
+                cooldown=True,
+                metadata={
+                    "invalidation_source": "funding_updated.signal",
+                    "signal_origin": self._signal_origin(best_opposite_signal),
+                    "scope": state.scope.to_dict(),
+                },
+            )
+            await self.emit_invalidated(
+                state,
+                extra_payload={
+                    "trigger": "funding_updated",
+                    "correlation_id": correlation_id,
+                },
+            )
             return
 
-        if state.last_divergence is not None and self._is_opposite_divergence_for_state(state, state.last_divergence):
-            self.set_invalidated(state, reason="atomic_update_opposite_divergence_invalidated_divergence_setup", cooldown=True, metadata={"invalidation_source": "funding_updated.divergence"})
-            await self.emit_invalidated(state, extra_payload={"trigger": "funding_updated", "correlation_id": correlation_id})
+        if state.last_divergence is not None and self._is_opposite_divergence_for_state(
+            state,
+            state.last_divergence,
+        ):
+            self.set_invalidated(
+                state,
+                reason="atomic_update_opposite_divergence_invalidated_divergence_setup",
+                cooldown=True,
+                metadata={
+                    "invalidation_source": "funding_updated.divergence",
+                    "scope": state.scope.to_dict(),
+                },
+            )
+            await self.emit_invalidated(
+                state,
+                extra_payload={
+                    "trigger": "funding_updated",
+                    "correlation_id": correlation_id,
+                },
+            )
             return
 
         if state.status != FundingSetupStatus.SETUP_DETECTED:
             return
 
-        if state.last_signal is not None and self._can_confirm_by_signal(state, state.last_signal):
+        best_aligned_signal = self._best_signal_for_direction(
+            state,
+            target_direction=state.direction,
+        )
+        if best_aligned_signal is not None and self._can_confirm_by_signal(
+            state,
+            best_aligned_signal,
+        ):
             self.set_confirmed(
                 state,
-                score=self._compute_confirmation_score_from_signal(state, state.last_signal),
-                confidence=self._compute_confirmation_confidence_from_signal(state, state.last_signal),
+                score=self._compute_confirmation_score_from_signal(
+                    state,
+                    best_aligned_signal,
+                ),
+                confidence=self._compute_confirmation_confidence_from_signal(
+                    state,
+                    best_aligned_signal,
+                ),
                 reason="atomic_update_signal_confirmed_divergence_setup",
                 tags=[self.config.tag_confirmed_by_signal, self.config.tag_atomic_context],
-                event_time=self._extract_event_time_from_normalized(state.last_signal),
-                metadata={"confirmation_source": "funding_updated.signal"},
+                event_time=self._extract_event_time_from_normalized(best_aligned_signal),
+                metadata={
+                    "confirmation_source": "funding_updated.signal",
+                    "signal_origin": self._signal_origin(best_aligned_signal),
+                    "scope": state.scope.to_dict(),
+                },
             )
-            await self.emit_confirmed(state, extra_payload={"trigger": "funding_updated", "correlation_id": correlation_id})
+            await self.emit_confirmed(
+                state,
+                extra_payload={
+                    "trigger": "funding_updated",
+                    "correlation_id": correlation_id,
+                },
+            )
             return
 
-        if state.last_extreme is not None and self._can_confirm_by_extreme(state, state.last_extreme):
+        if state.last_extreme is not None and self._can_confirm_by_extreme(
+            state,
+            state.last_extreme,
+        ):
             self.set_confirmed(
                 state,
-                score=self._compute_confirmation_score_from_extreme(state, state.last_extreme),
-                confidence=self._compute_confirmation_confidence_from_extreme(state, state.last_extreme),
+                score=self._compute_confirmation_score_from_extreme(
+                    state,
+                    state.last_extreme,
+                ),
+                confidence=self._compute_confirmation_confidence_from_extreme(
+                    state,
+                    state.last_extreme,
+                ),
                 reason="atomic_update_extreme_confirmed_divergence_setup",
                 tags=[self.config.tag_confirmed_by_extreme, self.config.tag_atomic_context],
                 event_time=self._extract_event_time_from_normalized(state.last_extreme),
-                metadata={"confirmation_source": "funding_updated.extreme"},
+                metadata={
+                    "confirmation_source": "funding_updated.extreme",
+                    "scope": state.scope.to_dict(),
+                },
             )
-            await self.emit_confirmed(state, extra_payload={"trigger": "funding_updated", "correlation_id": correlation_id})
+            await self.emit_confirmed(
+                state,
+                extra_payload={
+                    "trigger": "funding_updated",
+                    "correlation_id": correlation_id,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Direction & alignment helpers
     # ------------------------------------------------------------------
 
-    def _derive_direction_from_divergence(self, divergence_event: Any) -> FundingStrategyDirection:
-        divergence_type = self._enum_str(self._get_value(divergence_event, "divergence_type"))
+    def _derive_direction_from_divergence(
+        self,
+        divergence_event: Any,
+    ) -> FundingStrategyDirection:
+        divergence_type = self._enum_str(
+            self._get_value(divergence_event, "divergence_type")
+        )
+
         bullish_types = {
             FundingDivergenceType.PRICE_UP_FUNDING_DOWN.value,
             FundingDivergenceType.OI_UP_FUNDING_DOWN.value,
@@ -1112,14 +1735,19 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             FundingDivergenceType.LIQUIDATIONS_LONGS_WITH_POSITIVE_FUNDING.value,
             FundingDivergenceType.OI_UP_FUNDING_UP_PRICE_STALLED.value,
         }
+
         if divergence_type in bullish_types:
             return FundingStrategyDirection.LONG
         if divergence_type in bearish_types:
             return FundingStrategyDirection.SHORT
         return FundingStrategyDirection.NEUTRAL
 
-    def _extreme_direction(self, extreme_event: Any) -> FundingStrategyDirection:
+    def _extreme_direction(
+        self,
+        extreme_event: Any,
+    ) -> FundingStrategyDirection:
         extreme_type = self._enum_str(self._get_value(extreme_event, "extreme_type"))
+
         positive = {
             FundingExtremeType.LOCAL_HIGH.value,
             FundingExtremeType.GLOBAL_HIGH.value,
@@ -1132,13 +1760,17 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             FundingExtremeType.ZSCORE_LOW.value,
             FundingExtremeType.PERCENTILE_LOW.value,
         }
+
         if extreme_type in positive:
             return FundingStrategyDirection.SHORT
         if extreme_type in negative:
             return FundingStrategyDirection.LONG
         return FundingStrategyDirection.NEUTRAL
 
-    def _signal_direction(self, signal: Any) -> FundingStrategyDirection:
+    def _signal_direction(
+        self,
+        signal: Any,
+    ) -> FundingStrategyDirection:
         score = self._to_float(self._get_value(signal, "score"), default=0.0)
         signal_type = self._enum_str(self._get_value(signal, "signal_type"))
         bias = self._enum_str(self._get_value(signal, "bias"))
@@ -1153,100 +1785,398 @@ class FundingDivergenceStrategy(BaseFundingStrategy):
             FundingSignalType.DIVERGENCE_DETECTED.value,
             FundingSignalType.FLIP_DETECTED.value,
         }
-        if signal_type in directional_types and bias in {FundingBias.SHORT_BIAS.value, FundingBias.OVERCROWDED_SHORTS.value, FundingBias.SQUEEZE_RISK_SHORTS.value}:
+
+        if (
+            signal_type in directional_types
+            and bias
+            in {
+                FundingBias.SHORT_BIAS.value,
+                FundingBias.OVERCROWDED_SHORTS.value,
+                FundingBias.SQUEEZE_RISK_SHORTS.value,
+            }
+        ):
             return FundingStrategyDirection.LONG
-        if signal_type in directional_types and bias in {FundingBias.LONG_BIAS.value, FundingBias.OVERCROWDED_LONGS.value, FundingBias.SQUEEZE_RISK_LONGS.value}:
+
+        if (
+            signal_type in directional_types
+            and bias
+            in {
+                FundingBias.LONG_BIAS.value,
+                FundingBias.OVERCROWDED_LONGS.value,
+                FundingBias.SQUEEZE_RISK_LONGS.value,
+            }
+        ):
             return FundingStrategyDirection.SHORT
 
         return FundingStrategyDirection.NEUTRAL
 
-    def _calc_directional_alignment_bonus(self, *, target_direction: FundingStrategyDirection, regime_bias: str | None, pressure_direction: str | None) -> float:
+    @staticmethod
+    def _opposite_direction(
+        direction: FundingStrategyDirection,
+    ) -> FundingStrategyDirection:
+        if direction == FundingStrategyDirection.LONG:
+            return FundingStrategyDirection.SHORT
+        if direction == FundingStrategyDirection.SHORT:
+            return FundingStrategyDirection.LONG
+        return FundingStrategyDirection.NEUTRAL
+
+    def _calc_directional_alignment_bonus(
+        self,
+        *,
+        target_direction: FundingStrategyDirection,
+        regime_bias: str | None,
+        pressure_direction: str | None,
+    ) -> float:
         bonus = _ALIGNMENT_BONUS_BASE
+
         if target_direction == FundingStrategyDirection.LONG:
-            if regime_bias in {FundingBias.SHORT_BIAS.value, FundingBias.OVERCROWDED_SHORTS.value, FundingBias.SQUEEZE_RISK_SHORTS.value}:
+            if regime_bias in {
+                FundingBias.SHORT_BIAS.value,
+                FundingBias.OVERCROWDED_SHORTS.value,
+                FundingBias.SQUEEZE_RISK_SHORTS.value,
+            }:
                 bonus += _ALIGNMENT_BONUS_PER_DIMENSION
-            if pressure_direction in {FundingPressureDirection.SHORT.value, FundingPressureDirection.NEUTRAL.value}:
+            if pressure_direction in {
+                FundingPressureDirection.SHORT.value,
+                FundingPressureDirection.NEUTRAL.value,
+            }:
                 bonus += _ALIGNMENT_BONUS_PER_DIMENSION
+
         elif target_direction == FundingStrategyDirection.SHORT:
-            if regime_bias in {FundingBias.LONG_BIAS.value, FundingBias.OVERCROWDED_LONGS.value, FundingBias.SQUEEZE_RISK_LONGS.value}:
+            if regime_bias in {
+                FundingBias.LONG_BIAS.value,
+                FundingBias.OVERCROWDED_LONGS.value,
+                FundingBias.SQUEEZE_RISK_LONGS.value,
+            }:
                 bonus += _ALIGNMENT_BONUS_PER_DIMENSION
-            if pressure_direction in {FundingPressureDirection.LONG.value, FundingPressureDirection.NEUTRAL.value}:
+            if pressure_direction in {
+                FundingPressureDirection.LONG.value,
+                FundingPressureDirection.NEUTRAL.value,
+            }:
                 bonus += _ALIGNMENT_BONUS_PER_DIMENSION
+
         return self._clip_score(bonus)
 
-    def _calc_extreme_alignment_bonus(self, state: FundingStrategyState, target_direction: FundingStrategyDirection) -> float:
+    def _calc_extreme_alignment_bonus(
+        self,
+        state: FundingStrategyState,
+        target_direction: FundingStrategyDirection,
+    ) -> float:
         if state.last_extreme is None:
             return 0.0
-        direction = self._extreme_direction(state.last_extreme)
-        severity = self._to_float(self._get_value(state.last_extreme, "severity"), default=0.0)
-        return severity if direction == target_direction else 0.0
 
-    def _calc_signal_alignment_bonus(self, state: FundingStrategyState, target_direction: FundingStrategyDirection) -> float:
-        if state.last_signal is None:
+        direction = self._extreme_direction(state.last_extreme)
+        severity = self._to_float(
+            self._get_value(state.last_extreme, "severity"),
+            default=0.0,
+        )
+
+        if direction != target_direction:
             return 0.0
-        direction = self._signal_direction(state.last_signal)
-        confidence = self._to_float(self._get_value(state.last_signal, "confidence"), default=0.0)
-        return confidence if direction == target_direction else 0.0
+
+        extreme_type = self._enum_str(self._get_value(state.last_extreme, "extreme_type"))
+        multiplier = self._extreme_type_weight(extreme_type)
+
+        return self._clip_score(severity * multiplier)
+
+    def _calc_signal_alignment_bonus(
+        self,
+        state: FundingStrategyState,
+        target_direction: FundingStrategyDirection,
+    ) -> float:
+        best_signal = self._best_signal_for_direction(state, target_direction)
+        if best_signal is None:
+            return 0.0
+
+        confidence = self._to_float(
+            self._get_value(best_signal, "confidence"),
+            default=0.0,
+        )
+        origin_weight = self._signal_origin_alignment_weight(best_signal)
+
+        return self._clip_score(confidence * origin_weight)
+
+    def _best_signal_for_direction(
+        self,
+        state: FundingStrategyState,
+        target_direction: FundingStrategyDirection,
+    ) -> Any | None:
+        if target_direction == FundingStrategyDirection.NEUTRAL:
+            return None
+
+        candidates = list(state.recent_signals)
+        if state.last_signal is not None and state.last_signal not in candidates:
+            candidates.append(state.last_signal)
+
+        if not candidates:
+            return None
+
+        best_signal = None
+        best_score = -1.0
+
+        for signal in candidates:
+            if self._signal_direction(signal) != target_direction:
+                continue
+
+            confidence = self._to_float(
+                self._get_value(signal, "confidence"),
+                default=0.0,
+            )
+            score = abs(self._to_float(self._get_value(signal, "score"), default=0.0))
+            origin_weight = self._signal_origin_alignment_weight(signal)
+
+            rank = self._clip_score(
+                (confidence * 0.55) + (score * 0.30) + (origin_weight * 0.15)
+            )
+
+            if rank > best_score:
+                best_score = rank
+                best_signal = signal
+
+        return best_signal
+
+    def _signal_origin_alignment_weight(
+        self,
+        signal: Any,
+    ) -> float:
+        origin = self._signal_origin(signal)
+        if not origin:
+            return 0.50
+        return self._clip_score(
+            self.config.signal_origin_alignment_weight.get(origin, 0.50)
+        )
+
+    def _signal_origin_confirmation_weight(
+        self,
+        signal: Any,
+    ) -> float:
+        origin = self._signal_origin(signal)
+        if not origin:
+            return 0.50
+        return self._clip_score(
+            self.config.signal_origin_confirmation_weight.get(origin, 0.50)
+        )
+
+    def _divergence_type_bonus(
+        self,
+        divergence_event: Any,
+    ) -> float:
+        divergence_type = self._enum_str(
+            self._get_value(divergence_event, "divergence_type")
+        )
+
+        if divergence_type in {
+            FundingDivergenceType.LIQUIDATIONS_LONGS_WITH_POSITIVE_FUNDING.value,
+            FundingDivergenceType.LIQUIDATIONS_SHORTS_WITH_NEGATIVE_FUNDING.value,
+        }:
+            return self.config.liquidation_divergence_bonus
+
+        if divergence_type in {
+            FundingDivergenceType.CVD_UP_FUNDING_DOWN.value,
+            FundingDivergenceType.CVD_DOWN_FUNDING_UP.value,
+        }:
+            return self.config.cvd_divergence_bonus
+
+        if divergence_type in {
+            FundingDivergenceType.OI_UP_FUNDING_DOWN.value,
+            FundingDivergenceType.OI_UP_FUNDING_UP_PRICE_STALLED.value,
+        }:
+            return self.config.oi_divergence_bonus
+
+        if divergence_type in {
+            FundingDivergenceType.PRICE_UP_FUNDING_DOWN.value,
+            FundingDivergenceType.PRICE_DOWN_FUNDING_UP.value,
+        }:
+            return self.config.price_divergence_bonus
+
+        return 0.0
+
+    @staticmethod
+    def _extreme_type_weight(
+        extreme_type: str | None,
+    ) -> float:
+        if extreme_type in {
+            FundingExtremeType.GLOBAL_HIGH.value,
+            FundingExtremeType.GLOBAL_LOW.value,
+        }:
+            return 1.00
+
+        if extreme_type in {
+            FundingExtremeType.PERCENTILE_HIGH.value,
+            FundingExtremeType.PERCENTILE_LOW.value,
+        }:
+            return 0.90
+
+        if extreme_type in {
+            FundingExtremeType.ZSCORE_HIGH.value,
+            FundingExtremeType.ZSCORE_LOW.value,
+        }:
+            return 0.85
+
+        if extreme_type in {
+            FundingExtremeType.LOCAL_HIGH.value,
+            FundingExtremeType.LOCAL_LOW.value,
+        }:
+            return 0.70
+
+        return 0.50
 
     # ------------------------------------------------------------------
     # Emit hooks
     # ------------------------------------------------------------------
 
-    def on_before_setup_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_setup_emit(
+        self,
+        state: FundingStrategyState,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         payload["strategy_family"] = "funding"
         payload["strategy_variant"] = "divergence"
         payload["signal_class"] = "directional_dislocation"
+        payload["scope"] = state.scope.to_dict()
         return payload
 
-    def on_before_confirmation_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_confirmation_emit(
+        self,
+        state: FundingStrategyState,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         payload["strategy_family"] = "funding"
         payload["strategy_variant"] = "divergence"
         payload["signal_class"] = "directional_dislocation"
         payload["is_tradeable"] = True
+        payload["scope"] = state.scope.to_dict()
         return payload
 
-    def on_before_invalidation_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_invalidation_emit(
+            self,
+            state: FundingStrategyState,
+            payload: dict[str, Any],
+    ) -> dict[str, Any]:
         payload["strategy_family"] = "funding"
         payload["strategy_variant"] = "divergence"
+        payload["signal_class"] = "directional_dislocation"
+        payload["scope"] = state.scope.to_dict()
         return payload
 
-    def on_before_expiration_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_expiration_emit(
+            self,
+            state: FundingStrategyState,
+            payload: dict[str, Any],
+    ) -> dict[str, Any]:
         payload["strategy_family"] = "funding"
         payload["strategy_variant"] = "divergence"
+        payload["signal_class"] = "directional_dislocation"
+        payload["scope"] = state.scope.to_dict()
         return payload
 
     # ------------------------------------------------------------------
     # Private utilities
     # ------------------------------------------------------------------
 
-    def _build_setup_tags(self, state: FundingStrategyState) -> list[str]:
-        tags = [self.config.tag_divergence, self.config.tag_dislocation, self.config.tag_reversal]
+    def _build_setup_tags(
+        self,
+        state: FundingStrategyState,
+        divergence_event: Any,
+    ) -> list[str]:
+        tags = [
+            self.config.tag_divergence,
+            self.config.tag_dislocation,
+            self.config.tag_reversal,
+        ]
+
+        divergence_type = self._enum_str(
+            self._get_value(divergence_event, "divergence_type")
+        )
+
+        if divergence_type in {
+            FundingDivergenceType.LIQUIDATIONS_LONGS_WITH_POSITIVE_FUNDING.value,
+            FundingDivergenceType.LIQUIDATIONS_SHORTS_WITH_NEGATIVE_FUNDING.value,
+        }:
+            tags.append(self.config.tag_liquidation)
+
+        if divergence_type in {
+            FundingDivergenceType.CVD_UP_FUNDING_DOWN.value,
+            FundingDivergenceType.CVD_DOWN_FUNDING_UP.value,
+        }:
+            tags.append(self.config.tag_cvd)
+
+        if divergence_type in {
+            FundingDivergenceType.OI_UP_FUNDING_DOWN.value,
+            FundingDivergenceType.OI_UP_FUNDING_UP_PRICE_STALLED.value,
+        }:
+            tags.append(self.config.tag_oi)
+
+        if divergence_type in {
+            FundingDivergenceType.PRICE_UP_FUNDING_DOWN.value,
+            FundingDivergenceType.PRICE_DOWN_FUNDING_UP.value,
+        }:
+            tags.append(self.config.tag_price)
+
         if state.last_extreme is not None:
             tags.append(self.config.tag_extreme)
+
         if state.last_signal is not None:
             tags.append(self.config.tag_signal)
+
         return tags
 
-    def _build_divergence_context(self, *, divergence_event: Any, regime: Any | None, pressure: Any | None) -> dict[str, Any]:
+    def _build_divergence_context(
+        self,
+        *,
+        divergence_event: Any,
+        regime: Any | None,
+        pressure: Any | None,
+    ) -> dict[str, Any]:
         return {
+            "scope": {
+                "exchange": self._enum_str(self._get_value(divergence_event, "exchange")),
+                "market_type": self._get_value(divergence_event, "market_type"),
+                "symbol": self._get_value(divergence_event, "symbol"),
+                "timeframe": self._enum_str(self._get_value(divergence_event, "timeframe")),
+                "exchange_symbol": self._get_value(divergence_event, "exchange_symbol"),
+            },
             "divergence": {
-                "divergence_type": self._enum_str(self._get_value(divergence_event, "divergence_type")),
-                "confidence": self._to_float(self._get_value(divergence_event, "confidence"), default=0.0),
+                "divergence_type": self._enum_str(
+                    self._get_value(divergence_event, "divergence_type")
+                ),
+                "confidence": self._to_float(
+                    self._get_value(divergence_event, "confidence"),
+                    default=0.0,
+                ),
                 "funding_rate": self._get_value(divergence_event, "funding_rate"),
                 "price_change_pct": self._get_value(divergence_event, "price_change_pct"),
                 "oi_change_pct": self._get_value(divergence_event, "oi_change_pct"),
                 "cvd_change": self._get_value(divergence_event, "cvd_change"),
                 "long_liquidations": self._get_value(divergence_event, "long_liquidations"),
                 "short_liquidations": self._get_value(divergence_event, "short_liquidations"),
+                "type_bonus": self._divergence_type_bonus(divergence_event),
             },
             "regime": {
                 "regime": self._enum_str(self._get_value(regime, "regime")),
                 "bias": self._enum_str(self._get_value(regime, "bias")),
-                "confidence": self._to_float(self._get_value(regime, "confidence"), default=0.0),
+                "confidence": self._to_float(
+                    self._get_value(regime, "confidence"),
+                    default=0.0,
+                ),
             },
             "pressure": {
                 "direction": self._enum_str(self._get_value(pressure, "direction")),
                 "level": self._enum_str(self._get_value(pressure, "level")),
-                "pressure_score": self._to_float(self._get_value(pressure, "pressure_score"), default=0.0),
+                "pressure_score": self._to_float(
+                    self._get_value(pressure, "pressure_score"),
+                    default=0.0,
+                ),
+                "squeeze_probability": self._get_value(pressure, "squeeze_probability"),
+                "mean_reversion_probability": self._get_value(
+                    pressure,
+                    "mean_reversion_probability",
+                ),
             },
         }
+
+
+__all__ = [
+    "FundingDivergenceStrategy",
+    "FundingDivergenceStrategyConfig",
+]

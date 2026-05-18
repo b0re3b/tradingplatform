@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import json
 from abc import ABC, abstractmethod
+from collections import defaultdict, deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Iterable, Mapping
+from pathlib import Path
+from typing import Any, Deque
+from uuid import uuid4
 
 from analytics.funding.enums import (
     FundingBias,
@@ -29,6 +35,13 @@ from analytics.funding.models import (
     FundingSignal,
     FundingStatistics,
     FundingSnapshot,
+    funding_key_to_dict,
+    make_funding_key,
+    normalize_exchange,
+    normalize_exchange_symbol,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
 )
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
@@ -74,8 +87,7 @@ def parse_datetime(value: Any) -> datetime | None:
             return ensure_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
         except ValueError:
             try:
-                numeric = float(raw)
-                return parse_datetime(numeric)
+                return parse_datetime(float(raw))
             except ValueError:
                 return None
 
@@ -83,7 +95,6 @@ def parse_datetime(value: Any) -> datetime | None:
 
 
 def serialize_for_event(value: Any) -> Any:
-    """Convert common non-JSON-safe values before putting them into EventBus payloads."""
     if isinstance(value, datetime):
         normalized = ensure_utc(value)
         return normalized.isoformat() if normalized else None
@@ -94,8 +105,8 @@ def serialize_for_event(value: Any) -> Any:
     if hasattr(value, "to_dict") and callable(value.to_dict):
         return serialize_for_event(value.to_dict())
     if isinstance(value, Mapping):
-        return {str(k): serialize_for_event(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
+        return {str(key): serialize_for_event(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, deque)):
         return [serialize_for_event(item) for item in value]
     return value
 
@@ -104,33 +115,45 @@ def unwrap_analytics_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """
     Accept both direct analytics payloads and FundingAnalyticsEvent.to_dict() envelopes.
 
-    Examples accepted:
+    Supported examples:
     - {"symbol": "BTCUSDT", "regime": "positive", ...}
     - {"event_type": "regime", "payload": {"symbol": "BTCUSDT", ...}}
     - {"payload": {"regime_state": {...}, "pressure_state": {...}}}
     """
     raw = dict(payload)
     inner = raw.get("payload")
+
     if isinstance(inner, Mapping):
         inner_dict = dict(inner)
-        for key in ("snapshot", "statistics", "regime_state", "pressure_state", "extreme_event", "divergence_event", "flip_event", "signal"):
-            if isinstance(inner_dict.get(key), Mapping):
-                nested = dict(inner_dict[key])
+
+        for key in (
+            "snapshot",
+            "statistics",
+            "regime_state",
+            "pressure_state",
+            "extreme_event",
+            "divergence_event",
+            "flip_event",
+            "signal",
+        ):
+            nested_value = inner_dict.get(key)
+            if isinstance(nested_value, Mapping):
+                nested = dict(nested_value)
                 nested.setdefault("_envelope", raw)
                 return nested
+
         inner_dict.setdefault("_envelope", raw)
         return inner_dict
+
     return raw
 
 
 # =============================================================================
-# Enums / Dataclasses
+# Scope / enums / dataclasses
 # =============================================================================
 
 
 class FundingSetupStatus(str, Enum):
-    """Current lifecycle status of a funding strategy setup."""
-
     IDLE = "idle"
     SETUP_DETECTED = "setup_detected"
     CONFIRMED = "confirmed"
@@ -140,29 +163,98 @@ class FundingSetupStatus(str, Enum):
 
 
 class FundingStrategyDirection(str, Enum):
-    """Expected trade direction produced by the strategy layer."""
-
     LONG = "long"
     SHORT = "short"
     NEUTRAL = "neutral"
+
+
+@dataclass(frozen=True, slots=True)
+class FundingStrategyScope:
+    """
+    Full futures funding scope used by strategy/funding/*.
+
+    Canonical key:
+        exchange + market_type + symbol + timeframe
+    """
+
+    exchange: str
+    market_type: str
+    symbol: str
+    timeframe: str
+    exchange_symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        normalized_exchange = normalize_exchange(self.exchange).value
+        normalized_market_type = normalize_market_type(self.market_type)
+        normalized_symbol = normalize_symbol(self.symbol)
+        normalized_timeframe = normalize_timeframe(self.timeframe).value
+        normalized_exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=normalized_symbol,
+        )
+
+        object.__setattr__(self, "exchange", normalized_exchange)
+        object.__setattr__(self, "market_type", normalized_market_type)
+        object.__setattr__(self, "symbol", normalized_symbol)
+        object.__setattr__(self, "timeframe", normalized_timeframe)
+        object.__setattr__(self, "exchange_symbol", normalized_exchange_symbol)
+
+    @property
+    def key(self) -> str:
+        return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
+
+    @property
+    def legacy_key(self) -> str:
+        return f"{self.symbol}:{self.exchange}"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol or self.symbol,
+        }
+
+    def funding_key(self) -> tuple[str, str, str, str]:
+        return make_funding_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    def __iter__(self):
+        """
+        Backward compatibility for existing child strategy code:
+
+            symbol, exchange = self.extract_symbol_exchange(payload)
+
+        This intentionally yields only the legacy pair.
+        """
+        yield self.symbol
+        yield self.exchange
+
+
+_current_scope: contextvars.ContextVar[FundingStrategyScope | None] = contextvars.ContextVar(
+    "current_funding_strategy_scope",
+    default=None,
+)
 
 
 @dataclass(slots=True)
 class BaseFundingStrategyConfig:
     """
     Base config for strategy/funding/* runtime modules.
-
-    Core-aligned responsibilities:
-    - EventBus topic names and priorities
-    - Scheduler-managed cleanup
-    - optional funding analytics aggregate/signal subscriptions
-    - state lifecycle limits and stale-event protection
     """
 
     setup_ttl_sec: float = 15 * 60.0
     cooldown_sec: float = 5 * 60.0
     event_stale_after_sec: float = 10 * 60.0
     state_lock_timeout_sec: float = 3.0
+
+    default_market_type: str = "usdm_futures"
+    default_timeframe: FundingTimeframe | str = FundingTimeframe.H1
 
     allow_reconfirm: bool = False
     emit_setup_events: bool = True
@@ -186,13 +278,23 @@ class BaseFundingStrategyConfig:
     enable_scheduler_cleanup: bool = True
     cleanup_interval_sec: float = 30.0
     cleanup_job_timeout_sec: float = 10.0
+    cleanup_job_name: str | None = None
 
-    # Optional base-level analytics subscriptions. Concrete strategies may enable these
-    # to receive atomic context updates and normalized funding signals.
     enable_funding_updated_subscription: bool = False
     enable_funding_signal_subscription: bool = False
     funding_updated_event_name: str = "analytics.funding.updated"
     funding_signal_event_name: str = "analytics.funding.signal"
+
+    recent_signals_maxlen: int = 50
+    signals_per_type_maxlen: int = 20
+
+    enable_generated_signal_parquet_history: bool = False
+    generated_signal_parquet_base_path: str = "data/parquet"
+    generated_signal_parquet_dataset_name: str = "strategy_funding_signals"
+    generated_signal_parquet_flush_interval_sec: float = 60.0
+    generated_signal_parquet_flush_timeout_sec: float = 10.0
+    generated_signal_parquet_flush_batch_size: int = 100
+    generated_signal_parquet_flush_job_name: str | None = None
 
     def validate(self) -> None:
         if self.setup_ttl_sec <= 0:
@@ -217,14 +319,29 @@ class BaseFundingStrategyConfig:
             raise ValueError("funding_updated_event_name must not be empty")
         if self.enable_funding_signal_subscription and not self.funding_signal_event_name.strip():
             raise ValueError("funding_signal_event_name must not be empty")
+        if self.recent_signals_maxlen <= 0:
+            raise ValueError("recent_signals_maxlen must be > 0")
+        if self.signals_per_type_maxlen <= 0:
+            raise ValueError("signals_per_type_maxlen must be > 0")
+        if self.generated_signal_parquet_flush_interval_sec <= 0:
+            raise ValueError("generated_signal_parquet_flush_interval_sec must be > 0")
+        if self.generated_signal_parquet_flush_timeout_sec <= 0:
+            raise ValueError("generated_signal_parquet_flush_timeout_sec must be > 0")
+        if self.generated_signal_parquet_flush_batch_size <= 0:
+            raise ValueError("generated_signal_parquet_flush_batch_size must be > 0")
 
 
 @dataclass(slots=True)
 class FundingStrategyState:
-    """Local per-symbol/exchange state for funding strategies."""
+    """
+    Local per-futures-scope state for funding strategies.
+    """
 
     symbol: str
     exchange: str
+    market_type: str = "usdm_futures"
+    timeframe: FundingTimeframe | str = FundingTimeframe.H1
+    exchange_symbol: str | None = None
 
     status: FundingSetupStatus = FundingSetupStatus.IDLE
     direction: FundingStrategyDirection = FundingStrategyDirection.NEUTRAL
@@ -254,6 +371,11 @@ class FundingStrategyState:
     last_divergence: FundingDivergenceEvent | dict[str, Any] | None = None
     last_flip: FundingFlipEvent | dict[str, Any] | None = None
     last_signal: FundingSignal | dict[str, Any] | None = None
+
+    recent_signals: Deque[FundingSignal | dict[str, Any]] = field(default_factory=deque)
+    last_signals_by_origin: dict[str, FundingSignal | dict[str, Any]] = field(default_factory=dict)
+    last_signals_by_type: dict[str, Deque[FundingSignal | dict[str, Any]]] = field(default_factory=dict)
+
     last_funding_updated_payload: dict[str, Any] | None = None
 
     setup_event_time: datetime | None = None
@@ -266,8 +388,19 @@ class FundingStrategyState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.symbol = self.symbol.upper().strip()
-        self.exchange = str(self.exchange).lower().strip()
+        scope = FundingStrategyScope(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe.value if isinstance(self.timeframe, FundingTimeframe) else self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+        self.symbol = scope.symbol
+        self.exchange = scope.exchange
+        self.market_type = scope.market_type
+        self.timeframe = FundingTimeframe(scope.timeframe)
+        self.exchange_symbol = scope.exchange_symbol
 
         self.created_at = ensure_utc(self.created_at) or utc_now()
         self.updated_at = ensure_utc(self.updated_at) or utc_now()
@@ -285,8 +418,22 @@ class FundingStrategyState:
         self.confidence = max(0.0, min(1.0, self.confidence))
 
     @property
+    def scope(self) -> FundingStrategyScope:
+        return FundingStrategyScope(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe.value if isinstance(self.timeframe, FundingTimeframe) else str(self.timeframe),
+            exchange_symbol=self.exchange_symbol,
+        )
+
+    @property
     def key(self) -> str:
-        return f"{self.symbol}:{self.exchange}"
+        return self.scope.key
+
+    @property
+    def legacy_key(self) -> str:
+        return self.scope.legacy_key
 
     def is_active(self) -> bool:
         return self.status in {
@@ -299,6 +446,12 @@ class FundingStrategyState:
             {
                 "symbol": self.symbol,
                 "exchange": self.exchange,
+                "market_type": self.market_type,
+                "timeframe": self.timeframe,
+                "exchange_symbol": self.exchange_symbol,
+                "scope": self.scope.to_dict(),
+                "key": self.key,
+                "legacy_key": self.legacy_key,
                 "status": self.status,
                 "direction": self.direction,
                 "strategy_name": self.strategy_name,
@@ -320,13 +473,16 @@ class FundingStrategyState:
                 "last_signal_time": self.last_signal_time,
                 "last_emit_time": self.last_emit_time,
                 "emit_count": self.emit_count,
+                "recent_signals_count": len(self.recent_signals),
+                "last_signal_origins": sorted(self.last_signals_by_origin.keys()),
+                "last_signal_types": sorted(self.last_signals_by_type.keys()),
                 "metadata": dict(self.metadata),
             }
         )
 
 
 # =============================================================================
-# Base Strategy
+# Base strategy
 # =============================================================================
 
 
@@ -334,16 +490,14 @@ class BaseFundingStrategy(ABC):
     """
     Base class for strategy/funding/* modules.
 
-    Core-aligned behavior:
-    - typed EventBus / Event / Subscription / EventPriority
-    - constructor dependency injection for EventBus, Scheduler, config
-    - lifecycle start/stop/restart + backward-compatible register()
-    - subscription tracking and graceful unsubscribe
-    - optional Scheduler cleanup via add_interval_job()
-    - centralized logging via core.logger.get_logger()
-    - EventBus.emit with priority/source/correlation_id/headers
-    - normalized funding analytics attachment helpers
-    - optional handlers for analytics.funding.updated and analytics.funding.signal
+    Core-aligned:
+    - EventBus/Scheduler via dependency injection;
+    - register()/unregister()/start()/stop();
+    - full futures scope: exchange + market_type + symbol + timeframe;
+    - Scheduler-managed cleanup and optional parquet signal-history flush;
+    - EventBus.emit() for strategy events;
+    - centralized get_logger();
+    - no raw market data access.
     """
 
     def __init__(
@@ -353,6 +507,7 @@ class BaseFundingStrategy(ABC):
         config: BaseFundingStrategyConfig | None = None,
         scheduler: Scheduler | None = None,
         service_name: str | None = None,
+        parquet_storage: Any | None = None,
     ) -> None:
         if event_bus is None:
             raise ValueError("event_bus is required")
@@ -362,6 +517,7 @@ class BaseFundingStrategy(ABC):
         self.config.validate()
         self.scheduler = scheduler
         self.service_name = service_name or self.config.service_name
+        self.parquet_storage = parquet_storage
 
         self.logger = get_logger(
             __name__,
@@ -373,10 +529,17 @@ class BaseFundingStrategy(ABC):
         self._states: dict[str, FundingStrategyState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._subscriptions: list[Subscription] = []
+
         self._cleanup_job_id: str | None = None
-        self._registered: bool = False
-        self._running: bool = False
-        self._stopping: bool = False
+        self._generated_signal_flush_job_id: str | None = None
+
+        self._generated_signal_buffer: list[dict[str, Any]] = []
+        self._generated_signal_buffer_lock = asyncio.Lock()
+        self._parquet_unavailable_logged = False
+
+        self._registered = False
+        self._running = False
+        self._stopping = False
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -389,15 +552,18 @@ class BaseFundingStrategy(ABC):
 
         self._running = True
         self._stopping = False
+
         self.register()
         self._register_scheduler_jobs()
+        self._register_generated_signal_flush_job()
 
         self.logger.info(
-            "Funding strategy started | strategy=%s namespace=%s subscriptions=%s cleanup_job_id=%s",
+            "Funding strategy started | strategy=%s namespace=%s subscriptions=%s cleanup_job_id=%s signal_flush_job_id=%s",
             self.strategy_name,
             self.config.strategy_namespace,
             len(self._subscriptions),
             self._cleanup_job_id,
+            self._generated_signal_flush_job_id,
         )
 
     async def stop(self) -> None:
@@ -407,8 +573,11 @@ class BaseFundingStrategy(ABC):
         self._stopping = True
         self._running = False
 
+        await self.flush_generated_signals_to_parquet()
+
         self.unregister()
         self._unregister_scheduler_jobs()
+        self._unregister_generated_signal_flush_job()
 
         self.logger.info(
             "Funding strategy stopped | strategy=%s states=%s",
@@ -422,7 +591,6 @@ class BaseFundingStrategy(ABC):
         await self.start()
 
     def register(self) -> None:
-        """Backward-compatible sync registration API."""
         if self._registered:
             self.logger.warning("%s already registered", self.__class__.__name__)
             return
@@ -490,7 +658,6 @@ class BaseFundingStrategy(ABC):
 
     @abstractmethod
     def register_subscriptions(self) -> None:
-        """Child strategies must subscribe through self.subscribe(...)."""
         raise NotImplementedError
 
     @property
@@ -505,25 +672,25 @@ class BaseFundingStrategy(ABC):
     async def on_funding_updated(self, event: Event) -> None:
         payload = self.extract_payload(event)
         normalized = self._normalize_updated_payload(payload)
-        symbol, exchange = self.extract_symbol_exchange(normalized)
-        if not symbol:
+        scope = self.extract_funding_scope(normalized)
+
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             self.attach_updated_context(state, normalized)
             self._expire_state_if_needed(state)
             await self.on_after_funding_updated(state, normalized, event)
         except Exception:
             self.logger.exception(
-                "Failed to process funding updated event | strategy=%s symbol=%s exchange=%s",
+                "Failed to process funding updated event | strategy=%s scope=%s",
                 self.strategy_name,
-                symbol,
-                exchange,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
@@ -531,26 +698,26 @@ class BaseFundingStrategy(ABC):
     async def on_funding_signal(self, event: Event) -> None:
         payload = self.extract_payload(event)
         normalized = self._normalize_signal_payload(payload)
-        symbol, exchange = self.extract_symbol_exchange(normalized)
-        if not symbol:
+        scope = self.extract_funding_scope(normalized)
+
+        if scope is None:
             return
 
-        lock = await self.acquire_symbol_lock(symbol, exchange)
+        lock = await self.acquire_scope_lock(scope)
         if lock is None:
             return
 
         try:
-            state = self.get_state(symbol, exchange)
+            state = self.get_state_for_scope(scope)
             signal = self._build_signal(normalized)
             self.attach_signal(state, signal)
             self._expire_state_if_needed(state)
             await self.on_after_funding_signal(state, signal, event)
         except Exception:
             self.logger.exception(
-                "Failed to process funding signal event | strategy=%s symbol=%s exchange=%s",
+                "Failed to process funding signal event | strategy=%s scope=%s",
                 self.strategy_name,
-                symbol,
-                exchange,
+                scope.to_dict(),
             )
         finally:
             self.release_symbol_lock(lock)
@@ -561,7 +728,6 @@ class BaseFundingStrategy(ABC):
         payload: dict[str, Any],
         event: Event,
     ) -> None:
-        """Optional hook for descendants."""
         return None
 
     async def on_after_funding_signal(
@@ -570,35 +736,49 @@ class BaseFundingStrategy(ABC):
         signal: FundingSignal | dict[str, Any],
         event: Event,
     ) -> None:
-        """Optional hook for descendants."""
         return None
 
     # -------------------------------------------------------------------------
     # State access
     # -------------------------------------------------------------------------
 
-    def get_state(self, symbol: str, exchange: str = "unknown") -> FundingStrategyState:
-        key = self._make_key(symbol, exchange)
-        state = self._states.get(key)
+    def get_state(
+        self,
+        symbol: str,
+        exchange: str = "unknown",
+        *,
+        market_type: str | None = None,
+        timeframe: FundingTimeframe | str | None = None,
+        exchange_symbol: str | None = None,
+    ) -> FundingStrategyState:
+        scope = self._scope_from_args(
+            symbol=symbol,
+            exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
+        )
+        return self.get_state_for_scope(scope)
+
+    def get_state_for_scope(self, scope: FundingStrategyScope) -> FundingStrategyState:
+        state = self._states.get(scope.key)
 
         if state is None:
             state = FundingStrategyState(
-                symbol=symbol,
-                exchange=exchange,
+                symbol=scope.symbol,
+                exchange=scope.exchange,
+                market_type=scope.market_type,
+                timeframe=scope.timeframe,
+                exchange_symbol=scope.exchange_symbol,
                 strategy_name=self.strategy_name,
+                recent_signals=deque(maxlen=self.config.recent_signals_maxlen),
             )
-            self._states[key] = state
+            self._states[state.key] = state
 
         if self.config.cleanup_expired_on_access:
             self._expire_state_if_needed(state)
 
         return state
-
-    def get_all_states(self) -> dict[str, FundingStrategyState]:
-        return dict(self._states)
-
-    def get_active_states(self) -> dict[str, FundingStrategyState]:
-        return {key: state for key, state in self._states.items() if self.is_state_active(state)}
 
     def reset_state(
         self,
@@ -606,13 +786,27 @@ class BaseFundingStrategy(ABC):
         exchange: str = "unknown",
         preserve_cooldown: bool = True,
         preserve_context: bool = True,
+        *,
+        market_type: str | None = None,
+        timeframe: FundingTimeframe | str | None = None,
+        exchange_symbol: str | None = None,
     ) -> FundingStrategyState:
-        previous = self.get_state(symbol, exchange)
+        scope = self._scope_from_args(
+            symbol=symbol,
+            exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
+        )
+        previous = self.get_state_for_scope(scope)
         cooldown_until = previous.cooldown_until if preserve_cooldown else None
 
         new_state = FundingStrategyState(
-            symbol=symbol,
-            exchange=exchange,
+            symbol=scope.symbol,
+            exchange=scope.exchange,
+            market_type=scope.market_type,
+            timeframe=scope.timeframe,
+            exchange_symbol=scope.exchange_symbol,
             strategy_name=self.strategy_name,
             cooldown_until=cooldown_until,
             status=(
@@ -620,6 +814,7 @@ class BaseFundingStrategy(ABC):
                 if cooldown_until and cooldown_until > utc_now()
                 else FundingSetupStatus.IDLE
             ),
+            recent_signals=deque(maxlen=self.config.recent_signals_maxlen),
         )
 
         if preserve_context:
@@ -631,12 +826,31 @@ class BaseFundingStrategy(ABC):
             new_state.last_divergence = previous.last_divergence
             new_state.last_flip = previous.last_flip
             new_state.last_signal = previous.last_signal
+            new_state.recent_signals = deque(
+                previous.recent_signals,
+                maxlen=self.config.recent_signals_maxlen,
+            )
+            new_state.last_signals_by_origin = dict(previous.last_signals_by_origin)
+            new_state.last_signals_by_type = {
+                key: deque(value, maxlen=self.config.signals_per_type_maxlen)
+                for key, value in previous.last_signals_by_type.items()
+            }
             new_state.last_funding_updated_payload = previous.last_funding_updated_payload
             new_state.last_analytics_update_time = previous.last_analytics_update_time
             new_state.last_signal_time = previous.last_signal_time
 
         self._states[new_state.key] = new_state
         return new_state
+
+    def get_all_states(self) -> dict[str, FundingStrategyState]:
+        return dict(self._states)
+
+    def get_active_states(self) -> dict[str, FundingStrategyState]:
+        return {
+            key: state
+            for key, state in self._states.items()
+            if self.is_state_active(state)
+        }
 
     def stats(self) -> dict[str, Any]:
         active = sum(1 for state in self._states.values() if state.is_active())
@@ -651,27 +865,43 @@ class BaseFundingStrategy(ABC):
             "states_active": active,
             "locks": len(self._locks),
             "cleanup_job_id": self._cleanup_job_id,
+            "generated_signal_flush_job_id": self._generated_signal_flush_job_id,
+            "generated_signal_parquet_enabled": self.config.enable_generated_signal_parquet_history,
+            "generated_signal_buffer_size": len(self._generated_signal_buffer),
+            "generated_signal_parquet_root": str(self._generated_signal_parquet_root()),
         }
 
     # -------------------------------------------------------------------------
     # Locking
     # -------------------------------------------------------------------------
 
-    async def acquire_symbol_lock(self, symbol: str, exchange: str = "unknown") -> asyncio.Lock | None:
-        key = self._make_key(symbol, exchange)
-        lock = self._locks.setdefault(key, asyncio.Lock())
+    async def acquire_symbol_lock(
+        self,
+        symbol: str,
+        exchange: str = "unknown",
+    ) -> asyncio.Lock | None:
+        scope = self._scope_from_args(symbol=symbol, exchange=exchange)
+        return await self.acquire_scope_lock(scope)
+
+    async def acquire_scope_lock(self, scope: FundingStrategyScope) -> asyncio.Lock | None:
+        lock = self._locks.setdefault(scope.key, asyncio.Lock())
 
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=self.config.state_lock_timeout_sec)
+            await asyncio.wait_for(
+                lock.acquire(),
+                timeout=self.config.state_lock_timeout_sec,
+            )
             return lock
         except asyncio.TimeoutError:
             get_logger(
                 __name__,
                 event_type="strategy",
                 strategies=self.strategy_name,
-                symbol=str(symbol).upper().strip(),
-                exchange=str(exchange).lower().strip(),
-            ).warning("Funding strategy lock timeout | strategy=%s", self.strategy_name)
+                symbol=scope.symbol,
+                exchange=scope.exchange,
+                market_type=scope.market_type,
+                timeframe=scope.timeframe,
+            ).warning("Funding strategy lock timeout | strategy=%s scope=%s", self.strategy_name, scope.to_dict())
             return None
 
     @staticmethod
@@ -715,7 +945,10 @@ class BaseFundingStrategy(ABC):
         state.setup_event_time = ensure_utc(event_time) or now
         state.expires_at = now + timedelta(seconds=ttl)
         state.cooldown_until = None
-        state.metadata = serialize_for_event(dict(metadata or {}))
+
+        merged_metadata = dict(metadata or {})
+        merged_metadata.setdefault("scope", state.scope.to_dict())
+        state.metadata = serialize_for_event(merged_metadata)
 
         get_logger(
             __name__,
@@ -723,6 +956,8 @@ class BaseFundingStrategy(ABC):
             strategies=self.strategy_name,
             symbol=state.symbol,
             exchange=state.exchange,
+            market_type=state.market_type,
+            timeframe=state.timeframe.value,
         ).debug(
             "%s setup detected | type=%s direction=%s score=%.4f confidence=%.4f",
             self.strategy_name,
@@ -772,6 +1007,7 @@ class BaseFundingStrategy(ABC):
 
         if metadata:
             state.metadata.update(serialize_for_event(metadata))
+        state.metadata.setdefault("scope", state.scope.to_dict())
 
         get_logger(
             __name__,
@@ -779,6 +1015,8 @@ class BaseFundingStrategy(ABC):
             strategies=self.strategy_name,
             symbol=state.symbol,
             exchange=state.exchange,
+            market_type=state.market_type,
+            timeframe=state.timeframe.value,
         ).debug(
             "%s setup confirmed | type=%s direction=%s score=%.4f confidence=%.4f",
             self.strategy_name,
@@ -809,6 +1047,7 @@ class BaseFundingStrategy(ABC):
 
         if metadata:
             state.metadata.update(serialize_for_event(metadata))
+        state.metadata.setdefault("scope", state.scope.to_dict())
 
         if cooldown:
             state.cooldown_until = now + timedelta(seconds=self.config.cooldown_sec)
@@ -820,6 +1059,8 @@ class BaseFundingStrategy(ABC):
             strategies=self.strategy_name,
             symbol=state.symbol,
             exchange=state.exchange,
+            market_type=state.market_type,
+            timeframe=state.timeframe.value,
         ).debug(
             "%s setup invalidated | type=%s reason=%s cooldown=%s",
             self.strategy_name,
@@ -846,6 +1087,8 @@ class BaseFundingStrategy(ABC):
         if reason not in state.reasons:
             state.reasons.append(reason)
 
+        state.metadata.setdefault("scope", state.scope.to_dict())
+
         if cooldown:
             state.cooldown_until = now + timedelta(seconds=self.config.cooldown_sec)
             state.status = FundingSetupStatus.COOLDOWN
@@ -856,6 +1099,8 @@ class BaseFundingStrategy(ABC):
             strategies=self.strategy_name,
             symbol=state.symbol,
             exchange=state.exchange,
+            market_type=state.market_type,
+            timeframe=state.timeframe.value,
         ).debug(
             "%s setup expired | type=%s cooldown=%s",
             self.strategy_name,
@@ -883,13 +1128,22 @@ class BaseFundingStrategy(ABC):
             if reason not in state.reasons:
                 state.reasons.append(reason)
 
+        state.metadata.setdefault("scope", state.scope.to_dict())
         return state
 
     def set_idle(self, state: FundingStrategyState) -> FundingStrategyState:
-        return self.reset_state(state.symbol, state.exchange, preserve_cooldown=False, preserve_context=True)
+        return self.reset_state(
+            state.symbol,
+            state.exchange,
+            preserve_cooldown=False,
+            preserve_context=True,
+            market_type=state.market_type,
+            timeframe=state.timeframe,
+            exchange_symbol=state.exchange_symbol,
+        )
 
     # -------------------------------------------------------------------------
-    # State freshness / cleanup
+    # Freshness / cleanup
     # -------------------------------------------------------------------------
 
     def is_in_cooldown(self, state: FundingStrategyState) -> bool:
@@ -926,20 +1180,29 @@ class BaseFundingStrategy(ABC):
 
     async def cleanup_expired_states(self, *, emit_events: bool = True) -> int:
         expired_count = 0
+
         for state in list(self._states.values()):
             previous_status = state.status
             self._expire_state_if_needed(state)
+
             if previous_status != state.status and state.status == FundingSetupStatus.COOLDOWN:
                 expired_count += 1
                 if emit_events and self.config.emit_expiration_events:
                     await self.emit_expired(state, extra_payload={"trigger": "scheduler_cleanup"})
+
         return expired_count
 
     # -------------------------------------------------------------------------
     # Analytics attachment helpers
     # -------------------------------------------------------------------------
 
-    def attach_updated_context(self, state: FundingStrategyState, payload: Mapping[str, Any]) -> None:
+    def attach_updated_context(
+        self,
+        state: FundingStrategyState,
+        payload: Mapping[str, Any],
+    ) -> None:
+        self._sync_state_scope_from_payload(state, payload)
+
         state.last_funding_updated_payload = serialize_for_event(dict(payload))
         state.last_analytics_update_time = self.extract_event_time(dict(payload)) or utc_now()
         state.updated_at = utc_now()
@@ -954,46 +1217,82 @@ class BaseFundingStrategy(ABC):
 
         if snapshot_payload:
             state.last_snapshot = self._build_snapshot(snapshot_payload)
+            self._sync_state_scope_from_obj(state, state.last_snapshot)
         if statistics_payload:
             state.last_statistics = self._build_statistics(statistics_payload)
+            self._sync_state_scope_from_obj(state, state.last_statistics)
         if regime_payload:
             state.last_regime = self._build_regime_state(regime_payload)
+            self._sync_state_scope_from_obj(state, state.last_regime)
         if pressure_payload:
             state.last_pressure = self._build_pressure_state(pressure_payload)
+            self._sync_state_scope_from_obj(state, state.last_pressure)
         if extreme_payload:
             state.last_extreme = self._build_extreme_event(extreme_payload)
+            self._sync_state_scope_from_obj(state, state.last_extreme)
         if divergence_payload:
             state.last_divergence = self._build_divergence_event(divergence_payload)
+            self._sync_state_scope_from_obj(state, state.last_divergence)
         if flip_payload:
             state.last_flip = self._build_flip_event(flip_payload)
+            self._sync_state_scope_from_obj(state, state.last_flip)
+
+        self._reindex_state_if_needed(state)
 
     def attach_regime(self, state: FundingStrategyState, regime_state: Any) -> None:
         state.last_regime = regime_state
         state.updated_at = utc_now()
+        self._sync_state_scope_from_obj(state, regime_state)
+        self._reindex_state_if_needed(state)
 
     def attach_pressure(self, state: FundingStrategyState, pressure_state: Any) -> None:
         state.last_pressure = pressure_state
         state.updated_at = utc_now()
+        self._sync_state_scope_from_obj(state, pressure_state)
+        self._reindex_state_if_needed(state)
 
     def attach_extreme(self, state: FundingStrategyState, extreme_event: Any) -> None:
         state.last_extreme = extreme_event
         state.updated_at = utc_now()
+        self._sync_state_scope_from_obj(state, extreme_event)
+        self._reindex_state_if_needed(state)
 
     def attach_divergence(self, state: FundingStrategyState, divergence_event: Any) -> None:
         state.last_divergence = divergence_event
         state.updated_at = utc_now()
+        self._sync_state_scope_from_obj(state, divergence_event)
+        self._reindex_state_if_needed(state)
 
     def attach_flip(self, state: FundingStrategyState, flip_event: Any) -> None:
         state.last_flip = flip_event
         state.updated_at = utc_now()
+        self._sync_state_scope_from_obj(state, flip_event)
+        self._reindex_state_if_needed(state)
 
     def attach_signal(self, state: FundingStrategyState, signal_event: Any) -> None:
         state.last_signal = signal_event
         state.last_signal_time = self._extract_event_time_from_normalized(signal_event) or utc_now()
         state.updated_at = utc_now()
 
+        self._sync_state_scope_from_obj(state, signal_event)
+        self._reindex_state_if_needed(state)
+
+        if state.recent_signals.maxlen is None:
+            state.recent_signals = deque(state.recent_signals, maxlen=self.config.recent_signals_maxlen)
+        state.recent_signals.append(signal_event)
+
+        origin = self._signal_origin(signal_event)
+        if origin:
+            state.last_signals_by_origin[origin] = signal_event
+
+        signal_type = self._enum_str(self._get_value(signal_event, "signal_type"))
+        if signal_type:
+            if signal_type not in state.last_signals_by_type:
+                state.last_signals_by_type[signal_type] = deque(maxlen=self.config.signals_per_type_maxlen)
+            state.last_signals_by_type[signal_type].append(signal_event)
+
     # -------------------------------------------------------------------------
-    # Event helpers
+    # Event helpers / scope extraction
     # -------------------------------------------------------------------------
 
     def extract_payload(self, event: Event | Mapping[str, Any] | Any) -> dict[str, Any]:
@@ -1020,20 +1319,73 @@ class BaseFundingStrategy(ABC):
 
         return {}
 
-    def extract_symbol_exchange(self, payload: Mapping[str, Any]) -> tuple[str, str]:
+    def extract_funding_scope(self, payload: Mapping[str, Any]) -> FundingStrategyScope | None:
         data = unwrap_analytics_payload(payload)
-        symbol = str(data.get("symbol") or self._nested_get(payload, "symbol") or "").upper().strip()
-        exchange_value = data.get("exchange") or self._nested_get(payload, "exchange") or "unknown"
-        exchange = self._enum_str(exchange_value) or "unknown"
-        return symbol, str(exchange).lower().strip()
+
+        symbol = (
+            data.get("symbol")
+            or self._nested_get(payload, "symbol")
+            or self._nested_get(data, "symbol")
+        )
+        if not symbol:
+            return None
+
+        exchange = (
+            data.get("exchange")
+            or self._nested_get(payload, "exchange")
+            or "unknown"
+        )
+        market_type = (
+            data.get("market_type")
+            or self._nested_get(payload, "market_type")
+            or self._metadata_scope_get(data, "market_type")
+            or self.config.default_market_type
+        )
+        timeframe = (
+            data.get("timeframe")
+            or self._nested_get(payload, "timeframe")
+            or self._metadata_scope_get(data, "timeframe")
+            or self.config.default_timeframe
+        )
+        exchange_symbol = (
+            data.get("exchange_symbol")
+            or self._nested_get(payload, "exchange_symbol")
+            or self._metadata_scope_get(data, "exchange_symbol")
+            or symbol
+        )
+
+        scope = FundingStrategyScope(
+            exchange=self._enum_str(exchange) or "unknown",
+            market_type=str(market_type),
+            symbol=str(symbol),
+            timeframe=timeframe.value if isinstance(timeframe, FundingTimeframe) else str(timeframe),
+            exchange_symbol=str(exchange_symbol) if exchange_symbol is not None else None,
+        )
+        _current_scope.set(scope)
+        return scope
+
+    def extract_symbol_exchange(self, payload: Mapping[str, Any]) -> tuple[str, str]:
+        """
+        Backward-compatible API for existing child strategies.
+
+        It also stores the full extracted scope in a contextvar, so subsequent
+        get_state(symbol, exchange) / acquire_symbol_lock(symbol, exchange)
+        inside the same async task can still use the full scope.
+        """
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
+            return "", "unknown"
+        return scope.symbol, scope.exchange
 
     def extract_event_time(self, payload: Mapping[str, Any]) -> datetime | None:
         data = unwrap_analytics_payload(payload)
         raw = data.get("event_time") or data.get("timestamp") or data.get("ts")
+
         if raw is None:
             envelope = data.get("_envelope")
             if isinstance(envelope, Mapping):
                 raw = envelope.get("event_time") or envelope.get("timestamp") or envelope.get("ts")
+
         return parse_datetime(raw)
 
     def event_age_seconds(self, event_time: datetime | None) -> float | None:
@@ -1091,9 +1443,15 @@ class BaseFundingStrategy(ABC):
         event_kind: str,
         extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        scope = state.scope
+
         payload: dict[str, Any] = {
             "symbol": state.symbol,
             "exchange": state.exchange,
+            "market_type": state.market_type,
+            "timeframe": state.timeframe.value,
+            "exchange_symbol": state.exchange_symbol,
+            "scope": scope.to_dict(),
             "strategy": self.strategy_name,
             "strategy_name": self.strategy_name,
             "strategy_namespace": self.config.strategy_namespace,
@@ -1138,95 +1496,184 @@ class BaseFundingStrategy(ABC):
     ) -> bool:
         event_kind = str(payload.get("event_kind", "unknown"))
         resolved_priority = priority or self._priority_for_event_kind(event_kind)
-        symbol = str(payload.get("symbol", "")).upper().strip()
-        exchange = str(payload.get("exchange", "unknown")).lower().strip()
+
+        symbol = normalize_symbol(str(payload.get("symbol", "")))
+        exchange = normalize_exchange(str(payload.get("exchange", "unknown"))).value
+        market_type = normalize_market_type(str(payload.get("market_type") or self.config.default_market_type))
+        timeframe = normalize_timeframe(payload.get("timeframe") or self.config.default_timeframe).value
+        exchange_symbol = normalize_exchange_symbol(payload.get("exchange_symbol"), fallback_symbol=symbol)
+
+        scope = FundingStrategyScope(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
+        )
+
         resolved_correlation_id = correlation_id or str(
             payload.get("correlation_id")
             or payload.get("source_event_id")
-            or f"{self.strategy_name}:{exchange}:{symbol}:{event_kind}:{payload.get('event_time', '')}"
+            or f"{self.strategy_name}:{scope.key}:{event_kind}:{payload.get('event_time', '')}"
         )
+
         resolved_headers = {
             "strategy": self.strategy_name,
             "strategy_namespace": self.config.strategy_namespace,
             "event_kind": event_kind,
-            "symbol": symbol,
-            "exchange": exchange,
+            "symbol": scope.symbol,
+            "exchange": scope.exchange,
+            "market_type": scope.market_type,
+            "timeframe": scope.timeframe,
+            "exchange_symbol": scope.exchange_symbol,
+            "scope": scope.to_dict(),
         }
+
         if headers:
             resolved_headers.update(serialize_for_event(headers))
+
+        serialized_payload = serialize_for_event(payload)
 
         try:
             accepted = await self.event_bus.emit(
                 event_name,
-                serialize_for_event(payload),
+                serialized_payload,
                 priority=resolved_priority,
                 source=self.config.source_name,
                 correlation_id=resolved_correlation_id,
                 headers=resolved_headers,
             )
 
-            state = self._states.get(self._make_key(symbol, exchange))
+            state = self._states.get(scope.key)
             if state is not None:
                 state.last_emit_time = utc_now()
                 state.emit_count += 1
+
+            if accepted:
+                await self._buffer_generated_strategy_signal(
+                    event_name=event_name,
+                    payload=serialized_payload,
+                    priority=resolved_priority,
+                    correlation_id=resolved_correlation_id,
+                    headers=resolved_headers,
+                )
 
             return accepted
 
         except RuntimeError:
             self.logger.exception(
-                "EventBus rejected funding strategy event | strategy=%s event_name=%s",
+                "EventBus rejected funding strategy event | strategy=%s event_name=%s scope=%s",
                 self.strategy_name,
                 event_name,
+                scope.to_dict(),
             )
             return False
         except Exception:
             self.logger.exception(
-                "Failed to emit funding strategy event | strategy=%s event_name=%s",
+                "Failed to emit funding strategy event | strategy=%s event_name=%s scope=%s",
                 self.strategy_name,
                 event_name,
+                scope.to_dict(),
             )
             return False
 
-    async def emit_setup(self, state: FundingStrategyState, *, extra_payload: dict[str, Any] | None = None) -> None:
+    async def emit_setup(
+        self,
+        state: FundingStrategyState,
+        *,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
         if not self.config.emit_setup_events:
             return
-        payload = self.build_base_signal_payload(state=state, event_kind="setup", extra_payload=extra_payload)
+        payload = self.build_base_signal_payload(
+            state=state,
+            event_kind="setup",
+            extra_payload=extra_payload,
+        )
         payload = self.on_before_setup_emit(state, payload)
-        await self._emit(event_name=f"{self.config.strategy_namespace}.setup", payload=payload, priority=self.config.setup_priority)
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.setup",
+            payload=payload,
+            priority=self.config.setup_priority,
+        )
 
-    async def emit_confirmed(self, state: FundingStrategyState, *, extra_payload: dict[str, Any] | None = None) -> None:
+    async def emit_confirmed(
+        self,
+        state: FundingStrategyState,
+        *,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
         if not self.config.emit_confirmation_events:
             return
-        payload = self.build_base_signal_payload(state=state, event_kind="confirmed", extra_payload=extra_payload)
+        payload = self.build_base_signal_payload(
+            state=state,
+            event_kind="confirmed",
+            extra_payload=extra_payload,
+        )
         payload = self.on_before_confirmation_emit(state, payload)
-        await self._emit(event_name=f"{self.config.strategy_namespace}.confirmed", payload=payload, priority=self.config.confirmation_priority)
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.confirmed",
+            payload=payload,
+            priority=self.config.confirmation_priority,
+        )
 
-    async def emit_invalidated(self, state: FundingStrategyState, *, extra_payload: dict[str, Any] | None = None) -> None:
+    async def emit_invalidated(
+        self,
+        state: FundingStrategyState,
+        *,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
         if not self.config.emit_invalidation_events:
             return
-        payload = self.build_base_signal_payload(state=state, event_kind="invalidated", extra_payload=extra_payload)
+        payload = self.build_base_signal_payload(
+            state=state,
+            event_kind="invalidated",
+            extra_payload=extra_payload,
+        )
         payload = self.on_before_invalidation_emit(state, payload)
-        await self._emit(event_name=f"{self.config.strategy_namespace}.invalidated", payload=payload, priority=self.config.invalidation_priority)
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.invalidated",
+            payload=payload,
+            priority=self.config.invalidation_priority,
+        )
 
-    async def emit_expired(self, state: FundingStrategyState, *, extra_payload: dict[str, Any] | None = None) -> None:
+    async def emit_expired(
+        self,
+        state: FundingStrategyState,
+        *,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
         if not self.config.emit_expiration_events:
             return
-        payload = self.build_base_signal_payload(state=state, event_kind="expired", extra_payload=extra_payload)
+        payload = self.build_base_signal_payload(
+            state=state,
+            event_kind="expired",
+            extra_payload=extra_payload,
+        )
         payload = self.on_before_expiration_emit(state, payload)
-        await self._emit(event_name=f"{self.config.strategy_namespace}.expired", payload=payload, priority=self.config.expiration_priority)
+        await self._emit(
+            event_name=f"{self.config.strategy_namespace}.expired",
+            payload=payload,
+            priority=self.config.expiration_priority,
+        )
 
     # -------------------------------------------------------------------------
-    # Normalizers used by child strategies
+    # Normalizers
     # -------------------------------------------------------------------------
 
     def _normalize_updated_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         raw = dict(payload)
         inner = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
         normalized = dict(inner)
+
         normalized.setdefault("symbol", raw.get("symbol") or self._nested_get(inner, "symbol"))
         normalized.setdefault("exchange", raw.get("exchange") or self._nested_get(inner, "exchange") or "unknown")
+        normalized.setdefault("market_type", raw.get("market_type") or self._nested_get(inner, "market_type") or self.config.default_market_type)
+        normalized.setdefault("timeframe", raw.get("timeframe") or self._nested_get(inner, "timeframe") or self.config.default_timeframe)
+        normalized.setdefault("exchange_symbol", raw.get("exchange_symbol") or self._nested_get(inner, "exchange_symbol") or normalized.get("symbol"))
         normalized.setdefault("event_time", raw.get("event_time") or raw.get("timestamp") or raw.get("ts"))
         normalized["_envelope"] = raw
+
         return normalized
 
     def _normalize_signal_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1287,9 +1734,13 @@ class BaseFundingStrategy(ABC):
     # -------------------------------------------------------------------------
 
     def _build_snapshot(self, data: Mapping[str, Any]) -> FundingSnapshot:
+        scope = self._scope_from_payload_or_data(data)
         return FundingSnapshot(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             funding_rate=self._to_float(data.get("funding_rate"), 0.0),
             predicted_funding_rate=self._to_optional_float(data.get("predicted_funding_rate")),
             mark_price=self._to_optional_float(data.get("mark_price")),
@@ -1299,14 +1750,17 @@ class BaseFundingStrategy(ABC):
             next_funding_time=parse_datetime(data.get("next_funding_time")),
             event_time=parse_datetime(data.get("event_time")) or utc_now(),
             received_at=parse_datetime(data.get("received_at")) or utc_now(),
-            metadata=self._safe_metadata(data.get("metadata")),
+            metadata=self._metadata_with_scope(data, scope),
         )
 
     def _build_statistics(self, data: Mapping[str, Any]) -> FundingStatistics:
+        scope = self._scope_from_payload_or_data(data)
         return FundingStatistics(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-            timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             current_rate=self._to_float(data.get("current_rate"), 0.0),
             mean_rate=self._to_float(data.get("mean_rate"), 0.0),
             median_rate=self._to_float(data.get("median_rate"), 0.0),
@@ -1322,10 +1776,13 @@ class BaseFundingStrategy(ABC):
         )
 
     def _build_regime_state(self, data: Mapping[str, Any]) -> FundingRegimeState:
+        scope = self._scope_from_payload_or_data(data)
         return FundingRegimeState(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-            timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             regime=self._parse_enum(FundingRegime, data.get("regime"), FundingRegime.UNKNOWN),
             bias=self._parse_enum(FundingBias, data.get("bias"), FundingBias.NEUTRAL),
             current_rate=self._to_float(data.get("current_rate"), 0.0),
@@ -1336,14 +1793,17 @@ class BaseFundingStrategy(ABC):
             changed=bool(data.get("changed", False)),
             previous_regime=self._parse_optional_enum(FundingRegime, data.get("previous_regime")),
             event_time=parse_datetime(data.get("event_time")) or utc_now(),
-            metadata=self._safe_metadata(data.get("metadata")),
+            metadata=self._metadata_with_scope(data, scope),
         )
 
     def _build_pressure_state(self, data: Mapping[str, Any]) -> FundingPressureState:
+        scope = self._scope_from_payload_or_data(data)
         return FundingPressureState(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-            timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             direction=self._parse_enum(FundingPressureDirection, data.get("direction"), FundingPressureDirection.NEUTRAL),
             level=self._parse_enum(FundingPressureLevel, data.get("level"), FundingPressureLevel.UNKNOWN),
             bias=self._parse_enum(FundingBias, data.get("bias"), FundingBias.NEUTRAL),
@@ -1354,14 +1814,17 @@ class BaseFundingStrategy(ABC):
             squeeze_probability=self._to_optional_float(data.get("squeeze_probability")),
             mean_reversion_probability=self._to_optional_float(data.get("mean_reversion_probability")),
             event_time=parse_datetime(data.get("event_time")) or utc_now(),
-            metadata=self._safe_metadata(data.get("metadata")),
+            metadata=self._metadata_with_scope(data, scope),
         )
 
     def _build_extreme_event(self, data: Mapping[str, Any]) -> FundingExtremeEvent:
+        scope = self._scope_from_payload_or_data(data)
         return FundingExtremeEvent(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-            timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             extreme_type=self._parse_enum(FundingExtremeType, data.get("extreme_type"), FundingExtremeType.NONE),
             regime=self._parse_enum(FundingRegime, data.get("regime"), FundingRegime.UNKNOWN),
             funding_rate=self._to_float(data.get("funding_rate"), 0.0),
@@ -1371,14 +1834,17 @@ class BaseFundingStrategy(ABC):
             is_reversal_risk=bool(data.get("is_reversal_risk", False)),
             is_squeeze_risk=bool(data.get("is_squeeze_risk", False)),
             event_time=parse_datetime(data.get("event_time")) or utc_now(),
-            metadata=self._safe_metadata(data.get("metadata")),
+            metadata=self._metadata_with_scope(data, scope),
         )
 
     def _build_divergence_event(self, data: Mapping[str, Any]) -> FundingDivergenceEvent:
+        scope = self._scope_from_payload_or_data(data)
         return FundingDivergenceEvent(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-            timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             divergence_type=self._parse_enum(FundingDivergenceType, data.get("divergence_type"), FundingDivergenceType.NONE),
             funding_rate=self._to_float(data.get("funding_rate"), 0.0),
             price_change_pct=self._to_optional_float(data.get("price_change_pct")),
@@ -1388,29 +1854,35 @@ class BaseFundingStrategy(ABC):
             short_liquidations=self._to_optional_float(data.get("short_liquidations")),
             confidence=self._clip_score(data.get("confidence")),
             event_time=parse_datetime(data.get("event_time")) or utc_now(),
-            metadata=self._safe_metadata(data.get("metadata")),
+            metadata=self._metadata_with_scope(data, scope),
         )
 
     def _build_flip_event(self, data: Mapping[str, Any]) -> FundingFlipEvent:
+        scope = self._scope_from_payload_or_data(data)
         return FundingFlipEvent(
-            symbol=str(data.get("symbol", "")).upper().strip(),
-            exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-            timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+            symbol=scope.symbol,
+            exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+            market_type=scope.market_type,
+            timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+            exchange_symbol=scope.exchange_symbol or scope.symbol,
             flip_type=self._parse_enum(FundingFlipType, data.get("flip_type"), FundingFlipType.NONE),
             previous_rate=self._to_float(data.get("previous_rate"), 0.0),
             current_rate=self._to_float(data.get("current_rate"), 0.0),
             flip_magnitude=self._to_float(data.get("flip_magnitude"), 0.0),
             confidence=self._clip_score(data.get("confidence")),
             event_time=parse_datetime(data.get("event_time")) or utc_now(),
-            metadata=self._safe_metadata(data.get("metadata")),
+            metadata=self._metadata_with_scope(data, scope),
         )
 
     def _build_signal(self, data: Mapping[str, Any]) -> FundingSignal | dict[str, Any]:
         try:
+            scope = self._scope_from_payload_or_data(data)
             return FundingSignal(
-                symbol=str(data.get("symbol", "")).upper().strip(),
-                exchange=self._parse_enum(FundingDataSource, data.get("exchange"), FundingDataSource.UNKNOWN),
-                timeframe=self._parse_enum(FundingTimeframe, data.get("timeframe"), FundingTimeframe.H1),
+                symbol=scope.symbol,
+                exchange=self._parse_enum(FundingDataSource, scope.exchange, FundingDataSource.UNKNOWN),
+                market_type=scope.market_type,
+                timeframe=self._parse_enum(FundingTimeframe, scope.timeframe, FundingTimeframe.H1),
+                exchange_symbol=scope.exchange_symbol or scope.symbol,
                 signal_type=self._parse_enum(FundingSignalType, data.get("signal_type"), FundingSignalType.REVERSION_SETUP),
                 bias=self._parse_enum(FundingBias, data.get("bias"), FundingBias.NEUTRAL),
                 regime=self._parse_enum(FundingRegime, data.get("regime"), FundingRegime.UNKNOWN),
@@ -1420,11 +1892,190 @@ class BaseFundingStrategy(ABC):
                 supporting_factors=list(data.get("supporting_factors") or []),
                 tags=list(data.get("tags") or []),
                 event_time=parse_datetime(data.get("event_time")) or utc_now(),
-                metadata=self._safe_metadata(data.get("metadata")),
+                metadata=self._metadata_with_scope(data, scope),
             )
         except Exception:
             self.logger.exception("Failed to build FundingSignal, keeping raw dict")
             return dict(data)
+
+    # -------------------------------------------------------------------------
+    # Parquet generated strategy signal history
+    # -------------------------------------------------------------------------
+
+    async def _buffer_generated_strategy_signal(
+        self,
+        *,
+        event_name: str,
+        payload: dict[str, Any],
+        priority: EventPriority,
+        correlation_id: str,
+        headers: dict[str, Any],
+    ) -> None:
+        if not self.config.enable_generated_signal_parquet_history:
+            return
+
+        row = self._build_generated_signal_row(
+            event_name=event_name,
+            payload=payload,
+            priority=priority,
+            correlation_id=correlation_id,
+            headers=headers,
+        )
+
+        should_flush = False
+
+        async with self._generated_signal_buffer_lock:
+            self._generated_signal_buffer.append(row)
+            should_flush = (
+                len(self._generated_signal_buffer)
+                >= self.config.generated_signal_parquet_flush_batch_size
+            )
+
+        if should_flush:
+            await self.flush_generated_signals_to_parquet()
+
+    def _build_generated_signal_row(
+        self,
+        *,
+        event_name: str,
+        payload: dict[str, Any],
+        priority: EventPriority,
+        correlation_id: str,
+        headers: dict[str, Any],
+    ) -> dict[str, Any]:
+        event_time = payload.get("event_time") or utc_now().isoformat()
+        scope = payload.get("scope") if isinstance(payload.get("scope"), Mapping) else {}
+
+        return {
+            "event_name": event_name,
+            "event_kind": payload.get("event_kind"),
+            "strategy": self.strategy_name,
+            "strategy_namespace": self.config.strategy_namespace,
+            "source": self.config.source_name,
+            "correlation_id": correlation_id,
+            "priority": priority.value if isinstance(priority, EventPriority) else str(priority),
+            "event_time": event_time,
+            "exchange": payload.get("exchange") or scope.get("exchange"),
+            "market_type": payload.get("market_type") or scope.get("market_type"),
+            "symbol": payload.get("symbol") or scope.get("symbol"),
+            "timeframe": payload.get("timeframe") or scope.get("timeframe"),
+            "exchange_symbol": payload.get("exchange_symbol") or scope.get("exchange_symbol"),
+            "direction": payload.get("direction"),
+            "status": payload.get("status"),
+            "setup_type": payload.get("setup_type"),
+            "score": payload.get("score"),
+            "confidence": payload.get("confidence"),
+            "reason": payload.get("reason"),
+            "tags_json": self._json_dumps(payload.get("tags")),
+            "reasons_json": self._json_dumps(payload.get("reasons")),
+            "metadata_json": self._json_dumps(payload.get("metadata")),
+            "headers_json": self._json_dumps(headers),
+            "payload_json": self._json_dumps(payload),
+            "created_at": utc_now().isoformat(),
+        }
+
+    async def flush_generated_signals_to_parquet(self) -> int:
+        if not self.config.enable_generated_signal_parquet_history:
+            return 0
+
+        async with self._generated_signal_buffer_lock:
+            if not self._generated_signal_buffer:
+                return 0
+            rows = list(self._generated_signal_buffer)
+            self._generated_signal_buffer.clear()
+
+        try:
+            written = await asyncio.to_thread(self._write_generated_signal_rows, rows)
+            if written:
+                self.logger.debug(
+                    "Funding strategy generated signals flushed | strategy=%s records=%s",
+                    self.strategy_name,
+                    written,
+                )
+            return written
+        except Exception:
+            async with self._generated_signal_buffer_lock:
+                self._generated_signal_buffer[0:0] = rows
+            self.logger.exception(
+                "Failed to flush generated funding strategy signals | strategy=%s",
+                self.strategy_name,
+            )
+            return 0
+
+    def _write_generated_signal_rows(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+
+        external_writer = (
+            getattr(self.parquet_storage, "append_records", None)
+            or getattr(self.parquet_storage, "write_records", None)
+        )
+        if external_writer is not None:
+            external_writer(
+                dataset=self.config.generated_signal_parquet_dataset_name,
+                records=rows,
+            )
+            return len(rows)
+
+        pd = self._import_pandas_for_parquet()
+        if pd is None:
+            return 0
+
+        root = self._generated_signal_parquet_root()
+        grouped: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+
+        for row in rows:
+            event_time = str(row.get("event_time") or utc_now().isoformat())
+            event_date = event_time[:10]
+            grouped[
+                (
+                    str(row.get("strategy") or self.strategy_name),
+                    str(row.get("exchange") or "unknown"),
+                    str(row.get("market_type") or self.config.default_market_type),
+                    str(row.get("symbol") or "UNKNOWN"),
+                    str(row.get("timeframe") or normalize_timeframe(self.config.default_timeframe).value),
+                    event_date,
+                )
+            ].append(row)
+
+        written = 0
+
+        for (strategy, exchange, market_type, symbol, timeframe, event_date), group_rows in grouped.items():
+            output_dir = (
+                root
+                / f"strategy={strategy}"
+                / f"exchange={exchange}"
+                / f"market_type={market_type}"
+                / f"symbol={symbol}"
+                / f"timeframe={timeframe}"
+                / f"date={event_date}"
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_file = output_dir / f"part-{int(utc_now().timestamp() * 1000)}-{uuid4().hex}.parquet"
+            pd.DataFrame(group_rows).to_parquet(output_file, index=False)
+            written += len(group_rows)
+
+        return written
+
+    def _generated_signal_parquet_root(self) -> Path:
+        return (
+            Path(self.config.generated_signal_parquet_base_path).expanduser()
+            / self.config.generated_signal_parquet_dataset_name
+        )
+
+    def _import_pandas_for_parquet(self):
+        try:
+            import pandas as pd  # type: ignore
+
+            return pd
+        except Exception:
+            if not self._parquet_unavailable_logged:
+                self.logger.warning(
+                    "Generated strategy signal parquet history is enabled but pandas/pyarrow/fastparquet is unavailable; "
+                    "install pandas with pyarrow or inject parquet_storage"
+                )
+                self._parquet_unavailable_logged = True
+            return None
 
     # -------------------------------------------------------------------------
     # Score / direction / key helpers
@@ -1442,7 +2093,7 @@ class BaseFundingStrategy(ABC):
 
     @classmethod
     def _average_scores(cls, *values: float | None) -> float:
-        valid = [cls._clip_score(v) for v in values if v is not None]
+        valid = [cls._clip_score(value) for value in values if value is not None]
         if not valid:
             return 0.0
         return sum(valid) / len(valid)
@@ -1451,18 +2102,82 @@ class BaseFundingStrategy(ABC):
     def _weighted_average(cls, weighted_values: Iterable[tuple[float | None, float]]) -> float:
         total_weight = 0.0
         total = 0.0
+
         for value, weight in weighted_values:
             if value is None or weight <= 0:
                 continue
             total += cls._clip_score(value) * float(weight)
             total_weight += float(weight)
+
         if total_weight <= 0:
             return 0.0
+
         return cls._clip_score(total / total_weight)
 
     @staticmethod
-    def _make_key(symbol: str, exchange: str = "unknown") -> str:
-        return f"{str(symbol).upper().strip()}:{str(exchange).lower().strip()}"
+    def _make_key(
+        symbol: str,
+        exchange: str = "unknown",
+        market_type: str = "usdm_futures",
+        timeframe: FundingTimeframe | str = FundingTimeframe.H1,
+    ) -> str:
+        return FundingStrategyScope(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe.value if isinstance(timeframe, FundingTimeframe) else str(timeframe),
+        ).key
+
+    def _scope_from_args(
+            self,
+            *,
+            symbol: str,
+            exchange: str = "unknown",
+            market_type: str | None = None,
+            timeframe: FundingTimeframe | str | None = None,
+            exchange_symbol: str | None = None,
+    ) -> FundingStrategyScope:
+        current_scope = _current_scope.get()
+
+        if (
+                current_scope is not None
+                and current_scope.symbol == normalize_symbol(symbol)
+                and current_scope.exchange == normalize_exchange(exchange).value
+                and market_type is None
+                and timeframe is None
+        ):
+            return current_scope
+
+        resolved_timeframe = (
+            self._timeframe_value(timeframe)
+            if timeframe is not None
+            else self._timeframe_value(self.config.default_timeframe)
+        )
+
+        return FundingStrategyScope(
+            exchange=exchange,
+            market_type=market_type or self.config.default_market_type,
+            symbol=symbol,
+            timeframe=resolved_timeframe,
+            exchange_symbol=exchange_symbol,
+        )
+
+    def _scope_from_payload_or_data(self, data: Mapping[str, Any]) -> FundingStrategyScope:
+        direct = self.extract_funding_scope(data)
+        if direct is not None:
+            return direct
+
+        current_scope = _current_scope.get()
+        if current_scope is not None:
+            return current_scope
+
+        return FundingStrategyScope(
+            exchange=str(data.get("exchange") or "unknown"),
+            market_type=str(data.get("market_type") or self.config.default_market_type),
+            symbol=str(data.get("symbol") or "UNKNOWN"),
+            timeframe=str(data.get("timeframe") or self.config.default_timeframe),
+            exchange_symbol=data.get("exchange_symbol"),
+        )
 
     @staticmethod
     def _to_float(value: Any, default: float = 0.0) -> float:
@@ -1531,24 +2246,119 @@ class BaseFundingStrategy(ABC):
         value = payload.get(key)
         if isinstance(value, Mapping):
             return dict(value)
+
         inner = payload.get("payload")
         if isinstance(inner, Mapping) and isinstance(inner.get(key), Mapping):
             return dict(inner[key])
+
         return None
 
     @staticmethod
     def _nested_get(payload: Mapping[str, Any], key: str) -> Any:
         if key in payload:
             return payload[key]
+
         inner = payload.get("payload")
         if isinstance(inner, Mapping):
             if key in inner:
                 return inner[key]
-            for nested_key in ("snapshot", "statistics", "regime_state", "pressure_state", "extreme_event", "divergence_event", "flip_event", "signal"):
+            for nested_key in (
+                "snapshot",
+                "statistics",
+                "regime_state",
+                "pressure_state",
+                "extreme_event",
+                "divergence_event",
+                "flip_event",
+                "signal",
+            ):
                 nested = inner.get(nested_key)
                 if isinstance(nested, Mapping) and key in nested:
                     return nested[key]
+
         return None
+
+    @staticmethod
+    def _metadata_scope_get(data: Mapping[str, Any], key: str) -> Any:
+        metadata = data.get("metadata")
+        if isinstance(metadata, Mapping):
+            if key in metadata:
+                return metadata[key]
+            scope = metadata.get("scope")
+            if isinstance(scope, Mapping) and key in scope:
+                return scope[key]
+        return None
+
+    def _metadata_with_scope(
+        self,
+        data: Mapping[str, Any],
+        scope: FundingStrategyScope,
+    ) -> dict[str, Any]:
+        metadata = self._safe_metadata(data.get("metadata"))
+        metadata["scope"] = {
+            "exchange": scope.exchange,
+            "market_type": scope.market_type,
+            "symbol": scope.symbol,
+            "timeframe": scope.timeframe,
+        }
+        metadata["exchange_symbol"] = scope.exchange_symbol or scope.symbol
+        return metadata
+
+    def _sync_state_scope_from_payload(
+        self,
+        state: FundingStrategyState,
+        payload: Mapping[str, Any],
+    ) -> None:
+        scope = self.extract_funding_scope(payload)
+        if scope is None:
+            return
+        self._apply_scope_to_state(state, scope)
+
+    def _sync_state_scope_from_obj(
+        self,
+        state: FundingStrategyState,
+        obj: Any,
+    ) -> None:
+        symbol = self._get_value(obj, "symbol")
+        if not symbol:
+            return
+
+        scope = FundingStrategyScope(
+            exchange=self._enum_str(self._get_value(obj, "exchange")) or state.exchange,
+            market_type=str(self._get_value(obj, "market_type", state.market_type)),
+            symbol=str(symbol),
+            timeframe=self._enum_str(self._get_value(obj, "timeframe", state.timeframe)) or state.timeframe.value,
+            exchange_symbol=self._get_value(obj, "exchange_symbol", state.exchange_symbol),
+        )
+        self._apply_scope_to_state(state, scope)
+
+    @staticmethod
+    def _apply_scope_to_state(
+        state: FundingStrategyState,
+        scope: FundingStrategyScope,
+    ) -> None:
+        state.symbol = scope.symbol
+        state.exchange = scope.exchange
+        state.market_type = scope.market_type
+        state.timeframe = FundingTimeframe(scope.timeframe)
+        state.exchange_symbol = scope.exchange_symbol
+
+    def _reindex_state_if_needed(self, state: FundingStrategyState) -> None:
+        desired_key = state.key
+        existing_keys = [key for key, value in self._states.items() if value is state]
+
+        if desired_key not in existing_keys:
+            self._states[desired_key] = state
+
+        for key in existing_keys:
+            if key != desired_key:
+                self._states.pop(key, None)
+
+    def _signal_origin(self, signal: Any) -> str:
+        metadata = self._get_value(signal, "metadata", {}) or {}
+        if isinstance(metadata, Mapping):
+            return str(metadata.get("signal_origin") or "").strip()
+        return ""
 
     @staticmethod
     def _pressure_level_rank(level: str | None) -> int:
@@ -1561,20 +2371,29 @@ class BaseFundingStrategy(ABC):
         }
         return ranks.get(str(level), 0)
 
-    def _has_pressure_level_dropped_enough(self, previous_level: str | None, current_level: str | None) -> bool:
+    def _has_pressure_level_dropped_enough(
+        self,
+        previous_level: str | None,
+        current_level: str | None,
+    ) -> bool:
         previous_rank = self._pressure_level_rank(previous_level)
         current_rank = self._pressure_level_rank(current_level)
         return (previous_rank - current_rank) >= 1
 
     def _extract_event_time_from_normalized(self, obj: Any) -> datetime | None:
-        return ensure_utc(self._get_value(obj, "event_time")) if isinstance(self._get_value(obj, "event_time"), datetime) else parse_datetime(self._get_value(obj, "event_time"))
+        raw = self._get_value(obj, "event_time")
+        if isinstance(raw, datetime):
+            return ensure_utc(raw)
+        return parse_datetime(raw)
 
     # -------------------------------------------------------------------------
-    # Protected composition helpers
+    # Context builders
     # -------------------------------------------------------------------------
 
     def _build_funding_context(self, state: FundingStrategyState) -> dict[str, Any]:
-        context: dict[str, Any] = {}
+        context: dict[str, Any] = {
+            "scope": state.scope.to_dict(),
+        }
 
         regime = state.last_regime
         if regime is not None:
@@ -1610,14 +2429,16 @@ class BaseFundingStrategy(ABC):
         signal = state.last_signal
         if signal is not None:
             context["funding_signal_type"] = self._enum_str(self._get_value(signal, "signal_type"))
+            context["funding_signal_origin"] = self._signal_origin(signal)
             context["funding_signal_score"] = self._get_value(signal, "score")
             context["funding_signal_confidence"] = self._get_value(signal, "confidence")
 
-        return serialize_for_event({k: v for k, v in context.items() if v is not None})
+        return serialize_for_event({key: value for key, value in context.items() if value is not None})
 
     def _build_full_analytics_context(self, state: FundingStrategyState) -> dict[str, Any]:
         return serialize_for_event(
             {
+                "scope": state.scope.to_dict(),
                 "snapshot": state.last_snapshot,
                 "statistics": state.last_statistics,
                 "regime": state.last_regime,
@@ -1626,9 +2447,103 @@ class BaseFundingStrategy(ABC):
                 "divergence": state.last_divergence,
                 "flip": state.last_flip,
                 "signal": state.last_signal,
+                "recent_signals": list(state.recent_signals),
+                "last_signals_by_origin": dict(state.last_signals_by_origin),
+                "last_signals_by_type": {
+                    key: list(value)
+                    for key, value in state.last_signals_by_type.items()
+                },
                 "last_funding_updated_payload": state.last_funding_updated_payload,
             }
         )
+
+    # -------------------------------------------------------------------------
+    # Scheduler jobs
+    # -------------------------------------------------------------------------
+
+    def _register_scheduler_jobs(self) -> None:
+        if self.scheduler is None or not self.config.enable_scheduler_cleanup:
+            return
+        if self._cleanup_job_id is not None:
+            return
+
+        job_name = self.config.cleanup_job_name or f"{self.strategy_name}:cleanup_expired_states"
+        existing = self.scheduler.get_job_by_name(job_name)
+
+        if existing is not None:
+            self._cleanup_job_id = existing.job_id
+            return
+
+        self._cleanup_job_id = self.scheduler.add_interval_job(
+            name=job_name,
+            func=self.cleanup_expired_states,
+            interval=self.config.cleanup_interval_sec,
+            kwargs={"emit_events": True},
+            run_immediately=False,
+            max_retries=1,
+            retry_delay=1.0,
+            timeout=self.config.cleanup_job_timeout_sec,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    def _unregister_scheduler_jobs(self) -> None:
+        if self.scheduler is None or self._cleanup_job_id is None:
+            self._cleanup_job_id = None
+            return
+
+        try:
+            self.scheduler.remove_job(self._cleanup_job_id)
+        except KeyError:
+            pass
+        finally:
+            self._cleanup_job_id = None
+
+    def _register_generated_signal_flush_job(self) -> None:
+        if (
+            self.scheduler is None
+            or not self.config.enable_generated_signal_parquet_history
+            or self._generated_signal_flush_job_id is not None
+        ):
+            return
+
+        job_name = (
+            self.config.generated_signal_parquet_flush_job_name
+            or f"{self.strategy_name}:flush_generated_strategy_signals"
+        )
+        existing = self.scheduler.get_job_by_name(job_name)
+
+        if existing is not None:
+            self._generated_signal_flush_job_id = existing.job_id
+            return
+
+        self._generated_signal_flush_job_id = self.scheduler.add_interval_job(
+            name=job_name,
+            func=self.flush_generated_signals_to_parquet,
+            interval=self.config.generated_signal_parquet_flush_interval_sec,
+            run_immediately=False,
+            max_retries=1,
+            retry_delay=1.0,
+            timeout=self.config.generated_signal_parquet_flush_timeout_sec,
+            allow_overlap=False,
+            enabled=True,
+        )
+
+    def _unregister_generated_signal_flush_job(self) -> None:
+        if self.scheduler is None or self._generated_signal_flush_job_id is None:
+            self._generated_signal_flush_job_id = None
+            return
+
+        try:
+            self.scheduler.remove_job(self._generated_signal_flush_job_id)
+        except KeyError:
+            pass
+        finally:
+            self._generated_signal_flush_job_id = None
+
+    # -------------------------------------------------------------------------
+    # Misc helpers
+    # -------------------------------------------------------------------------
 
     def _priority_for_event_kind(self, event_kind: str) -> EventPriority:
         if event_kind == "confirmed":
@@ -1649,57 +2564,74 @@ class BaseFundingStrategy(ABC):
         subscriptions = getattr(self.event_bus, "_subscriptions", None)
         if not isinstance(subscriptions, list):
             return
+
         for subscription in subscriptions:
             if id(subscription) not in before_ids and subscription not in self._subscriptions:
                 self._subscriptions.append(subscription)
 
-    def _register_scheduler_jobs(self) -> None:
-        if self.scheduler is None or not self.config.enable_scheduler_cleanup:
-            return
-        if self._cleanup_job_id is not None:
-            return
-
-        existing = self.scheduler.get_job_by_name(f"{self.strategy_name}:cleanup_expired_states")
-        if existing is not None:
-            self._cleanup_job_id = existing.job_id
-            return
-
-        self._cleanup_job_id = self.scheduler.add_interval_job(
-            name=f"{self.strategy_name}:cleanup_expired_states",
-            func=self.cleanup_expired_states,
-            interval=self.config.cleanup_interval_sec,
-            kwargs={"emit_events": True},
-            run_immediately=False,
-            max_retries=1,
-            retry_delay=1.0,
-            timeout=self.config.cleanup_job_timeout_sec,
-            allow_overlap=False,
-            enabled=True,
-        )
-
-    def _unregister_scheduler_jobs(self) -> None:
-        if self.scheduler is None or self._cleanup_job_id is None:
-            self._cleanup_job_id = None
-            return
-        try:
-            self.scheduler.remove_job(self._cleanup_job_id)
-        except KeyError:
-            pass
-        finally:
-            self._cleanup_job_id = None
+    @staticmethod
+    def _json_dumps(value: Any) -> str | None:
+        if value is None:
+            return None
+        return json.dumps(serialize_for_event(value), ensure_ascii=False, sort_keys=True, default=str)
 
     # -------------------------------------------------------------------------
     # Optional hooks for descendants
     # -------------------------------------------------------------------------
 
-    def on_before_setup_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_setup_emit(
+        self,
+        state: FundingStrategyState,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         return payload
 
-    def on_before_confirmation_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_confirmation_emit(
+        self,
+        state: FundingStrategyState,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         return payload
 
-    def on_before_invalidation_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_invalidation_emit(
+        self,
+        state: FundingStrategyState,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         return payload
 
-    def on_before_expiration_emit(self, state: FundingStrategyState, payload: dict[str, Any]) -> dict[str, Any]:
+    def on_before_expiration_emit(
+        self,
+        state: FundingStrategyState,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         return payload
+
+    @staticmethod
+    def _timeframe_value(value: FundingTimeframe | str | None) -> str:
+        if value is None:
+            return FundingTimeframe.H1.value
+        if isinstance(value, FundingTimeframe):
+            return value.value
+
+        raw = str(value).strip()
+        if raw.startswith("FundingTimeframe."):
+            enum_name = raw.split(".", 1)[1]
+            enum_value = getattr(FundingTimeframe, enum_name, None)
+            if isinstance(enum_value, FundingTimeframe):
+                return enum_value.value
+
+        return raw
+__all__ = [
+    "BaseFundingStrategy",
+    "BaseFundingStrategyConfig",
+    "FundingSetupStatus",
+    "FundingStrategyDirection",
+    "FundingStrategyScope",
+    "FundingStrategyState",
+    "ensure_utc",
+    "parse_datetime",
+    "serialize_for_event",
+    "unwrap_analytics_payload",
+    "utc_now",
+]
