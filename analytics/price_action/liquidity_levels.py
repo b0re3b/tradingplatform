@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
-from copy import deepcopy
+
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
 
@@ -17,12 +18,16 @@ from analytics.price_action.enums import (
     SwingType,
 )
 from analytics.price_action.models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     Candle,
     LayerLiquidityState,
     LiquidityEvent,
     LiquidityLevel,
     LiquidityState,
     SwingPoint,
+    clamp_unit,
 )
 
 
@@ -86,6 +91,9 @@ class LiquidityLevelsConfig(BasePriceActionConfig):
         if self.stop_run_wick_ratio_threshold < 0:
             raise ValueError("stop_run_wick_ratio_threshold must be >= 0")
 
+        self.swing_high_topic = self._normalize_topic(self.swing_high_topic)
+        self.swing_low_topic = self._normalize_topic(self.swing_low_topic)
+
         if self.subscribe_market_structure_swings:
             if not self.swing_high_topic:
                 raise ValueError("swing_high_topic must not be empty")
@@ -95,24 +103,36 @@ class LiquidityLevelsConfig(BasePriceActionConfig):
 
 class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     """
-    Event-driven liquidity levels analyzer.
+    Event-driven futures liquidity levels analyzer.
 
-    Responsibilities:
-    - listen to market.candle / market.candles;
-    - listen to analytics.price_action.market_structure.swing_high;
-    - listen to analytics.price_action.market_structure.swing_low;
-    - build liquidity pools from swing highs/lows;
-    - detect equal highs / equal lows clusters;
-    - track touches, sweeps, reclaims, failed breakouts and stop runs;
-    - publish analytics.price_action.liquidity_levels.* events.
+    Correct input flow:
+        exchange adapters
+            -> market.candle
+            -> CandlesCache
+            -> market.candle.closed / market.candles.updated
+            -> LiquidityLevelsAnalyzer
+
+        MarketStructureAnalyzer
+            -> analytics.price_action.market_structure.swing_high / swing_low
+            -> LiquidityLevelsAnalyzer
+
+    Output:
+        LiquidityLevelsAnalyzer
+            -> analytics.price_action.liquidity_levels.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     def __init__(
         self,
         symbol: str,
-        timeframe: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
         *,
         event_bus: EventBus,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        exchange_symbol: str | None = None,
         scheduler: Scheduler | None = None,
         config: LiquidityLevelsConfig | None = None,
     ) -> None:
@@ -121,6 +141,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
+            exchange=exchange,
+            market_type=market_type,
+            exchange_symbol=exchange_symbol,
             event_bus=event_bus,
             scheduler=scheduler,
             config=resolved_config,
@@ -130,8 +153,12 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self.config: LiquidityLevelsConfig = resolved_config
 
         self._candles: Deque[Candle] = deque(maxlen=self.config.max_candles)
-        self._internal_levels: Deque[LiquidityLevel] = deque(maxlen=self.config.max_levels_per_layer)
-        self._external_levels: Deque[LiquidityLevel] = deque(maxlen=self.config.max_levels_per_layer)
+        self._internal_levels: Deque[LiquidityLevel] = deque(
+            maxlen=self.config.max_levels_per_layer
+        )
+        self._external_levels: Deque[LiquidityLevel] = deque(
+            maxlen=self.config.max_levels_per_layer
+        )
         self._events: Deque[LiquidityEvent] = deque(maxlen=self.config.max_events)
 
         self._processed_swings: set[str] = set()
@@ -142,16 +169,12 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self._processed_stop_run_keys: set[tuple[str, int]] = set()
 
         self._global_candle_index = 0
-        self._state = LiquidityState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "Initialized LiquidityLevelsAnalyzer",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "config": asdict(self.config),
             },
         )
@@ -180,7 +203,11 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         if not candles:
             self.logger.warning(
                 "LiquidityLevelsAnalyzer received empty candle payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -192,7 +219,11 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         if not candles:
             self.logger.warning(
                 "LiquidityLevelsAnalyzer received empty candles payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -203,7 +234,22 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         if not isinstance(event.payload, Mapping):
             self.logger.warning(
                 "LiquidityLevelsAnalyzer received invalid swing payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
+            )
+            return
+
+        if not self._payload_matches_module_scope(event.payload):
+            self.logger.debug(
+                "Swing event skipped because scope does not match",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -234,8 +280,6 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         await self._emit_event(
             self._build_event_name("updated"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": result.get("state"),
                 "updated_levels_count": len(result.get("updated_levels", [])),
                 "new_events_count": len(result.get("new_events", [])),
@@ -265,14 +309,11 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self._processed_stop_run_keys.clear()
 
         self._global_candle_index = 0
-        self._state = LiquidityState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "LiquidityLevelsAnalyzer reset",
-            extra={"symbol": self.symbol, "timeframe": self.timeframe},
+            extra=self._log_scope_extra(),
         )
 
     def get_state(self) -> LiquidityState:
@@ -302,28 +343,23 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
     def add_candles(self, candles: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         return self.add_data(candles=candles)
 
-    def add_swings(self, swings: Sequence[SwingPoint | Mapping[str, Any]]) -> dict[str, Any]:
+    def add_swings(
+        self,
+        swings: Sequence[SwingPoint | Mapping[str, Any]],
+    ) -> dict[str, Any]:
         return self.add_data(swings=swings)
 
     def add_data(
-            self,
-            *,
-            candles: Sequence[Mapping[str, Any]] | None = None,
-            swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
+        self,
+        *,
+        candles: Sequence[Mapping[str, Any]] | None = None,
+        swings: Sequence[SwingPoint | Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """
         Atomically ingest liquidity level inputs.
 
-        If any candle or swing in the provided batch is invalid, all state mutations
-        performed during this batch are rolled back:
-        - candles buffer;
-        - internal/external liquidity levels;
-        - emitted domain events;
-        - processed swing/touch/sweep/reclaim/failed-breakout/stop-run keys;
-        - global candle index;
-        - typed liquidity state.
-
-        This prevents half-committed liquidity state after malformed market data.
+        If any candle or swing in the provided batch is invalid, all state
+        mutations performed during this batch are rolled back.
         """
         candles_batch = list(candles or [])
         swings_batch = list(swings or [])
@@ -334,8 +370,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             self.logger.debug(
                 "Liquidity levels updated",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "updated_levels": 0,
                     "new_events": 0,
                     "last_price": self._state.last_price,
@@ -343,6 +378,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             )
 
             return {
+                **self.scope_payload,
                 "state": self.snapshot(),
                 "updated_levels": [],
                 "new_events": [],
@@ -357,7 +393,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         rollback_processed_touch_keys = set(self._processed_touch_keys)
         rollback_processed_sweep_keys = set(self._processed_sweep_keys)
         rollback_processed_reclaim_keys = set(self._processed_reclaim_keys)
-        rollback_processed_failed_breakout_keys = set(self._processed_failed_breakout_keys)
+        rollback_processed_failed_breakout_keys = set(
+            self._processed_failed_breakout_keys
+        )
         rollback_processed_stop_run_keys = set(self._processed_stop_run_keys)
 
         rollback_global_candle_index = self._global_candle_index
@@ -368,7 +406,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
 
         try:
             if swings_batch:
-                levels_from_swings, events_from_swings = self._ingest_swings(swings_batch)
+                levels_from_swings, events_from_swings = self._ingest_swings(
+                    swings_batch
+                )
                 updated_levels.extend(levels_from_swings)
                 new_events.extend(events_from_swings)
 
@@ -397,8 +437,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             self.logger.exception(
                 "Liquidity levels batch ingestion failed and was rolled back",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "candles_count": len(candles_batch),
                     "swings_count": len(swings_batch),
                     "rollback_global_candle_index": rollback_global_candle_index,
@@ -409,8 +448,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         self.logger.debug(
             "Liquidity levels updated",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "updated_levels": len(updated_levels),
                 "new_events": len(new_events),
                 "last_price": self._state.last_price,
@@ -418,6 +456,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         )
 
         return {
+            **self.scope_payload,
             "state": self.snapshot(),
             "updated_levels": [self._level_to_dict(level) for level in updated_levels],
             "new_events": [self._event_to_dict(event) for event in new_events],
@@ -450,6 +489,12 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         for raw in swings:
             swing = self._parse_swing(raw)
 
+            if swing.key != self.key:
+                raise ValueError(
+                    "swing scope does not match liquidity module scope: "
+                    f"swing={swing.key}, module={self.key}"
+                )
+
             if swing.swing_id in self._processed_swings:
                 continue
 
@@ -481,21 +526,41 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         if isinstance(raw, SwingPoint):
             return raw
 
+        if not isinstance(raw, Mapping):
+            raise TypeError("swing payload must be SwingPoint or mapping")
+
         swing_type_raw = raw["swing_type"]
         layer_raw = raw["layer"]
 
         return SwingPoint(
+            exchange=str(raw.get("exchange", self.exchange)),
+            market_type=str(raw.get("market_type", self.market_type)),
+            symbol=str(raw.get("symbol", self.symbol)),
+            exchange_symbol=(
+                str(raw.get("exchange_symbol"))
+                if raw.get("exchange_symbol") is not None
+                else self.exchange_symbol
+            ),
+            timeframe=str(raw.get("timeframe", self.timeframe)),
             swing_id=str(raw["swing_id"]),
             timestamp=self._ensure_utc_datetime(raw["timestamp"]),
             price=float(raw["price"]),
-            swing_type=swing_type_raw if isinstance(swing_type_raw, SwingType) else SwingType(str(swing_type_raw)),
-            layer=layer_raw if isinstance(layer_raw, StructureLayer) else StructureLayer(str(layer_raw)),
+            swing_type=(
+                swing_type_raw
+                if isinstance(swing_type_raw, SwingType)
+                else SwingType(str(swing_type_raw))
+            ),
+            layer=(
+                layer_raw
+                if isinstance(layer_raw, StructureLayer)
+                else StructureLayer(str(layer_raw))
+            ),
             index=int(raw["index"]),
             candle_open=float(raw.get("candle_open", raw.get("open", 0.0))),
             candle_high=float(raw.get("candle_high", raw.get("high", 0.0))),
             candle_low=float(raw.get("candle_low", raw.get("low", 0.0))),
             candle_close=float(raw.get("candle_close", raw.get("close", 0.0))),
-            strength=float(raw.get("strength", 0.0)),
+            strength=clamp_unit(float(raw.get("strength", 0.0))),
             is_confirmed=bool(raw.get("is_confirmed", True)),
             metadata=dict(raw.get("metadata", {})),
         )
@@ -506,9 +571,18 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         swing: SwingPoint,
         level_type: LiquidityLevelType,
     ) -> tuple[LiquidityLevel | None, list[LiquidityEvent]]:
+        if swing.key != self.key:
+            raise ValueError(
+                "swing scope does not match liquidity module scope: "
+                f"swing={swing.key}, module={self.key}"
+            )
+
         events: list[LiquidityEvent] = []
 
-        upper_bound, lower_bound = self._build_zone_bounds(price=swing.price, layer=swing.layer)
+        upper_bound, lower_bound = self._build_zone_bounds(
+            price=swing.price,
+            layer=swing.layer,
+        )
         existing = self._find_merge_candidate(
             layer=swing.layer,
             level_type=level_type,
@@ -535,6 +609,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                     metadata={
                         "merged_swing_id": swing.swing_id,
                         "source_count": existing.source_count,
+                        "source_swing_key": list(swing.key),
                     },
                 )
             )
@@ -546,13 +621,18 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             return existing, events
 
         level = LiquidityLevel(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             level_id=uuid4().hex,
             layer=swing.layer,
             level_type=level_type,
             price=swing.price,
             upper_bound=upper_bound,
             lower_bound=lower_bound,
-            strength=max(0.0, min(1.0, swing.strength)),
+            strength=clamp_unit(swing.strength),
             status=LiquidityLevelStatus.ACTIVE,
             touch_count=1,
             sweep_count=0,
@@ -565,6 +645,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             metadata={
                 "origin_swing_type": swing.swing_type.value,
                 "origin_swing_index": swing.index,
+                "origin_swing_key": list(swing.key),
                 "equal_cluster_confirmed": False,
             },
         )
@@ -581,6 +662,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                 metadata={
                     "source_swing_id": swing.swing_id,
                     "source_swing_type": swing.swing_type.value,
+                    "source_swing_key": list(swing.key),
                 },
             )
         )
@@ -609,6 +691,14 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         upper_bound: float,
         lower_bound: float,
     ) -> None:
+        self._assert_level_scope(level)
+
+        if swing.key != self.key:
+            raise ValueError(
+                "swing scope does not match liquidity module scope: "
+                f"swing={swing.key}, module={self.key}"
+            )
+
         if swing.swing_id not in level.source_swing_ids:
             level.source_swing_ids.append(swing.swing_id)
             level.source_prices.append(swing.price)
@@ -620,10 +710,14 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         level.lower_bound = min(level.lower_bound, lower_bound)
         level.updated_at = swing.timestamp
 
-        avg_strength = (level.strength + max(0.0, min(1.0, swing.strength))) / 2.0
+        avg_strength = (level.strength + clamp_unit(swing.strength)) / 2.0
         source_bonus = min(0.25, 0.03 * max(0, level.source_count - 1))
-        equal_cluster_bonus = 0.10 if level.source_count >= self.config.min_cluster_size_for_equal_levels else 0.0
-        level.strength = max(0.0, min(1.0, avg_strength + source_bonus + equal_cluster_bonus))
+        equal_cluster_bonus = (
+            0.10
+            if level.source_count >= self.config.min_cluster_size_for_equal_levels
+            else 0.0
+        )
+        level.strength = clamp_unit(avg_strength + source_bonus + equal_cluster_bonus)
 
         if self._can_promote_to_equal_level(level):
             if level.level_type == LiquidityLevelType.SWING_HIGH_LIQUIDITY:
@@ -632,6 +726,8 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                 level.level_type = LiquidityLevelType.EQUAL_LOWS
 
             level.metadata["equal_cluster_confirmed"] = True
+
+        level.metadata["last_merged_swing_key"] = list(swing.key)
 
     # -------------------------------------------------------------------------
     # Candles ingestion
@@ -643,6 +739,8 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         for raw in candles:
             candle = self._parse_candle(raw, index=self._global_candle_index)
             self._global_candle_index += 1
+
+            self._assert_candle_scope(candle)
 
             self._candles.append(candle)
             self._state.last_price = candle.close
@@ -661,6 +759,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         candle: Candle,
     ) -> list[LiquidityEvent]:
         events: list[LiquidityEvent] = []
+
+        self._assert_level_scope(level)
+        self._assert_candle_scope(candle)
 
         if level.status == LiquidityLevelStatus.INVALIDATED:
             return events
@@ -682,7 +783,10 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                         timestamp=candle.timestamp,
                         reference_price=candle.close,
                         confidence=min(1.0, level.strength),
-                        metadata={"candle_index": candle.index},
+                        metadata={
+                            "candle_index": candle.index,
+                            "source_candle_key": list(candle.key),
+                        },
                     )
                 )
 
@@ -714,6 +818,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                             "candle_index": candle.index,
                             "sweep_side": sweep_side,
                             "sweep_price": sweep_price,
+                            "source_candle_key": list(candle.key),
                         },
                     )
                 )
@@ -733,6 +838,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                                 metadata={
                                     "candle_index": candle.index,
                                     "sweep_side": sweep_side,
+                                    "source_candle_key": list(candle.key),
                                 },
                             )
                         )
@@ -758,6 +864,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                         metadata={
                             "candle_index": candle.index,
                             "last_sweep_side": level.last_sweep_side,
+                            "source_candle_key": list(candle.key),
                         },
                     )
                 )
@@ -773,10 +880,14 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                                 level=level,
                                 timestamp=candle.timestamp,
                                 reference_price=candle.close,
-                                confidence=self._failed_breakout_confidence(level, candle),
+                                confidence=self._failed_breakout_confidence(
+                                    level,
+                                    candle,
+                                ),
                                 metadata={
                                     "candle_index": candle.index,
                                     "last_sweep_side": level.last_sweep_side,
+                                    "source_candle_key": list(candle.key),
                                 },
                             )
                         )
@@ -888,6 +999,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             metadata={
                 "candle_index": candle.index,
                 "bars_since_sweep": bars_since_sweep,
+                "source_candle_key": list(candle.key),
             },
         )
 
@@ -901,13 +1013,25 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
 
     def _refresh_layer_state(self, layer: StructureLayer) -> None:
         state = self._layer_state(layer)
-        levels = list(self._levels_for_layer(layer))
+        levels = [
+            level
+            for level in list(self._levels_for_layer(layer))
+            if level.key == self.key
+        ]
 
-        active_levels = [level for level in levels if level.status == LiquidityLevelStatus.ACTIVE]
-        swept_levels = [level for level in levels if level.status == LiquidityLevelStatus.SWEPT]
-        reclaimed_levels = [level for level in levels if level.status == LiquidityLevelStatus.RECLAIMED]
+        active_levels = [
+            level for level in levels if level.status == LiquidityLevelStatus.ACTIVE
+        ]
+        swept_levels = [
+            level for level in levels if level.status == LiquidityLevelStatus.SWEPT
+        ]
+        reclaimed_levels = [
+            level for level in levels if level.status == LiquidityLevelStatus.RECLAIMED
+        ]
         invalidated_levels = [
-            level for level in levels if level.status == LiquidityLevelStatus.INVALIDATED
+            level
+            for level in levels
+            if level.status == LiquidityLevelStatus.INVALIDATED
         ]
 
         state.total_levels = len(levels)
@@ -931,7 +1055,11 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         state.strongest_buy_side = self._strongest_level(levels, upper_side=True)
         state.strongest_sell_side = self._strongest_level(levels, upper_side=False)
 
-        layer_events = [event for event in self._events if event.layer == layer]
+        layer_events = [
+            event
+            for event in self._events
+            if event.layer == layer and event.key == self.key
+        ]
         state.last_event = layer_events[-1] if layer_events else None
 
         state.recent_sweep_count = len(
@@ -940,16 +1068,25 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
                 for level in levels
                 if level.last_sweep_index is not None
                 and self._bars_since_index(level.last_sweep_index) is not None
-                and self._bars_since_index(level.last_sweep_index) <= self.config.retest_window_bars
+                and self._bars_since_index(level.last_sweep_index)
+                <= self.config.retest_window_bars
             ]
         )
 
         state.metadata = {
             "equal_highs": len(
-                [level for level in levels if level.level_type == LiquidityLevelType.EQUAL_HIGHS]
+                [
+                    level
+                    for level in levels
+                    if level.level_type == LiquidityLevelType.EQUAL_HIGHS
+                ]
             ),
             "equal_lows": len(
-                [level for level in levels if level.level_type == LiquidityLevelType.EQUAL_LOWS]
+                [
+                    level
+                    for level in levels
+                    if level.level_type == LiquidityLevelType.EQUAL_LOWS
+                ]
             ),
             "buy_side_levels": len(
                 [level for level in levels if self._is_upper_side_liquidity(level)]
@@ -957,19 +1094,63 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             "sell_side_levels": len(
                 [level for level in levels if not self._is_upper_side_liquidity(level)]
             ),
+            "scope": self.scope_payload,
         }
+
+    # -------------------------------------------------------------------------
+    # Scope helpers
+    # -------------------------------------------------------------------------
+
+    def _new_state(self) -> LiquidityState:
+        return LiquidityState(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
+        )
+
+    def _payload_matches_module_scope(self, payload: Mapping[str, Any]) -> bool:
+        if not self.config.require_event_scope:
+            return True
+
+        key = self._extract_key_from_payload(payload)
+        return key == self.key
+
+    def _assert_candle_scope(self, candle: Candle) -> None:
+        if candle.key != self.key:
+            raise ValueError(
+                "candle scope does not match liquidity module scope: "
+                f"candle={candle.key}, module={self.key}"
+            )
+
+    def _assert_level_scope(self, level: LiquidityLevel) -> None:
+        if level.key != self.key:
+            raise ValueError(
+                "liquidity level scope does not match module scope: "
+                f"level={level.key}, module={self.key}"
+            )
 
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
 
     def _levels_for_layer(self, layer: StructureLayer) -> Deque[LiquidityLevel]:
-        return self._internal_levels if layer == StructureLayer.INTERNAL else self._external_levels
+        return (
+            self._internal_levels
+            if layer == StructureLayer.INTERNAL
+            else self._external_levels
+        )
 
     def _layer_state(self, layer: StructureLayer) -> LayerLiquidityState:
         return self._state.internal if layer == StructureLayer.INTERNAL else self._state.external
 
-    def _build_zone_bounds(self, *, price: float, layer: StructureLayer) -> tuple[float, float]:
+    def _build_zone_bounds(
+        self,
+        *,
+        price: float,
+        layer: StructureLayer,
+    ) -> tuple[float, float]:
         width_pct = (
             self.config.swing_liquidity_zone_width_pct_internal
             if layer == StructureLayer.INTERNAL
@@ -995,7 +1176,9 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         candidates = [
             level
             for level in self._levels_for_layer(layer)
-            if level.level_type == level_type and level.status != LiquidityLevelStatus.INVALIDATED
+            if level.key == self.key
+            and level.level_type == level_type
+            and level.status != LiquidityLevelStatus.INVALIDATED
         ]
         if not candidates:
             return None
@@ -1060,7 +1243,8 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         candidates = [
             level
             for level in levels
-            if level.status != LiquidityLevelStatus.INVALIDATED
+            if level.key == self.key
+            and level.status != LiquidityLevelStatus.INVALIDATED
             and self._is_upper_side_liquidity(level) == upper_side
         ]
 
@@ -1083,7 +1267,8 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         candidates = [
             level
             for level in levels
-            if level.status != LiquidityLevelStatus.INVALIDATED
+            if level.key == self.key
+            and level.status != LiquidityLevelStatus.INVALIDATED
             and self._is_upper_side_liquidity(level) == upper_side
         ]
         if not candidates:
@@ -1106,8 +1291,12 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             else max(level.lower_bound - candle.low, 0.0)
         ) / max(level.price, 1e-9)
 
-        raw = (level.strength + candle.body_ratio + min(1.0, penetration * 150.0)) / 3.0
-        return max(0.0, min(1.0, raw))
+        raw = (
+            level.strength
+            + candle.body_ratio
+            + min(1.0, penetration * 150.0)
+        ) / 3.0
+        return clamp_unit(raw)
 
     def _reclaim_confidence(self, level: LiquidityLevel, candle: Candle) -> float:
         wick_ratio = (
@@ -1116,11 +1305,18 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             else candle.lower_wick_ratio
         )
         raw = (level.strength + min(1.0, wick_ratio) + candle.body_ratio) / 3.0
-        return max(0.0, min(1.0, raw))
+        return clamp_unit(raw)
 
-    def _failed_breakout_confidence(self, level: LiquidityLevel, candle: Candle) -> float:
-        raw = (self._reclaim_confidence(level, candle) + min(1.0, level.strength)) / 2.0
-        return max(0.0, min(1.0, raw))
+    def _failed_breakout_confidence(
+        self,
+        level: LiquidityLevel,
+        candle: Candle,
+    ) -> float:
+        raw = (
+            self._reclaim_confidence(level, candle)
+            + min(1.0, level.strength)
+        ) / 2.0
+        return clamp_unit(raw)
 
     def _stop_run_confidence(self, level: LiquidityLevel, candle: Candle) -> float:
         wick_ratio = (
@@ -1129,7 +1325,7 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
             else candle.lower_wick_ratio
         )
         raw = (level.strength + min(1.0, wick_ratio)) / 2.0
-        return max(0.0, min(1.0, raw))
+        return clamp_unit(raw)
 
     def _create_event(
         self,
@@ -1141,27 +1337,47 @@ class LiquidityLevelsAnalyzer(BasePriceActionModule[LiquidityState]):
         confidence: float,
         metadata: Mapping[str, Any] | None = None,
     ) -> LiquidityEvent:
+        self._assert_level_scope(level)
+
         event = LiquidityEvent(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             event_id=uuid4().hex,
             event_type=event_type,
             timestamp=timestamp,
-            symbol=self.symbol,
-            timeframe=self.timeframe,
             layer=level.layer,
             level_id=level.level_id,
             level_type=level.level_type,
             price=level.price,
-            confidence=max(0.0, min(1.0, confidence)),
+            confidence=clamp_unit(confidence),
             reference_price=reference_price,
-            metadata=dict(metadata or {}),
+            metadata={
+                **dict(metadata or {}),
+                "level_key": list(level.key),
+            },
         )
         self._events.append(event)
         return event
 
     def _level_to_dict(self, level: LiquidityLevel) -> dict[str, Any]:
         serialized = self._safe_serialize(level)
-        return serialized if isinstance(serialized, dict) else {"value": serialized}
+        if isinstance(serialized, dict):
+            serialized["key"] = list(level.key)
+            return serialized
+        return {"value": serialized, **self.scope_payload}
 
     def _event_to_dict(self, event: LiquidityEvent) -> dict[str, Any]:
         serialized = self._safe_serialize(event)
-        return serialized if isinstance(serialized, dict) else {"value": serialized}
+        if isinstance(serialized, dict):
+            serialized["key"] = list(event.key)
+            return serialized
+        return {"value": serialized, **self.scope_payload}
+
+
+__all__ = [
+    "LiquidityLevelsConfig",
+    "LiquidityLevelsAnalyzer",
+]

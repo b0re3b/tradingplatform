@@ -11,7 +11,20 @@ from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
-from analytics.price_action.models import Candle
+from analytics.price_action.models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    Candle,
+    PriceActionKey,
+    make_price_action_key,
+    normalize_exchange,
+    normalize_exchange_symbol,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
+    price_action_key_to_dict,
+)
 
 
 StateT = TypeVar("StateT")
@@ -22,11 +35,20 @@ EventHandler = Callable[[Event], Awaitable[None]]
 @dataclass(slots=True)
 class BasePriceActionConfig:
     """
-    Shared config contract for all analytics.price_action modules.
+    Shared infrastructure config for all analytics.price_action modules.
 
     Concrete analyzers should extend this dataclass and define only their
-    domain-specific parameters there. Infrastructure behavior stays here:
-    EventBus topics, event publishing, snapshots and scheduler integration.
+    domain-specific parameters there.
+
+    Correct data flow:
+        exchange adapters
+            -> market.candle
+            -> CandlesCache
+            -> market.candle.closed / market.candles.updated
+            -> analytics.price_action
+            -> analytics.price_action.*
+
+    Price action analyzers should not consume raw exchange candle events by default.
     """
 
     emit_events: bool = True
@@ -39,8 +61,13 @@ class BasePriceActionConfig:
     snapshot_job_retry_delay_seconds: float = 1.0
 
     subscribe_market_candles: bool = True
-    market_candle_topic: str = "market.candle"
-    market_candles_topic: str = "market.candles"
+
+    # Data-layer topics, not raw exchange topics.
+    market_candle_topic: str = "market.candle.closed"
+    market_candles_topic: str = "market.candles.updated"
+
+    # Scope safety.
+    require_event_scope: bool = True
 
     event_priority: EventPriority = EventPriority.NORMAL
 
@@ -52,7 +79,10 @@ class BasePriceActionConfig:
         if not self.event_namespace:
             raise ValueError("event_namespace must not be empty")
 
-        if self.snapshot_interval_seconds is not None and self.snapshot_interval_seconds <= 0:
+        if (
+            self.snapshot_interval_seconds is not None
+            and self.snapshot_interval_seconds <= 0
+        ):
             raise ValueError("snapshot_interval_seconds must be > 0 when provided")
 
         if self.snapshot_job_timeout_seconds <= 0:
@@ -73,6 +103,8 @@ class BasePriceActionConfig:
         if not isinstance(self.event_priority, EventPriority):
             self.event_priority = EventPriority(self.event_priority)
 
+        self.require_event_scope = bool(self.require_event_scope)
+
     @staticmethod
     def _normalize_topic(topic: str) -> str:
         return str(topic or "").strip().strip(".")
@@ -83,12 +115,22 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
     Base infrastructure for all analytics.price_action analyzers.
 
     Contract:
-    - event_bus is mandatory and injected through constructor;
-    - scheduler is optional, but all periodic jobs must go through it;
+    - EventBus is mandatory and injected through constructor;
+    - Scheduler is optional, but all periodic jobs must go through it;
     - logger is created only through core.logger.get_logger;
     - subscriptions are registered via register() / EventBus.subscribe();
     - events are published only via awaited EventBus.emit();
-    - sync domain logic should return results, while async handlers publish them.
+    - candle input comes from CandlesCache, not raw exchange adapters;
+    - every module is scoped by exchange + market_type + symbol + timeframe.
+
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
+    Futures examples:
+        ("binance", "usdm_futures", "BTCUSDT", "1m")
+        ("bybit", "linear", "BTCUSDT", "1m")
+        ("okx", "swap", "BTCUSDT", "1m")
+        ("mexc", "usdm_futures", "BTCUSDT", "1m")
     """
 
     def __init__(
@@ -97,24 +139,43 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         timeframe: str,
         *,
         event_bus: EventBus,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        exchange_symbol: str | None = None,
         scheduler: Scheduler | None = None,
         config: BasePriceActionConfig | None = None,
         service_name: str = "analytics.price_action.base",
     ) -> None:
-        symbol = str(symbol or "").strip().upper()
-        timeframe = str(timeframe or "").strip()
+        symbol = normalize_symbol(symbol)
+        timeframe = normalize_timeframe(timeframe)
+        exchange = normalize_exchange(exchange)
+        market_type = normalize_market_type(market_type)
+        exchange_symbol = normalize_exchange_symbol(
+            exchange_symbol,
+            fallback_symbol=symbol,
+        )
 
-        if not symbol:
-            raise ValueError("symbol must not be empty")
-        if not timeframe:
-            raise ValueError("timeframe must not be empty")
         if not isinstance(event_bus, EventBus):
             raise TypeError("event_bus must be an instance of core.event_bus.EventBus")
-        if scheduler is not None and not isinstance(scheduler, Scheduler):
-            raise TypeError("scheduler must be an instance of core.scheduler.Scheduler or None")
 
+        if scheduler is not None and not isinstance(scheduler, Scheduler):
+            raise TypeError(
+                "scheduler must be an instance of core.scheduler.Scheduler or None"
+            )
+
+        self.exchange = exchange
+        self.market_type = market_type
         self.symbol = symbol
+        self.exchange_symbol = exchange_symbol
         self.timeframe = timeframe
+
+        self.key: PriceActionKey = make_price_action_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
         self.event_bus = event_bus
         self.scheduler = scheduler
 
@@ -128,6 +189,8 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             __name__,
             service_name=service_name,
             event_type="analytics_price_action",
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
@@ -173,22 +236,24 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         if self._registered:
             self.logger.warning(
                 "Price action module already registered",
-                extra={"price_action_module": self.module_name},
+                extra=self._log_scope_extra(),
             )
             return
 
         if self._shutdown:
-            raise RuntimeError(f"{self.module_name} is already shut down and cannot be registered again")
+            raise RuntimeError(
+                f"{self.module_name} is already shut down and cannot be registered again"
+            )
 
         if self.config.subscribe_market_candles:
             self._subscribe(
                 self.config.market_candle_topic,
-                self.on_candle_event,
+                self._on_candle_event_scoped,
                 name=f"{self.module_name}.on_candle_event",
             )
             self._subscribe(
                 self.config.market_candles_topic,
-                self.on_candles_event,
+                self._on_candles_event_scoped,
                 name=f"{self.module_name}.on_candles_event",
             )
 
@@ -198,9 +263,11 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.info(
             "Price action module registered",
             extra={
-                "price_action_module": self.module_name,
+                **self._log_scope_extra(),
                 "subscriptions": len(self._subscriptions),
                 "scheduled_jobs": len(self._scheduled_job_ids),
+                "market_candle_topic": self.config.market_candle_topic,
+                "market_candles_topic": self.config.market_candles_topic,
             },
         )
 
@@ -217,7 +284,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
                 self.logger.exception(
                     "Failed to unsubscribe price action handler",
                     extra={
-                        "price_action_module": self.module_name,
+                        **self._log_scope_extra(),
                         "pattern": getattr(subscription, "pattern", None),
                         "handler": getattr(subscription, "name", None),
                     },
@@ -227,12 +294,15 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         for job_id in list(self._scheduled_job_ids):
             try:
-                if self.scheduler is not None and self.scheduler.get_job(job_id) is not None:
+                if (
+                    self.scheduler is not None
+                    and self.scheduler.get_job(job_id) is not None
+                ):
                     self.scheduler.disable_job(job_id)
             except Exception:
                 self.logger.exception(
                     "Failed to disable scheduled job",
-                    extra={"price_action_module": self.module_name, "job_id": job_id},
+                    extra={**self._log_scope_extra(), "job_id": job_id},
                 )
 
         self._scheduled_job_ids.clear()
@@ -240,7 +310,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         self.logger.info(
             "Price action module unregistered",
-            extra={"price_action_module": self.module_name},
+            extra=self._log_scope_extra(),
         )
 
     async def shutdown(self) -> None:
@@ -257,7 +327,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         self.logger.info(
             "Price action module shutdown completed",
-            extra={"price_action_module": self.module_name},
+            extra=self._log_scope_extra(),
         )
 
     def _subscribe(
@@ -281,7 +351,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.debug(
             "Price action handler subscribed",
             extra={
-                "price_action_module": self.module_name,
+                **self._log_scope_extra(),
                 "pattern": normalized_pattern,
                 "handler": subscription.name,
             },
@@ -298,12 +368,13 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         if self.scheduler is None:
             self.logger.warning(
                 "Snapshot publishing requested but Scheduler is not provided",
-                extra={"price_action_module": self.module_name},
+                extra=self._log_scope_extra(),
             )
             return
 
         job_name = (
             f"{self.config.event_namespace}.snapshot."
+            f"{self.exchange}.{self.market_type}."
             f"{self.symbol.lower()}.{self.timeframe}"
         )
 
@@ -323,12 +394,56 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.info(
             "Price action snapshot job registered",
             extra={
-                "price_action_module": self.module_name,
+                **self._log_scope_extra(),
                 "job_id": job_id,
                 "job_name": job_name,
                 "interval": self.config.snapshot_interval_seconds,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Scoped EventBus wrappers
+    # ------------------------------------------------------------------
+
+    async def _on_candle_event_scoped(self, event: Event) -> None:
+        """
+        Wrapper around subclass on_candle_event().
+
+        It filters data-layer candle events by:
+            exchange + market_type + symbol + timeframe
+        """
+        if not self._event_matches_module_scope(event):
+            self.logger.debug(
+                "Candle event skipped because scope does not match module",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                },
+            )
+            return
+
+        await self.on_candle_event(event)
+
+    async def _on_candles_event_scoped(self, event: Event) -> None:
+        """
+        Wrapper around subclass on_candles_event().
+
+        Batch payloads are accepted when the top-level payload matches module
+        scope, or at least one candle inside the batch matches module scope.
+        """
+        if not self._event_matches_module_scope(event, allow_batch=True):
+            self.logger.debug(
+                "Candles event skipped because scope does not match module",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                },
+            )
+            return
+
+        await self.on_candles_event(event)
 
     # ------------------------------------------------------------------
     # Default EventBus handlers
@@ -344,7 +459,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.debug(
             "Candle event ignored by base module",
             extra={
-                "price_action_module": self.module_name,
+                **self._log_scope_extra(),
                 "topic": event.topic,
                 "event_id": event.event_id,
             },
@@ -360,22 +475,159 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         self.logger.debug(
             "Candles event ignored by base module",
             extra={
-                "price_action_module": self.module_name,
+                **self._log_scope_extra(),
                 "topic": event.topic,
                 "event_id": event.event_id,
             },
         )
 
     # ------------------------------------------------------------------
+    # Scope helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def scope_payload(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "exchange_symbol": self.exchange_symbol,
+            "timeframe": self.timeframe,
+            "key": list(self.key),
+        }
+
+    def _log_scope_extra(self) -> dict[str, Any]:
+        return {
+            "price_action_module": self.module_name,
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "key": list(self.key),
+        }
+
+    def _event_matches_module_scope(
+        self,
+        event: Event,
+        *,
+        allow_batch: bool = False,
+    ) -> bool:
+        payload = getattr(event, "payload", None)
+
+        if not self.config.require_event_scope:
+            return True
+
+        payload_key = self._extract_key_from_payload(payload)
+        if payload_key is not None:
+            return payload_key == self.key
+
+        if allow_batch:
+            candle_payloads = self._extract_candles_payload(event)
+            if not candle_payloads:
+                return False
+
+            return any(
+                self._extract_key_from_payload(candle_payload) == self.key
+                for candle_payload in candle_payloads
+            )
+
+        return False
+
+    def _extract_key_from_payload(self, payload: Any) -> PriceActionKey | None:
+        if not isinstance(payload, Mapping):
+            return None
+
+        key = self._extract_key_from_mapping(payload)
+        if key is not None:
+            return key
+
+        candle = payload.get("candle")
+        if isinstance(candle, Mapping):
+            key = self._extract_key_from_mapping(candle)
+            if key is not None:
+                return key
+
+        data = payload.get("data")
+        if isinstance(data, Mapping):
+            key = self._extract_key_from_mapping(data)
+            if key is not None:
+                return key
+
+        return None
+
+    def _extract_key_from_mapping(
+        self,
+        payload: Mapping[str, Any],
+    ) -> PriceActionKey | None:
+        exchange = (
+            payload.get("exchange")
+            or payload.get("venue")
+            or payload.get("source_exchange")
+        )
+        market_type = (
+            payload.get("market_type")
+            or payload.get("category")
+            or payload.get("inst_type")
+            or payload.get("instrument_type")
+        )
+        symbol = (
+            payload.get("symbol")
+            or payload.get("s")
+            or payload.get("instrument")
+            or payload.get("market")
+        )
+        timeframe = (
+            payload.get("timeframe")
+            or payload.get("tf")
+            or payload.get("interval")
+        )
+
+        if not exchange or not market_type or not symbol or not timeframe:
+            return None
+
+        try:
+            return make_price_action_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        except ValueError:
+            return None
+
+    def _ensure_payload_scope(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Add module scope to any emitted payload.
+
+        Caller payload can override neither scope nor key. This prevents a child
+        analyzer from accidentally emitting symbol-only or wrong-scope events.
+        """
+        safe_payload = dict(payload)
+        safe_payload.update(self.scope_payload)
+        return safe_payload
+
+    # ------------------------------------------------------------------
     # Parsing / normalization helpers
     # ------------------------------------------------------------------
 
-    def _parse_candle(self, raw: Mapping[str, Any], *, index: int | None = None) -> Candle:
+    def _parse_candle(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        index: int | None = None,
+    ) -> Candle:
         if not isinstance(raw, Mapping):
             raise TypeError("raw candle must be a mapping")
 
         timestamp_value = (
             raw.get("timestamp")
+            or raw.get("timestamp_ms")
+            or raw.get("close_time_ms")
+            or raw.get("open_time_ms")
+            or raw.get("received_at_ms")
             or raw.get("ts")
             or raw.get("time")
             or raw.get("datetime")
@@ -383,20 +635,74 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         candle_index = index if index is not None else int(raw.get("index", 0))
 
+        exchange = (
+            raw.get("exchange")
+            or raw.get("venue")
+            or raw.get("source_exchange")
+            or self.exchange
+        )
+        market_type = (
+            raw.get("market_type")
+            or raw.get("category")
+            or raw.get("inst_type")
+            or raw.get("instrument_type")
+            or self.market_type
+        )
+        symbol = raw.get("symbol") or raw.get("s") or raw.get("instrument") or self.symbol
+        timeframe = (
+            raw.get("timeframe")
+            or raw.get("tf")
+            or raw.get("interval")
+            or self.timeframe
+        )
+        exchange_symbol = (
+            raw.get("exchange_symbol")
+            or raw.get("raw_symbol")
+            or raw.get("exchangeSymbol")
+            or self.exchange_symbol
+        )
+
         try:
-            return Candle(
+            candle = Candle(
+                exchange=str(exchange),
+                market_type=str(market_type),
+                symbol=str(symbol),
+                exchange_symbol=(
+                    str(exchange_symbol) if exchange_symbol is not None else None
+                ),
+                timeframe=str(timeframe),
                 timestamp=self._ensure_utc_datetime(timestamp_value),
                 open=float(raw["open"]),
                 high=float(raw["high"]),
                 low=float(raw["low"]),
                 close=float(raw["close"]),
                 volume=float(raw.get("volume", 0.0)),
+                quote_volume=(
+                    float(raw["quote_volume"])
+                    if raw.get("quote_volume") is not None
+                    else None
+                ),
+                trades_count=(
+                    int(raw["trades_count"])
+                    if raw.get("trades_count") is not None
+                    else None
+                ),
+                is_closed=bool(raw.get("is_closed", True)),
                 index=candle_index,
+                metadata=dict(raw.get("metadata") or {}),
             )
         except KeyError as exc:
             raise ValueError(f"missing required candle field: {exc.args[0]}") from exc
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid candle payload: {exc}") from exc
+
+        if candle.key != self.key:
+            raise ValueError(
+                "candle scope does not match price action module scope: "
+                f"candle={candle.key}, module={self.key}"
+            )
+
+        return candle
 
     def _parse_candles(
         self,
@@ -408,7 +714,16 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
 
         for offset, raw in enumerate(candles):
             index = None if start_index is None else start_index + offset
-            parsed.append(self._parse_candle(raw, index=index))
+            try:
+                parsed.append(self._parse_candle(raw, index=index))
+            except ValueError:
+                self.logger.debug(
+                    "Candle skipped while parsing batch because scope or payload is invalid",
+                    extra={
+                        **self._log_scope_extra(),
+                        "batch_offset": offset,
+                    },
+                )
 
         return parsed
 
@@ -429,20 +744,49 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             candles = payload.get("candles")
 
             if isinstance(candle, Mapping):
-                return [candle]
+                return [self._merge_parent_scope(payload, candle)]
 
-            if isinstance(candles, Sequence) and not isinstance(candles, (str, bytes, bytearray)):
-                return [item for item in candles if isinstance(item, Mapping)]
+            if isinstance(candles, Sequence) and not isinstance(
+                candles,
+                (str, bytes, bytearray),
+            ):
+                return [
+                    self._merge_parent_scope(payload, item)
+                    for item in candles
+                    if isinstance(item, Mapping)
+                ]
 
             if self._looks_like_candle(payload):
                 return [payload]
 
             return []
 
-        if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        if isinstance(payload, Sequence) and not isinstance(
+            payload,
+            (str, bytes, bytearray),
+        ):
             return [item for item in payload if isinstance(item, Mapping)]
 
         return []
+
+    def _merge_parent_scope(
+        self,
+        parent: Mapping[str, Any],
+        child: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(child)
+
+        for key in (
+            "exchange",
+            "market_type",
+            "symbol",
+            "exchange_symbol",
+            "timeframe",
+        ):
+            if key not in merged and key in parent:
+                merged[key] = parent[key]
+
+        return merged
 
     def _looks_like_candle(self, payload: Mapping[str, Any]) -> bool:
         required = {"open", "high", "low", "close"}
@@ -461,6 +805,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             # milliseconds
             if value > 1_000_000_000_000:
                 return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
+
             # seconds
             return datetime.fromtimestamp(value, tz=timezone.utc)
 
@@ -514,6 +859,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         Emit analytics event through core.event_bus.EventBus.
 
         No background task is created here. Callers must await this method.
+        The module scope is always injected into payload.
         """
         if not self.config.emit_events:
             return False
@@ -522,9 +868,11 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         if not normalized_event_name:
             raise ValueError("event_name must not be empty")
 
-        safe_payload = self._safe_serialize(payload)
+        scoped_payload = self._ensure_payload_scope(payload)
+        safe_payload = self._safe_serialize(scoped_payload)
+
         if not isinstance(safe_payload, Mapping):
-            safe_payload = {"value": safe_payload}
+            safe_payload = {"value": safe_payload, **self.scope_payload}
 
         try:
             return await self.event_bus.emit(
@@ -540,7 +888,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             self.logger.exception(
                 "Failed to emit price action event",
                 extra={
-                    "price_action_module": self.module_name,
+                    **self._log_scope_extra(),
                     "event_name": normalized_event_name,
                     "payload_keys": payload_keys,
                 },
@@ -584,8 +932,6 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         return await self._emit_event(
             self._build_event_name(snapshot_name),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "module": self.module_name,
                 "snapshot": self.snapshot(),
                 "published_at": self._now_utc().isoformat(),
@@ -602,8 +948,6 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         return await self._emit_event(
             self._build_event_name("reset"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "module": self.module_name,
                 "reset_at": self._now_utc().isoformat(),
             },
@@ -619,6 +963,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         serialized = self._safe_serialize(self.config)
         if isinstance(serialized, dict):
             return serialized
+
         return {"value": serialized}
 
     def _safe_serialize(self, value: Any) -> Any:
@@ -637,13 +982,22 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             return value.value
 
         if is_dataclass(value):
-            return {k: self._safe_serialize(v) for k, v in asdict(value).items()}
+            return {
+                k: self._safe_serialize(v)
+                for k, v in asdict(value).items()
+            }
 
         if isinstance(value, Mapping):
-            return {str(k): self._safe_serialize(v) for k, v in value.items()}
+            return {
+                str(k): self._safe_serialize(v)
+                for k, v in value.items()
+            }
 
         if isinstance(value, (list, tuple, set, frozenset)):
-            return [self._safe_serialize(v) for v in value]
+            return [
+                self._safe_serialize(v)
+                for v in value
+            ]
 
         return str(value)
 
@@ -654,8 +1008,7 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         metadata: MutableMapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
+            **self.scope_payload,
             "generated_at": self._now_utc().isoformat(),
             "module": self.module_name,
             "state": self._safe_serialize(state),

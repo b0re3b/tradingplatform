@@ -9,14 +9,25 @@ from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
 
 from analytics.price_action.base import BasePriceActionConfig, BasePriceActionModule
-from analytics.price_action.enums import MarketBias, StructureEventType, StructureLayer, SwingType
+from analytics.price_action.enums import (
+    MarketBias,
+    StructureEventType,
+    StructureLayer,
+    SwingType,
+)
 from analytics.price_action.models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     Candle,
     MarketStructureState,
+    PriceActionKey,
     StructureEvent,
     StructureLayerState,
     SwingPoint,
     clamp_unit,
+    make_price_action_key,
+    price_action_key_to_dict,
 )
 
 
@@ -45,7 +56,9 @@ class MarketStructureConfig(BasePriceActionConfig):
     publish_snapshots: bool = False
 
     subscribe_higher_timeframe_context: bool = True
-    higher_timeframe_context_topic: str = "analytics.price_action.higher_timeframe_context.updated"
+    higher_timeframe_context_topic: str = (
+        "analytics.price_action.higher_timeframe_context.updated"
+    )
 
     def validate(self) -> None:
         BasePriceActionConfig.validate(self)
@@ -83,29 +96,49 @@ class MarketStructureConfig(BasePriceActionConfig):
         if not 0.0 <= self.min_external_strength <= 1.0:
             raise ValueError("min_external_strength must be in [0.0, 1.0]")
 
-        if self.subscribe_higher_timeframe_context and not self.higher_timeframe_context_topic:
+        self.higher_timeframe_context_topic = self._normalize_topic(
+            self.higher_timeframe_context_topic
+        )
+
+        if (
+            self.subscribe_higher_timeframe_context
+            and not self.higher_timeframe_context_topic
+        ):
             raise ValueError("higher_timeframe_context_topic must not be empty")
 
 
 class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
     """
-    Event-driven market structure analyzer.
+    Event-driven futures market structure analyzer.
+
+    Correct input flow:
+        exchange adapters
+            -> market.candle
+            -> CandlesCache
+            -> market.candle.closed / market.candles.updated
+            -> MarketStructureAnalyzer
+            -> analytics.price_action.market_structure.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
 
     Responsibilities:
-    - listen to market.candle / market.candles
-    - detect internal/external swing highs and lows
-    - classify HH / HL / LH / LL
-    - detect BOS / CHOCH / MSS-style structure breaks
-    - publish analytics.price_action.market_structure.* events
-    - expose state and snapshots for strategy/dashboard/storage layers
+    - detect internal/external swing highs and lows;
+    - classify HH / HL / LH / LL;
+    - detect BOS / CHOCH / MSS-style structure breaks;
+    - publish scoped analytics.price_action.market_structure.* events;
+    - expose state and snapshots for strategy/dashboard/storage layers.
     """
 
     def __init__(
         self,
         symbol: str,
-        timeframe: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
         *,
         event_bus: EventBus,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        exchange_symbol: str | None = None,
         scheduler: Scheduler | None = None,
         config: MarketStructureConfig | None = None,
         higher_timeframe: str | None = None,
@@ -115,6 +148,9 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
+            exchange=exchange,
+            market_type=market_type,
+            exchange_symbol=exchange_symbol,
             event_bus=event_bus,
             scheduler=scheduler,
             config=resolved_config,
@@ -122,30 +158,32 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         )
 
         self.config: MarketStructureConfig = resolved_config
-        self.higher_timeframe = higher_timeframe
+        self.higher_timeframe = str(higher_timeframe).strip() if higher_timeframe else None
 
         self._candles: Deque[Candle] = deque(maxlen=self.config.max_candles)
-        self._internal_swings: Deque[SwingPoint] = deque(maxlen=self.config.max_internal_swings)
-        self._external_swings: Deque[SwingPoint] = deque(maxlen=self.config.max_external_swings)
+        self._internal_swings: Deque[SwingPoint] = deque(
+            maxlen=self.config.max_internal_swings
+        )
+        self._external_swings: Deque[SwingPoint] = deque(
+            maxlen=self.config.max_external_swings
+        )
         self._events: Deque[StructureEvent] = deque(maxlen=self.config.max_events)
 
         self._processed_pivots: set[tuple[int, SwingType]] = set()
-        self._processed_structure_labels: set[tuple[str, StructureEventType, StructureLayer]] = set()
+        self._processed_structure_labels: set[
+            tuple[str, StructureEventType, StructureLayer]
+        ] = set()
         self._processed_breaks: set[tuple[StructureLayer, str, str, str]] = set()
 
         self._global_candle_index = 0
         self._last_processed_pivot_center_index = -1
 
-        self._state = MarketStructureState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "Initialized MarketStructureAnalyzer",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "higher_timeframe": self.higher_timeframe,
                 "config": asdict(self.config),
             },
@@ -170,30 +208,59 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         if not candles:
             self.logger.warning(
                 "MarketStructureAnalyzer received empty candle payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
         result = self.add_candles(candles)
-        await self._publish_update_result(result, correlation_id=event.correlation_id)
+        await self._publish_update_result(
+            result,
+            correlation_id=event.correlation_id,
+        )
 
     async def on_candles_event(self, event: Event) -> None:
         candles = self._extract_candles_payload(event)
         if not candles:
             self.logger.warning(
                 "MarketStructureAnalyzer received empty candles payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
         result = self.add_candles(candles)
-        await self._publish_update_result(result, correlation_id=event.correlation_id)
+        await self._publish_update_result(
+            result,
+            correlation_id=event.correlation_id,
+        )
 
     async def on_higher_timeframe_context_event(self, event: Event) -> None:
         if not isinstance(event.payload, Mapping):
             self.logger.warning(
                 "Invalid higher timeframe context payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
+            )
+            return
+
+        if not self._higher_timeframe_context_matches_scope(event.payload):
+            self.logger.debug(
+                "Higher timeframe context skipped because scope does not match",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -203,8 +270,6 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         await self._emit_event(
             self._build_event_name("mtf_alignment_updated"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": self.snapshot(),
             },
             source=self.module_name,
@@ -256,8 +321,6 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         await self._emit_event(
             self._build_event_name("updated"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": result.get("state"),
                 "new_swings_count": len(result.get("new_swings", [])),
                 "new_events_count": len(result.get("new_events", [])),
@@ -286,14 +349,11 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         self._global_candle_index = 0
         self._last_processed_pivot_center_index = -1
 
-        self._state = MarketStructureState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "MarketStructureAnalyzer reset",
-            extra={"symbol": self.symbol, "timeframe": self.timeframe},
+            extra=self._log_scope_extra(),
         )
 
     def get_state(self) -> MarketStructureState:
@@ -344,6 +404,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
             self._refresh_state()
 
             return {
+                **self.scope_payload,
                 "state": self.snapshot(),
                 "new_swings": [],
                 "new_events": [],
@@ -381,8 +442,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         self.logger.debug(
             "Market structure incrementally updated",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "added_candles": len(candles),
                 "new_swings": len(new_swings),
                 "new_events": len(new_events),
@@ -393,6 +453,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         )
 
         return {
+            **self.scope_payload,
             "state": self.snapshot(),
             "new_swings": [self._swing_to_dict(swing) for swing in new_swings],
             "new_events": [self._event_to_dict(event) for event in new_events],
@@ -401,12 +462,29 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
     def update_higher_timeframe_context(self, context: Mapping[str, Any]) -> None:
         mtf = self._state.mtf_alignment
 
-        tf = context.get("timeframe") or context.get("higher_timeframe") or self.higher_timeframe
-        bias_raw = context.get("bias") or context.get("higher_timeframe_bias") or MarketBias.UNKNOWN
-        confidence = float(context.get("confidence", context.get("higher_timeframe_confidence", 0.0)))
+        tf = (
+            context.get("timeframe")
+            or context.get("higher_timeframe")
+            or self.higher_timeframe
+        )
+        bias_raw = (
+            context.get("bias")
+            or context.get("higher_timeframe_bias")
+            or MarketBias.UNKNOWN
+        )
+        confidence = float(
+            context.get(
+                "confidence",
+                context.get("higher_timeframe_confidence", 0.0),
+            )
+        )
 
         try:
-            higher_bias = bias_raw if isinstance(bias_raw, MarketBias) else MarketBias(str(bias_raw))
+            higher_bias = (
+                bias_raw
+                if isinstance(bias_raw, MarketBias)
+                else MarketBias(str(bias_raw))
+            )
         except ValueError:
             higher_bias = MarketBias.UNKNOWN
 
@@ -414,7 +492,10 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         mtf.higher_timeframe_bias = higher_bias
         mtf.higher_timeframe_confidence = clamp_unit(confidence)
         mtf.last_updated = self._state.last_update
-        mtf.metadata = dict(context.get("metadata", {}))
+        mtf.metadata = {
+            **self.scope_payload,
+            **dict(context.get("metadata", {})),
+        }
 
         self._refresh_alignment_state()
 
@@ -427,7 +508,9 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
                 "external_swings": len(self._external_swings),
                 "events": len(self._events),
                 "higher_timeframe": self.higher_timeframe,
-                "last_processed_pivot_center_index": self._last_processed_pivot_center_index,
+                "last_processed_pivot_center_index": (
+                    self._last_processed_pivot_center_index
+                ),
                 "global_candle_index": self._global_candle_index,
                 "config": self._serialize_config(),
             },
@@ -449,8 +532,10 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         if center_candle.index <= self._last_processed_pivot_center_index:
             return []
 
-        left_slice = candles[center_pos - self.config.pivot_left:center_pos]
-        right_slice = candles[center_pos + 1:center_pos + 1 + self.config.pivot_right]
+        left_slice = candles[center_pos - self.config.pivot_left : center_pos]
+        right_slice = candles[
+            center_pos + 1 : center_pos + 1 + self.config.pivot_right
+        ]
 
         is_swing_high = all(center_candle.high > x.high for x in left_slice) and all(
             center_candle.high >= x.high for x in right_slice
@@ -465,17 +550,28 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
 
         if is_swing_high:
             created_swings.extend(
-                self._register_pivot(center_candle=center_candle, swing_type=SwingType.HIGH)
+                self._register_pivot(
+                    center_candle=center_candle,
+                    swing_type=SwingType.HIGH,
+                )
             )
 
         if is_swing_low:
             created_swings.extend(
-                self._register_pivot(center_candle=center_candle, swing_type=SwingType.LOW)
+                self._register_pivot(
+                    center_candle=center_candle,
+                    swing_type=SwingType.LOW,
+                )
             )
 
         return created_swings
 
-    def _register_pivot(self, *, center_candle: Candle, swing_type: SwingType) -> list[SwingPoint]:
+    def _register_pivot(
+        self,
+        *,
+        center_candle: Candle,
+        swing_type: SwingType,
+    ) -> list[SwingPoint]:
         pivot_key = (center_candle.index, swing_type)
         if pivot_key in self._processed_pivots:
             return []
@@ -532,6 +628,11 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
                 return None
 
         return SwingPoint(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             swing_id=uuid4().hex,
             timestamp=center_candle.timestamp,
             price=price,
@@ -547,6 +648,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
             metadata={
                 "body_ratio": center_candle.body_ratio,
                 "range_size": center_candle.range_size,
+                "source_candle_key": list(center_candle.key),
             },
         )
 
@@ -567,18 +669,24 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         if center_pos is None:
             return 0.0
 
-        left_slice = candles[max(0, center_pos - self.config.pivot_left):center_pos]
-        right_slice = candles[center_pos + 1:center_pos + 1 + self.config.pivot_right]
+        left_slice = candles[max(0, center_pos - self.config.pivot_left) : center_pos]
+        right_slice = candles[
+            center_pos + 1 : center_pos + 1 + self.config.pivot_right
+        ]
         neighbors = [*left_slice, *right_slice]
 
         if not neighbors:
             return 0.0
 
         if swing_type == SwingType.HIGH:
-            pivot_distance = mean_safe([max(center_candle.high - x.high, 0.0) for x in neighbors])
+            pivot_distance = mean_safe(
+                [max(center_candle.high - x.high, 0.0) for x in neighbors]
+            )
             normalizer = center_candle.high if center_candle.high > 0 else 1.0
         else:
-            pivot_distance = mean_safe([max(x.low - center_candle.low, 0.0) for x in neighbors])
+            pivot_distance = mean_safe(
+                [max(x.low - center_candle.low, 0.0) for x in neighbors]
+            )
             normalizer = center_candle.low if center_candle.low > 0 else 1.0
 
         distance_score = pivot_distance / normalizer
@@ -596,7 +704,10 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
     # Structure label classification
     # -------------------------------------------------------------------------
 
-    def _classify_structure_labels(self, swings: Sequence[SwingPoint]) -> list[StructureEvent]:
+    def _classify_structure_labels(
+        self,
+        swings: Sequence[SwingPoint],
+    ) -> list[StructureEvent]:
         created_events: list[StructureEvent] = []
 
         grouped: dict[StructureLayer, list[SwingPoint]] = {
@@ -625,7 +736,8 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         swing: SwingPoint,
     ) -> StructureEvent | None:
         same_type_swings = [
-            x for x in all_swings
+            x
+            for x in all_swings
             if x.swing_type == swing.swing_type and x.index < swing.index
         ]
 
@@ -635,11 +747,27 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         previous = same_type_swings[-1]
 
         if swing.swing_type == SwingType.HIGH:
-            event_type = StructureEventType.HH if swing.price > previous.price else StructureEventType.LH
-            direction = MarketBias.BULLISH if event_type == StructureEventType.HH else MarketBias.BEARISH
+            event_type = (
+                StructureEventType.HH
+                if swing.price > previous.price
+                else StructureEventType.LH
+            )
+            direction = (
+                MarketBias.BULLISH
+                if event_type == StructureEventType.HH
+                else MarketBias.BEARISH
+            )
         else:
-            event_type = StructureEventType.HL if swing.price > previous.price else StructureEventType.LL
-            direction = MarketBias.BULLISH if event_type == StructureEventType.HL else MarketBias.BEARISH
+            event_type = (
+                StructureEventType.HL
+                if swing.price > previous.price
+                else StructureEventType.LL
+            )
+            direction = (
+                MarketBias.BULLISH
+                if event_type == StructureEventType.HL
+                else MarketBias.BEARISH
+            )
 
         dedup_key = (swing.swing_id, event_type, swing.layer)
         if dedup_key in self._processed_structure_labels:
@@ -648,6 +776,11 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         self._processed_structure_labels.add(dedup_key)
 
         event = StructureEvent(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             event_id=uuid4().hex,
             event_type=event_type,
             timestamp=swing.timestamp,
@@ -662,6 +795,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
                 "previous_price": previous.price,
                 "previous_index": previous.index,
                 "swing_strength": swing.strength,
+                "previous_swing_id": previous.swing_id,
             },
         )
 
@@ -746,7 +880,10 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
             return None
 
         prev_bias = self._layer_state(layer).bias
-        event_type = self._resolve_break_event_type(prev_bias=prev_bias, direction=direction)
+        event_type = self._resolve_break_event_type(
+            prev_bias=prev_bias,
+            direction=direction,
+        )
 
         dedup_key = (layer, swing.swing_id, str(current_candle.index), event_type.value)
         if dedup_key in self._processed_breaks:
@@ -755,6 +892,11 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         self._processed_breaks.add(dedup_key)
 
         event = StructureEvent(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             event_id=uuid4().hex,
             event_type=event_type,
             timestamp=current_candle.timestamp,
@@ -776,6 +918,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
                 "trigger_high": current_candle.high,
                 "trigger_low": current_candle.low,
                 "threshold_pct": threshold,
+                "source_candle_key": list(current_candle.key),
             },
         )
 
@@ -810,7 +953,11 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         else:
             move_pct = max(swing.price - current_candle.close, 0.0) / reference
 
-        raw = (swing.strength + current_candle.body_ratio + min(1.0, move_pct * 100.0)) / 3.0
+        raw = (
+            swing.strength
+            + current_candle.body_ratio
+            + min(1.0, move_pct * 100.0)
+        ) / 3.0
         return clamp_unit(raw)
 
     # -------------------------------------------------------------------------
@@ -894,7 +1041,10 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
             latest_bearish_ts = max(state.last_lh.timestamp, state.last_ll.timestamp)
 
         if state.last_bos and state.last_choch:
-            last_break = max([state.last_bos, state.last_choch], key=lambda x: x.timestamp)
+            last_break = max(
+                [state.last_bos, state.last_choch],
+                key=lambda x: x.timestamp,
+            )
         else:
             last_break = state.last_bos or state.last_choch
 
@@ -919,7 +1069,7 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         if len(swings) < 2:
             return 0.0
 
-        recent = swings[-self.config.alignment_window:]
+        recent = swings[-self.config.alignment_window :]
         avg_strength = mean_safe([x.strength for x in recent])
 
         prices = [x.price for x in recent if x.price > 0]
@@ -963,6 +1113,11 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         )
 
         event = StructureEvent(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             event_id=uuid4().hex,
             event_type=event_type,
             timestamp=swing.timestamp,
@@ -976,11 +1131,80 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
             metadata={
                 "index": swing.index,
                 "strength": swing.strength,
+                "swing_key": list(swing.key),
             },
         )
 
         self._events.append(event)
         return event
+
+    # -------------------------------------------------------------------------
+    # Scope helpers
+    # -------------------------------------------------------------------------
+
+    def _new_state(self) -> MarketStructureState:
+        return MarketStructureState(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
+        )
+
+    def _scope_kwargs(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "exchange_symbol": self.exchange_symbol,
+            "timeframe": self.timeframe,
+        }
+
+    def _higher_timeframe_context_matches_scope(
+        self,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        """
+        Higher-timeframe context must belong to the same exchange/market/symbol.
+
+        Its timeframe may differ from this module timeframe.
+        """
+        if not self.config.require_event_scope:
+            return True
+
+        exchange = payload.get("exchange") or payload.get("venue")
+        market_type = (
+            payload.get("market_type")
+            or payload.get("category")
+            or payload.get("inst_type")
+            or payload.get("instrument_type")
+        )
+        symbol = payload.get("symbol") or payload.get("s") or payload.get("instrument")
+        timeframe = (
+            payload.get("timeframe")
+            or payload.get("higher_timeframe")
+            or self.higher_timeframe
+            or self.timeframe
+        )
+
+        if not exchange or not market_type or not symbol or not timeframe:
+            return False
+
+        try:
+            key = make_price_action_key(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        except ValueError:
+            return False
+
+        return (
+            key[0] == self.key[0]
+            and key[1] == self.key[1]
+            and key[2] == self.key[2]
+        )
 
     # -------------------------------------------------------------------------
     # Utility helpers
@@ -994,13 +1218,21 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         )
 
     def _swings_for_layer(self, layer: StructureLayer) -> Deque[SwingPoint]:
-        return self._internal_swings if layer == StructureLayer.INTERNAL else self._external_swings
+        return (
+            self._internal_swings
+            if layer == StructureLayer.INTERNAL
+            else self._external_swings
+        )
 
     def _sorted_swings_for_layer(self, layer: StructureLayer) -> list[SwingPoint]:
         return sorted(self._swings_for_layer(layer), key=lambda x: x.index)
 
     def _layer_state(self, layer: StructureLayer) -> StructureLayerState:
-        return self._state.internal if layer == StructureLayer.INTERNAL else self._state.external
+        return (
+            self._state.internal
+            if layer == StructureLayer.INTERNAL
+            else self._state.external
+        )
 
     def _last_swing_of_type(
         self,
@@ -1019,10 +1251,16 @@ class MarketStructureAnalyzer(BasePriceActionModule[MarketStructureState]):
         return filtered[-1] if filtered else None
 
     def _swing_to_dict(self, swing: SwingPoint) -> dict[str, Any]:
-        return self._safe_serialize(swing)
+        payload = self._safe_serialize(swing)
+        if isinstance(payload, dict):
+            payload["key"] = list(swing.key)
+        return payload
 
     def _event_to_dict(self, event: StructureEvent) -> dict[str, Any]:
-        return self._safe_serialize(event)
+        payload = self._safe_serialize(event)
+        if isinstance(payload, dict):
+            payload["key"] = list(event.key)
+        return payload
 
 
 def mean_safe(values: Sequence[float]) -> float:

@@ -1,6 +1,7 @@
 from __future__ import annotations
-from copy import deepcopy
+
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
@@ -16,6 +17,9 @@ from analytics.price_action.enums import (
     StructureLayer,
 )
 from analytics.price_action.models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     Candle,
     FVGEvent,
     FairValueGap,
@@ -74,23 +78,36 @@ class FairValueGapConfig(BasePriceActionConfig):
 
 class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
     """
-    Event-driven Fair Value Gap analyzer.
+    Event-driven futures Fair Value Gap analyzer.
+
+    Correct input flow:
+        exchange adapters
+            -> market.candle
+            -> CandlesCache
+            -> market.candle.closed / market.candles.updated
+            -> FairValueGapAnalyzer
+            -> analytics.price_action.fair_value_gap.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
 
     Responsibilities:
-    - listen to market.candle / market.candles;
     - detect bullish / bearish FVG using 3-candle logic;
     - maintain internal / external FVG layers;
     - track fills, partial fills, respected gaps, invalidations and retests;
-    - publish analytics.price_action.fair_value_gap.* events through EventBus;
+    - publish scoped analytics.price_action.fair_value_gap.* events through EventBus;
     - expose state snapshots for strategy/dashboard/storage layers.
     """
 
     def __init__(
         self,
         symbol: str,
-        timeframe: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
         *,
         event_bus: EventBus,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        exchange_symbol: str | None = None,
         scheduler: Scheduler | None = None,
         config: FairValueGapConfig | None = None,
     ) -> None:
@@ -99,6 +116,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
+            exchange=exchange,
+            market_type=market_type,
+            exchange_symbol=exchange_symbol,
             event_bus=event_bus,
             scheduler=scheduler,
             config=resolved_config,
@@ -108,8 +128,12 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         self.config: FairValueGapConfig = resolved_config
 
         self._candles: Deque[Candle] = deque(maxlen=self.config.max_candles)
-        self._internal_gaps: Deque[FairValueGap] = deque(maxlen=self.config.max_gaps_per_layer)
-        self._external_gaps: Deque[FairValueGap] = deque(maxlen=self.config.max_gaps_per_layer)
+        self._internal_gaps: Deque[FairValueGap] = deque(
+            maxlen=self.config.max_gaps_per_layer
+        )
+        self._external_gaps: Deque[FairValueGap] = deque(
+            maxlen=self.config.max_gaps_per_layer
+        )
         self._events: Deque[FVGEvent] = deque(maxlen=self.config.max_events)
 
         self._global_candle_index = 0
@@ -120,16 +144,12 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         self._processed_invalidation_keys: set[tuple[str, int]] = set()
         self._processed_retest_keys: set[tuple[str, int]] = set()
 
-        self._state = FairValueGapState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "Initialized FairValueGapAnalyzer",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "config": asdict(self.config),
             },
         )
@@ -143,24 +163,38 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         if not candles:
             self.logger.warning(
                 "FairValueGapAnalyzer received empty candle payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
         result = self.add_candles(candles)
-        await self._publish_update_result(result, correlation_id=event.correlation_id)
+        await self._publish_update_result(
+            result,
+            correlation_id=event.correlation_id,
+        )
 
     async def on_candles_event(self, event: Event) -> None:
         candles = self._extract_candles_payload(event)
         if not candles:
             self.logger.warning(
                 "FairValueGapAnalyzer received empty candles payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
         result = self.add_candles(candles)
-        await self._publish_update_result(result, correlation_id=event.correlation_id)
+        await self._publish_update_result(
+            result,
+            correlation_id=event.correlation_id,
+        )
 
     async def _publish_update_result(
         self,
@@ -186,8 +220,6 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         await self._emit_event(
             self._build_event_name("updated"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": result.get("state"),
                 "updated_gaps_count": len(result.get("updated_gaps", [])),
                 "new_events_count": len(result.get("new_events", [])),
@@ -217,14 +249,11 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         self._processed_invalidation_keys.clear()
         self._processed_retest_keys.clear()
 
-        self._state = FairValueGapState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "FairValueGapAnalyzer reset",
-            extra={"symbol": self.symbol, "timeframe": self.timeframe},
+            extra=self._log_scope_extra(),
         )
 
     def get_state(self) -> FairValueGapState:
@@ -255,22 +284,14 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         Atomically ingest candle batches for Fair Value Gap analysis.
 
         If any candle in the batch is invalid, the analyzer rolls back all state
-        mutations performed during this batch:
-        - candles buffer;
-        - internal/external gaps;
-        - events;
-        - processed lifecycle keys;
-        - global candle index;
-        - last processed triplet index;
-        - typed state snapshot.
-
-        This prevents half-committed analyzer state after malformed market data.
+        mutations performed during this batch.
         """
         candles_batch = list(candles or [])
 
         if not candles_batch:
             self._refresh_state()
             return {
+                **self.scope_payload,
                 "state": self.snapshot(),
                 "updated_gaps": [],
                 "new_events": [],
@@ -282,7 +303,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         rollback_events = deepcopy(self._events)
 
         rollback_global_candle_index = self._global_candle_index
-        rollback_last_processed_triplet_end_index = self._last_processed_triplet_end_index
+        rollback_last_processed_triplet_end_index = (
+            self._last_processed_triplet_end_index
+        )
 
         rollback_processed_fill_keys = set(self._processed_fill_keys)
         rollback_processed_respect_keys = set(self._processed_respect_keys)
@@ -303,7 +326,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                 self._state.last_price = candle.close
                 self._state.last_update = candle.timestamp
 
-                created_gaps, creation_events = self._process_incremental_gap_detection()
+                created_gaps, creation_events = (
+                    self._process_incremental_gap_detection()
+                )
                 updated_gaps.extend(created_gaps)
                 new_events.extend(creation_events)
 
@@ -319,7 +344,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
             self._events = rollback_events
 
             self._global_candle_index = rollback_global_candle_index
-            self._last_processed_triplet_end_index = rollback_last_processed_triplet_end_index
+            self._last_processed_triplet_end_index = (
+                rollback_last_processed_triplet_end_index
+            )
 
             self._processed_fill_keys = rollback_processed_fill_keys
             self._processed_respect_keys = rollback_processed_respect_keys
@@ -331,11 +358,12 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
             self.logger.exception(
                 "Fair value gap batch ingestion failed and was rolled back",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "candles_count": len(candles_batch),
                     "rollback_global_candle_index": rollback_global_candle_index,
-                    "rollback_last_processed_triplet_end_index": rollback_last_processed_triplet_end_index,
+                    "rollback_last_processed_triplet_end_index": (
+                        rollback_last_processed_triplet_end_index
+                    ),
                 },
             )
             raise
@@ -343,8 +371,7 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         self.logger.debug(
             "Fair value gap analyzer updated",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "updated_gaps": len(updated_gaps),
                 "new_events": len(new_events),
                 "last_price": self._state.last_price,
@@ -352,6 +379,7 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         )
 
         return {
+            **self.scope_payload,
             "state": self.snapshot(),
             "updated_gaps": [self._gap_to_dict(gap) for gap in updated_gaps],
             "new_events": [self._event_to_dict(event) for event in new_events],
@@ -366,7 +394,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                 "external_gaps": len(self._external_gaps),
                 "events": len(self._events),
                 "global_candle_index": self._global_candle_index,
-                "last_processed_triplet_end_index": self._last_processed_triplet_end_index,
+                "last_processed_triplet_end_index": (
+                    self._last_processed_triplet_end_index
+                ),
                 "config": self._serialize_config(),
             },
         )
@@ -375,7 +405,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
     # Incremental gap detection
     # -------------------------------------------------------------------------
 
-    def _process_incremental_gap_detection(self) -> tuple[list[FairValueGap], list[FVGEvent]]:
+    def _process_incremental_gap_detection(
+        self,
+    ) -> tuple[list[FairValueGap], list[FVGEvent]]:
         candles = list(self._candles)
         if len(candles) < 3:
             return [], []
@@ -412,6 +444,10 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         layer: StructureLayer,
     ) -> tuple[FairValueGap | None, list[FVGEvent]]:
         events: list[FVGEvent] = []
+
+        self._assert_candle_scope(c1)
+        self._assert_candle_scope(c2)
+        self._assert_candle_scope(c3)
 
         if c2.body_ratio < self.config.min_impulse_body_ratio:
             return None, events
@@ -471,12 +507,22 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                     metadata={
                         "triplet_end_index": c3.index,
                         "merged_with_direction": direction.value,
+                        "source_candle_keys": [
+                            list(c1.key),
+                            list(c2.key),
+                            list(c3.key),
+                        ],
                     },
                 )
             )
             return merge_candidate, events
 
         gap = FairValueGap(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             gap_id=uuid4().hex,
             layer=layer,
             direction=direction,
@@ -498,6 +544,11 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                 "impulse_body_ratio": c2.body_ratio,
                 "middle_candle_bullish": c2.is_bullish,
                 "middle_candle_bearish": c2.is_bearish,
+                "source_candle_keys": [
+                    list(c1.key),
+                    list(c2.key),
+                    list(c3.key),
+                ],
             },
         )
 
@@ -513,6 +564,7 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                 metadata={
                     "triplet_end_index": c3.index,
                     "size_pct": size_pct,
+                    "source_candle_key": list(c3.key),
                 },
             )
         )
@@ -525,9 +577,12 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
 
     def _process_gap_lifecycle(self, candle: Candle) -> list[FVGEvent]:
         events: list[FVGEvent] = []
+        self._assert_candle_scope(candle)
 
         for layer in (StructureLayer.INTERNAL, StructureLayer.EXTERNAL):
             for gap in list(self._gaps_for_layer(layer)):
+                self._assert_gap_scope(gap)
+
                 if gap.status in {FVGStatus.FILLED, FVGStatus.INVALIDATED}:
                     continue
 
@@ -566,12 +621,17 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                                 event_type=event_type,
                                 gap=gap,
                                 timestamp=candle.timestamp,
-                                confidence=self._fill_confidence(gap, candle, fill_pct),
+                                confidence=self._fill_confidence(
+                                    gap,
+                                    candle,
+                                    fill_pct,
+                                ),
                                 reference_price=candle.close,
                                 metadata={
                                     "candle_index": candle.index,
                                     "previous_fill_percentage": previous_fill_pct,
                                     "new_fill_percentage": fill_pct,
+                                    "source_candle_key": list(candle.key),
                                 },
                             )
                         )
@@ -594,7 +654,10 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                                     timestamp=candle.timestamp,
                                     confidence=self._respect_confidence(gap, candle),
                                     reference_price=candle.close,
-                                    metadata={"candle_index": candle.index},
+                                    metadata={
+                                        "candle_index": candle.index,
+                                        "source_candle_key": list(candle.key),
+                                    },
                                 )
                             )
 
@@ -618,9 +681,15 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                                     event_type=FVGEventType.FVG_INVALIDATED,
                                     gap=gap,
                                     timestamp=candle.timestamp,
-                                    confidence=self._invalidation_confidence(gap, candle),
+                                    confidence=self._invalidation_confidence(
+                                        gap,
+                                        candle,
+                                    ),
                                     reference_price=candle.close,
-                                    metadata={"candle_index": candle.index},
+                                    metadata={
+                                        "candle_index": candle.index,
+                                        "source_candle_key": list(candle.key),
+                                    },
                                 )
                             )
 
@@ -645,7 +714,10 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                                     timestamp=candle.timestamp,
                                     confidence=min(1.0, gap.strength),
                                     reference_price=candle.close,
-                                    metadata={"candle_index": candle.index},
+                                    metadata={
+                                        "candle_index": candle.index,
+                                        "source_candle_key": list(candle.key),
+                                    },
                                 )
                             )
 
@@ -679,10 +751,16 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         threshold_pct = self.config.respected_reaction_threshold_pct
 
         if gap.direction == FVGDirection.BULLISH:
-            reaction = max(candle.close - gap.upper_bound, 0.0) / max(gap.mid_price, 1e-9)
+            reaction = max(candle.close - gap.upper_bound, 0.0) / max(
+                gap.mid_price,
+                1e-9,
+            )
             return candle.close > gap.mid_price and reaction >= threshold_pct
 
-        reaction = max(gap.lower_bound - candle.close, 0.0) / max(gap.mid_price, 1e-9)
+        reaction = max(gap.lower_bound - candle.close, 0.0) / max(
+            gap.mid_price,
+            1e-9,
+        )
         return candle.close < gap.mid_price and reaction >= threshold_pct
 
     def _is_gap_invalidated(self, gap: FairValueGap, candle: Candle) -> bool:
@@ -715,13 +793,17 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
 
     def _refresh_layer_state(self, layer: StructureLayer) -> None:
         state = self._layer_state(layer)
-        gaps = list(self._gaps_for_layer(layer))
+        gaps = [gap for gap in list(self._gaps_for_layer(layer)) if gap.key == self.key]
 
         active_gaps = [gap for gap in gaps if gap.status == FVGStatus.ACTIVE]
-        partially_filled_gaps = [gap for gap in gaps if gap.status == FVGStatus.PARTIALLY_FILLED]
+        partially_filled_gaps = [
+            gap for gap in gaps if gap.status == FVGStatus.PARTIALLY_FILLED
+        ]
         filled_gaps = [gap for gap in gaps if gap.status == FVGStatus.FILLED]
         respected_gaps = [gap for gap in gaps if gap.status == FVGStatus.RESPECTED]
-        invalidated_gaps = [gap for gap in gaps if gap.status == FVGStatus.INVALIDATED]
+        invalidated_gaps = [
+            gap for gap in gaps if gap.status == FVGStatus.INVALIDATED
+        ]
 
         state.total_gaps = len(gaps)
         state.active_gaps = len(active_gaps)
@@ -753,7 +835,11 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
 
         state.recent_fill_activity = self._recent_fill_activity(gaps)
 
-        layer_events = [event for event in self._events if event.layer == layer]
+        layer_events = [
+            event
+            for event in self._events
+            if event.layer == layer and event.key == self.key
+        ]
         state.last_event = layer_events[-1] if layer_events else None
         state.metadata = {
             "open_gaps": len(
@@ -768,14 +854,46 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
                     }
                 ]
             ),
+            "scope": self.scope_payload,
         }
+
+    # -------------------------------------------------------------------------
+    # Scope helpers
+    # -------------------------------------------------------------------------
+
+    def _new_state(self) -> FairValueGapState:
+        return FairValueGapState(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
+        )
+
+    def _assert_candle_scope(self, candle: Candle) -> None:
+        if candle.key != self.key:
+            raise ValueError(
+                "candle scope does not match fair value gap module scope: "
+                f"candle={candle.key}, module={self.key}"
+            )
+
+    def _assert_gap_scope(self, gap: FairValueGap) -> None:
+        if gap.key != self.key:
+            raise ValueError(
+                "gap scope does not match fair value gap module scope: "
+                f"gap={gap.key}, module={self.key}"
+            )
 
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
 
     def _gaps_for_layer(self, layer: StructureLayer) -> Deque[FairValueGap]:
-        return self._internal_gaps if layer == StructureLayer.INTERNAL else self._external_gaps
+        return (
+            self._internal_gaps
+            if layer == StructureLayer.INTERNAL
+            else self._external_gaps
+        )
 
     def _layer_state(self, layer: StructureLayer) -> LayerFVGState:
         return self._state.internal if layer == StructureLayer.INTERNAL else self._state.external
@@ -805,7 +923,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         candidates = [
             gap
             for gap in self._gaps_for_layer(layer)
-            if gap.direction == direction and gap.status != FVGStatus.INVALIDATED
+            if gap.key == self.key
+            and gap.direction == direction
+            and gap.status != FVGStatus.INVALIDATED
         ]
         if not candidates:
             return None
@@ -818,7 +938,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
 
         for gap in candidates:
             distance_pct = abs(mid_price - gap.mid_price) / max(gap.mid_price, 1e-9)
-            overlaps = not (upper_bound < gap.lower_bound or lower_bound > gap.upper_bound)
+            overlaps = not (
+                upper_bound < gap.lower_bound or lower_bound > gap.upper_bound
+            )
 
             if overlaps or distance_pct <= threshold_pct:
                 if distance_pct < best_distance:
@@ -837,6 +959,8 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         timestamp: Any,
         strength: float,
     ) -> None:
+        self._assert_gap_scope(gap)
+
         gap.lower_bound = min(gap.lower_bound, lower_bound)
         gap.upper_bound = max(gap.upper_bound, upper_bound)
         gap.mid_price = (gap.upper_bound + gap.lower_bound) / 2.0
@@ -861,7 +985,10 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         impulse_score = min(1.0, c2.body_ratio)
         gap_score = min(1.0, size_pct * 200.0)
         range_score = min(1.0, c2.range_size / max(c2.close, 1e-9))
-        reaction_score = min(1.0, abs(c3.close - c1.close) / max(c2.close, 1e-9) * 50.0)
+        reaction_score = min(
+            1.0,
+            abs(c3.close - c1.close) / max(c2.close, 1e-9) * 50.0,
+        )
 
         raw = (impulse_score + gap_score + range_score + reaction_score) / 4.0
         return max(0.0, min(1.0, raw))
@@ -879,7 +1006,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         candidates = [
             gap
             for gap in gaps
-            if gap.direction == direction and gap.status != FVGStatus.INVALIDATED
+            if gap.key == self.key
+            and gap.direction == direction
+            and gap.status != FVGStatus.INVALIDATED
         ]
         if not candidates:
             return None
@@ -895,7 +1024,9 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         candidates = [
             gap
             for gap in gaps
-            if gap.direction == direction and gap.status != FVGStatus.INVALIDATED
+            if gap.key == self.key
+            and gap.direction == direction
+            and gap.status != FVGStatus.INVALIDATED
         ]
         if not candidates:
             return None
@@ -914,7 +1045,8 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         open_gaps = [
             gap
             for gap in gaps
-            if gap.status
+            if gap.key == self.key
+            and gap.status
             in {
                 FVGStatus.ACTIVE,
                 FVGStatus.PARTIALLY_FILLED,
@@ -924,24 +1056,49 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         if not open_gaps:
             return 0.0
 
-        return max(0.0, min(1.0, sum(gap.fill_percentage for gap in open_gaps) / len(open_gaps)))
+        return max(
+            0.0,
+            min(
+                1.0,
+                sum(gap.fill_percentage for gap in open_gaps) / len(open_gaps),
+            ),
+        )
 
-    def _fill_confidence(self, gap: FairValueGap, candle: Candle, fill_pct: float) -> float:
+    def _fill_confidence(
+        self,
+        gap: FairValueGap,
+        candle: Candle,
+        fill_pct: float,
+    ) -> float:
         raw = (gap.strength + candle.body_ratio + fill_pct) / 3.0
         return max(0.0, min(1.0, raw))
 
     def _respect_confidence(self, gap: FairValueGap, candle: Candle) -> float:
         move_pct = abs(candle.close - gap.mid_price) / max(gap.mid_price, 1e-9)
-        raw = (gap.strength + candle.body_ratio + min(1.0, move_pct * 100.0)) / 3.0
+        raw = (
+            gap.strength
+            + candle.body_ratio
+            + min(1.0, move_pct * 100.0)
+        ) / 3.0
         return max(0.0, min(1.0, raw))
 
     def _invalidation_confidence(self, gap: FairValueGap, candle: Candle) -> float:
         if gap.direction == FVGDirection.BULLISH:
-            move_pct = max(gap.lower_bound - candle.close, 0.0) / max(gap.mid_price, 1e-9)
+            move_pct = max(gap.lower_bound - candle.close, 0.0) / max(
+                gap.mid_price,
+                1e-9,
+            )
         else:
-            move_pct = max(candle.close - gap.upper_bound, 0.0) / max(gap.mid_price, 1e-9)
+            move_pct = max(candle.close - gap.upper_bound, 0.0) / max(
+                gap.mid_price,
+                1e-9,
+            )
 
-        raw = (gap.strength + candle.body_ratio + min(1.0, move_pct * 100.0)) / 3.0
+        raw = (
+            gap.strength
+            + candle.body_ratio
+            + min(1.0, move_pct * 100.0)
+        ) / 3.0
         return max(0.0, min(1.0, raw))
 
     def _create_event(
@@ -954,12 +1111,17 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
         reference_price: float | None,
         metadata: Mapping[str, Any] | None = None,
     ) -> FVGEvent:
+        self._assert_gap_scope(gap)
+
         event = FVGEvent(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             event_id=uuid4().hex,
             event_type=event_type,
             timestamp=timestamp,
-            symbol=self.symbol,
-            timeframe=self.timeframe,
             layer=gap.layer,
             gap_id=gap.gap_id,
             direction=gap.direction,
@@ -968,15 +1130,30 @@ class FairValueGapAnalyzer(BasePriceActionModule[FairValueGapState]):
             fill_percentage=gap.fill_percentage,
             confidence=max(0.0, min(1.0, confidence)),
             reference_price=reference_price,
-            metadata=dict(metadata or {}),
+            metadata={
+                **dict(metadata or {}),
+                "gap_key": list(gap.key),
+            },
         )
         self._events.append(event)
         return event
 
     def _gap_to_dict(self, gap: FairValueGap) -> dict[str, Any]:
         serialized = self._safe_serialize(gap)
-        return serialized if isinstance(serialized, dict) else {"value": serialized}
+        if isinstance(serialized, dict):
+            serialized["key"] = list(gap.key)
+            return serialized
+        return {"value": serialized, **self.scope_payload}
 
     def _event_to_dict(self, event: FVGEvent) -> dict[str, Any]:
         serialized = self._safe_serialize(event)
-        return serialized if isinstance(serialized, dict) else {"value": serialized}
+        if isinstance(serialized, dict):
+            serialized["key"] = list(event.key)
+            return serialized
+        return {"value": serialized, **self.scope_payload}
+
+
+__all__ = [
+    "FairValueGapConfig",
+    "FairValueGapAnalyzer",
+]

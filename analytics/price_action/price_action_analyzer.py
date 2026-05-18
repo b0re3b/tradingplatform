@@ -9,9 +9,18 @@ from core.scheduler import Scheduler
 
 from analytics.price_action.base import BasePriceActionConfig, BasePriceActionModule
 from analytics.price_action.fair_value_gap import FairValueGapAnalyzer, FairValueGapConfig
-from analytics.price_action.liquidity_levels import LiquidityLevelsAnalyzer, LiquidityLevelsConfig
-from analytics.price_action.market_structure import MarketStructureAnalyzer, MarketStructureConfig
+from analytics.price_action.liquidity_levels import (
+    LiquidityLevelsAnalyzer,
+    LiquidityLevelsConfig,
+)
+from analytics.price_action.market_structure import (
+    MarketStructureAnalyzer,
+    MarketStructureConfig,
+)
 from analytics.price_action.models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     FairValueGapState,
     LiquidityState,
     MarketStructureState,
@@ -31,8 +40,11 @@ class PriceActionAnalyzerConfig(BasePriceActionConfig):
     """
     Facade config for analytics.price_action.
 
-    This config controls orchestration only. Domain-specific logic remains
+    This config controls orchestration only. Domain-specific calculations remain
     inside individual analyzers and their own config models.
+
+    Facade scope:
+        exchange + market_type + symbol + timeframe
     """
 
     emit_events: bool = True
@@ -123,7 +135,7 @@ class PriceActionAnalyzerConfig(BasePriceActionConfig):
 
 class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
     """
-    Facade / orchestrator for the analytics.price_action package.
+    Facade / orchestrator for analytics.price_action.
 
     Responsibilities:
     - own and register child price action analyzers;
@@ -132,7 +144,20 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
     - publish analytics.price_action.updated / snapshot / reset;
     - expose one facade snapshot for strategy, dashboard and storage layers.
 
-    It must not duplicate domain calculations from child analyzers.
+    This class must not duplicate domain calculations from child analyzers.
+
+    Correct input flow:
+        exchange adapters
+            -> market.candle
+            -> CandlesCache
+            -> market.candle.closed / market.candles.updated
+            -> child price_action analyzers
+            -> analytics.price_action.<module>.updated
+            -> PriceActionAnalyzer facade
+            -> analytics.price_action.updated
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     _MODULE_ORDER: tuple[str, ...] = (
@@ -146,9 +171,12 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
     def __init__(
         self,
         symbol: str,
-        timeframe: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
         *,
         event_bus: EventBus,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        exchange_symbol: str | None = None,
         scheduler: Scheduler | None = None,
         config: PriceActionAnalyzerConfig | None = None,
         market_structure: MarketStructureAnalyzer | None = None,
@@ -162,6 +190,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
+            exchange=exchange,
+            market_type=market_type,
+            exchange_symbol=exchange_symbol,
             event_bus=event_bus,
             scheduler=scheduler,
             config=resolved_config,
@@ -202,23 +233,21 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             else self._build_trend_analyzer()
         ) if self.config.enable_trend else None
 
+        self._validate_child_scopes()
+
         self._child_update_counts: dict[str, int] = {
             module_name: 0 for module_name in self._MODULE_ORDER
         }
         self._last_child_payloads: dict[str, dict[str, Any]] = {}
         self._state_version = 0
 
-        self._state = PriceActionCompositeState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_composite_state()
         self._refresh_composite_state(advance_version=True)
 
         self.logger.info(
             "Initialized PriceActionAnalyzer facade",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "config": asdict(self.config),
                 "enabled_modules": self._enabled_module_names(),
             },
@@ -233,7 +262,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             return None
 
         return MarketStructureAnalyzer(
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
@@ -245,7 +277,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             return None
 
         return SupportResistanceAnalyzer(
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
@@ -257,7 +292,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             return None
 
         return FairValueGapAnalyzer(
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
@@ -269,7 +307,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             return None
 
         return LiquidityLevelsAnalyzer(
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
@@ -281,7 +322,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             return None
 
         return TrendAnalyzer(
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
@@ -303,7 +347,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         if self._registered:
             self.logger.warning(
                 "PriceActionAnalyzer already registered",
-                extra={"symbol": self.symbol, "timeframe": self.timeframe},
+                extra=self._log_scope_extra(),
             )
             return
 
@@ -328,8 +372,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                     self.logger.exception(
                         "Failed to rollback registered child price action module",
                         extra={
-                            "symbol": self.symbol,
-                            "timeframe": self.timeframe,
+                            **self._log_scope_extra(),
                             "child_module": getattr(
                                 module,
                                 "module_name",
@@ -350,8 +393,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         self.logger.info(
             "PriceActionAnalyzer facade registered",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "enabled_modules": self._enabled_module_names(),
                 "subscriptions": len(self._subscriptions),
             },
@@ -361,7 +403,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         """
         Shutdown facade and optionally child modules.
 
-        EventBus and Scheduler lifecycles remain owned by the application/core layer.
+        EventBus and Scheduler lifecycles remain owned by application/core.
         """
         if self.config.shutdown_child_modules:
             for module in self._iter_enabled_modules():
@@ -371,8 +413,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                     self.logger.exception(
                         "Failed to shutdown child price action module",
                         extra={
-                            "symbol": self.symbol,
-                            "timeframe": self.timeframe,
+                            **self._log_scope_extra(),
                             "child_module": module.module_name,
                         },
                     )
@@ -404,8 +445,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             self.logger.warning(
                 "Ignoring update from disabled or unknown price action child module",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "child_module": module_name,
                     "topic": event.topic,
                     "event_id": event.event_id,
@@ -417,8 +457,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             self.logger.warning(
                 "PriceActionAnalyzer received invalid child update payload",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "child_module": module_name,
                     "topic": event.topic,
                     "event_id": event.event_id,
@@ -426,7 +465,21 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             )
             return
 
-        self._child_update_counts[module_name] = self._child_update_counts.get(module_name, 0) + 1
+        if not self._payload_matches_module_scope(event.payload):
+            self.logger.debug(
+                "Ignoring child update because scope does not match facade",
+                extra={
+                    **self._log_scope_extra(),
+                    "child_module": module_name,
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
+            )
+            return
+
+        self._child_update_counts[module_name] = (
+            self._child_update_counts.get(module_name, 0) + 1
+        )
         self._last_child_payloads[module_name] = dict(event.payload)
 
         self._refresh_composite_state(
@@ -461,17 +514,13 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         }
         self._last_child_payloads.clear()
 
-        self._state = PriceActionCompositeState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_composite_state()
         self._refresh_composite_state(advance_version=True)
 
         self.logger.info(
             "PriceActionAnalyzer facade reset",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "state_version": self._state_version,
             },
         )
@@ -485,8 +534,6 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         await self._emit_event(
             self._build_event_name("reset"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": self.snapshot(),
                 "state_version": self._state_version,
                 "reset_at": self._now_utc().isoformat(),
@@ -532,16 +579,32 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         }
 
     def get_market_structure_state(self) -> MarketStructureState | None:
-        return self.market_structure.get_state() if self.market_structure is not None else None
+        return (
+            self.market_structure.get_state()
+            if self.market_structure is not None
+            else None
+        )
 
     def get_support_resistance_state(self) -> SupportResistanceState | None:
-        return self.support_resistance.get_state() if self.support_resistance is not None else None
+        return (
+            self.support_resistance.get_state()
+            if self.support_resistance is not None
+            else None
+        )
 
     def get_fair_value_gap_state(self) -> FairValueGapState | None:
-        return self.fair_value_gap.get_state() if self.fair_value_gap is not None else None
+        return (
+            self.fair_value_gap.get_state()
+            if self.fair_value_gap is not None
+            else None
+        )
 
     def get_liquidity_state(self) -> LiquidityState | None:
-        return self.liquidity_levels.get_state() if self.liquidity_levels is not None else None
+        return (
+            self.liquidity_levels.get_state()
+            if self.liquidity_levels is not None
+            else None
+        )
 
     def get_trend_state(self) -> TrendState | None:
         return self.trend.get_state() if self.trend is not None else None
@@ -562,8 +625,6 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         return await self._emit_event(
             self._build_event_name("updated"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": self.snapshot(),
                 "updated_module": updated_module,
                 "source_topic": source_topic,
@@ -588,11 +649,26 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         if advance_version:
             self._state_version += 1
 
-        market_structure_state = self.get_market_structure_state()
-        support_resistance_state = self.get_support_resistance_state()
-        fair_value_gap_state = self.get_fair_value_gap_state()
-        liquidity_state = self.get_liquidity_state()
-        trend_state = self.get_trend_state()
+        market_structure_state = self._state_or_none_if_wrong_scope(
+            "market_structure",
+            self.get_market_structure_state(),
+        )
+        support_resistance_state = self._state_or_none_if_wrong_scope(
+            "support_resistance",
+            self.get_support_resistance_state(),
+        )
+        fair_value_gap_state = self._state_or_none_if_wrong_scope(
+            "fair_value_gap",
+            self.get_fair_value_gap_state(),
+        )
+        liquidity_state = self._state_or_none_if_wrong_scope(
+            "liquidity_levels",
+            self.get_liquidity_state(),
+        )
+        trend_state = self._state_or_none_if_wrong_scope(
+            "trend",
+            self.get_trend_state(),
+        )
 
         last_price, last_update = self._resolve_latest_price_and_update(
             market_structure_state=market_structure_state,
@@ -603,7 +679,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         )
 
         self._state = PriceActionCompositeState(
+            exchange=self.exchange,
+            market_type=self.market_type,
             symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
             timeframe=self.timeframe,
             last_price=last_price,
             last_update=last_update,
@@ -613,6 +692,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             liquidity=liquidity_state,
             trend=trend_state,
             metadata={
+                **self.scope_payload,
                 "state_version": self._state_version,
                 "updated_module": updated_module,
                 "source_topic": source_topic,
@@ -668,6 +748,57 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 return float(last_price), getattr(state, "last_update", None)
 
         return None, None
+
+    # ------------------------------------------------------------------
+    # Scope helpers
+    # ------------------------------------------------------------------
+
+    def _new_composite_state(self) -> PriceActionCompositeState:
+        return PriceActionCompositeState(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
+        )
+
+    def _validate_child_scopes(self) -> None:
+        for module_name, module in self.get_child_analyzers().items():
+            self._validate_child_scope(module_name, module)
+
+    def _validate_child_scope(
+        self,
+        module_name: str,
+        module: BasePriceActionModule[Any],
+    ) -> None:
+        child_key = getattr(module, "key", None)
+        if child_key != self.key:
+            raise ValueError(
+                f"Child price action module scope mismatch: "
+                f"module={module_name}, child_key={child_key}, facade_key={self.key}"
+            )
+
+    def _state_or_none_if_wrong_scope(
+        self,
+        module_name: str,
+        state: Any,
+    ) -> Any | None:
+        if state is None:
+            return None
+
+        state_key = getattr(state, "key", None)
+        if state_key == self.key:
+            return state
+
+        self.logger.warning(
+            "Ignoring child state because scope does not match facade",
+            extra={
+                **self._log_scope_extra(),
+                "child_module": module_name,
+                "child_key": list(state_key) if state_key else None,
+            },
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Helpers

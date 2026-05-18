@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Deque, Mapping, Sequence
 from uuid import uuid4
-from copy import deepcopy
+
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
 
@@ -17,6 +18,9 @@ from analytics.price_action.enums import (
     TrendRegime,
 )
 from analytics.price_action.models import (
+    DEFAULT_EXCHANGE,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     Candle,
     SignedScore,
     TrendLayerState,
@@ -59,7 +63,9 @@ class TrendConfig(BasePriceActionConfig):
     market_structure_updated_topic: str = "analytics.price_action.market_structure.updated"
 
     subscribe_support_resistance: bool = True
-    support_resistance_updated_topic: str = "analytics.price_action.support_resistance.updated"
+    support_resistance_updated_topic: str = (
+        "analytics.price_action.support_resistance.updated"
+    )
 
     def validate(self) -> None:
         BasePriceActionConfig.validate(self)
@@ -100,12 +106,21 @@ class TrendConfig(BasePriceActionConfig):
             raise ValueError("consolidation_range_threshold must be > 0")
 
         if self.direction_negative_threshold >= self.direction_positive_threshold:
-            raise ValueError("direction_negative_threshold must be < direction_positive_threshold")
+            raise ValueError(
+                "direction_negative_threshold must be < direction_positive_threshold"
+            )
 
         if not 0.0 <= self.structure_bias_weight <= 0.30:
             raise ValueError("structure_bias_weight must be in [0.0, 0.30]")
         if not 0.0 <= self.support_resistance_weight <= 0.30:
             raise ValueError("support_resistance_weight must be in [0.0, 0.30]")
+
+        self.market_structure_updated_topic = self._normalize_topic(
+            self.market_structure_updated_topic
+        )
+        self.support_resistance_updated_topic = self._normalize_topic(
+            self.support_resistance_updated_topic
+        )
 
         if self.subscribe_market_structure and not self.market_structure_updated_topic:
             raise ValueError("market_structure_updated_topic must not be empty")
@@ -116,23 +131,40 @@ class TrendConfig(BasePriceActionConfig):
 
 class TrendAnalyzer(BasePriceActionModule[TrendState]):
     """
-    Event-driven trend analyzer.
+    Event-driven futures trend analyzer.
 
-    Responsibilities:
-    - listen to market.candle / market.candles;
-    - optionally consume analytics.price_action.market_structure.updated;
-    - optionally consume analytics.price_action.support_resistance.updated;
-    - calculate internal/external trend state;
-    - emit analytics.price_action.trend.* events;
-    - expose snapshots for strategy/dashboard/storage layers.
+    Correct input flow:
+        exchange adapters
+            -> market.candle
+            -> CandlesCache
+            -> market.candle.closed / market.candles.updated
+            -> TrendAnalyzer
+
+        MarketStructureAnalyzer
+            -> analytics.price_action.market_structure.updated
+            -> TrendAnalyzer
+
+        SupportResistanceAnalyzer
+            -> analytics.price_action.support_resistance.updated
+            -> TrendAnalyzer
+
+    Output:
+        TrendAnalyzer
+            -> analytics.price_action.trend.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     def __init__(
         self,
         symbol: str,
-        timeframe: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
         *,
         event_bus: EventBus,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        exchange_symbol: str | None = None,
         scheduler: Scheduler | None = None,
         config: TrendConfig | None = None,
     ) -> None:
@@ -141,6 +173,9 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         super().__init__(
             symbol=symbol,
             timeframe=timeframe,
+            exchange=exchange,
+            market_type=market_type,
+            exchange_symbol=exchange_symbol,
             event_bus=event_bus,
             scheduler=scheduler,
             config=resolved_config,
@@ -158,17 +193,13 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         self._latest_market_structure: dict[str, Any] = {}
         self._latest_support_resistance: dict[str, Any] = {}
 
-        self._state = TrendState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
         self._missing_mtf_logged = False
 
         self.logger.info(
             "Initialized TrendAnalyzer",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "config": asdict(self.config),
             },
         )
@@ -199,7 +230,11 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         if not candles:
             self.logger.warning(
                 "TrendAnalyzer received empty candle payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -211,7 +246,11 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         if not candles:
             self.logger.warning(
                 "TrendAnalyzer received empty candles payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -222,7 +261,22 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         if not isinstance(event.payload, Mapping):
             self.logger.warning(
                 "TrendAnalyzer received invalid market structure payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
+            )
+            return
+
+        if not self._payload_matches_module_scope(event.payload):
+            self.logger.debug(
+                "Market structure context skipped because scope does not match",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -233,7 +287,22 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         if not isinstance(event.payload, Mapping):
             self.logger.warning(
                 "TrendAnalyzer received invalid support/resistance payload",
-                extra={"topic": event.topic, "event_id": event.event_id},
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
+            )
+            return
+
+        if not self._payload_matches_module_scope(event.payload):
+            self.logger.debug(
+                "Support/resistance context skipped because scope does not match",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": event.topic,
+                    "event_id": event.event_id,
+                },
             )
             return
 
@@ -264,8 +333,6 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         await self._emit_event(
             self._build_event_name("updated"),
             {
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
                 "state": result.get("state"),
                 "new_signals_count": len(result.get("new_signals", [])),
             },
@@ -290,16 +357,12 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         self._state_version += 1
         self._missing_mtf_logged = False
 
-        self._state = TrendState(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
+        self._state = self._new_state()
 
         self.logger.info(
             "TrendAnalyzer reset",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "state_version": self._state_version,
             },
         )
@@ -330,34 +393,24 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         return self.add_data(candles=candles)
 
     def add_data(
-            self,
-            *,
-            candles: Sequence[Mapping[str, Any]] | None = None,
-            market_structure: Mapping[str, Any] | None = None,
-            support_resistance: Mapping[str, Any] | None = None,
+        self,
+        *,
+        candles: Sequence[Mapping[str, Any]] | None = None,
+        market_structure: Mapping[str, Any] | None = None,
+        support_resistance: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Atomically update trend analyzer inputs.
 
         If any candle/context processing step fails, all mutations from this update
-        are rolled back:
-        - candles buffer;
-        - generated signals;
-        - latest market-structure/support-resistance context;
-        - global candle index;
-        - state version;
-        - typed TrendState;
-        - missing-MTF logging guard.
-
-        This prevents half-committed trend state after malformed market data or
-        malformed context updates.
+        are rolled back.
         """
         candles_batch = list(candles or [])
 
         if (
-                not candles_batch
-                and market_structure is None
-                and support_resistance is None
+            not candles_batch
+            and market_structure is None
+            and support_resistance is None
         ):
             self._state_version += 1
 
@@ -370,8 +423,7 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
             self.logger.debug(
                 "TrendAnalyzer updated",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "new_signals": len(new_signals),
                     "last_price": self._state.last_price,
                     "state_version": self._state_version,
@@ -379,8 +431,11 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
             )
 
             return {
+                **self.scope_payload,
                 "state": self.snapshot(),
-                "new_signals": [self._signal_to_dict(signal) for signal in new_signals],
+                "new_signals": [
+                    self._signal_to_dict(signal) for signal in new_signals
+                ],
             }
 
         rollback_candles = deepcopy(self._candles)
@@ -400,14 +455,18 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
                     candle = self._parse_candle(raw, index=self._global_candle_index)
                     self._global_candle_index += 1
 
+                    self._assert_candle_scope(candle)
+
                     self._candles.append(candle)
                     self._state.last_price = candle.close
                     self._state.last_update = candle.timestamp
 
             if market_structure is not None:
+                self._assert_context_scope(market_structure, "market_structure")
                 self._latest_market_structure = dict(market_structure)
 
             if support_resistance is not None:
+                self._assert_context_scope(support_resistance, "support_resistance")
                 self._latest_support_resistance = dict(support_resistance)
 
             self._state_version += 1
@@ -432,8 +491,7 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
             self.logger.exception(
                 "TrendAnalyzer batch update failed and was rolled back",
                 extra={
-                    "symbol": self.symbol,
-                    "timeframe": self.timeframe,
+                    **self._log_scope_extra(),
                     "candles_count": len(candles_batch),
                     "has_market_structure": market_structure is not None,
                     "has_support_resistance": support_resistance is not None,
@@ -446,8 +504,7 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         self.logger.debug(
             "TrendAnalyzer updated",
             extra={
-                "symbol": self.symbol,
-                "timeframe": self.timeframe,
+                **self._log_scope_extra(),
                 "new_signals": len(new_signals),
                 "last_price": self._state.last_price,
                 "state_version": self._state_version,
@@ -455,6 +512,7 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         )
 
         return {
+            **self.scope_payload,
             "state": self.snapshot(),
             "new_signals": [self._signal_to_dict(signal) for signal in new_signals],
         }
@@ -553,7 +611,9 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         layer_state.slope_direction_score = self._signed_score(slope_score)
 
         layer_state.structure_score = self._unit_score(abs(structure_score))
-        layer_state.continuation_probability = self._unit_score(continuation_probability)
+        layer_state.continuation_probability = self._unit_score(
+            continuation_probability
+        )
         layer_state.reversal_risk = self._unit_score(reversal_risk)
         layer_state.exhaustion_score = self._unit_score(exhaustion_score)
         layer_state.pullback_depth = self._unit_score(pullback_depth)
@@ -571,6 +631,7 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         )
 
         layer_state.metadata = {
+            **self.scope_payload,
             "short_ma": short_ma,
             "medium_ma": medium_ma,
             "long_ma": long_ma,
@@ -706,7 +767,10 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
             TrendDirection.BEARISH,
         }:
             alignment = 1.0
-        elif internal.direction == TrendDirection.UNKNOWN or external.direction == TrendDirection.UNKNOWN:
+        elif (
+            internal.direction == TrendDirection.UNKNOWN
+            or external.direction == TrendDirection.UNKNOWN
+        ):
             alignment = 0.0
         else:
             alignment = 0.2
@@ -726,18 +790,26 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         )
 
         self._state.metadata = {
+            **self.scope_payload,
             "internal_direction": internal.direction.value,
             "external_direction": external.direction.value,
+            "state_version": self._state_version,
         }
 
     def _detect_cross_layer_events(self) -> list[TrendSignal]:
         internal = self._state.internal
         external = self._state.external
 
-        if internal.direction == TrendDirection.UNKNOWN or external.direction == TrendDirection.UNKNOWN:
+        if (
+            internal.direction == TrendDirection.UNKNOWN
+            or external.direction == TrendDirection.UNKNOWN
+        ):
             return []
 
-        if internal.direction == TrendDirection.NEUTRAL and external.direction == TrendDirection.NEUTRAL:
+        if (
+            internal.direction == TrendDirection.NEUTRAL
+            and external.direction == TrendDirection.NEUTRAL
+        ):
             return []
 
         if internal.direction == external.direction:
@@ -747,7 +819,10 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
                     event_type=TrendEventType.TREND_ALIGNMENT,
                     direction=external.direction,
                     strength=float(self._state.overall_trend_score),
-                    confidence=(float(internal.confidence) + float(external.confidence)) / 2.0,
+                    confidence=(
+                        float(internal.confidence) + float(external.confidence)
+                    )
+                    / 2.0,
                     regime=external.regime,
                     metadata={
                         "internal_direction": internal.direction.value,
@@ -762,7 +837,10 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
                 event_type=TrendEventType.TREND_DISAGREEMENT,
                 direction=external.direction,
                 strength=float(self._state.overall_trend_score),
-                confidence=(float(internal.confidence) + float(external.confidence)) / 2.0,
+                confidence=(
+                    float(internal.confidence) + float(external.confidence)
+                )
+                / 2.0,
                 regime=external.regime,
                 metadata={
                     "internal_direction": internal.direction.value,
@@ -811,7 +889,9 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         medium_dist = (short_ma - medium_ma) / current_price
         long_dist = (medium_ma - long_ma) / current_price
 
-        composite = ma_stack * 0.5 + (short_dist + medium_dist + long_dist) * 40.0 * 0.5
+        composite = ma_stack * 0.5 + (
+            short_dist + medium_dist + long_dist
+        ) * 40.0 * 0.5
         return self._clamp_signed(composite)
 
     def _structure_score(self, layer: StructureLayer) -> float:
@@ -862,7 +942,10 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         nearest_resistance = layer_ctx.get("nearest_resistance")
 
         support_distance = self._extract_distance_pct(nearest_support, current_price)
-        resistance_distance = self._extract_distance_pct(nearest_resistance, current_price)
+        resistance_distance = self._extract_distance_pct(
+            nearest_resistance,
+            current_price,
+        )
 
         if support_distance is None and resistance_distance is None:
             return 0.0
@@ -918,7 +1001,9 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         medium_base = max(closes[-self.config.medium_window], 1e-9)
 
         short_return = abs((closes[-1] - closes[-self.config.short_window]) / short_base)
-        medium_return = abs((closes[-1] - closes[-self.config.medium_window]) / medium_base)
+        medium_return = abs(
+            (closes[-1] - closes[-self.config.medium_window]) / medium_base
+        )
 
         overstretch = min(1.0, (short_return + medium_return) * 25.0)
         slope_fade = 1.0 - min(1.0, abs(slope_score))
@@ -1066,7 +1151,7 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
                 self._missing_mtf_logged = True
                 self.logger.debug(
                     "TrendAnalyzer has no market structure context yet",
-                    extra={"symbol": self.symbol, "timeframe": self.timeframe},
+                    extra=self._log_scope_extra(),
                 )
             return 0.0
 
@@ -1121,6 +1206,48 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
             return MarketBias.UNKNOWN
 
     # ------------------------------------------------------------------
+    # Scope helpers
+    # ------------------------------------------------------------------
+
+    def _new_state(self) -> TrendState:
+        return TrendState(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
+        )
+
+    def _payload_matches_module_scope(self, payload: Mapping[str, Any]) -> bool:
+        if not self.config.require_event_scope:
+            return True
+
+        key = self._extract_key_from_payload(payload)
+        return key == self.key
+
+    def _assert_candle_scope(self, candle: Candle) -> None:
+        if candle.key != self.key:
+            raise ValueError(
+                "candle scope does not match trend module scope: "
+                f"candle={candle.key}, module={self.key}"
+            )
+
+    def _assert_context_scope(
+        self,
+        payload: Mapping[str, Any],
+        context_name: str,
+    ) -> None:
+        if not self.config.require_event_scope:
+            return
+
+        key = self._extract_key_from_payload(payload)
+        if key != self.key:
+            raise ValueError(
+                f"{context_name} scope does not match trend module scope: "
+                f"context={key}, module={self.key}"
+            )
+
+    # ------------------------------------------------------------------
     # Signal helpers
     # ------------------------------------------------------------------
 
@@ -1136,10 +1263,13 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         metadata: Mapping[str, Any] | None = None,
     ) -> TrendSignal:
         signal = TrendSignal(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            exchange_symbol=self.exchange_symbol,
+            timeframe=self.timeframe,
             signal_id=uuid4().hex,
             timestamp=self._state.last_update or self._now_utc(),
-            symbol=self.symbol,
-            timeframe=self.timeframe,
             layer=layer,
             event_type=event_type,
             direction=direction,
@@ -1147,7 +1277,11 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
             confidence=self._unit_score(confidence),
             regime=regime,
             price=self._state.last_price,
-            metadata=dict(metadata or {}),
+            metadata={
+                **self.scope_payload,
+                **dict(metadata or {}),
+                "state_version": self._state_version,
+            },
         )
 
         self._signals.append(signal)
@@ -1181,7 +1315,10 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
         layer_state.is_exhausted = False
         layer_state.in_pullback = False
         layer_state.is_aligned_with_structure = False
-        layer_state.metadata = {"layer": layer.value}
+        layer_state.metadata = {
+            **self.scope_payload,
+            "layer": layer.value,
+        }
 
     def _sma(self, values: Sequence[float], window: int) -> float:
         if len(values) < window:
@@ -1210,4 +1347,13 @@ class TrendAnalyzer(BasePriceActionModule[TrendState]):
 
     def _signal_to_dict(self, signal: TrendSignal) -> dict[str, Any]:
         serialized = self._safe_serialize(signal)
-        return serialized if isinstance(serialized, dict) else {"value": serialized}
+        if isinstance(serialized, dict):
+            serialized["key"] = list(signal.key)
+            return serialized
+        return {"value": serialized, **self.scope_payload}
+
+
+__all__ = [
+    "TrendConfig",
+    "TrendAnalyzer",
+]
