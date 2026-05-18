@@ -13,36 +13,66 @@ from analytics.whales.base import BaseWhaleComponent
 from analytics.whales.config import WhaleTrackerConfig
 from analytics.whales.enums import WhaleComponentName, WhaleTradeSide
 from analytics.whales.models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     LiquidationRecord,
     SymbolTrackerState,
     WhaleActivitySignal,
+    WhaleKey,
     WhaleLiquidationContextSignal,
     WhalePressureSignal,
     WhaleTradeRecord,
     WhaleTrackerResult,
     make_symbol_tracker_state,
+    normalize_exchange,
+    normalize_exchange_symbol,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
+    whale_key_to_dict,
 )
 
 
 class WhaleTracker(BaseWhaleComponent):
     """
-    High-level tracker whale activity.
+    High-level tracker для whale activity / pressure / liquidation context.
 
-    Вхід:
-        - analytics.whales.large_trade від LargeTradeDetector;
-        - market.liquidation, якщо config.subscribe_liquidations=True.
+    Production input:
+        analytics.whales.large_trade
+        market.liquidations.updated або analytics.liquidations.*
 
-    Вихід:
-        - analytics.whales.whale_activity;
-        - analytics.whales.whale_pressure;
-        - analytics.whales.whale_liquidation_context.
+    Legacy raw input:
+        market.liquidation
 
-    Core-інтеграція:
-        - EventBus/Scheduler передаються через constructor dependency injection;
-        - підписки виконуються через register() / EventBus.subscribe();
-        - handler-и приймають core.event_bus.Event;
-        - cleanup запускається тільки через Scheduler.add_interval_job();
-        - власних uncontrolled asyncio cleanup loops немає.
+    Output:
+        analytics.whales.whale_activity
+        analytics.whales.whale_pressure
+        analytics.whales.whale_liquidation_context
+
+    Correct production flow:
+        exchange adapters
+            -> market.trade
+            -> TradesCache
+            -> market.trades.updated
+            -> LargeTradeDetector
+            -> analytics.whales.large_trade
+            -> WhaleTracker
+
+        liquidation stream/cache
+            -> market.liquidation
+            -> LiquidationCache / liquidation analytics layer
+            -> market.liquidations.updated або analytics.liquidations.*
+            -> WhaleTracker
+
+    Scope:
+        exchange + market_type + symbol + timeframe
+
+    Важливо:
+    - не читає біржові adapters напряму;
+    - не слухає raw market.liquidation у production, якщо legacy mode не дозволений;
+    - state не змішує різні біржі / market_type / timeframe;
+    - cleanup запускається тільки через Scheduler.add_interval_job();
+    - власних uncontrolled asyncio cleanup loops немає.
     """
 
     def __init__(
@@ -50,18 +80,21 @@ class WhaleTracker(BaseWhaleComponent):
         *,
         config: WhaleTrackerConfig,
         event_bus: EventBus,
-        scheduler: Scheduler,
+        scheduler: Scheduler | None = None,
     ) -> None:
         super().__init__(
             component_name=WhaleComponentName.WHALE_TRACKER.value,
             event_bus=event_bus,
             scheduler=scheduler,
+            default_exchange=config.default_exchange,
+            default_market_type=config.default_market_type,
+            default_timeframe=config.default_timeframe,
         )
 
         self.config = config
         self.config.validate()
 
-        self._states: dict[str, SymbolTrackerState] = {}
+        self._states: dict[WhaleKey, SymbolTrackerState] = {}
         self._lock = asyncio.Lock()
 
     # =========================================================================
@@ -72,7 +105,12 @@ class WhaleTracker(BaseWhaleComponent):
         """
         Зареєструвати EventBus subscriptions.
 
-        Idempotent: повторний виклик не створює дублікати підписок.
+        Production:
+            analytics.whales.large_trade
+            market.liquidations.updated / analytics.liquidations.*
+
+        Legacy:
+            market.liquidation тільки якщо config.allow_legacy_raw_topics=True.
         """
         if self._registered:
             return
@@ -84,18 +122,26 @@ class WhaleTracker(BaseWhaleComponent):
             )
             return
 
-        self._subscribe(
+        self._subscribe_production(
             self.config.large_trade_event_name,
             self.handle_large_trade_event,
             name="analytics.whales.whale_tracker.handle_large_trade_event",
         )
 
         if self.config.subscribe_liquidations:
-            self._subscribe(
-                self.config.liquidation_event_name,
+            self._subscribe_production_many(
+                self.config.liquidation_event_patterns,
                 self.handle_liquidation_event,
                 name="analytics.whales.whale_tracker.handle_liquidation_event",
             )
+
+            if self.config.allow_legacy_raw_topics:
+                self._subscribe_legacy_raw(
+                    self.config.raw_liquidation_event_name,
+                    self.handle_raw_liquidation_event,
+                    name="analytics.whales.whale_tracker.handle_raw_liquidation_event",
+                    allow_legacy_raw_topics=self.config.allow_legacy_raw_topics,
+                )
 
         self._registered = True
 
@@ -128,8 +174,11 @@ class WhaleTracker(BaseWhaleComponent):
             "WhaleTracker started",
             extra={
                 "component": self.component_name,
+                "production_input_topics": list(self.config.production_input_topics),
+                "legacy_raw_input_topics": list(self.config.legacy_raw_input_topics),
+                "allow_legacy_raw_topics": self.config.allow_legacy_raw_topics,
                 "large_trade_event_name": self.config.large_trade_event_name,
-                "liquidation_event_name": self.config.liquidation_event_name,
+                "liquidation_event_patterns": list(self.config.liquidation_event_patterns),
                 "whale_activity_event_name": self.config.whale_activity_event_name,
                 "whale_pressure_event_name": self.config.whale_pressure_event_name,
                 "whale_liquidation_context_event_name": (
@@ -140,6 +189,7 @@ class WhaleTracker(BaseWhaleComponent):
                 "liquidation_window_sec": self.config.liquidation_window_sec,
                 "subscribe_liquidations": self.config.subscribe_liquidations,
                 "cleanup_interval_sec": self.config.cleanup_interval_sec,
+                "scope": "exchange:market_type:symbol:timeframe",
             },
         )
 
@@ -147,7 +197,6 @@ class WhaleTracker(BaseWhaleComponent):
         if not self._started and not self._registered:
             return
 
-        self._remove_scheduler_jobs()
         await super().stop()
 
         self.logger.info(
@@ -168,9 +217,9 @@ class WhaleTracker(BaseWhaleComponent):
 
             await self.process_large_trade_payload(
                 payload,
-                correlation_id=event.correlation_id,
-                source_event_id=event.event_id,
-                source_topic=event.topic,
+                correlation_id=self._event_correlation_id(event),
+                source_event_id=getattr(event, "event_id", None),
+                source_topic=getattr(event, "topic", None),
             )
 
         except Exception:
@@ -178,25 +227,59 @@ class WhaleTracker(BaseWhaleComponent):
                 "Unhandled error while processing large trade event",
                 extra={
                     "component": self.component_name,
-                    "topic": event.topic,
-                    "event_id": event.event_id,
-                    "source": event.source,
-                    "correlation_id": event.correlation_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                    "source": getattr(event, "source", None),
+                    "correlation_id": getattr(event, "correlation_id", None),
                 },
             )
 
     async def handle_liquidation_event(self, event: Event) -> None:
         """
-        EventBus handler для market.liquidation.
+        Production EventBus handler для market.liquidations.updated /
+        analytics.liquidations.*.
         """
+        await self._handle_liquidation_event(
+            event,
+            allow_raw_payload=False,
+        )
+
+    async def handle_raw_liquidation_event(self, event: Event) -> None:
+        """
+        Legacy raw handler для market.liquidation.
+
+        Використовувати тільки для migration/test/manual режиму.
+        """
+        if not self.config.allow_legacy_raw_topics:
+            self.logger.warning(
+                "Raw liquidation event skipped: legacy raw topics are disabled",
+                extra={
+                    "component": self.component_name,
+                    "topic": getattr(event, "topic", None),
+                },
+            )
+            return
+
+        await self._handle_liquidation_event(
+            event,
+            allow_raw_payload=True,
+        )
+
+    async def _handle_liquidation_event(
+        self,
+        event: Event,
+        *,
+        allow_raw_payload: bool,
+    ) -> None:
         try:
             payload = self._payload_from_event(event)
 
             await self.process_liquidation_payload(
                 payload,
-                correlation_id=event.correlation_id,
-                source_event_id=event.event_id,
-                source_topic=event.topic,
+                correlation_id=self._event_correlation_id(event),
+                source_event_id=getattr(event, "event_id", None),
+                source_topic=getattr(event, "topic", None),
+                allow_raw_payload=allow_raw_payload,
             )
 
         except Exception:
@@ -204,10 +287,11 @@ class WhaleTracker(BaseWhaleComponent):
                 "Unhandled error while processing liquidation event",
                 extra={
                     "component": self.component_name,
-                    "topic": event.topic,
-                    "event_id": event.event_id,
-                    "source": event.source,
-                    "correlation_id": event.correlation_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                    "source": getattr(event, "source", None),
+                    "correlation_id": getattr(event, "correlation_id", None),
+                    "allow_raw_payload": allow_raw_payload,
                 },
             )
 
@@ -238,8 +322,11 @@ class WhaleTracker(BaseWhaleComponent):
         if record is None:
             return WhaleTrackerResult()
 
+        if not self.config.should_process_key(record.key):
+            return WhaleTrackerResult()
+
         async with self._lock:
-            state = self._get_or_create_state(record.symbol)
+            state = self._get_or_create_state(record)
             state.large_trades.append(record)
             state.total_large_trades_seen += 1
             state.touch()
@@ -247,17 +334,14 @@ class WhaleTracker(BaseWhaleComponent):
             self._prune_symbol_state(state, record.timestamp_ms)
 
             whale_activity_signal = self._detect_whale_activity(
-                symbol=record.symbol,
                 state=state,
                 current_ts_ms=record.timestamp_ms,
             )
             whale_pressure_signal = self._detect_whale_pressure(
-                symbol=record.symbol,
                 state=state,
                 current_ts_ms=record.timestamp_ms,
             )
             whale_liquidation_context_signal = self._detect_whale_liquidation_context(
-                symbol=record.symbol,
                 state=state,
                 current_ts_ms=record.timestamp_ms,
             )
@@ -283,19 +367,30 @@ class WhaleTracker(BaseWhaleComponent):
         correlation_id: str | None = None,
         source_event_id: str | None = None,
         source_topic: str | None = None,
+        allow_raw_payload: bool = False,
     ) -> WhaleLiquidationContextSignal | None:
         """
         Обробити payload liquidation event.
+
+        Production payload має приходити з data-layer / liquidation analytics topic.
+        Raw market.liquidation дозволений тільки якщо allow_raw_payload=True.
         """
         if not self.config.enabled or not self.config.subscribe_liquidations:
             return None
 
-        record = self._normalize_liquidation_payload(payload)
+        record = self._normalize_liquidation_payload(
+            payload,
+            allow_raw_payload=allow_raw_payload,
+            source_topic=source_topic,
+        )
         if record is None:
             return None
 
+        if not self.config.should_process_key(record.key):
+            return None
+
         async with self._lock:
-            state = self._get_or_create_state(record.symbol)
+            state = self._get_or_create_state(record)
             state.liquidations.append(record)
             state.total_liquidations_seen += 1
             state.touch()
@@ -303,7 +398,6 @@ class WhaleTracker(BaseWhaleComponent):
             self._prune_symbol_state(state, record.timestamp_ms)
 
             whale_liquidation_context_signal = self._detect_whale_liquidation_context(
-                symbol=record.symbol,
                 state=state,
                 current_ts_ms=record.timestamp_ms,
             )
@@ -326,8 +420,6 @@ class WhaleTracker(BaseWhaleComponent):
     ) -> WhaleTrackerResult:
         """
         Backward-compatible alias для старого direct API.
-
-        Новий код має використовувати process_large_trade_payload().
         """
         return await self.process_large_trade_payload(event)
 
@@ -337,8 +429,6 @@ class WhaleTracker(BaseWhaleComponent):
     ) -> WhaleLiquidationContextSignal | None:
         """
         Backward-compatible alias для старого direct API.
-
-        Новий код має використовувати process_liquidation_payload().
         """
         return await self.process_liquidation_payload(event)
 
@@ -349,7 +439,6 @@ class WhaleTracker(BaseWhaleComponent):
     def _detect_whale_activity(
         self,
         *,
-        symbol: str,
         state: SymbolTrackerState,
         current_ts_ms: int,
     ) -> WhaleActivitySignal | None:
@@ -369,7 +458,6 @@ class WhaleTracker(BaseWhaleComponent):
         ]
 
         buy_signal = self._build_whale_activity_signal_if_triggered(
-            symbol=symbol,
             side=WhaleTradeSide.BUY.value,
             trades=buys,
             state=state,
@@ -379,7 +467,6 @@ class WhaleTracker(BaseWhaleComponent):
             return buy_signal
 
         return self._build_whale_activity_signal_if_triggered(
-            symbol=symbol,
             side=WhaleTradeSide.SELL.value,
             trades=sells,
             state=state,
@@ -389,7 +476,6 @@ class WhaleTracker(BaseWhaleComponent):
     def _build_whale_activity_signal_if_triggered(
         self,
         *,
-        symbol: str,
         side: str,
         trades: Sequence[WhaleTradeRecord],
         state: SymbolTrackerState,
@@ -412,7 +498,11 @@ class WhaleTracker(BaseWhaleComponent):
         avg_notional = total_notional / len(trades)
 
         signal = WhaleActivitySignal(
-            symbol=symbol,
+            exchange=state.exchange,
+            market_type=state.market_type,
+            symbol=state.symbol,
+            timeframe=state.timeframe,
+            exchange_symbol=state.exchange_symbol,
             side=side,
             trade_count=len(trades),
             total_notional=total_notional,
@@ -420,6 +510,9 @@ class WhaleTracker(BaseWhaleComponent):
             max_notional=max_notional,
             window_sec=self.config.cluster_window_sec,
             timestamp_ms=current_ts_ms,
+            metadata={
+                "scope": whale_key_to_dict(state.key),
+            },
         )
 
         state.whale_activity_signals_emitted += 1
@@ -429,7 +522,6 @@ class WhaleTracker(BaseWhaleComponent):
     def _detect_whale_pressure(
         self,
         *,
-        symbol: str,
         state: SymbolTrackerState,
         current_ts_ms: int,
     ) -> WhalePressureSignal | None:
@@ -465,11 +557,7 @@ class WhaleTracker(BaseWhaleComponent):
             else WhaleTradeSide.SELL.value
         )
         dominant_notional = max(buy_notional, sell_notional)
-        imbalance_ratio = (
-            dominant_notional / total_notional
-            if total_notional > 0
-            else 0.0
-        )
+        imbalance_ratio = dominant_notional / total_notional if total_notional > 0 else 0.0
 
         if imbalance_ratio < self.config.pressure_imbalance_ratio_threshold:
             return None
@@ -481,7 +569,11 @@ class WhaleTracker(BaseWhaleComponent):
             return None
 
         signal = WhalePressureSignal(
-            symbol=symbol,
+            exchange=state.exchange,
+            market_type=state.market_type,
+            symbol=state.symbol,
+            timeframe=state.timeframe,
+            exchange_symbol=state.exchange_symbol,
             dominant_side=dominant_side,
             buy_trade_count=len(buy_trades),
             sell_trade_count=len(sell_trades),
@@ -492,6 +584,9 @@ class WhaleTracker(BaseWhaleComponent):
             net_flow_notional=buy_notional - sell_notional,
             window_sec=self.config.pressure_window_sec,
             timestamp_ms=current_ts_ms,
+            metadata={
+                "scope": whale_key_to_dict(state.key),
+            },
         )
 
         state.whale_pressure_signals_emitted += 1
@@ -501,14 +596,11 @@ class WhaleTracker(BaseWhaleComponent):
     def _detect_whale_liquidation_context(
         self,
         *,
-        symbol: str,
         state: SymbolTrackerState,
         current_ts_ms: int,
     ) -> WhaleLiquidationContextSignal | None:
         whale_window_start_ms = current_ts_ms - self.config.cluster_window_sec * 1000
-        liquidation_window_start_ms = (
-            current_ts_ms - self.config.liquidation_window_sec * 1000
-        )
+        liquidation_window_start_ms = current_ts_ms - self.config.liquidation_window_sec * 1000
 
         recent_whale_trades = [
             trade
@@ -591,7 +683,11 @@ class WhaleTracker(BaseWhaleComponent):
         )
 
         signal = WhaleLiquidationContextSignal(
-            symbol=symbol,
+            exchange=state.exchange,
+            market_type=state.market_type,
+            symbol=state.symbol,
+            timeframe=state.timeframe,
+            exchange_symbol=state.exchange_symbol,
             whale_side=whale_side,
             whale_total_notional=whale_total_notional,
             whale_trade_count=len(whale_trades),
@@ -600,6 +696,9 @@ class WhaleTracker(BaseWhaleComponent):
             liquidation_count=len(related_liquidations),
             context_strength=context_strength,
             timestamp_ms=current_ts_ms,
+            metadata={
+                "scope": whale_key_to_dict(state.key),
+            },
         )
 
         state.whale_liquidation_context_signals_emitted += 1
@@ -646,11 +745,11 @@ class WhaleTracker(BaseWhaleComponent):
         if not self.config.emit_on_bus or not result.has_signals:
             return
 
-        headers: dict[str, Any] = {}
+        base_headers: dict[str, Any] = {}
         if source_event_id is not None:
-            headers["source_event_id"] = source_event_id
+            base_headers["source_event_id"] = source_event_id
         if source_topic is not None:
-            headers["source_topic"] = source_topic
+            base_headers["source_topic"] = source_topic
 
         if result.whale_activity_signal is not None:
             signal = result.whale_activity_signal
@@ -660,20 +759,29 @@ class WhaleTracker(BaseWhaleComponent):
                     "Whale activity detected",
                     extra={
                         "component": self.component_name,
+                        "exchange": signal.exchange,
+                        "market_type": signal.market_type,
                         "symbol": signal.symbol,
+                        "timeframe": signal.timeframe,
                         "side": signal.side,
                         "trade_count": signal.trade_count,
                         "total_notional": signal.total_notional,
+                        "scope": whale_key_to_dict(signal.key),
                     },
                 )
 
+            headers = {
+                **base_headers,
+                "scope": str(whale_key_to_dict(signal.key)),
+            }
+
             await self._emit(
                 self.config.whale_activity_event_name,
-                signal.to_payload(),
+                signal,
                 priority=EventPriority.NORMAL,
                 source=self.component_name,
                 correlation_id=correlation_id,
-                headers=headers or None,
+                headers=headers,
             )
 
         if result.whale_pressure_signal is not None:
@@ -684,20 +792,29 @@ class WhaleTracker(BaseWhaleComponent):
                     "Whale pressure detected",
                     extra={
                         "component": self.component_name,
+                        "exchange": signal.exchange,
+                        "market_type": signal.market_type,
                         "symbol": signal.symbol,
+                        "timeframe": signal.timeframe,
                         "dominant_side": signal.dominant_side,
                         "imbalance_ratio": signal.imbalance_ratio,
                         "total_notional": signal.total_notional,
+                        "scope": whale_key_to_dict(signal.key),
                     },
                 )
 
+            headers = {
+                **base_headers,
+                "scope": str(whale_key_to_dict(signal.key)),
+            }
+
             await self._emit(
                 self.config.whale_pressure_event_name,
-                signal.to_payload(),
+                signal,
                 priority=EventPriority.NORMAL,
                 source=self.component_name,
                 correlation_id=correlation_id,
-                headers=headers or None,
+                headers=headers,
             )
 
         if result.whale_liquidation_context_signal is not None:
@@ -708,36 +825,54 @@ class WhaleTracker(BaseWhaleComponent):
                     "Whale liquidation context detected",
                     extra={
                         "component": self.component_name,
+                        "exchange": signal.exchange,
+                        "market_type": signal.market_type,
                         "symbol": signal.symbol,
+                        "timeframe": signal.timeframe,
                         "whale_side": signal.whale_side,
                         "liquidation_side": signal.liquidation_side,
                         "context_strength": signal.context_strength,
+                        "scope": whale_key_to_dict(signal.key),
                     },
                 )
 
+            headers = {
+                **base_headers,
+                "scope": str(whale_key_to_dict(signal.key)),
+            }
+
             await self._emit(
                 self.config.whale_liquidation_context_event_name,
-                signal.to_payload(),
+                signal,
                 priority=EventPriority.NORMAL,
                 source=self.component_name,
                 correlation_id=correlation_id,
-                headers=headers or None,
+                headers=headers,
             )
 
     # =========================================================================
     # State management
     # =========================================================================
 
-    def _get_or_create_state(self, symbol: str) -> SymbolTrackerState:
-        state = self._states.get(symbol)
+    def _get_or_create_state(
+        self,
+        record: WhaleTradeRecord | LiquidationRecord,
+    ) -> SymbolTrackerState:
+        key = record.key
+        state = self._states.get(key)
         if state is not None:
             return state
 
         state = make_symbol_tracker_state(
             large_trade_window_size=self.config.large_trade_buffer_size,
             liquidation_window_size=self.config.liquidation_buffer_size,
+            exchange=record.exchange,
+            market_type=record.market_type,
+            symbol=record.symbol,
+            timeframe=record.timeframe,
+            exchange_symbol=record.exchange_symbol,
         )
-        self._states[symbol] = state
+        self._states[key] = state
         return state
 
     def _prune_symbol_state(
@@ -769,7 +904,7 @@ class WhaleTracker(BaseWhaleComponent):
 
     async def cleanup(self) -> None:
         """
-        Видаляє неактивні symbol states.
+        Видаляє неактивні scoped states.
 
         Запускається через core Scheduler.add_interval_job().
         """
@@ -780,21 +915,25 @@ class WhaleTracker(BaseWhaleComponent):
         now_mono = time.monotonic()
 
         async with self._lock:
-            stale_symbols = [
-                symbol
-                for symbol, state in self._states.items()
+            stale_keys = [
+                key
+                for key, state in self._states.items()
                 if (now_mono - state.last_update_ts_monotonic) >= ttl
             ]
 
-            for symbol in stale_symbols:
-                self._states.pop(symbol, None)
+            for key in stale_keys:
+                self._states.pop(key, None)
 
-        if stale_symbols:
+        if stale_keys:
             self.logger.info(
-                "Cleaned stale WhaleTracker symbol states",
+                "Cleaned stale WhaleTracker scoped states",
                 extra={
                     "component": self.component_name,
-                    "removed_symbols_count": len(stale_symbols),
+                    "removed_states_count": len(stale_keys),
+                    "removed_scopes": [
+                        whale_key_to_dict(key)
+                        for key in stale_keys[:20]
+                    ],
                 },
             )
 
@@ -802,47 +941,130 @@ class WhaleTracker(BaseWhaleComponent):
     # Public state / stats API
     # =========================================================================
 
-    def get_symbol_state(self, symbol: str) -> dict[str, Any]:
-        normalized_symbol = self._normalize_symbol(symbol)
-        if normalized_symbol is None:
+    def get_key_state(self, key: WhaleKey) -> dict[str, Any]:
+        state = self._states.get(key)
+        scope = whale_key_to_dict(key)
+
+        if state is None:
+            return {
+                **scope,
+                "scope": scope,
+                "exists": False,
+            }
+
+        return {
+            **scope,
+            "scope": scope,
+            "exists": True,
+            **state.to_dict(),
+        }
+
+    def get_symbol_state(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Backward-compatible read API.
+
+        Якщо exchange/market_type/timeframe передані — повертає scoped state.
+        Якщо ні — повертає всі scope-и для symbol.
+        """
+        try:
+            normalized_symbol = normalize_symbol(symbol)
+        except ValueError:
             return {
                 "symbol": symbol,
                 "exists": False,
                 "error": "invalid_symbol",
             }
 
-        state = self._states.get(normalized_symbol)
-        if state is None:
-            return {
-                "symbol": normalized_symbol,
-                "exists": False,
-            }
+        if exchange is not None or market_type is not None or timeframe is not None:
+            key = self.make_key(
+                exchange=exchange or self.default_exchange,
+                market_type=market_type or self.default_market_type,
+                symbol=normalized_symbol,
+                timeframe=timeframe or self.default_timeframe,
+            )
+            return self.get_key_state(key)
+
+        matching = [
+            state.to_dict()
+            for key, state in self._states.items()
+            if whale_key_to_dict(key)["symbol"] == normalized_symbol
+        ]
 
         return {
             "symbol": normalized_symbol,
-            "exists": True,
-            **state.to_dict(),
+            "exists": bool(matching),
+            "scopes": matching,
         }
 
     def get_all_states(self) -> dict[str, Any]:
         return {
-            symbol: state.to_dict()
-            for symbol, state in self._states.items()
+            self.scoped_mapping_key(key): state.to_dict()
+            for key, state in self._states.items()
         }
 
-    async def reset_symbol(self, symbol: str) -> None:
-        normalized_symbol = self._normalize_symbol(symbol)
-        if normalized_symbol is None:
+    async def reset_key(self, key: WhaleKey) -> None:
+        async with self._lock:
+            self._states.pop(key, None)
+
+        self.logger.info(
+            "Reset WhaleTracker scoped state",
+            extra={
+                "component": self.component_name,
+                "scope": whale_key_to_dict(key),
+            },
+        )
+
+    async def reset_symbol(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> None:
+        """
+        Backward-compatible reset API.
+
+        Якщо exchange/market_type/timeframe передані — reset одного key.
+        Якщо ні — reset усіх state-ів для symbol.
+        """
+        try:
+            normalized_symbol = normalize_symbol(symbol)
+        except ValueError:
             return
 
         async with self._lock:
-            self._states.pop(normalized_symbol, None)
+            if exchange is not None or market_type is not None or timeframe is not None:
+                key = self.make_key(
+                    exchange=exchange or self.default_exchange,
+                    market_type=market_type or self.default_market_type,
+                    symbol=normalized_symbol,
+                    timeframe=timeframe or self.default_timeframe,
+                )
+                removed_keys = [key]
+            else:
+                removed_keys = [
+                    key
+                    for key in self._states.keys()
+                    if whale_key_to_dict(key)["symbol"] == normalized_symbol
+                ]
+
+            for key in removed_keys:
+                self._states.pop(key, None)
 
         self.logger.info(
             "Reset WhaleTracker symbol state",
             extra={
                 "component": self.component_name,
                 "symbol": normalized_symbol,
+                "removed_states_count": len(removed_keys),
             },
         )
 
@@ -860,15 +1082,19 @@ class WhaleTracker(BaseWhaleComponent):
         health.update(
             {
                 "enabled": self.config.enabled,
-                "tracked_symbols": len(self._states),
+                "tracked_scopes": len(self._states),
+                "production_input_topics": list(self.config.production_input_topics),
+                "legacy_raw_input_topics": list(self.config.legacy_raw_input_topics),
+                "allow_legacy_raw_topics": self.config.allow_legacy_raw_topics,
                 "large_trade_event_name": self.config.large_trade_event_name,
-                "liquidation_event_name": self.config.liquidation_event_name,
+                "liquidation_event_patterns": list(self.config.liquidation_event_patterns),
                 "subscribe_liquidations": self.config.subscribe_liquidations,
                 "whale_activity_event_name": self.config.whale_activity_event_name,
                 "whale_pressure_event_name": self.config.whale_pressure_event_name,
                 "whale_liquidation_context_event_name": (
                     self.config.whale_liquidation_context_event_name
                 ),
+                "scope": "exchange:market_type:symbol:timeframe",
             }
         )
         return health
@@ -901,6 +1127,7 @@ class WhaleTracker(BaseWhaleComponent):
                 payload.get("symbol")
                 or payload.get("s")
                 or payload.get("instrument")
+                or event.get("symbol")
             )
             side = self._normalize_side(
                 payload.get("side")
@@ -932,8 +1159,45 @@ class WhaleTracker(BaseWhaleComponent):
             if notional <= 0:
                 return None
 
+            normalized_symbol = normalize_symbol(symbol)
+            exchange = normalize_exchange(
+                payload.get("exchange")
+                or event.get("exchange")
+                or self.default_exchange
+            )
+            market_type = normalize_market_type(
+                payload.get("market_type")
+                or event.get("market_type")
+                or self.default_market_type
+            )
+            timeframe = normalize_timeframe(
+                payload.get("timeframe")
+                or event.get("timeframe")
+                or self.default_timeframe
+            )
+            exchange_symbol = normalize_exchange_symbol(
+                payload.get("exchange_symbol")
+                or event.get("exchange_symbol")
+                or payload.get("raw_symbol")
+                or payload.get("s"),
+                fallback_symbol=normalized_symbol,
+            )
+
+            metadata = dict(payload.get("metadata") or {})
+            metadata.update(
+                {
+                    "source": event.get("source"),
+                    "scope": {
+                        "exchange": exchange,
+                        "market_type": market_type,
+                        "symbol": normalized_symbol,
+                        "timeframe": timeframe,
+                    },
+                }
+            )
+
             return WhaleTradeRecord(
-                symbol=symbol,
+                symbol=normalized_symbol,
                 side=side,
                 notional=notional,
                 price=price,
@@ -946,11 +1210,12 @@ class WhaleTracker(BaseWhaleComponent):
                     or payload.get("id")
                     or payload.get("t")
                 ),
-                exchange=self._safe_str(
-                    payload.get("exchange")
-                    or event.get("exchange")
-                ),
+                exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 raw_event=event,
+                metadata=metadata,
             )
 
         except Exception:
@@ -963,17 +1228,30 @@ class WhaleTracker(BaseWhaleComponent):
     def _normalize_liquidation_payload(
         self,
         event_payload: Mapping[str, Any] | dict[str, Any],
+        *,
+        allow_raw_payload: bool,
+        source_topic: str | None = None,
     ) -> LiquidationRecord | None:
         try:
             event = dict(event_payload)
-            raw_payload = event.get("data", event)
 
-            if not isinstance(raw_payload, Mapping):
-                self.logger.debug(
-                    "Liquidation event dropped: payload data is not mapping",
+            if self._is_raw_liquidation_topic(source_topic) and not allow_raw_payload:
+                self.logger.warning(
+                    "Liquidation payload dropped: raw topic is not allowed in production path",
                     extra={
                         "component": self.component_name,
-                        "payload_type": type(raw_payload).__name__,
+                        "source_topic": source_topic,
+                    },
+                )
+                return None
+
+            raw_payload = self._extract_liquidation_payload(event)
+            if raw_payload is None:
+                self.logger.debug(
+                    "Liquidation event dropped: cannot extract liquidation payload",
+                    extra={
+                        "component": self.component_name,
+                        "payload_keys": list(event.keys()),
                     },
                 )
                 return None
@@ -984,6 +1262,7 @@ class WhaleTracker(BaseWhaleComponent):
                 payload.get("symbol")
                 or payload.get("s")
                 or payload.get("instrument")
+                or event.get("symbol")
             )
             side = self._normalize_side(
                 payload.get("side")
@@ -1015,8 +1294,46 @@ class WhaleTracker(BaseWhaleComponent):
             if notional <= 0:
                 return None
 
+            normalized_symbol = normalize_symbol(symbol)
+            exchange = normalize_exchange(
+                payload.get("exchange")
+                or event.get("exchange")
+                or self.default_exchange
+            )
+            market_type = normalize_market_type(
+                payload.get("market_type")
+                or event.get("market_type")
+                or self.default_market_type
+            )
+            timeframe = normalize_timeframe(
+                payload.get("timeframe")
+                or event.get("timeframe")
+                or self.default_timeframe
+            )
+            exchange_symbol = normalize_exchange_symbol(
+                payload.get("exchange_symbol")
+                or event.get("exchange_symbol")
+                or payload.get("raw_symbol")
+                or payload.get("s"),
+                fallback_symbol=normalized_symbol,
+            )
+
+            metadata = dict(payload.get("metadata") or {})
+            metadata.update(
+                {
+                    "source_topic": source_topic,
+                    "payload_source": event.get("source"),
+                    "scope": {
+                        "exchange": exchange,
+                        "market_type": market_type,
+                        "symbol": normalized_symbol,
+                        "timeframe": timeframe,
+                    },
+                }
+            )
+
             return LiquidationRecord(
-                symbol=symbol,
+                symbol=normalized_symbol,
                 side=side,
                 notional=notional,
                 price=price,
@@ -1027,25 +1344,64 @@ class WhaleTracker(BaseWhaleComponent):
                     or payload.get("id")
                     or payload.get("t")
                 ),
-                exchange=self._safe_str(
-                    payload.get("exchange")
-                    or event.get("exchange")
-                ),
+                exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 raw_event=event,
+                metadata=metadata,
             )
 
         except Exception:
             self.logger.exception(
                 "Failed to normalize liquidation payload",
-                extra={"component": self.component_name},
+                extra={
+                    "component": self.component_name,
+                    "source_topic": source_topic,
+                },
             )
             return None
 
-    def _normalize_symbol(self, value: Any) -> str | None:
-        text = self._safe_str(value)
-        if text is None:
+    @staticmethod
+    def _extract_liquidation_payload(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """
+        Витягує liquidation payload із data-layer event.
+
+        Підтримує:
+        - {"liquidation": {...}}
+        - {"data": {...}}
+        - {"liquidations": [{...}, ...]} — бере останню liquidation
+        - plain liquidation dict
+        """
+        liquidation = event.get("liquidation")
+        if isinstance(liquidation, Mapping):
+            return liquidation
+
+        data = event.get("data")
+        if isinstance(data, Mapping):
+            return data
+
+        liquidations = event.get("liquidations")
+        if isinstance(liquidations, list) and liquidations:
+            last_item = liquidations[-1]
+            if isinstance(last_item, Mapping):
+                return last_item
+
+        if "price" in event or "p" in event:
+            return event
+
+        return None
+
+    @staticmethod
+    def _is_raw_liquidation_topic(source_topic: str | None) -> bool:
+        return source_topic == "market.liquidation"
+
+    @staticmethod
+    def _normalize_symbol(value: Any) -> str | None:
+        try:
+            return normalize_symbol(value)
+        except ValueError:
             return None
-        return text.upper()
 
     @staticmethod
     def _normalize_side(value: Any) -> str:

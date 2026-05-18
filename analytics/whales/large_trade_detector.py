@@ -13,10 +13,19 @@ from analytics.whales.base import BaseWhaleComponent
 from analytics.whales.config import LargeTradeDetectorConfig
 from analytics.whales.enums import WhaleComponentName, WhaleTradeSide
 from analytics.whales.models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     LargeTradeSignal,
     SymbolStats,
     TradeRecord,
+    WhaleKey,
     make_symbol_stats,
+    normalize_exchange,
+    normalize_exchange_symbol,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
+    whale_key_to_dict,
 )
 
 
@@ -24,22 +33,33 @@ class LargeTradeDetector(BaseWhaleComponent):
     """
     Low-level detector для аномально великих трейдів.
 
-    Event-driven режим:
-        EventBus topic:
-            market.trade
-        handler:
-            handle_trade_event(event: Event)
-        output:
-            analytics.whales.large_trade
+    Production EventBus flow:
+        exchange adapters
+            -> market.trade
+            -> TradesCache
+            -> market.trades.updated
+            -> LargeTradeDetector
+            -> analytics.whales.large_trade
+
+    Legacy/manual raw flow:
+        market.trade -> LargeTradeDetector
+
+    Raw flow дозволений тільки якщо:
+        config.allow_legacy_raw_topics=True
 
     Direct режим для тестів/backtesting/replay:
         await process_trade_payload(payload)
 
+    Scope:
+        exchange + market_type + symbol + timeframe
+
     Важливо:
     - EventBus/Scheduler передаються через constructor dependency injection;
     - підписки виконуються через register() / EventBus.subscribe();
+    - production subscriptions мають слухати data-layer updated topics;
     - cleanup запускається тільки через Scheduler.add_interval_job();
-    - власних uncontrolled asyncio cleanup loops немає.
+    - власних uncontrolled asyncio cleanup loops немає;
+    - rolling state не змішує різні біржі / market_type / timeframe.
     """
 
     def __init__(
@@ -47,19 +67,22 @@ class LargeTradeDetector(BaseWhaleComponent):
         *,
         config: LargeTradeDetectorConfig,
         event_bus: EventBus,
-        scheduler: Scheduler,
+        scheduler: Scheduler | None = None,
     ) -> None:
         super().__init__(
             component_name=WhaleComponentName.LARGE_TRADE_DETECTOR.value,
             event_bus=event_bus,
             scheduler=scheduler,
+            default_exchange=config.default_exchange,
+            default_market_type=config.default_market_type,
+            default_timeframe=config.default_timeframe,
         )
 
         self.config = config
         self.config.validate()
 
-        self._stats: dict[str, SymbolStats] = {}
-        self._symbol_locks: dict[str, asyncio.Lock] = {}
+        self._stats: dict[WhaleKey, SymbolStats] = {}
+        self._state_locks: dict[WhaleKey, asyncio.Lock] = {}
         self._registry_lock = asyncio.Lock()
 
     # =========================================================================
@@ -71,6 +94,13 @@ class LargeTradeDetector(BaseWhaleComponent):
         Зареєструвати EventBus subscriptions.
 
         Idempotent: повторний виклик не створює дублікати підписок.
+
+        Production:
+            config.production_input_topics -> market.trades.updated
+
+        Legacy:
+            config.raw_input_event_name -> market.trade
+            тільки якщо config.allow_legacy_raw_topics=True
         """
         if self._registered:
             return
@@ -82,11 +112,19 @@ class LargeTradeDetector(BaseWhaleComponent):
             )
             return
 
-        self._subscribe(
-            self.config.input_event_name,
+        self._subscribe_production_many(
+            self.config.production_input_topics,
             self.handle_trade_event,
             name="analytics.whales.large_trade_detector.handle_trade_event",
         )
+
+        if self.config.allow_legacy_raw_topics:
+            self._subscribe_legacy_raw(
+                self.config.raw_input_event_name,
+                self.handle_raw_trade_event,
+                name="analytics.whales.large_trade_detector.handle_raw_trade_event",
+                allow_legacy_raw_topics=self.config.allow_legacy_raw_topics,
+            )
 
         self._registered = True
 
@@ -119,15 +157,16 @@ class LargeTradeDetector(BaseWhaleComponent):
             "LargeTradeDetector started",
             extra={
                 "component": self.component_name,
-                "input_event_name": self.config.input_event_name,
+                "production_input_topics": list(self.config.production_input_topics),
+                "legacy_raw_input_topics": list(self.config.legacy_raw_input_topics),
+                "allow_legacy_raw_topics": self.config.allow_legacy_raw_topics,
                 "output_event_name": self.config.output_event_name,
                 "rolling_window_size": self.config.rolling_window_size,
                 "zscore_threshold": self.config.zscore_threshold,
-                "default_abs_notional_threshold": (
-                    self.config.default_abs_notional_threshold
-                ),
+                "default_abs_notional_threshold": self.config.default_abs_notional_threshold,
                 "recalibration_interval": self.config.recalibration_interval,
                 "cleanup_interval_sec": self.config.cleanup_interval_sec,
+                "scope": "exchange:market_type:symbol:timeframe",
             },
         )
 
@@ -135,7 +174,6 @@ class LargeTradeDetector(BaseWhaleComponent):
         if not self._started and not self._registered:
             return
 
-        self._remove_scheduler_jobs()
         await super().stop()
 
         self.logger.info(
@@ -149,19 +187,52 @@ class LargeTradeDetector(BaseWhaleComponent):
 
     async def handle_trade_event(self, event: Event) -> None:
         """
-        EventBus handler.
+        Production EventBus handler для market.trades.updated.
 
         Core EventBus передає core.event_bus.Event, а бізнес-логіка нижче
         працює з dict payload.
         """
+        await self._handle_trade_event(
+            event,
+            allow_raw_payload=False,
+        )
+
+    async def handle_raw_trade_event(self, event: Event) -> None:
+        """
+        Legacy/raw EventBus handler для market.trade.
+
+        Використовувати тільки для migration/test/manual режиму.
+        """
+        if not self.config.allow_legacy_raw_topics:
+            self.logger.warning(
+                "Raw trade event skipped: legacy raw topics are disabled",
+                extra={
+                    "component": self.component_name,
+                    "topic": getattr(event, "topic", None),
+                },
+            )
+            return
+
+        await self._handle_trade_event(
+            event,
+            allow_raw_payload=True,
+        )
+
+    async def _handle_trade_event(
+        self,
+        event: Event,
+        *,
+        allow_raw_payload: bool,
+    ) -> None:
         try:
             payload = self._payload_from_event(event)
 
             await self.process_trade_payload(
                 payload,
-                correlation_id=event.correlation_id,
-                source_event_id=event.event_id,
-                source_topic=event.topic,
+                correlation_id=self._event_correlation_id(event),
+                source_event_id=getattr(event, "event_id", None),
+                source_topic=getattr(event, "topic", None),
+                allow_raw_payload=allow_raw_payload,
             )
 
         except Exception:
@@ -169,10 +240,11 @@ class LargeTradeDetector(BaseWhaleComponent):
                 "Unhandled error while processing trade event",
                 extra={
                     "component": self.component_name,
-                    "topic": event.topic,
-                    "event_id": event.event_id,
-                    "source": event.source,
-                    "correlation_id": event.correlation_id,
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                    "source": getattr(event, "source", None),
+                    "correlation_id": getattr(event, "correlation_id", None),
+                    "allow_raw_payload": allow_raw_payload,
                 },
             )
 
@@ -187,34 +259,48 @@ class LargeTradeDetector(BaseWhaleComponent):
         correlation_id: str | None = None,
         source_event_id: str | None = None,
         source_topic: str | None = None,
+        allow_raw_payload: bool = False,
     ) -> LargeTradeSignal | None:
         """
-        Основний метод обробки raw trade payload.
+        Основний метод обробки trade payload.
 
         Використовується:
         - EventBus handler-ом;
         - тестами;
         - backtesting/replay.
+
+        Production payload очікується з TradesCache / data-layer:
+            market.trades.updated
+
+        Raw payload з exchange adapter дозволений тільки якщо:
+            allow_raw_payload=True
         """
         if not self.config.enabled:
             return None
 
-        trade = self._normalize_trade_payload(payload)
+        trade = self._normalize_trade_payload(
+            payload,
+            allow_raw_payload=allow_raw_payload,
+            source_topic=source_topic,
+        )
         if trade is None:
+            return None
+
+        if not self.config.should_process_key(trade.key):
             return None
 
         if not self._passes_basic_filters(trade):
             return None
 
-        stats, symbol_lock = await self._get_or_create_symbol_state(trade.symbol)
+        stats, state_lock = await self._get_or_create_key_state(trade)
 
         signal: LargeTradeSignal | None = None
 
-        async with symbol_lock:
+        async with state_lock:
             mean_before = stats.mean()
             std_before = stats.std()
 
-            abs_threshold = self._get_abs_threshold(trade.symbol)
+            abs_threshold = self._get_abs_threshold(trade.key)
             zscore = self._calculate_zscore(
                 value=trade.notional,
                 mean=mean_before,
@@ -228,7 +314,7 @@ class LargeTradeDetector(BaseWhaleComponent):
             )
 
             if absolute_triggered or relative_triggered:
-                if self._passes_symbol_cooldown(stats, trade.symbol):
+                if self._passes_key_cooldown_for_stats(stats, trade.key):
                     signal = LargeTradeSignal.from_trade(
                         trade=trade,
                         abs_threshold=abs_threshold,
@@ -253,15 +339,19 @@ class LargeTradeDetector(BaseWhaleComponent):
                     "Large trade detected",
                     extra={
                         "component": self.component_name,
+                        "exchange": signal.exchange,
+                        "market_type": signal.market_type,
                         "symbol": signal.symbol,
+                        "timeframe": signal.timeframe,
+                        "exchange_symbol": signal.exchange_symbol,
                         "side": signal.side,
                         "notional": signal.notional,
                         "zscore": signal.zscore,
                         "trigger_type": signal.trigger_type,
                         "trade_id": signal.trade_id,
-                        "exchange": signal.exchange,
                         "source_topic": source_topic,
                         "source_event_id": source_event_id,
+                        "scope": whale_key_to_dict(signal.key),
                     },
                 )
 
@@ -291,13 +381,23 @@ class LargeTradeDetector(BaseWhaleComponent):
     def _normalize_trade_payload(
         self,
         event_payload: Mapping[str, Any] | dict[str, Any],
+        *,
+        allow_raw_payload: bool,
+        source_topic: str | None = None,
     ) -> TradeRecord | None:
         """
-        Нормалізація raw market.trade payload у TradeRecord.
+        Нормалізація trade payload у TradeRecord.
 
-        Підтримує схеми:
-        - payload["data"] / plain payload;
+        Production підтримує data-layer payload-и:
+        - payload["trade"] / payload["data"] / plain payload;
+        - payload["trades"] як список — бере останній trade.
+
+        Підтримує поля:
+        - exchange;
+        - market_type;
         - symbol / s / instrument;
+        - exchange_symbol;
+        - timeframe;
         - price / p;
         - quantity / qty / q / size;
         - side / S / maker_side / direction / m;
@@ -305,14 +405,24 @@ class LargeTradeDetector(BaseWhaleComponent):
         """
         try:
             event = dict(event_payload)
-            raw_payload = event.get("data", event)
 
-            if not isinstance(raw_payload, Mapping):
-                self.logger.debug(
-                    "Trade event dropped: payload data is not mapping",
+            if self._is_raw_topic(source_topic) and not allow_raw_payload:
+                self.logger.warning(
+                    "Trade payload dropped: raw topic is not allowed in production path",
                     extra={
                         "component": self.component_name,
-                        "payload_type": type(raw_payload).__name__,
+                        "source_topic": source_topic,
+                    },
+                )
+                return None
+
+            raw_payload = self._extract_trade_payload(event)
+            if raw_payload is None:
+                self.logger.debug(
+                    "Trade event dropped: cannot extract trade payload",
+                    extra={
+                        "component": self.component_name,
+                        "payload_keys": list(event.keys()),
                     },
                 )
                 return None
@@ -323,6 +433,7 @@ class LargeTradeDetector(BaseWhaleComponent):
                 payload.get("symbol")
                 or payload.get("s")
                 or payload.get("instrument")
+                or event.get("symbol")
             )
             if not symbol:
                 self.logger.debug(
@@ -384,28 +495,100 @@ class LargeTradeDetector(BaseWhaleComponent):
                 or payload.get("id")
                 or payload.get("t")
             )
+
             exchange = self._safe_str(
                 payload.get("exchange")
                 or event.get("exchange")
+                or self.default_exchange
+            )
+            market_type = self._safe_str(
+                payload.get("market_type")
+                or event.get("market_type")
+                or self.default_market_type
+            )
+            timeframe = self._safe_str(
+                payload.get("timeframe")
+                or event.get("timeframe")
+                or self.default_timeframe
+            )
+            exchange_symbol = self._safe_str(
+                payload.get("exchange_symbol")
+                or event.get("exchange_symbol")
+                or payload.get("raw_symbol")
+                or payload.get("s")
+            )
+
+            normalized_exchange = normalize_exchange(exchange)
+            normalized_market_type = normalize_market_type(market_type)
+            normalized_timeframe = normalize_timeframe(timeframe)
+            normalized_symbol = normalize_symbol(symbol)
+            normalized_exchange_symbol = normalize_exchange_symbol(
+                exchange_symbol,
+                fallback_symbol=normalized_symbol,
+            )
+
+            metadata = dict(payload.get("metadata") or {})
+            metadata.update(
+                {
+                    "source_topic": source_topic,
+                    "payload_source": event.get("source"),
+                }
             )
 
             return TradeRecord(
-                symbol=symbol,
+                symbol=normalized_symbol,
                 price=price,
                 quantity=quantity,
                 side=side,
                 timestamp_ms=timestamp_ms,
                 trade_id=trade_id,
-                exchange=exchange,
+                exchange=normalized_exchange,
+                market_type=normalized_market_type,
+                timeframe=normalized_timeframe,
+                exchange_symbol=normalized_exchange_symbol,
                 raw_event=event,
+                metadata=metadata,
             )
 
         except Exception:
             self.logger.exception(
                 "Failed to normalize trade payload",
-                extra={"component": self.component_name},
+                extra={
+                    "component": self.component_name,
+                    "source_topic": source_topic,
+                },
             )
             return None
+
+    @staticmethod
+    def _extract_trade_payload(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """
+        Витягує один trade payload із data-layer event.
+
+        Підтримує:
+        - {"trade": {...}}
+        - {"data": {...}}
+        - {"trades": [{...}, ...]}
+        - plain trade dict
+        """
+        trade = event.get("trade")
+        if isinstance(trade, Mapping):
+            return trade
+
+        data = event.get("data")
+        if isinstance(data, Mapping):
+            return data
+
+        trades = event.get("trades")
+        if isinstance(trades, list) and trades:
+            last_trade = trades[-1]
+            if isinstance(last_trade, Mapping):
+                return last_trade
+
+        if "price" in event or "p" in event:
+            return event
+
+        return None
 
     def _passes_basic_filters(self, trade: TradeRecord) -> bool:
         if trade.notional < self.config.min_notional_filter:
@@ -441,13 +624,21 @@ class LargeTradeDetector(BaseWhaleComponent):
 
         return zscore >= self.config.zscore_threshold
 
-    def _get_abs_threshold(self, symbol: str) -> float:
-        return self.config.get_symbol_abs_threshold(symbol)
+    def _get_abs_threshold(self, key: WhaleKey) -> float:
+        getter = getattr(self.config, "get_key_abs_threshold", None)
+        if callable(getter):
+            return float(getter(key))
 
-    def _passes_symbol_cooldown(self, stats: SymbolStats, symbol: str) -> bool:
+        scope = whale_key_to_dict(key)
+        return float(self.config.get_symbol_abs_threshold(scope["symbol"]))
+
+    def _passes_key_cooldown_for_stats(self, stats: SymbolStats, key: WhaleKey) -> bool:
+        getter = getattr(self.config, "get_key_cooldown", None)
+        cooldown = float(getter(key)) if callable(getter) else self.config.signal_cooldown_sec
+
         return self._passes_cooldown(
             stats.last_signal_ts_monotonic,
-            self.config.get_symbol_cooldown(symbol),
+            cooldown,
         )
 
     async def _emit_signal(
@@ -460,43 +651,54 @@ class LargeTradeDetector(BaseWhaleComponent):
         if not self.config.emit_on_bus:
             return
 
-        headers: dict[str, Any] = {}
+        headers: dict[str, Any] = {
+            "scope": str(whale_key_to_dict(signal.key)),
+        }
         if source_event_id is not None:
             headers["source_event_id"] = source_event_id
 
         await self._emit(
             self.config.output_event_name,
-            signal.to_payload(),
+            signal,
             priority=EventPriority.NORMAL,
             source=self.component_name,
             correlation_id=correlation_id,
-            headers=headers or None,
+            headers=headers,
         )
 
     # =========================================================================
-    # Symbol state management
+    # Scoped state management
     # =========================================================================
 
-    async def _get_or_create_symbol_state(
+    async def _get_or_create_key_state(
         self,
-        symbol: str,
+        trade: TradeRecord,
     ) -> tuple[SymbolStats, asyncio.Lock]:
-        stats = self._stats.get(symbol)
-        lock = self._symbol_locks.get(symbol)
+        key = trade.key
+
+        stats = self._stats.get(key)
+        lock = self._state_locks.get(key)
 
         if stats is not None and lock is not None:
             return stats, lock
 
         async with self._registry_lock:
-            stats = self._stats.get(symbol)
+            stats = self._stats.get(key)
             if stats is None:
-                stats = make_symbol_stats(self.config.rolling_window_size)
-                self._stats[symbol] = stats
+                stats = make_symbol_stats(
+                    self.config.rolling_window_size,
+                    exchange=trade.exchange,
+                    market_type=trade.market_type,
+                    symbol=trade.symbol,
+                    timeframe=trade.timeframe,
+                    exchange_symbol=trade.exchange_symbol,
+                )
+                self._stats[key] = stats
 
-            lock = self._symbol_locks.get(symbol)
+            lock = self._state_locks.get(key)
             if lock is None:
                 lock = asyncio.Lock()
-                self._symbol_locks[symbol] = lock
+                self._state_locks[key] = lock
 
             return stats, lock
 
@@ -506,7 +708,7 @@ class LargeTradeDetector(BaseWhaleComponent):
 
     async def cleanup(self) -> None:
         """
-        Видаляє неактивні symbol states.
+        Видаляє неактивні scoped states.
 
         Запускається через core Scheduler.add_interval_job().
         """
@@ -517,22 +719,26 @@ class LargeTradeDetector(BaseWhaleComponent):
             return
 
         async with self._registry_lock:
-            stale_symbols = [
-                symbol
-                for symbol, stats in self._stats.items()
+            stale_keys = [
+                key
+                for key, stats in self._stats.items()
                 if (now_mono - stats.last_update_ts_monotonic) >= ttl
             ]
 
-            for symbol in stale_symbols:
-                self._stats.pop(symbol, None)
-                self._symbol_locks.pop(symbol, None)
+            for key in stale_keys:
+                self._stats.pop(key, None)
+                self._state_locks.pop(key, None)
 
-        if stale_symbols:
+        if stale_keys:
             self.logger.info(
-                "Cleaned stale LargeTradeDetector symbol states",
+                "Cleaned stale LargeTradeDetector scoped states",
                 extra={
                     "component": self.component_name,
-                    "removed_symbols_count": len(stale_symbols),
+                    "removed_states_count": len(stale_keys),
+                    "removed_scopes": [
+                        whale_key_to_dict(key)
+                        for key in stale_keys[:20]
+                    ],
                 },
             )
 
@@ -540,55 +746,139 @@ class LargeTradeDetector(BaseWhaleComponent):
     # Public state / stats API
     # =========================================================================
 
-    def get_symbol_stats(self, symbol: str) -> dict[str, Any]:
-        normalized_symbol = self._normalize_symbol(symbol)
-        if normalized_symbol is None:
+    def get_key_stats(self, key: WhaleKey) -> dict[str, Any]:
+        stats = self._stats.get(key)
+        scope = whale_key_to_dict(key)
+
+        if stats is None:
+            return {
+                **scope,
+                "scope": scope,
+                "exists": False,
+            }
+
+        return {
+            **scope,
+            "scope": scope,
+            "exists": True,
+            **stats.to_dict(),
+        }
+
+    def get_symbol_stats(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Backward-compatible read API.
+
+        Якщо exchange/market_type/timeframe передані — повертає scoped state.
+        Якщо ні — повертає агрегований список state-ів для symbol.
+        """
+        try:
+            normalized_symbol = normalize_symbol(symbol)
+        except ValueError:
             return {
                 "symbol": symbol,
                 "exists": False,
                 "error": "invalid_symbol",
             }
 
-        stats = self._stats.get(normalized_symbol)
-        if stats is None:
-            return {
-                "symbol": normalized_symbol,
-                "exists": False,
-            }
+        if exchange is not None or market_type is not None or timeframe is not None:
+            key = self.make_key(
+                exchange=exchange or self.default_exchange,
+                market_type=market_type or self.default_market_type,
+                symbol=normalized_symbol,
+                timeframe=timeframe or self.default_timeframe,
+            )
+            return self.get_key_stats(key)
+
+        matching = [
+            stats.to_dict()
+            for key, stats in self._stats.items()
+            if whale_key_to_dict(key)["symbol"] == normalized_symbol
+        ]
 
         return {
             "symbol": normalized_symbol,
-            "exists": True,
-            **stats.to_dict(),
+            "exists": bool(matching),
+            "scopes": matching,
         }
 
     def get_all_stats(self) -> dict[str, Any]:
         return {
-            symbol: stats.to_dict()
-            for symbol, stats in self._stats.items()
+            self.scoped_mapping_key(key): stats.to_dict()
+            for key, stats in self._stats.items()
         }
 
-    async def reset_symbol(self, symbol: str) -> None:
-        normalized_symbol = self._normalize_symbol(symbol)
-        if normalized_symbol is None:
+    async def reset_key(self, key: WhaleKey) -> None:
+        async with self._registry_lock:
+            self._stats.pop(key, None)
+            self._state_locks.pop(key, None)
+
+        self.logger.info(
+            "Reset LargeTradeDetector scoped state",
+            extra={
+                "component": self.component_name,
+                "scope": whale_key_to_dict(key),
+            },
+        )
+
+    async def reset_symbol(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> None:
+        """
+        Backward-compatible reset API.
+
+        Якщо exchange/market_type/timeframe передані — reset одного key.
+        Якщо ні — reset усіх state-ів для symbol.
+        """
+        try:
+            normalized_symbol = normalize_symbol(symbol)
+        except ValueError:
             return
 
         async with self._registry_lock:
-            self._stats.pop(normalized_symbol, None)
-            self._symbol_locks.pop(normalized_symbol, None)
+            if exchange is not None or market_type is not None or timeframe is not None:
+                key = self.make_key(
+                    exchange=exchange or self.default_exchange,
+                    market_type=market_type or self.default_market_type,
+                    symbol=normalized_symbol,
+                    timeframe=timeframe or self.default_timeframe,
+                )
+                removed_keys = [key]
+            else:
+                removed_keys = [
+                    key
+                    for key in self._stats.keys()
+                    if whale_key_to_dict(key)["symbol"] == normalized_symbol
+                ]
+
+            for key in removed_keys:
+                self._stats.pop(key, None)
+                self._state_locks.pop(key, None)
 
         self.logger.info(
             "Reset LargeTradeDetector symbol state",
             extra={
                 "component": self.component_name,
                 "symbol": normalized_symbol,
+                "removed_states_count": len(removed_keys),
             },
         )
 
     async def reset_all(self) -> None:
         async with self._registry_lock:
             self._stats.clear()
-            self._symbol_locks.clear()
+            self._state_locks.clear()
 
         self.logger.info(
             "Reset all LargeTradeDetector states",
@@ -600,9 +890,12 @@ class LargeTradeDetector(BaseWhaleComponent):
         health.update(
             {
                 "enabled": self.config.enabled,
-                "tracked_symbols": len(self._stats),
-                "input_event_name": self.config.input_event_name,
+                "tracked_scopes": len(self._stats),
+                "production_input_topics": list(self.config.production_input_topics),
+                "legacy_raw_input_topics": list(self.config.legacy_raw_input_topics),
+                "allow_legacy_raw_topics": self.config.allow_legacy_raw_topics,
                 "output_event_name": self.config.output_event_name,
+                "scope": "exchange:market_type:symbol:timeframe",
             }
         )
         return health
@@ -611,11 +904,12 @@ class LargeTradeDetector(BaseWhaleComponent):
     # Parsing / normalization helpers
     # =========================================================================
 
-    def _normalize_symbol(self, value: Any) -> str | None:
-        symbol = self._safe_str(value)
-        if symbol is None:
+    @staticmethod
+    def _normalize_symbol(value: Any) -> str | None:
+        try:
+            return normalize_symbol(value)
+        except ValueError:
             return None
-        return symbol.upper()
 
     @staticmethod
     def _normalize_side(
@@ -673,6 +967,10 @@ class LargeTradeDetector(BaseWhaleComponent):
                 pass
 
         return int(time.time() * 1000)
+
+    @staticmethod
+    def _is_raw_topic(source_topic: str | None) -> bool:
+        return source_topic in {"market.trade", "market.liquidation"}
 
     @staticmethod
     def _safe_float(value: Any) -> float | None:

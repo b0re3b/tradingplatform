@@ -4,7 +4,7 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping, TypeAlias
 
 from analytics.whales.enums import (
     LargeTradeTriggerType,
@@ -17,8 +17,15 @@ from analytics.whales.enums import (
 
 
 # =============================================================================
-# Common helpers
+# Common constants / helpers
 # =============================================================================
+
+DEFAULT_MARKET_TYPE = "perpetual"
+DEFAULT_TIMEFRAME = "realtime"
+UNKNOWN_EXCHANGE = "unknown"
+
+WhaleKey: TypeAlias = tuple[str, str, str, str]
+# exchange, market_type, symbol, timeframe
 
 
 def utc_now_ms() -> int:
@@ -26,11 +33,117 @@ def utc_now_ms() -> int:
 
 
 def _safe_non_negative(value: float) -> float:
-    return max(0.0, value)
+    return max(0.0, float(value))
 
 
 def _clamp_0_1(value: float) -> float:
-    return max(0.0, min(1.0, value))
+    return max(0.0, min(1.0, float(value)))
+
+
+def normalize_exchange(exchange: object | None) -> str:
+    value = str(exchange or UNKNOWN_EXCHANGE).strip().lower()
+    return value or UNKNOWN_EXCHANGE
+
+
+def normalize_market_type(market_type: object | None = None) -> str:
+    value = str(market_type or DEFAULT_MARKET_TYPE).strip().lower()
+    return value or DEFAULT_MARKET_TYPE
+
+
+def normalize_symbol(symbol: object) -> str:
+    value = (
+        str(symbol or "")
+        .replace("-", "")
+        .replace("/", "")
+        .replace("_", "")
+        .upper()
+        .strip()
+    )
+    if not value:
+        raise ValueError("symbol must not be empty")
+    return value
+
+
+def normalize_timeframe(timeframe: object | None = None) -> str:
+    value = str(timeframe or DEFAULT_TIMEFRAME).strip()
+    return value or DEFAULT_TIMEFRAME
+
+
+def normalize_exchange_symbol(
+    exchange_symbol: object | None,
+    *,
+    fallback_symbol: str,
+) -> str:
+    value = str(exchange_symbol or "").strip()
+    return value or fallback_symbol
+
+
+def normalize_side(side: object | None) -> str:
+    return WhaleTradeSide.normalize(side).value
+
+
+def make_whale_key(
+    *,
+    exchange: object | None,
+    market_type: object | None,
+    symbol: object,
+    timeframe: object | None = DEFAULT_TIMEFRAME,
+) -> WhaleKey:
+    return (
+        normalize_exchange(exchange),
+        normalize_market_type(market_type),
+        normalize_symbol(symbol),
+        normalize_timeframe(timeframe),
+    )
+
+
+def whale_key_to_dict(key: WhaleKey) -> dict[str, str]:
+    exchange, market_type, symbol, timeframe = key
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }
+
+
+def scope_payload(
+    *,
+    exchange: object | None,
+    market_type: object | None,
+    symbol: object,
+    timeframe: object | None = DEFAULT_TIMEFRAME,
+    exchange_symbol: object | None = None,
+) -> dict[str, str]:
+    key = make_whale_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    data = whale_key_to_dict(key)
+    data["exchange_symbol"] = normalize_exchange_symbol(
+        exchange_symbol,
+        fallback_symbol=data["symbol"],
+    )
+    return data
+
+
+def _metadata_copy(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    return dict(value or {})
+
+
+def _payload_with_scope(
+    payload: dict[str, Any],
+    *,
+    key: WhaleKey,
+    exchange_symbol: str | None,
+) -> dict[str, Any]:
+    scope = whale_key_to_dict(key)
+    payload.update(scope)
+    payload["exchange_symbol"] = exchange_symbol or scope["symbol"]
+    payload["scope"] = scope
+    return payload
 
 
 # =============================================================================
@@ -43,15 +156,13 @@ class WhaleBaseSignalModel:
     """
     Базова модель для всіх whale-сигналів.
 
-    Важливо:
-    - це не core.event_bus.Event;
-    - to_payload() повертає dict payload для EventBus.emit(...);
-    - runtime-компонент сам обгортає payload у EventBus.emit().
+    Це не core.event_bus.Event.
+    Runtime-компонент сам публікує payload через EventBus.emit().
     """
 
     detector_name: str
     event_type: str
-    schema_version: int = 1
+    schema_version: int = 2
     created_at_ms: int = field(default_factory=utc_now_ms)
 
     def to_payload(self) -> dict[str, Any]:
@@ -65,13 +176,10 @@ class WhaleBaseSignalModel:
     def to_event(self) -> dict[str, Any]:
         """
         Backward-compatible alias.
-
-        Новий runtime-код має використовувати to_payload().
         """
         return self.to_payload()
 
 
-# Backward-compatible alias for old imports.
 WhaleBaseEventModel = WhaleBaseSignalModel
 
 
@@ -83,7 +191,14 @@ WhaleBaseEventModel = WhaleBaseSignalModel
 @dataclass(slots=True)
 class TradeRecord:
     """
-    Нормалізований raw trade record після прийому market.trade payload.
+    Нормалізований trade record після прийому data-layer trade payload.
+
+    Production source:
+        exchange adapters -> market.trade -> TradesCache -> market.trades.updated
+        -> analytics.whales.LargeTradeDetector
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     symbol: str
@@ -91,25 +206,67 @@ class TradeRecord:
     quantity: float
     side: str
     timestamp_ms: int
+
     trade_id: str | None = None
     exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     raw_event: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.side = normalize_side(self.side)
+        self.price = float(self.price)
+        self.quantity = float(self.quantity)
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.metadata = _metadata_copy(self.metadata)
+
+        if self.price <= 0:
+            raise ValueError("price must be > 0")
+        if self.quantity <= 0:
+            raise ValueError("quantity must be > 0")
+        if self.timestamp_ms <= 0:
+            raise ValueError("timestamp_ms must be > 0")
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     @property
     def notional(self) -> float:
         return self.price * self.quantity
 
     def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        payload = {
             "symbol": self.symbol,
             "price": self.price,
             "quantity": self.quantity,
             "side": self.side,
             "timestamp_ms": self.timestamp_ms,
             "trade_id": self.trade_id,
-            "exchange": self.exchange,
             "notional": self.notional,
+            "metadata": dict(self.metadata),
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         if include_raw:
             payload["raw_event"] = self.raw_event
         return payload
@@ -127,14 +284,66 @@ class WhaleTradeRecord:
     price: float
     quantity: float
     timestamp_ms: int
+
     zscore: float = 0.0
     trigger_type: str = LargeTradeTriggerType.UNKNOWN.value
     trade_id: str | None = None
+
     exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     raw_event: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.side = normalize_side(self.side)
+        self.notional = _safe_non_negative(self.notional)
+        self.price = float(self.price)
+        self.quantity = float(self.quantity)
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.zscore = float(self.zscore)
+        self.metadata = _metadata_copy(self.metadata)
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @classmethod
+    def from_large_trade_signal(cls, signal: "LargeTradeSignal") -> "WhaleTradeRecord":
+        return cls(
+            symbol=signal.symbol,
+            side=signal.side,
+            notional=signal.notional,
+            price=signal.price,
+            quantity=signal.quantity,
+            timestamp_ms=signal.timestamp_ms,
+            zscore=signal.zscore,
+            trigger_type=signal.trigger_type,
+            trade_id=signal.trade_id,
+            exchange=signal.exchange,
+            market_type=signal.market_type,
+            timeframe=signal.timeframe,
+            exchange_symbol=signal.exchange_symbol,
+            metadata=dict(signal.metadata),
+        )
 
     def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        payload = {
             "symbol": self.symbol,
             "side": self.side,
             "notional": self.notional,
@@ -144,8 +353,13 @@ class WhaleTradeRecord:
             "zscore": self.zscore,
             "trigger_type": self.trigger_type,
             "trade_id": self.trade_id,
-            "exchange": self.exchange,
+            "metadata": dict(self.metadata),
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         if include_raw:
             payload["raw_event"] = self.raw_event
         return payload
@@ -154,7 +368,11 @@ class WhaleTradeRecord:
 @dataclass(slots=True)
 class LiquidationRecord:
     """
-    Нормалізований liquidation record після прийому market.liquidation payload.
+    Нормалізований liquidation record.
+
+    Production source:
+        liquidation stream/cache -> market.liquidations.updated
+        або analytics.liquidations.* -> WhaleTracker
     """
 
     symbol: str
@@ -163,12 +381,43 @@ class LiquidationRecord:
     price: float
     quantity: float
     timestamp_ms: int
+
     liquidation_id: str | None = None
     exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     raw_event: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.side = normalize_side(self.side)
+        self.notional = _safe_non_negative(self.notional)
+        self.price = float(self.price)
+        self.quantity = float(self.quantity)
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.metadata = _metadata_copy(self.metadata)
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        payload = {
             "symbol": self.symbol,
             "side": self.side,
             "notional": self.notional,
@@ -176,8 +425,13 @@ class LiquidationRecord:
             "quantity": self.quantity,
             "timestamp_ms": self.timestamp_ms,
             "liquidation_id": self.liquidation_id,
-            "exchange": self.exchange,
+            "metadata": dict(self.metadata),
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         if include_raw:
             payload["raw_event"] = self.raw_event
         return payload
@@ -193,10 +447,62 @@ class WhaleActivityRecord:
     max_notional: float
     window_sec: int
     timestamp_ms: int
+
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     raw_event: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.side = normalize_side(self.side)
+        self.trade_count = max(0, int(self.trade_count))
+        self.total_notional = _safe_non_negative(self.total_notional)
+        self.avg_notional = _safe_non_negative(self.avg_notional)
+        self.max_notional = _safe_non_negative(self.max_notional)
+        self.window_sec = max(0, int(self.window_sec))
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.metadata = _metadata_copy(self.metadata)
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @classmethod
+    def from_signal(cls, signal: "WhaleActivitySignal") -> "WhaleActivityRecord":
+        return cls(
+            symbol=signal.symbol,
+            side=signal.side,
+            trade_count=signal.trade_count,
+            total_notional=signal.total_notional,
+            avg_notional=signal.avg_notional,
+            max_notional=signal.max_notional,
+            window_sec=signal.window_sec,
+            timestamp_ms=signal.timestamp_ms,
+            exchange=signal.exchange,
+            market_type=signal.market_type,
+            timeframe=signal.timeframe,
+            exchange_symbol=signal.exchange_symbol,
+            metadata=dict(signal.metadata),
+        )
 
     def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        payload = {
             "symbol": self.symbol,
             "side": self.side,
             "trade_count": self.trade_count,
@@ -205,7 +511,13 @@ class WhaleActivityRecord:
             "max_notional": self.max_notional,
             "window_sec": self.window_sec,
             "timestamp_ms": self.timestamp_ms,
+            "metadata": dict(self.metadata),
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         if include_raw:
             payload["raw_event"] = self.raw_event
         return payload
@@ -224,7 +536,44 @@ class WhalePressureRecord:
     net_flow_notional: float
     window_sec: int
     timestamp_ms: int
+
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     raw_event: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.dominant_side = normalize_side(self.dominant_side)
+        self.buy_trade_count = max(0, int(self.buy_trade_count))
+        self.sell_trade_count = max(0, int(self.sell_trade_count))
+        self.buy_notional = _safe_non_negative(self.buy_notional)
+        self.sell_notional = _safe_non_negative(self.sell_notional)
+        self.total_notional = _safe_non_negative(self.total_notional)
+        self.imbalance_ratio = _clamp_0_1(self.imbalance_ratio)
+        self.net_flow_notional = float(self.net_flow_notional)
+        self.window_sec = max(0, int(self.window_sec))
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.metadata = _metadata_copy(self.metadata)
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     @property
     def pressure_type(self) -> str:
@@ -233,8 +582,29 @@ class WhalePressureRecord:
             sell_notional=self.sell_notional,
         ).value
 
+    @classmethod
+    def from_signal(cls, signal: "WhalePressureSignal") -> "WhalePressureRecord":
+        return cls(
+            symbol=signal.symbol,
+            dominant_side=signal.dominant_side,
+            buy_trade_count=signal.buy_trade_count,
+            sell_trade_count=signal.sell_trade_count,
+            buy_notional=signal.buy_notional,
+            sell_notional=signal.sell_notional,
+            total_notional=signal.total_notional,
+            imbalance_ratio=signal.imbalance_ratio,
+            net_flow_notional=signal.net_flow_notional,
+            window_sec=signal.window_sec,
+            timestamp_ms=signal.timestamp_ms,
+            exchange=signal.exchange,
+            market_type=signal.market_type,
+            timeframe=signal.timeframe,
+            exchange_symbol=signal.exchange_symbol,
+            metadata=dict(signal.metadata),
+        )
+
     def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        payload = {
             "symbol": self.symbol,
             "dominant_side": self.dominant_side,
             "buy_trade_count": self.buy_trade_count,
@@ -247,7 +617,13 @@ class WhalePressureRecord:
             "pressure_type": self.pressure_type,
             "window_sec": self.window_sec,
             "timestamp_ms": self.timestamp_ms,
+            "metadata": dict(self.metadata),
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         if include_raw:
             payload["raw_event"] = self.raw_event
         return payload
@@ -264,10 +640,67 @@ class WhaleLiquidationContextRecord:
     liquidation_count: int
     context_strength: float
     timestamp_ms: int
+
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     raw_event: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.whale_side = normalize_side(self.whale_side)
+        self.liquidation_side = normalize_side(self.liquidation_side)
+        self.whale_total_notional = _safe_non_negative(self.whale_total_notional)
+        self.whale_trade_count = max(0, int(self.whale_trade_count))
+        self.liquidation_total_notional = _safe_non_negative(self.liquidation_total_notional)
+        self.liquidation_count = max(0, int(self.liquidation_count))
+        self.context_strength = _clamp_0_1(self.context_strength)
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.metadata = _metadata_copy(self.metadata)
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @classmethod
+    def from_signal(
+        cls,
+        signal: "WhaleLiquidationContextSignal",
+    ) -> "WhaleLiquidationContextRecord":
+        return cls(
+            symbol=signal.symbol,
+            whale_side=signal.whale_side,
+            whale_total_notional=signal.whale_total_notional,
+            whale_trade_count=signal.whale_trade_count,
+            liquidation_side=signal.liquidation_side,
+            liquidation_total_notional=signal.liquidation_total_notional,
+            liquidation_count=signal.liquidation_count,
+            context_strength=signal.context_strength,
+            timestamp_ms=signal.timestamp_ms,
+            exchange=signal.exchange,
+            market_type=signal.market_type,
+            timeframe=signal.timeframe,
+            exchange_symbol=signal.exchange_symbol,
+            metadata=dict(signal.metadata),
+        )
 
     def to_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        payload = {
             "symbol": self.symbol,
             "whale_side": self.whale_side,
             "whale_total_notional": self.whale_total_notional,
@@ -277,9 +710,60 @@ class WhaleLiquidationContextRecord:
             "liquidation_count": self.liquidation_count,
             "context_strength": self.context_strength,
             "timestamp_ms": self.timestamp_ms,
+            "metadata": dict(self.metadata),
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
         if include_raw:
             payload["raw_event"] = self.raw_event
+        return payload
+
+
+# =============================================================================
+# Scoped signal base
+# =============================================================================
+
+
+@dataclass(slots=True)
+class WhaleScopedSignalModel(WhaleBaseSignalModel):
+    symbol: str = ""
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.metadata = _metadata_copy(self.metadata)
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    def scoped_payload(self) -> dict[str, Any]:
+        payload = WhaleBaseSignalModel.to_payload(self)
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+        payload["metadata"] = dict(self.metadata)
         return payload
 
 
@@ -289,8 +773,7 @@ class WhaleLiquidationContextRecord:
 
 
 @dataclass(slots=True)
-class LargeTradeSignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class LargeTradeSignal(WhaleScopedSignalModel):
     side: str = WhaleTradeSide.UNKNOWN.value
     price: float = 0.0
     quantity: float = 0.0
@@ -304,16 +787,26 @@ class LargeTradeSignal(WhaleBaseSignalModel):
 
     trigger_type: str = LargeTradeTriggerType.UNKNOWN.value
     trade_id: str | None = None
-    exchange: str | None = None
 
     detector_name: str = "LargeTradeDetector"
     event_type: str = WhaleEventType.LARGE_TRADE.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.side = normalize_side(self.side)
+        self.price = float(self.price)
+        self.quantity = float(self.quantity)
+        self.notional = _safe_non_negative(self.notional)
+        self.timestamp_ms = int(self.timestamp_ms)
+        self.abs_threshold = _safe_non_negative(self.abs_threshold)
+        self.mean_notional = _safe_non_negative(self.mean_notional)
+        self.std_notional = _safe_non_negative(self.std_notional)
+        self.zscore = float(self.zscore)
+
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "side": self.side,
                 "price": self.price,
                 "quantity": self.quantity,
@@ -325,7 +818,6 @@ class LargeTradeSignal(WhaleBaseSignalModel):
                 "zscore": self.zscore,
                 "trigger_type": self.trigger_type,
                 "trade_id": self.trade_id,
-                "exchange": self.exchange,
             }
         )
         return payload
@@ -344,6 +836,10 @@ class LargeTradeSignal(WhaleBaseSignalModel):
     ) -> LargeTradeSignal:
         return cls(
             symbol=trade.symbol,
+            exchange=trade.exchange,
+            market_type=trade.market_type,
+            timeframe=trade.timeframe,
+            exchange_symbol=trade.exchange_symbol,
             side=trade.side,
             price=trade.price,
             quantity=trade.quantity,
@@ -358,13 +854,12 @@ class LargeTradeSignal(WhaleBaseSignalModel):
                 relative_triggered=relative_triggered,
             ).value,
             trade_id=trade.trade_id,
-            exchange=trade.exchange,
+            metadata=dict(trade.metadata),
         )
 
 
 @dataclass(slots=True)
-class WhaleActivitySignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class WhaleActivitySignal(WhaleScopedSignalModel):
     side: str = WhaleTradeSide.UNKNOWN.value
     trade_count: int = 0
     total_notional: float = 0.0
@@ -376,11 +871,20 @@ class WhaleActivitySignal(WhaleBaseSignalModel):
     detector_name: str = "WhaleTracker"
     event_type: str = WhaleEventType.WHALE_ACTIVITY.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.side = normalize_side(self.side)
+        self.trade_count = max(0, int(self.trade_count))
+        self.total_notional = _safe_non_negative(self.total_notional)
+        self.avg_notional = _safe_non_negative(self.avg_notional)
+        self.max_notional = _safe_non_negative(self.max_notional)
+        self.window_sec = max(0, int(self.window_sec))
+        self.timestamp_ms = int(self.timestamp_ms)
+
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "side": self.side,
                 "trade_count": self.trade_count,
                 "total_notional": self.total_notional,
@@ -394,8 +898,7 @@ class WhaleActivitySignal(WhaleBaseSignalModel):
 
 
 @dataclass(slots=True)
-class WhalePressureSignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class WhalePressureSignal(WhaleScopedSignalModel):
     dominant_side: str = WhaleTradeSide.UNKNOWN.value
     buy_trade_count: int = 0
     sell_trade_count: int = 0
@@ -410,6 +913,19 @@ class WhalePressureSignal(WhaleBaseSignalModel):
     detector_name: str = "WhaleTracker"
     event_type: str = WhaleEventType.WHALE_PRESSURE.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.dominant_side = normalize_side(self.dominant_side)
+        self.buy_trade_count = max(0, int(self.buy_trade_count))
+        self.sell_trade_count = max(0, int(self.sell_trade_count))
+        self.buy_notional = _safe_non_negative(self.buy_notional)
+        self.sell_notional = _safe_non_negative(self.sell_notional)
+        self.total_notional = _safe_non_negative(self.total_notional)
+        self.imbalance_ratio = _clamp_0_1(self.imbalance_ratio)
+        self.net_flow_notional = float(self.net_flow_notional)
+        self.window_sec = max(0, int(self.window_sec))
+        self.timestamp_ms = int(self.timestamp_ms)
+
     @property
     def pressure_type(self) -> str:
         return WhalePressureType.from_notional(
@@ -418,10 +934,9 @@ class WhalePressureSignal(WhaleBaseSignalModel):
         ).value
 
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "dominant_side": self.dominant_side,
                 "buy_trade_count": self.buy_trade_count,
                 "sell_trade_count": self.sell_trade_count,
@@ -439,8 +954,7 @@ class WhalePressureSignal(WhaleBaseSignalModel):
 
 
 @dataclass(slots=True)
-class WhaleLiquidationContextSignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class WhaleLiquidationContextSignal(WhaleScopedSignalModel):
     whale_side: str = WhaleTradeSide.UNKNOWN.value
     whale_total_notional: float = 0.0
     whale_trade_count: int = 0
@@ -453,11 +967,21 @@ class WhaleLiquidationContextSignal(WhaleBaseSignalModel):
     detector_name: str = "WhaleTracker"
     event_type: str = WhaleEventType.WHALE_LIQUIDATION_CONTEXT.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.whale_side = normalize_side(self.whale_side)
+        self.liquidation_side = normalize_side(self.liquidation_side)
+        self.whale_total_notional = _safe_non_negative(self.whale_total_notional)
+        self.whale_trade_count = max(0, int(self.whale_trade_count))
+        self.liquidation_total_notional = _safe_non_negative(self.liquidation_total_notional)
+        self.liquidation_count = max(0, int(self.liquidation_count))
+        self.context_strength = _clamp_0_1(self.context_strength)
+        self.timestamp_ms = int(self.timestamp_ms)
+
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "whale_side": self.whale_side,
                 "whale_total_notional": self.whale_total_notional,
                 "whale_trade_count": self.whale_trade_count,
@@ -472,8 +996,7 @@ class WhaleLiquidationContextSignal(WhaleBaseSignalModel):
 
 
 @dataclass(slots=True)
-class WhaleClusterSignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class WhaleClusterSignal(WhaleScopedSignalModel):
     cluster_side: str = WhaleTradeSide.UNKNOWN.value
     cluster_score: float = 0.0
     persistence_score: float = 0.0
@@ -496,6 +1019,23 @@ class WhaleClusterSignal(WhaleBaseSignalModel):
     detector_name: str = "WhaleClusterAnalyzer"
     event_type: str = WhaleEventType.WHALE_CLUSTER.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.cluster_side = normalize_side(self.cluster_side)
+        self.cluster_score = _clamp_0_1(self.cluster_score)
+        self.persistence_score = _clamp_0_1(self.persistence_score)
+        self.directional_bias = _clamp_0_1(self.directional_bias)
+        self.continuation_probability = _clamp_0_1(self.continuation_probability)
+        self.exhaustion_probability = _clamp_0_1(self.exhaustion_probability)
+        self.activity_signal_count = max(0, int(self.activity_signal_count))
+        self.pressure_signal_count = max(0, int(self.pressure_signal_count))
+        self.liquidation_context_count = max(0, int(self.liquidation_context_count))
+        self.total_activity_notional = _safe_non_negative(self.total_activity_notional)
+        self.total_pressure_notional = _safe_non_negative(self.total_pressure_notional)
+        self.total_liquidation_context_notional = _safe_non_negative(
+            self.total_liquidation_context_notional
+        )
+
     @property
     def bias(self) -> str:
         return WhaleBias.from_side(self.cluster_side).value
@@ -508,10 +1048,9 @@ class WhaleClusterSignal(WhaleBaseSignalModel):
         ).value
 
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "cluster_side": self.cluster_side,
                 "cluster_score": self.cluster_score,
                 "persistence_score": self.persistence_score,
@@ -535,8 +1074,7 @@ class WhaleClusterSignal(WhaleBaseSignalModel):
 
 
 @dataclass(slots=True)
-class WhaleClusterUpdateSignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class WhaleClusterUpdateSignal(WhaleScopedSignalModel):
     cluster_side: str = WhaleTradeSide.UNKNOWN.value
     cluster_score: float = 0.0
     persistence_score: float = 0.0
@@ -550,11 +1088,18 @@ class WhaleClusterUpdateSignal(WhaleBaseSignalModel):
     detector_name: str = "WhaleClusterAnalyzer"
     event_type: str = WhaleEventType.WHALE_CLUSTER_UPDATE.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.cluster_side = normalize_side(self.cluster_side)
+        self.cluster_score = _clamp_0_1(self.cluster_score)
+        self.persistence_score = _clamp_0_1(self.persistence_score)
+        self.continuation_probability = _clamp_0_1(self.continuation_probability)
+        self.exhaustion_probability = _clamp_0_1(self.exhaustion_probability)
+
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "cluster_side": self.cluster_side,
                 "cluster_score": self.cluster_score,
                 "persistence_score": self.persistence_score,
@@ -570,8 +1115,7 @@ class WhaleClusterUpdateSignal(WhaleBaseSignalModel):
 
 
 @dataclass(slots=True)
-class WhaleClusterExhaustionSignal(WhaleBaseSignalModel):
-    symbol: str = ""
+class WhaleClusterExhaustionSignal(WhaleScopedSignalModel):
     cluster_side: str = WhaleTradeSide.UNKNOWN.value
     cluster_score: float = 0.0
     exhaustion_probability: float = 0.0
@@ -581,11 +1125,17 @@ class WhaleClusterExhaustionSignal(WhaleBaseSignalModel):
     detector_name: str = "WhaleClusterAnalyzer"
     event_type: str = WhaleEventType.WHALE_CLUSTER_EXHAUSTION.value
 
+    def __post_init__(self) -> None:
+        WhaleScopedSignalModel.__post_init__(self)
+        self.cluster_side = normalize_side(self.cluster_side)
+        self.cluster_score = _clamp_0_1(self.cluster_score)
+        self.exhaustion_probability = _clamp_0_1(self.exhaustion_probability)
+        self.reversal_risk = _clamp_0_1(self.reversal_risk)
+
     def to_payload(self) -> dict[str, Any]:
-        payload = WhaleBaseSignalModel.to_payload(self)
+        payload = self.scoped_payload()
         payload.update(
             {
-                "symbol": self.symbol,
                 "cluster_side": self.cluster_side,
                 "cluster_score": self.cluster_score,
                 "exhaustion_probability": self.exhaustion_probability,
@@ -597,7 +1147,7 @@ class WhaleClusterExhaustionSignal(WhaleBaseSignalModel):
 
 
 # =============================================================================
-# Internal rolling / symbol states
+# Internal rolling / scoped states
 # =============================================================================
 
 
@@ -606,10 +1156,17 @@ class SymbolStats:
     """
     Rolling-статистика для LargeTradeDetector.
 
-    Це внутрішній state, не EventBus payload.
+    Назва залишена backward-compatible, але state тепер scoped через WhaleKey.
     """
 
     notionals: deque[float]
+
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    symbol: str = ""
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     trades_processed: int = 0
     signals_emitted: int = 0
     last_signal_ts_monotonic: float = 0.0
@@ -618,6 +1175,25 @@ class SymbolStats:
     running_sum: float = 0.0
     running_sum_sq: float = 0.0
     updates_since_recalibration: int = 0
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol or "UNKNOWN")
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
 
     def touch(self) -> None:
         self.last_update_ts_monotonic = time.monotonic()
@@ -668,7 +1244,7 @@ class SymbolStats:
         return math.sqrt(max(variance, 0.0))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "sample_size": self.sample_size,
             "trades_processed": self.trades_processed,
             "signals_emitted": self.signals_emitted,
@@ -677,6 +1253,12 @@ class SymbolStats:
             "last_signal_ts_monotonic": self.last_signal_ts_monotonic,
             "last_update_ts_monotonic": self.last_update_ts_monotonic,
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+        return payload
 
 
 @dataclass(slots=True)
@@ -684,11 +1266,17 @@ class SymbolTrackerState:
     """
     Rolling-state для WhaleTracker.
 
-    Це внутрішній state, не EventBus payload.
+    Назва залишена backward-compatible, але state тепер scoped через WhaleKey.
     """
 
     large_trades: deque[WhaleTradeRecord]
     liquidations: deque[LiquidationRecord]
+
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    symbol: str = ""
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
 
     total_large_trades_seen: int = 0
     total_liquidations_seen: int = 0
@@ -703,11 +1291,30 @@ class SymbolTrackerState:
 
     last_update_ts_monotonic: float = field(default_factory=time.monotonic)
 
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol or "UNKNOWN")
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
     def touch(self) -> None:
         self.last_update_ts_monotonic = time.monotonic()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "large_trades_buffer_size": len(self.large_trades),
             "liquidations_buffer_size": len(self.liquidations),
             "total_large_trades_seen": self.total_large_trades_seen,
@@ -719,6 +1326,12 @@ class SymbolTrackerState:
             ),
             "last_update_ts_monotonic": self.last_update_ts_monotonic,
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+        return payload
 
 
 @dataclass(slots=True)
@@ -726,12 +1339,18 @@ class SymbolClusterState:
     """
     Rolling-state для WhaleClusterAnalyzer.
 
-    Це внутрішній state, не EventBus payload.
+    Назва залишена backward-compatible, але state тепер scoped через WhaleKey.
     """
 
     activity_records: deque[WhaleActivityRecord]
     pressure_records: deque[WhalePressureRecord]
     liquidation_context_records: deque[WhaleLiquidationContextRecord]
+
+    exchange: str | None = None
+    market_type: str = DEFAULT_MARKET_TYPE
+    symbol: str = ""
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
 
     total_events_seen: int = 0
     total_clusters_emitted: int = 0
@@ -747,11 +1366,30 @@ class SymbolClusterState:
 
     last_update_ts_monotonic: float = field(default_factory=time.monotonic)
 
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.market_type = normalize_market_type(self.market_type)
+        self.symbol = normalize_symbol(self.symbol or "UNKNOWN")
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+
+    @property
+    def key(self) -> WhaleKey:
+        return make_whale_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
     def touch(self) -> None:
         self.last_update_ts_monotonic = time.monotonic()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "activity_records_size": len(self.activity_records),
             "pressure_records_size": len(self.pressure_records),
             "liquidation_context_records_size": len(self.liquidation_context_records),
@@ -763,6 +1401,12 @@ class SymbolClusterState:
             "cluster_last_seen_ts_ms": self.cluster_last_seen_ts_ms,
             "last_update_ts_monotonic": self.last_update_ts_monotonic,
         }
+        _payload_with_scope(
+            payload,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+        return payload
 
 
 # =============================================================================
@@ -778,14 +1422,7 @@ class WhaleTrackerResult:
 
     @property
     def has_signals(self) -> bool:
-        return any(
-            signal is not None
-            for signal in (
-                self.whale_activity_signal,
-                self.whale_pressure_signal,
-                self.whale_liquidation_context_signal,
-            )
-        )
+        return any(signal is not None for signal in self.iter_signals())
 
     def iter_signals(self) -> tuple[WhaleBaseSignalModel, ...]:
         return tuple(
@@ -826,14 +1463,7 @@ class WhaleClusterAnalysisResult:
 
     @property
     def has_signals(self) -> bool:
-        return any(
-            signal is not None
-            for signal in (
-                self.whale_cluster_signal,
-                self.whale_cluster_update_signal,
-                self.whale_cluster_exhaustion_signal,
-            )
-        )
+        return any(signal is not None for signal in self.iter_signals())
 
     def iter_signals(self) -> tuple[WhaleBaseSignalModel, ...]:
         return tuple(
@@ -871,15 +1501,37 @@ class WhaleClusterAnalysisResult:
 # =============================================================================
 
 
-def make_symbol_stats(window_size: int) -> SymbolStats:
+def make_symbol_stats(
+    window_size: int,
+    *,
+    exchange: str | None = None,
+    market_type: str = DEFAULT_MARKET_TYPE,
+    symbol: str = "UNKNOWN",
+    timeframe: str = DEFAULT_TIMEFRAME,
+    exchange_symbol: str | None = None,
+) -> SymbolStats:
     if window_size <= 1:
         raise ValueError("window_size must be > 1")
-    return SymbolStats(notionals=deque(maxlen=window_size))
+
+    return SymbolStats(
+        notionals=deque(maxlen=window_size),
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+        exchange_symbol=exchange_symbol,
+    )
 
 
 def make_symbol_tracker_state(
     large_trade_window_size: int,
     liquidation_window_size: int,
+    *,
+    exchange: str | None = None,
+    market_type: str = DEFAULT_MARKET_TYPE,
+    symbol: str = "UNKNOWN",
+    timeframe: str = DEFAULT_TIMEFRAME,
+    exchange_symbol: str | None = None,
 ) -> SymbolTrackerState:
     if large_trade_window_size <= 0:
         raise ValueError("large_trade_window_size must be > 0")
@@ -889,6 +1541,11 @@ def make_symbol_tracker_state(
     return SymbolTrackerState(
         large_trades=deque(maxlen=large_trade_window_size),
         liquidations=deque(maxlen=liquidation_window_size),
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+        exchange_symbol=exchange_symbol,
     )
 
 
@@ -896,6 +1553,12 @@ def make_symbol_cluster_state(
     activity_window_size: int,
     pressure_window_size: int,
     liquidation_context_window_size: int,
+    *,
+    exchange: str | None = None,
+    market_type: str = DEFAULT_MARKET_TYPE,
+    symbol: str = "UNKNOWN",
+    timeframe: str = DEFAULT_TIMEFRAME,
+    exchange_symbol: str | None = None,
 ) -> SymbolClusterState:
     if activity_window_size <= 0:
         raise ValueError("activity_window_size must be > 0")
@@ -908,13 +1571,33 @@ def make_symbol_cluster_state(
         activity_records=deque(maxlen=activity_window_size),
         pressure_records=deque(maxlen=pressure_window_size),
         liquidation_context_records=deque(maxlen=liquidation_context_window_size),
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+        exchange_symbol=exchange_symbol,
     )
 
 
 __all__ = [
+    # constants / keys
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_TIMEFRAME",
+    "UNKNOWN_EXCHANGE",
+    "WhaleKey",
+    "make_whale_key",
+    "whale_key_to_dict",
+    "scope_payload",
+    "normalize_exchange",
+    "normalize_market_type",
+    "normalize_symbol",
+    "normalize_timeframe",
+    "normalize_exchange_symbol",
+
     # base
     "WhaleBaseSignalModel",
     "WhaleBaseEventModel",
+    "WhaleScopedSignalModel",
 
     # normalized records
     "TradeRecord",
