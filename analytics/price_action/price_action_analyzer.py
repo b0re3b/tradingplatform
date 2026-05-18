@@ -465,9 +465,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             )
             return
 
-        if not self._payload_matches_module_scope(event.payload):
+        if self.config.require_event_scope and not self._event_matches_module_scope(event):
             self.logger.debug(
-                "Ignoring child update because scope does not match facade",
+                "PriceActionAnalyzer child update skipped because scope does not match",
                 extra={
                     **self._log_scope_extra(),
                     "child_module": module_name,

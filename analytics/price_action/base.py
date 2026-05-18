@@ -429,12 +429,18 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
         """
         Wrapper around subclass on_candles_event().
 
-        Batch payloads are accepted when the top-level payload matches module
-        scope, or at least one candle inside the batch matches module scope.
+        Batch payloads are accepted when at least one candle inside the batch
+        matches module scope. Wrong-scope children are filtered before the subclass
+        handler sees the event, so domain analyzers do not fail on mixed batches.
         """
-        if not self._event_matches_module_scope(event, allow_batch=True):
+        if not self.config.require_event_scope:
+            await self.on_candles_event(event)
+            return
+
+        candle_payloads = self._extract_candles_payload(event)
+        if not candle_payloads:
             self.logger.debug(
-                "Candles event skipped because scope does not match module",
+                "Candles event skipped because it contains no candle payloads",
                 extra={
                     **self._log_scope_extra(),
                     "topic": getattr(event, "topic", None),
@@ -443,7 +449,47 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             )
             return
 
-        await self.on_candles_event(event)
+        matching_candles = [
+            candle
+            for candle in candle_payloads
+            if self._extract_key_from_payload(candle) == self.key
+        ]
+
+        if not matching_candles:
+            self.logger.debug(
+                "Candles event skipped because scope does not match module",
+                extra={
+                    **self._log_scope_extra(),
+                    "topic": getattr(event, "topic", None),
+                    "event_id": getattr(event, "event_id", None),
+                    "batch_size": len(candle_payloads),
+                },
+            )
+            return
+
+        scoped_payload = {
+            **self.scope_payload,
+            "candles": matching_candles,
+            "count": len(matching_candles),
+            "original_count": len(candle_payloads),
+            "filtered_count": len(candle_payloads) - len(matching_candles),
+        }
+
+        parent_payload = getattr(event, "payload", None)
+        if isinstance(parent_payload, Mapping):
+            for key in ("source", "update_reason", "metadata"):
+                if key in parent_payload:
+                    scoped_payload[key] = parent_payload[key]
+
+        scoped_event = Event(
+            topic=event.topic,
+            payload=scoped_payload,
+            source=event.source,
+            correlation_id=event.correlation_id,
+            headers=dict(getattr(event, "headers", {}) or {}),
+        )
+
+        await self.on_candles_event(scoped_event)
 
     # ------------------------------------------------------------------
     # Default EventBus handlers
@@ -596,16 +642,20 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             return None
 
     def _ensure_payload_scope(
-        self,
-        payload: Mapping[str, Any],
+            self,
+            payload: Any,
     ) -> dict[str, Any]:
         """
         Add module scope to any emitted payload.
 
-        Caller payload can override neither scope nor key. This prevents a child
-        analyzer from accidentally emitting symbol-only or wrong-scope events.
+        Mapping payloads are copied as-is. Non-mapping payloads are wrapped under
+        "value". Caller payload can override neither scope nor key.
         """
-        safe_payload = dict(payload)
+        if isinstance(payload, Mapping):
+            safe_payload = dict(payload)
+        else:
+            safe_payload = {"value": payload}
+
         safe_payload.update(self.scope_payload)
         return safe_payload
 

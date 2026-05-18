@@ -31,7 +31,7 @@ UnitScore = NewType("UnitScore", float)       # expected range [0.0, 1.0]
 Metadata = dict[str, Any]
 
 DEFAULT_EXCHANGE = "unknown"
-DEFAULT_MARKET_TYPE = "perpetual"
+DEFAULT_MARKET_TYPE = "usdm_futures"
 DEFAULT_TIMEFRAME = "1m"
 
 PriceActionKey: TypeAlias = tuple[str, str, str, str]
@@ -761,7 +761,7 @@ class FairValueGap(PriceActionScope):
 @dataclass(slots=True)
 class FVGEvent(PriceActionScope):
     event_id: str = ""
-    event_type: FVGEventType = FVGEventType.CREATED
+    event_type: FVGEventType = FVGEventType.FVG_CREATED
     timestamp: datetime = field(default_factory=utc_now)
     layer: StructureLayer = StructureLayer.INTERNAL
     gap_id: str = ""
@@ -869,7 +869,7 @@ class FairValueGapState(PriceActionScope):
 class LiquidityLevel(PriceActionScope):
     level_id: str = ""
     layer: StructureLayer = StructureLayer.INTERNAL
-    level_type: LiquidityLevelType = LiquidityLevelType.BUY_SIDE
+    level_type: LiquidityLevelType = LiquidityLevelType.BUY_SIDE_LIQUIDITY
     price: float = 0.0
     upper_bound: float = 0.0
     lower_bound: float = 0.0
@@ -945,7 +945,7 @@ class LiquidityEvent(PriceActionScope):
     timestamp: datetime = field(default_factory=utc_now)
     layer: StructureLayer = StructureLayer.INTERNAL
     level_id: str = ""
-    level_type: LiquidityLevelType = LiquidityLevelType.BUY_SIDE
+    level_type: LiquidityLevelType = LiquidityLevelType.BUY_SIDE_LIQUIDITY
     price: float = 0.0
     confidence: float = 0.0
     reference_price: float | None = None
@@ -1044,7 +1044,7 @@ class TrendSignal(PriceActionScope):
     signal_id: str = ""
     timestamp: datetime = field(default_factory=utc_now)
     layer: StructureLayer = StructureLayer.INTERNAL
-    event_type: TrendEventType = TrendEventType.TREND_CONFIRMED
+    event_type: TrendEventType = TrendEventType.TREND_STARTED
     direction: TrendDirection = TrendDirection.UNKNOWN
     strength: float = 0.0
     confidence: float = 0.0

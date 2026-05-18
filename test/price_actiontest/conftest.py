@@ -24,9 +24,57 @@ from analytics.price_action.support_resistance import SupportResistanceConfig
 from analytics.price_action.trend import TrendConfig
 
 
+TEST_EXCHANGE = "binance"
+TEST_MARKET_TYPE = "usdm_futures"
 TEST_SYMBOL = "BTCUSDT"
+TEST_EXCHANGE_SYMBOL = "BTCUSDT"
 TEST_TIMEFRAME = "1m"
+
+TEST_ALT_EXCHANGE = "bybit"
+TEST_ALT_MARKET_TYPE = "linear"
+TEST_ALT_SYMBOL = "ETHUSDT"
+TEST_ALT_EXCHANGE_SYMBOL = "ETHUSDT"
+
+TEST_SPOT_MARKET_TYPE = "spot"
 TEST_START = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Shared timestamp helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _to_epoch_ms(value: datetime) -> int:
+    return int(_ensure_utc(value).timestamp() * 1000)
+
+
+def _minute_bounds(start_time: datetime, index: int) -> tuple[datetime, datetime]:
+    open_time = _ensure_utc(start_time) + timedelta(minutes=index)
+    close_time = open_time + timedelta(minutes=1) - timedelta(milliseconds=1)
+    return open_time, close_time
+
+
+def _scope_payload(
+    *,
+    exchange: str = TEST_EXCHANGE,
+    market_type: str = TEST_MARKET_TYPE,
+    symbol: str = TEST_SYMBOL,
+    exchange_symbol: str = TEST_EXCHANGE_SYMBOL,
+    timeframe: str = TEST_TIMEFRAME,
+) -> dict[str, Any]:
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "exchange_symbol": exchange_symbol,
+        "timeframe": timeframe,
+        "key": [exchange, market_type, symbol, timeframe],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +86,8 @@ def event_bus() -> EventBus:
     """
     Real EventBus instance.
 
-    We prefer the real core EventBus over a dummy mock because price_action modules
-    are event-driven and their lifecycle/register/unregister behavior must be
-    tested against the actual infrastructure contract.
+    Price action modules are EventBus-first, so tests should exercise the real
+    core contract instead of a dummy object whenever possible.
     """
     return EventBus()
 
@@ -50,10 +97,24 @@ def scheduler(event_bus: EventBus) -> Scheduler:
     """
     Real Scheduler instance bound to the test EventBus.
 
-    Snapshot jobs are disabled in most configs below by default, but this fixture
-    is useful for lifecycle tests that verify scheduled snapshot registration.
+    Snapshot jobs are usually disabled in test configs, but lifecycle tests use
+    this fixture to verify Scheduler integration.
     """
     return Scheduler(event_bus=event_bus)
+
+
+# ---------------------------------------------------------------------------
+# Scope fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def exchange() -> str:
+    return TEST_EXCHANGE
+
+
+@pytest.fixture
+def market_type() -> str:
+    return TEST_MARKET_TYPE
 
 
 @pytest.fixture
@@ -62,8 +123,38 @@ def symbol() -> str:
 
 
 @pytest.fixture
+def exchange_symbol() -> str:
+    return TEST_EXCHANGE_SYMBOL
+
+
+@pytest.fixture
 def timeframe() -> str:
     return TEST_TIMEFRAME
+
+
+@pytest.fixture
+def alt_exchange() -> str:
+    return TEST_ALT_EXCHANGE
+
+
+@pytest.fixture
+def alt_market_type() -> str:
+    return TEST_ALT_MARKET_TYPE
+
+
+@pytest.fixture
+def alt_symbol() -> str:
+    return TEST_ALT_SYMBOL
+
+
+@pytest.fixture
+def alt_exchange_symbol() -> str:
+    return TEST_ALT_EXCHANGE_SYMBOL
+
+
+@pytest.fixture
+def spot_market_type() -> str:
+    return TEST_SPOT_MARKET_TYPE
 
 
 @pytest.fixture
@@ -71,18 +162,114 @@ def start_time() -> datetime:
     return TEST_START
 
 
+@pytest.fixture
+def price_action_scope(
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return _scope_payload(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        exchange_symbol=exchange_symbol,
+        timeframe=timeframe,
+    )
+
+
+@pytest.fixture
+def wrong_exchange_scope(
+    alt_exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return _scope_payload(
+        exchange=alt_exchange,
+        market_type=market_type,
+        symbol=symbol,
+        exchange_symbol=exchange_symbol,
+        timeframe=timeframe,
+    )
+
+
+@pytest.fixture
+def wrong_market_type_scope(
+    exchange: str,
+    alt_market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return _scope_payload(
+        exchange=exchange,
+        market_type=alt_market_type,
+        symbol=symbol,
+        exchange_symbol=exchange_symbol,
+        timeframe=timeframe,
+    )
+
+
+@pytest.fixture
+def wrong_symbol_scope(
+    exchange: str,
+    market_type: str,
+    alt_symbol: str,
+    alt_exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return _scope_payload(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=alt_symbol,
+        exchange_symbol=alt_exchange_symbol,
+        timeframe=timeframe,
+    )
+
+
+@pytest.fixture
+def spot_scope(
+    exchange: str,
+    spot_market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
+    return _scope_payload(
+        exchange=exchange,
+        market_type=spot_market_type,
+        symbol=symbol,
+        exchange_symbol=exchange_symbol,
+        timeframe=timeframe,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Candle factories
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def candle_factory(start_time: datetime) -> Callable[..., dict[str, Any]]:
+def candle_factory(
+    start_time: datetime,
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> Callable[..., dict[str, Any]]:
     """
-    Factory for valid OHLCV candle payloads.
+    Factory for valid CandlesCache-like OHLCV payloads.
 
-    Returns dict payloads instead of Candle instances on purpose:
-    analyzer public APIs and EventBus handlers usually receive raw mappings and
-    must exercise their own parsing/normalization logic.
+    The callable is backward-compatible with older tests:
+        candle_factory(index, open_=..., high=..., low=..., close=...)
+
+    But every returned candle now includes the full futures scope and data-layer
+    identity fields:
+        exchange, market_type, symbol, exchange_symbol, timeframe,
+        open_time_ms, close_time_ms, timestamp_ms, received_at_ms, is_closed.
     """
 
     def _make(
@@ -93,21 +280,188 @@ def candle_factory(start_time: datetime) -> Callable[..., dict[str, Any]]:
         low: float | None = None,
         close: float | None = None,
         volume: float = 1_000.0,
+        quote_volume: float | None = None,
+        trades_count: int | None = None,
         timestamp: datetime | str | int | float | None = None,
+        timestamp_ms: int | None = None,
+        open_time_ms: int | None = None,
+        close_time_ms: int | None = None,
+        received_at_ms: int | None = None,
+        is_closed: bool = True,
+        exchange_: str | None = None,
+        market_type_: str | None = None,
+        symbol_: str | None = None,
+        exchange_symbol_: str | None = None,
+        timeframe_: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resolved_close = close if close is not None else open_ + 0.25
         resolved_high = high if high is not None else max(open_, resolved_close) + 0.50
         resolved_low = low if low is not None else min(open_, resolved_close) - 0.50
 
+        open_time, close_time = _minute_bounds(start_time, index)
+        resolved_open_time_ms = (
+            int(open_time_ms) if open_time_ms is not None else _to_epoch_ms(open_time)
+        )
+        resolved_close_time_ms = (
+            int(close_time_ms) if close_time_ms is not None else _to_epoch_ms(close_time)
+        )
+        resolved_timestamp_ms = (
+            int(timestamp_ms)
+            if timestamp_ms is not None
+            else resolved_close_time_ms
+        )
+        resolved_received_at_ms = (
+            int(received_at_ms)
+            if received_at_ms is not None
+            else resolved_timestamp_ms + 25
+        )
+
+        resolved_exchange = exchange_ if exchange_ is not None else exchange
+        resolved_market_type = market_type_ if market_type_ is not None else market_type
+        resolved_symbol = symbol_ if symbol_ is not None else symbol
+        resolved_exchange_symbol = (
+            exchange_symbol_ if exchange_symbol_ is not None else exchange_symbol
+        )
+        resolved_timeframe = timeframe_ if timeframe_ is not None else timeframe
+
+        payload_metadata = {
+            "open_time_ms": resolved_open_time_ms,
+            "close_time_ms": resolved_close_time_ms,
+            "timestamp_ms": resolved_timestamp_ms,
+            "received_at_ms": resolved_received_at_ms,
+            "source": "pytest.candle_factory",
+        }
+        payload_metadata.update(metadata or {})
+
         return {
-            "timestamp": timestamp or start_time + timedelta(minutes=index),
+            "exchange": resolved_exchange,
+            "market_type": resolved_market_type,
+            "symbol": resolved_symbol,
+            "exchange_symbol": resolved_exchange_symbol,
+            "timeframe": resolved_timeframe,
+            "timestamp": timestamp or close_time,
+            "timestamp_ms": resolved_timestamp_ms,
+            "open_time_ms": resolved_open_time_ms,
+            "close_time_ms": resolved_close_time_ms,
+            "received_at_ms": resolved_received_at_ms,
             "open": float(open_),
             "high": float(resolved_high),
             "low": float(resolved_low),
             "close": float(resolved_close),
             "volume": float(volume),
-            "index": index,
+            "quote_volume": (
+                float(quote_volume)
+                if quote_volume is not None
+                else float(volume) * float(resolved_close)
+            ),
+            "trades_count": int(trades_count) if trades_count is not None else 100 + index,
+            "is_closed": bool(is_closed),
+            "index": int(index),
+            "metadata": payload_metadata,
         }
+
+    return _make
+
+
+@pytest.fixture
+def wrong_scope_candle_factory(
+    candle_factory: Callable[..., dict[str, Any]],
+    alt_exchange: str,
+    alt_market_type: str,
+    alt_symbol: str,
+    alt_exchange_symbol: str,
+) -> Callable[..., dict[str, Any]]:
+    """
+    Factory for intentionally wrong-scope candles.
+
+    Useful for tests that assert scoped handlers ignore or reject data from
+    another exchange, market type or symbol.
+    """
+
+    def _make(
+        index: int,
+        *,
+        wrong_exchange: bool = False,
+        wrong_market_type: bool = False,
+        wrong_symbol: bool = False,
+        spot: bool = False,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        if wrong_exchange:
+            overrides.setdefault("exchange_", alt_exchange)
+
+        if wrong_market_type:
+            overrides.setdefault("market_type_", alt_market_type)
+
+        if spot:
+            overrides.setdefault("market_type_", TEST_SPOT_MARKET_TYPE)
+
+        if wrong_symbol:
+            overrides.setdefault("symbol_", alt_symbol)
+            overrides.setdefault("exchange_symbol_", alt_exchange_symbol)
+
+        return candle_factory(index, **overrides)
+
+    return _make
+
+
+@pytest.fixture
+def candles_updated_payload() -> Callable[..., dict[str, Any]]:
+    """
+    Build CandlesCache-style batch payloads for market.candles.updated events.
+    """
+
+    def _make(
+        candles: Sequence[dict[str, Any]],
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        symbol: str | None = None,
+        exchange_symbol: str | None = None,
+        timeframe: str | None = None,
+        source: str = "CandlesCache",
+        update_reason: str = "test",
+    ) -> dict[str, Any]:
+        first = candles[0] if candles else {}
+
+        resolved_exchange = exchange or str(first.get("exchange") or TEST_EXCHANGE)
+        resolved_market_type = market_type or str(first.get("market_type") or TEST_MARKET_TYPE)
+        resolved_symbol = symbol or str(first.get("symbol") or TEST_SYMBOL)
+        resolved_exchange_symbol = (
+            exchange_symbol
+            or str(first.get("exchange_symbol") or resolved_symbol)
+        )
+        resolved_timeframe = timeframe or str(first.get("timeframe") or TEST_TIMEFRAME)
+
+        return {
+            **_scope_payload(
+                exchange=resolved_exchange,
+                market_type=resolved_market_type,
+                symbol=resolved_symbol,
+                exchange_symbol=resolved_exchange_symbol,
+                timeframe=resolved_timeframe,
+            ),
+            "candles": list(candles),
+            "count": len(candles),
+            "source": source,
+            "update_reason": update_reason,
+        }
+
+    return _make
+
+
+@pytest.fixture
+def candle_closed_event_payload(
+    candle_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """
+    Build a single closed-candle payload exactly like a CandlesCache emission.
+    """
+
+    def _make(index: int, **overrides: Any) -> dict[str, Any]:
+        overrides.setdefault("is_closed", True)
+        return candle_factory(index, **overrides)
 
     return _make
 
@@ -118,8 +472,6 @@ def rising_candles(
 ) -> Callable[..., list[dict[str, Any]]]:
     """
     Controlled bullish sequence.
-
-    Useful for TrendAnalyzer, MarketStructureAnalyzer and breakout scenarios.
     """
 
     def _make(
@@ -129,6 +481,7 @@ def rising_candles(
         step: float = 0.75,
         index_offset: int = 0,
         volume: float = 1_000.0,
+        **scope_overrides: Any,
     ) -> list[dict[str, Any]]:
         candles: list[dict[str, Any]] = []
 
@@ -142,6 +495,7 @@ def rising_candles(
                     low=price - 0.30,
                     close=price + 0.60,
                     volume=volume + i,
+                    **scope_overrides,
                 )
             )
 
@@ -156,8 +510,6 @@ def falling_candles(
 ) -> Callable[..., list[dict[str, Any]]]:
     """
     Controlled bearish sequence.
-
-    Useful for TrendAnalyzer, MarketStructureAnalyzer and breakdown scenarios.
     """
 
     def _make(
@@ -167,6 +519,7 @@ def falling_candles(
         step: float = 0.75,
         index_offset: int = 0,
         volume: float = 1_000.0,
+        **scope_overrides: Any,
     ) -> list[dict[str, Any]]:
         candles: list[dict[str, Any]] = []
 
@@ -180,6 +533,7 @@ def falling_candles(
                     low=price - 0.85,
                     close=price - 0.60,
                     volume=volume + i,
+                    **scope_overrides,
                 )
             )
 
@@ -194,9 +548,6 @@ def ranging_candles(
 ) -> Callable[..., list[dict[str, Any]]]:
     """
     Sideways/ranging sequence with alternating candles.
-
-    Useful for verifying that TrendAnalyzer does not incorrectly mark a strong
-    directional trend on low-displacement data.
     """
 
     def _make(
@@ -206,6 +557,7 @@ def ranging_candles(
         amplitude: float = 0.35,
         index_offset: int = 0,
         volume: float = 1_000.0,
+        **scope_overrides: Any,
     ) -> list[dict[str, Any]]:
         candles: list[dict[str, Any]] = []
 
@@ -224,6 +576,7 @@ def ranging_candles(
                     low=low,
                     close=close,
                     volume=volume,
+                    **scope_overrides,
                 )
             )
 
@@ -239,14 +592,15 @@ def swing_pattern_candles(
     """
     Deterministic pivot-friendly candles.
 
-    The default shape creates visible local highs/lows that are useful for
-    MarketStructureAnalyzer tests with small pivot_left/pivot_right settings.
+    The default shape creates visible local highs/lows for small
+    pivot_left/pivot_right settings.
     """
 
     def _make(
         *,
         prices: Sequence[float] | None = None,
         index_offset: int = 0,
+        **scope_overrides: Any,
     ) -> list[dict[str, Any]]:
         resolved_prices = list(
             prices
@@ -286,6 +640,7 @@ def swing_pattern_candles(
                     low=low,
                     close=close,
                     volume=1_000.0 + i,
+                    **scope_overrides,
                 )
             )
 
@@ -301,7 +656,7 @@ def bullish_fvg_candles(
     """
     Three-candle bullish FVG setup.
 
-    Typical bullish gap condition expected by ICT-style logic:
+    Typical bullish gap condition:
     first candle high is below third candle low, with impulse in between.
     """
     return [
@@ -333,13 +688,20 @@ def bearish_fvg_candles(
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def swing_factory(start_time: datetime) -> Callable[..., dict[str, Any]]:
+def swing_factory(
+    start_time: datetime,
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> Callable[..., dict[str, Any]]:
     """
     Factory for raw SwingPoint-like mappings.
 
-    Returned shape intentionally mirrors serialized swing events from
-    MarketStructureAnalyzer so support/resistance and liquidity tests can use
-    it directly through add_swings() or EventBus payloads.
+    The shape mirrors serialized swing events emitted by MarketStructureAnalyzer.
+    Full scope is included so SupportResistanceAnalyzer and LiquidityLevelsAnalyzer
+    can enforce event-scope filtering.
     """
 
     def _make(
@@ -350,39 +712,117 @@ def swing_factory(start_time: datetime) -> Callable[..., dict[str, Any]]:
         layer: StructureLayer | str = StructureLayer.INTERNAL,
         strength: float = 0.75,
         swing_id: str | None = None,
+        exchange_: str | None = None,
+        market_type_: str | None = None,
+        symbol_: str | None = None,
+        exchange_symbol_: str | None = None,
+        timeframe_: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         resolved_swing_type = (
             swing_type.value if isinstance(swing_type, SwingType) else str(swing_type)
         )
         resolved_layer = layer.value if isinstance(layer, StructureLayer) else str(layer)
 
+        resolved_exchange = exchange_ if exchange_ is not None else exchange
+        resolved_market_type = market_type_ if market_type_ is not None else market_type
+        resolved_symbol = symbol_ if symbol_ is not None else symbol
+        resolved_exchange_symbol = (
+            exchange_symbol_ if exchange_symbol_ is not None else exchange_symbol
+        )
+        resolved_timeframe = timeframe_ if timeframe_ is not None else timeframe
+
+        timestamp = start_time + timedelta(minutes=index)
+
         return {
+            **_scope_payload(
+                exchange=resolved_exchange,
+                market_type=resolved_market_type,
+                symbol=resolved_symbol,
+                exchange_symbol=resolved_exchange_symbol,
+                timeframe=resolved_timeframe,
+            ),
             "swing_id": swing_id or f"{resolved_layer}-{resolved_swing_type}-{index}",
-            "timestamp": start_time + timedelta(minutes=index),
+            "timestamp": timestamp,
+            "timestamp_ms": _to_epoch_ms(timestamp),
             "price": float(price),
             "swing_type": resolved_swing_type,
             "layer": resolved_layer,
-            "index": index,
+            "index": int(index),
             "candle_open": float(price - 0.25),
             "candle_high": float(price + 0.50),
             "candle_low": float(price - 0.50),
             "candle_close": float(price + 0.25),
             "strength": float(strength),
             "is_confirmed": True,
-            "metadata": {},
+            "metadata": {
+                "source": "pytest.swing_factory",
+                **dict(metadata or {}),
+            },
         }
 
     return _make
 
 
 @pytest.fixture
-def market_structure_update_payload() -> dict[str, Any]:
+def wrong_scope_swing_factory(
+    swing_factory: Callable[..., dict[str, Any]],
+    alt_exchange: str,
+    alt_market_type: str,
+    alt_symbol: str,
+    alt_exchange_symbol: str,
+) -> Callable[..., dict[str, Any]]:
+    def _make(
+        index: int,
+        *,
+        wrong_exchange: bool = False,
+        wrong_market_type: bool = False,
+        wrong_symbol: bool = False,
+        spot: bool = False,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        if wrong_exchange:
+            overrides.setdefault("exchange_", alt_exchange)
+
+        if wrong_market_type:
+            overrides.setdefault("market_type_", alt_market_type)
+
+        if spot:
+            overrides.setdefault("market_type_", TEST_SPOT_MARKET_TYPE)
+
+        if wrong_symbol:
+            overrides.setdefault("symbol_", alt_symbol)
+            overrides.setdefault("exchange_symbol_", alt_exchange_symbol)
+
+        return swing_factory(index, **overrides)
+
+    return _make
+
+
+@pytest.fixture
+def market_structure_update_payload(
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
     return {
-        "symbol": TEST_SYMBOL,
-        "timeframe": TEST_TIMEFRAME,
+        **_scope_payload(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            exchange_symbol=exchange_symbol,
+            timeframe=timeframe,
+        ),
         "state": {
-            "symbol": TEST_SYMBOL,
-            "timeframe": TEST_TIMEFRAME,
+            **_scope_payload(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                exchange_symbol=exchange_symbol,
+                timeframe=timeframe,
+            ),
             "last_price": 101.25,
             "internal": {
                 "bias": MarketBias.BULLISH.value,
@@ -407,13 +847,29 @@ def market_structure_update_payload() -> dict[str, Any]:
 
 
 @pytest.fixture
-def support_resistance_update_payload() -> dict[str, Any]:
+def support_resistance_update_payload(
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> dict[str, Any]:
     return {
-        "symbol": TEST_SYMBOL,
-        "timeframe": TEST_TIMEFRAME,
+        **_scope_payload(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            exchange_symbol=exchange_symbol,
+            timeframe=timeframe,
+        ),
         "state": {
-            "symbol": TEST_SYMBOL,
-            "timeframe": TEST_TIMEFRAME,
+            **_scope_payload(
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                exchange_symbol=exchange_symbol,
+                timeframe=timeframe,
+            ),
             "last_price": 101.25,
             "nearest_support": 99.50,
             "nearest_resistance": 103.00,
@@ -424,11 +880,71 @@ def support_resistance_update_payload() -> dict[str, Any]:
 
 
 @pytest.fixture
+def child_update_payload_factory(
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    exchange_symbol: str,
+    timeframe: str,
+) -> Callable[..., dict[str, Any]]:
+    """
+    Generic scoped child update payload factory for facade tests.
+    """
+
+    def _make(
+        *,
+        module_name: str,
+        last_price: float = 100.0,
+        exchange_: str | None = None,
+        market_type_: str | None = None,
+        symbol_: str | None = None,
+        exchange_symbol_: str | None = None,
+        timeframe_: str | None = None,
+        state_overrides: dict[str, Any] | None = None,
+        payload_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_exchange = exchange_ if exchange_ is not None else exchange
+        resolved_market_type = market_type_ if market_type_ is not None else market_type
+        resolved_symbol = symbol_ if symbol_ is not None else symbol
+        resolved_exchange_symbol = (
+            exchange_symbol_ if exchange_symbol_ is not None else exchange_symbol
+        )
+        resolved_timeframe = timeframe_ if timeframe_ is not None else timeframe
+
+        scope = _scope_payload(
+            exchange=resolved_exchange,
+            market_type=resolved_market_type,
+            symbol=resolved_symbol,
+            exchange_symbol=resolved_exchange_symbol,
+            timeframe=resolved_timeframe,
+        )
+
+        state = {
+            **scope,
+            "last_price": float(last_price),
+            "metadata": {
+                "child_module": module_name,
+                "source": "pytest.child_update_payload_factory",
+            },
+        }
+        state.update(state_overrides or {})
+
+        payload = {
+            **scope,
+            "state": state,
+            "updated_module": module_name,
+            "new_events_count": 0,
+        }
+        payload.update(payload_overrides or {})
+        return payload
+
+    return _make
+
+
+@pytest.fixture
 def event_factory() -> Callable[..., Event]:
     """
     Factory for core Event payloads.
-
-    This keeps Event construction consistent across handler tests.
     """
 
     def _make(
@@ -450,6 +966,44 @@ def event_factory() -> Callable[..., Event]:
     return _make
 
 
+@pytest.fixture
+def candle_closed_event_factory(
+    event_factory: Callable[..., Event],
+    candle_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., Event]:
+    def _make(index: int, **overrides: Any) -> Event:
+        payload = candle_factory(index, is_closed=True, **overrides)
+        return event_factory(
+            "market.candle.closed",
+            payload,
+            source="CandlesCache",
+            correlation_id=f"closed-candle-{index}",
+        )
+
+    return _make
+
+
+@pytest.fixture
+def candles_updated_event_factory(
+    event_factory: Callable[..., Event],
+    candles_updated_payload: Callable[..., dict[str, Any]],
+) -> Callable[..., Event]:
+    def _make(
+        candles: Sequence[dict[str, Any]],
+        *,
+        correlation_id: str = "candles-updated",
+        **payload_overrides: Any,
+    ) -> Event:
+        return event_factory(
+            "market.candles.updated",
+            candles_updated_payload(candles, **payload_overrides),
+            source="CandlesCache",
+            correlation_id=correlation_id,
+        )
+
+    return _make
+
+
 # ---------------------------------------------------------------------------
 # Analyzer configs
 # ---------------------------------------------------------------------------
@@ -460,7 +1014,6 @@ def market_structure_config() -> MarketStructureConfig:
     Test-tuned MarketStructureConfig.
 
     Small pivot windows make swing detection deterministic and keep tests fast.
-    Snapshot publishing is disabled by default; lifecycle tests can override it.
     """
     return MarketStructureConfig(
         pivot_left=1,
@@ -479,6 +1032,9 @@ def market_structure_config() -> MarketStructureConfig:
         publish_snapshots=False,
         snapshot_interval_seconds=None,
         subscribe_market_candles=True,
+        market_candle_topic="market.candle.closed",
+        market_candles_topic="market.candles.updated",
+        require_event_scope=True,
         subscribe_higher_timeframe_context=True,
     )
 
@@ -503,6 +1059,9 @@ def support_resistance_config() -> SupportResistanceConfig:
         publish_snapshots=False,
         snapshot_interval_seconds=None,
         subscribe_market_candles=True,
+        market_candle_topic="market.candle.closed",
+        market_candles_topic="market.candles.updated",
+        require_event_scope=True,
         subscribe_market_structure_swings=True,
     )
 
@@ -525,6 +1084,9 @@ def fair_value_gap_config() -> FairValueGapConfig:
         publish_snapshots=False,
         snapshot_interval_seconds=None,
         subscribe_market_candles=True,
+        market_candle_topic="market.candle.closed",
+        market_candles_topic="market.candles.updated",
+        require_event_scope=True,
     )
 
 
@@ -549,6 +1111,9 @@ def liquidity_levels_config() -> LiquidityLevelsConfig:
         publish_snapshots=False,
         snapshot_interval_seconds=None,
         subscribe_market_candles=True,
+        market_candle_topic="market.candle.closed",
+        market_candles_topic="market.candles.updated",
+        require_event_scope=True,
         subscribe_market_structure_swings=True,
     )
 
@@ -577,9 +1142,52 @@ def trend_config() -> TrendConfig:
         publish_snapshots=False,
         snapshot_interval_seconds=None,
         subscribe_market_candles=True,
+        market_candle_topic="market.candle.closed",
+        market_candles_topic="market.candles.updated",
+        require_event_scope=True,
         subscribe_market_structure=True,
         subscribe_support_resistance=True,
     )
+
+
+@pytest.fixture
+def unscoped_market_structure_config(
+    market_structure_config: MarketStructureConfig,
+) -> MarketStructureConfig:
+    market_structure_config.require_event_scope = False
+    return market_structure_config
+
+
+@pytest.fixture
+def unscoped_support_resistance_config(
+    support_resistance_config: SupportResistanceConfig,
+) -> SupportResistanceConfig:
+    support_resistance_config.require_event_scope = False
+    return support_resistance_config
+
+
+@pytest.fixture
+def unscoped_fair_value_gap_config(
+    fair_value_gap_config: FairValueGapConfig,
+) -> FairValueGapConfig:
+    fair_value_gap_config.require_event_scope = False
+    return fair_value_gap_config
+
+
+@pytest.fixture
+def unscoped_liquidity_levels_config(
+    liquidity_levels_config: LiquidityLevelsConfig,
+) -> LiquidityLevelsConfig:
+    liquidity_levels_config.require_event_scope = False
+    return liquidity_levels_config
+
+
+@pytest.fixture
+def unscoped_trend_config(
+    trend_config: TrendConfig,
+) -> TrendConfig:
+    trend_config.require_event_scope = False
+    return trend_config
 
 
 @pytest.fixture
@@ -593,14 +1201,16 @@ def price_action_analyzer_config(
     """
     Facade config with all child modules enabled.
 
-    Child configs are injected explicitly so facade tests use the same fast,
-    deterministic settings as direct analyzer tests.
+    Facade does not consume market candles directly. Child modules own data-layer
+    candle subscriptions.
     """
     return PriceActionAnalyzerConfig(
         emit_events=True,
+        event_namespace="analytics.price_action",
         publish_snapshots=False,
         snapshot_interval_seconds=None,
         subscribe_market_candles=False,
+        require_event_scope=True,
         auto_register_modules=True,
         shutdown_child_modules=True,
         reset_child_modules=True,
@@ -657,12 +1267,55 @@ def assert_snapshot_envelope() -> Callable[[dict[str, Any]], None]:
 
     def _assert(snapshot: dict[str, Any]) -> None:
         assert isinstance(snapshot, dict)
+        assert "exchange" in snapshot
+        assert "market_type" in snapshot
         assert "symbol" in snapshot
+        assert "exchange_symbol" in snapshot
         assert "timeframe" in snapshot
         assert "state" in snapshot
         assert "metadata" in snapshot
+        assert snapshot["exchange"]
+        assert snapshot["market_type"]
         assert snapshot["symbol"]
         assert snapshot["timeframe"]
         assert isinstance(snapshot["metadata"], dict)
+
+    return _assert
+
+
+@pytest.fixture
+def assert_scope_matches() -> Callable[[dict[str, Any], dict[str, Any]], None]:
+    """
+    Assert that a serialized payload carries the expected price-action scope.
+    """
+
+    def _assert(payload: dict[str, Any], expected_scope: dict[str, Any]) -> None:
+        assert payload["exchange"] == expected_scope["exchange"]
+        assert payload["market_type"] == expected_scope["market_type"]
+        assert payload["symbol"] == expected_scope["symbol"]
+        assert payload["exchange_symbol"] == expected_scope["exchange_symbol"]
+        assert payload["timeframe"] == expected_scope["timeframe"]
+
+        if "key" in payload:
+            assert list(payload["key"]) == list(expected_scope["key"])
+
+    return _assert
+
+
+@pytest.fixture
+def assert_no_duplicate_ids() -> Callable[[Iterable[dict[str, Any]], str], None]:
+    def _assert(items: Iterable[dict[str, Any]], id_key: str) -> None:
+        ids = [item[id_key] for item in items if id_key in item]
+        assert len(ids) == len(set(ids))
+
+    return _assert
+
+
+@pytest.fixture
+def assert_confidences_are_bounded() -> Callable[[Iterable[dict[str, Any]]], None]:
+    def _assert(items: Iterable[dict[str, Any]]) -> None:
+        for item in items:
+            if "confidence" in item:
+                assert 0.0 <= float(item["confidence"]) <= 1.0
 
     return _assert
