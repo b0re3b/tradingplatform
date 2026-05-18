@@ -22,6 +22,12 @@ from analytics.spoofing import (
 )
 
 
+DEFAULT_TEST_EXCHANGE = "binance"
+DEFAULT_TEST_SYMBOL = "BTCUSDT"
+DEFAULT_TEST_MARKET_TYPE = "perpetual"
+DEFAULT_TEST_TIMEFRAME = "realtime"
+
+
 # =============================================================================
 # Fake core infrastructure
 # =============================================================================
@@ -38,7 +44,8 @@ class EmittedEventRecord:
     - priority;
     - source;
     - correlation_id;
-    - headers/metadata.
+    - headers/metadata;
+    - додаткові kwargs.
     """
 
     topic: str
@@ -54,11 +61,18 @@ class EmittedEventRecord:
 class SubscriptionRecord:
     """
     Запис підписки, яку тестовий EventBus отримав через subscribe().
+
+    Fake також має unsubscribe(), бо production analyzer має вміти
+    коректно знімати підписки під час lifecycle/stop tests.
     """
 
     topic: str
     handler: Callable[..., Any]
     kwargs: dict[str, Any] = field(default_factory=dict)
+    active: bool = True
+
+    def unsubscribe(self) -> None:
+        self.active = False
 
 
 class FakeEventBus:
@@ -67,9 +81,11 @@ class FakeEventBus:
 
     Його ціль — не імітувати всю шину подій, а дати тестам можливість
     перевірити, що analytics.spoofing:
-    - підписується на правильні topics;
+    - підписується на правильні production topics;
+    - не підписується на raw legacy topics без явного дозволу;
     - публікує правильні analytics.spoofing.* events;
-    - передає correlation_id/source/headers.
+    - передає correlation_id/source/headers;
+    - коректно працює з unsubscribe lifecycle.
     """
 
     def __init__(self) -> None:
@@ -81,14 +97,14 @@ class FakeEventBus:
         topic: str,
         handler: Callable[..., Any],
         **kwargs: Any,
-    ) -> None:
-        self.subscriptions.append(
-            SubscriptionRecord(
-                topic=topic,
-                handler=handler,
-                kwargs=kwargs,
-            )
+    ) -> SubscriptionRecord:
+        subscription = SubscriptionRecord(
+            topic=topic,
+            handler=handler,
+            kwargs=kwargs,
         )
+        self.subscriptions.append(subscription)
+        return subscription
 
     async def emit(
         self,
@@ -116,6 +132,11 @@ class FakeEventBus:
 
     def topics(self) -> list[str]:
         return [item.topic for item in self.emitted]
+
+    def subscribed_topics(self, *, active_only: bool = False) -> list[str]:
+        if active_only:
+            return [item.topic for item in self.subscriptions if item.active]
+        return [item.topic for item in self.subscriptions]
 
     def last_event(self) -> EmittedEventRecord:
         if not self.emitted:
@@ -150,7 +171,7 @@ class FakeScheduler:
     Мінімальний fake Scheduler під contract core.scheduler.Scheduler.
 
     Потрібен для перевірки, що SpoofingAnalyzer реєструє cleanup job
-    через add_interval_job(), а не запускає власний loop.
+    через add_interval_job(), а не запускає власний uncontrolled asyncio loop.
     """
 
     def __init__(self) -> None:
@@ -196,22 +217,49 @@ class FakeScheduler:
                 return job
         return None
 
+    def get_job(self, job_id: str) -> IntervalJobRecord | None:
+        for job in self.interval_jobs:
+            if job.job_id == job_id:
+                return job
+        return None
+
+    def enable_job(self, job_id: str) -> bool:
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        job.enabled = True
+        return True
+
+    def disable_job(self, job_id: str) -> bool:
+        job = self.get_job(job_id)
+        if job is None:
+            return False
+        job.enabled = False
+        return True
+
+    def remove_job(self, job_id: str) -> bool:
+        before = len(self.interval_jobs)
+        self.interval_jobs = [
+            job for job in self.interval_jobs if job.job_id != job_id
+        ]
+        return len(self.interval_jobs) != before
+
 
 class FakeEvent:
     """
-    Простий fake Event під callback SpoofingAnalyzer.on_orderbook_event().
+    Простий fake Event під analyzer callback.
 
     Дає payload і кілька можливих місць для correlation_id, бо analyzer може
-    діставати correlation_id з event attribute або metadata/headers залежно
-    від реалізації helper-а.
+    діставати correlation_id з event_id, correlation_id, metadata або headers.
     """
 
     def __init__(
         self,
         payload: Any,
         *,
+        event_id: str | None = "test-event-id",
         correlation_id: str | None = "test-correlation-id",
-        topic: str = "market.orderbook",
+        topic: str = "market.orderbook.updated",
         source: str = "tests",
         metadata: dict[str, Any] | None = None,
         headers: dict[str, Any] | None = None,
@@ -219,6 +267,7 @@ class FakeEvent:
         self.payload = payload
         self.topic = topic
         self.source = source
+        self.event_id = event_id
         self.correlation_id = correlation_id
         self.metadata = metadata or {}
         self.headers = headers or {}
@@ -226,6 +275,65 @@ class FakeEvent:
         if correlation_id is not None:
             self.metadata.setdefault("correlation_id", correlation_id)
             self.headers.setdefault("correlation_id", correlation_id)
+
+
+# =============================================================================
+# Unsafe/poison snapshot для adversarial tests
+# =============================================================================
+
+
+@dataclass(slots=True)
+class UnsafeOrderbookLevelSnapshot:
+    """
+    Snapshot-like object для poisoned tests.
+
+    Реальний OrderbookLevelSnapshot валідуює price/size у __post_init__ і
+    кидає ValueError для price <= 0. Частина adversarial tests спеціально
+    передає такі рівні в analyzer/detector, щоб перевірити фільтрацію.
+    Тому для невалідних значень factory повертає цей lightweight object.
+    """
+
+    symbol: str
+    exchange: str
+    side: SpoofingSide
+    price: float
+    size: float
+    market_type: str = DEFAULT_TEST_MARKET_TYPE
+    timeframe: str = DEFAULT_TEST_TIMEFRAME
+    exchange_symbol: str | None = None
+    best_bid: float | None = None
+    best_ask: float | None = None
+    mid_price: float | None = None
+    spread: float | None = None
+    sequence_id: int | None = None
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (
+            str(self.exchange).strip().lower(),
+            str(self.market_type or DEFAULT_TEST_MARKET_TYPE).strip().lower(),
+            str(self.symbol).strip().upper(),
+            str(self.timeframe or DEFAULT_TEST_TIMEFRAME).strip(),
+        )
+
+    @property
+    def scope(self) -> dict[str, str]:
+        exchange, market_type, symbol, timeframe = self.key
+        return {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "exchange_symbol": self.exchange_symbol or symbol,
+        }
+
+    @property
+    def level_key(self) -> str:
+        exchange, market_type, symbol, timeframe = self.key
+        side = self.side.value if isinstance(self.side, SpoofingSide) else str(self.side)
+        return f"{exchange}:{market_type}:{symbol}:{timeframe}:{side}:{self.price:.12f}"
 
 
 # =============================================================================
@@ -248,17 +356,33 @@ def spoofing_config() -> SpoofingConfig:
     """
     Базовий тестовий SpoofingConfig.
 
-    Налаштування зроблені досить permissive, щоб tests могли легко створювати
-    positive detector cases без надмірно великих synthetic orderbook values.
+    Налаштування достатньо permissive, щоб tests могли легко створювати
+    positive detector cases без нереалістично великих synthetic orderbook values.
+
+    Водночас config уже key-first:
+        exchange + market_type + symbol + timeframe
     """
 
     config = SpoofingConfig()
 
     config.enabled = True
-    config.exchange = None
+
+    # Scoped defaults for futures-first tests.
+    config.default_exchange = DEFAULT_TEST_EXCHANGE
+    config.default_market_type = DEFAULT_TEST_MARKET_TYPE
+    config.default_timeframe = DEFAULT_TEST_TIMEFRAME
+
+    # Legacy-compatible aliases.
+    config.exchange = DEFAULT_TEST_EXCHANGE
     config.symbols = []
 
-    # Wall detection
+    # Scoped allowlists disabled by default.
+    config.exchange_allowlist = None
+    config.market_type_allowlist = None
+    config.symbol_allowlist = None
+    config.timeframe_allowlist = None
+
+    # Wall detection.
     config.wall_detection.enabled = True
     config.wall_detection.min_wall_size_abs = 10_000.0
     config.wall_detection.min_wall_size_ratio = 3.0
@@ -267,17 +391,18 @@ def spoofing_config() -> SpoofingConfig:
     config.wall_detection.min_levels_to_scan = 3
     config.wall_detection.max_levels_to_scan = 50
 
-    # Persistence
+    # Persistence.
     config.persistence.enabled = True
     config.persistence.wall_ttl_ms = 15_000
     config.persistence.min_tracking_lifetime_ms = 0
     config.persistence.cleanup_interval_ms = 2_000
+    config.persistence.max_walls_per_key = 500
     config.persistence.max_walls_per_symbol = 500
     config.persistence.max_history_events_per_level = 200
     config.persistence.size_update_epsilon = 1e-9
     config.persistence.price_rounding_decimals = 8
 
-    # Pull detection
+    # Pull detection.
     config.pull_detection.enabled = True
     config.pull_detection.max_pull_lifetime_ms = 2_500
     config.pull_detection.min_pull_ratio = 0.60
@@ -286,27 +411,27 @@ def spoofing_config() -> SpoofingConfig:
     config.pull_detection.fast_pull_lifetime_ms = 750
     config.pull_detection.strong_pull_ratio = 0.85
 
-    # Fake liquidity
+    # Fake liquidity.
     config.fake_liquidity.enabled = True
     config.fake_liquidity.max_fill_ratio = 0.20
     config.fake_liquidity.min_pull_ratio = 0.70
     config.fake_liquidity.max_lifetime_ms = 4_000
     config.fake_liquidity.min_price_reaction_bps = 2.0
 
-    # Layering
+    # Layering.
     config.layering.enabled = True
     config.layering.min_layers = 3
     config.layering.max_price_gap_bps_between_layers = 20.0
     config.layering.min_total_layer_notional = 10_000.0
     config.layering.synchronized_pull_window_ms = 1_000
 
-    # Flip pressure
+    # Flip pressure.
     config.flip_pressure.enabled = True
     config.flip_pressure.min_price_reaction_bps = 3.0
     config.flip_pressure.reaction_window_ms = 3_000
     config.flip_pressure.min_pressure_flip_strength = 0.60
 
-    # Scoring
+    # Scoring.
     config.scoring.enabled = True
     config.scoring.detection_threshold = 0.50
     config.scoring.high_severity_threshold = 0.75
@@ -315,15 +440,33 @@ def spoofing_config() -> SpoofingConfig:
     config.scoring.confidence_boost_on_detector_agreement = 0.10
     config.scoring.max_confidence = 0.99
 
-    # Analyzer
+    # Analyzer.
     config.analyzer.enabled = True
     config.analyzer.publish_updates = True
     config.analyzer.publish_detected_only = False
     config.analyzer.publish_lifecycle_events = True
     config.analyzer.publish_score_updates = True
     config.analyzer.publish_errors = True
+
+    config.analyzer.max_tracked_walls_per_key = 500
     config.analyzer.max_tracked_walls_per_symbol = 500
     config.analyzer.max_detector_results_per_cycle = 50
+
+    # Production topics only by default.
+    config.analyzer.source_topic_patterns_orderbook = ("market.orderbook.updated",)
+    config.analyzer.source_topic_patterns_trade = ("market.trades.updated",)
+    config.analyzer.event_topic_orderbook = "market.orderbook.updated"
+    config.analyzer.event_topic_trade = "market.trades.updated"
+    config.analyzer.legacy_raw_orderbook_topic = "market.orderbook"
+    config.analyzer.legacy_raw_trade_topic = "market.trade"
+    config.analyzer.allow_legacy_raw_topics = False
+
+    config.analyzer.event_topic_lifecycle = "analytics.spoofing.lifecycle"
+    config.analyzer.event_topic_updated = "analytics.spoofing.updated"
+    config.analyzer.event_topic_detected = "analytics.spoofing.detected"
+    config.analyzer.event_topic_score_updated = "analytics.spoofing.score_updated"
+    config.analyzer.event_topic_error = "analytics.spoofing.error"
+
     config.analyzer.scheduler_cleanup_enabled = True
     config.analyzer.scheduler_cleanup_job_name = "analytics.spoofing.persistence_cleanup"
 
@@ -359,13 +502,18 @@ def orderbook_snapshot_factory(fixed_now: datetime):
     """
     Factory для normalized OrderbookLevelSnapshot.
 
-    Використовується analyzer/wall detector/persistence tests.
+    Для валідних values повертає реальний OrderbookLevelSnapshot.
+    Для poisoned values повертає UnsafeOrderbookLevelSnapshot, щоб тести могли
+    перевіряти фільтрацію analyzer/detector без падіння в dataclass constructor.
     """
 
     def factory(
         *,
-        symbol: str = "BTCUSDT",
-        exchange: str = "binance",
+        symbol: str = DEFAULT_TEST_SYMBOL,
+        exchange: str = DEFAULT_TEST_EXCHANGE,
+        market_type: str = DEFAULT_TEST_MARKET_TYPE,
+        timeframe: str = DEFAULT_TEST_TIMEFRAME,
+        exchange_symbol: str | None = None,
         side: SpoofingSide = SpoofingSide.BID,
         price: float = 100.0,
         size: float = 100.0,
@@ -376,21 +524,29 @@ def orderbook_snapshot_factory(fixed_now: datetime):
         sequence_id: int | None = 1,
         timestamp: datetime | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> OrderbookLevelSnapshot:
-        return OrderbookLevelSnapshot(
-            symbol=symbol,
-            exchange=exchange,
-            side=side,
-            price=price,
-            size=size,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            mid_price=mid_price,
-            spread=spread,
-            sequence_id=sequence_id,
-            timestamp=timestamp or fixed_now,
-            metadata=metadata or {},
-        )
+    ) -> OrderbookLevelSnapshot | UnsafeOrderbookLevelSnapshot:
+        kwargs = {
+            "symbol": symbol,
+            "exchange": exchange,
+            "market_type": market_type,
+            "timeframe": timeframe,
+            "exchange_symbol": exchange_symbol,
+            "side": side,
+            "price": price,
+            "size": size,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid_price": mid_price,
+            "spread": spread,
+            "sequence_id": sequence_id,
+            "timestamp": timestamp or fixed_now,
+            "metadata": metadata or {},
+        }
+
+        try:
+            return OrderbookLevelSnapshot(**kwargs)
+        except (TypeError, ValueError):
+            return UnsafeOrderbookLevelSnapshot(**kwargs)
 
     return factory
 
@@ -401,18 +557,21 @@ def tracked_wall_factory(fixed_now: datetime):
     Factory для TrackedWall.
 
     Дає змогу точно контролювати:
+    - scope: exchange + market_type + symbol + timeframe;
     - lifetime_ms;
-    - pull_ratio;
-    - fill_ratio;
+    - pull_ratio/fill_ratio через estimated sizes;
     - side/price/state;
-    - repetition/update count.
+    - repetition/update counters.
     """
 
     def factory(
         *,
         wall_id: str | None = None,
-        symbol: str = "BTCUSDT",
-        exchange: str = "binance",
+        symbol: str = DEFAULT_TEST_SYMBOL,
+        exchange: str = DEFAULT_TEST_EXCHANGE,
+        market_type: str = DEFAULT_TEST_MARKET_TYPE,
+        timeframe: str = DEFAULT_TEST_TIMEFRAME,
+        exchange_symbol: str | None = None,
         side: SpoofingSide = SpoofingSide.BID,
         price: float = 100.0,
         lifetime_ms: float = 500.0,
@@ -434,12 +593,25 @@ def tracked_wall_factory(fixed_now: datetime):
         metadata: dict[str, Any] | None = None,
     ) -> TrackedWall:
         first_seen_at = fixed_now - timedelta(milliseconds=lifetime_ms)
-        resolved_wall_id = wall_id or f"{exchange}:{symbol}:{side.value}:{price:.8f}"
+        normalized_exchange = str(exchange).strip().lower()
+        normalized_market_type = str(market_type or DEFAULT_TEST_MARKET_TYPE).strip().lower()
+        normalized_symbol = str(symbol).strip().upper()
+        normalized_timeframe = str(timeframe or DEFAULT_TEST_TIMEFRAME).strip()
+        normalized_side = side.value if isinstance(side, SpoofingSide) else str(side)
+
+        resolved_wall_id = wall_id or (
+            f"{normalized_exchange}:{normalized_market_type}:"
+            f"{normalized_symbol}:{normalized_timeframe}:"
+            f"{normalized_side}:{price:.8f}"
+        )
 
         return TrackedWall(
             wall_id=resolved_wall_id,
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
             side=side,
             price=price,
             first_seen_at=first_seen_at,
@@ -475,8 +647,11 @@ def spoofing_features_factory(fixed_now: datetime):
 
     def factory(
         *,
-        symbol: str = "BTCUSDT",
-        exchange: str = "binance",
+        symbol: str = DEFAULT_TEST_SYMBOL,
+        exchange: str = DEFAULT_TEST_EXCHANGE,
+        market_type: str = DEFAULT_TEST_MARKET_TYPE,
+        timeframe: str = DEFAULT_TEST_TIMEFRAME,
+        exchange_symbol: str | None = None,
         side: SpoofingSide = SpoofingSide.BID,
         price: float = 100.0,
         wall_size: float = 1000.0,
@@ -507,6 +682,9 @@ def spoofing_features_factory(fixed_now: datetime):
         return SpoofingFeatures(
             symbol=symbol,
             exchange=exchange,
+            market_type=market_type,
+            timeframe=timeframe,
+            exchange_symbol=exchange_symbol,
             side=side,
             price=price,
             wall_size=wall_size,
@@ -585,25 +763,33 @@ def detector_result_factory(spoofing_features_factory, fixed_now: datetime):
 @pytest.fixture
 def raw_orderbook_payload_factory():
     """
-    Factory для raw market.orderbook payload.
+    Factory для legacy/raw market.orderbook-like payload.
 
-    Використовується тестами SpoofingAnalyzer.process_event_payload().
+    Залишено для наявних tests, але payload уже містить market_type/timeframe,
+    щоб не втрачати futures scope.
     """
 
     def factory(
         *,
-        symbol: str = "BTCUSDT",
-        exchange: str = "binance",
+        symbol: str = DEFAULT_TEST_SYMBOL,
+        exchange: str = DEFAULT_TEST_EXCHANGE,
+        market_type: str = DEFAULT_TEST_MARKET_TYPE,
+        timeframe: str = DEFAULT_TEST_TIMEFRAME,
+        exchange_symbol: str | None = None,
         bids: list[tuple[float, float]] | None = None,
         asks: list[tuple[float, float]] | None = None,
         best_bid: float = 99.9,
         best_ask: float = 100.1,
         sequence_id: int = 1,
+        timestamp_ms: int = 1_767_268_800_000,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "symbol": symbol,
             "exchange": exchange,
+            "market_type": market_type,
+            "timeframe": timeframe,
+            "exchange_symbol": exchange_symbol or symbol,
             "bids": bids
             if bids is not None
             else [
@@ -621,7 +807,36 @@ def raw_orderbook_payload_factory():
             "best_bid": best_bid,
             "best_ask": best_ask,
             "sequence_id": sequence_id,
+            "timestamp_ms": timestamp_ms,
             "metadata": metadata or {},
+        }
+
+    return factory
+
+
+@pytest.fixture
+def orderbook_updated_payload_factory(raw_orderbook_payload_factory):
+    """
+    Factory для production data-layer payload:
+        OrderBookCache -> market.orderbook.updated -> SpoofingAnalyzer
+
+    Це не змінює структуру tests, але дає готовий helper для нових
+    adversarial cases у наявних файлах.
+    """
+
+    def factory(**kwargs: Any) -> dict[str, Any]:
+        payload = raw_orderbook_payload_factory(**kwargs)
+        return {
+            **payload,
+            "topic_contract": "market.orderbook.updated",
+            "source": "data.orderbook_cache",
+            "book": {
+                "bids": payload["bids"],
+                "asks": payload["asks"],
+                "best_bid": payload["best_bid"],
+                "best_ask": payload["best_ask"],
+                "sequence_id": payload["sequence_id"],
+            },
         }
 
     return factory
@@ -637,18 +852,24 @@ def wall_snapshot_set_factory(orderbook_snapshot_factory):
 
     def factory(
         *,
-        symbol: str = "BTCUSDT",
-        exchange: str = "binance",
+        symbol: str = DEFAULT_TEST_SYMBOL,
+        exchange: str = DEFAULT_TEST_EXCHANGE,
+        market_type: str = DEFAULT_TEST_MARKET_TYPE,
+        timeframe: str = DEFAULT_TEST_TIMEFRAME,
+        exchange_symbol: str | None = None,
         side: SpoofingSide = SpoofingSide.BID,
         wall_price: float = 99.7,
         wall_size: float = 1000.0,
         normal_size: float = 1.0,
         mid_price: float = 100.0,
-    ) -> list[OrderbookLevelSnapshot]:
+    ) -> list[OrderbookLevelSnapshot | UnsafeOrderbookLevelSnapshot]:
         return [
             orderbook_snapshot_factory(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 side=side,
                 price=99.9,
                 size=normal_size,
@@ -657,6 +878,9 @@ def wall_snapshot_set_factory(orderbook_snapshot_factory):
             orderbook_snapshot_factory(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 side=side,
                 price=99.8,
                 size=normal_size * 1.1,
@@ -665,6 +889,9 @@ def wall_snapshot_set_factory(orderbook_snapshot_factory):
             orderbook_snapshot_factory(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 side=side,
                 price=wall_price,
                 size=wall_size,
@@ -673,6 +900,9 @@ def wall_snapshot_set_factory(orderbook_snapshot_factory):
             orderbook_snapshot_factory(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 side=SpoofingSide.ASK,
                 price=100.1,
                 size=normal_size,
@@ -681,6 +911,9 @@ def wall_snapshot_set_factory(orderbook_snapshot_factory):
             orderbook_snapshot_factory(
                 symbol=symbol,
                 exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
                 side=SpoofingSide.ASK,
                 price=100.2,
                 size=normal_size * 1.2,
@@ -696,13 +929,16 @@ def layering_walls_factory(tracked_wall_factory):
     """
     Factory для multi-level layering scenario.
 
-    Створює кілька близьких BID/ASK walls одного symbol/exchange.
+    Створює кілька близьких BID/ASK walls одного scoped futures market.
     """
 
     def factory(
         *,
-        symbol: str = "BTCUSDT",
-        exchange: str = "binance",
+        symbol: str = DEFAULT_TEST_SYMBOL,
+        exchange: str = DEFAULT_TEST_EXCHANGE,
+        market_type: str = DEFAULT_TEST_MARKET_TYPE,
+        timeframe: str = DEFAULT_TEST_TIMEFRAME,
+        exchange_symbol: str | None = None,
         side: SpoofingSide = SpoofingSide.BID,
         base_price: float = 99.90,
         count: int = 3,
@@ -721,9 +957,15 @@ def layering_walls_factory(tracked_wall_factory):
 
             walls.append(
                 tracked_wall_factory(
-                    wall_id=f"{exchange}:{symbol}:{side.value}:{price:.8f}",
+                    wall_id=(
+                        f"{exchange}:{market_type}:{symbol}:"
+                        f"{timeframe}:{side.value}:{price:.8f}"
+                    ),
                     symbol=symbol,
                     exchange=exchange,
+                    market_type=market_type,
+                    timeframe=timeframe,
+                    exchange_symbol=exchange_symbol,
                     side=side,
                     price=price,
                     initial_size=size,

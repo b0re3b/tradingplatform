@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from statistics import median
 from typing import Any, Iterable
 
@@ -243,8 +244,8 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         *,
         symbol: str,
         exchange: str,
-        bids: Iterable[tuple[float, float]],
-        asks: Iterable[tuple[float, float]],
+        bids: Iterable[Any],
+        asks: Iterable[Any],
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
         exchange_symbol: str | None = None,
@@ -262,10 +263,25 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         Production runtime не має напряму передавати сюди raw exchange payload.
         Production path:
             OrderBookCache -> market.orderbook.updated -> SpoofingAnalyzer
+
+        Robustness:
+        - malformed raw levels не мають валити pipeline;
+        - non-numeric, NaN, inf, -inf, price <= 0, size <= 0 пропускаються;
+        - OrderbookLevelSnapshot створюється тільки після pre-validation.
         """
         ts = self.ensure_utc(timestamp)
-        mid_price = self._resolve_mid_price(best_bid=best_bid, best_ask=best_ask)
-        spread = self._resolve_spread(best_bid=best_bid, best_ask=best_ask)
+
+        safe_best_bid = self._coerce_optional_positive_float(best_bid)
+        safe_best_ask = self._coerce_optional_positive_float(best_ask)
+
+        mid_price = self._resolve_mid_price(
+            best_bid=safe_best_bid,
+            best_ask=safe_best_ask,
+        )
+        spread = self._resolve_spread(
+            best_bid=safe_best_bid,
+            best_ask=safe_best_ask,
+        )
 
         base_metadata = {
             **dict(metadata or {}),
@@ -274,47 +290,47 @@ class OrderbookWallDetector(BaseSpoofingDetector):
 
         levels: list[OrderbookLevelSnapshot] = []
 
-        for price, size in bids:
-            levels.append(
-                self.build_level_snapshot(
-                    symbol=symbol,
-                    exchange=exchange,
-                    market_type=market_type,
-                    timeframe=timeframe,
-                    exchange_symbol=exchange_symbol,
-                    side=SpoofingSide.BID,
-                    price=price,
-                    size=size,
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    mid_price=mid_price,
-                    spread=spread,
-                    sequence_id=sequence_id,
-                    timestamp=ts,
-                    metadata=base_metadata,
-                )
+        for price, size in self._iter_valid_raw_levels(bids):
+            snapshot = self._safe_build_level_snapshot(
+                symbol=symbol,
+                exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
+                side=SpoofingSide.BID,
+                price=price,
+                size=size,
+                best_bid=safe_best_bid,
+                best_ask=safe_best_ask,
+                mid_price=mid_price,
+                spread=spread,
+                sequence_id=sequence_id,
+                timestamp=ts,
+                metadata=base_metadata,
             )
+            if snapshot is not None:
+                levels.append(snapshot)
 
-        for price, size in asks:
-            levels.append(
-                self.build_level_snapshot(
-                    symbol=symbol,
-                    exchange=exchange,
-                    market_type=market_type,
-                    timeframe=timeframe,
-                    exchange_symbol=exchange_symbol,
-                    side=SpoofingSide.ASK,
-                    price=price,
-                    size=size,
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    mid_price=mid_price,
-                    spread=spread,
-                    sequence_id=sequence_id,
-                    timestamp=ts,
-                    metadata=base_metadata,
-                )
+        for price, size in self._iter_valid_raw_levels(asks):
+            snapshot = self._safe_build_level_snapshot(
+                symbol=symbol,
+                exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
+                side=SpoofingSide.ASK,
+                price=price,
+                size=size,
+                best_bid=safe_best_bid,
+                best_ask=safe_best_ask,
+                mid_price=mid_price,
+                spread=spread,
+                sequence_id=sequence_id,
+                timestamp=ts,
+                metadata=base_metadata,
             )
+            if snapshot is not None:
+                levels.append(snapshot)
 
         return levels
 
@@ -324,7 +340,7 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         symbol: str,
         exchange: str,
         side: SpoofingSide,
-        levels: Iterable[tuple[float, float]],
+        levels: Iterable[Any],
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
         exchange_symbol: str | None = None,
@@ -409,10 +425,12 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         if snapshot.side == SpoofingSide.UNKNOWN:
             return None
 
-        if snapshot.size <= 0.0 or snapshot.price <= 0.0:
+        if not self._is_valid_snapshot_numeric_values(snapshot):
             return None
 
         notional = snapshot.price * snapshot.size
+        if not math.isfinite(notional) or notional <= 0.0:
+            return None
 
         if notional < self.config.wall_detection.min_wall_size_abs:
             return None
@@ -421,7 +439,12 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             snapshot=snapshot,
             baseline_size=baseline_size,
         )
+        if not math.isfinite(effective_baseline) or effective_baseline <= 0.0:
+            return None
+
         size_ratio = snapshot.size / effective_baseline
+        if not math.isfinite(size_ratio):
+            return None
 
         if size_ratio < self.config.wall_detection.min_wall_size_ratio:
             return None
@@ -432,6 +455,8 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             if mid_price is not None and mid_price > 0
             else 0.0
         )
+        if not math.isfinite(distance_from_mid_bps):
+            return None
 
         if distance_from_mid_bps > self.config.wall_detection.max_distance_from_mid_bps:
             return None
@@ -665,6 +690,12 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         levels: list[OrderbookLevelSnapshot] = []
 
         for item in snapshots:
+            if item is None:
+                continue
+
+            if not self._has_snapshot_contract(item):
+                continue
+
             if key is not None and item.key != key:
                 continue
             if normalized_symbol is not None and item.symbol != normalized_symbol:
@@ -677,7 +708,11 @@ class OrderbookWallDetector(BaseSpoofingDetector):
                 continue
             if resolved_side is not None and item.side != resolved_side:
                 continue
+            if item.side == SpoofingSide.UNKNOWN:
+                continue
             if not self.should_process_key(item.key):
+                continue
+            if not self._is_valid_snapshot_numeric_values(item):
                 continue
 
             levels.append(item)
@@ -725,6 +760,8 @@ class OrderbookWallDetector(BaseSpoofingDetector):
     ) -> float | None:
         if best_bid is None or best_ask is None:
             return None
+        if not math.isfinite(best_bid) or not math.isfinite(best_ask):
+            return None
         if best_bid <= 0 or best_ask <= 0:
             return None
         return (best_bid + best_ask) / 2.0
@@ -737,6 +774,8 @@ class OrderbookWallDetector(BaseSpoofingDetector):
     ) -> float | None:
         if best_bid is None or best_ask is None:
             return None
+        if not math.isfinite(best_bid) or not math.isfinite(best_ask):
+            return None
         if best_bid <= 0 or best_ask <= 0:
             return None
         return max(0.0, best_ask - best_bid)
@@ -745,7 +784,11 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         self,
         snapshot: OrderbookLevelSnapshot,
     ) -> float | None:
-        if snapshot.mid_price is not None and snapshot.mid_price > 0:
+        if (
+            snapshot.mid_price is not None
+            and math.isfinite(snapshot.mid_price)
+            and snapshot.mid_price > 0
+        ):
             return snapshot.mid_price
 
         return self._resolve_mid_price(
@@ -760,6 +803,8 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         baseline_size: float | None,
     ) -> float:
         if baseline_size is None:
+            return max(snapshot.size, 1.0)
+        if not math.isfinite(baseline_size) or baseline_size <= 0.0:
             return max(snapshot.size, 1.0)
         return max(baseline_size, 1e-12)
 
@@ -784,18 +829,20 @@ class OrderbookWallDetector(BaseSpoofingDetector):
         if (
             snapshot.side == SpoofingSide.BID
             and snapshot.best_bid is not None
+            and math.isfinite(snapshot.best_bid)
             and snapshot.best_bid > 0
         ):
             distance = self.bps_distance(snapshot.price, snapshot.best_bid)
-            return distance <= near_bps
+            return math.isfinite(distance) and distance <= near_bps
 
         if (
             snapshot.side == SpoofingSide.ASK
             and snapshot.best_ask is not None
+            and math.isfinite(snapshot.best_ask)
             and snapshot.best_ask > 0
         ):
             distance = self.bps_distance(snapshot.price, snapshot.best_ask)
-            return distance <= near_bps
+            return math.isfinite(distance) and distance <= near_bps
 
         return False
 
@@ -808,7 +855,14 @@ class OrderbookWallDetector(BaseSpoofingDetector):
 
         Бере median size, щоб один великий wall не зіпсував baseline.
         """
-        sizes = [item.size for item in snapshots if item.size > 0]
+        sizes = [
+            item.size
+            for item in snapshots
+            if item is not None
+            and isinstance(item.size, (int, float))
+            and math.isfinite(float(item.size))
+            and float(item.size) > 0.0
+        ]
         if not sizes:
             return 1.0
 
@@ -836,6 +890,165 @@ class OrderbookWallDetector(BaseSpoofingDetector):
             f"size_ratio={size_ratio:.2f}, "
             f"distance_from_mid_bps={distance_from_mid_bps:.2f}, "
             f"{near_txt}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Raw level robustness helpers
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_optional_positive_float(value: Any) -> float | None:
+        if value is None:
+            return None
+
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if not math.isfinite(result) or result <= 0.0:
+            return None
+
+        return result
+
+    @staticmethod
+    def _coerce_raw_price_size(raw_level: Any) -> tuple[float, float] | None:
+        """
+        Безпечно дістає price/size з raw level.
+
+        Підтримує:
+        - tuple/list: (price, size, ...)
+        - dict: {"price": ..., "size": ...}
+        - dict aliases: qty/quantity/amount
+        """
+        if raw_level is None:
+            return None
+
+        raw_price: Any
+        raw_size: Any
+
+        if isinstance(raw_level, dict):
+            raw_price = raw_level.get("price")
+            raw_size = (
+                raw_level.get("size")
+                if "size" in raw_level
+                else raw_level.get("qty", raw_level.get("quantity", raw_level.get("amount")))
+            )
+        elif isinstance(raw_level, (list, tuple)):
+            if len(raw_level) < 2:
+                return None
+            raw_price = raw_level[0]
+            raw_size = raw_level[1]
+        else:
+            return None
+
+        try:
+            price = float(raw_price)
+            size = float(raw_size)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if not OrderbookWallDetector._is_valid_raw_level_value(price=price, size=size):
+            return None
+
+        return price, size
+
+    @staticmethod
+    def _is_valid_raw_level_value(*, price: float, size: float) -> bool:
+        return (
+            math.isfinite(price)
+            and math.isfinite(size)
+            and price > 0.0
+            and size > 0.0
+        )
+
+    @classmethod
+    def _iter_valid_raw_levels(
+        cls,
+        levels: Iterable[Any],
+    ) -> Iterable[tuple[float, float]]:
+        for raw_level in levels or ():
+            parsed = cls._coerce_raw_price_size(raw_level)
+            if parsed is None:
+                continue
+            yield parsed
+
+    def _safe_build_level_snapshot(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        market_type: str,
+        timeframe: str,
+        exchange_symbol: str | None,
+        side: SpoofingSide,
+        price: float,
+        size: float,
+        best_bid: float | None,
+        best_ask: float | None,
+        mid_price: float | None,
+        spread: float | None,
+        sequence_id: int | None,
+        timestamp: Any,
+        metadata: dict[str, Any],
+    ) -> OrderbookLevelSnapshot | None:
+        """
+        Створює OrderbookLevelSnapshot тільки для попередньо валідованих values.
+
+        Додатково захищає helper від майбутніх змін у model validation:
+        manual/test helper не має валити весь pipeline через один поганий level.
+        """
+        if not self._is_valid_raw_level_value(price=price, size=size):
+            return None
+
+        try:
+            return self.build_level_snapshot(
+                symbol=symbol,
+                exchange=exchange,
+                market_type=market_type,
+                timeframe=timeframe,
+                exchange_symbol=exchange_symbol,
+                side=side,
+                price=price,
+                size=size,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                mid_price=mid_price,
+                spread=spread,
+                sequence_id=sequence_id,
+                timestamp=timestamp,
+                metadata=metadata,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _has_snapshot_contract(item: Any) -> bool:
+        required_attrs = (
+            "key",
+            "symbol",
+            "exchange",
+            "market_type",
+            "timeframe",
+            "side",
+            "price",
+            "size",
+        )
+        return all(hasattr(item, attr) for attr in required_attrs)
+
+    @staticmethod
+    def _is_valid_snapshot_numeric_values(item: Any) -> bool:
+        try:
+            price = float(item.price)
+            size = float(item.size)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+        return (
+            math.isfinite(price)
+            and math.isfinite(size)
+            and price > 0.0
+            and size > 0.0
         )
 
 

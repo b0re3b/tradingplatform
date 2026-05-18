@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Protocol
 
@@ -85,11 +86,6 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             -> market.orderbook.updated
             -> SpoofingAnalyzer
             -> analytics.spoofing.*
-
-    Важливо:
-    - analyzer не ходить у біржові адаптери;
-    - raw market.orderbook / raw bids/asks не є production path;
-    - detector/scoring/tracker логіка лишається в окремих класах.
     """
 
     component = SpoofingComponent.ANALYZER
@@ -97,7 +93,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     def __init__(
         self,
         *,
-        event_bus: EventBus,
+        event_bus: EventBus | None,
         scheduler: Scheduler | None,
         config: SpoofingConfig,
         orderbook_cache: SupportsOrderBookCache | None = None,
@@ -163,6 +159,10 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         self._cleanup_job_id: str | None = None
         self._registered = False
 
+        # BaseSpoofingAnalyzer уже може мати _running. Явно синхронізуємо
+        # lifecycle, щоб stop() не залежав від різних прапорців.
+        self._running = False
+
     # -------------------------------------------------------------------------
     # Dependency factories
     # -------------------------------------------------------------------------
@@ -206,16 +206,6 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         Реєструє analyzer у core infrastructure:
         - EventBus subscriptions на data-layer topics;
         - Scheduler interval job для cleanup PersistenceTracker.
-
-        Production topics:
-            market.orderbook.updated
-            market.trades.updated
-
-        Raw topics:
-            market.orderbook
-            market.trade
-
-        не підписуються, якщо allow_legacy_raw_topics=False.
         """
         if self._registered:
             self.log_warning("SpoofingAnalyzer already registered")
@@ -229,6 +219,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         self._register_scheduler_jobs()
 
         self._registered = True
+        self._running = True
 
         self.log_info(
             "SpoofingAnalyzer registered",
@@ -238,6 +229,67 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             publish_detected_only=self.config.analyzer.publish_detected_only,
             scope="exchange:market_type:symbol:timeframe",
         )
+
+    def stop(self) -> None:
+        """
+        Зупиняє analyzer lifecycle:
+        - unsubscribe всіх EventBus subscriptions;
+        - disable cleanup Scheduler job;
+        - синхронізує _registered і _running.
+
+        Метод навмисно sync, як і register(), щоб відповідати поточному
+        core-style lifecycle у пакеті.
+        """
+        if not self._registered and not getattr(self, "_running", False):
+            self.log_warning("SpoofingAnalyzer already stopped")
+            return
+
+        for subscription in list(self._subscriptions):
+            try:
+                unsubscribe = getattr(subscription, "unsubscribe", None)
+                if callable(unsubscribe):
+                    unsubscribe()
+                    continue
+
+                close = getattr(subscription, "close", None)
+                if callable(close):
+                    close()
+                    continue
+
+                cancel = getattr(subscription, "cancel", None)
+                if callable(cancel):
+                    cancel()
+
+            except Exception as exc:
+                self.log_exception(
+                    "Failed to unsubscribe SpoofingAnalyzer subscription",
+                    error=str(exc),
+                    subscription=str(subscription),
+                )
+
+        self._subscriptions.clear()
+
+        if self.scheduler is not None and self._cleanup_job_id is not None:
+            try:
+                disable_job = getattr(self.scheduler, "disable_job", None)
+                if callable(disable_job):
+                    disable_job(self._cleanup_job_id)
+                else:
+                    remove_job = getattr(self.scheduler, "remove_job", None)
+                    if callable(remove_job):
+                        remove_job(self._cleanup_job_id)
+            except Exception as exc:
+                self.log_exception(
+                    "Failed to disable SpoofingAnalyzer cleanup job",
+                    cleanup_job_id=self._cleanup_job_id,
+                    error=str(exc),
+                )
+
+        self._cleanup_job_id = None
+        self._registered = False
+        self._running = False
+
+        self.log_info("SpoofingAnalyzer stopped")
 
     def _register_eventbus_subscriptions(self) -> None:
         event_bus = self.require_event_bus()
@@ -280,13 +332,6 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     async def _handle_event(self, event: Event) -> None:
         """
         Production EventBus callback для data-layer events.
-
-        Очікувані topics:
-            market.orderbook.updated
-            market.trades.updated
-
-        Основний processing path для orderbook:
-            extract SpoofingKey -> load/build snapshots -> process_key/process_snapshots
         """
         payload = getattr(event, "payload", None)
         if not isinstance(payload, Mapping):
@@ -409,12 +454,6 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     ) -> AnalyzerOutput:
         """
         Основний production API.
-
-        key:
-            exchange + market_type + symbol + timeframe
-
-        Якщо orderbook_cache переданий, analyzer читає actual book state
-        через read-only cache API. Якщо ні — повертає output із reason.
         """
         if not self.config.enabled or not self.config.analyzer.enabled:
             return self._empty_output(
@@ -457,14 +496,6 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     ) -> AnalyzerOutput:
         """
         Обробляє EventBus payload.
-
-        Production payload очікується від OrderBookCache:
-            market.orderbook.updated
-
-        Підтримується:
-        1. payload["snapshots"] з normalized snapshots;
-        2. payload із cached bids/asks лише якщо topic уже data-layer updated;
-        3. raw bids/asks тільки якщо allow_raw_payload=True.
         """
         resolved_key = key or self.extract_key_from_payload(payload)
         if resolved_key is None:
@@ -509,8 +540,8 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         *,
         symbol: str,
         exchange: str,
-        bids: Iterable[tuple[float, float]],
-        asks: Iterable[tuple[float, float]],
+        bids: Iterable[Any],
+        asks: Iterable[Any],
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
         exchange_symbol: str | None = None,
@@ -554,9 +585,11 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         )
 
         resolved_mid = current_mid_price
-        if resolved_mid is None and best_bid is not None and best_ask is not None:
-            if best_bid > 0 and best_ask > 0:
-                resolved_mid = (best_bid + best_ask) / 2.0
+        if resolved_mid is None:
+            resolved_mid = self._resolve_mid_price_from_best_quotes(
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
 
         return await self.process_snapshots(
             snapshots=snapshots,
@@ -592,7 +625,11 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 metadata=metadata,
             )
 
-        levels = [level for level in snapshots if level.key == key]
+        levels = [
+            level
+            for level in snapshots
+            if self._has_level_contract(level) and level.key == key
+        ]
         if not levels:
             output = self._empty_output(
                 key=key,
@@ -602,7 +639,11 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             self._latest_output_by_key[key] = output
             return output
 
-        resolved_mid_price = current_mid_price or self._resolve_mid_price_from_levels(levels)
+        resolved_mid_price = current_mid_price
+        if resolved_mid_price is not None and not self._is_finite_positive(resolved_mid_price):
+            resolved_mid_price = None
+        if resolved_mid_price is None:
+            resolved_mid_price = self._resolve_mid_price_from_levels(levels)
 
         self.persistence_tracker.maybe_cleanup(now=levels[0].timestamp)
 
@@ -718,15 +759,17 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
 
         Залишає:
         - валідні bid/ask рівні;
+        - finite price/size;
         - дозволений scoped key;
         - top-N levels per side according to wall_detection.max_levels_to_scan.
         """
         valid = [
             level
             for level in levels
-            if level.key == key
-            and level.price > 0
-            and level.size > 0
+            if self._has_level_contract(level)
+            and level.key == key
+            and self._is_finite_positive(level.price)
+            and self._is_finite_positive(level.size)
             and level.side in {SpoofingSide.BID, SpoofingSide.ASK}
             and self.should_process_key(level.key)
         ]
@@ -852,7 +895,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         detector_name: str,
     ) -> list[DetectorResult]:
         """
-        Захищений запуск detector-а через analyze_many().
+        Захищений запуск optional detector-а через analyze_many().
         """
         try:
             result = detector.analyze_many(
@@ -1159,15 +1202,23 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 continue
 
             try:
+                side = item["side"]
+                price = self._optional_float(item["price"])
+                size = self._optional_float(item["size"])
+                if price is None or size is None:
+                    continue
+                if price <= 0.0 or size <= 0.0:
+                    continue
+
                 snapshot = self.build_level_snapshot(
                     symbol=str(item.get("symbol") or scope["symbol"]),
                     exchange=str(item.get("exchange") or scope["exchange"]),
                     market_type=str(item.get("market_type") or scope["market_type"]),
                     timeframe=str(item.get("timeframe") or scope["timeframe"]),
                     exchange_symbol=self._optional_str(item.get("exchange_symbol")),
-                    side=item["side"],
-                    price=self.safe_float(item["price"]),
-                    size=self.safe_float(item["size"]),
+                    side=side,
+                    price=price,
+                    size=size,
                     best_bid=self._optional_float(item.get("best_bid")),
                     best_ask=self._optional_float(item.get("best_ask")),
                     mid_price=self._optional_float(item.get("mid_price")),
@@ -1304,7 +1355,12 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                     price = float(item[0])
                     size = float(item[1])
 
-                if price > 0.0 and size > 0.0:
+                if (
+                    math.isfinite(price)
+                    and math.isfinite(size)
+                    and price > 0.0
+                    and size > 0.0
+                ):
                     levels.append((price, size))
             except Exception:
                 continue
@@ -1338,7 +1394,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             return None
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     @staticmethod
@@ -1357,36 +1413,62 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
 
     def _extract_current_mid_price(self, payload: dict[str, Any]) -> float | None:
         explicit_mid = self._optional_float(payload.get("current_mid_price"))
-        if explicit_mid is not None:
+        if explicit_mid is not None and explicit_mid > 0.0:
             return explicit_mid
 
         explicit_mid = self._optional_float(payload.get("mid_price"))
-        if explicit_mid is not None:
+        if explicit_mid is not None and explicit_mid > 0.0:
             return explicit_mid
 
-        best_bid = self._optional_float(payload.get("best_bid"))
-        best_ask = self._optional_float(payload.get("best_ask"))
-        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
-            return (best_bid + best_ask) / 2.0
+        return self._resolve_mid_price_from_best_quotes(
+            best_bid=payload.get("best_bid"),
+            best_ask=payload.get("best_ask"),
+        )
 
-        return None
+    @staticmethod
+    def _resolve_mid_price_from_best_quotes(
+        *,
+        best_bid: Any,
+        best_ask: Any,
+    ) -> float | None:
+        try:
+            bid = float(best_bid)
+            ask = float(best_ask)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        if not math.isfinite(bid) or not math.isfinite(ask):
+            return None
+        if bid <= 0.0 or ask <= 0.0:
+            return None
+
+        return (bid + ask) / 2.0
 
     @staticmethod
     def _resolve_mid_price_from_levels(
         levels: list[OrderbookLevelSnapshot],
     ) -> float | None:
         for level in levels:
-            if level.mid_price is not None and level.mid_price > 0:
-                return level.mid_price
+            mid = getattr(level, "mid_price", None)
+            if mid is not None:
+                try:
+                    value = float(mid)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value) and value > 0.0:
+                    return value
 
         for level in levels:
-            if (
-                level.best_bid is not None
-                and level.best_ask is not None
-                and level.best_bid > 0
-                and level.best_ask > 0
-            ):
-                return (level.best_bid + level.best_ask) / 2.0
+            best_bid = getattr(level, "best_bid", None)
+            best_ask = getattr(level, "best_ask", None)
+            try:
+                bid = float(best_bid)
+                ask = float(best_ask)
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            if math.isfinite(bid) and math.isfinite(ask) and bid > 0.0 and ask > 0.0:
+                return (bid + ask) / 2.0
 
         return None
 
@@ -1395,9 +1477,34 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         if value is None:
             return None
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
             return None
+
+        if not math.isfinite(result):
+            return None
+
+        return result
+
+    @staticmethod
+    def _is_finite_positive(value: Any) -> bool:
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+        return math.isfinite(result) and result > 0.0
+
+    @staticmethod
+    def _has_level_contract(level: Any) -> bool:
+        required_attrs = (
+            "key",
+            "price",
+            "size",
+            "side",
+            "timestamp",
+        )
+        return all(hasattr(level, attr) for attr in required_attrs)
 
     # -------------------------------------------------------------------------
     # Output helpers
@@ -1420,6 +1527,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             metadata={
                 "scope": scope,
                 "reason": reason,
+                "exchange_symbol": scope["symbol"],
                 **self._safe_metadata(metadata),
             },
         )
@@ -1483,7 +1591,9 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         return {
             "component": self.component.value,
             "registered": self._registered,
+            "running": getattr(self, "_running", False),
             "cleanup_job_id": self._cleanup_job_id,
+            "subscriptions": len(self._subscriptions),
             "tracker": self.persistence_tracker.stats(),
             "latest_outputs": len(self._latest_output_by_key),
             "latest_signals": len(self._latest_signal_by_key),
