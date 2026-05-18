@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, TypeAlias
 
@@ -26,34 +27,148 @@ OIKey: TypeAlias = tuple[str, str, str, str]
 # =============================================================================
 
 def safe_float(value: Any, default: float | None = None) -> float | None:
+    """
+    Convert value to finite float.
+
+    Returns default for:
+    - None
+    - unparseable values
+    - NaN
+    - +inf / -inf
+
+    This helper is intentionally strict because OI features, scores and
+    downstream strategy/risk logic must never receive non-finite numbers.
+    """
     if value is None:
         return default
 
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
-    if result != result:  # NaN
+    if not math.isfinite(result):
         return default
 
     return result
 
 
 def safe_int(value: Any, default: int | None = None) -> int | None:
+    """
+    Convert value to int only when it is finite and parseable.
+    """
     if value is None:
         return default
 
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+    if not math.isfinite(result):
+        return default
+
+    try:
+        return int(result)
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    """
+    Clamp finite numeric value to [low, high].
+
+    Raises:
+        ValueError: when bounds or value are non-finite.
+    """
     if low > high:
         raise ValueError("low must be <= high")
-    return max(low, min(high, float(value)))
+
+    if not math.isfinite(float(low)) or not math.isfinite(float(high)):
+        raise ValueError("clamp bounds must be finite")
+
+    number = safe_float(value)
+    if number is None:
+        raise ValueError("value must be finite")
+
+    return max(low, min(high, number))
+
+
+def required_float(value: Any, field_name: str) -> float:
+    """
+    Convert required numeric value to finite float.
+    """
+    result = safe_float(value)
+    if result is None:
+        raise ValueError(f"{field_name} must be a finite number")
+    return result
+
+
+def positive_float(value: Any, field_name: str) -> float:
+    """
+    Convert required numeric value to finite float and require > 0.
+    """
+    result = required_float(value, field_name)
+    if result <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return result
+
+
+def non_negative_float(value: Any, field_name: str) -> float:
+    """
+    Convert required numeric value to finite float and require >= 0.
+    """
+    result = required_float(value, field_name)
+    if result < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return result
+
+
+def optional_non_negative_float(
+    value: Any,
+    field_name: str,
+) -> float | None:
+    """
+    Convert optional numeric value and require >= 0 when present.
+    """
+    result = safe_float(value)
+    if result is None:
+        return None
+
+    if result < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+
+    return result
+
+
+def optional_positive_float(
+    value: Any,
+    field_name: str,
+) -> float | None:
+    """
+    Convert optional numeric value and require > 0 when present.
+    """
+    result = safe_float(value)
+    if result is None:
+        return None
+
+    if result <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+
+    return result
+
+
+def normalize_optional_score(value: Any) -> float | None:
+    """
+    Normalize optional model score.
+
+    Direct result construction, deserialization and tests may pass invalid
+    or out-of-range values. Scores must remain finite and bounded.
+    """
+    score = safe_float(value)
+    if score is None:
+        return None
+    return clamp(score)
 
 
 # Backward-compatible aliases.
@@ -361,27 +476,26 @@ class OISnapshot:
             fallback_symbol=self.symbol,
         )
 
-        self.timestamp = float(self.timestamp)
-        self.oi = float(self.oi)
-
-        self.open_interest_value = safe_float(self.open_interest_value)
-        self.mark_price = safe_float(self.mark_price)
-        self.index_price = safe_float(self.index_price)
-
-        if self.timestamp <= 0:
-            raise ValueError("OISnapshot.timestamp must be > 0")
-
-        if self.oi < 0:
-            raise ValueError("OISnapshot.oi must be >= 0")
-
-        if self.open_interest_value is not None and self.open_interest_value < 0:
-            raise ValueError("OISnapshot.open_interest_value must be >= 0")
-
-        if self.mark_price is not None and self.mark_price <= 0:
-            raise ValueError("OISnapshot.mark_price must be > 0")
-
-        if self.index_price is not None and self.index_price <= 0:
-            raise ValueError("OISnapshot.index_price must be > 0")
+        self.timestamp = positive_float(
+            self.timestamp,
+            "OISnapshot.timestamp",
+        )
+        self.oi = non_negative_float(
+            self.oi,
+            "OISnapshot.oi",
+        )
+        self.open_interest_value = optional_non_negative_float(
+            self.open_interest_value,
+            "OISnapshot.open_interest_value",
+        )
+        self.mark_price = optional_positive_float(
+            self.mark_price,
+            "OISnapshot.mark_price",
+        )
+        self.index_price = optional_positive_float(
+            self.index_price,
+            "OISnapshot.index_price",
+        )
 
         self.metadata = normalize_scope_metadata(
             self.metadata,
@@ -434,8 +548,8 @@ class OISnapshot:
             market_type=str(data.get("market_type") or data.get("category") or DEFAULT_MARKET_TYPE),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             exchange_symbol=data.get("exchange_symbol"),
-            timestamp=float(timestamp),
-            oi=float(oi_value),
+            timestamp=timestamp,
+            oi=oi_value,
             open_interest_value=data.get("open_interest_value"),
             mark_price=data.get("mark_price"),
             index_price=data.get("index_price"),
@@ -444,7 +558,7 @@ class OISnapshot:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        payload = {
+        return {
             **self.scope_payload(),
             "timestamp": self.timestamp,
             "oi": self.oi,
@@ -455,7 +569,6 @@ class OISnapshot:
             "source": self.source,
             "metadata": dict(self.metadata),
         }
-        return payload
 
     def scope_payload(self) -> dict[str, Any]:
         return make_scope_payload(
@@ -524,10 +637,10 @@ class OIMarketContext:
             fallback_symbol=self.symbol,
         )
 
-        self.timestamp = float(self.timestamp)
-
-        if self.timestamp <= 0:
-            raise ValueError("OIMarketContext.timestamp must be > 0")
+        self.timestamp = positive_float(
+            self.timestamp,
+            "OIMarketContext.timestamp",
+        )
 
         for attr in (
             "price",
@@ -549,6 +662,27 @@ class OIMarketContext:
             "index_price",
         ):
             setattr(self, attr, safe_float(getattr(self, attr)))
+
+        for attr in (
+            "price",
+            "volume",
+            "quote_volume",
+            "volume_ma",
+            "long_liquidations",
+            "short_liquidations",
+            "aggressive_buy_volume",
+            "aggressive_sell_volume",
+            "mark_price",
+            "index_price",
+        ):
+            value = getattr(self, attr)
+            if value is not None and value < 0:
+                raise ValueError(f"OIMarketContext.{attr} must be >= 0")
+
+        for attr in ("price", "mark_price", "index_price"):
+            value = getattr(self, attr)
+            if value is not None and value <= 0:
+                raise ValueError(f"OIMarketContext.{attr} must be > 0")
 
         self.extra = normalize_scope_metadata(
             self.extra,
@@ -602,7 +736,7 @@ class OIMarketContext:
     def is_stale(self, now_ts: float, max_age_sec: float) -> bool:
         if max_age_sec <= 0:
             raise ValueError("max_age_sec must be > 0")
-        return float(now_ts) - self.timestamp > max_age_sec
+        return required_float(now_ts, "now_ts") - self.timestamp > max_age_sec
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> OIMarketContext:
@@ -618,7 +752,7 @@ class OIMarketContext:
             market_type=str(data.get("market_type") or data.get("category") or DEFAULT_MARKET_TYPE),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             exchange_symbol=data.get("exchange_symbol"),
-            timestamp=float(timestamp),
+            timestamp=timestamp,
             price=data.get("price"),
             price_delta=data.get("price_delta"),
             price_delta_pct=data.get("price_delta_pct"),
@@ -750,10 +884,11 @@ class OIFeatures:
             self.exchange_symbol,
             fallback_symbol=self.symbol,
         )
-        self.timestamp = float(self.timestamp)
 
-        if self.timestamp <= 0:
-            raise ValueError("OIFeatures.timestamp must be > 0")
+        self.timestamp = positive_float(
+            self.timestamp,
+            "OIFeatures.timestamp",
+        )
 
         for attr in (
             "oi",
@@ -798,6 +933,45 @@ class OIFeatures:
         if self.oi < 0:
             raise ValueError("OIFeatures.oi must be >= 0")
 
+        for attr in (
+            "open_interest_value",
+            "price",
+            "volume",
+            "quote_volume",
+            "volume_ma",
+            "long_liquidations",
+            "short_liquidations",
+            "aggressive_buy_volume",
+            "aggressive_sell_volume",
+        ):
+            value = getattr(self, attr)
+            if value is not None and value < 0:
+                raise ValueError(f"OIFeatures.{attr} must be >= 0")
+
+        if self.price is not None and self.price <= 0:
+            raise ValueError("OIFeatures.price must be > 0")
+
+        if self.liquidation_imbalance is not None:
+            self.liquidation_imbalance = clamp(
+                self.liquidation_imbalance,
+                low=-1.0,
+                high=1.0,
+            )
+
+        if self.aggressive_flow_imbalance is not None:
+            self.aggressive_flow_imbalance = clamp(
+                self.aggressive_flow_imbalance,
+                low=-1.0,
+                high=1.0,
+            )
+
+        if self.oi_pressure_score is not None:
+            self.oi_pressure_score = clamp(
+                self.oi_pressure_score,
+                low=-1.0,
+                high=1.0,
+            )
+
         self.oi_direction = _coerce_oi_direction(self.oi_direction)
         self.price_direction = _coerce_oi_direction(self.price_direction)
         self.metadata = normalize_scope_metadata(
@@ -841,7 +1015,7 @@ class OIFeatures:
             symbol=str(data["symbol"]),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             exchange_symbol=data.get("exchange_symbol"),
-            timestamp=float(timestamp),
+            timestamp=timestamp,
             oi=data["oi"],
             oi_delta=data["oi_delta"],
             oi_delta_pct=data["oi_delta_pct"],
@@ -937,9 +1111,14 @@ class OIRegimeResult:
 
     def __post_init__(self) -> None:
         self.regime = _coerce_oi_regime(self.regime)
-        self.confidence = clamp(float(self.confidence))
-        self.score = safe_float(self.score)
-        self.reasons = list(self.reasons or [])
+        self.confidence = clamp(
+            required_float(
+                self.confidence,
+                "OIRegimeResult.confidence",
+            )
+        )
+        self.score = normalize_optional_score(self.score)
+        self.reasons = list(dict.fromkeys(self.reasons or []))
 
     @property
     def confidence_band(self) -> OIConfidenceBand:
@@ -949,7 +1128,7 @@ class OIRegimeResult:
     def from_dict(cls, data: dict[str, Any]) -> OIRegimeResult:
         return cls(
             regime=_coerce_oi_regime(data["regime"]),
-            confidence=float(data.get("confidence", 0.0)),
+            confidence=data.get("confidence", 0.0),
             reasons=list(data.get("reasons") or []),
             score=data.get("score"),
         )
@@ -976,10 +1155,15 @@ class OIDivergenceResult:
     def __post_init__(self) -> None:
         self.detected = bool(self.detected)
         self.divergence_type = _coerce_divergence_type(self.divergence_type)
-        self.confidence = clamp(float(self.confidence))
+        self.confidence = clamp(
+            required_float(
+                self.confidence,
+                "OIDivergenceResult.confidence",
+            )
+        )
         self.window_size = safe_int(self.window_size)
-        self.score = safe_float(self.score)
-        self.reasons = list(self.reasons or [])
+        self.score = normalize_optional_score(self.score)
+        self.reasons = list(dict.fromkeys(self.reasons or []))
 
         if not self.detected:
             self.divergence_type = OIDivergenceType.NONE
@@ -997,7 +1181,7 @@ class OIDivergenceResult:
         return cls(
             detected=bool(data.get("detected", False)),
             divergence_type=_coerce_divergence_type(data.get("divergence_type")),
-            confidence=float(data.get("confidence", 0.0)),
+            confidence=data.get("confidence", 0.0),
             reasons=list(data.get("reasons") or []),
             window_size=data.get("window_size"),
             score=data.get("score"),
@@ -1028,9 +1212,14 @@ class OIAnomalyResult:
         self.detected = bool(self.detected)
         self.anomaly_type = _coerce_anomaly_type(self.anomaly_type)
         self.strength = _coerce_signal_strength(self.strength)
-        self.confidence = clamp(float(self.confidence))
-        self.score = safe_float(self.score)
-        self.reasons = list(self.reasons or [])
+        self.confidence = clamp(
+            required_float(
+                self.confidence,
+                "OIAnomalyResult.confidence",
+            )
+        )
+        self.score = normalize_optional_score(self.score)
+        self.reasons = list(dict.fromkeys(self.reasons or []))
 
         if not self.detected:
             self.anomaly_type = OIAnomalyType.NONE
@@ -1047,7 +1236,7 @@ class OIAnomalyResult:
             detected=bool(data.get("detected", False)),
             anomaly_type=_coerce_anomaly_type(data.get("anomaly_type")),
             strength=_coerce_signal_strength(data.get("strength")),
-            confidence=float(data.get("confidence", 0.0)),
+            confidence=data.get("confidence", 0.0),
             reasons=list(data.get("reasons") or []),
             score=data.get("score"),
         )
@@ -1098,10 +1287,10 @@ class OIAnalysisResult:
             fallback_symbol=self.symbol,
         )
 
-        self.timestamp = float(self.timestamp)
-
-        if self.timestamp <= 0:
-            raise ValueError("OIAnalysisResult.timestamp must be > 0")
+        self.timestamp = positive_float(
+            self.timestamp,
+            "OIAnalysisResult.timestamp",
+        )
 
         if self.snapshot.key != self.key:
             raise ValueError(
@@ -1183,7 +1372,7 @@ class OIAnalysisResult:
             symbol=str(data["symbol"]),
             timeframe=str(data.get("timeframe") or DEFAULT_TIMEFRAME),
             exchange_symbol=data.get("exchange_symbol"),
-            timestamp=float(data["timestamp"]),
+            timestamp=data["timestamp"],
             snapshot=OISnapshot.from_dict(dict(data["snapshot"])),
             context=OIMarketContext.from_dict(dict(data["context"])),
             features=OIFeatures.from_dict(dict(data["features"])),
@@ -1363,10 +1552,10 @@ class OIState:
         self.touch(analysis.timestamp)
 
     def touch(self, timestamp: float) -> None:
-        timestamp = float(timestamp)
-        if timestamp <= 0:
-            raise ValueError("timestamp must be > 0")
-        self.last_update_ts = timestamp
+        self.last_update_ts = positive_float(
+            timestamp,
+            "OIState.last_update_ts",
+        )
 
     def is_stale(self, now_ts: float, max_age_sec: float) -> bool:
         if max_age_sec <= 0:
@@ -1375,7 +1564,7 @@ class OIState:
         if self.last_update_ts is None:
             return True
 
-        return float(now_ts) - self.last_update_ts > max_age_sec
+        return required_float(now_ts, "now_ts") - self.last_update_ts > max_age_sec
 
     def reset_runtime(self) -> None:
         self.last_snapshot = None
@@ -1492,6 +1681,12 @@ __all__ = [
     "safe_float",
     "safe_int",
     "clamp",
+    "required_float",
+    "positive_float",
+    "non_negative_float",
+    "optional_non_negative_float",
+    "optional_positive_float",
+    "normalize_optional_score",
     "normalize_symbol",
     "normalize_exchange",
     "normalize_market_type",

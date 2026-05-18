@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -31,6 +32,21 @@ AGGRESSIVE_FLOW_EXTREME_ABS: Final[float] = 0.20
 LIQUIDATION_COMPONENT_ABS: Final[float] = 0.25
 STRONG_LIQUIDATION_IMBALANCE_ABS: Final[float] = 0.40
 
+# Selection tuning.
+# Broad OI_SPIKE / OI_COLLAPSE rules are useful, but they should not always
+# suppress more specific structural or risk-critical labels.
+SPECIFIC_ANOMALY_BONUS: Final[dict[OIAnomalyType, float]] = {
+    OIAnomalyType.LIQUIDATION_DRIVEN_OI_DROP: 0.08,
+    OIAnomalyType.SUDDEN_DELEVERAGING: 0.10,
+    OIAnomalyType.EXTREME_CROWDING: 0.07,
+    OIAnomalyType.OVERHEATED_BUILDUP: 0.05,
+    OIAnomalyType.FUNDING_OI_IMBALANCE: 0.08,
+    OIAnomalyType.OI_PRICE_DISLOCATION: 0.05,
+    OIAnomalyType.OI_VOLUME_DISLOCATION: 0.05,
+    OIAnomalyType.OI_COLLAPSE: 0.03,
+    OIAnomalyType.OI_SPIKE: 0.0,
+    OIAnomalyType.NONE: 0.0,
+}
 
 ANOMALY_PRIORITY: Final[dict[OIAnomalyType, int]] = {
     # Найбільш risk-critical аномалії.
@@ -59,11 +75,33 @@ def _clamp(
     low: float = 0.0,
     high: float = 1.0,
 ) -> float:
-    return max(low, min(high, float(value)))
+    if low > high:
+        raise ValueError("low must be <= high")
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return low
+
+    if not math.isfinite(number):
+        return low
+
+    return max(low, min(high, number))
 
 
 def _safe_abs(value: float | None) -> float:
-    return abs(value) if value is not None else 0.0
+    if value is None:
+        return 0.0
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+    if not math.isfinite(number):
+        return 0.0
+
+    return abs(number)
 
 
 def _is_positive(value: float | None) -> bool:
@@ -78,6 +116,12 @@ def _is_negative(value: float | None) -> bool:
 class AnomalyCandidate:
     """
     Internal score container for rule-based OI anomaly classification.
+
+    Pure value object:
+    - no EventBus;
+    - no Scheduler;
+    - no logger;
+    - no side effects.
     """
 
     anomaly_type: OIAnomalyType
@@ -86,7 +130,7 @@ class AnomalyCandidate:
 
     def __post_init__(self) -> None:
         self.score = _clamp(self.score)
-        self.reasons = list(dict.fromkeys(self.reasons))
+        self.reasons = list(dict.fromkeys(self.reasons or []))
 
     @property
     def priority(self) -> int:
@@ -99,13 +143,14 @@ class AnomalyCandidate:
 
 class OIAnomalyDetector:
     """
-    Rule-based detector for Open Interest anomalies.
+    Rule-based detector for futures Open Interest anomalies.
 
     This is a pure domain service:
-    - no EventBus
-    - no Scheduler
-    - no logger
-    - no side effects
+    - no EventBus;
+    - no Scheduler;
+    - no logger;
+    - no IO;
+    - no mutable runtime state.
 
     It receives OIFeatures and returns OIAnomalyResult.
     """
@@ -221,11 +266,21 @@ class OIAnomalyDetector:
         if not candidates:
             return None
 
+        def effective_score(candidate: AnomalyCandidate) -> float:
+            if candidate.score < MIN_ANOMALY_SCORE:
+                return candidate.score
+
+            return _clamp(
+                candidate.score
+                + SPECIFIC_ANOMALY_BONUS.get(candidate.anomaly_type, 0.0)
+            )
+
         return max(
             candidates,
             key=lambda candidate: (
-                candidate.score,
+                effective_score(candidate),
                 candidate.priority,
+                candidate.score,
                 candidate.reasons_count,
             ),
         )
@@ -300,6 +355,24 @@ class OIAnomalyDetector:
             and features.volume_ratio >= self.thresholds.volume_confirmation_ratio
         )
 
+    def _has_elevated_volume(self, features: OIFeatures) -> bool:
+        return (
+            features.volume_ratio is not None
+            and features.volume_ratio >= ELEVATED_VOLUME_RATIO
+        )
+
+    def _has_high_volume(self, features: OIFeatures) -> bool:
+        return (
+            features.volume_ratio is not None
+            and features.volume_ratio >= HIGH_VOLUME_RATIO
+        )
+
+    def _has_weak_volume(self, features: OIFeatures) -> bool:
+        return (
+            features.volume_ratio is not None
+            and features.volume_ratio < WEAK_VOLUME_RATIO
+        )
+
     def _has_elevated_pressure(self, features: OIFeatures) -> bool:
         return (
             features.oi_pressure_score is not None
@@ -321,41 +394,103 @@ class OIAnomalyDetector:
             >= self.thresholds.squeeze_funding_abs_threshold
         )
 
+    def _has_positive_extreme_funding(self, features: OIFeatures) -> bool:
+        return (
+            features.funding_rate is not None
+            and features.funding_rate >= self.thresholds.squeeze_funding_abs_threshold
+        )
+
+    def _has_negative_extreme_funding(self, features: OIFeatures) -> bool:
+        return (
+            features.funding_rate is not None
+            and features.funding_rate <= -self.thresholds.squeeze_funding_abs_threshold
+        )
+
+    @staticmethod
+    def _has_large_liquidation_component(features: OIFeatures) -> bool:
+        return (
+            features.liquidation_imbalance is not None
+            and abs(features.liquidation_imbalance) >= LIQUIDATION_COMPONENT_ABS
+        )
+
+    @staticmethod
+    def _has_strong_liquidation_imbalance(features: OIFeatures) -> bool:
+        return (
+            features.liquidation_imbalance is not None
+            and abs(features.liquidation_imbalance) >= STRONG_LIQUIDATION_IMBALANCE_ABS
+        )
+
+    @staticmethod
+    def _has_extreme_aggressive_flow(features: OIFeatures) -> bool:
+        return (
+            features.aggressive_flow_imbalance is not None
+            and abs(features.aggressive_flow_imbalance) >= AGGRESSIVE_FLOW_EXTREME_ABS
+        )
+
+    def _is_positive_oi_shift(self, features: OIFeatures) -> bool:
+        return features.oi_delta_pct >= self.thresholds.squeeze_oi_build_pct
+
+    def _is_negative_oi_drop(self, features: OIFeatures) -> bool:
+        return features.oi_delta_pct <= -self.thresholds.deleveraging_oi_drop_pct
+
     # ------------------------------------------------------------------
     # Anomaly rules
     # ------------------------------------------------------------------
 
     def _detect_oi_spike(self, features: OIFeatures) -> AnomalyCandidate:
+        """
+        Broad positive OI spike.
+
+        This rule is intentionally broad, but its score is dampened when
+        the snapshot better matches structural volume dislocation, extreme
+        crowding, or funding imbalance.
+        """
         score = 0.0
         reasons: list[str] = []
 
         if self._is_positive_oi_extreme(features):
-            score += 0.34
+            score += 0.30
             reasons.append("positive_oi_zscore_extreme")
 
         if features.oi_delta_pct >= self.thresholds.min_oi_change_pct * 2.0:
-            score += 0.24
+            score += 0.22
             reasons.append("large_positive_oi_change")
 
         if _is_positive(features.oi_velocity):
-            score += 0.08
+            score += 0.07
             reasons.append("positive_oi_velocity")
 
         if _is_positive(features.oi_acceleration):
-            score += 0.08
+            score += 0.07
             reasons.append("positive_oi_acceleration")
 
         if self._has_volume_confirmation(features):
-            score += 0.08
+            score += 0.07
             reasons.append("volume_confirmation")
 
         if self._fast_oi_above_slow_oi(features):
-            score += 0.06
+            score += 0.05
             reasons.append("fast_oi_above_slow_oi")
 
         if self._has_elevated_pressure(features):
-            score += 0.06
+            score += 0.05
             reasons.append("pressure_score_elevated")
+
+        if (
+            self._has_weak_volume(features)
+            and features.oi_price_efficiency is not None
+            and abs(features.oi_price_efficiency) >= STRONG_OI_PRICE_EFFICIENCY
+        ):
+            score -= 0.10
+            reasons.append("structural_volume_dislocation_penalty")
+
+        if self._has_extreme_funding(features):
+            score -= 0.06
+            reasons.append("funding_specific_context_penalty")
+
+        if self._has_extreme_pressure(features) and self._has_large_liquidation_component(features):
+            score -= 0.08
+            reasons.append("crowding_specific_context_penalty")
 
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.OI_SPIKE,
@@ -364,36 +499,50 @@ class OIAnomalyDetector:
         )
 
     def _detect_oi_collapse(self, features: OIFeatures) -> AnomalyCandidate:
+        """
+        Broad negative OI collapse.
+
+        Risk-critical liquidation/deleveraging rules receive selector bonuses,
+        so this rule remains a broad fallback.
+        """
         score = 0.0
         reasons: list[str] = []
 
         if self._is_negative_oi_extreme(features):
-            score += 0.34
+            score += 0.32
             reasons.append("negative_oi_zscore_extreme")
 
         if features.oi_delta_pct <= -(self.thresholds.min_oi_change_pct * 2.0):
-            score += 0.24
+            score += 0.22
             reasons.append("large_negative_oi_change")
 
         if _is_negative(features.oi_velocity):
-            score += 0.08
+            score += 0.07
             reasons.append("negative_oi_velocity")
 
         if _is_negative(features.oi_acceleration):
-            score += 0.08
+            score += 0.07
             reasons.append("negative_oi_acceleration")
 
         if self._has_volume_confirmation(features):
-            score += 0.08
+            score += 0.07
             reasons.append("volume_confirmation")
 
         if self._fast_oi_below_slow_oi(features):
-            score += 0.06
+            score += 0.05
             reasons.append("fast_oi_below_slow_oi")
 
         if self._has_elevated_pressure(features):
-            score += 0.06
+            score += 0.05
             reasons.append("pressure_score_elevated")
+
+        if self._has_strong_liquidation_imbalance(features):
+            score -= 0.06
+            reasons.append("liquidation_specific_context_penalty")
+
+        if features.oi_delta_pct <= -self.thresholds.deleveraging_oi_drop_pct:
+            score -= 0.05
+            reasons.append("deleveraging_specific_context_penalty")
 
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.OI_COLLAPSE,
@@ -405,12 +554,28 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        Price moves meaningfully, but OI does not confirm the move.
+
+        Critical fix:
+        Without a meaningful price move this rule must not trigger. Otherwise
+        low-context noise can be misclassified as OI_PRICE_DISLOCATION.
+        """
+        if (
+            features.price_delta_pct is None
+            or abs(features.price_delta_pct) < self.thresholds.min_price_change_pct
+        ):
+            return AnomalyCandidate(
+                anomaly_type=OIAnomalyType.OI_PRICE_DISLOCATION,
+                score=0.0,
+                reasons=["price_move_not_meaningful"],
+            )
+
         score = 0.0
         reasons: list[str] = []
 
-        if _safe_abs(features.price_delta_pct) >= self.thresholds.min_price_change_pct:
-            score += 0.20
-            reasons.append("meaningful_price_move")
+        score += 0.20
+        reasons.append("meaningful_price_move")
 
         if (
             features.oi_price_efficiency is not None
@@ -426,7 +591,7 @@ class OIAnomalyDetector:
             score += 0.18
             reasons.append("flat_or_weak_oi_response")
 
-        if features.volume_ratio is not None and features.volume_ratio < WEAK_VOLUME_RATIO:
+        if self._has_weak_volume(features):
             score += 0.08
             reasons.append("weak_volume_context")
 
@@ -461,52 +626,52 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        Large OI movement with weak volume or abnormal OI-per-volume behavior.
+
+        This should beat broad OI_SPIKE when the setup is structural rather
+        than simply momentum-driven.
+        """
         score = 0.0
         reasons: list[str] = []
 
-        if self._has_volume_confirmation(features):
-            score += 0.24
-            reasons.append("elevated_volume")
+        weak_volume = self._has_weak_volume(features)
+        strong_oi_shift = (
+            abs(features.oi_delta_pct) >= self.thresholds.squeeze_oi_build_pct
+        )
+
+        if weak_volume and strong_oi_shift:
+            score += 0.34
+            reasons.append("large_oi_shift_on_weak_volume")
 
         if (
             features.oi_change_per_volume is not None
-            and abs(features.oi_change_per_volume) < VERY_SMALL_OI_PER_VOLUME
+            and abs(features.oi_change_per_volume) <= WEAK_OI_PER_VOLUME
         ):
-            score += 0.22
-            reasons.append("almost_no_oi_change_per_volume")
-
-        elif (
-            features.oi_change_per_volume is not None
-            and abs(features.oi_change_per_volume) < WEAK_OI_PER_VOLUME
-        ):
-            score += 0.16
-            reasons.append("weak_oi_change_relative_to_volume")
+            score += 0.18
+            reasons.append("abnormal_oi_per_volume")
 
         if (
-            abs(features.oi_delta_pct)
-            <= self.thresholds.divergence_max_oi_response_pct
+            features.oi_price_efficiency is not None
+            and abs(features.oi_price_efficiency) >= STRONG_OI_PRICE_EFFICIENCY
         ):
-            score += 0.14
-            reasons.append("flat_oi_response")
-
-        if _safe_abs(features.price_delta_pct) >= self.thresholds.min_price_change_pct:
-            score += 0.08
-            reasons.append("price_also_moving")
+            score += 0.20
+            reasons.append("high_oi_price_efficiency")
 
         if (
-            features.aggressive_flow_imbalance is not None
-            and abs(features.aggressive_flow_imbalance)
-            >= self.thresholds.aggressive_flow_confirmation
+            features.price_delta_pct is not None
+            and abs(features.price_delta_pct) < self.thresholds.min_price_change_pct
         ):
+            score += 0.12
+            reasons.append("price_compression")
+
+        if self._is_positive_oi_extreme(features) or self._is_negative_oi_extreme(features):
             score += 0.06
-            reasons.append("aggressive_flow_present")
+            reasons.append("oi_zscore_extreme")
 
-        if (
-            features.oi_zscore is not None
-            and abs(features.oi_zscore) < 0.75
-        ):
-            score += 0.06
-            reasons.append("oi_not_expanding_statistically")
+        if features.volume_ratio is None:
+            score -= 0.10
+            reasons.append("missing_volume_ratio_penalty")
 
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.OI_VOLUME_DISLOCATION,
@@ -518,6 +683,9 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        OI drop driven by liquidation pressure.
+        """
         score = 0.0
         reasons: list[str] = []
 
@@ -525,12 +693,8 @@ class OIAnomalyDetector:
             score += 0.28
             reasons.append("sharp_oi_drop")
 
-        if (
-            features.liquidation_imbalance is not None
-            and abs(features.liquidation_imbalance)
-            >= STRONG_LIQUIDATION_IMBALANCE_ABS
-        ):
-            score += 0.26
+        if self._has_strong_liquidation_imbalance(features):
+            score += 0.28
             reasons.append("strong_liquidation_imbalance")
 
         if (
@@ -540,7 +704,7 @@ class OIAnomalyDetector:
             score += 0.16
             reasons.append("large_price_move")
 
-        if features.volume_ratio is not None and features.volume_ratio >= HIGH_VOLUME_RATIO:
+        if self._has_high_volume(features):
             score += 0.10
             reasons.append("high_volume")
 
@@ -562,6 +726,13 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        Strong OI buildup that is overheated but not necessarily full crowding.
+
+        If funding-only imbalance is dominant, this rule is penalized so
+        FUNDING_OI_IMBALANCE can win. If funding + pressure + liquidation are
+        all extreme, this rule is penalized so EXTREME_CROWDING can win.
+        """
         score = 0.0
         reasons: list[str] = []
 
@@ -577,11 +748,11 @@ class OIAnomalyDetector:
             reasons.append("strong_oi_buildup")
 
         if self._has_extreme_funding(features):
-            score += 0.16
+            score += 0.13
             reasons.append("extreme_funding")
 
         if self._has_extreme_pressure(features):
-            score += 0.14
+            score += 0.12
             reasons.append("extreme_pressure_score")
 
         if features.volume_ratio is not None and features.volume_ratio >= 1.3:
@@ -599,6 +770,21 @@ class OIAnomalyDetector:
             score += 0.06
             reasons.append("oi_outpacing_price")
 
+        if (
+            self._has_extreme_funding(features)
+            and not self._has_extreme_pressure(features)
+        ):
+            score -= 0.16
+            reasons.append("funding_imbalance_context_penalty")
+
+        if (
+            self._has_extreme_funding(features)
+            and self._has_extreme_pressure(features)
+            and self._has_large_liquidation_component(features)
+        ):
+            score -= 0.12
+            reasons.append("extreme_crowding_context_penalty")
+
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.OVERHEATED_BUILDUP,
             score=score,
@@ -609,39 +795,50 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        Sudden market-wide deleveraging signature.
+        """
         score = 0.0
         reasons: list[str] = []
 
         if features.oi_delta_pct <= -self.thresholds.deleveraging_oi_drop_pct:
-            score += 0.30
-            reasons.append("sudden_oi_drop")
+            score += 0.34
+            reasons.append("deleveraging_sudden_oi_drop")
 
         if features.volume_ratio is not None and features.volume_ratio >= 1.4:
             score += 0.12
-            reasons.append("high_volume")
+            reasons.append("deleveraging_high_volume")
 
         if _safe_abs(features.price_delta_pct) >= self.thresholds.min_price_change_pct:
             score += 0.10
-            reasons.append("price_reaction_present")
+            reasons.append("deleveraging_price_reaction_present")
 
         if _is_negative(features.oi_velocity):
             score += 0.08
-            reasons.append("negative_oi_velocity")
+            reasons.append("deleveraging_negative_oi_velocity")
 
         if _is_negative(features.oi_acceleration):
             score += 0.08
-            reasons.append("negative_oi_acceleration")
+            reasons.append("deleveraging_negative_oi_acceleration")
 
-        if (
-            features.liquidation_imbalance is not None
-            and abs(features.liquidation_imbalance) >= LIQUIDATION_COMPONENT_ABS
-        ):
-            score += 0.10
-            reasons.append("liquidation_component_present")
+        if self._has_large_liquidation_component(features):
+            score += 0.11
+            reasons.append("deleveraging_liquidation_component_present")
 
         if self._is_negative_oi_extreme(features):
-            score += 0.08
-            reasons.append("negative_oi_zscore_extreme")
+            score += 0.09
+            reasons.append("deleveraging_negative_oi_zscore_extreme")
+
+        if self._has_negative_extreme_funding(features):
+            score += 0.10
+            reasons.append("deleveraging_extreme_negative_funding")
+
+        if (
+            features.oi_pressure_score is not None
+            and features.oi_pressure_score <= -self.thresholds.pressure_score_exhaustion_threshold
+        ):
+            score += 0.10
+            reasons.append("deleveraging_extreme_negative_pressure")
 
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.SUDDEN_DELEVERAGING,
@@ -653,45 +850,76 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        Funding/OI imbalance.
+
+        Critical fix:
+        This anomaly is hard-gated by extreme funding. Without extreme funding,
+        compressed price + weak OI response must not produce a funding anomaly.
+        """
         score = 0.0
         reasons: list[str] = []
 
-        if self._has_extreme_funding(features):
-            score += 0.28
-            reasons.append("extreme_funding")
+        if not self._has_extreme_funding(features):
+            return AnomalyCandidate(
+                anomaly_type=OIAnomalyType.FUNDING_OI_IMBALANCE,
+                score=0.0,
+                reasons=["funding_not_extreme"],
+            )
+
+        score += 0.36
+        reasons.append("funding_extreme")
 
         if (
-            abs(features.oi_delta_pct)
-            <= self.thresholds.divergence_max_oi_response_pct
+            features.funding_rate is not None
+            and features.funding_rate > 0
+            and features.oi_delta_pct < self.thresholds.min_oi_change_pct
         ):
-            score += 0.18
-            reasons.append("oi_not_following_funding_extreme")
+            score += 0.20
+            reasons.append("funding_positive_without_oi_expansion")
 
-        elif abs(features.oi_delta_pct) < self.thresholds.min_oi_change_pct:
+        if (
+            features.funding_rate is not None
+            and features.funding_rate < 0
+            and features.oi_delta_pct > -self.thresholds.min_oi_change_pct
+        ):
+            score += 0.20
+            reasons.append("funding_negative_without_oi_contraction")
+
+        if (
+            features.price_delta_pct is not None
+            and abs(features.price_delta_pct) < self.thresholds.min_price_change_pct
+        ):
             score += 0.12
-            reasons.append("weak_oi_response_to_funding")
+            reasons.append("funding_price_compression")
 
-        if _safe_abs(features.price_delta_pct) < self.thresholds.min_price_change_pct:
-            score += 0.10
-            reasons.append("price_compression")
-
-        if features.oi_zscore is not None and abs(features.oi_zscore) < 1.0:
+        if (
+            features.oi_zscore is not None
+            and abs(features.oi_zscore) < self.thresholds.anomaly_zscore_threshold
+        ):
             score += 0.08
-            reasons.append("oi_not_statistically_extreme")
+            reasons.append("funding_oi_not_statistically_extreme")
 
         if (
             features.oi_pressure_score is not None
-            and abs(features.oi_pressure_score) < WEAK_PRESSURE_ABS
+            and abs(features.oi_pressure_score) < self.thresholds.pressure_score_exhaustion_threshold
+        ):
+            score += 0.10
+            reasons.append("funding_without_extreme_pressure")
+
+        if (
+            features.oi_pressure_score is not None
+            and abs(features.oi_pressure_score) < self.thresholds.pressure_score_trend_threshold
         ):
             score += 0.08
-            reasons.append("pressure_not_confirming_crowding")
+            reasons.append("funding_pressure_not_confirming_crowding")
 
         if (
             features.volume_ratio is not None
             and features.volume_ratio < LIMITED_VOLUME_CONFIRMATION_RATIO
         ):
-            score += 0.06
-            reasons.append("limited_volume_confirmation")
+            score += 0.07
+            reasons.append("funding_limited_volume_confirmation")
 
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.FUNDING_OI_IMBALANCE,
@@ -703,52 +931,61 @@ class OIAnomalyDetector:
         self,
         features: OIFeatures,
     ) -> AnomalyCandidate:
+        """
+        Extreme crowding/crowded positioning context.
+
+        This should win over OVERHEATED_BUILDUP when funding, pressure and
+        liquidation/flow context are all extreme. It should not steal obvious
+        negative deleveraging events.
+        """
         score = 0.0
         reasons: list[str] = []
 
         if self._is_extreme_oi_extreme(features):
             score += 0.24
-            reasons.append("extreme_oi_zscore")
+            reasons.append("extreme_crowding_oi_zscore")
 
         if self._has_extreme_funding(features):
             score += 0.18
-            reasons.append("extreme_funding")
+            reasons.append("extreme_crowding_funding")
 
         if self._has_extreme_pressure(features):
-            score += 0.16
-            reasons.append("extreme_pressure")
+            score += 0.17
+            reasons.append("extreme_crowding_pressure")
+
+        if self._has_extreme_funding(features) and self._has_extreme_pressure(features):
+            score += 0.10
+            reasons.append("extreme_crowding_funding_pressure_combo")
 
         if (
             features.oi_delta_pct >= self.thresholds.squeeze_oi_build_pct
             or features.oi_delta_pct <= -self.thresholds.squeeze_oi_build_pct
         ):
             score += 0.12
-            reasons.append("strong_oi_shift")
+            reasons.append("extreme_crowding_strong_oi_shift")
 
-        if features.volume_ratio is not None and features.volume_ratio >= ELEVATED_VOLUME_RATIO:
+        if self._has_elevated_volume(features):
             score += 0.08
-            reasons.append("elevated_volume")
+            reasons.append("extreme_crowding_elevated_volume")
 
-        if (
-            features.aggressive_flow_imbalance is not None
-            and abs(features.aggressive_flow_imbalance) >= AGGRESSIVE_FLOW_EXTREME_ABS
-        ):
+        if self._has_extreme_aggressive_flow(features):
             score += 0.08
-            reasons.append("aggressive_flow_imbalance")
+            reasons.append("extreme_crowding_aggressive_flow_imbalance")
 
-        if (
-            features.liquidation_imbalance is not None
-            and abs(features.liquidation_imbalance) >= LIQUIDATION_COMPONENT_ABS
-        ):
-            score += 0.06
-            reasons.append("liquidation_imbalance")
+        if self._has_large_liquidation_component(features):
+            score += 0.07
+            reasons.append("extreme_crowding_liquidation_imbalance")
 
         if (
             features.oi_price_efficiency is not None
             and abs(features.oi_price_efficiency) > STRONG_OI_PRICE_EFFICIENCY
         ):
             score += 0.06
-            reasons.append("oi_outpacing_price")
+            reasons.append("extreme_crowding_oi_outpacing_price")
+
+        if features.oi_delta_pct <= -self.thresholds.deleveraging_oi_drop_pct:
+            score -= 0.25
+            reasons.append("deleveraging_context_penalty")
 
         return AnomalyCandidate(
             anomaly_type=OIAnomalyType.EXTREME_CROWDING,

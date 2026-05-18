@@ -47,6 +47,10 @@ class OIInstrumentBuffers:
 
     All series are stored in chronological order:
         oldest -> newest.
+
+    Important:
+    WebSocket/cache events may arrive out of order. Buffers therefore insert
+    values by timestamp instead of blindly appending to the tail.
     """
 
     oi_values: deque[float]
@@ -61,16 +65,65 @@ class OIInstrumentBuffers:
     feature_history: deque[OIFeatures]
 
     def append_oi(self, oi: float, timestamp: float) -> None:
-        self.oi_values.append(float(oi))
-        self.oi_timestamps.append(float(timestamp))
+        self._insert_chronological(
+            values=self.oi_values,
+            timestamps=self.oi_timestamps,
+            value=oi,
+            timestamp=timestamp,
+        )
 
     def append_price(self, price: float, timestamp: float) -> None:
-        self.price_values.append(float(price))
-        self.price_timestamps.append(float(timestamp))
+        self._insert_chronological(
+            values=self.price_values,
+            timestamps=self.price_timestamps,
+            value=price,
+            timestamp=timestamp,
+        )
 
     def append_volume(self, volume: float, timestamp: float) -> None:
-        self.volume_values.append(float(volume))
-        self.volume_timestamps.append(float(timestamp))
+        self._insert_chronological(
+            values=self.volume_values,
+            timestamps=self.volume_timestamps,
+            value=volume,
+            timestamp=timestamp,
+        )
+
+    @staticmethod
+    def _insert_chronological(
+        *,
+        values: deque[float],
+        timestamps: deque[float],
+        value: float,
+        timestamp: float,
+    ) -> None:
+        value_f = float(value)
+        timestamp_f = float(timestamp)
+
+        if not math.isfinite(value_f) or not math.isfinite(timestamp_f):
+            return
+
+        value_items = list(values)
+        timestamp_items = list(timestamps)
+
+        insert_at = len(timestamp_items)
+        for idx, existing_ts in enumerate(timestamp_items):
+            if timestamp_f < existing_ts:
+                insert_at = idx
+                break
+
+        value_items.insert(insert_at, value_f)
+        timestamp_items.insert(insert_at, timestamp_f)
+
+        maxlen = values.maxlen
+        if maxlen is not None:
+            while len(value_items) > maxlen:
+                value_items.pop(0)
+                timestamp_items.pop(0)
+
+        values.clear()
+        timestamps.clear()
+        values.extend(value_items)
+        timestamps.extend(timestamp_items)
 
 
 @dataclass(slots=True)
@@ -166,28 +219,8 @@ class OIAnalyzer:
     - emit analytics.oi.* events through EventBus;
     - schedule cleanup/metrics jobs through Scheduler.
 
-    This class is infrastructure-aware and is the only Open Interest analytics
-    class that should depend on core.EventBus / core.Scheduler.
-
-    Correct data flow:
-        OpenInterestCache    -> market.open_interest.updated
-        CandlesCache         -> market.candle.closed / market.candles.updated
-        TradesCache          -> market.trades.updated
-        FundingCache         -> market.funding.updated
-        OrderflowAnalyzer    -> analytics.orderflow.updated
-        LiquidationsAnalyzer -> analytics.liquidations.updated
-
-        OIAnalyzer -> analytics.oi.*
-
     Scope:
         exchange + market_type + symbol + timeframe
-
-    This class does NOT:
-    - read exchange WebSocket/REST directly;
-    - subscribe to raw market.open_interest / market.candle / market.trade;
-    - call strategy/risk/execution directly;
-    - own EventBus/Scheduler lifecycle;
-    - start uncontrolled background loops.
     """
 
     def __init__(
@@ -237,12 +270,6 @@ class OIAnalyzer:
     # ------------------------------------------------------------------
 
     def register(self) -> None:
-        """
-        Register EventBus subscriptions and optional Scheduler jobs.
-
-        EventBus and Scheduler lifecycles are managed by the application
-        bootstrap/container, not by this class.
-        """
         if self._registered:
             self.logger.warning("OIAnalyzer already registered")
             return
@@ -269,11 +296,6 @@ class OIAnalyzer:
         )
 
     def unregister(self) -> None:
-        """
-        Remove EventBus subscriptions and scheduler jobs.
-
-        Scheduler itself remains owned by the application container.
-        """
         for subscription in list(self._subscriptions):
             try:
                 self.event_bus.unsubscribe(subscription)
@@ -437,12 +459,6 @@ class OIAnalyzer:
     # ------------------------------------------------------------------
 
     async def on_open_interest(self, event: Event) -> None:
-        """
-        Main OI analysis trigger.
-
-        Expected source:
-            OpenInterestCache -> market.open_interest.updated
-        """
         if not self.config.enabled:
             return
 
@@ -541,12 +557,6 @@ class OIAnalyzer:
             )
 
     async def on_candle(self, event: Event) -> None:
-        """
-        Price/volume context from CandlesCache.
-
-        Expected source:
-            CandlesCache -> market.candle.closed
-        """
         if not self.config.enabled:
             return
 
@@ -566,14 +576,6 @@ class OIAnalyzer:
             )
 
     async def on_candles_updated(self, event: Event) -> None:
-        """
-        Optional batch/snapshot candle context from CandlesCache.
-
-        Supports:
-            payload["candles"] = [...]
-        or:
-            payload as one candle-like mapping.
-        """
         if not self.config.enabled:
             return
 
@@ -623,15 +625,6 @@ class OIAnalyzer:
             )
 
     async def on_trades_updated(self, event: Event) -> None:
-        """
-        Optional fallback context from TradesCache.
-
-        Preferred source for orderflow is analytics.orderflow.updated, but
-        market.trades.updated can still provide:
-        - last price;
-        - volume;
-        - basic aggressive buy/sell flow.
-        """
         if not self.config.enabled:
             return
 
@@ -681,12 +674,6 @@ class OIAnalyzer:
             )
 
     async def on_funding(self, event: Event) -> None:
-        """
-        Funding context from FundingCache.
-
-        Expected source:
-            FundingCache -> market.funding.updated
-        """
         if not self.config.enabled:
             return
 
@@ -736,9 +723,12 @@ class OIAnalyzer:
             if next_funding_time_ms is not None:
                 context.next_funding_time_ms = next_funding_time_ms
 
-            context.timestamp = timestamp
+            self._advance_context_timestamp(
+                key=key,
+                context=context,
+                timestamp=timestamp,
+            )
             context.source = str(payload.get("source") or "funding_cache")
-            self._last_context_ts[key] = timestamp
 
             state = self._get_or_create_state(key)
             state.apply_context(context)
@@ -753,12 +743,6 @@ class OIAnalyzer:
             )
 
     async def on_liquidation(self, event: Event) -> None:
-        """
-        Liquidation context from analytics liquidations layer.
-
-        Expected source:
-            LiquidationsAnalyzer -> analytics.liquidations.updated
-        """
         if not self.config.enabled:
             return
 
@@ -807,9 +791,12 @@ class OIAnalyzer:
                 elif normalized_side in {"short", "sell"}:
                     context.short_liquidations = qty
 
-            context.timestamp = timestamp
+            self._advance_context_timestamp(
+                key=key,
+                context=context,
+                timestamp=timestamp,
+            )
             context.source = str(payload.get("source") or "liquidations_analytics")
-            self._last_context_ts[key] = timestamp
 
             state = self._get_or_create_state(key)
             state.apply_context(context)
@@ -824,12 +811,6 @@ class OIAnalyzer:
             )
 
     async def on_orderflow_update(self, event: Event) -> None:
-        """
-        Preferred aggressive flow / CVD context.
-
-        Expected source:
-            OrderflowAnalyzer -> analytics.orderflow.updated
-        """
         if not self.config.enabled:
             return
 
@@ -871,9 +852,12 @@ class OIAnalyzer:
             if aggressive_sell_volume is not None:
                 context.aggressive_sell_volume = aggressive_sell_volume
 
-            context.timestamp = timestamp
+            self._advance_context_timestamp(
+                key=key,
+                context=context,
+                timestamp=timestamp,
+            )
             context.source = str(payload.get("source") or "orderflow_analytics")
-            self._last_context_ts[key] = timestamp
 
             state = self._get_or_create_state(key)
             state.apply_context(context)
@@ -892,11 +876,6 @@ class OIAnalyzer:
     # ------------------------------------------------------------------
 
     async def cleanup_stale_state(self) -> None:
-        """
-        Scheduled cleanup job.
-
-        This should be run by core.scheduler.Scheduler.add_interval_job().
-        """
         self._stats.cleanup_runs += 1
 
         now_ts = self._now()
@@ -950,11 +929,6 @@ class OIAnalyzer:
                 self._stats.emitted_state_cleaned += 1
 
     async def emit_metrics(self) -> None:
-        """
-        Scheduled metrics job.
-
-        This should be run by core.scheduler.Scheduler.add_interval_job().
-        """
         accepted = await self._emit(
             self.config.metrics_topic,
             self.stats(),
@@ -1596,32 +1570,35 @@ class OIAnalyzer:
 
         if close_price is not None:
             buffers.append_price(close_price, timestamp)
-            self._update_price_context(
+            self._refresh_price_context_from_buffers(
                 context=context,
                 buffers=buffers,
-                price=close_price,
             )
-
-        if mark_price is not None:
-            context.mark_price = mark_price
-
-        if index_price is not None:
-            context.index_price = index_price
 
         if volume is not None and volume >= 0:
             buffers.append_volume(volume, timestamp)
-            self._update_volume_context(
+            self._refresh_volume_context_from_buffers(
                 context=context,
                 buffers=buffers,
-                volume=volume,
             )
 
-        if quote_volume is not None and quote_volume >= 0:
-            context.quote_volume = quote_volume
+        if self._is_current_or_new_context_timestamp(key, timestamp):
+            if mark_price is not None:
+                context.mark_price = mark_price
 
-        context.timestamp = timestamp
-        context.source = str(payload.get("source") or "candles_cache")
-        self._last_context_ts[key] = timestamp
+            if index_price is not None:
+                context.index_price = index_price
+
+            if quote_volume is not None and quote_volume >= 0:
+                context.quote_volume = quote_volume
+
+            context.source = str(payload.get("source") or "candles_cache")
+
+        self._advance_context_timestamp(
+            key=key,
+            context=context,
+            timestamp=timestamp,
+        )
 
         state = self._get_or_create_state(key)
         state.apply_context(context)
@@ -1646,32 +1623,108 @@ class OIAnalyzer:
 
         if price is not None:
             buffers.append_price(price, timestamp)
-            self._update_price_context(
+            self._refresh_price_context_from_buffers(
                 context=context,
                 buffers=buffers,
-                price=price,
             )
 
         if qty is not None and qty >= 0:
             buffers.append_volume(qty, timestamp)
-            self._update_volume_context(
+            self._refresh_volume_context_from_buffers(
                 context=context,
                 buffers=buffers,
-                volume=qty,
-            )
-            self._update_aggressive_flow_context(
-                context=context,
-                side=side,
-                qty=qty,
             )
 
-        context.timestamp = timestamp
-        context.source = str(payload.get("source") or "trades_cache")
-        self._last_context_ts[key] = timestamp
+            if self._is_current_or_new_context_timestamp(key, timestamp):
+                self._update_aggressive_flow_context(
+                    context=context,
+                    side=side,
+                    qty=qty,
+                )
+
+        if self._is_current_or_new_context_timestamp(key, timestamp):
+            context.source = str(payload.get("source") or "trades_cache")
+
+        self._advance_context_timestamp(
+            key=key,
+            context=context,
+            timestamp=timestamp,
+        )
 
         state = self._get_or_create_state(key)
         state.apply_context(context)
         return True
+
+    def _refresh_price_context_from_buffers(
+        self,
+        *,
+        context: OIMarketContext,
+        buffers: OIInstrumentBuffers,
+    ) -> None:
+        if not buffers.price_values:
+            return
+
+        latest_price = float(buffers.price_values[-1])
+        previous_price = (
+            float(buffers.price_values[-2])
+            if len(buffers.price_values) >= 2
+            else None
+        )
+
+        context.price = latest_price
+
+        if previous_price is not None:
+            context.price_delta = latest_price - previous_price
+            if abs(previous_price) > 1e-12:
+                context.price_delta_pct = (
+                    (latest_price - previous_price) / abs(previous_price)
+                ) * 100.0
+
+    def _refresh_volume_context_from_buffers(
+        self,
+        *,
+        context: OIMarketContext,
+        buffers: OIInstrumentBuffers,
+    ) -> None:
+        if not buffers.volume_values:
+            return
+
+        latest_volume = float(buffers.volume_values[-1])
+        context.volume = latest_volume
+
+        volume_ma = self.feature_builder.compute_moving_average(
+            list(buffers.volume_values),
+            self.config.windows.volume_window,
+        )
+        context.volume_ma = volume_ma
+        context.volume_ratio = self.feature_builder.compute_volume_ratio(
+            latest_volume,
+            volume_ma,
+        )
+
+    def _advance_context_timestamp(
+        self,
+        *,
+        key: OIKey,
+        context: OIMarketContext,
+        timestamp: float,
+    ) -> None:
+        current_ts = self._last_context_ts.get(key)
+
+        if current_ts is None or timestamp >= current_ts:
+            context.timestamp = timestamp
+            self._last_context_ts[key] = timestamp
+            return
+
+        context.timestamp = current_ts
+
+    def _is_current_or_new_context_timestamp(
+        self,
+        key: OIKey,
+        timestamp: float,
+    ) -> bool:
+        current_ts = self._last_context_ts.get(key)
+        return current_ts is None or timestamp >= current_ts
 
     def _update_price_context(
         self,
@@ -1680,20 +1733,11 @@ class OIAnalyzer:
         buffers: OIInstrumentBuffers,
         price: float,
     ) -> None:
-        previous_price = (
-            float(buffers.price_values[-2])
-            if len(buffers.price_values) >= 2
-            else None
+        buffers.append_price(price, context.timestamp)
+        self._refresh_price_context_from_buffers(
+            context=context,
+            buffers=buffers,
         )
-
-        context.price = price
-
-        if previous_price is not None:
-            context.price_delta = price - previous_price
-            if abs(previous_price) > 1e-12:
-                context.price_delta_pct = (
-                    (price - previous_price) / abs(previous_price)
-                ) * 100.0
 
     def _update_volume_context(
         self,
@@ -1702,16 +1746,10 @@ class OIAnalyzer:
         buffers: OIInstrumentBuffers,
         volume: float,
     ) -> None:
-        context.volume = volume
-
-        volume_ma = self.feature_builder.compute_moving_average(
-            list(buffers.volume_values),
-            self.config.windows.volume_window,
-        )
-        context.volume_ma = volume_ma
-        context.volume_ratio = self.feature_builder.compute_volume_ratio(
-            volume,
-            volume_ma,
+        buffers.append_volume(volume, context.timestamp)
+        self._refresh_volume_context_from_buffers(
+            context=context,
+            buffers=buffers,
         )
 
     @staticmethod
@@ -1881,7 +1919,7 @@ class OIAnalyzer:
 
             try:
                 value = float(payload[key])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
 
             if math.isfinite(value):

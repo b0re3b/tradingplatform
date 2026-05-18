@@ -9,6 +9,7 @@ from .config import OIAnalyzerConfig
 from .enums import OIDirection, OIDivergenceType
 from .models import OIDivergenceResult, OIFeatures
 
+
 MIN_DIVERGENCE_SCORE: Final[float] = 0.35
 MIN_DIVERGENCE_WINDOW_SIZE: Final[int] = 3
 
@@ -16,22 +17,24 @@ WEAK_VOLUME_RATIO: Final[float] = 1.0
 WEAK_PRESSURE_UPPER: Final[float] = 0.20
 WEAK_PRESSURE_LOWER: Final[float] = -0.20
 
+# Must stay small: confidence should remain the primary selector key.
+EXHAUSTION_SELECTION_BONUS: Final[float] = 0.005
+
+EXHAUSTION_EFFICIENCY_THRESHOLD: Final[float] = 1.25
+EXHAUSTION_LIQUIDATION_THRESHOLD: Final[float] = 0.35
+
 DIVERGENCE_PRIORITY: Final[dict[OIDivergenceType, int]] = {
-    # Exhaustion signals are usually the most actionable/risk-relevant.
     OIDivergenceType.EXHAUSTION_UP: 100,
     OIDivergenceType.EXHAUSTION_DOWN: 100,
 
-    # Weak breakout/breakdown warnings are also highly specific.
     OIDivergenceType.WEAK_BREAKOUT_UP: 90,
     OIDivergenceType.WEAK_BREAKOUT_DOWN: 90,
 
-    # Explicit price/OI disagreement.
     OIDivergenceType.PRICE_UP_OI_DOWN: 80,
     OIDivergenceType.PRICE_DOWN_OI_DOWN: 80,
     OIDivergenceType.PRICE_UP_OI_FLAT: 75,
     OIDivergenceType.PRICE_DOWN_OI_FLAT: 75,
 
-    # Broad contextual bullish/bearish divergence.
     OIDivergenceType.BULLISH: 65,
     OIDivergenceType.BEARISH: 65,
 
@@ -45,7 +48,7 @@ def _to_float(value: float | int | str | None) -> float | None:
 
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
     if not math.isfinite(result):
@@ -59,7 +62,17 @@ def _clamp(
     low: float = 0.0,
     high: float = 1.0,
 ) -> float:
-    return max(low, min(high, float(value)))
+    if low > high:
+        raise ValueError("low must be <= high")
+
+    if not math.isfinite(float(low)) or not math.isfinite(float(high)):
+        raise ValueError("clamp bounds must be finite")
+
+    number = _to_float(value)
+    if number is None:
+        return low
+
+    return max(low, min(high, number))
 
 
 def _mean(values: Sequence[float | None]) -> float | None:
@@ -129,6 +142,22 @@ class DivergenceWindowSummary:
                 f"window_size must be >= {MIN_DIVERGENCE_WINDOW_SIZE}"
             )
 
+        self.price_delta_pct_total = _to_float(self.price_delta_pct_total)
+        self.oi_delta_pct_total = _to_float(self.oi_delta_pct_total)
+        self.avg_volume_ratio = _to_float(self.avg_volume_ratio)
+        self.avg_oi_zscore = _to_float(self.avg_oi_zscore)
+        self.avg_pressure_score = _to_float(self.avg_pressure_score)
+        self.avg_funding_rate = _to_float(self.avg_funding_rate)
+        self.avg_liquidation_imbalance = _to_float(
+            self.avg_liquidation_imbalance
+        )
+        self.avg_aggressive_flow_imbalance = _to_float(
+            self.avg_aggressive_flow_imbalance
+        )
+        self.avg_oi_price_efficiency = _to_float(
+            self.avg_oi_price_efficiency
+        )
+
     @property
     def price_direction(self) -> OIDirection:
         return _direction_from_delta(self.price_delta_pct_total)
@@ -152,11 +181,11 @@ class DivergenceCandidate:
 
     @property
     def confidence(self) -> float:
-        return self.result.confidence
+        return _clamp(self.result.confidence)
 
     @property
     def score(self) -> float:
-        return float(self.result.score or 0.0)
+        return _clamp(float(self.result.score or 0.0))
 
     @property
     def priority(self) -> int:
@@ -172,10 +201,10 @@ class OIDivergenceDetector:
     Rule-based detector for divergences between price action and Open Interest.
 
     This is a pure domain service:
-    - no EventBus
-    - no Scheduler
-    - no logger
-    - no side effects
+    - no EventBus;
+    - no Scheduler;
+    - no logger;
+    - no side effects.
 
     It receives historical OIFeatures and returns OIDivergenceResult.
     """
@@ -330,10 +359,25 @@ class OIDivergenceDetector:
         if not candidates:
             return None
 
+        def effective_confidence(candidate: DivergenceCandidate) -> float:
+            confidence = candidate.confidence
+
+            if (
+                candidate.divergence_type
+                in {
+                    OIDivergenceType.EXHAUSTION_UP,
+                    OIDivergenceType.EXHAUSTION_DOWN,
+                }
+                and candidate.score >= MIN_DIVERGENCE_SCORE
+            ):
+                confidence += EXHAUSTION_SELECTION_BONUS
+
+            return _clamp(confidence)
+
         return max(
             candidates,
             key=lambda candidate: (
-                candidate.confidence,
+                effective_confidence(candidate),
                 candidate.score,
                 candidate.priority,
                 candidate.reasons_count,
@@ -363,7 +407,7 @@ class OIDivergenceDetector:
     ) -> OIDivergenceResult:
         score = _clamp(score)
         detected = score >= MIN_DIVERGENCE_SCORE
-        normalized_reasons = list(dict.fromkeys(reasons))
+        normalized_reasons = list(dict.fromkeys(reasons or []))
 
         return OIDivergenceResult(
             detected=detected,
@@ -402,6 +446,16 @@ class OIDivergenceDetector:
             <= -self.thresholds.divergence_max_oi_response_pct
         )
 
+    def _is_up_oi_response(
+        self,
+        oi_delta_pct_total: float | None,
+    ) -> bool:
+        return (
+            oi_delta_pct_total is not None
+            and oi_delta_pct_total
+            >= self.thresholds.divergence_max_oi_response_pct
+        )
+
     def _is_weak_volume(
         self,
         avg_volume_ratio: float | None,
@@ -428,6 +482,42 @@ class OIDivergenceDetector:
             price_delta_pct_total is not None
             and abs(price_delta_pct_total)
             >= self.thresholds.divergence_min_price_move_pct
+        )
+
+    def _is_extreme_positive_funding(
+        self,
+        avg_funding_rate: float | None,
+    ) -> bool:
+        return (
+            avg_funding_rate is not None
+            and avg_funding_rate >= self.thresholds.squeeze_funding_abs_threshold
+        )
+
+    def _is_extreme_negative_funding(
+        self,
+        avg_funding_rate: float | None,
+    ) -> bool:
+        return (
+            avg_funding_rate is not None
+            and avg_funding_rate <= -self.thresholds.squeeze_funding_abs_threshold
+        )
+
+    def _is_extreme_positive_pressure(
+        self,
+        avg_pressure_score: float | None,
+    ) -> bool:
+        return (
+            avg_pressure_score is not None
+            and avg_pressure_score >= self.thresholds.pressure_score_exhaustion_threshold
+        )
+
+    def _is_extreme_negative_pressure(
+        self,
+        avg_pressure_score: float | None,
+    ) -> bool:
+        return (
+            avg_pressure_score is not None
+            and avg_pressure_score <= -self.thresholds.pressure_score_exhaustion_threshold
         )
 
     # ------------------------------------------------------------------
@@ -529,6 +619,17 @@ class OIDivergenceDetector:
             score += 0.06
             reasons.append("oi_not_expanding_with_down_move")
 
+        if (
+            self._is_extreme_negative_pressure(window.avg_pressure_score)
+            or self._is_extreme_negative_funding(window.avg_funding_rate)
+            or (
+                window.avg_oi_zscore is not None
+                and window.avg_oi_zscore <= -self.thresholds.anomaly_zscore_threshold
+            )
+        ):
+            score -= 0.06
+            reasons.append("exhaustion_specific_context_penalty")
+
         return self._make_result(
             window=window,
             divergence_type=OIDivergenceType.PRICE_DOWN_OI_DOWN,
@@ -552,7 +653,7 @@ class OIDivergenceDetector:
             reasons.append("price_trending_up")
 
         if self._is_flat_oi_response(window.oi_delta_pct_total):
-            score += 0.28
+            score += 0.30
             reasons.append("oi_flat_response")
 
         if self._is_weak_volume(window.avg_volume_ratio):
@@ -572,6 +673,18 @@ class OIDivergenceDetector:
         ):
             score += 0.05
             reasons.append("oi_not_statistically_expanding")
+
+        # If the latest bar is a clear weak breakout, this window-level label
+        # should not suppress WEAK_BREAKOUT_UP.
+        latest = window.latest
+        if (
+            latest.price_delta_pct is not None
+            and latest.price_delta_pct >= self.thresholds.divergence_min_price_move_pct
+            and latest.volume_ratio is not None
+            and latest.volume_ratio < WEAK_VOLUME_RATIO
+        ):
+            score -= 0.10
+            reasons.append("latest_weak_breakout_specific_context_penalty")
 
         return self._make_result(
             window=window,
@@ -596,7 +709,7 @@ class OIDivergenceDetector:
             reasons.append("price_trending_down")
 
         if self._is_flat_oi_response(window.oi_delta_pct_total):
-            score += 0.28
+            score += 0.30
             reasons.append("oi_flat_response")
 
         if self._is_weak_volume(window.avg_volume_ratio):
@@ -616,6 +729,18 @@ class OIDivergenceDetector:
         ):
             score += 0.05
             reasons.append("oi_not_statistically_expanding")
+
+        # If the latest bar is a clear weak breakdown, this window-level label
+        # should not suppress WEAK_BREAKOUT_DOWN.
+        latest = window.latest
+        if (
+            latest.price_delta_pct is not None
+            and latest.price_delta_pct <= -self.thresholds.divergence_min_price_move_pct
+            and latest.volume_ratio is not None
+            and latest.volume_ratio < WEAK_VOLUME_RATIO
+        ):
+            score -= 0.10
+            reasons.append("latest_weak_breakdown_specific_context_penalty")
 
         return self._make_result(
             window=window,
@@ -637,38 +762,38 @@ class OIDivergenceDetector:
             and latest.price_delta_pct
             >= self.thresholds.divergence_min_price_move_pct
         ):
-            score += 0.26
-            reasons.append("latest_up_move")
+            score += 0.27
+            reasons.append("weak_latest_up_move")
 
         if latest.price_direction == OIDirection.UP:
-            score += 0.10
-            reasons.append("latest_price_direction_up")
+            score += 0.08
+            reasons.append("weak_latest_price_direction_up")
 
         if latest.oi_delta_pct <= self.thresholds.divergence_max_oi_response_pct:
-            score += 0.24
-            reasons.append("latest_oi_not_confirming_breakout")
+            score += 0.22
+            reasons.append("weak_latest_oi_not_confirming_breakout")
 
-        if latest.volume_ratio is not None and latest.volume_ratio < 1.0:
-            score += 0.12
-            reasons.append("latest_breakout_on_weak_volume")
+        if latest.volume_ratio is not None and latest.volume_ratio < WEAK_VOLUME_RATIO:
+            score += 0.14
+            reasons.append("weak_latest_breakout_on_weak_volume")
 
         if (
             latest.aggressive_flow_imbalance is not None
             and latest.aggressive_flow_imbalance < 0.08
         ):
-            score += 0.08
-            reasons.append("insufficient_aggressive_buy_flow")
+            score += 0.09
+            reasons.append("weak_insufficient_aggressive_buy_flow")
 
         if (
             latest.oi_price_efficiency is not None
             and abs(latest.oi_price_efficiency) < 0.35
         ):
-            score += 0.08
+            score += 0.09
             reasons.append("weak_oi_price_efficiency")
 
         if latest.oi_zscore is not None and abs(latest.oi_zscore) < 0.75:
-            score += 0.06
-            reasons.append("no_oi_expansion_extreme")
+            score += 0.05
+            reasons.append("weak_no_oi_expansion_extreme")
 
         return self._make_result(
             window=window,
@@ -690,38 +815,38 @@ class OIDivergenceDetector:
             and latest.price_delta_pct
             <= -self.thresholds.divergence_min_price_move_pct
         ):
-            score += 0.26
-            reasons.append("latest_down_move")
+            score += 0.27
+            reasons.append("weak_latest_down_move")
 
         if latest.price_direction == OIDirection.DOWN:
-            score += 0.10
-            reasons.append("latest_price_direction_down")
+            score += 0.08
+            reasons.append("weak_latest_price_direction_down")
 
         if latest.oi_delta_pct >= -self.thresholds.divergence_max_oi_response_pct:
-            score += 0.24
-            reasons.append("latest_oi_not_confirming_breakdown")
+            score += 0.22
+            reasons.append("weak_latest_oi_not_confirming_breakdown")
 
-        if latest.volume_ratio is not None and latest.volume_ratio < 1.0:
-            score += 0.12
-            reasons.append("latest_breakdown_on_weak_volume")
+        if latest.volume_ratio is not None and latest.volume_ratio < WEAK_VOLUME_RATIO:
+            score += 0.14
+            reasons.append("weak_latest_breakdown_on_weak_volume")
 
         if (
             latest.aggressive_flow_imbalance is not None
             and latest.aggressive_flow_imbalance > -0.08
         ):
-            score += 0.08
-            reasons.append("insufficient_aggressive_sell_flow")
+            score += 0.09
+            reasons.append("weak_insufficient_aggressive_sell_flow")
 
         if (
             latest.oi_price_efficiency is not None
             and abs(latest.oi_price_efficiency) < 0.35
         ):
-            score += 0.08
+            score += 0.09
             reasons.append("weak_oi_price_efficiency")
 
         if latest.oi_zscore is not None and abs(latest.oi_zscore) < 0.75:
-            score += 0.06
-            reasons.append("no_oi_expansion_extreme")
+            score += 0.05
+            reasons.append("weak_no_oi_expansion_extreme")
 
         return self._make_result(
             window=window,
@@ -734,58 +859,56 @@ class OIDivergenceDetector:
         self,
         window: DivergenceWindowSummary,
     ) -> OIDivergenceResult:
-        latest = window.latest
         score = 0.0
         reasons: list[str] = []
 
         if (
-            window.price_delta_pct_total is not None
-            and window.price_delta_pct_total
-            > self.thresholds.divergence_min_price_move_pct
+            window.price_direction is OIDirection.UP
+            and self._is_strong_price_move(window.price_delta_pct_total)
         ):
-            score += 0.24
-            reasons.append("uptrend_present")
+            score += 0.18
+            reasons.append("exhaustion_price_trending_up")
+
+        if window.oi_direction is OIDirection.UP:
+            score += 0.12
+            reasons.append("exhaustion_oi_expanding")
 
         if (
-            self._is_down_oi_response(window.oi_delta_pct_total)
-            or self._is_flat_oi_response(window.oi_delta_pct_total)
+            window.avg_oi_zscore is not None
+            and window.avg_oi_zscore >= self.thresholds.anomaly_zscore_threshold
         ):
-            score += 0.22
-            reasons.append("oi_failing_to_support_uptrend")
+            score += 0.16
+            reasons.append("exhaustion_elevated_oi_zscore")
 
-        if latest.oi_acceleration is not None and latest.oi_acceleration < 0:
+        if self._is_extreme_positive_pressure(window.avg_pressure_score):
+            score += 0.18
+            reasons.append("exhaustion_extreme_positive_pressure")
+
+        if self._is_extreme_positive_funding(window.avg_funding_rate):
+            score += 0.14
+            reasons.append("exhaustion_extreme_positive_funding")
+
+        if (
+            window.avg_liquidation_imbalance is not None
+            and window.avg_liquidation_imbalance >= EXHAUSTION_LIQUIDATION_THRESHOLD
+        ):
             score += 0.10
-            reasons.append("negative_oi_acceleration")
+            reasons.append("exhaustion_short_liquidation_pressure")
 
-        if latest.oi_velocity is not None and latest.oi_velocity < 0:
+        if (
+            window.avg_aggressive_flow_imbalance is not None
+            and window.avg_aggressive_flow_imbalance
+            >= self.thresholds.aggressive_flow_confirmation
+        ):
             score += 0.08
-            reasons.append("negative_oi_velocity")
-
-        if self._is_weak_volume(window.avg_volume_ratio):
-            score += 0.10
-            reasons.append("fading_volume")
+            reasons.append("exhaustion_aggressive_buy_flow")
 
         if (
-            window.avg_funding_rate is not None
-            and window.avg_funding_rate
-            >= self.thresholds.funding_extreme_positive
-        ):
-            score += 0.10
-            reasons.append("crowded_positive_funding")
-
-        if (
-            window.avg_pressure_score is not None
-            and window.avg_pressure_score < WEAK_PRESSURE_UPPER
+            window.avg_oi_price_efficiency is not None
+            and window.avg_oi_price_efficiency >= EXHAUSTION_EFFICIENCY_THRESHOLD
         ):
             score += 0.08
-            reasons.append("pressure_fading")
-
-        if (
-            latest.aggressive_flow_imbalance is not None
-            and latest.aggressive_flow_imbalance < 0.05
-        ):
-            score += 0.05
-            reasons.append("buy_aggression_fading")
+            reasons.append("exhaustion_high_oi_price_efficiency")
 
         return self._make_result(
             window=window,
@@ -798,58 +921,56 @@ class OIDivergenceDetector:
         self,
         window: DivergenceWindowSummary,
     ) -> OIDivergenceResult:
-        latest = window.latest
         score = 0.0
         reasons: list[str] = []
 
         if (
-            window.price_delta_pct_total is not None
-            and window.price_delta_pct_total
-            < -self.thresholds.divergence_min_price_move_pct
-        ):
-            score += 0.24
-            reasons.append("downtrend_present")
-
-        if (
-            self._is_down_oi_response(window.oi_delta_pct_total)
-            or self._is_flat_oi_response(window.oi_delta_pct_total)
+            window.price_direction is OIDirection.DOWN
+            and self._is_strong_price_move(window.price_delta_pct_total)
         ):
             score += 0.18
-            reasons.append("oi_not_expanding_with_downtrend")
+            reasons.append("exhaustion_price_trending_down")
 
-        if latest.oi_acceleration is not None and latest.oi_acceleration > 0:
+        if window.oi_direction in {OIDirection.DOWN, OIDirection.UP}:
+            score += 0.12
+            reasons.append("exhaustion_oi_positioning_extreme_or_contracting")
+
+        if (
+            window.avg_oi_zscore is not None
+            and window.avg_oi_zscore <= -self.thresholds.anomaly_zscore_threshold
+        ):
+            score += 0.16
+            reasons.append("exhaustion_negative_oi_zscore")
+
+        if self._is_extreme_negative_pressure(window.avg_pressure_score):
+            score += 0.18
+            reasons.append("exhaustion_extreme_negative_pressure")
+
+        if self._is_extreme_negative_funding(window.avg_funding_rate):
+            score += 0.14
+            reasons.append("exhaustion_extreme_negative_funding")
+
+        if (
+            window.avg_liquidation_imbalance is not None
+            and window.avg_liquidation_imbalance <= -EXHAUSTION_LIQUIDATION_THRESHOLD
+        ):
             score += 0.10
-            reasons.append("positive_oi_acceleration")
+            reasons.append("exhaustion_long_liquidation_pressure")
 
-        if latest.oi_velocity is not None and latest.oi_velocity > 0:
+        if (
+            window.avg_aggressive_flow_imbalance is not None
+            and window.avg_aggressive_flow_imbalance
+            <= -self.thresholds.aggressive_flow_confirmation
+        ):
             score += 0.08
-            reasons.append("positive_oi_velocity")
-
-        if self._is_weak_volume(window.avg_volume_ratio):
-            score += 0.10
-            reasons.append("fading_volume")
+            reasons.append("exhaustion_aggressive_sell_flow")
 
         if (
-            window.avg_funding_rate is not None
-            and window.avg_funding_rate
-            <= self.thresholds.funding_extreme_negative
-        ):
-            score += 0.10
-            reasons.append("crowded_negative_funding")
-
-        if (
-            window.avg_pressure_score is not None
-            and window.avg_pressure_score > WEAK_PRESSURE_LOWER
+            window.avg_oi_price_efficiency is not None
+            and abs(window.avg_oi_price_efficiency) >= EXHAUSTION_EFFICIENCY_THRESHOLD
         ):
             score += 0.08
-            reasons.append("pressure_fading")
-
-        if (
-            latest.aggressive_flow_imbalance is not None
-            and latest.aggressive_flow_imbalance > -0.05
-        ):
-            score += 0.05
-            reasons.append("sell_aggression_fading")
+            reasons.append("exhaustion_high_oi_price_efficiency")
 
         return self._make_result(
             window=window,

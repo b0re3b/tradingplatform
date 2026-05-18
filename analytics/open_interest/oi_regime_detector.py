@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -13,13 +14,30 @@ DEFAULT_NEUTRAL_CONFIDENCE: Final[float] = 0.25
 MAX_NEUTRAL_CONFIDENCE: Final[float] = 0.40
 MAX_RULE_CONFIDENCE: Final[float] = 0.98
 
+# Selection tuning.
+CAPITULATION_SELECTION_BONUS: Final[float] = 0.16
+OVERHEATED_SELECTION_BONUS: Final[float] = 0.16
+TREND_EXHAUSTION_SELECTION_BONUS: Final[float] = 0.14
+SQUEEZE_SELECTION_BONUS: Final[float] = 0.08
+TREND_CONFIRMATION_SELECTION_BONUS: Final[float] = 0.04
+
+# Generic buildup should not dominate dense risk contexts.
+RISK_CONTEXT_BUILDUP_PENALTY: Final[float] = 0.22
+
+# Trend confirmation should mean a stronger trend, not just any price/OI alignment.
+MIN_TREND_CONFIRMATION_PRICE_MOVE_PCT: Final[float] = 1.0
+
+# Dense overheated context thresholds.
+OVERHEATED_LIQUIDATION_CONTEXT_ABS: Final[float] = 0.30
+LIQUIDATION_CONTEXT_ABS: Final[float] = 0.20
+
 
 REGIME_PRIORITY: Final[dict[OIRegime, int]] = {
-    # Risk / liquidation regimes should win ties over generic directional regimes.
+    # Risk / liquidation regimes should win close calls over generic regimes.
     OIRegime.CAPITULATION: 100,
-    OIRegime.SQUEEZE_SETUP: 95,
-    OIRegime.OVERHEATED: 90,
-    OIRegime.TREND_EXHAUSTION: 85,
+    OIRegime.OVERHEATED: 96,
+    OIRegime.SQUEEZE_SETUP: 94,
+    OIRegime.TREND_EXHAUSTION: 92,
 
     # Directional unwind / covering regimes are more specific than generic trend.
     OIRegime.SHORT_COVERING: 80,
@@ -41,11 +59,33 @@ def _clamp(
     low: float = 0.0,
     high: float = 1.0,
 ) -> float:
-    return max(low, min(high, float(value)))
+    if low > high:
+        raise ValueError("low must be <= high")
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return low
+
+    if not math.isfinite(number):
+        return low
+
+    return max(low, min(high, number))
 
 
 def _safe_abs(value: float | None) -> float:
-    return abs(value) if value is not None else 0.0
+    if value is None:
+        return 0.0
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+    if not math.isfinite(number):
+        return 0.0
+
+    return abs(number)
 
 
 def _is_positive(value: float | None) -> bool:
@@ -59,7 +99,13 @@ def _is_negative(value: float | None) -> bool:
 @dataclass(slots=True)
 class RegimeCandidate:
     """
-    Internal score container for rule-based regime classification.
+    Internal score container for rule-based OI regime classification.
+
+    This is intentionally a pure value object:
+    - no EventBus;
+    - no Scheduler;
+    - no logger;
+    - no side effects.
     """
 
     regime: OIRegime
@@ -68,22 +114,27 @@ class RegimeCandidate:
 
     def __post_init__(self) -> None:
         self.score = _clamp(self.score)
-        self.reasons = list(dict.fromkeys(self.reasons))
+        self.reasons = list(dict.fromkeys(self.reasons or []))
 
     @property
     def priority(self) -> int:
         return REGIME_PRIORITY.get(self.regime, 0)
 
+    @property
+    def reasons_count(self) -> int:
+        return len(self.reasons)
+
 
 class OIRegimeDetector:
     """
-    Rule-based detector for Open Interest market regimes.
+    Rule-based detector for futures Open Interest market regimes.
 
     This is a pure domain service:
-    - no EventBus
-    - no Scheduler
-    - no logger
-    - no side effects
+    - no EventBus;
+    - no Scheduler;
+    - no logger;
+    - no IO;
+    - no mutable runtime state.
 
     It receives OIFeatures and returns OIRegimeResult.
     """
@@ -94,12 +145,16 @@ class OIRegimeDetector:
 
     def detect(self, features: OIFeatures) -> OIRegimeResult:
         """
-        Detect current OI regime from a single features snapshot.
+        Detect current OI regime from a single feature snapshot.
 
-        The detector evaluates all supported regimes independently, then chooses
-        the candidate with the highest score. If multiple candidates have the
-        same score, a deterministic priority is used so specific risk regimes
-        win over generic trend/build-up regimes.
+        The detector evaluates every supported regime independently and then
+        selects the best candidate using an effective score.
+
+        Important selection behavior:
+        - generic buildup regimes are penalized in dense risk contexts;
+        - risk regimes get granular selection bonuses;
+        - trend confirmation is penalized in extreme/risk contexts;
+        - final output confidence remains based on the raw bounded rule score.
         """
         candidates = self._build_candidates(features)
         best = self._select_best_candidate(candidates)
@@ -146,18 +201,42 @@ class OIRegimeDetector:
         if not candidates:
             return None
 
+        def effective_score(candidate: RegimeCandidate) -> float:
+            score = candidate.score
+
+            if candidate.score < MIN_REGIME_SCORE:
+                return score
+
+            if candidate.regime is OIRegime.CAPITULATION:
+                score += CAPITULATION_SELECTION_BONUS
+
+            elif candidate.regime is OIRegime.OVERHEATED:
+                score += OVERHEATED_SELECTION_BONUS
+
+            elif candidate.regime is OIRegime.TREND_EXHAUSTION:
+                score += TREND_EXHAUSTION_SELECTION_BONUS
+
+            elif candidate.regime is OIRegime.SQUEEZE_SETUP:
+                score += SQUEEZE_SELECTION_BONUS
+
+            elif candidate.regime is OIRegime.TREND_CONFIRMATION:
+                score += TREND_CONFIRMATION_SELECTION_BONUS
+
+            return _clamp(score)
+
         return max(
             candidates,
             key=lambda candidate: (
-                candidate.score,
+                effective_score(candidate),
                 candidate.priority,
-                len(candidate.reasons),
+                candidate.score,
+                candidate.reasons_count,
             ),
         )
 
     def _score_to_confidence(self, score: float) -> float:
         """
-        Convert rule score into model confidence.
+        Convert bounded rule score into bounded model confidence.
         """
         score = _clamp(score)
 
@@ -198,11 +277,35 @@ class OIRegimeDetector:
             and features.price_delta_pct <= -self.thresholds.min_price_change_pct
         )
 
+    def _strong_price_up(self, features: OIFeatures) -> bool:
+        return (
+            features.price_delta_pct is not None
+            and features.price_delta_pct >= MIN_TREND_CONFIRMATION_PRICE_MOVE_PCT
+        )
+
+    def _strong_price_down(self, features: OIFeatures) -> bool:
+        return (
+            features.price_delta_pct is not None
+            and features.price_delta_pct <= -MIN_TREND_CONFIRMATION_PRICE_MOVE_PCT
+        )
+
+    def _strong_price_move(self, features: OIFeatures) -> bool:
+        return (
+            features.price_delta_pct is not None
+            and abs(features.price_delta_pct) >= MIN_TREND_CONFIRMATION_PRICE_MOVE_PCT
+        )
+
     def _oi_up(self, features: OIFeatures) -> bool:
         return features.oi_delta_pct >= self.thresholds.min_oi_change_pct
 
     def _oi_down(self, features: OIFeatures) -> bool:
         return features.oi_delta_pct <= -self.thresholds.min_oi_change_pct
+
+    def _strong_oi_up(self, features: OIFeatures) -> bool:
+        return features.oi_delta_pct >= self.thresholds.squeeze_oi_build_pct
+
+    def _strong_oi_down(self, features: OIFeatures) -> bool:
+        return features.oi_delta_pct <= -self.thresholds.capitulation_oi_drop_pct
 
     def _positive_pressure(self, features: OIFeatures) -> bool:
         return (
@@ -235,10 +338,28 @@ class OIRegimeDetector:
             and features.funding_rate <= self.thresholds.funding_extreme_negative
         )
 
+    def _has_extreme_funding(self, features: OIFeatures) -> bool:
+        return (
+            self._funding_extreme_positive(features)
+            or self._funding_extreme_negative(features)
+        )
+
     def _oi_extreme(self, features: OIFeatures) -> bool:
         return (
             features.oi_zscore is not None
             and abs(features.oi_zscore) >= self.thresholds.overheated_zscore_threshold
+        )
+
+    def _oi_anomalous_positive(self, features: OIFeatures) -> bool:
+        return (
+            features.oi_zscore is not None
+            and features.oi_zscore >= self.thresholds.anomaly_zscore_threshold
+        )
+
+    def _oi_anomalous_negative(self, features: OIFeatures) -> bool:
+        return (
+            features.oi_zscore is not None
+            and features.oi_zscore <= -self.thresholds.anomaly_zscore_threshold
         )
 
     @staticmethod
@@ -285,6 +406,48 @@ class OIRegimeDetector:
             and features.oi_ma_fast < features.oi_ma_slow
         )
 
+    def _risk_context_up(self, features: OIFeatures) -> bool:
+        return (
+            self._funding_extreme_positive(features)
+            or self._oi_extreme(features)
+            or self._extreme_pressure(features)
+            or self._high_liquidation_pressure_up(features)
+        )
+
+    def _risk_context_down(self, features: OIFeatures) -> bool:
+        return (
+            self._funding_extreme_negative(features)
+            or self._oi_extreme(features)
+            or self._extreme_pressure(features)
+            or self._high_liquidation_pressure_down(features)
+        )
+
+    def _dense_overheated_context(self, features: OIFeatures) -> bool:
+        return (
+                self._oi_extreme(features)
+                and self._extreme_pressure(features)
+                and self._has_extreme_funding(features)
+                and (
+                        (
+                                features.liquidation_imbalance is not None
+                                and abs(features.liquidation_imbalance)
+                                >= OVERHEATED_LIQUIDATION_CONTEXT_ABS
+                        )
+                        or (
+                                features.aggressive_flow_imbalance is not None
+                                and abs(features.aggressive_flow_imbalance) >= 0.20
+                        )
+                )
+        )
+
+    def _dense_overheated_with_liquidations(self, features: OIFeatures) -> bool:
+        return (
+            self._dense_overheated_context(features)
+            and features.liquidation_imbalance is not None
+            and abs(features.liquidation_imbalance)
+            >= OVERHEATED_LIQUIDATION_CONTEXT_ABS
+        )
+
     # ------------------------------------------------------------------
     # Regime rules
     # ------------------------------------------------------------------
@@ -323,6 +486,10 @@ class OIRegimeDetector:
         if self._fast_oi_above_slow_oi(features):
             score += 0.06
             reasons.append("fast_oi_above_slow_oi")
+
+        if self._risk_context_up(features):
+            score -= RISK_CONTEXT_BUILDUP_PENALTY
+            reasons.append("risk_context_penalty")
 
         return RegimeCandidate(
             regime=OIRegime.LONG_BUILDUP,
@@ -364,6 +531,10 @@ class OIRegimeDetector:
         if self._fast_oi_above_slow_oi(features):
             score += 0.06
             reasons.append("fast_oi_above_slow_oi")
+
+        if self._risk_context_down(features):
+            score -= RISK_CONTEXT_BUILDUP_PENALTY
+            reasons.append("risk_context_penalty")
 
         return RegimeCandidate(
             regime=OIRegime.SHORT_BUILDUP,
@@ -443,16 +614,16 @@ class OIRegimeDetector:
         score = 0.0
         reasons: list[str] = []
 
-        if self._price_up(features) and self._oi_up(features):
-            score += 0.22
-            reasons.append("price_up_oi_up")
+        if self._strong_price_up(features) and self._oi_up(features):
+            score += 0.32
+            reasons.append("strong_price_up_oi_up")
 
-        elif self._price_down(features) and self._oi_up(features):
-            score += 0.22
-            reasons.append("price_down_oi_up")
+        elif self._strong_price_down(features) and self._oi_up(features):
+            score += 0.32
+            reasons.append("strong_price_down_oi_up")
 
         if self._has_volume_confirmation(features):
-            score += 0.16
+            score += 0.18
             reasons.append("volume_confirmation")
 
         if self._fast_oi_above_slow_oi(features):
@@ -467,7 +638,7 @@ class OIRegimeDetector:
             features.oi_price_efficiency is not None
             and abs(features.oi_price_efficiency) >= 0.75
         ):
-            score += 0.10
+            score += 0.14
             reasons.append("oi_price_efficiency_confirmation")
 
         if (
@@ -475,12 +646,38 @@ class OIRegimeDetector:
             and abs(features.oi_pressure_score)
             >= self.thresholds.pressure_score_trend_threshold
         ):
-            score += 0.14
+            score += 0.16
             reasons.append("pressure_score_confirmation")
 
         if features.volume_ratio is not None and features.volume_ratio >= 1.5:
             score += 0.08
             reasons.append("strong_volume")
+
+        if self._aggressive_buy_confirmation(features) or self._aggressive_sell_confirmation(features):
+            score += 0.10
+            reasons.append("aggressive_flow_confirmation")
+
+        if (
+            features.funding_rate is not None
+            and not self._has_extreme_funding(features)
+            and abs(features.funding_rate) > 0
+        ):
+            score += 0.06
+            reasons.append("healthy_funding_context")
+
+        # Trend confirmation is not meant to classify extreme crowding or
+        # exhaustion. Dense risk context should be handled by risk regimes.
+        if self._oi_extreme(features) or self._has_extreme_funding(features):
+            score -= 0.20
+            reasons.append("risk_context_penalty")
+
+        if self._extreme_pressure(features):
+            score -= 0.12
+            reasons.append("extreme_pressure_penalty")
+
+        if self._dense_overheated_with_liquidations(features):
+            score -= 0.10
+            reasons.append("overheated_context_penalty")
 
         return RegimeCandidate(
             regime=OIRegime.TREND_CONFIRMATION,
@@ -496,28 +693,51 @@ class OIRegimeDetector:
             score += 0.05
             reasons.append("price_context_present")
 
+        if self._strong_price_move(features):
+            score += 0.14
+            reasons.append("strong_price_move")
+
         if self._oi_extreme(features):
-            score += 0.20
+            score += 0.18
             reasons.append("oi_extreme")
 
+        elif (
+            features.oi_zscore is not None
+            and abs(features.oi_zscore) >= self.thresholds.anomaly_zscore_threshold
+        ):
+            score += 0.12
+            reasons.append("oi_anomalous")
+
         if self._extreme_pressure(features):
-            score += 0.20
+            score += 0.22
             reasons.append("extreme_pressure")
+
+        if self._has_extreme_funding(features):
+            score += 0.14
+            reasons.append("extreme_funding_crowding")
+
+        if self._strong_price_move(features) and self._extreme_pressure(features):
+            score += 0.12
+            reasons.append("exhaustion_price_pressure_combo")
+
+        if self._has_extreme_funding(features) and self._extreme_pressure(features):
+            score += 0.10
+            reasons.append("exhaustion_funding_pressure_combo")
 
         if (
             features.oi_acceleration is not None
             and (
                 (
-                    features.price_direction == OIDirection.UP
+                    self._price_up(features)
                     and features.oi_acceleration < 0
                 )
                 or (
-                    features.price_direction == OIDirection.DOWN
+                    self._price_down(features)
                     and features.oi_acceleration > 0
                 )
             )
         ):
-            score += 0.14
+            score += 0.12
             reasons.append("oi_acceleration_divergence")
 
         if (
@@ -526,7 +746,7 @@ class OIRegimeDetector:
             and _safe_abs(features.price_delta_pct)
             >= self.thresholds.min_price_change_pct
         ):
-            score += 0.15
+            score += 0.14
             reasons.append("weak_oi_support_for_price_move")
 
         if (
@@ -535,21 +755,27 @@ class OIRegimeDetector:
             and _safe_abs(features.price_delta_pct)
             >= self.thresholds.min_price_change_pct
         ):
-            score += 0.10
+            score += 0.08
             reasons.append("weak_volume_follow_through")
 
         if (
-            self._funding_extreme_positive(features)
-            and features.price_direction == OIDirection.UP
-        ) or (
-            self._funding_extreme_negative(features)
-            and features.price_direction == OIDirection.DOWN
+            self._price_up(features)
+            and self._oi_up(features)
+            and self._extreme_pressure(features)
         ):
             score += 0.12
-            reasons.append("extreme_funding_crowding")
+            reasons.append("uptrend_crowding_exhaustion")
 
         if (
-            features.oi_direction == OIDirection.DOWN
+            self._price_down(features)
+            and self._oi_up(features)
+            and self._extreme_pressure(features)
+        ):
+            score += 0.12
+            reasons.append("downtrend_crowding_exhaustion")
+
+        if (
+            self._oi_down(features)
             and _safe_abs(features.price_delta_pct)
             >= self.thresholds.min_price_change_pct
         ):
@@ -567,19 +793,19 @@ class OIRegimeDetector:
         reasons: list[str] = []
 
         has_funding_context = features.funding_rate is not None
+        require_funding_for_squeeze = bool(
+            getattr(self.config, "require_funding_for_squeeze", False)
+        )
 
-        if (
-            self.config.require_funding_for_squeeze
-            and not has_funding_context
-        ):
+        if require_funding_for_squeeze and not has_funding_context:
             return RegimeCandidate(
                 regime=OIRegime.SQUEEZE_SETUP,
                 score=0.0,
                 reasons=["funding_required_for_squeeze_but_missing"],
             )
 
-        if features.oi_delta_pct >= self.thresholds.squeeze_oi_build_pct:
-            score += 0.22
+        if self._strong_oi_up(features):
+            score += 0.24
             reasons.append("strong_oi_buildup")
 
         if self._oi_extreme(features):
@@ -587,12 +813,16 @@ class OIRegimeDetector:
             reasons.append("oi_extreme")
 
         if self._funding_extreme_positive(features):
-            score += 0.16
+            score += 0.18
             reasons.append("extreme_positive_funding")
 
         elif self._funding_extreme_negative(features):
-            score += 0.16
+            score += 0.18
             reasons.append("extreme_negative_funding")
+
+        if self._extreme_pressure(features):
+            score += 0.12
+            reasons.append("extreme_pressure")
 
         if (
             features.volume_ratio is not None
@@ -602,10 +832,10 @@ class OIRegimeDetector:
             reasons.append("elevated_volume")
 
         if (
-            features.price_direction == OIDirection.FLAT
-            or (
-                features.price_delta_pct is not None
-                and abs(features.price_delta_pct) < self.thresholds.min_price_change_pct
+            features.price_delta_pct is not None
+            and abs(features.price_delta_pct) < max(
+                self.thresholds.min_price_change_pct * 2.0,
+                0.50,
             )
         ):
             score += 0.12
@@ -628,10 +858,16 @@ class OIRegimeDetector:
 
         if (
             features.liquidation_imbalance is not None
-            and abs(features.liquidation_imbalance) >= 0.20
+            and abs(features.liquidation_imbalance) >= LIQUIDATION_CONTEXT_ABS
         ):
             score += 0.08
             reasons.append("liquidation_pressure_present")
+
+        # If the context is already densely overheated, OVERHEATED should win
+        # over generic squeeze setup.
+        if self._dense_overheated_with_liquidations(features):
+            score -= 0.18
+            reasons.append("overheated_context_penalty")
 
         return RegimeCandidate(
             regime=OIRegime.SQUEEZE_SETUP,
@@ -651,7 +887,7 @@ class OIRegimeDetector:
             score += 0.28
             reasons.append("large_price_move")
 
-        if features.oi_delta_pct <= -self.thresholds.capitulation_oi_drop_pct:
+        if self._strong_oi_down(features):
             score += 0.28
             reasons.append("sharp_oi_drop")
 
@@ -666,10 +902,7 @@ class OIRegimeDetector:
             score += 0.10
             reasons.append("high_volume")
 
-        if (
-            features.oi_zscore is not None
-            and features.oi_zscore <= -self.thresholds.anomaly_zscore_threshold
-        ):
+        if self._oi_anomalous_negative(features):
             score += 0.10
             reasons.append("negative_oi_zscore_extreme")
 
@@ -692,23 +925,27 @@ class OIRegimeDetector:
             reasons.append("oi_extreme")
 
         if self._extreme_pressure(features):
-            score += 0.18
+            score += 0.20
             reasons.append("extreme_pressure")
 
         if self._funding_extreme_positive(features):
-            score += 0.14
+            score += 0.16
             reasons.append("extreme_positive_funding")
 
         elif self._funding_extreme_negative(features):
-            score += 0.14
+            score += 0.16
             reasons.append("extreme_negative_funding")
+
+        if self._dense_overheated_context(features):
+            score += 0.16
+            reasons.append("overheated_combo_context")
 
         if features.volume_ratio is not None and features.volume_ratio >= 1.4:
             score += 0.08
             reasons.append("high_volume")
 
-        if features.oi_delta_pct >= self.thresholds.squeeze_oi_build_pct:
-            score += 0.10
+        if self._strong_oi_up(features):
+            score += 0.12
             reasons.append("strong_oi_expansion")
 
         if self._fast_oi_above_slow_oi(features):
@@ -731,9 +968,10 @@ class OIRegimeDetector:
 
         if (
             features.liquidation_imbalance is not None
-            and abs(features.liquidation_imbalance) >= 0.30
+            and abs(features.liquidation_imbalance)
+            >= OVERHEATED_LIQUIDATION_CONTEXT_ABS
         ):
-            score += 0.04
+            score += 0.08
             reasons.append("liquidation_imbalance")
 
         return RegimeCandidate(
