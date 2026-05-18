@@ -496,7 +496,7 @@ class LiquidationCluster(LiquidationScopedModel):
     source: str | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        LiquidationScopedModel.__post_init__(self)
 
         self.start_time = ensure_utc(self.start_time)
         self.end_time = ensure_utc(self.end_time)
@@ -593,7 +593,7 @@ class CascadeDetectionResult(LiquidationScopedModel):
     source: str | None = "cascade_detector"
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        LiquidationScopedModel.__post_init__(self)
 
         self.detected_at = ensure_utc(self.detected_at)
         self.intensity_score = max(0.0, min(1.0, float(self.intensity_score)))
@@ -690,7 +690,7 @@ class LiquidationWindowStats(LiquidationScopedModel):
     max_price: Decimal | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        LiquidationScopedModel.__post_init__(self)
 
         self.window_start = ensure_utc(self.window_start)
         self.window_end = ensure_utc(self.window_end)
@@ -815,7 +815,7 @@ class LiquidationBufferSnapshot(LiquidationScopedModel):
     total_events_seen: int = 0
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        LiquidationScopedModel.__post_init__(self)
 
         self.total_buffered_events = max(0, int(self.total_buffered_events))
         self.long_buffered_events = max(0, int(self.long_buffered_events))

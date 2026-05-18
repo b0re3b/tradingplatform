@@ -15,7 +15,7 @@ from .enums import (
     LiquidationStatus,
 )
 from .liquidation_stream import (
-    LiquidationExchangeAdapterProtocol,
+    LiquidationHistoryStoreProtocol,
     LiquidationStream,
 )
 from .metrics import (
@@ -25,12 +25,24 @@ from .metrics import (
 )
 from .models import (
     DEFAULT_LARGE_LIQUIDATION_THRESHOLD_USD,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     DECIMAL_ZERO,
     CascadeDetectionResult,
     LiquidationBufferSnapshot,
     LiquidationCluster,
     LiquidationEvent,
+    LiquidationKey,
+    LiquidationScopedModel,
     LiquidationWindowStats,
+    liquidation_key_to_dict,
+    make_liquidation_key,
+    normalize_exchange,
+    normalize_exchange_symbol,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
+    scoped_metadata,
 )
 from .state import (
     LiquidationState,
@@ -38,22 +50,32 @@ from .state import (
 )
 from .utils import (
     build_cluster_from_events,
+    build_cluster_from_events_for_key,
+    build_key_from_event,
+    build_key_from_payload,
+    build_liquidation_key,
     build_symbol_key,
     clamp_float,
     compute_acceleration_ratio,
     compute_weighted_average_price,
     compute_window_stats,
+    compute_window_stats_for_key,
+    ensure_same_scope,
     ensure_utc,
+    filter_events_by_key,
+    filter_events_by_scope,
     filter_events_by_side,
     filter_valid_events,
+    infer_scope_from_events,
     infer_severity,
     is_stale_event,
-    normalize_exchange,
+    key_to_scope,
     normalize_score,
-    normalize_symbol,
     prune_events_by_window,
     prune_events_older_than,
     safe_decimal,
+    safe_float,
+    scoped_key_to_string,
     side_to_direction,
     sort_events_by_timestamp,
     split_events_in_halves,
@@ -65,9 +87,9 @@ from .utils import (
 
 __all__ = [
     # Runtime classes
-    "CascadeDetector",
     "LiquidationStream",
-    "LiquidationExchangeAdapterProtocol",
+    "LiquidationHistoryStoreProtocol",
+    "CascadeDetector",
 
     # Configs
     "LiquidationsConfig",
@@ -83,11 +105,13 @@ __all__ = [
     "LiquidationStatus",
 
     # Models
+    "LiquidationScopedModel",
     "LiquidationEvent",
     "LiquidationCluster",
     "CascadeDetectionResult",
     "LiquidationWindowStats",
     "LiquidationBufferSnapshot",
+    "LiquidationKey",
 
     # State
     "LiquidationState",
@@ -100,25 +124,52 @@ __all__ = [
 
     # Constants
     "DECIMAL_ZERO",
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_TIMEFRAME",
     "DEFAULT_LARGE_LIQUIDATION_THRESHOLD_USD",
 
-    # Utils
+    # Scope / normalization helpers
+    "make_liquidation_key",
+    "liquidation_key_to_dict",
+    "scoped_metadata",
+    "normalize_exchange",
+    "normalize_symbol",
+    "normalize_exchange_symbol",
+    "normalize_market_type",
+    "normalize_timeframe",
+    "build_liquidation_key",
+    "build_key_from_event",
+    "build_key_from_payload",
+    "key_to_scope",
+    "scoped_key_to_string",
+    "ensure_same_scope",
+    "infer_scope_from_events",
+
+    # Backward-compatible legacy helper
+    "build_symbol_key",
+
+    # Time / parsing helpers
     "utc_now",
     "ensure_utc",
     "safe_decimal",
-    "normalize_exchange",
-    "normalize_symbol",
-    "build_symbol_key",
-    "side_to_direction",
+    "safe_float",
+
+    # Filtering helpers
+    "filter_events_by_side",
+    "filter_events_by_key",
+    "filter_events_by_scope",
+    "filter_valid_events",
     "prune_events_older_than",
     "prune_events_by_window",
-    "filter_events_by_side",
-    "filter_valid_events",
     "sort_events_by_timestamp",
+
+    # Aggregation / scoring helpers
+    "side_to_direction",
     "sum_notional",
     "sum_quantity",
     "compute_weighted_average_price",
     "compute_window_stats",
+    "compute_window_stats_for_key",
     "split_events_in_halves",
     "compute_acceleration_ratio",
     "clamp_float",
@@ -126,4 +177,5 @@ __all__ = [
     "infer_severity",
     "is_stale_event",
     "build_cluster_from_events",
+    "build_cluster_from_events_for_key",
 ]
