@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Mapping, TypeAlias
 
 from .enums import (
     CascadeDirection,
@@ -17,38 +17,64 @@ from .enums import (
 DECIMAL_ZERO = Decimal("0")
 DEFAULT_LARGE_LIQUIDATION_THRESHOLD_USD = Decimal("100000")
 
+DEFAULT_MARKET_TYPE = "perpetual"
+DEFAULT_TIMEFRAME = "realtime"
+DEFAULT_EXCHANGE_SYMBOL = ""
 
-def _utc_now() -> datetime:
-    """
-    Локальний default_factory для timestamp-полів.
+LiquidationKey: TypeAlias = tuple[str, str, str, str]
+# exchange, market_type, symbol, timeframe
 
-    Це не runtime helper і не I/O. Для основної логіки часу краще використовувати
-    analytics/liquidations/utils.py або root utils/time_utils.py.
-    """
+
+# =============================================================================
+# Time / serialization helpers
+# =============================================================================
+
+
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _ensure_utc(dt: datetime) -> datetime:
-    """
-    Мінімальна нормалізація datetime для model-level properties.
-    """
+def ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
+def _utc_now() -> datetime:
+    """
+    Backward-compatible local default_factory alias.
+    """
+    return utc_now()
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    """
+    Backward-compatible local datetime normalization alias.
+    """
+    return ensure_utc(dt)
+
+
 def _decimal_to_str(value: Any) -> Any:
     """
-    Допоміжний serializer для Decimal/datetime у вкладених структурах.
+    JSON-friendly serializer для Decimal / datetime / enum / dataclass / dict / list.
     """
     if isinstance(value, Decimal):
         return str(value)
 
     if isinstance(value, datetime):
-        return _ensure_utc(value).isoformat()
+        return ensure_utc(value).isoformat()
 
-    if isinstance(value, dict):
-        return {key: _decimal_to_str(item) for key, item in value.items()}
+    if hasattr(value, "value"):
+        return value.value
+
+    if is_dataclass(value):
+        return _decimal_to_str(asdict(value))
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _decimal_to_str(item)
+            for key, item in value.items()
+        }
 
     if isinstance(value, list):
         return [_decimal_to_str(item) for item in value]
@@ -59,13 +85,228 @@ def _decimal_to_str(value: Any) -> Any:
     return value
 
 
+# =============================================================================
+# Scope / normalization helpers
+# =============================================================================
+
+
+def normalize_exchange(exchange: object | None) -> str:
+    value = str(exchange or "").strip().lower()
+    if not value:
+        raise ValueError("exchange must not be empty")
+    return value
+
+
+def normalize_symbol(symbol: object | None) -> str:
+    value = (
+        str(symbol or "")
+        .strip()
+        .upper()
+        .replace("-", "")
+        .replace("/", "")
+        .replace("_", "")
+    )
+    if not value:
+        raise ValueError("symbol must not be empty")
+    return value
+
+
+def normalize_market_type(market_type: object | None = None) -> str:
+    value = str(market_type or DEFAULT_MARKET_TYPE).strip().lower()
+    return value or DEFAULT_MARKET_TYPE
+
+
+def normalize_timeframe(timeframe: object | None = None) -> str:
+    value = str(timeframe or DEFAULT_TIMEFRAME).strip().lower()
+    return value or DEFAULT_TIMEFRAME
+
+
+def normalize_exchange_symbol(
+    exchange_symbol: object | None,
+    *,
+    fallback_symbol: str,
+) -> str:
+    value = str(exchange_symbol or "").strip()
+    return value or fallback_symbol
+
+
+def make_liquidation_key(
+    *,
+    exchange: object | None,
+    market_type: object | None,
+    symbol: object,
+    timeframe: object | None = None,
+) -> LiquidationKey:
+    return (
+        normalize_exchange(exchange),
+        normalize_market_type(market_type),
+        normalize_symbol(symbol),
+        normalize_timeframe(timeframe),
+    )
+
+
+def liquidation_key_to_dict(key: LiquidationKey) -> dict[str, str]:
+    exchange, market_type, symbol, timeframe = key
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }
+
+
+def scoped_metadata(
+    *,
+    exchange: object | None,
+    market_type: object | None,
+    symbol: object,
+    timeframe: object | None = None,
+    exchange_symbol: object | None = None,
+) -> dict[str, str]:
+    key = make_liquidation_key(
+        exchange=exchange,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    scope = liquidation_key_to_dict(key)
+    scope["exchange_symbol"] = normalize_exchange_symbol(
+        exchange_symbol,
+        fallback_symbol=scope["symbol"],
+    )
+    return scope
+
+
+def _normalize_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    key: LiquidationKey,
+    exchange_symbol: str,
+) -> dict[str, Any]:
+    result = dict(metadata or {})
+    result.setdefault("scope", liquidation_key_to_dict(key))
+    result.setdefault("exchange_symbol", exchange_symbol)
+    return result
+
+
+# =============================================================================
+# Base scoped model
+# =============================================================================
+
+
+@dataclass(slots=True)
+class LiquidationScopedModel:
+    """
+    Базова модель для liquidation scope.
+
+    Canonical scope:
+        exchange + market_type + symbol + timeframe
+
+    `exchange_symbol` зберігає нативний символ біржі:
+        - Binance USDM: BTCUSDT
+        - Binance COINM: BTCUSD_PERP / BTCUSD
+        - OKX swap: BTC-USDT-SWAP
+        - Bybit linear: BTCUSDT
+    """
+
+    exchange: str
+    symbol: str
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.exchange = normalize_exchange(self.exchange)
+        self.symbol = normalize_symbol(self.symbol)
+        self.market_type = normalize_market_type(self.market_type)
+        self.timeframe = normalize_timeframe(self.timeframe)
+        self.exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=self.symbol,
+        )
+        self.metadata = _normalize_metadata(
+            self.metadata,
+            key=self.key,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+    @property
+    def normalized_exchange(self) -> str:
+        return self.exchange
+
+    @property
+    def normalized_symbol(self) -> str:
+        return self.symbol
+
+    @property
+    def key(self) -> LiquidationKey:
+        return make_liquidation_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def liquidation_key(self) -> LiquidationKey:
+        return self.key
+
+    @property
+    def symbol_key(self) -> tuple[str, str]:
+        """
+        Backward-compatible alias.
+
+        Новий код має використовувати `.key`.
+        """
+        return self.normalized_exchange, self.normalized_symbol
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return scoped_metadata(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
+
+    def _base_payload(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "scope": liquidation_key_to_dict(self.key),
+            "metadata": dict(self.metadata),
+        }
+
+
+# =============================================================================
+# Domain models
+# =============================================================================
+
+
 @dataclass(slots=True, frozen=True)
 class LiquidationEvent:
     """
     Нормалізована атомарна liquidation-подія.
 
     Створюється на stream/ingestion рівні після парсингу raw payload біржі.
-    Ця модель не публікує події самостійно і не знає про EventBus.
+
+    Correct production flow:
+        exchanges/*_ws.py
+            -> EventBus.emit("market.liquidation", raw normalized payload)
+            -> LiquidationStream
+            -> LiquidationEvent
+            -> market.liquidation.normalized / market.liquidations.updated
+
+    Ця модель:
+    - не публікує події самостійно;
+    - не знає про EventBus;
+    - не читає біржі;
+    - не містить торгової логіки.
     """
 
     exchange: str
@@ -76,6 +317,10 @@ class LiquidationEvent:
     notional_usd: Decimal
     timestamp: datetime
 
+    market_type: str = DEFAULT_MARKET_TYPE
+    timeframe: str = DEFAULT_TIMEFRAME
+    exchange_symbol: str | None = None
+
     event_type: LiquidationEventType = LiquidationEventType.NORMALIZED
 
     trade_id: str | None = None
@@ -84,22 +329,89 @@ class LiquidationEvent:
     correlation_id: str | None = None
 
     source: str | None = None
-    received_at: datetime = field(default_factory=_utc_now)
+    received_at: datetime = field(default_factory=utc_now)
 
     raw_payload_hash: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        normalized_exchange = normalize_exchange(self.exchange)
+        normalized_symbol = normalize_symbol(self.symbol)
+        normalized_market_type = normalize_market_type(self.market_type)
+        normalized_timeframe = normalize_timeframe(self.timeframe)
+        normalized_exchange_symbol = normalize_exchange_symbol(
+            self.exchange_symbol,
+            fallback_symbol=normalized_symbol,
+        )
+
+        key = make_liquidation_key(
+            exchange=normalized_exchange,
+            market_type=normalized_market_type,
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+        )
+
+        object.__setattr__(self, "exchange", normalized_exchange)
+        object.__setattr__(self, "symbol", normalized_symbol)
+        object.__setattr__(self, "market_type", normalized_market_type)
+        object.__setattr__(self, "timeframe", normalized_timeframe)
+        object.__setattr__(self, "exchange_symbol", normalized_exchange_symbol)
+
+        object.__setattr__(self, "price", Decimal(str(self.price)))
+        object.__setattr__(self, "quantity", Decimal(str(self.quantity)))
+        object.__setattr__(self, "notional_usd", Decimal(str(self.notional_usd)))
+        object.__setattr__(self, "timestamp", ensure_utc(self.timestamp))
+        object.__setattr__(self, "received_at", ensure_utc(self.received_at))
+
+        object.__setattr__(
+            self,
+            "metadata",
+            _normalize_metadata(
+                self.metadata,
+                key=key,
+                exchange_symbol=normalized_exchange_symbol,
+            ),
+        )
+
     @property
     def normalized_exchange(self) -> str:
-        return self.exchange.strip().lower()
+        return self.exchange
 
     @property
     def normalized_symbol(self) -> str:
-        return self.symbol.strip().upper().replace("-", "").replace("/", "")
+        return self.symbol
+
+    @property
+    def key(self) -> LiquidationKey:
+        return make_liquidation_key(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+
+    @property
+    def liquidation_key(self) -> LiquidationKey:
+        return self.key
 
     @property
     def symbol_key(self) -> tuple[str, str]:
+        """
+        Backward-compatible alias.
+
+        Новий код має використовувати `.key`, щоб не змішувати market_type/timeframe.
+        """
         return self.normalized_exchange, self.normalized_symbol
+
+    @property
+    def scope(self) -> dict[str, str]:
+        return scoped_metadata(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
 
     @property
     def is_large(self) -> bool:
@@ -112,13 +424,16 @@ class LiquidationEvent:
         return self.notional_usd >= DEFAULT_LARGE_LIQUIDATION_THRESHOLD_USD
 
     def is_large_at(self, threshold_usd: Decimal) -> bool:
-        return threshold_usd > DECIMAL_ZERO and self.notional_usd >= threshold_usd
+        threshold = Decimal(str(threshold_usd))
+        return threshold > DECIMAL_ZERO and self.notional_usd >= threshold
 
     @property
     def is_valid(self) -> bool:
         return (
             bool(self.normalized_exchange)
             and bool(self.normalized_symbol)
+            and bool(self.market_type)
+            and bool(self.timeframe)
             and self.side.is_known
             and self.price > DECIMAL_ZERO
             and self.quantity > DECIMAL_ZERO
@@ -131,8 +446,8 @@ class LiquidationEvent:
 
     @property
     def age_seconds(self) -> float:
-        now = _utc_now()
-        return max(0.0, (now - _ensure_utc(self.timestamp)).total_seconds())
+        now = utc_now()
+        return max(0.0, (now - ensure_utc(self.timestamp)).total_seconds())
 
     def to_dict(self, *, serialize: bool = True) -> dict[str, Any]:
         data = asdict(self)
@@ -140,6 +455,10 @@ class LiquidationEvent:
         data["side"] = self.side.value
         data["event_type"] = self.event_type.value
         data["pressure_direction"] = self.pressure_direction.value
+        data["normalized_exchange"] = self.normalized_exchange
+        data["normalized_symbol"] = self.normalized_symbol
+        data["scope"] = liquidation_key_to_dict(self.key)
+        data["liquidation_key"] = self.key
 
         if serialize:
             return _decimal_to_str(data)
@@ -148,7 +467,7 @@ class LiquidationEvent:
 
 
 @dataclass(slots=True)
-class LiquidationCluster:
+class LiquidationCluster(LiquidationScopedModel):
     """
     Агрегований кластер liquidation events у часовому вікні.
 
@@ -156,46 +475,44 @@ class LiquidationCluster:
     а лише зберігає результат агрегації.
     """
 
-    exchange: str
-    symbol: str
-    side: LiquidationSide
-    start_time: datetime
-    end_time: datetime
+    side: LiquidationSide = LiquidationSide.UNKNOWN
+    start_time: datetime = field(default_factory=utc_now)
+    end_time: datetime = field(default_factory=utc_now)
 
-    event_count: int
-    total_notional_usd: Decimal
-    total_quantity: Decimal
+    event_count: int = 0
+    total_notional_usd: Decimal = DECIMAL_ZERO
+    total_quantity: Decimal = DECIMAL_ZERO
 
-    avg_price: Decimal
-    min_price: Decimal
-    max_price: Decimal
+    avg_price: Decimal = DECIMAL_ZERO
+    min_price: Decimal = DECIMAL_ZERO
+    max_price: Decimal = DECIMAL_ZERO
 
-    direction: CascadeDirection
+    direction: CascadeDirection = CascadeDirection.UNKNOWN
 
     severity: CascadeSeverity = CascadeSeverity.LOW
     status: LiquidationStatus = LiquidationStatus.NEW
 
     cluster_id: str | None = None
     source: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def normalized_exchange(self) -> str:
-        return self.exchange.strip().lower()
+    def __post_init__(self) -> None:
+        super().__post_init__()
 
-    @property
-    def normalized_symbol(self) -> str:
-        return self.symbol.strip().upper().replace("-", "").replace("/", "")
+        self.start_time = ensure_utc(self.start_time)
+        self.end_time = ensure_utc(self.end_time)
 
-    @property
-    def symbol_key(self) -> tuple[str, str]:
-        return self.normalized_exchange, self.normalized_symbol
+        self.event_count = max(0, int(self.event_count))
+        self.total_notional_usd = Decimal(str(self.total_notional_usd))
+        self.total_quantity = Decimal(str(self.total_quantity))
+        self.avg_price = Decimal(str(self.avg_price))
+        self.min_price = Decimal(str(self.min_price))
+        self.max_price = Decimal(str(self.max_price))
 
     @property
     def duration_seconds(self) -> float:
         return max(
             0.0,
-            (_ensure_utc(self.end_time) - _ensure_utc(self.start_time)).total_seconds(),
+            (ensure_utc(self.end_time) - ensure_utc(self.start_time)).total_seconds(),
         )
 
     @property
@@ -233,6 +550,10 @@ class LiquidationCluster:
         data["price_range"] = self.price_range
         data["price_range_pct"] = self.price_range_pct
         data["avg_notional_per_event"] = self.avg_notional_per_event
+        data["normalized_exchange"] = self.normalized_exchange
+        data["normalized_symbol"] = self.normalized_symbol
+        data["scope"] = liquidation_key_to_dict(self.key)
+        data["liquidation_key"] = self.key
 
         if serialize:
             return _decimal_to_str(data)
@@ -241,7 +562,7 @@ class LiquidationCluster:
 
 
 @dataclass(slots=True)
-class CascadeDetectionResult:
+class CascadeDetectionResult(LiquidationScopedModel):
     """
     Результат детекції liquidation cascade.
 
@@ -249,22 +570,20 @@ class CascadeDetectionResult:
     як вхідний аналітичний сигнал, а не як готове торгове рішення.
     """
 
-    exchange: str
-    symbol: str
-    side: LiquidationSide
-    direction: CascadeDirection
-    detected_at: datetime
-    cluster: LiquidationCluster
+    side: LiquidationSide = LiquidationSide.UNKNOWN
+    direction: CascadeDirection = CascadeDirection.UNKNOWN
+    detected_at: datetime = field(default_factory=utc_now)
+    cluster: LiquidationCluster | None = None
 
-    intensity_score: float
-    confidence: float
-    continuation_bias: float
-    exhaustion_bias: float
+    intensity_score: float = 0.0
+    confidence: float = 0.0
+    continuation_bias: float = 0.0
+    exhaustion_bias: float = 0.0
 
-    event_count: int
-    total_notional_usd: Decimal
-    window_seconds: int
-    price_range_pct: float
+    event_count: int = 0
+    total_notional_usd: Decimal = DECIMAL_ZERO
+    window_seconds: int = 0
+    price_range_pct: float = 0.0
 
     severity: CascadeSeverity = CascadeSeverity.LOW
     status: LiquidationStatus = LiquidationStatus.CONFIRMED
@@ -272,19 +591,26 @@ class CascadeDetectionResult:
     signal_id: str | None = None
     correlation_id: str | None = None
     source: str | None = "cascade_detector"
-    metadata: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def normalized_exchange(self) -> str:
-        return self.exchange.strip().lower()
+    def __post_init__(self) -> None:
+        super().__post_init__()
 
-    @property
-    def normalized_symbol(self) -> str:
-        return self.symbol.strip().upper().replace("-", "").replace("/", "")
+        self.detected_at = ensure_utc(self.detected_at)
+        self.intensity_score = max(0.0, min(1.0, float(self.intensity_score)))
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        self.continuation_bias = max(0.0, min(1.0, float(self.continuation_bias)))
+        self.exhaustion_bias = max(0.0, min(1.0, float(self.exhaustion_bias)))
+        self.event_count = max(0, int(self.event_count))
+        self.total_notional_usd = Decimal(str(self.total_notional_usd))
+        self.window_seconds = max(0, int(self.window_seconds))
+        self.price_range_pct = max(0.0, float(self.price_range_pct))
 
-    @property
-    def symbol_key(self) -> tuple[str, str]:
-        return self.normalized_exchange, self.normalized_symbol
+        if self.cluster is not None and self.cluster.key != self.key:
+            raise ValueError(
+                "CascadeDetectionResult cluster scope mismatch: "
+                f"result={liquidation_key_to_dict(self.key)} "
+                f"cluster={liquidation_key_to_dict(self.cluster.key)}"
+            )
 
     @property
     def is_high_confidence(self) -> bool:
@@ -329,6 +655,10 @@ class CascadeDetectionResult:
         data["favors_continuation"] = self.favors_continuation
         data["favors_exhaustion"] = self.favors_exhaustion
         data["bias_delta"] = self.bias_delta
+        data["normalized_exchange"] = self.normalized_exchange
+        data["normalized_symbol"] = self.normalized_symbol
+        data["scope"] = liquidation_key_to_dict(self.key)
+        data["liquidation_key"] = self.key
 
         if serialize:
             return _decimal_to_str(data)
@@ -337,15 +667,16 @@ class CascadeDetectionResult:
 
 
 @dataclass(slots=True)
-class LiquidationWindowStats:
+class LiquidationWindowStats(LiquidationScopedModel):
     """
     Статистика по liquidation events у конкретному sliding window.
+
+    Scope має відповідати одному:
+        exchange + market_type + symbol + timeframe
     """
 
-    exchange: str
-    symbol: str
-    window_start: datetime
-    window_end: datetime
+    window_start: datetime = field(default_factory=utc_now)
+    window_end: datetime = field(default_factory=utc_now)
 
     total_events: int = 0
     long_events: int = 0
@@ -358,25 +689,30 @@ class LiquidationWindowStats:
     min_price: Decimal | None = None
     max_price: Decimal | None = None
 
-    metadata: dict[str, Any] = field(default_factory=dict)
+    def __post_init__(self) -> None:
+        super().__post_init__()
 
-    @property
-    def normalized_exchange(self) -> str:
-        return self.exchange.strip().lower()
+        self.window_start = ensure_utc(self.window_start)
+        self.window_end = ensure_utc(self.window_end)
 
-    @property
-    def normalized_symbol(self) -> str:
-        return self.symbol.strip().upper().replace("-", "").replace("/", "")
+        self.total_events = max(0, int(self.total_events))
+        self.long_events = max(0, int(self.long_events))
+        self.short_events = max(0, int(self.short_events))
 
-    @property
-    def symbol_key(self) -> tuple[str, str]:
-        return self.normalized_exchange, self.normalized_symbol
+        self.total_notional_usd = Decimal(str(self.total_notional_usd))
+        self.long_notional_usd = Decimal(str(self.long_notional_usd))
+        self.short_notional_usd = Decimal(str(self.short_notional_usd))
+
+        if self.min_price is not None:
+            self.min_price = Decimal(str(self.min_price))
+        if self.max_price is not None:
+            self.max_price = Decimal(str(self.max_price))
 
     @property
     def duration_seconds(self) -> float:
         return max(
             0.0,
-            (_ensure_utc(self.window_end) - _ensure_utc(self.window_start)).total_seconds(),
+            (ensure_utc(self.window_end) - ensure_utc(self.window_start)).total_seconds(),
         )
 
     @property
@@ -449,6 +785,10 @@ class LiquidationWindowStats:
         data["price_range_pct"] = self.price_range_pct
         data["avg_notional_per_event"] = self.avg_notional_per_event
         data["duration_seconds"] = self.duration_seconds
+        data["normalized_exchange"] = self.normalized_exchange
+        data["normalized_symbol"] = self.normalized_symbol
+        data["scope"] = liquidation_key_to_dict(self.key)
+        data["liquidation_key"] = self.key
 
         if serialize:
             return _decimal_to_str(data)
@@ -457,38 +797,42 @@ class LiquidationWindowStats:
 
 
 @dataclass(slots=True)
-class LiquidationBufferSnapshot:
+class LiquidationBufferSnapshot(LiquidationScopedModel):
     """
     Знімок буфера/state для діагностики, dashboard, storage та metrics.
     """
 
-    exchange: str
-    symbol: str
+    total_buffered_events: int = 0
+    long_buffered_events: int = 0
+    short_buffered_events: int = 0
 
-    total_buffered_events: int
-    long_buffered_events: int
-    short_buffered_events: int
-
-    first_event_at: datetime | None
-    last_event_at: datetime | None
-    last_cascade_at: datetime | None
-    cooldown_until: datetime | None
+    first_event_at: datetime | None = None
+    last_event_at: datetime | None = None
+    last_cascade_at: datetime | None = None
+    cooldown_until: datetime | None = None
 
     max_events: int | None = None
     total_events_seen: int = 0
-    metadata: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def normalized_exchange(self) -> str:
-        return self.exchange.strip().lower()
+    def __post_init__(self) -> None:
+        super().__post_init__()
 
-    @property
-    def normalized_symbol(self) -> str:
-        return self.symbol.strip().upper().replace("-", "").replace("/", "")
+        self.total_buffered_events = max(0, int(self.total_buffered_events))
+        self.long_buffered_events = max(0, int(self.long_buffered_events))
+        self.short_buffered_events = max(0, int(self.short_buffered_events))
+        self.total_events_seen = max(0, int(self.total_events_seen))
 
-    @property
-    def symbol_key(self) -> tuple[str, str]:
-        return self.normalized_exchange, self.normalized_symbol
+        if self.max_events is not None:
+            self.max_events = max(0, int(self.max_events))
+
+        if self.first_event_at is not None:
+            self.first_event_at = ensure_utc(self.first_event_at)
+        if self.last_event_at is not None:
+            self.last_event_at = ensure_utc(self.last_event_at)
+        if self.last_cascade_at is not None:
+            self.last_cascade_at = ensure_utc(self.last_cascade_at)
+        if self.cooldown_until is not None:
+            self.cooldown_until = ensure_utc(self.cooldown_until)
 
     @property
     def is_empty(self) -> bool:
@@ -498,7 +842,7 @@ class LiquidationBufferSnapshot:
     def is_in_cooldown(self) -> bool:
         if self.cooldown_until is None:
             return False
-        return _utc_now() < _ensure_utc(self.cooldown_until)
+        return utc_now() < ensure_utc(self.cooldown_until)
 
     @property
     def dominant_buffer_side(self) -> LiquidationSide:
@@ -514,8 +858,65 @@ class LiquidationBufferSnapshot:
         data["dominant_buffer_side"] = self.dominant_buffer_side.value
         data["is_empty"] = self.is_empty
         data["is_in_cooldown"] = self.is_in_cooldown
+        data["normalized_exchange"] = self.normalized_exchange
+        data["normalized_symbol"] = self.normalized_symbol
+        data["scope"] = liquidation_key_to_dict(self.key)
+        data["liquidation_key"] = self.key
 
         if serialize:
             return _decimal_to_str(data)
 
         return data
+
+
+# =============================================================================
+# Generic payload helper
+# =============================================================================
+
+
+def model_to_payload(model: Any) -> dict[str, Any]:
+    """
+    Єдиний helper для EventBus/storage/dashboard serialization.
+    """
+    if hasattr(model, "to_dict") and callable(model.to_dict):
+        return model.to_dict()
+
+    if hasattr(model, "to_payload") and callable(model.to_payload):
+        payload = model.to_payload()
+        if isinstance(payload, Mapping):
+            return dict(payload)
+
+    if is_dataclass(model):
+        return _decimal_to_str(asdict(model))
+
+    if isinstance(model, Mapping):
+        return _decimal_to_str(dict(model))
+
+    raise TypeError(f"Unsupported liquidation model type: {type(model)!r}")
+
+
+__all__ = [
+    "DECIMAL_ZERO",
+    "DEFAULT_LARGE_LIQUIDATION_THRESHOLD_USD",
+    "DEFAULT_MARKET_TYPE",
+    "DEFAULT_TIMEFRAME",
+    "DEFAULT_EXCHANGE_SYMBOL",
+    "LiquidationKey",
+    "utc_now",
+    "ensure_utc",
+    "normalize_exchange",
+    "normalize_symbol",
+    "normalize_market_type",
+    "normalize_timeframe",
+    "normalize_exchange_symbol",
+    "make_liquidation_key",
+    "liquidation_key_to_dict",
+    "scoped_metadata",
+    "LiquidationScopedModel",
+    "LiquidationEvent",
+    "LiquidationCluster",
+    "CascadeDetectionResult",
+    "LiquidationWindowStats",
+    "LiquidationBufferSnapshot",
+    "model_to_payload",
+]

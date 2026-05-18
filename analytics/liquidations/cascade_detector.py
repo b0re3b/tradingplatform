@@ -6,26 +6,35 @@ from typing import Any
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
+
 from .config import CascadeDetectorConfig
 from .enums import LiquidationEventType, LiquidationStatus
 from .metrics import LiquidationMetrics
 from .models import (
     CascadeDetectionResult,
     LiquidationEvent,
+    LiquidationKey,
     LiquidationWindowStats,
+    liquidation_key_to_dict,
+    make_liquidation_key,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_symbol,
+    normalize_timeframe,
 )
 from .state import LiquidationState, SymbolLiquidationState
 from .utils import (
-    build_cluster_from_events,
-    build_symbol_key,
+    build_cluster_from_events_for_key,
     clamp_float,
     compute_acceleration_ratio,
-    compute_window_stats,
+    compute_window_stats_for_key,
     ensure_utc,
+    filter_events_by_key,
     filter_events_by_side,
     infer_severity,
     normalize_score,
     prune_events_older_than,
+    scoped_key_to_string,
     utc_now,
 )
 
@@ -34,13 +43,25 @@ class CascadeDetector:
     """
     Analytics detector для liquidation cascades.
 
+    Correct production flow:
+        exchange adapters
+            -> market.liquidation
+            -> LiquidationStream
+            -> market.liquidation.normalized
+            -> CascadeDetector
+            -> analytics.liquidations.cascade_detected
+            -> analytics.liquidations.exhaustion_detected
+
     Відповідальність:
-    - слухає market.liquidation.normalized через core.EventBus;
-    - бере sliding window подій із LiquidationState;
+    - слухає normalized/data-layer topic, а не raw market.liquidation;
+    - бере sliding window із LiquidationState;
     - рахує side dominance / notional burst / acceleration / price compaction;
-    - формує CascadeDetectionResult;
-    - публікує analytics.liquidation.* події через EventBus;
+    - формує CascadeDetectionResult з повним liquidation scope;
+    - публікує analytics.liquidations.* через EventBus;
     - реєструє healthcheck/snapshot/cleanup jobs через core.Scheduler.
+
+    Scope:
+        exchange + market_type + symbol + timeframe
 
     Цей клас НЕ:
     - не читає WebSocket;
@@ -62,12 +83,16 @@ class CascadeDetector:
         self.event_bus = event_bus
         self.scheduler = scheduler
         self.config = config
+        self.config.validate()
+        self.config.assert_input_topic_allowed()
+
         self.state = state
         self.metrics = metrics or LiquidationMetrics()
         self.service_name = service_name
 
         self.logger = get_logger(
             __name__,
+            service_name=self.service_name,
             event_type="analytics.liquidations.cascade_detector",
         )
 
@@ -107,11 +132,17 @@ class CascadeDetector:
         """
         Реєструє EventBus subscription і Scheduler jobs.
 
-        Для core.EventBus subscribe() є sync-методом, тому тут немає await.
+        core.EventBus.subscribe() є sync-методом, тому тут немає await.
         """
         if self._registered:
             self.logger.warning("CascadeDetector already registered")
             return
+
+        if not self.config.enabled:
+            self.logger.info("CascadeDetector registration skipped: disabled by config")
+            return
+
+        self.config.assert_input_topic_allowed()
 
         self._subscription = self.event_bus.subscribe(
             self.config.input_topic,
@@ -126,7 +157,9 @@ class CascadeDetector:
             "CascadeDetector registered",
             extra={
                 "input_topic": self.config.input_topic,
+                "output_topics": list(self.config.output_topics),
                 "scheduler_enabled": self.scheduler is not None,
+                "scope": "exchange:market_type:symbol:timeframe",
             },
         )
 
@@ -152,10 +185,13 @@ class CascadeDetector:
             "CascadeDetector started",
             extra={
                 "input_topic": self.config.input_topic,
+                "publish_topic_detected": self.config.publish_topic_detected,
+                "publish_topic_exhaustion": self.config.publish_topic_exhaustion,
                 "window_seconds": self.config.window_seconds,
                 "min_events": self.config.min_events,
                 "min_total_notional_usd": str(self.config.min_total_notional_usd),
                 "min_side_imbalance_ratio": self.config.min_side_imbalance_ratio,
+                "scope": "exchange:market_type:symbol:timeframe",
             },
         )
 
@@ -183,8 +219,8 @@ class CascadeDetector:
         """
         Основний EventBus handler.
 
-        core.EventBus передає envelope Event.
-        LiquidationEvent лежить у event.payload.
+        Очікує, що event.payload уже є LiquidationEvent із data-layer topic:
+            market.liquidation.normalized
         """
         if not self._running:
             return
@@ -209,10 +245,7 @@ class CascadeDetector:
             self._processed_events += 1
             self._last_event_at = ensure_utc(liquidation_event.timestamp)
 
-            symbol_state = self.state.get(
-                liquidation_event.exchange,
-                liquidation_event.symbol,
-            )
+            symbol_state = self.state.get_key(liquidation_event.key)
 
             if symbol_state is None or symbol_state.is_empty:
                 self._empty_window_skips += 1
@@ -243,7 +276,11 @@ class CascadeDetector:
                     "topic": event.topic,
                     "event_id": event.event_id,
                     "exchange": liquidation_event.exchange,
+                    "market_type": liquidation_event.market_type,
                     "symbol": liquidation_event.symbol,
+                    "timeframe": liquidation_event.timeframe,
+                    "exchange_symbol": liquidation_event.exchange_symbol,
+                    "scope": liquidation_key_to_dict(liquidation_event.key),
                     "error": repr(exc),
                 },
             )
@@ -259,18 +296,25 @@ class CascadeDetector:
         trigger_event: LiquidationEvent,
         correlation_id: str | None = None,
     ) -> CascadeDetectionResult | None:
+        if trigger_event.key != symbol_state.key:
+            raise ValueError(
+                "Trigger event scope does not match SymbolLiquidationState: "
+                f"event={liquidation_key_to_dict(trigger_event.key)} "
+                f"state={liquidation_key_to_dict(symbol_state.key)}"
+            )
+
         window_events = self._get_window_events(
             symbol_state,
             now=trigger_event.timestamp,
         )
+        window_events = filter_events_by_key(window_events, trigger_event.key)
 
         if not window_events:
             self._empty_window_skips += 1
             return None
 
-        stats = compute_window_stats(
-            exchange=trigger_event.exchange,
-            symbol=trigger_event.symbol,
+        stats = compute_window_stats_for_key(
+            key=trigger_event.key,
             events=window_events,
         )
 
@@ -306,9 +350,8 @@ class CascadeDetector:
             extreme_threshold=self.config.extreme_severity_threshold,
         )
 
-        cluster = build_cluster_from_events(
-            exchange=trigger_event.exchange,
-            symbol=trigger_event.symbol,
+        cluster = build_cluster_from_events_for_key(
+            key=trigger_event.key,
             side=stats.dominant_side,
             events=dominant_side_events,
             severity=severity,
@@ -335,7 +378,10 @@ class CascadeDetector:
 
         result = CascadeDetectionResult(
             exchange=trigger_event.exchange,
+            market_type=trigger_event.market_type,
             symbol=trigger_event.symbol,
+            timeframe=trigger_event.timeframe,
+            exchange_symbol=trigger_event.exchange_symbol,
             side=stats.dominant_side,
             direction=cluster.direction,
             detected_at=utc_now(),
@@ -353,6 +399,9 @@ class CascadeDetector:
             correlation_id=correlation_id or trigger_event.correlation_id,
             source=self.service_name,
             metadata={
+                "scope": liquidation_key_to_dict(trigger_event.key),
+                "scope_key": scoped_key_to_string(trigger_event.key),
+                "exchange_symbol": trigger_event.exchange_symbol,
                 "trigger_event_id": trigger_event.event_id,
                 "trigger_event_timestamp": trigger_event.timestamp.isoformat(),
                 "side_imbalance_ratio": stats.side_imbalance_ratio,
@@ -444,13 +493,7 @@ class CascadeDetector:
                 max(self.config.min_acceleration_ratio * 1.5, 1.0),
             )
 
-        total_weight = (
-            self.config.continuation_score_weight
-            + self.config.imbalance_score_weight
-            + self.config.notional_score_weight
-            + self.config.acceleration_score_weight
-        )
-
+        total_weight = self.config.score_weights_sum
         if total_weight <= 0:
             return 0.0
 
@@ -558,18 +601,18 @@ class CascadeDetector:
     # ---------------------------------------------------------------------
 
     async def _emit_detection_result(self, result: CascadeDetectionResult) -> None:
+        headers = self._headers_for_result(
+            result,
+            event_type=LiquidationEventType.CASCADE,
+        )
+
         accepted = await self.event_bus.emit(
             self.config.publish_topic_detected,
             result,
             priority=EventPriority.HIGH,
             source=self.service_name,
             correlation_id=result.correlation_id,
-            headers={
-                "exchange": result.exchange,
-                "symbol": result.symbol,
-                "event_type": LiquidationEventType.CASCADE.value,
-                "severity": result.severity.value,
-            },
+            headers=headers,
         )
 
         if accepted:
@@ -581,7 +624,11 @@ class CascadeDetector:
             "Liquidation cascade detected",
             extra={
                 "exchange": result.exchange,
+                "market_type": result.market_type,
                 "symbol": result.symbol,
+                "timeframe": result.timeframe,
+                "exchange_symbol": result.exchange_symbol,
+                "scope": liquidation_key_to_dict(result.key),
                 "side": result.side.value,
                 "severity": result.severity.value,
                 "intensity_score": result.intensity_score,
@@ -595,18 +642,18 @@ class CascadeDetector:
         )
 
         if result.favors_exhaustion:
+            exhaustion_headers = self._headers_for_result(
+                result,
+                event_type=LiquidationEventType.EXHAUSTION,
+            )
+
             exhaustion_accepted = await self.event_bus.emit(
                 self.config.publish_topic_exhaustion,
                 result,
                 priority=EventPriority.HIGH,
                 source=self.service_name,
                 correlation_id=result.correlation_id,
-                headers={
-                    "exchange": result.exchange,
-                    "symbol": result.symbol,
-                    "event_type": LiquidationEventType.EXHAUSTION.value,
-                    "severity": result.severity.value,
-                },
+                headers=exhaustion_headers,
             )
 
             if exhaustion_accepted:
@@ -626,6 +673,7 @@ class CascadeDetector:
                 item.to_dict(serialize=True)
                 for item in self.get_recent_signals(limit=25)
             ],
+            "scope": "exchange:market_type:symbol:timeframe",
             "emitted_at": utc_now().isoformat(),
         }
 
@@ -666,8 +714,17 @@ class CascadeDetector:
         self,
         exchange: str,
         symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> CascadeDetectionResult | None:
-        symbol_state = self.state.get(exchange, symbol)
+        key = self._make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        symbol_state = self.state.get_key(key)
 
         if symbol_state is None or symbol_state.is_empty:
             return None
@@ -683,32 +740,51 @@ class CascadeDetector:
 
         return result
 
+    def detect_now_key(
+        self,
+        key: LiquidationKey,
+    ) -> CascadeDetectionResult | None:
+        """
+        Sync convenience method не робимо, бо detection публікує async EventBus.
+        Залишено явну помилку, щоб не створювати прихованих background tasks.
+        """
+        raise RuntimeError("Use async detect_now(..., market_type=..., timeframe=...)")
+
     def get_recent_signals(
         self,
         *,
         symbol: str | None = None,
         exchange: str | None = None,
+        market_type: str | None = None,
+        timeframe: str | None = None,
         limit: int = 50,
     ) -> list[CascadeDetectionResult]:
         if limit <= 0:
             return []
 
-        target_exchange: str | None = None
-        target_symbol: str | None = None
-
-        if exchange is not None and symbol is not None:
-            target_exchange, target_symbol = build_symbol_key(exchange, symbol)
-        elif exchange is not None:
-            target_exchange = exchange.strip().lower()
-        elif symbol is not None:
-            target_symbol = symbol.strip().upper().replace("-", "").replace("/", "")
+        target_exchange = normalize_exchange(exchange) if exchange is not None else None
+        target_symbol = normalize_symbol(symbol) if symbol is not None else None
+        target_market_type = (
+            normalize_market_type(market_type)
+            if market_type is not None
+            else None
+        )
+        target_timeframe = (
+            normalize_timeframe(timeframe)
+            if timeframe is not None
+            else None
+        )
 
         result: list[CascadeDetectionResult] = []
 
         for signal in reversed(self._latest_signals):
             if target_exchange and signal.exchange != target_exchange:
                 continue
+            if target_market_type and signal.market_type != target_market_type:
+                continue
             if target_symbol and signal.symbol != target_symbol:
+                continue
+            if target_timeframe and signal.timeframe != target_timeframe:
                 continue
 
             result.append(signal)
@@ -718,32 +794,49 @@ class CascadeDetector:
 
         return result
 
+    def get_key_last_signal(
+        self,
+        key: LiquidationKey,
+    ) -> CascadeDetectionResult | None:
+        for signal in reversed(self._latest_signals):
+            if signal.key == key:
+                return signal
+        return None
+
     def get_symbol_last_signal(
         self,
         exchange: str,
         symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> CascadeDetectionResult | None:
         signals = self.get_recent_signals(
             exchange=exchange,
+            market_type=market_type,
             symbol=symbol,
+            timeframe=timeframe,
             limit=1,
         )
         return signals[0] if signals else None
 
     def get_hot_symbols(self, limit: int = 10) -> list[dict[str, Any]]:
-        latest_by_key: dict[tuple[str, str], CascadeDetectionResult] = {}
+        latest_by_key: dict[LiquidationKey, CascadeDetectionResult] = {}
 
         for signal in self._latest_signals:
-            key = signal.symbol_key
-            previous = latest_by_key.get(key)
+            previous = latest_by_key.get(signal.key)
 
             if previous is None or signal.detected_at > previous.detected_at:
-                latest_by_key[key] = signal
+                latest_by_key[signal.key] = signal
 
         rows = [
             {
                 "exchange": signal.exchange,
+                "market_type": signal.market_type,
                 "symbol": signal.symbol,
+                "timeframe": signal.timeframe,
+                "exchange_symbol": signal.exchange_symbol,
+                "scope": liquidation_key_to_dict(signal.key),
                 "severity": signal.severity.value,
                 "intensity_score": signal.intensity_score,
                 "confidence": signal.confidence,
@@ -765,38 +858,35 @@ class CascadeDetector:
 
         return rows[: max(0, limit)]
 
-    def get_symbol_diagnostic(
+    def get_key_diagnostic(
         self,
-        exchange: str,
-        symbol: str,
+        key: LiquidationKey,
     ) -> dict[str, Any]:
-        normalized_exchange, normalized_symbol = build_symbol_key(exchange, symbol)
-        symbol_state = self.state.get(normalized_exchange, normalized_symbol)
+        scope = liquidation_key_to_dict(key)
+        symbol_state = self.state.get_key(key)
 
         if symbol_state is None:
             return {
-                "exchange": normalized_exchange,
-                "symbol": normalized_symbol,
+                **scope,
+                "scope": scope,
                 "exists": False,
             }
 
         now = utc_now()
         window_events = self._get_window_events(symbol_state, now=now)
+        window_events = filter_events_by_key(window_events, key)
 
-        stats = compute_window_stats(
-            exchange=normalized_exchange,
-            symbol=normalized_symbol,
+        stats = compute_window_stats_for_key(
+            key=key,
             events=window_events,
         )
 
-        last_signal = self.get_symbol_last_signal(
-            normalized_exchange,
-            normalized_symbol,
-        )
+        last_signal = self.get_key_last_signal(key)
 
         return {
-            "exchange": normalized_exchange,
-            "symbol": normalized_symbol,
+            **scope,
+            "scope": scope,
+            "exchange_symbol": symbol_state.exchange_symbol,
             "exists": True,
             "buffer_snapshot": symbol_state.snapshot().to_dict(serialize=True),
             "window_stats": stats.to_dict(serialize=True),
@@ -807,6 +897,22 @@ class CascadeDetector:
                 else None
             ),
         }
+
+    def get_symbol_diagnostic(
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        key = self._make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return self.get_key_diagnostic(key)
 
     # ---------------------------------------------------------------------
     # Scheduler jobs
@@ -904,6 +1010,8 @@ class CascadeDetector:
             "status": status,
             "running": self._running,
             "registered": self._registered,
+            "scope": "exchange:market_type:symbol:timeframe",
+            "input_topic": self.config.input_topic,
             "last_event_at": self._last_event_at.isoformat() if self._last_event_at else None,
             "last_signal_at": self._last_signal_at.isoformat() if self._last_signal_at else None,
             "seconds_since_last_event": seconds_since_last_event,
@@ -923,7 +1031,9 @@ class CascadeDetector:
             "service_name": self.service_name,
             "running": self._running,
             "registered": self._registered,
+            "scope": "exchange:market_type:symbol:timeframe",
             "input_topic": self.config.input_topic,
+            "output_topics": list(self.config.output_topics),
             "uptime_seconds": uptime_seconds,
             "processed_events": self._processed_events,
             "invalid_payload_skips": self._invalid_payload_skips,
@@ -932,6 +1042,7 @@ class CascadeDetector:
             "cooldown_skips": self._cooldown_skips,
             "empty_window_skips": self._empty_window_skips,
             "threshold_skips": self._threshold_skips,
+            "tracked_scopes": self.state.scopes_count,
             "tracked_symbols": self.state.symbols_count,
             "latest_signals_buffered": len(self._latest_signals),
             "latest_signals_limit": self._latest_signals_limit,
@@ -951,3 +1062,44 @@ class CascadeDetector:
     @property
     def is_registered(self) -> bool:
         return self._registered
+
+    # ---------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _headers_for_result(
+        result: CascadeDetectionResult,
+        *,
+        event_type: LiquidationEventType,
+    ) -> dict[str, str]:
+        return {
+            "exchange": result.exchange,
+            "market_type": result.market_type,
+            "symbol": result.symbol,
+            "timeframe": result.timeframe,
+            "exchange_symbol": result.exchange_symbol or result.symbol,
+            "scope": scoped_key_to_string(result.key),
+            "event_type": event_type.value,
+            "severity": result.severity.value,
+        }
+
+    @staticmethod
+    def _make_key(
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str | None = None,
+        timeframe: str | None = None,
+    ) -> LiquidationKey:
+        return make_liquidation_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+
+__all__ = [
+    "CascadeDetector",
+]
