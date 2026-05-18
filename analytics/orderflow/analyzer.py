@@ -11,7 +11,14 @@ from .aggressive_trades import AggressiveTradesAnalyzer
 from .config import OrderFlowConfig
 from .cvd import CvdAnalyzer
 from .enums import OrderFlowEventTopic
-from .models import BaseOrderFlowStats
+from .models import (
+    BaseOrderFlowStats,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    OrderFlowKey,
+    make_orderflow_key,
+    orderflow_key_to_dict,
+)
 from .orderbook_imbalance import OrderbookImbalanceAnalyzer
 from .volume_delta import VolumeDeltaAnalyzer
 
@@ -30,13 +37,30 @@ class OrderFlowAnalyzer:
 
     Responsibilities:
     - own and wire all order-flow analyzers;
-    - inject EventBus / Scheduler / Config / caches into concrete modules;
+    - inject EventBus / Scheduler / Config / data caches into concrete modules;
     - centrally register/stop all submodules;
-    - expose aggregated stats and latest per-symbol state;
-    - optionally run all sub-analyzers manually for one symbol.
+    - expose aggregated stats and latest scoped futures state;
+    - optionally run all sub-analyzers manually for one futures scope.
 
     This class is an orchestration layer only.
     It must not contain trading logic or strategy decisions.
+
+    Correct input flow:
+        exchange adapters
+            -> market.trade / market.orderbook
+            -> TradesCache / OrderbookCache
+            -> market.trades.updated / market.orderbook.updated
+            -> analytics.orderflow
+            -> analytics.orderflow.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
+
+    Futures examples:
+        ("binance", "usdm_futures", "BTCUSDT", "1m")
+        ("bybit", "linear", "BTCUSDT", "1m")
+        ("okx", "swap", "BTCUSDT", "1m")
+        ("mexc", "usdm_futures", "BTCUSDT", "1m")
     """
 
     def __init__(
@@ -46,9 +70,12 @@ class OrderFlowAnalyzer:
         trades_cache: Any,
         orderbook_cache: Any,
         config: OrderFlowConfig | None = None,
-        scheduler: Scheduler,
+        scheduler: Scheduler | None = None,
         trades_topic_patterns: list[str] | tuple[str, ...] | None = None,
         orderbook_topic_patterns: list[str] | tuple[str, ...] | None = None,
+        default_exchange: str | None = None,
+        default_market_type: str = DEFAULT_MARKET_TYPE,
+        default_timeframe: str = DEFAULT_TIMEFRAME,
     ) -> None:
         self._event_bus = event_bus
         self._scheduler = scheduler
@@ -57,6 +84,14 @@ class OrderFlowAnalyzer:
         self._config = config or OrderFlowConfig()
 
         self._config.validate()
+
+        self._default_exchange = (
+            str(default_exchange).strip().lower()
+            if default_exchange
+            else None
+        )
+        self._default_market_type = self._normalize_market_type(default_market_type)
+        self._default_timeframe = self._normalize_timeframe(default_timeframe)
 
         self._trades_topic_patterns = list(
             trades_topic_patterns
@@ -83,6 +118,9 @@ class OrderFlowAnalyzer:
             trades_cache=self._trades_cache,
             config=self._config.cvd,
             source_topic_patterns=self._trades_topic_patterns,
+            default_exchange=self._default_exchange,
+            default_market_type=self._default_market_type,
+            default_timeframe=self._default_timeframe,
         )
 
         self.volume_delta = VolumeDeltaAnalyzer(
@@ -91,6 +129,9 @@ class OrderFlowAnalyzer:
             trades_cache=self._trades_cache,
             config=self._config.volume_delta,
             source_topic_patterns=self._trades_topic_patterns,
+            default_exchange=self._default_exchange,
+            default_market_type=self._default_market_type,
+            default_timeframe=self._default_timeframe,
         )
 
         self.aggressive_trades = AggressiveTradesAnalyzer(
@@ -99,6 +140,9 @@ class OrderFlowAnalyzer:
             trades_cache=self._trades_cache,
             config=self._config.aggressive_trades,
             source_topic_patterns=self._trades_topic_patterns,
+            default_exchange=self._default_exchange,
+            default_market_type=self._default_market_type,
+            default_timeframe=self._default_timeframe,
         )
 
         self.orderbook_imbalance = OrderbookImbalanceAnalyzer(
@@ -107,6 +151,9 @@ class OrderFlowAnalyzer:
             orderbook_cache=self._orderbook_cache,
             config=self._config.orderbook_imbalance,
             source_topic_patterns=self._orderbook_topic_patterns,
+            default_exchange=self._default_exchange,
+            default_market_type=self._default_market_type,
+            default_timeframe=self._default_timeframe,
         )
 
         self._modules: dict[str, OrderFlowModule] = {
@@ -142,6 +189,7 @@ class OrderFlowAnalyzer:
                     {
                         "reason": "disabled_by_config",
                         "enabled": False,
+                        "scope": "exchange:market_type:symbol:timeframe",
                     },
                     priority=EventPriority.LOW,
                 )
@@ -170,10 +218,14 @@ class OrderFlowAnalyzer:
             self._running = True
 
             self._logger.info(
-                "OrderFlowAnalyzer registered | modules=%s trades_patterns=%s orderbook_patterns=%s",
+                (
+                    "OrderFlowAnalyzer registered | modules=%s "
+                    "trades_patterns=%s orderbook_patterns=%s scope=%s"
+                ),
                 registered_modules,
                 self._trades_topic_patterns,
                 self._orderbook_topic_patterns,
+                "exchange:market_type:symbol:timeframe",
             )
 
             await self._emit_lifecycle_event(
@@ -183,6 +235,12 @@ class OrderFlowAnalyzer:
                     "modules": registered_modules,
                     "trades_topic_patterns": list(self._trades_topic_patterns),
                     "orderbook_topic_patterns": list(self._orderbook_topic_patterns),
+                    "scope": "exchange:market_type:symbol:timeframe",
+                    "defaults": {
+                        "exchange": self._default_exchange,
+                        "market_type": self._default_market_type,
+                        "timeframe": self._default_timeframe,
+                    },
                 },
                 priority=EventPriority.NORMAL,
             )
@@ -225,6 +283,7 @@ class OrderFlowAnalyzer:
                 {
                     "enabled": self._config.enabled,
                     "modules": stopped_modules,
+                    "scope": "exchange:market_type:symbol:timeframe",
                 },
                 priority=EventPriority.NORMAL,
             )
@@ -246,75 +305,147 @@ class OrderFlowAnalyzer:
     def enabled_modules(self) -> tuple[str, ...]:
         return self._config.enabled_modules()
 
-    def get_latest_stats(
+    def get_latest_stats_by_key(
         self,
-        symbol: str,
-    ) -> dict[str, BaseOrderFlowStats | None | str]:
-        normalized_symbol = self._normalize_symbol(symbol)
+        key: OrderFlowKey,
+    ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
+        """
+        Return latest stats for one scoped futures market.
+
+        key:
+            exchange + market_type + symbol + timeframe
+        """
+        normalized_key = self._normalize_key_from_tuple(key)
 
         return {
-            "symbol": normalized_symbol,
-            "cvd": self.cvd.get_latest_stats(normalized_symbol),
-            "volume_delta": self.volume_delta.get_latest_stats(normalized_symbol),
-            "aggressive_trades": self.aggressive_trades.get_latest_stats(
-                normalized_symbol
+            "key": list(normalized_key),
+            "scope": orderflow_key_to_dict(normalized_key),
+            "cvd": self.cvd.get_latest_stats_by_key(normalized_key),
+            "volume_delta": self.volume_delta.get_latest_stats_by_key(normalized_key),
+            "aggressive_trades": self.aggressive_trades.get_latest_stats_by_key(
+                normalized_key
             ),
-            "orderbook_imbalance": self.orderbook_imbalance.get_latest_stats(
-                normalized_symbol
+            "orderbook_imbalance": self.orderbook_imbalance.get_latest_stats_by_key(
+                normalized_key
             ),
         }
 
-    async def process_symbol(
+    def get_latest_stats(
         self,
+        *,
+        exchange: str,
         symbol: str,
-    ) -> dict[str, BaseOrderFlowStats | None | str]:
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
         """
-        Manually process one symbol across all enabled sub-analyzers.
+        Scoped latest-stats API.
+
+        Use this instead of the old symbol-only form.
+        """
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return self.get_latest_stats_by_key(key)
+
+    async def process_key(
+        self,
+        key: OrderFlowKey,
+    ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
+        """
+        Manually process one scoped futures market across all enabled sub-analyzers.
 
         Normal live operation should happen through EventBus subscriptions.
         This method is useful for tests, backtests, warmup, admin actions,
         or one-shot recalculation.
         """
-        normalized_symbol = self._normalize_symbol(symbol)
+        normalized_key = self._normalize_key_from_tuple(key)
 
         if not self._config.enabled:
             self._logger.warning(
-                "Manual order-flow processing skipped: facade disabled | symbol=%s",
-                normalized_symbol,
+                "Manual order-flow processing skipped: facade disabled",
+                extra=orderflow_key_to_dict(normalized_key),
             )
-            return self._empty_symbol_result(normalized_symbol)
+            return self._empty_key_result(normalized_key)
 
-        results: dict[str, BaseOrderFlowStats | None | str] = {
-            "symbol": normalized_symbol,
-            "cvd": None,
-            "volume_delta": None,
-            "aggressive_trades": None,
-            "orderbook_imbalance": None,
-        }
+        results: dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]] = (
+            self._empty_key_result(normalized_key)
+        )
 
         for name, module in self._modules.items():
             if not self._is_module_enabled(name):
                 continue
 
             try:
-                results[name] = await module.process_symbol(normalized_symbol)
+                results[name] = await module.process_key(normalized_key)
             except Exception:
                 self._logger.exception(
-                    "Manual order-flow module processing failed | module=%s symbol=%s",
-                    name,
-                    normalized_symbol,
+                    "Manual order-flow module processing failed",
+                    extra={
+                        **orderflow_key_to_dict(normalized_key),
+                        "module": name,
+                    },
                 )
                 await self._emit_lifecycle_event(
                     OrderFlowEventTopic.ERROR.value,
                     {
+                        **orderflow_key_to_dict(normalized_key),
+                        "key": list(normalized_key),
                         "module": name,
-                        "symbol": normalized_symbol,
                         "reason": "manual_process_failed",
                     },
                     priority=EventPriority.HIGH,
                 )
 
         return results
+
+    async def process_market(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
+        """
+        Scoped convenience wrapper for manual processing.
+        """
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        return await self.process_key(key)
+
+    async def process_symbol(
+        self,
+        symbol: str,
+    ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
+        """
+        Backward-compatible wrapper.
+
+        Symbol-only processing is unsafe in multi-exchange futures mode.
+        This method is allowed only when default_exchange was explicitly
+        configured for this facade instance.
+        """
+        if not self._default_exchange:
+            raise ValueError(
+                "process_symbol(symbol) requires default_exchange. "
+                "Use process_market(exchange=..., market_type=..., symbol=..., timeframe=...) "
+                "or process_key(key) instead."
+            )
+
+        key = self.make_key(
+            exchange=self._default_exchange,
+            market_type=self._default_market_type,
+            symbol=symbol,
+            timeframe=self._default_timeframe,
+        )
+        return await self.process_key(key)
 
     async def cleanup(self) -> None:
         """
@@ -345,6 +476,12 @@ class OrderFlowAnalyzer:
             "running": self._running,
             "enabled": self._config.enabled,
             "enabled_modules": self.enabled_modules(),
+            "scope": "exchange:market_type:symbol:timeframe",
+            "defaults": {
+                "exchange": self._default_exchange,
+                "market_type": self._default_market_type,
+                "timeframe": self._default_timeframe,
+            },
             "trades_topic_patterns": list(self._trades_topic_patterns),
             "orderbook_topic_patterns": list(self._orderbook_topic_patterns),
             "scheduler_attached": self._scheduler is not None,
@@ -377,23 +514,58 @@ class OrderFlowAnalyzer:
 
         return False
 
-    def _normalize_symbol(self, symbol: str) -> str:
-        normalized = str(symbol).strip().upper()
-        if not normalized:
-            raise ValueError("symbol must not be empty")
-        return normalized
-
-    def _empty_symbol_result(
+    def _empty_key_result(
         self,
-        symbol: str,
-    ) -> dict[str, BaseOrderFlowStats | None | str]:
+        key: OrderFlowKey,
+    ) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
         return {
-            "symbol": symbol,
+            "key": list(key),
+            "scope": orderflow_key_to_dict(key),
             "cvd": None,
             "volume_delta": None,
             "aggressive_trades": None,
             "orderbook_imbalance": None,
         }
+
+    @staticmethod
+    def make_key(
+        *,
+        exchange: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> OrderFlowKey:
+        return make_orderflow_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+    def _normalize_key_from_tuple(self, key: OrderFlowKey) -> OrderFlowKey:
+        if len(key) != 4:
+            raise ValueError(
+                "OrderFlowKey must be a 4-tuple: "
+                "(exchange, market_type, symbol, timeframe)"
+            )
+
+        exchange, market_type, symbol, timeframe = key
+        return self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+    @staticmethod
+    def _normalize_market_type(value: Any) -> str:
+        normalized = str(value or DEFAULT_MARKET_TYPE).strip().lower()
+        return normalized if normalized else DEFAULT_MARKET_TYPE
+
+    @staticmethod
+    def _normalize_timeframe(value: Any) -> str:
+        normalized = str(value or DEFAULT_TIMEFRAME).strip()
+        return normalized if normalized else DEFAULT_TIMEFRAME
 
     async def _emit_lifecycle_event(
         self,

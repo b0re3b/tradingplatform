@@ -5,11 +5,15 @@ from enum import Enum
 
 class OrderFlowSide(str, Enum):
     """
-    Normalized aggressor / flow side used by order-flow analytics.
+    Normalized aggressor / flow side used by futures order-flow analytics.
 
-    This enum is intentionally independent from exchange-specific naming.
-    Exchange adapters and data normalizers should map raw values into these
-    canonical values before analytics modules process them.
+    Exchange adapters and data caches should normalize raw exchange values into
+    these canonical values before analytics modules process them.
+
+    Futures-only note:
+    - "long" is treated as aggressive buy context;
+    - "short" is treated as aggressive sell context;
+    - this enum is still side/flow-oriented, not position-management logic.
     """
 
     BUY = "buy"
@@ -17,7 +21,7 @@ class OrderFlowSide(str, Enum):
     UNKNOWN = "unknown"
 
     @classmethod
-    def from_value(cls, value: object) -> "OrderFlowSide":
+    def from_value(cls, value: object) -> OrderFlowSide:
         if isinstance(value, cls):
             return value
 
@@ -31,16 +35,22 @@ class OrderFlowSide(str, Enum):
             "bid",
             "b",
             "long",
-            "maker_sell_false",
+            "taker_buy",
             "aggressive_buy",
+            "maker_sell_false",
+            "is_buyer_maker_false",
+            "buyer_maker_false",
         }
         sell_aliases = {
             "sell",
             "ask",
             "s",
             "short",
-            "maker_sell_true",
+            "taker_sell",
             "aggressive_sell",
+            "maker_sell_true",
+            "is_buyer_maker_true",
+            "buyer_maker_true",
         }
 
         if normalized in buy_aliases:
@@ -53,15 +63,23 @@ class OrderFlowSide(str, Enum):
 
     @property
     def is_buy(self) -> bool:
-        return self is self.BUY
+        return self is OrderFlowSide.BUY
 
     @property
     def is_sell(self) -> bool:
-        return self is self.SELL
+        return self is OrderFlowSide.SELL
 
     @property
     def is_known(self) -> bool:
-        return self in {self.BUY, self.SELL}
+        return self in {OrderFlowSide.BUY, OrderFlowSide.SELL}
+
+    @property
+    def sign(self) -> int:
+        if self is OrderFlowSide.BUY:
+            return 1
+        if self is OrderFlowSide.SELL:
+            return -1
+        return 0
 
 
 class OrderFlowMetricType(str, Enum):
@@ -69,11 +87,12 @@ class OrderFlowMetricType(str, Enum):
     Order-flow metric identifiers.
 
     These values are used in:
-    - stats models
-    - update payloads
-    - signal payloads
-    - module metrics
-    - logs
+    - stats models;
+    - update payloads;
+    - signal payloads;
+    - module metrics;
+    - logs;
+    - dashboard/storage routing.
     """
 
     CVD = "cvd"
@@ -94,12 +113,18 @@ class OrderFlowSignalType(str, Enum):
 
     @property
     def is_directional(self) -> bool:
-        return self in {self.BULLISH, self.BEARISH}
+        return self in {
+            OrderFlowSignalType.BULLISH,
+            OrderFlowSignalType.BEARISH,
+        }
 
 
 class OrderFlowSourceType(str, Enum):
     """
     Source data category consumed by an order-flow analyzer.
+
+    Important:
+    these are logical source categories, not exchange adapter names.
     """
 
     TRADES = "trades"
@@ -114,11 +139,16 @@ class OrderFlowEventTopic(str, Enum):
     Topic convention:
         analytics.orderflow.<metric>.<event>
 
-    Data layer should publish market.* events.
-    Order-flow analyzers should consume market.* events and emit these
-    analytics.orderflow.* events.
-    Strategy modules should subscribe to these topics instead of calling
-    order-flow analyzers directly.
+    Data layer publishes:
+        market.trades.updated
+        market.orderbook.updated
+
+    Order-flow analyzers consume those data-layer topics and emit these
+    analytics.orderflow.* topics.
+
+    Strategy, Open Interest, Liquidity, Dashboard, Bots and Storage should
+    subscribe to analytics.orderflow.* topics instead of calling analyzers
+    directly.
     """
 
     # ------------------------------------------------------------------
@@ -129,6 +159,10 @@ class OrderFlowEventTopic(str, Enum):
     STOPPED = "analytics.orderflow.stopped"
     HEALTH = "analytics.orderflow.health"
     ERROR = "analytics.orderflow.error"
+
+    # Optional service-level aggregate update for downstream packages that
+    # want a single orderflow topic instead of metric-specific topics.
+    UPDATED = "analytics.orderflow.updated"
 
     # ------------------------------------------------------------------
     # CVD events
@@ -158,37 +192,107 @@ class OrderFlowEventTopic(str, Enum):
     ORDERBOOK_IMBALANCE_UPDATED = "analytics.orderflow.orderbook_imbalance.updated"
     ORDERBOOK_IMBALANCE_SIGNAL = "analytics.orderflow.orderbook_imbalance.signal"
 
+    @property
+    def topic(self) -> str:
+        return self.value
+
 
 class OrderFlowInputTopic(str, Enum):
     """
-    Canonical market-data topics consumed by analytics.orderflow modules.
+    Canonical data-layer topics consumed by analytics.orderflow modules.
 
-    These are not emitted by orderflow itself. They are expected to come from:
-    - data.market_stream
-    - exchange websocket adapters
-    - cache update publishers
+    Orderflow must NOT consume raw exchange adapter events by default.
+
+    Correct flow:
+        exchange adapters
+            -> market.trade / market.orderbook
+            -> TradesCache / OrderbookCache
+            -> market.trades.updated / market.orderbook.updated
+            -> analytics.orderflow
+            -> analytics.orderflow.*
+
+    Futures scope expected in payload:
+        exchange + market_type + symbol + timeframe/window
+
+    Futures market_type examples:
+        binance: usdm_futures
+        bybit: linear
+        okx: swap
+        mexc: usdm_futures
     """
 
-    MARKET_TRADE = "market.trade"
-    MARKET_TRADE_WILDCARD = "market.trade.*"
+    # Main trade context from TradesCache.
     MARKET_TRADES_UPDATED = "market.trades.updated"
 
+    # Main orderbook context from OrderbookCache.
     MARKET_ORDERBOOK_UPDATED = "market.orderbook.updated"
-    MARKET_ORDERBOOK_SNAPSHOT = "market.orderbook.snapshot"
-    MARKET_ORDERBOOK_WILDCARD = "market.orderbook.*"
+
+    # ------------------------------------------------------------------
+    # Legacy raw topics.
+    # ------------------------------------------------------------------
+    # These are intentionally NOT included in default TRADE_INPUT_TOPICS or
+    # ORDERBOOK_INPUT_TOPICS. They can be used only explicitly in tests or
+    # compatibility adapters if needed.
+    MARKET_TRADE_LEGACY = "market.trade"
+    MARKET_TRADE_WILDCARD_LEGACY = "market.trade.*"
+    MARKET_ORDERBOOK_SNAPSHOT_LEGACY = "market.orderbook.snapshot"
+    MARKET_ORDERBOOK_WILDCARD_LEGACY = "market.orderbook.*"
+
+    @property
+    def topic(self) -> str:
+        return self.value
+
+    @property
+    def is_data_layer_topic(self) -> bool:
+        return self in {
+            OrderFlowInputTopic.MARKET_TRADES_UPDATED,
+            OrderFlowInputTopic.MARKET_ORDERBOOK_UPDATED,
+        }
+
+    @property
+    def is_legacy_raw_topic(self) -> bool:
+        return self in {
+            OrderFlowInputTopic.MARKET_TRADE_LEGACY,
+            OrderFlowInputTopic.MARKET_TRADE_WILDCARD_LEGACY,
+            OrderFlowInputTopic.MARKET_ORDERBOOK_SNAPSHOT_LEGACY,
+            OrderFlowInputTopic.MARKET_ORDERBOOK_WILDCARD_LEGACY,
+        }
+
+
+# ---------------------------------------------------------------------
+# Default input topics
+# ---------------------------------------------------------------------
+# These are the only default topics analyzers should subscribe to.
+# Raw exchange topics are intentionally excluded.
+# ---------------------------------------------------------------------
 
 
 TRADE_INPUT_TOPICS: tuple[str, ...] = (
-    OrderFlowInputTopic.MARKET_TRADE.value,
-    OrderFlowInputTopic.MARKET_TRADE_WILDCARD.value,
     OrderFlowInputTopic.MARKET_TRADES_UPDATED.value,
 )
 
 ORDERBOOK_INPUT_TOPICS: tuple[str, ...] = (
     OrderFlowInputTopic.MARKET_ORDERBOOK_UPDATED.value,
-    OrderFlowInputTopic.MARKET_ORDERBOOK_SNAPSHOT.value,
-    OrderFlowInputTopic.MARKET_ORDERBOOK_WILDCARD.value,
 )
+
+
+# Explicit legacy groups for compatibility tests or temporary migration only.
+# Do not use these as production defaults.
+
+LEGACY_RAW_TRADE_INPUT_TOPICS: tuple[str, ...] = (
+    OrderFlowInputTopic.MARKET_TRADE_LEGACY.value,
+    OrderFlowInputTopic.MARKET_TRADE_WILDCARD_LEGACY.value,
+)
+
+LEGACY_RAW_ORDERBOOK_INPUT_TOPICS: tuple[str, ...] = (
+    OrderFlowInputTopic.MARKET_ORDERBOOK_SNAPSHOT_LEGACY.value,
+    OrderFlowInputTopic.MARKET_ORDERBOOK_WILDCARD_LEGACY.value,
+)
+
+
+# ---------------------------------------------------------------------
+# Metric -> output topic maps
+# ---------------------------------------------------------------------
 
 
 METRIC_UPDATE_TOPICS: dict[OrderFlowMetricType, OrderFlowEventTopic] = {
@@ -207,15 +311,39 @@ METRIC_SIGNAL_TOPICS: dict[OrderFlowMetricType, OrderFlowEventTopic] = {
 }
 
 
-def get_update_topic(metric_type: OrderFlowMetricType) -> str:
+def normalize_metric_type(metric_type: OrderFlowMetricType | str) -> OrderFlowMetricType:
+    """
+    Normalize metric enum/string into OrderFlowMetricType.
+    """
+    if isinstance(metric_type, OrderFlowMetricType):
+        return metric_type
+
+    return OrderFlowMetricType(str(metric_type))
+
+
+def get_update_topic(metric_type: OrderFlowMetricType | str) -> str:
     """
     Return canonical analytics.orderflow.*.updated topic for a metric.
     """
-    return METRIC_UPDATE_TOPICS[metric_type].value
+    return METRIC_UPDATE_TOPICS[normalize_metric_type(metric_type)].value
 
 
-def get_signal_topic(metric_type: OrderFlowMetricType) -> str:
+def get_signal_topic(metric_type: OrderFlowMetricType | str) -> str:
     """
     Return canonical analytics.orderflow.*.signal topic for a metric.
     """
-    return METRIC_SIGNAL_TOPICS[metric_type].value
+    return METRIC_SIGNAL_TOPICS[normalize_metric_type(metric_type)].value
+
+
+def is_orderflow_update_topic(topic: str) -> bool:
+    """
+    Check whether a topic is one of metric-specific orderflow update topics.
+    """
+    return topic in {event_topic.value for event_topic in METRIC_UPDATE_TOPICS.values()}
+
+
+def is_orderflow_signal_topic(topic: str) -> bool:
+    """
+    Check whether a topic is one of metric-specific orderflow signal topics.
+    """
+    return topic in {event_topic.value for event_topic in METRIC_SIGNAL_TOPICS.values()}

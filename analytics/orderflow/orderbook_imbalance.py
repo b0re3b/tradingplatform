@@ -4,7 +4,7 @@ import asyncio
 import math
 import statistics
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
@@ -20,10 +20,14 @@ from .enums import (
 )
 from .models import (
     BaseOrderFlowStats,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
+    OrderFlowKey,
     OrderFlowSignal,
     OrderbookImbalanceStats,
     OrderbookLevel,
     OrderbookSnapshot,
+    orderflow_key_to_dict,
 )
 
 
@@ -32,14 +36,25 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
     Orderbook imbalance analyzer for analytics.orderflow.
 
     Responsibilities:
-    - consume orderbook events through EventBus subscriptions registered in base
-    - read snapshots from orderbook_cache
-    - normalize snapshots through BaseOrderFlowAnalyzer helpers
-    - calculate bid/ask imbalance at configured depth
-    - optionally smooth imbalance ratio
-    - emit analytics.orderflow.orderbook_imbalance.updated and
-      analytics.orderflow.orderbook_imbalance.signal
-    - use Scheduler-injected cleanup/health jobs from BaseOrderFlowAnalyzer
+    - consume normalized data-layer orderbook updates from OrderbookCache;
+    - read orderbook snapshots from orderbook_cache using scoped futures key;
+    - normalize snapshots through BaseOrderFlowAnalyzer helpers;
+    - calculate bid/ask imbalance at configured depth;
+    - optionally smooth imbalance ratio per exchange + market_type + symbol + timeframe;
+    - emit analytics.orderflow.orderbook_imbalance.updated;
+    - emit analytics.orderflow.orderbook_imbalance.signal;
+    - use Scheduler-injected cleanup/health jobs from BaseOrderFlowAnalyzer.
+
+    Correct input flow:
+        exchange adapters
+            -> market.orderbook
+            -> OrderbookCache
+            -> market.orderbook.updated
+            -> OrderbookImbalanceAnalyzer
+            -> analytics.orderflow.orderbook_imbalance.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     def __init__(
@@ -50,6 +65,9 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         config: OrderbookImbalanceConfig | None = None,
         scheduler: Scheduler | None = None,
         source_topic_patterns: list[str] | tuple[str, ...] | None = None,
+        default_exchange: str | None = None,
+        default_market_type: str = DEFAULT_MARKET_TYPE,
+        default_timeframe: str = DEFAULT_TIMEFRAME,
     ) -> None:
         self._orderbook_cache = orderbook_cache
         self._config = config or OrderbookImbalanceConfig()
@@ -62,42 +80,49 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             source_type=OrderFlowSourceType.ORDERBOOK,
             source_topic_patterns=source_topic_patterns or ORDERBOOK_INPUT_TOPICS,
             component_module="orderflow",
+            default_exchange=default_exchange,
+            default_market_type=default_market_type,
+            default_timeframe=default_timeframe,
         )
 
         self._state_lock = asyncio.Lock()
 
-        self._last_stats_by_symbol: dict[str, OrderbookImbalanceStats] = {}
-        self._ratio_history_by_symbol: dict[str, list[float]] = {}
-        self._last_snapshot_ts_by_symbol: dict[str, float] = {}
+        self._last_stats_by_key: dict[OrderFlowKey, OrderbookImbalanceStats] = {}
+        self._ratio_history_by_key: dict[OrderFlowKey, list[float]] = {}
+        self._last_snapshot_ts_by_key: dict[OrderFlowKey, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def process_symbol(self, symbol: str) -> OrderbookImbalanceStats | None:
-        normalized_symbol = str(symbol).strip().upper()
+    async def process_key(self, key: OrderFlowKey) -> OrderbookImbalanceStats | None:
+        """
+        Process one scoped futures market.
 
-        if not self.should_process_symbol(normalized_symbol):
-            self._inc_metric("skipped", normalized_symbol)
+        key:
+            exchange + market_type + symbol + timeframe
+        """
+        if not self.should_process_key(key):
+            self._inc_metric("skipped", key)
             return None
 
         async with self._state_lock:
             try:
-                snapshot = await self._get_orderbook_snapshot(normalized_symbol)
+                snapshot = await self._get_orderbook_snapshot(key)
                 if snapshot is None:
-                    self._inc_metric("skipped", normalized_symbol)
+                    self._inc_metric("skipped", key)
                     return None
 
                 stats = self._calculate_imbalance(snapshot)
                 if stats is None:
-                    self._inc_metric("skipped", normalized_symbol)
+                    self._inc_metric("skipped", key)
                     return None
 
-                stats = self._apply_smoothing(normalized_symbol, stats)
+                stats = self._apply_smoothing(key, stats)
 
-                self._last_stats_by_symbol[normalized_symbol] = stats
-                self._last_snapshot_ts_by_symbol[normalized_symbol] = snapshot.timestamp
-                self._inc_metric("processed", normalized_symbol)
+                self._last_stats_by_key[key] = stats
+                self._last_snapshot_ts_by_key[key] = snapshot.timestamp
+                self._inc_metric("processed", key)
 
                 await self.emit_update(stats)
 
@@ -108,15 +133,15 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
                 return stats
 
             except Exception:
-                self._inc_metric("errors", normalized_symbol)
+                self._inc_metric("errors", key)
                 self._logger.exception(
-                    "Failed to process orderbook imbalance | symbol=%s",
-                    normalized_symbol,
+                    "Failed to process orderbook imbalance",
+                    extra=orderflow_key_to_dict(key),
                 )
                 return None
 
-    def get_latest_stats(self, symbol: str) -> BaseOrderFlowStats | None:
-        return self._last_stats_by_symbol.get(str(symbol).strip().upper())
+    def get_latest_stats_by_key(self, key: OrderFlowKey) -> BaseOrderFlowStats | None:
+        return self._last_stats_by_key.get(key)
 
     def stats(self) -> dict[str, Any]:
         base_stats = super().stats()
@@ -132,26 +157,37 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
                 "smooth_window": self._config.smooth_window,
             }
         )
-        base_stats["tracked_symbols"] = len(self._last_stats_by_symbol)
+        base_stats["tracked_keys"] = len(self._last_stats_by_key)
+        base_stats["tracked_markets"] = [
+            {
+                **orderflow_key_to_dict(key),
+                "has_stats": key in self._last_stats_by_key,
+                "ratio_history_size": len(self._ratio_history_by_key.get(key, [])),
+                "last_snapshot_ts": self._last_snapshot_ts_by_key.get(key),
+            }
+            for key in sorted(self._tracked_keys())
+        ]
         return base_stats
 
     async def cleanup(self) -> None:
         now = time.time()
         max_age = max(float(self._config.cleanup_interval_sec) * 3.0, 60.0)
 
-        for symbol, snapshot_ts in list(self._last_snapshot_ts_by_symbol.items()):
+        for key, snapshot_ts in list(self._last_snapshot_ts_by_key.items()):
             if (now - snapshot_ts) <= max_age:
                 continue
 
-            self._last_stats_by_symbol.pop(symbol, None)
-            self._ratio_history_by_symbol.pop(symbol, None)
-            self._last_snapshot_ts_by_symbol.pop(symbol, None)
-            self._last_signal_ts_by_symbol.pop(symbol, None)
+            self._last_stats_by_key.pop(key, None)
+            self._ratio_history_by_key.pop(key, None)
+            self._last_snapshot_ts_by_key.pop(key, None)
+            self._last_signal_ts_by_key.pop(key, None)
 
             self._logger.debug(
-                "Removed stale orderbook imbalance state | symbol=%s max_age=%s",
-                symbol,
-                max_age,
+                "Removed stale orderbook imbalance state",
+                extra={
+                    **orderflow_key_to_dict(key),
+                    "max_age": max_age,
+                },
             )
 
     # ------------------------------------------------------------------
@@ -159,30 +195,82 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
     # ------------------------------------------------------------------
 
     async def _handle_event(self, event: Event) -> None:
-        symbol = self.extract_symbol_from_event(event)
-        if not symbol:
+        key = self.extract_key_from_event(event)
+        if key is None:
             self._logger.debug(
-                "Orderbook event without symbol skipped | topic=%s event_id=%s",
+                "Orderbook event without scoped key skipped | topic=%s event_id=%s",
                 event.topic,
                 event.event_id,
             )
             self._inc_metric("skipped")
             return
 
-        await self.process_symbol(symbol)
+        await self.process_key(key)
 
     # ------------------------------------------------------------------
     # Internal data loading
     # ------------------------------------------------------------------
 
-    async def _get_orderbook_snapshot(self, symbol: str) -> OrderbookSnapshot | None:
+    async def _get_orderbook_snapshot(
+        self,
+        key: OrderFlowKey,
+    ) -> OrderbookSnapshot | None:
         if self._orderbook_cache is None:
             return None
 
+        exchange, market_type, symbol, timeframe = key
+
         candidates: tuple[tuple[str, dict[str, Any]], ...] = (
-            ("get_snapshot", {"symbol": symbol}),
-            ("get_orderbook", {"symbol": symbol}),
-            ("get", {"symbol": symbol}),
+            (
+                "get_snapshot",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                },
+            ),
+            (
+                "get_snapshot",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                },
+            ),
+            (
+                "get_orderbook",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                },
+            ),
+            (
+                "get_orderbook",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                },
+            ),
+            (
+                "get_book",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                },
+            ),
+            (
+                "get",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                },
+            ),
         )
 
         for method_name, kwargs in candidates:
@@ -193,10 +281,13 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             result = await self._call_cache_method(
                 method=method,
                 method_name=method_name,
-                symbol=symbol,
+                key=key,
                 kwargs=kwargs,
             )
-            snapshot = self._extract_snapshot_from_cache_result(result, symbol)
+            snapshot = self._extract_snapshot_from_cache_result(
+                result=result,
+                key=key,
+            )
             if snapshot is not None:
                 return snapshot
 
@@ -207,9 +298,11 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         *,
         method: Any,
         method_name: str,
-        symbol: str,
+        key: OrderFlowKey,
         kwargs: dict[str, Any],
     ) -> Any:
+        exchange, market_type, symbol, _timeframe = key
+
         try:
             result = method(**kwargs)
             if asyncio.iscoroutine(result):
@@ -217,31 +310,56 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             return result
 
         except TypeError:
-            try:
-                result = method(symbol)
-                if asyncio.iscoroutine(result):
-                    result = await result
-                return result
-            except Exception:
-                self._logger.exception(
-                    "Failed to fetch orderbook snapshot | method=%s symbol=%s",
-                    method_name,
-                    symbol,
-                )
-                return None
+            # Compatibility fallback for older cache APIs.
+            fallback_calls: tuple[tuple[Any, ...], ...] = (
+                (exchange, market_type, symbol),
+                (exchange, symbol),
+                (symbol,),
+            )
+
+            for args in fallback_calls:
+                try:
+                    result = method(*args)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    return result
+                except TypeError:
+                    continue
+                except Exception:
+                    self._logger.exception(
+                        "Failed to fetch orderbook snapshot",
+                        extra={
+                            **orderflow_key_to_dict(key),
+                            "method": method_name,
+                            "args": args,
+                        },
+                    )
+                    return None
+
+            self._logger.exception(
+                "Failed to fetch orderbook snapshot: incompatible cache method signature",
+                extra={
+                    **orderflow_key_to_dict(key),
+                    "method": method_name,
+                },
+            )
+            return None
 
         except Exception:
             self._logger.exception(
-                "Failed to fetch orderbook snapshot | method=%s symbol=%s",
-                method_name,
-                symbol,
+                "Failed to fetch orderbook snapshot",
+                extra={
+                    **orderflow_key_to_dict(key),
+                    "method": method_name,
+                },
             )
             return None
 
     def _extract_snapshot_from_cache_result(
-            self,
-            result: Any,
-            symbol: str,
+        self,
+        *,
+        result: Any,
+        key: OrderFlowKey,
     ) -> OrderbookSnapshot | None:
         """
         Extract and normalize OrderbookSnapshot from cache result.
@@ -252,21 +370,19 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         - raw orderbook dict
         - {"data": raw orderbook dict}
 
-        The analyzer must accept already-normalized models from the data/cache
-        layer, but still enforce symbol matching and valid bid/ask levels.
+        The analyzer accepts already-normalized models from the data/cache layer,
+        but still enforces full futures scope and valid bid/ask levels.
         """
         if result is None:
             return None
 
-        normalized_symbol = str(symbol).strip().upper()
-
         if isinstance(result, OrderbookSnapshot):
             return self._normalize_snapshot_model(
                 result,
-                expected_symbol=normalized_symbol,
+                expected_key=key,
             )
 
-        if not isinstance(result, dict):
+        if not isinstance(result, Mapping):
             return None
 
         data = result.get("data")
@@ -274,58 +390,64 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         if isinstance(data, OrderbookSnapshot):
             snapshot = self._normalize_snapshot_model(
                 data,
-                expected_symbol=normalized_symbol,
+                expected_key=key,
             )
             if snapshot is not None:
                 return snapshot
 
-        if isinstance(data, dict):
+        if isinstance(data, Mapping):
             snapshot = self.normalize_orderbook_snapshot(
                 data,
-                default_symbol=normalized_symbol,
+                default_exchange=key[0],
+                default_market_type=key[1],
+                default_symbol=key[2],
+                default_timeframe=key[3],
             )
             if snapshot is not None:
                 return self._normalize_snapshot_model(
                     snapshot,
-                    expected_symbol=normalized_symbol,
+                    expected_key=key,
                 )
 
         snapshot = self.normalize_orderbook_snapshot(
             result,
-            default_symbol=normalized_symbol,
+            default_exchange=key[0],
+            default_market_type=key[1],
+            default_symbol=key[2],
+            default_timeframe=key[3],
         )
         if snapshot is not None:
             return self._normalize_snapshot_model(
                 snapshot,
-                expected_symbol=normalized_symbol,
+                expected_key=key,
             )
 
         return None
 
     def _normalize_snapshot_model(
-            self,
-            snapshot: OrderbookSnapshot,
-            *,
-            expected_symbol: str,
+        self,
+        snapshot: OrderbookSnapshot,
+        *,
+        expected_key: OrderFlowKey,
     ) -> OrderbookSnapshot | None:
         """
         Validate and normalize an OrderbookSnapshot model returned by cache.
 
-        This protects the analyzer from:
-        - lower-case symbols;
+        Protects the analyzer from:
+        - snapshots for another exchange;
+        - snapshots for another market_type;
         - snapshots for another symbol;
+        - snapshots for another timeframe;
         - invalid or unsorted levels;
         - empty bid/ask sides after filtering.
         """
-        snapshot_symbol = str(snapshot.symbol).strip().upper()
-        if not snapshot_symbol:
-            return None
-
-        if snapshot_symbol != expected_symbol:
+        if snapshot.key != expected_key:
             self._logger.debug(
-                "Orderbook snapshot symbol mismatch skipped | expected=%s actual=%s",
-                expected_symbol,
-                snapshot_symbol,
+                "Orderbook snapshot scope mismatch skipped",
+                extra={
+                    "expected": orderflow_key_to_dict(expected_key),
+                    "actual": orderflow_key_to_dict(snapshot.key),
+                },
             )
             return None
 
@@ -350,11 +472,14 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         valid_asks.sort(key=lambda item: item.price)
 
         return OrderbookSnapshot(
-            symbol=snapshot_symbol,
+            exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
+            symbol=snapshot.symbol,
+            exchange_symbol=snapshot.exchange_symbol,
+            timeframe=snapshot.timeframe,
             bids=valid_bids,
             asks=valid_asks,
             timestamp=float(snapshot.timestamp),
-            exchange=snapshot.exchange,
             sequence_id=snapshot.sequence_id,
             raw=snapshot.raw,
         )
@@ -404,9 +529,14 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         imbalance_ratio = self._normalize_ratio(raw_ratio)
 
         return OrderbookImbalanceStats(
+            exchange=snapshot.exchange,
+            market_type=snapshot.market_type,
             symbol=snapshot.symbol,
+            exchange_symbol=snapshot.exchange_symbol,
+            timeframe=snapshot.timeframe,
             metric=OrderFlowMetricType.ORDERBOOK_IMBALANCE,
             source_type=OrderFlowSourceType.ORDERBOOK,
+            timestamp=time.time(),
             bid_volume=bid_volume,
             ask_volume=ask_volume,
             imbalance_ratio=imbalance_ratio,
@@ -420,6 +550,14 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
                 len(bid_levels),
                 len(ask_levels),
             ),
+            metadata={
+                "snapshot_ts": snapshot.timestamp,
+                "sequence_id": snapshot.sequence_id,
+                "depth_levels_configured": self._config.depth_levels,
+                "bid_levels_available": len(bids),
+                "ask_levels_available": len(asks),
+                "scope": "exchange:market_type:symbol:timeframe",
+            },
         )
 
     def _prepare_side(
@@ -429,7 +567,8 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         reverse: bool,
     ) -> list[OrderbookLevel]:
         filtered = [
-            level for level in levels
+            level
+            for level in levels
             if level.is_valid
         ]
         filtered.sort(key=lambda item: item.price, reverse=reverse)
@@ -437,14 +576,14 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
 
     def _apply_smoothing(
         self,
-        symbol: str,
+        key: OrderFlowKey,
         stats: OrderbookImbalanceStats,
     ) -> OrderbookImbalanceStats:
         window = max(int(self._config.smooth_window), 1)
         if window <= 1:
             return stats
 
-        history = self._ratio_history_by_symbol.setdefault(symbol, [])
+        history = self._ratio_history_by_key.setdefault(key, [])
         history.append(stats.imbalance_ratio)
 
         if len(history) > window:
@@ -457,7 +596,11 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         )
 
         return OrderbookImbalanceStats(
+            exchange=stats.exchange,
+            market_type=stats.market_type,
             symbol=stats.symbol,
+            exchange_symbol=stats.exchange_symbol,
+            timeframe=stats.timeframe,
             metric=stats.metric,
             source_type=stats.source_type,
             bid_volume=stats.bid_volume,
@@ -470,6 +613,12 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             mid_price=stats.mid_price,
             depth_levels_used=stats.depth_levels_used,
             timestamp=stats.timestamp,
+            metadata={
+                **dict(stats.metadata),
+                "smoothing_window": window,
+                "smoothing_points": len(history),
+                "raw_imbalance_ratio": stats.imbalance_ratio,
+            },
         )
 
     def _normalize_ratio(self, raw_ratio: float) -> float:
@@ -501,8 +650,8 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         bearish_ok = ratio_for_signal <= self._config.bearish_ratio_threshold
 
         if bullish_ok and not bearish_ok:
-            return self.build_signal(
-                symbol=stats.symbol,
+            return self.build_signal_from_stats(
+                stats=stats,
                 signal_type=OrderFlowSignalType.BULLISH,
                 side=OrderFlowSide.BUY,
                 strength=self._calculate_bullish_strength(ratio_for_signal, stats),
@@ -511,8 +660,8 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
             )
 
         if bearish_ok and not bullish_ok:
-            return self.build_signal(
-                symbol=stats.symbol,
+            return self.build_signal_from_stats(
+                stats=stats,
                 signal_type=OrderFlowSignalType.BEARISH,
                 side=OrderFlowSide.SELL,
                 strength=self._calculate_bearish_strength(ratio_for_signal, stats),
@@ -524,6 +673,12 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
 
     def _build_signal_context(self, stats: OrderbookImbalanceStats) -> dict[str, Any]:
         return {
+            "exchange": stats.exchange,
+            "market_type": stats.market_type,
+            "symbol": stats.symbol,
+            "exchange_symbol": stats.exchange_symbol,
+            "timeframe": stats.timeframe,
+            "key": list(stats.key),
             "imbalance_ratio": stats.imbalance_ratio,
             "imbalance_diff": stats.imbalance_diff,
             "bid_volume": stats.bid_volume,
@@ -569,6 +724,17 @@ class OrderbookImbalanceAnalyzer(BaseOrderFlowAnalyzer):
         ]
 
         return self._normalize_strength(components)
+
+    # ------------------------------------------------------------------
+    # Misc helpers
+    # ------------------------------------------------------------------
+
+    def _tracked_keys(self) -> set[OrderFlowKey]:
+        return (
+            set(self._last_stats_by_key)
+            | set(self._ratio_history_by_key)
+            | set(self._last_snapshot_ts_by_key)
+        )
 
     # ------------------------------------------------------------------
     # Math helpers

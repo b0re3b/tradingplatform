@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Mapping
 
 from core.event_bus import Event, EventBus, Subscription
 from core.logger import get_logger
@@ -18,11 +18,16 @@ from .enums import (
     OrderFlowSourceType,
 )
 from .models import (
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     BaseOrderFlowStats,
     NormalizedTrade,
+    OrderFlowKey,
     OrderFlowSignal,
     OrderFlowUpdate,
     OrderbookSnapshot,
+    make_orderflow_key,
+    orderflow_key_to_dict,
     signal_to_dict,
     update_to_dict,
 )
@@ -33,17 +38,31 @@ class BaseOrderFlowAnalyzer(ABC):
     Base class for all analytics.orderflow analyzers.
 
     Responsibilities:
-    - EventBus subscription lifecycle via register()/stop()
-    - Scheduler-based health and cleanup jobs
-    - shared metrics
-    - signal throttling
-    - update/signal EventBus publishing
-    - common extraction and normalization helpers
+    - EventBus subscription lifecycle via register()/stop();
+    - Scheduler-based health and cleanup jobs;
+    - shared metrics;
+    - signal throttling;
+    - update/signal EventBus publishing;
+    - common extraction and normalization helpers;
+    - futures scope handling.
+
+    Correct scope:
+        exchange + market_type + symbol + timeframe
+
+    Correct input flow:
+        exchange adapters
+            -> data caches
+            -> market.trades.updated / market.orderbook.updated
+            -> analytics.orderflow analyzer
+            -> analytics.orderflow.*
 
     Concrete analyzers should implement:
-    - process_symbol()
-    - get_latest_stats()
+    - process_key()
+    - get_latest_stats_by_key()
     - _handle_event()
+
+    Backward-compatible methods process_symbol() / get_latest_stats() are kept
+    as wrappers for gradual migration, but new code should use scoped methods.
     """
 
     def __init__(
@@ -53,9 +72,12 @@ class BaseOrderFlowAnalyzer(ABC):
         config: BaseOrderFlowSubConfig,
         metric_type: OrderFlowMetricType,
         source_type: OrderFlowSourceType,
-        scheduler: Scheduler ,
+        scheduler: Scheduler | None = None,
         source_topic_patterns: list[str] | tuple[str, ...] | None = None,
         component_module: str = "orderflow",
+        default_exchange: str | None = None,
+        default_market_type: str = DEFAULT_MARKET_TYPE,
+        default_timeframe: str = DEFAULT_TIMEFRAME,
     ) -> None:
         self._event_bus = event_bus
         self._scheduler = scheduler
@@ -63,6 +85,14 @@ class BaseOrderFlowAnalyzer(ABC):
         self._metric_type = metric_type
         self._source_type = source_type
         self._source_topic_patterns = list(source_topic_patterns or ())
+
+        self._default_exchange = (
+            str(default_exchange).strip().lower()
+            if default_exchange
+            else None
+        )
+        self._default_market_type = self._normalize_market_type(default_market_type)
+        self._default_timeframe = self._normalize_timeframe(default_timeframe)
 
         self._logger = get_logger(
             __name__,
@@ -80,7 +110,7 @@ class BaseOrderFlowAnalyzer(ABC):
         self._health_job_id: str | None = None
         self._cleanup_job_id: str | None = None
 
-        self._last_signal_ts_by_symbol: dict[str, float] = {}
+        self._last_signal_ts_by_key: dict[OrderFlowKey, float] = {}
         self._metrics: dict[str, Any] = self._build_initial_metrics()
 
         self._validate_config()
@@ -122,11 +152,12 @@ class BaseOrderFlowAnalyzer(ABC):
         self._running = True
 
         self._logger.info(
-            "%s registered | metric=%s source_type=%s patterns=%s",
+            "%s registered | metric=%s source_type=%s patterns=%s scope=%s",
             self.__class__.__name__,
             self._metric_type.value,
             self._source_type.value,
             self._source_topic_patterns,
+            "exchange:market_type:symbol:timeframe",
         )
 
     def start(self) -> None:
@@ -167,16 +198,66 @@ class BaseOrderFlowAnalyzer(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def process_symbol(self, symbol: str) -> BaseOrderFlowStats | None:
+    async def process_key(self, key: OrderFlowKey) -> BaseOrderFlowStats | None:
+        """
+        Process one scoped futures market.
+
+        key:
+            exchange + market_type + symbol + timeframe
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def get_latest_stats(self, symbol: str) -> BaseOrderFlowStats | None:
+    def get_latest_stats_by_key(self, key: OrderFlowKey) -> BaseOrderFlowStats | None:
+        """
+        Return latest stats for one scoped futures market.
+        """
         raise NotImplementedError
 
     @abstractmethod
     async def _handle_event(self, event: Event) -> None:
         raise NotImplementedError
+
+    async def process_symbol(self, symbol: str) -> BaseOrderFlowStats | None:
+        """
+        Backward-compatible wrapper.
+
+        This requires default_exchange to be configured because symbol-only
+        processing is unsafe in multi-exchange futures mode.
+        """
+        if not self._default_exchange:
+            raise ValueError(
+                "process_symbol(symbol) requires default_exchange. "
+                "Use process_key(exchange, market_type, symbol, timeframe) instead."
+            )
+
+        key = self.make_key(
+            exchange=self._default_exchange,
+            market_type=self._default_market_type,
+            symbol=symbol,
+            timeframe=self._default_timeframe,
+        )
+        return await self.process_key(key)
+
+    def get_latest_stats(self, symbol: str) -> BaseOrderFlowStats | None:
+        """
+        Backward-compatible wrapper.
+
+        New code should call get_latest_stats_by_key().
+        """
+        if not self._default_exchange:
+            raise ValueError(
+                "get_latest_stats(symbol) requires default_exchange. "
+                "Use get_latest_stats_by_key(key) instead."
+            )
+
+        key = self.make_key(
+            exchange=self._default_exchange,
+            market_type=self._default_market_type,
+            symbol=symbol,
+            timeframe=self._default_timeframe,
+        )
+        return self.get_latest_stats_by_key(key)
 
     # ------------------------------------------------------------------
     # Public stats
@@ -188,6 +269,12 @@ class BaseOrderFlowAnalyzer(ABC):
             "metric": self._metric_type.value,
             "source_type": self._source_type.value,
             "source_topic_patterns": list(self._source_topic_patterns),
+            "scope": "exchange:market_type:symbol:timeframe",
+            "defaults": {
+                "exchange": self._default_exchange,
+                "market_type": self._default_market_type,
+                "timeframe": self._default_timeframe,
+            },
             "config": {
                 "enabled": self._config.enabled,
                 "emit_updates": self._config.emit_updates,
@@ -218,7 +305,7 @@ class BaseOrderFlowAnalyzer(ABC):
                 "skipped": self._metrics["skipped"],
                 "errors": self._metrics["errors"],
                 "emit_errors": self._metrics["emit_errors"],
-                "symbols": dict(self._metrics["symbols"]),
+                "keys": dict(self._metrics["keys"]),
             },
         }
 
@@ -249,12 +336,7 @@ class BaseOrderFlowAnalyzer(ABC):
         if not self._config.emit_updates:
             return
 
-        update = OrderFlowUpdate(
-            symbol=stats.symbol,
-            metric=self._metric_type,
-            source_type=self._source_type,
-            stats=stats.to_dict(),
-        )
+        update = OrderFlowUpdate.from_stats(stats)
 
         emitted = await self._safe_emit(
             topic=self._config.update_topic,
@@ -263,14 +345,14 @@ class BaseOrderFlowAnalyzer(ABC):
         )
 
         if emitted:
-            self._inc_metric("updates_emitted", stats.symbol)
+            self._inc_metric("updates_emitted", stats.key)
 
     async def emit_signal(self, signal: OrderFlowSignal) -> None:
         if not self._config.emit_signals:
             return
 
-        if not self._can_emit_signal(signal.symbol):
-            self._inc_metric("skipped", signal.symbol)
+        if not self._can_emit_signal(signal.key):
+            self._inc_metric("skipped", signal.key)
             return
 
         emitted = await self._safe_emit(
@@ -280,21 +362,29 @@ class BaseOrderFlowAnalyzer(ABC):
         )
 
         if emitted:
-            self._last_signal_ts_by_symbol[signal.symbol] = time.time()
-            self._inc_metric("signals_emitted", signal.symbol)
+            self._last_signal_ts_by_key[signal.key] = time.time()
+            self._inc_metric("signals_emitted", signal.key)
 
     def build_signal(
-            self,
-            *,
-            symbol: str,
-            signal_type: OrderFlowSignalType,
-            side: OrderFlowSide,
-            strength: float,
-            reason: str,
-            context: dict[str, Any] | None = None,
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+        signal_type: OrderFlowSignalType,
+        side: OrderFlowSide,
+        strength: float,
+        reason: str,
+        exchange_symbol: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> OrderFlowSignal:
         return OrderFlowSignal(
-            symbol=str(symbol).strip().upper(),
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            exchange_symbol=exchange_symbol,
+            timeframe=timeframe,
             metric=self._metric_type,
             source_type=self._source_type,
             signal_type=signal_type,
@@ -303,47 +393,104 @@ class BaseOrderFlowAnalyzer(ABC):
             reason=reason,
             context=context or {},
         )
+
+    def build_signal_from_stats(
+        self,
+        *,
+        stats: BaseOrderFlowStats,
+        signal_type: OrderFlowSignalType,
+        side: OrderFlowSide,
+        strength: float,
+        reason: str,
+        context: dict[str, Any] | None = None,
+    ) -> OrderFlowSignal:
+        merged_context = {
+            "stats": stats.to_dict(),
+            **dict(context or {}),
+        }
+
+        return self.build_signal(
+            exchange=stats.exchange,
+            market_type=stats.market_type,
+            symbol=stats.symbol,
+            exchange_symbol=stats.exchange_symbol,
+            timeframe=stats.timeframe,
+            signal_type=signal_type,
+            side=side,
+            strength=strength,
+            reason=reason,
+            context=merged_context,
+        )
+
     # ------------------------------------------------------------------
     # Shared event helpers
     # ------------------------------------------------------------------
 
+    def should_process_key(self, key: OrderFlowKey | None) -> bool:
+        if key is None:
+            return False
+
+        exchange, market_type, symbol, timeframe = key
+        if not exchange or not market_type or not symbol or not timeframe:
+            return False
+
+        return self._config.should_process_symbol(symbol)
+
     def should_process_symbol(self, symbol: str | None) -> bool:
+        """
+        Backward-compatible symbol allowlist check.
+        """
         if not symbol:
             return False
 
         return self._config.should_process_symbol(symbol)
 
-    def extract_symbol_from_event(self, event: Event) -> str | None:
+    def extract_key_from_event(self, event: Event) -> OrderFlowKey | None:
         payload = getattr(event, "payload", None)
-
-        symbol = self._extract_symbol_from_payload(payload)
-        if symbol:
-            return symbol
+        key = self._extract_key_from_payload(payload)
+        if key is not None:
+            return key
 
         symbol = getattr(event, "symbol", None)
-        if symbol:
-            return str(symbol).strip().upper()
+        exchange = getattr(event, "exchange", None) or self._default_exchange
+        market_type = getattr(event, "market_type", None) or self._default_market_type
+        timeframe = getattr(event, "timeframe", None) or self._default_timeframe
+
+        if symbol and exchange:
+            return self.make_key(
+                exchange=str(exchange),
+                market_type=str(market_type),
+                symbol=str(symbol),
+                timeframe=str(timeframe),
+            )
 
         return None
+
+    def extract_symbol_from_event(self, event: Event) -> str | None:
+        """
+        Backward-compatible helper.
+
+        Prefer extract_key_from_event().
+        """
+        key = self.extract_key_from_event(event)
+        return key[2] if key is not None else None
 
     def extract_exchange_from_event(self, event: Event) -> str | None:
-        payload = getattr(event, "payload", None)
+        key = self.extract_key_from_event(event)
+        return key[0] if key is not None else None
 
-        if isinstance(payload, dict):
-            exchange = payload.get("exchange")
-            if exchange:
-                return str(exchange)
+    def extract_market_type_from_event(self, event: Event) -> str | None:
+        key = self.extract_key_from_event(event)
+        return key[1] if key is not None else None
 
-            data = payload.get("data")
-            if isinstance(data, dict) and data.get("exchange"):
-                return str(data["exchange"])
-
-        return None
+    def extract_timeframe_from_event(self, event: Event) -> str | None:
+        key = self.extract_key_from_event(event)
+        return key[3] if key is not None else None
 
     def extract_payload_data(self, event: Event) -> Any:
         payload = getattr(event, "payload", None)
 
-        if isinstance(payload, dict) and "data" in payload:
+        if isinstance(payload, Mapping) and "data" in payload:
             return payload["data"]
 
         return payload
@@ -354,6 +501,9 @@ class BaseOrderFlowAnalyzer(ABC):
         *,
         default_symbol: str | None = None,
         default_exchange: str | None = None,
+        default_market_type: str | None = None,
+        default_timeframe: str | None = None,
+        default_exchange_symbol: str | None = None,
     ) -> NormalizedTrade | None:
         if raw_trade is None:
             return None
@@ -361,41 +511,93 @@ class BaseOrderFlowAnalyzer(ABC):
         if isinstance(raw_trade, NormalizedTrade):
             return raw_trade if raw_trade.is_valid else None
 
-        if not isinstance(raw_trade, dict):
+        if not isinstance(raw_trade, Mapping):
             return None
 
-        symbol = raw_trade.get("symbol") or raw_trade.get("s") or default_symbol
-        if not symbol:
+        symbol = (
+            raw_trade.get("symbol")
+            or raw_trade.get("s")
+            or raw_trade.get("instrument")
+            or default_symbol
+        )
+        exchange = (
+            raw_trade.get("exchange")
+            or raw_trade.get("venue")
+            or raw_trade.get("source_exchange")
+            or default_exchange
+            or self._default_exchange
+        )
+        market_type = (
+            raw_trade.get("market_type")
+            or raw_trade.get("category")
+            or raw_trade.get("inst_type")
+            or raw_trade.get("instrument_type")
+            or default_market_type
+            or self._default_market_type
+        )
+        timeframe = (
+            raw_trade.get("timeframe")
+            or raw_trade.get("tf")
+            or raw_trade.get("interval")
+            or default_timeframe
+            or self._default_timeframe
+        )
+        exchange_symbol = (
+            raw_trade.get("exchange_symbol")
+            or raw_trade.get("raw_symbol")
+            or raw_trade.get("exchangeSymbol")
+            or default_exchange_symbol
+        )
+
+        if not symbol or not exchange:
             return None
 
         raw_price = raw_trade.get("price", raw_trade.get("p"))
-        raw_quantity = raw_trade.get("quantity", raw_trade.get("qty", raw_trade.get("q")))
+        raw_quantity = raw_trade.get(
+            "quantity",
+            raw_trade.get("qty", raw_trade.get("q", raw_trade.get("size"))),
+        )
         raw_timestamp = raw_trade.get(
             "timestamp",
-            raw_trade.get("ts", raw_trade.get("T", time.time())),
+            raw_trade.get(
+                "timestamp_ms",
+                raw_trade.get("ts", raw_trade.get("T", time.time())),
+            ),
         )
 
         if raw_price is None or raw_quantity is None or raw_timestamp is None:
             return None
 
-        side = self._extract_trade_side(raw_trade)
+        side = self._extract_trade_side(dict(raw_trade))
         trade_id = raw_trade.get("trade_id", raw_trade.get("id"))
-        exchange = raw_trade.get("exchange", default_exchange)
         is_aggressive = bool(
             raw_trade.get("is_aggressive", raw_trade.get("aggressive", False))
         )
 
+        raw_notional = (
+            raw_trade.get("notional")
+            or raw_trade.get("quote_qty")
+            or raw_trade.get("quote_quantity")
+            or raw_trade.get("quote_volume")
+        )
+
         try:
             trade = NormalizedTrade.create(
-                symbol=str(symbol).upper(),
+                exchange=str(exchange),
+                market_type=str(market_type),
+                symbol=str(symbol),
+                exchange_symbol=(
+                    str(exchange_symbol) if exchange_symbol is not None else None
+                ),
+                timeframe=str(timeframe),
                 side=side,
                 price=float(raw_price),
                 quantity=float(raw_quantity),
-                timestamp=float(raw_timestamp),
+                notional=float(raw_notional) if raw_notional is not None else None,
+                timestamp=self._normalize_timestamp(float(raw_timestamp)),
                 trade_id=str(trade_id) if trade_id is not None else None,
-                exchange=str(exchange) if exchange is not None else None,
                 is_aggressive=is_aggressive,
-                raw=raw_trade,
+                raw=dict(raw_trade),
             )
         except (TypeError, ValueError):
             return None
@@ -408,6 +610,9 @@ class BaseOrderFlowAnalyzer(ABC):
         *,
         default_symbol: str | None = None,
         default_exchange: str | None = None,
+        default_market_type: str | None = None,
+        default_timeframe: str | None = None,
+        default_exchange_symbol: str | None = None,
     ) -> OrderbookSnapshot | None:
         if raw_snapshot is None:
             return None
@@ -415,11 +620,45 @@ class BaseOrderFlowAnalyzer(ABC):
         if isinstance(raw_snapshot, OrderbookSnapshot):
             return raw_snapshot if raw_snapshot.is_valid else None
 
-        if not isinstance(raw_snapshot, dict):
+        if not isinstance(raw_snapshot, Mapping):
             return None
 
-        symbol = raw_snapshot.get("symbol") or raw_snapshot.get("s") or default_symbol
-        if not symbol:
+        symbol = (
+            raw_snapshot.get("symbol")
+            or raw_snapshot.get("s")
+            or raw_snapshot.get("instrument")
+            or default_symbol
+        )
+        exchange = (
+            raw_snapshot.get("exchange")
+            or raw_snapshot.get("venue")
+            or raw_snapshot.get("source_exchange")
+            or default_exchange
+            or self._default_exchange
+        )
+        market_type = (
+            raw_snapshot.get("market_type")
+            or raw_snapshot.get("category")
+            or raw_snapshot.get("inst_type")
+            or raw_snapshot.get("instrument_type")
+            or default_market_type
+            or self._default_market_type
+        )
+        timeframe = (
+            raw_snapshot.get("timeframe")
+            or raw_snapshot.get("tf")
+            or raw_snapshot.get("interval")
+            or default_timeframe
+            or self._default_timeframe
+        )
+        exchange_symbol = (
+            raw_snapshot.get("exchange_symbol")
+            or raw_snapshot.get("raw_symbol")
+            or raw_snapshot.get("exchangeSymbol")
+            or default_exchange_symbol
+        )
+
+        if not symbol or not exchange:
             return None
 
         bids_raw = raw_snapshot.get("bids", raw_snapshot.get("b", []))
@@ -430,24 +669,36 @@ class BaseOrderFlowAnalyzer(ABC):
 
         raw_timestamp = raw_snapshot.get("timestamp")
         if raw_timestamp is None:
+            raw_timestamp = raw_snapshot.get("timestamp_ms")
+        if raw_timestamp is None:
+            raw_timestamp = raw_snapshot.get("last_update_ts_ms")
+        if raw_timestamp is None:
             raw_timestamp = raw_snapshot.get("ts")
         if raw_timestamp is None:
             raw_timestamp = raw_snapshot.get("T")
         if raw_timestamp is None:
             raw_timestamp = time.time()
 
-        exchange = raw_snapshot.get("exchange", default_exchange)
-        sequence_id = raw_snapshot.get("sequence_id", raw_snapshot.get("u"))
+        sequence_id = (
+            raw_snapshot.get("sequence_id")
+            or raw_snapshot.get("sequence")
+            or raw_snapshot.get("u")
+        )
 
         try:
             snapshot = OrderbookSnapshot.create(
-                symbol=str(symbol).upper(),
+                exchange=str(exchange),
+                market_type=str(market_type),
+                symbol=str(symbol),
+                exchange_symbol=(
+                    str(exchange_symbol) if exchange_symbol is not None else None
+                ),
+                timeframe=str(timeframe),
                 bids=bids_raw,
                 asks=asks_raw,
-                timestamp=float(raw_timestamp),
-                exchange=str(exchange) if exchange is not None else None,
+                timestamp=self._normalize_timestamp(float(raw_timestamp)),
                 sequence_id=str(sequence_id) if sequence_id is not None else None,
-                raw=raw_snapshot,
+                raw=dict(raw_snapshot),
             )
         except (TypeError, ValueError):
             return None
@@ -456,11 +707,30 @@ class BaseOrderFlowAnalyzer(ABC):
 
     def make_trade_key(self, trade: NormalizedTrade) -> str:
         if trade.trade_id:
-            return f"{trade.symbol}:{trade.exchange or ''}:{trade.trade_id}"
+            return (
+                f"{trade.exchange}:{trade.market_type}:{trade.symbol}:"
+                f"{trade.timeframe}:{trade.trade_id}"
+            )
 
         return (
-            f"{trade.symbol}:{trade.exchange or ''}:{trade.timestamp:.9f}:"
-            f"{trade.price:.12f}:{trade.quantity:.12f}:{trade.side.value}"
+            f"{trade.exchange}:{trade.market_type}:{trade.symbol}:{trade.timeframe}:"
+            f"{trade.timestamp:.9f}:{trade.price:.12f}:"
+            f"{trade.quantity:.12f}:{trade.side.value}"
+        )
+
+    @staticmethod
+    def make_key(
+        *,
+        exchange: str,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        symbol: str,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> OrderFlowKey:
+        return make_orderflow_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
         )
 
     # ------------------------------------------------------------------
@@ -477,24 +747,73 @@ class BaseOrderFlowAnalyzer(ABC):
             )
             raise
 
-    def _extract_symbol_from_payload(self, payload: Any) -> str | None:
-        if not isinstance(payload, dict):
+    def _extract_key_from_payload(self, payload: Any) -> OrderFlowKey | None:
+        if not isinstance(payload, Mapping):
             return None
 
-        symbol = payload.get("symbol") or payload.get("s")
-        if symbol:
-            return str(symbol).strip().upper()
+        key = self._extract_key_from_mapping(payload)
+        if key is not None:
+            return key
 
         data = payload.get("data")
-        if isinstance(data, dict):
-            symbol = data.get("symbol") or data.get("s")
-            if symbol:
-                return str(symbol).strip().upper()
+        if isinstance(data, Mapping):
+            return self._extract_key_from_mapping(data)
 
         return None
 
+    def _extract_key_from_mapping(self, data: Mapping[str, Any]) -> OrderFlowKey | None:
+        exchange = (
+            data.get("exchange")
+            or data.get("venue")
+            or data.get("source_exchange")
+            or self._default_exchange
+        )
+        market_type = (
+            data.get("market_type")
+            or data.get("category")
+            or data.get("inst_type")
+            or data.get("instrument_type")
+            or self._default_market_type
+        )
+        symbol = data.get("symbol") or data.get("s") or data.get("instrument")
+        timeframe = (
+            data.get("timeframe")
+            or data.get("tf")
+            or data.get("interval")
+            or self._default_timeframe
+        )
+
+        if not exchange or not symbol:
+            return None
+
+        try:
+            return self.make_key(
+                exchange=str(exchange),
+                market_type=str(market_type),
+                symbol=str(symbol),
+                timeframe=str(timeframe),
+            )
+        except ValueError:
+            return None
+
+    def _extract_symbol_from_payload(self, payload: Any) -> str | None:
+        key = self._extract_key_from_payload(payload)
+        return key[2] if key is not None else None
+
     def _extract_trade_side(self, raw_trade: dict[str, Any]) -> OrderFlowSide:
         side = raw_trade.get("side")
+        if side is not None:
+            side_enum = OrderFlowSide.from_value(side)
+            if side_enum.is_known:
+                return side_enum
+
+        side = raw_trade.get("aggressor_side")
+        if side is not None:
+            side_enum = OrderFlowSide.from_value(side)
+            if side_enum.is_known:
+                return side_enum
+
+        side = raw_trade.get("taker_side")
         if side is not None:
             side_enum = OrderFlowSide.from_value(side)
             if side_enum.is_known:
@@ -513,10 +832,9 @@ class BaseOrderFlowAnalyzer(ABC):
 
         return OrderFlowSide.UNKNOWN
 
-    def _can_emit_signal(self, symbol: str) -> bool:
+    def _can_emit_signal(self, key: OrderFlowKey) -> bool:
         now = time.time()
-        normalized_symbol = str(symbol).upper()
-        last_ts = self._last_signal_ts_by_symbol.get(normalized_symbol, 0.0)
+        last_ts = self._last_signal_ts_by_key.get(key, 0.0)
         return (now - last_ts) >= float(self._config.min_signal_interval_sec)
 
     async def _safe_emit(
@@ -552,31 +870,36 @@ class BaseOrderFlowAnalyzer(ABC):
 
     def _inc_metric(
         self,
-        key: str,
-        symbol: str | None = None,
+        name: str,
+        key: OrderFlowKey | None = None,
         amount: int = 1,
     ) -> None:
-        if key not in self._metrics:
-            self._metrics[key] = 0
+        if name not in self._metrics:
+            self._metrics[name] = 0
 
-        self._metrics[key] += amount
+        self._metrics[name] += amount
 
-        if symbol:
-            normalized = str(symbol).upper()
-            symbol_metrics = self._metrics["symbols"].setdefault(
-                normalized,
-                {
-                    "processed": 0,
-                    "signals_emitted": 0,
-                    "updates_emitted": 0,
-                    "skipped": 0,
-                    "errors": 0,
-                    "emit_errors": 0,
-                },
-            )
+        if key is None:
+            return
 
-            if key in symbol_metrics:
-                symbol_metrics[key] += amount
+        key_payload = orderflow_key_to_dict(key)
+        key_label = ":".join(key)
+
+        key_metrics = self._metrics["keys"].setdefault(
+            key_label,
+            {
+                **key_payload,
+                "processed": 0,
+                "signals_emitted": 0,
+                "updates_emitted": 0,
+                "skipped": 0,
+                "errors": 0,
+                "emit_errors": 0,
+            },
+        )
+
+        if name in key_metrics:
+            key_metrics[name] += amount
 
     def _build_initial_metrics(self) -> dict[str, Any]:
         return {
@@ -586,8 +909,30 @@ class BaseOrderFlowAnalyzer(ABC):
             "skipped": 0,
             "errors": 0,
             "emit_errors": 0,
-            "symbols": {},
+            "keys": {},
         }
+
+    @staticmethod
+    def _normalize_timestamp(value: float) -> float:
+        """
+        Normalize timestamp to seconds.
+
+        Data caches may use timestamp_ms. Analytics models use seconds.
+        """
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            return timestamp / 1000.0
+        return timestamp
+
+    @staticmethod
+    def _normalize_market_type(value: Any) -> str:
+        normalized = str(value or DEFAULT_MARKET_TYPE).strip().lower()
+        return normalized if normalized else DEFAULT_MARKET_TYPE
+
+    @staticmethod
+    def _normalize_timeframe(value: Any) -> str:
+        normalized = str(value or DEFAULT_TIMEFRAME).strip()
+        return normalized if normalized else DEFAULT_TIMEFRAME
 
     # ------------------------------------------------------------------
     # Scheduler integration

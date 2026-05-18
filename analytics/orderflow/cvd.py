@@ -4,7 +4,7 @@ import asyncio
 import math
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Mapping
 
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
@@ -22,8 +22,12 @@ from .models import (
     BaseOrderFlowStats,
     CvdPoint,
     CvdStats,
+    DEFAULT_MARKET_TYPE,
+    DEFAULT_TIMEFRAME,
     NormalizedTrade,
+    OrderFlowKey,
     OrderFlowSignal,
+    orderflow_key_to_dict,
 )
 
 
@@ -32,13 +36,25 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
     CVD analyzer for analytics.orderflow.
 
     Responsibilities:
-    - consume trade events through EventBus subscriptions registered in base
-    - read recent trades from trades_cache
-    - normalize trades through BaseOrderFlowAnalyzer helpers
-    - maintain per-symbol cumulative volume delta
-    - calculate window-based CVD stats
-    - emit analytics.orderflow.cvd.updated and analytics.orderflow.cvd.signal
-    - use Scheduler-injected cleanup/health jobs from BaseOrderFlowAnalyzer
+    - consume normalized data-layer trade updates from TradesCache;
+    - read recent trades from trades_cache using scoped futures key;
+    - normalize trades through BaseOrderFlowAnalyzer helpers;
+    - maintain cumulative volume delta per exchange + market_type + symbol + timeframe;
+    - calculate window-based CVD stats;
+    - emit analytics.orderflow.cvd.updated;
+    - emit analytics.orderflow.cvd.signal;
+    - use Scheduler-injected cleanup/health jobs from BaseOrderFlowAnalyzer.
+
+    Correct input flow:
+        exchange adapters
+            -> market.trade
+            -> TradesCache
+            -> market.trades.updated
+            -> CvdAnalyzer
+            -> analytics.orderflow.cvd.*
+
+    Scope:
+        exchange + market_type + symbol + timeframe
     """
 
     def __init__(
@@ -49,6 +65,9 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         config: CvdConfig | None = None,
         scheduler: Scheduler | None = None,
         source_topic_patterns: list[str] | tuple[str, ...] | None = None,
+        default_exchange: str | None = None,
+        default_market_type: str = DEFAULT_MARKET_TYPE,
+        default_timeframe: str = DEFAULT_TIMEFRAME,
     ) -> None:
         self._trades_cache = trades_cache
         self._config = config or CvdConfig()
@@ -61,15 +80,18 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             source_type=OrderFlowSourceType.TRADES,
             source_topic_patterns=source_topic_patterns or TRADE_INPUT_TOPICS,
             component_module="orderflow",
+            default_exchange=default_exchange,
+            default_market_type=default_market_type,
+            default_timeframe=default_timeframe,
         )
 
         self._state_lock = asyncio.Lock()
 
-        self._trades_by_symbol: dict[str, deque[NormalizedTrade]] = {}
-        self._cvd_points_by_symbol: dict[str, deque[CvdPoint]] = {}
-        self._last_stats_by_symbol: dict[str, CvdStats] = {}
-        self._last_seen_trade_key_by_symbol: dict[str, str] = {}
-        self._cumulative_cvd_by_symbol: dict[str, float] = {}
+        self._trades_by_key: dict[OrderFlowKey, deque[NormalizedTrade]] = {}
+        self._cvd_points_by_key: dict[OrderFlowKey, deque[CvdPoint]] = {}
+        self._last_stats_by_key: dict[OrderFlowKey, CvdStats] = {}
+        self._last_seen_trade_key_by_key: dict[OrderFlowKey, str] = {}
+        self._cumulative_cvd_by_key: dict[OrderFlowKey, float] = {}
 
         self._metrics.setdefault("processed_trades", 0)
 
@@ -77,51 +99,55 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
     # Public API
     # ------------------------------------------------------------------
 
-    async def process_symbol(self, symbol: str) -> CvdStats | None:
-        normalized_symbol = str(symbol).strip().upper()
+    async def process_key(self, key: OrderFlowKey) -> CvdStats | None:
+        """
+        Process one scoped futures market.
 
-        if not self.should_process_symbol(normalized_symbol):
-            self._inc_metric("skipped", normalized_symbol)
+        key:
+            exchange + market_type + symbol + timeframe
+        """
+        if not self.should_process_key(key):
+            self._inc_metric("skipped", key)
             return None
 
         async with self._state_lock:
             try:
-                raw_trades = await self._get_recent_trades(normalized_symbol)
+                raw_trades = await self._get_recent_trades(key)
                 if not raw_trades:
-                    self._inc_metric("skipped", normalized_symbol)
+                    self._inc_metric("skipped", key)
                     return None
 
                 normalized_trades = self._normalize_trades(
-                    normalized_symbol,
-                    raw_trades,
+                    key=key,
+                    raw_trades=raw_trades,
                 )
                 if not normalized_trades:
-                    self._inc_metric("skipped", normalized_symbol)
+                    self._inc_metric("skipped", key)
                     return None
 
                 new_trades = self._filter_new_trades(
-                    normalized_symbol,
-                    normalized_trades,
+                    key=key,
+                    trades=normalized_trades,
                 )
-                if not new_trades and normalized_symbol not in self._trades_by_symbol:
-                    self._inc_metric("skipped", normalized_symbol)
+                if not new_trades and key not in self._trades_by_key:
+                    self._inc_metric("skipped", key)
                     return None
 
                 added_count = self._append_new_trades(
-                    normalized_symbol,
-                    new_trades,
+                    key=key,
+                    trades=new_trades,
                 )
 
-                self._prune_old_trades(normalized_symbol)
-                self._prune_old_cvd_points(normalized_symbol)
+                self._prune_old_trades(key)
+                self._prune_old_cvd_points(key)
 
-                stats = self._calculate_window_stats(normalized_symbol)
+                stats = self._calculate_window_stats(key)
                 if stats is None:
-                    self._inc_metric("skipped", normalized_symbol)
+                    self._inc_metric("skipped", key)
                     return None
 
-                self._last_stats_by_symbol[normalized_symbol] = stats
-                self._inc_metric("processed", normalized_symbol)
+                self._last_stats_by_key[key] = stats
+                self._inc_metric("processed", key)
 
                 if added_count > 0:
                     self._metrics["processed_trades"] += added_count
@@ -135,15 +161,15 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
                 return stats
 
             except Exception:
-                self._inc_metric("errors", normalized_symbol)
+                self._inc_metric("errors", key)
                 self._logger.exception(
-                    "Failed to process CVD | symbol=%s",
-                    normalized_symbol,
+                    "Failed to process CVD",
+                    extra=orderflow_key_to_dict(key),
                 )
                 return None
 
-    def get_latest_stats(self, symbol: str) -> BaseOrderFlowStats | None:
-        return self._last_stats_by_symbol.get(str(symbol).strip().upper())
+    def get_latest_stats_by_key(self, key: OrderFlowKey) -> BaseOrderFlowStats | None:
+        return self._last_stats_by_key.get(key)
 
     def stats(self) -> dict[str, Any]:
         base_stats = super().stats()
@@ -166,7 +192,17 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
                 "require_slope_confirmation": self._config.require_slope_confirmation,
             }
         )
-        base_stats["tracked_symbols"] = len(self._trades_by_symbol)
+        base_stats["tracked_keys"] = len(self._trades_by_key)
+        base_stats["tracked_markets"] = [
+            {
+                **orderflow_key_to_dict(key),
+                "trades": len(self._trades_by_key.get(key, ())),
+                "cvd_points": len(self._cvd_points_by_key.get(key, ())),
+                "has_stats": key in self._last_stats_by_key,
+                "cumulative_cvd": self._cumulative_cvd_by_key.get(key, 0.0),
+            }
+            for key in sorted(self._tracked_keys())
+        ]
         base_stats["metrics"]["processed_trades"] = self._metrics.get(
             "processed_trades",
             0,
@@ -177,27 +213,27 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         now = time.time()
         max_age = max(float(self._config.window_seconds) * 3.0, 60.0)
 
-        symbols = set(self._trades_by_symbol) | set(self._cvd_points_by_symbol)
-
-        for symbol in symbols:
-            latest_ts = self._latest_symbol_timestamp(symbol)
+        for key in list(self._tracked_keys()):
+            latest_ts = self._latest_key_timestamp(key)
             if latest_ts <= 0:
                 continue
 
             if (now - latest_ts) <= max_age:
                 continue
 
-            self._trades_by_symbol.pop(symbol, None)
-            self._cvd_points_by_symbol.pop(symbol, None)
-            self._last_stats_by_symbol.pop(symbol, None)
-            self._last_seen_trade_key_by_symbol.pop(symbol, None)
-            self._cumulative_cvd_by_symbol.pop(symbol, None)
-            self._last_signal_ts_by_symbol.pop(symbol, None)
+            self._trades_by_key.pop(key, None)
+            self._cvd_points_by_key.pop(key, None)
+            self._last_stats_by_key.pop(key, None)
+            self._last_seen_trade_key_by_key.pop(key, None)
+            self._cumulative_cvd_by_key.pop(key, None)
+            self._last_signal_ts_by_key.pop(key, None)
 
             self._logger.debug(
-                "Removed stale CVD state | symbol=%s max_age=%s",
-                symbol,
-                max_age,
+                "Removed stale CVD state",
+                extra={
+                    **orderflow_key_to_dict(key),
+                    "max_age": max_age,
+                },
             )
 
     # ------------------------------------------------------------------
@@ -205,30 +241,74 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
     # ------------------------------------------------------------------
 
     async def _handle_event(self, event: Event) -> None:
-        symbol = self.extract_symbol_from_event(event)
-        if not symbol:
+        key = self.extract_key_from_event(event)
+        if key is None:
             self._logger.debug(
-                "Trade event without symbol skipped | topic=%s event_id=%s",
+                "Trade event without scoped key skipped | topic=%s event_id=%s",
                 event.topic,
                 event.event_id,
             )
             self._inc_metric("skipped")
             return
 
-        await self.process_symbol(symbol)
+        await self.process_key(key)
 
     # ------------------------------------------------------------------
     # Internal data loading
     # ------------------------------------------------------------------
 
-    async def _get_recent_trades(self, symbol: str) -> list[Any]:
+    async def _get_recent_trades(self, key: OrderFlowKey) -> list[Any]:
         if self._trades_cache is None:
             return []
 
+        exchange, market_type, symbol, timeframe = key
+
         candidates: tuple[tuple[str, dict[str, Any]], ...] = (
-            ("get_recent_trades", {"symbol": symbol}),
-            ("get_trades", {"symbol": symbol}),
-            ("get", {"symbol": symbol}),
+            (
+                "get_recent_trades",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "limit": self._config.max_trades_per_symbol,
+                },
+            ),
+            (
+                "get_recent_trades",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "limit": self._config.max_trades_per_symbol,
+                },
+            ),
+            (
+                "get_trades_since",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "since_ts": time.time() - float(self._config.window_seconds),
+                },
+            ),
+            (
+                "get_trades",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                    "limit": self._config.max_trades_per_symbol,
+                },
+            ),
+            (
+                "get",
+                {
+                    "exchange": exchange,
+                    "market_type": market_type,
+                    "symbol": symbol,
+                },
+            ),
         )
 
         for method_name, kwargs in candidates:
@@ -239,7 +319,7 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             result = await self._call_cache_method(
                 method=method,
                 method_name=method_name,
-                symbol=symbol,
+                key=key,
                 kwargs=kwargs,
             )
             trades = self._extract_trades_from_cache_result(result)
@@ -253,9 +333,11 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         *,
         method: Any,
         method_name: str,
-        symbol: str,
+        key: OrderFlowKey,
         kwargs: dict[str, Any],
     ) -> Any:
+        exchange, market_type, symbol, _timeframe = key
+
         try:
             result = method(**kwargs)
             if asyncio.iscoroutine(result):
@@ -263,24 +345,48 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             return result
 
         except TypeError:
-            try:
-                result = method(symbol)
-                if asyncio.iscoroutine(result):
-                    result = await result
-                return result
-            except Exception:
-                self._logger.exception(
-                    "Failed to fetch recent trades | method=%s symbol=%s",
-                    method_name,
-                    symbol,
-                )
-                return None
+            # Compatibility fallback for older cache APIs.
+            fallback_calls: tuple[tuple[Any, ...], ...] = (
+                (exchange, market_type, symbol),
+                (exchange, symbol),
+                (symbol,),
+            )
+
+            for args in fallback_calls:
+                try:
+                    result = method(*args)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    return result
+                except TypeError:
+                    continue
+                except Exception:
+                    self._logger.exception(
+                        "Failed to fetch recent trades",
+                        extra={
+                            **orderflow_key_to_dict(key),
+                            "method": method_name,
+                            "args": args,
+                        },
+                    )
+                    return None
+
+            self._logger.exception(
+                "Failed to fetch recent trades: incompatible cache method signature",
+                extra={
+                    **orderflow_key_to_dict(key),
+                    "method": method_name,
+                },
+            )
+            return None
 
         except Exception:
             self._logger.exception(
-                "Failed to fetch recent trades | method=%s symbol=%s",
-                method_name,
-                symbol,
+                "Failed to fetch recent trades",
+                extra={
+                    **orderflow_key_to_dict(key),
+                    "method": method_name,
+                },
             )
             return None
 
@@ -294,7 +400,10 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         if isinstance(result, tuple):
             return list(result)
 
-        if isinstance(result, dict):
+        if isinstance(result, deque):
+            return list(result)
+
+        if isinstance(result, Mapping):
             trades = result.get("trades")
             if isinstance(trades, list):
                 return trades
@@ -303,7 +412,7 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             if isinstance(data, list):
                 return data
 
-            if isinstance(data, dict):
+            if isinstance(data, Mapping):
                 nested_trades = data.get("trades")
                 if isinstance(nested_trades, list):
                     return nested_trades
@@ -312,14 +421,26 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
 
     def _normalize_trades(
         self,
-        symbol: str,
+        *,
+        key: OrderFlowKey,
         raw_trades: list[Any],
     ) -> list[NormalizedTrade]:
+        exchange, market_type, symbol, timeframe = key
         normalized: list[NormalizedTrade] = []
 
         for raw_trade in raw_trades:
-            trade = self.normalize_trade(raw_trade, default_symbol=symbol)
+            trade = self.normalize_trade(
+                raw_trade,
+                default_exchange=exchange,
+                default_market_type=market_type,
+                default_symbol=symbol,
+                default_timeframe=timeframe,
+            )
             if trade is None:
+                continue
+
+            if trade.key != key:
+                # Safety guard: cache result must not leak another market into this key.
                 continue
 
             if not trade.side.is_known:
@@ -339,18 +460,19 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
 
     def _append_new_trades(
         self,
-        symbol: str,
+        *,
+        key: OrderFlowKey,
         trades: list[NormalizedTrade],
     ) -> int:
         if not trades:
             return 0
 
-        trade_store = self._trades_by_symbol.setdefault(
-            symbol,
+        trade_store = self._trades_by_key.setdefault(
+            key,
             deque(maxlen=self._config.max_trades_per_symbol),
         )
-        cvd_store = self._cvd_points_by_symbol.setdefault(
-            symbol,
+        cvd_store = self._cvd_points_by_key.setdefault(
+            key,
             deque(maxlen=self._config.max_cvd_points_per_symbol),
         )
 
@@ -359,12 +481,17 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         for trade in trades:
             trade_store.append(trade)
 
-            previous_cvd = self._cumulative_cvd_by_symbol.get(symbol, 0.0)
+            previous_cvd = self._cumulative_cvd_by_key.get(key, 0.0)
             new_cvd_value = previous_cvd + trade.signed_volume
-            self._cumulative_cvd_by_symbol[symbol] = new_cvd_value
+            self._cumulative_cvd_by_key[key] = new_cvd_value
 
             cvd_store.append(
                 CvdPoint(
+                    exchange=trade.exchange,
+                    market_type=trade.market_type,
+                    symbol=trade.symbol,
+                    exchange_symbol=trade.exchange_symbol,
+                    timeframe=trade.timeframe,
                     timestamp=trade.timestamp,
                     value=new_cvd_value,
                     price=trade.price,
@@ -376,13 +503,14 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
 
     def _filter_new_trades(
         self,
-        symbol: str,
+        *,
+        key: OrderFlowKey,
         trades: list[NormalizedTrade],
     ) -> list[NormalizedTrade]:
         if not trades:
             return []
 
-        last_seen_key = self._last_seen_trade_key_by_symbol.get(symbol)
+        last_seen_key = self._last_seen_trade_key_by_key.get(key)
 
         if not last_seen_key:
             new_trades = trades
@@ -395,9 +523,9 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             if not new_trades and all(
                 self.make_trade_key(trade) != last_seen_key for trade in trades
             ):
-                new_trades = self._filter_new_trades_fallback(symbol, trades)
+                new_trades = self._filter_new_trades_fallback(key, trades)
 
-        self._last_seen_trade_key_by_symbol[symbol] = self.make_trade_key(trades[-1])
+        self._last_seen_trade_key_by_key[key] = self.make_trade_key(trades[-1])
         return new_trades
 
     def _collect_trades_after_last_seen(
@@ -423,10 +551,10 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
 
     def _filter_new_trades_fallback(
         self,
-        symbol: str,
+        key: OrderFlowKey,
         trades: list[NormalizedTrade],
     ) -> list[NormalizedTrade]:
-        existing = self._trades_by_symbol.get(symbol)
+        existing = self._trades_by_key.get(key)
         if not existing:
             return trades
 
@@ -441,8 +569,8 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
     # Window maintenance
     # ------------------------------------------------------------------
 
-    def _prune_old_trades(self, symbol: str) -> None:
-        store = self._trades_by_symbol.get(symbol)
+    def _prune_old_trades(self, key: OrderFlowKey) -> None:
+        store = self._trades_by_key.get(key)
         if not store:
             return
 
@@ -451,8 +579,8 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         while store and store[0].timestamp < cutoff_ts:
             store.popleft()
 
-    def _prune_old_cvd_points(self, symbol: str) -> None:
-        store = self._cvd_points_by_symbol.get(symbol)
+    def _prune_old_cvd_points(self, key: OrderFlowKey) -> None:
+        store = self._cvd_points_by_key.get(key)
         if not store:
             return
 
@@ -461,26 +589,34 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
         while store and store[0].timestamp < cutoff_ts:
             store.popleft()
 
-    def _latest_symbol_timestamp(self, symbol: str) -> float:
+    def _latest_key_timestamp(self, key: OrderFlowKey) -> float:
         latest_ts = 0.0
 
-        trades = self._trades_by_symbol.get(symbol)
+        trades = self._trades_by_key.get(key)
         if trades:
             latest_ts = max(latest_ts, trades[-1].timestamp)
 
-        points = self._cvd_points_by_symbol.get(symbol)
+        points = self._cvd_points_by_key.get(key)
         if points:
             latest_ts = max(latest_ts, points[-1].timestamp)
 
         return latest_ts
 
+    def _tracked_keys(self) -> set[OrderFlowKey]:
+        return (
+            set(self._trades_by_key)
+            | set(self._cvd_points_by_key)
+            | set(self._last_stats_by_key)
+            | set(self._cumulative_cvd_by_key)
+        )
+
     # ------------------------------------------------------------------
     # Core calculations
     # ------------------------------------------------------------------
 
-    def _calculate_window_stats(self, symbol: str) -> CvdStats | None:
-        trades = self._trades_by_symbol.get(symbol)
-        cvd_points = self._cvd_points_by_symbol.get(symbol)
+    def _calculate_window_stats(self, key: OrderFlowKey) -> CvdStats | None:
+        trades = self._trades_by_key.get(key)
+        cvd_points = self._cvd_points_by_key.get(key)
 
         if not trades or not cvd_points:
             return None
@@ -492,11 +628,13 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             return None
 
         buy_trades = [
-            trade for trade in recent_trades
+            trade
+            for trade in recent_trades
             if trade.side == OrderFlowSide.BUY
         ]
         sell_trades = [
-            trade for trade in recent_trades
+            trade
+            for trade in recent_trades
             if trade.side == OrderFlowSide.SELL
         ]
 
@@ -533,10 +671,17 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             else 0.0
         )
 
+        last_trade = recent_trades[-1]
+
         return CvdStats(
-            symbol=symbol,
+            exchange=last_trade.exchange,
+            market_type=last_trade.market_type,
+            symbol=last_trade.symbol,
+            exchange_symbol=last_trade.exchange_symbol,
+            timeframe=last_trade.timeframe,
             metric=OrderFlowMetricType.CVD,
             source_type=OrderFlowSourceType.TRADES,
+            timestamp=time.time(),
             window_seconds=float(self._config.window_seconds),
             trades_count=len(recent_trades),
             buy_volume=buy_volume,
@@ -568,6 +713,13 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             last_price=last_price,
             price_change=price_change,
             price_change_pct=price_change_pct,
+            metadata={
+                "trades_window_start_ts": recent_trades[0].timestamp,
+                "trades_window_end_ts": recent_trades[-1].timestamp,
+                "cvd_points_in_window": len(recent_points),
+                "trades_in_store": len(recent_trades),
+                "scope": "exchange:market_type:symbol:timeframe",
+            },
         )
 
     def _calculate_cvd_slope(self, points: list[CvdPoint]) -> float:
@@ -608,8 +760,8 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             bearish_ok = any(bearish_checks) and bearish_impulse_ok
 
         if bullish_ok and not bearish_ok:
-            return self.build_signal(
-                symbol=stats.symbol,
+            return self.build_signal_from_stats(
+                stats=stats,
                 signal_type=OrderFlowSignalType.BULLISH,
                 side=OrderFlowSide.BUY,
                 strength=self._calculate_bullish_strength(stats),
@@ -618,8 +770,8 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
             )
 
         if bearish_ok and not bullish_ok:
-            return self.build_signal(
-                symbol=stats.symbol,
+            return self.build_signal_from_stats(
+                stats=stats,
                 signal_type=OrderFlowSignalType.BEARISH,
                 side=OrderFlowSide.SELL,
                 strength=self._calculate_bearish_strength(stats),
@@ -665,6 +817,12 @@ class CvdAnalyzer(BaseOrderFlowAnalyzer):
 
     def _build_signal_context(self, stats: CvdStats) -> dict[str, Any]:
         return {
+            "exchange": stats.exchange,
+            "market_type": stats.market_type,
+            "symbol": stats.symbol,
+            "exchange_symbol": stats.exchange_symbol,
+            "timeframe": stats.timeframe,
+            "key": list(stats.key),
             "cvd_value": stats.cvd_value,
             "cvd_change": stats.cvd_change,
             "cvd_change_pct": stats.cvd_change_pct,
