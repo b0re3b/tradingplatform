@@ -398,7 +398,7 @@ class StrategyContextBuilder(BaseStrategyComponent):
         snapshot = PriceSnapshot(
             symbol=symbol,
             timestamp=timestamp,
-            last=last,
+            last_price=last,
             bid=bid,
             ask=ask,
             mark_price=mark_price,

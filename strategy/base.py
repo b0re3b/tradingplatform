@@ -836,20 +836,32 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         signal.metadata.setdefault("signal_id", signal.signal_id)
 
     def _build_evaluation(
-        self,
-        *,
-        context: StrategyContext,
-        timestamp: datetime,
-        passed: bool,
-        signal: StrategySignal | None,
-        score: float = 0.0,
-        confidence: float = 0.0,
-        reasons: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
+            self,
+            *,
+            context: StrategyContext | None,
+            timestamp: datetime,
+            passed: bool,
+            signal: StrategySignal | None,
+            score: float = 0.0,
+            confidence: float = 0.0,
+            reasons: list[str] | None = None,
+            metadata: dict[str, Any] | None = None,
     ) -> StrategyEvaluation:
+        symbol = "unknown"
+
+        if context is not None:
+            raw_symbol = getattr(context, "symbol", None)
+            if isinstance(raw_symbol, str) and raw_symbol.strip():
+                symbol = raw_symbol.strip()
+
+        if signal is not None:
+            raw_signal_symbol = getattr(signal, "symbol", None)
+            if isinstance(raw_signal_symbol, str) and raw_signal_symbol.strip():
+                symbol = raw_signal_symbol.strip()
+
         return StrategyEvaluation(
             strategy_name=self.strategy_name,
-            symbol=context.symbol,
+            symbol=symbol,
             timestamp=ensure_aware_utc(timestamp),
             signal=signal,
             passed=passed,
