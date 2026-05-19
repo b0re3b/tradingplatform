@@ -1,52 +1,134 @@
+# trading_system/strategy/strategies/orderflow/cvd_divergence_strategy.py
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
 
-from analytics.orderflow import CvdStats, OrderFlowAnalyzer
-from analytics.orderflow.models import (
-    OrderFlowKey,
-    orderflow_key_to_dict,
-    orderflow_key_to_string,
-)
 from core.event_bus import EventBus
+from core.scheduler import Scheduler
 
-from ...config import StrategyConfig
+from ...config import StrategyConfig, StrategyDefinitionConfig
 from ...enums import (
-    EntryType,
-    ExitType,
     MarketRegime,
-    SignalOrigin,
+    SetupType,
+    SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
     Timeframe,
-    TriggerType,
-    SetupType,
 )
-from ...models import (
-    EntryPlan,
-    ExecutionPlanDraft,
-    ExitPlan,
-    InvalidationPlan,
-    SignalContext,
-    StrategyEvaluation,
-    StrategySignal,
-    TargetPlan,
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
+from .base import (
+    ORDERFLOW_FEATURES,
+    OrderflowCompositeSnapshot,
+    OrderflowStrategyConfig,
+    OrderflowTradingStrategy,
 )
-
-from .base_orderflow_strategy import OrderflowStrategyBase
+from .utils import (
+    ScoreBreakdown,
+    confidence_from_components,
+    cvd_divergence_filter_reason,
+    cvd_divergence_side_from_snapshot,
+    cvd_source_features,
+    extract_aggressive_buy_ratio,
+    extract_aggressive_net_notional_delta,
+    extract_aggressive_sell_ratio,
+    extract_cvd_change_pct,
+    extract_cvd_delta_ratio,
+    extract_cvd_slope,
+    extract_cvd_value,
+    extract_event_time,
+    extract_large_buy_trades,
+    extract_large_sell_trades,
+    extract_orderbook_imbalance_diff,
+    extract_price_change_pct,
+    extract_total_notional,
+    extract_total_volume,
+    extract_trades_count,
+    freshness_score,
+    is_directional_side,
+    is_stale,
+    magnitude_score,
+    percent_score,
+    ratio_score,
+    serialize_for_metadata,
+    unit_score,
+    weighted_score,
+)
 
 
 @dataclass(slots=True)
-class CvdDivergenceThresholds:
+class CvdDivergencePayload:
     """
-    Strategy-level thresholds for CVD divergence logic.
+    Normalized strategy-level payload для CVD divergence.
 
-    These thresholds are not analytics config duplicates.
-    Analytics calculates CVD facts. Strategy decides whether those facts are
-    tradable enough to produce a StrategySignal.
+    Source of truth:
+        StrategyContext / FeatureSource.ORDERFLOW
+
+    Preferred normalized form:
+        OrderflowCompositeSnapshot
+
+    Strategy idea:
+        bullish divergence:
+            price_change_pct < 0 while CVD strengthens;
+
+        bearish divergence:
+            price_change_pct > 0 while CVD weakens.
     """
+
+    snapshot: OrderflowCompositeSnapshot
+    side: SignalSide
+
+    event_time: datetime | None = None
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def price_change_pct(self) -> float:
+        return extract_price_change_pct(self.snapshot)
+
+    @property
+    def cvd_change_pct(self) -> float:
+        return extract_cvd_change_pct(self.snapshot)
+
+    @property
+    def cvd_delta_ratio(self) -> float:
+        return extract_cvd_delta_ratio(self.snapshot)
+
+    @property
+    def cvd_slope(self) -> float:
+        return extract_cvd_slope(self.snapshot)
+
+    @property
+    def trades_count(self) -> int:
+        return extract_trades_count(self.snapshot)
+
+    @property
+    def total_volume(self) -> float:
+        return extract_total_volume(self.snapshot)
+
+    @property
+    def total_notional(self) -> float:
+        return extract_total_notional(self.snapshot)
+
+
+@dataclass(slots=True)
+class CvdDivergenceStrategyConfig(OrderflowStrategyConfig):
+    """
+    Unified CVD divergence strategy config.
+
+    Strategy idea:
+    - read normalized CVD/orderflow context from StrategyContext;
+    - detect directional CVD divergence;
+    - build internal reversal StrategySignal;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
+    """
+
+    require_fresh_cvd: bool = True
+    require_actionable_side: bool = True
 
     min_abs_price_change_pct: float = 0.05
     min_abs_cvd_change_pct: float = 0.05
@@ -59,932 +141,790 @@ class CvdDivergenceThresholds:
     bullish_divergence_score_threshold: float = 0.55
     bearish_divergence_score_threshold: float = 0.55
 
-    max_entry_offset_pct: float = 0.0015
-    default_stop_buffer_pct: float = 0.0035
-    default_tp_rr: float = 2.0
-    max_expected_holding_seconds: int = 300
+    min_orderbook_alignment_bonus_threshold: float = 0.05
+    min_aggressive_confirmation_ratio: float = 0.52
+    min_large_trade_confirmation_count: int = 0
+
+    score_price_weight: float = 0.22
+    score_cvd_change_weight: float = 0.24
+    score_delta_ratio_weight: float = 0.24
+    score_cvd_slope_weight: float = 0.10
+    score_participation_weight: float = 0.08
+    score_context_weight: float = 0.07
+    score_freshness_weight: float = 0.05
+
+    confidence_primary_weight: float = 0.55
+    confidence_context_weight: float = 0.25
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    orderbook_alignment_bonus: float = 0.04
+    aggressive_confirmation_bonus: float = 0.04
+    large_trade_confirmation_bonus: float = 0.03
+    volume_participation_bonus: float = 0.03
+
+    tag_cvd_divergence: str = "cvd_divergence"
+    tag_bullish_divergence: str = "bullish_cvd_divergence"
+    tag_bearish_divergence: str = "bearish_cvd_divergence"
+    tag_reversal: str = "reversal"
+    tag_absorption: str = "absorption"
+    tag_delta_dislocation: str = "delta_dislocation"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.REVERSAL
+
+    required_orderflow_features: tuple[str, ...] = (
+        ORDERFLOW_FEATURES.CVD,
+        ORDERFLOW_FEATURES.CVD_DELTA_RATIO,
+        ORDERFLOW_FEATURES.CVD_CHANGE_PCT,
+        ORDERFLOW_FEATURES.CVD_SLOPE,
+        ORDERFLOW_FEATURES.CVD_PRICE_CHANGE_PCT,
+    )
 
     def validate(self) -> None:
-        if self.min_abs_price_change_pct < 0:
-            raise ValueError("min_abs_price_change_pct must be >= 0")
-        if self.min_abs_cvd_change_pct < 0:
-            raise ValueError("min_abs_cvd_change_pct must be >= 0")
-        if self.min_abs_delta_ratio < 0:
-            raise ValueError("min_abs_delta_ratio must be >= 0")
-        if self.min_abs_cvd_slope < 0:
-            raise ValueError("min_abs_cvd_slope must be >= 0")
+        OrderflowStrategyConfig.validate(self)
+
+        non_negative_fields = {
+            "min_abs_price_change_pct": self.min_abs_price_change_pct,
+            "min_abs_cvd_change_pct": self.min_abs_cvd_change_pct,
+            "min_abs_delta_ratio": self.min_abs_delta_ratio,
+            "min_abs_cvd_slope": self.min_abs_cvd_slope,
+            "bullish_divergence_score_threshold": self.bullish_divergence_score_threshold,
+            "bearish_divergence_score_threshold": self.bearish_divergence_score_threshold,
+            "min_orderbook_alignment_bonus_threshold": self.min_orderbook_alignment_bonus_threshold,
+            "min_aggressive_confirmation_ratio": self.min_aggressive_confirmation_ratio,
+            "orderbook_alignment_bonus": self.orderbook_alignment_bonus,
+            "aggressive_confirmation_bonus": self.aggressive_confirmation_bonus,
+            "large_trade_confirmation_bonus": self.large_trade_confirmation_bonus,
+            "volume_participation_bonus": self.volume_participation_bonus,
+        }
+
+        for field_name, value in non_negative_fields.items():
+            if float(value) < 0.0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        unit_fields = {
+            "min_strength_for_signal": self.min_strength_for_signal,
+            "min_aggressive_confirmation_ratio": self.min_aggressive_confirmation_ratio,
+            "orderbook_alignment_bonus": self.orderbook_alignment_bonus,
+            "aggressive_confirmation_bonus": self.aggressive_confirmation_bonus,
+            "large_trade_confirmation_bonus": self.large_trade_confirmation_bonus,
+            "volume_participation_bonus": self.volume_participation_bonus,
+        }
+
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
         if self.min_trades_count < 1:
-            raise ValueError("min_trades_count must be >= 1")
-        if not 0.0 <= self.min_strength_for_signal <= 1.0:
-            raise ValueError("min_strength_for_signal must be between 0.0 and 1.0")
-        if self.bullish_divergence_score_threshold < 0:
-            raise ValueError("bullish_divergence_score_threshold must be >= 0")
-        if self.bearish_divergence_score_threshold < 0:
-            raise ValueError("bearish_divergence_score_threshold must be >= 0")
-        if self.max_entry_offset_pct < 0:
-            raise ValueError("max_entry_offset_pct must be >= 0")
-        if self.default_stop_buffer_pct <= 0:
-            raise ValueError("default_stop_buffer_pct must be > 0")
-        if self.default_tp_rr <= 0:
-            raise ValueError("default_tp_rr must be > 0")
-        if self.max_expected_holding_seconds <= 0:
-            raise ValueError("max_expected_holding_seconds must be > 0")
+            raise StrategyConfigError("min_trades_count must be >= 1")
+
+        if self.min_large_trade_confirmation_count < 0:
+            raise StrategyConfigError("min_large_trade_confirmation_count must be >= 0")
+
+        score_weights = {
+            "score_price_weight": self.score_price_weight,
+            "score_cvd_change_weight": self.score_cvd_change_weight,
+            "score_delta_ratio_weight": self.score_delta_ratio_weight,
+            "score_cvd_slope_weight": self.score_cvd_slope_weight,
+            "score_participation_weight": self.score_participation_weight,
+            "score_context_weight": self.score_context_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+
+        confidence_weights = {
+            "confidence_primary_weight": self.confidence_primary_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if float(value) < 0.0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_cvd_divergence",
+            "tag_bullish_divergence",
+            "tag_bearish_divergence",
+            "tag_reversal",
+            "tag_absorption",
+            "tag_delta_dislocation",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_orderflow_features:
+            raise StrategyConfigError("required_orderflow_features cannot be empty")
+
+        for feature in self.required_orderflow_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_orderflow_features cannot contain empty feature names"
+                )
 
 
-class CvdDivergenceStrategy(OrderflowStrategyBase):
+class CvdDivergenceStrategy(OrderflowTradingStrategy):
     """
-    CVD divergence strategy.
+    Unified CVD divergence strategy.
 
-    Main idea:
-    - bullish divergence:
-        price_change_pct < 0 while CVD strengthens;
-    - bearish divergence:
-        price_change_pct > 0 while CVD weakens.
+    Input:
+        StrategyContext with FeatureSource.ORDERFLOW domain data / features.
 
-    Data contract:
-    - primary source: SignalContext.orderflow["cvd"] / feature snapshots;
-    - fallback source: scoped analytics.orderflow CVD stats;
-    - scope: exchange + market_type + symbol + timeframe.
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    STRATEGY_NAME = "cvd_divergence_strategy"
-    CATEGORY = StrategyCategory.ORDERFLOW
-    DEFAULT_TIMEFRAME = Timeframe.M1
-
-    REQUIRED_FEATURES = {
-        "orderflow.cvd.price_change_pct",
-        "orderflow.cvd.cvd_change_pct",
-        "orderflow.cvd.delta_ratio",
-    }
+    component_namespace = "strategy.orderflow.cvd_divergence"
+    category: StrategyCategory = StrategyCategory.ORDERFLOW
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     def __init__(
         self,
         config: StrategyConfig,
-        *,
-        orderflow_analyzer: OrderFlowAnalyzer | None = None,
-        thresholds: CvdDivergenceThresholds | None = None,
         event_bus: EventBus | None = None,
-        logger: Any | None = None,
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        orderflow_config: CvdDivergenceStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        resolved_orderflow_config = (
+            orderflow_config or CvdDivergenceStrategyConfig()
+        )
+        resolved_orderflow_config.validate()
+
         super().__init__(
             config=config,
-            orderflow_analyzer=orderflow_analyzer,
             event_bus=event_bus,
-            logger=logger,
+            scheduler=scheduler,
+            definition=definition,
+            orderflow_config=resolved_orderflow_config,
+            service_name=service_name,
         )
-        self.thresholds = thresholds or CvdDivergenceThresholds()
 
-        self.validate_config()
-        self.thresholds.validate()
+        self.cvd_config: CvdDivergenceStrategyConfig = resolved_orderflow_config
 
     @property
-    def supported_regimes(self) -> set[MarketRegime]:
-        return {
-            MarketRegime.TRENDING_UP,
-            MarketRegime.TRENDING_DOWN,
-            MarketRegime.BREAKOUT,
-            MarketRegime.SQUEEZE,
-            MarketRegime.HIGH_VOLATILITY,
-            MarketRegime.UNKNOWN,
-        }
+    def strategy_name(self) -> str:
+        return "cvd_divergence"
 
-    def can_evaluate(self, context: SignalContext) -> bool:
-        self.validate_context(context)
-
-        if not self.is_enabled():
-            return False
-
-        if not self._runtime_allows_context(context):
-            return False
-
-        stats = self._resolve_cvd_stats(context)
-        if stats is None:
-            return False
-
-        if stats.trades_count < self.thresholds.min_trades_count:
-            return False
-
-        return True
-
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        self.validate_context(context)
-
-        evaluation = StrategyEvaluation(
-            strategy_name=self.STRATEGY_NAME,
-            symbol=context.symbol,
-            timestamp=context.timestamp,
-            passed=False,
-            score=0.0,
-            confidence=0.0,
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            strategy_name=self.strategy_name,
+            category=StrategyCategory.ORDERFLOW,
+            timeframe=Timeframe.M1,
+            tags=[
+                self.cvd_config.tag_orderflow,
+                self.cvd_config.tag_cvd,
+                self.cvd_config.tag_cvd_divergence,
+                self.cvd_config.tag_reversal,
+                self.cvd_config.tag_absorption,
+                self.cvd_config.tag_delta_dislocation,
+                "analytics_orderflow",
+            ],
+            version="2.0.0",
+            description=(
+                "Detects bullish/bearish CVD divergence from normalized "
+                "orderflow StrategyContext and returns internal StrategySignal."
+            ),
+            required_features=set(self.required_features()),
+            supported_regimes={
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.BREAKOUT,
+                MarketRegime.SQUEEZE,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.RANGING,
+                MarketRegime.UNKNOWN,
+            },
+            metadata={
+                "source": "analytics.orderflow",
+                "strategy_type": "cvd_divergence",
+                "base_class": "OrderflowTradingStrategy",
+                "canonical_payload": "OrderflowCompositeSnapshot",
+                "uses_cvd": True,
+                "uses_volume_delta": False,
+                "uses_aggressive_trades": True,
+                "uses_orderbook": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
+            },
         )
 
-        if not self.can_evaluate(context):
-            evaluation.reasons.append("strategy_cannot_evaluate_context")
-            return evaluation
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.cvd_config.required_orderflow_features
+        )
 
-        stats = self._resolve_cvd_stats(context)
-        if stats is None:
-            evaluation.reasons.append("cvd_stats_unavailable")
-            return evaluation
+    async def generate_signal(
+        self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
 
-        side = self._detect_divergence_side(stats)
-        if side == SignalSide.UNKNOWN:
-            evaluation.reasons.append("no_cvd_divergence_detected")
-            return evaluation
+        if not self.has_any_orderflow_data(
+            context,
+            tuple(self.cvd_config.required_orderflow_features),
+        ):
+            return None
 
-        score = self._calculate_score(stats, side, context)
-        confidence = self._calculate_confidence(stats, side, context)
-        reasons = self._build_reasons(stats, side)
-        confirmations = self._build_confirmations(stats, side, context)
+        if self.has_stale_orderflow_features(
+            context,
+            tuple(self.cvd_config.required_orderflow_features),
+        ):
+            return None
 
-        evaluation.score = score
-        evaluation.confidence = confidence
-        evaluation.reasons.extend(reasons)
+        payload = self._extract_payload(context)
+        if payload is None:
+            return None
+
+        if (
+            self.cvd_config.require_fresh_cvd
+            and is_stale(
+                event_time=payload.event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.cvd_config.stale_feature_max_age_seconds,
+            )
+        ):
+            return None
+
+        common_rejection = cvd_divergence_filter_reason(
+            payload.snapshot,
+            min_abs_price_change_pct=self.cvd_config.min_abs_price_change_pct,
+            min_abs_cvd_change_pct=self.cvd_config.min_abs_cvd_change_pct,
+            min_abs_delta_ratio=self.cvd_config.min_abs_delta_ratio,
+            min_abs_cvd_slope=self.cvd_config.min_abs_cvd_slope,
+            min_trades_count=self.cvd_config.min_trades_count,
+            min_strength_for_signal=self.cvd_config.min_strength_for_signal,
+        )
+        if common_rejection is not None:
+            return None
+
+        side = payload.side
+        if self.cvd_config.require_actionable_side and not is_directional_side(side):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            payload=payload,
+        )
 
         side_score_threshold = (
-            self.thresholds.bullish_divergence_score_threshold
-            if side == SignalSide.LONG
-            else self.thresholds.bearish_divergence_score_threshold
+            self.cvd_config.bullish_divergence_score_threshold
+            if side is SignalSide.LONG
+            else self.cvd_config.bearish_divergence_score_threshold
         )
-        min_score = max(self._get_min_score(), side_score_threshold)
-        min_confidence = self._get_min_confidence()
 
-        if score < min_score:
-            evaluation.reasons.append("score_below_threshold")
-            return evaluation
+        min_score = max(
+            self.cvd_config.min_signal_score,
+            side_score_threshold,
+        )
+        if breakdown.score < min_score:
+            return None
 
-        if confidence < min_confidence:
-            evaluation.reasons.append("confidence_below_threshold")
-            return evaluation
+        if breakdown.confidence < self.cvd_config.min_signal_confidence:
+            return None
 
-        signal = self._build_signal(
+        source_features = self._source_features(payload)
+        tags = self._tags(payload)
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "cvd_divergence_signal",
+                    f"side:{side.value}",
+                    *payload.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "orderflow_setup_family": "cvd_divergence",
+            "orderflow_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "snapshot": serialize_for_metadata(payload.snapshot.to_dict()),
+            "raw": serialize_for_metadata(payload.raw),
+            "event_time": (
+                payload.event_time.isoformat()
+                if payload.event_time is not None
+                else None
+            ),
+            "tags": tags,
+            "divergence_side": side.value,
+            "price_change_pct": payload.price_change_pct,
+            "cvd_change_pct": payload.cvd_change_pct,
+            "cvd_delta_ratio": payload.cvd_delta_ratio,
+            "cvd_slope": payload.cvd_slope,
+            "cvd_value": extract_cvd_value(payload.snapshot),
+            "trades_count": payload.trades_count,
+            "total_volume": payload.total_volume,
+            "total_notional": payload.total_notional,
+            "aggressive_buy_ratio": extract_aggressive_buy_ratio(payload.snapshot),
+            "aggressive_sell_ratio": extract_aggressive_sell_ratio(payload.snapshot),
+            "aggressive_net_notional_delta": extract_aggressive_net_notional_delta(
+                payload.snapshot
+            ),
+            "large_buy_trades": extract_large_buy_trades(payload.snapshot),
+            "large_sell_trades": extract_large_sell_trades(payload.snapshot),
+            "orderbook_imbalance_diff": extract_orderbook_imbalance_diff(
+                payload.snapshot
+            ),
+        }
+
+        return self.build_orderflow_signal(
             context=context,
-            stats=stats,
             side=side,
-            score=score,
-            confidence=confidence,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=self.cvd_config.default_setup_type,
             reasons=reasons,
             confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.cvd_config.default_priority,
         )
-
-        evaluation.signal = signal
-        evaluation.passed = True
-        return evaluation
-
-    def build_signal(self, context: SignalContext) -> StrategySignal | None:
-        evaluation = self.evaluate(context)
-        return evaluation.signal if evaluation.passed else None
 
     # ------------------------------------------------------------------
-    # Analytics integration
+    # Extraction
     # ------------------------------------------------------------------
 
-    def _resolve_cvd_stats(self, context: SignalContext) -> CvdStats | None:
-        """
-        Resolve CVD stats using the new scoped orderflow contract.
-
-        Priority:
-        1. SignalContext.orderflow["cvd"] / feature snapshots;
-        2. OrderFlowAnalyzer / CvdAnalyzer by OrderFlowKey;
-        3. temporary legacy fallback inside base only if enabled there.
-        """
-        key = self._resolve_orderflow_key(context)
-
-        stats = self._build_stats_from_context(context, key=key)
-        if stats is not None:
-            return stats
-
-        raw_stats = self._safe_get_metric_stats_by_key("cvd", key)
-        return self._coerce_cvd_stats(
-            raw_stats,
-            context=context,
-            key=key,
-            source="facade",
-        )
-
-    def _build_stats_from_context(
+    def _extract_payload(
         self,
-        context: SignalContext,
-        *,
-        key: OrderFlowKey,
-    ) -> CvdStats | None:
-        payload = self._extract_metric_payload(context, "cvd")
-        if not payload:
+        context: StrategyContext,
+    ) -> CvdDivergencePayload | None:
+        snapshot = self.resolve_orderflow_snapshot(context)
+        if snapshot is None or not snapshot.has_minimum_data():
             return None
 
-        return self._coerce_cvd_stats(
-            payload,
-            context=context,
-            key=key,
-            source="context",
-        )
-
-    def _coerce_cvd_stats(
-        self,
-        value: Any,
-        *,
-        context: SignalContext,
-        key: OrderFlowKey,
-        source: str,
-    ) -> CvdStats | None:
-        if value is None:
+        if snapshot.trades_count < self.cvd_config.min_trades_count:
             return None
 
-        if isinstance(value, CvdStats):
-            return value
-
-        if isinstance(value, Mapping):
-            data = dict(value)
-        else:
-            data = self._model_to_plain_dict(value)
-
-        if not data:
+        side = cvd_divergence_side_from_snapshot(
+            snapshot,
+            min_abs_price_change_pct=self.cvd_config.min_abs_price_change_pct,
+            min_abs_cvd_change_pct=self.cvd_config.min_abs_cvd_change_pct,
+            min_abs_delta_ratio=self.cvd_config.min_abs_delta_ratio,
+            min_abs_cvd_slope=self.cvd_config.min_abs_cvd_slope,
+        )
+        if not is_directional_side(side):
             return None
 
-        exchange, market_type, symbol, timeframe = key
-
-        price_from_context = None
-        if context.price is not None:
-            price_from_context = context.price.last_price or context.price.mid_price
-
-        timestamp = self._coalesce_float(
-            data.get("timestamp"),
-            self._context_timestamp_float(context),
+        event_time = (
+            extract_event_time(snapshot)
+            or snapshot.timestamp
+            or context.timestamp
         )
 
-        try:
-            return CvdStats(
-                exchange=self._coalesce_str(data.get("exchange"), exchange) or exchange,
-                market_type=(
-                    self._coalesce_str(data.get("market_type"), market_type)
-                    or market_type
-                ),
-                symbol=self._coalesce_str(data.get("symbol"), symbol) or symbol,
-                exchange_symbol=self._coalesce_str(
-                    data.get("exchange_symbol"),
-                    symbol,
-                ),
-                timeframe=self._coalesce_str(data.get("timeframe"), timeframe) or timeframe,
-                metric=data.get("metric", "cvd"),
-                source_type=data.get("source_type", "trades"),
-                timestamp=float(timestamp or 0.0),
-                window_seconds=float(
-                    self._coalesce_float(data.get("window_seconds"), 0.0) or 0.0
-                ),
-                trades_count=int(
-                    self._coalesce_int(data.get("trades_count"), 0) or 0
-                ),
-                buy_volume=float(
-                    self._coalesce_float(data.get("buy_volume"), 0.0) or 0.0
-                ),
-                sell_volume=float(
-                    self._coalesce_float(data.get("sell_volume"), 0.0) or 0.0
-                ),
-                volume_delta=float(
-                    self._coalesce_float(data.get("volume_delta"), 0.0) or 0.0
-                ),
-                buy_notional=float(
-                    self._coalesce_float(data.get("buy_notional"), 0.0) or 0.0
-                ),
-                sell_notional=float(
-                    self._coalesce_float(data.get("sell_notional"), 0.0) or 0.0
-                ),
-                notional_delta=float(
-                    self._coalesce_float(data.get("notional_delta"), 0.0) or 0.0
-                ),
-                cvd_value=float(
-                    self._coalesce_float(
-                        data.get("cvd_value"),
-                        data.get("value"),
-                        data.get("cvd_close"),
-                        data.get("close"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_open=float(
-                    self._coalesce_float(
-                        data.get("cvd_open"),
-                        data.get("open"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_high=float(
-                    self._coalesce_float(
-                        data.get("cvd_high"),
-                        data.get("high"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_low=float(
-                    self._coalesce_float(
-                        data.get("cvd_low"),
-                        data.get("low"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_close=float(
-                    self._coalesce_float(
-                        data.get("cvd_close"),
-                        data.get("close"),
-                        data.get("cvd_value"),
-                        data.get("value"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_change=float(
-                    self._coalesce_float(
-                        data.get("cvd_change"),
-                        data.get("change"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_change_pct=float(
-                    self._coalesce_float(
-                        data.get("cvd_change_pct"),
-                        data.get("change_pct"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                cvd_slope=float(
-                    self._coalesce_float(
-                        data.get("cvd_slope"),
-                        data.get("slope"),
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                delta_ratio=float(
-                    self._coalesce_float(data.get("delta_ratio"), 0.0) or 0.0
-                ),
-                buy_ratio=float(
-                    self._coalesce_float(data.get("buy_ratio"), 0.0) or 0.0
-                ),
-                sell_ratio=float(
-                    self._coalesce_float(data.get("sell_ratio"), 0.0) or 0.0
-                ),
-                avg_trade_size=float(
-                    self._coalesce_float(data.get("avg_trade_size"), 0.0) or 0.0
-                ),
-                avg_trade_notional=float(
-                    self._coalesce_float(data.get("avg_trade_notional"), 0.0) or 0.0
-                ),
-                last_price=self._coalesce_float(
-                    data.get("last_price"),
-                    price_from_context,
-                ),
-                price_change=self._coalesce_float(data.get("price_change")),
-                price_change_pct=self._coalesce_float(data.get("price_change_pct")),
-                metadata={
-                    **(
-                        dict(data.get("metadata"))
-                        if isinstance(data.get("metadata"), Mapping)
-                        else {}
-                    ),
-                    "strategy_source": source,
-                    "scope": "exchange:market_type:symbol:timeframe",
-                    "scope_payload": orderflow_key_to_dict(key),
-                    "scope_key": orderflow_key_to_string(key),
-                },
-            )
-        except Exception:
-            self.log_warning(
-                "Failed to reconstruct scoped CvdStats",
-                symbol=symbol,
-                strategy=self.STRATEGY_NAME,
-                source=source,
-                scope_key=orderflow_key_to_string(key),
-            )
-            return None
-
-    # ------------------------------------------------------------------
-    # Core divergence logic
-    # ------------------------------------------------------------------
-
-    def _detect_divergence_side(self, stats: CvdStats) -> SignalSide:
-        price_change_pct = float(stats.price_change_pct or 0.0)
-        cvd_change_pct = float(stats.cvd_change_pct or 0.0)
-        delta_ratio = float(stats.delta_ratio)
-        cvd_slope = float(stats.cvd_slope)
-
-        bullish_divergence = (
-            price_change_pct <= -abs(self.thresholds.min_abs_price_change_pct)
-            and cvd_change_pct >= abs(self.thresholds.min_abs_cvd_change_pct)
-            and delta_ratio >= abs(self.thresholds.min_abs_delta_ratio)
-            and cvd_slope >= self.thresholds.min_abs_cvd_slope
-        )
-
-        bearish_divergence = (
-            price_change_pct >= abs(self.thresholds.min_abs_price_change_pct)
-            and cvd_change_pct <= -abs(self.thresholds.min_abs_cvd_change_pct)
-            and delta_ratio <= -abs(self.thresholds.min_abs_delta_ratio)
-            and cvd_slope <= -abs(self.thresholds.min_abs_cvd_slope)
-        )
-
-        if bullish_divergence and not bearish_divergence:
-            return SignalSide.LONG
-
-        if bearish_divergence and not bullish_divergence:
-            return SignalSide.SHORT
-
-        return SignalSide.UNKNOWN
-
-    def _calculate_score(
-        self,
-        stats: CvdStats,
-        side: SignalSide,
-        context: SignalContext,
-    ) -> float:
-        price_component = self._normalize_percent(
-            abs(float(stats.price_change_pct or 0.0)),
-            scale=2.0,
-        )
-        cvd_pct_component = self._normalize_percent(
-            abs(float(stats.cvd_change_pct or 0.0)),
-            scale=2.0,
-        )
-        delta_component = self._normalize_ratio(
-            abs(float(stats.delta_ratio)),
-            scale=0.50,
-        )
-        slope_component = self._normalize_magnitude(
-            abs(float(stats.cvd_slope)),
-            scale=10.0,
-        )
-        notional_delta_component = self._normalize_ratio(
-            abs(self._notional_delta_ratio(stats)),
-            scale=0.50,
-        )
-        cvd_range_component = self._cvd_range_component(stats)
-
-        flow_balance_component = (
-            min(max(float(stats.buy_ratio), 0.0), 1.0)
-            if side == SignalSide.LONG
-            else min(max(float(stats.sell_ratio), 0.0), 1.0)
-        )
-
-        trades_component = min(
-            float(stats.trades_count) / max(self.thresholds.min_trades_count * 2, 1),
-            1.0,
-        )
-
-        raw_score = (
-            (price_component * 0.16)
-            + (cvd_pct_component * 0.22)
-            + (delta_component * 0.18)
-            + (slope_component * 0.12)
-            + (notional_delta_component * 0.12)
-            + (cvd_range_component * 0.08)
-            + (flow_balance_component * 0.06)
-            + (trades_component * 0.06)
-        )
-
-        weighted_score = raw_score
-        weighted_score *= self._category_weight()
-        weighted_score *= self._regime_adjustment(context)
-        weighted_score *= self._strategy_weight()
-
-        return max(0.0, weighted_score)
-
-    def _calculate_confidence(
-        self,
-        stats: CvdStats,
-        side: SignalSide,
-        context: SignalContext,
-    ) -> float:
-        components: list[float] = [
-            self._normalize_ratio(abs(float(stats.delta_ratio)), scale=0.35),
-            self._normalize_percent(abs(float(stats.cvd_change_pct or 0.0)), scale=2.0),
-            self._normalize_percent(abs(float(stats.price_change_pct or 0.0)), scale=2.0),
-            self._normalize_magnitude(abs(float(stats.cvd_slope)), scale=10.0),
-            self._normalize_ratio(abs(self._notional_delta_ratio(stats)), scale=0.35),
-            self._cvd_range_component(stats),
-            min(
-                float(stats.trades_count) / max(self.thresholds.min_trades_count * 2, 1),
-                1.0,
-            ),
+        reasons = [
+            "bullish_cvd_divergence"
+            if side is SignalSide.LONG
+            else "bearish_cvd_divergence",
+            f"price_change_pct:{extract_price_change_pct(snapshot):.6f}",
+            f"cvd_change_pct:{extract_cvd_change_pct(snapshot):.6f}",
+            f"cvd_delta_ratio:{extract_cvd_delta_ratio(snapshot):.6f}",
+            f"cvd_slope:{extract_cvd_slope(snapshot):.6f}",
         ]
 
-        if side == SignalSide.LONG:
-            components.append(min(max(float(stats.buy_ratio), 0.0), 1.0))
-            components.append(1.0 if stats.notional_delta > 0 else 0.35)
-        elif side == SignalSide.SHORT:
-            components.append(min(max(float(stats.sell_ratio), 0.0), 1.0))
-            components.append(1.0 if stats.notional_delta < 0 else 0.35)
+        return CvdDivergencePayload(
+            snapshot=snapshot,
+            side=side,
+            event_time=event_time,
+            reasons=reasons,
+            raw=self.orderflow_domain(context),
+        )
 
-        if stats.avg_trade_notional > 0:
-            components.append(0.75)
+    # ------------------------------------------------------------------
+    # Scoring / confidence
+    # ------------------------------------------------------------------
 
-        if context.regime is not None and context.regime.regime in self.supported_regimes:
-            components.append(0.75)
+    def _build_score_breakdown(
+        self,
+        *,
+        context: StrategyContext,
+        payload: CvdDivergencePayload,
+    ) -> ScoreBreakdown:
+        snapshot = payload.snapshot
+        side = payload.side
 
-        if context.price is not None and context.price.spread_bps is not None:
-            spread_ok = context.price.spread_bps <= self.config.filters.max_spread_bps
-            components.append(1.0 if spread_ok else 0.35)
+        price_component = percent_score(
+            abs(payload.price_change_pct),
+            scale=max(self.cvd_config.min_abs_price_change_pct * 4.0, 0.01),
+        )
+        cvd_change_component = percent_score(
+            abs(payload.cvd_change_pct),
+            scale=max(self.cvd_config.min_abs_cvd_change_pct * 4.0, 0.01),
+        )
+        delta_ratio_component = ratio_score(
+            abs(payload.cvd_delta_ratio),
+            scale=max(self.cvd_config.min_abs_delta_ratio * 4.0, 0.01),
+        )
+        cvd_slope_component = ratio_score(
+            abs(payload.cvd_slope),
+            scale=max(self.cvd_config.min_abs_cvd_slope * 4.0, 1.0),
+        )
+        participation_component = self._participation_component(snapshot)
+        context_component = self._context_component(snapshot, side)
+        fresh_score = freshness_score(
+            event_time=payload.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.cvd_config.stale_feature_max_age_seconds,
+        )
 
-        confidence = sum(components) / len(components) if components else 0.0
-        return max(0.0, min(confidence, 1.0))
+        components = {
+            "price": price_component,
+            "cvd_change": cvd_change_component,
+            "delta_ratio": delta_ratio_component,
+            "cvd_slope": cvd_slope_component,
+            "participation": participation_component,
+            "context": context_component,
+            "freshness": fresh_score,
+        }
+        weights = {
+            "price": self.cvd_config.score_price_weight,
+            "cvd_change": self.cvd_config.score_cvd_change_weight,
+            "delta_ratio": self.cvd_config.score_delta_ratio_weight,
+            "cvd_slope": self.cvd_config.score_cvd_slope_weight,
+            "participation": self.cvd_config.score_participation_weight,
+            "context": self.cvd_config.score_context_weight,
+            "freshness": self.cvd_config.score_freshness_weight,
+        }
 
-    def _build_reasons(self, stats: CvdStats, side: SignalSide) -> list[str]:
+        primary = weighted_score(
+            {
+                "price": price_component,
+                "cvd_change": cvd_change_component,
+                "delta_ratio": delta_ratio_component,
+                "cvd_slope": cvd_slope_component,
+            },
+            {
+                "price": 0.25,
+                "cvd_change": 0.30,
+                "delta_ratio": 0.30,
+                "cvd_slope": 0.15,
+            },
+        )
+
+        score = weighted_score(components, weights, default=primary)
+        confidence = confidence_from_components(
+            primary=primary,
+            context=context_component,
+            confirmation=participation_component,
+            freshness=fresh_score,
+            primary_weight=self.cvd_config.confidence_primary_weight,
+            context_weight=self.cvd_config.confidence_context_weight,
+            confirmation_weight=self.cvd_config.confidence_confirmation_weight,
+            freshness_weight=self.cvd_config.confidence_freshness_weight,
+        )
+
         reasons: list[str] = []
+        confirmations: list[str] = [
+            "price_cvd_dislocation",
+            f"cvd_delta_ratio:{payload.cvd_delta_ratio:.6f}",
+            f"cvd_change_pct:{payload.cvd_change_pct:.6f}",
+        ]
 
-        if side == SignalSide.LONG:
-            reasons.extend(
+        orderbook_bonus = self._orderbook_alignment_bonus(snapshot, side)
+        if orderbook_bonus > 0:
+            score += orderbook_bonus
+            confidence += min(0.03, orderbook_bonus)
+            confirmations.append("orderbook_supports_cvd_divergence")
+
+        aggressive_bonus = self._aggressive_confirmation_bonus(snapshot, side)
+        if aggressive_bonus > 0:
+            score += aggressive_bonus
+            confidence += min(0.03, aggressive_bonus)
+            confirmations.append("aggressive_flow_supports_cvd_divergence")
+
+        large_trade_bonus = self._large_trade_confirmation_bonus(snapshot, side)
+        if large_trade_bonus > 0:
+            score += large_trade_bonus
+            confirmations.append("large_trades_support_cvd_divergence")
+
+        volume_bonus = self._volume_participation_bonus(snapshot)
+        if volume_bonus > 0:
+            score += volume_bonus
+            confidence += min(0.02, volume_bonus)
+            confirmations.append("sufficient_volume_participation")
+
+        if side is SignalSide.LONG:
+            confirmations.append("bullish_cvd_divergence")
+        elif side is SignalSide.SHORT:
+            confirmations.append("bearish_cvd_divergence")
+
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
+
+    def _participation_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> float:
+        trades_component = unit_score(
+            snapshot.trades_count / max(self.cvd_config.min_trades_count * 3, 1)
+        )
+        volume_component = magnitude_score(
+            snapshot.total_volume,
+            scale=max(self.cvd_config.min_total_volume * 3.0, 1.0),
+        )
+        notional_component = magnitude_score(
+            snapshot.total_notional,
+            scale=max(self.cvd_config.min_total_notional * 3.0, 1.0),
+        )
+
+        return weighted_score(
+            {
+                "trades": trades_component,
+                "volume": volume_component,
+                "notional": notional_component,
+            },
+            {
+                "trades": 0.50,
+                "volume": 0.25,
+                "notional": 0.25,
+            },
+        )
+
+    def _context_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        orderbook = max(
+            0.0,
+            self._orderbook_alignment_score(snapshot, side),
+        )
+        aggressive = max(
+            0.0,
+            self._aggressive_alignment_score(snapshot, side),
+        )
+        large_trades = max(
+            0.0,
+            self._large_trade_alignment_score(snapshot, side),
+        )
+
+        return weighted_score(
+            {
+                "orderbook": orderbook,
+                "aggressive": aggressive,
+                "large_trades": large_trades,
+            },
+            {
+                "orderbook": 0.30,
+                "aggressive": 0.50,
+                "large_trades": 0.20,
+            },
+        )
+
+    def _orderbook_alignment_score(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        imbalance = extract_orderbook_imbalance_diff(snapshot)
+
+        if side is SignalSide.LONG:
+            return unit_score((imbalance + 1.0) / 2.0)
+
+        if side is SignalSide.SHORT:
+            return unit_score((1.0 - imbalance) / 2.0)
+
+        return 0.0
+
+    def _aggressive_alignment_score(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        buy_ratio = extract_aggressive_buy_ratio(snapshot)
+        sell_ratio = extract_aggressive_sell_ratio(snapshot)
+        aggressive_delta = extract_aggressive_net_notional_delta(snapshot)
+
+        if side is SignalSide.LONG:
+            return weighted_score(
+                {
+                    "ratio": buy_ratio,
+                    "delta": unit_score((aggressive_delta + 1.0) / 2.0),
+                },
+                {
+                    "ratio": 0.70,
+                    "delta": 0.30,
+                },
+            )
+
+        if side is SignalSide.SHORT:
+            return weighted_score(
+                {
+                    "ratio": sell_ratio,
+                    "delta": unit_score((1.0 - aggressive_delta) / 2.0),
+                },
+                {
+                    "ratio": 0.70,
+                    "delta": 0.30,
+                },
+            )
+
+        return 0.0
+
+    def _large_trade_alignment_score(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        large_buy = extract_large_buy_trades(snapshot)
+        large_sell = extract_large_sell_trades(snapshot)
+        total = large_buy + large_sell
+
+        if total <= 0:
+            return 0.0
+
+        if side is SignalSide.LONG:
+            return unit_score(large_buy / total)
+
+        if side is SignalSide.SHORT:
+            return unit_score(large_sell / total)
+
+        return 0.0
+
+    def _orderbook_alignment_bonus(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        threshold = self.cvd_config.min_orderbook_alignment_bonus_threshold
+        imbalance = extract_orderbook_imbalance_diff(snapshot)
+
+        if side is SignalSide.LONG and imbalance >= threshold:
+            return self.cvd_config.orderbook_alignment_bonus
+
+        if side is SignalSide.SHORT and imbalance <= -threshold:
+            return self.cvd_config.orderbook_alignment_bonus
+
+        return 0.0
+
+    def _aggressive_confirmation_bonus(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        threshold = self.cvd_config.min_aggressive_confirmation_ratio
+
+        if side is SignalSide.LONG:
+            if extract_aggressive_buy_ratio(snapshot) >= threshold:
+                return self.cvd_config.aggressive_confirmation_bonus
+
+        if side is SignalSide.SHORT:
+            if extract_aggressive_sell_ratio(snapshot) >= threshold:
+                return self.cvd_config.aggressive_confirmation_bonus
+
+        return 0.0
+
+    def _large_trade_confirmation_bonus(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        min_count = self.cvd_config.min_large_trade_confirmation_count
+        if min_count <= 0:
+            return 0.0
+
+        if side is SignalSide.LONG:
+            if extract_large_buy_trades(snapshot) >= min_count:
+                return self.cvd_config.large_trade_confirmation_bonus
+
+        if side is SignalSide.SHORT:
+            if extract_large_sell_trades(snapshot) >= min_count:
+                return self.cvd_config.large_trade_confirmation_bonus
+
+        return 0.0
+
+    def _volume_participation_bonus(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> float:
+        if self.cvd_config.min_total_volume > 0:
+            if snapshot.total_volume >= self.cvd_config.min_total_volume:
+                return self.cvd_config.volume_participation_bonus
+
+        if self.cvd_config.min_total_notional > 0:
+            if snapshot.total_notional >= self.cvd_config.min_total_notional:
+                return self.cvd_config.volume_participation_bonus
+
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Source features / tags
+    # ------------------------------------------------------------------
+
+    def _source_features(self, payload: CvdDivergencePayload) -> list[str]:
+        features = [
+            *cvd_source_features(),
+            ORDERFLOW_FEATURES.TRADES_COUNT,
+            ORDERFLOW_FEATURES.TOTAL_VOLUME,
+            ORDERFLOW_FEATURES.TOTAL_NOTIONAL,
+        ]
+
+        if payload.snapshot.has_aggressive_flow:
+            features.extend(
                 [
-                    "price_declining_while_cvd_strengthens",
-                    "bullish_cvd_divergence_detected",
+                    ORDERFLOW_FEATURES.AGGRESSIVE_TRADES,
+                    ORDERFLOW_FEATURES.AGGRESSIVE_BUY_RATIO,
+                    ORDERFLOW_FEATURES.AGGRESSIVE_SELL_RATIO,
+                    ORDERFLOW_FEATURES.AGGRESSIVE_NET_NOTIONAL_DELTA,
+                    ORDERFLOW_FEATURES.LARGE_BUY_TRADES,
+                    ORDERFLOW_FEATURES.LARGE_SELL_TRADES,
                 ]
             )
 
-            if stats.delta_ratio > 0:
-                reasons.append("positive_delta_ratio_confirmation")
-            if stats.cvd_slope > 0:
-                reasons.append("positive_cvd_slope_confirmation")
-            if stats.notional_delta > 0:
-                reasons.append("positive_notional_delta_confirmation")
-            if stats.buy_ratio > stats.sell_ratio:
-                reasons.append("buy_flow_dominance")
-
-        elif side == SignalSide.SHORT:
-            reasons.extend(
+        if payload.snapshot.has_orderbook:
+            features.extend(
                 [
-                    "price_rising_while_cvd_weakens",
-                    "bearish_cvd_divergence_detected",
+                    ORDERFLOW_FEATURES.ORDERBOOK_IMBALANCE,
+                    ORDERFLOW_FEATURES.ORDERBOOK_IMBALANCE_DIFF,
+                    ORDERFLOW_FEATURES.ORDERBOOK_IMBALANCE_RATIO,
                 ]
             )
 
-            if stats.delta_ratio < 0:
-                reasons.append("negative_delta_ratio_confirmation")
-            if stats.cvd_slope < 0:
-                reasons.append("negative_cvd_slope_confirmation")
-            if stats.notional_delta < 0:
-                reasons.append("negative_notional_delta_confirmation")
-            if stats.sell_ratio > stats.buy_ratio:
-                reasons.append("sell_flow_dominance")
+        return list(dict.fromkeys(features))
 
-        if stats.trades_count >= self.thresholds.min_trades_count:
-            reasons.append("sufficient_trade_sample")
+    def _tags(self, payload: CvdDivergencePayload) -> list[str]:
+        tags = [
+            self.cvd_config.tag_orderflow,
+            self.cvd_config.tag_cvd,
+            self.cvd_config.tag_cvd_divergence,
+            self.cvd_config.tag_reversal,
+            self.cvd_config.tag_delta_dislocation,
+        ]
 
-        if self._cvd_range_component(stats) > 0:
-            reasons.append("cvd_range_available")
+        if payload.side is SignalSide.LONG:
+            tags.append(self.cvd_config.tag_bullish_divergence)
 
-        if stats.avg_trade_notional > 0:
-            reasons.append("avg_trade_notional_available")
+        if payload.side is SignalSide.SHORT:
+            tags.append(self.cvd_config.tag_bearish_divergence)
 
-        return reasons
+        if payload.snapshot.has_aggressive_flow:
+            tags.append(self.cvd_config.tag_aggressive_flow)
 
-    def _build_confirmations(
-        self,
-        stats: CvdStats,
-        side: SignalSide,
-        context: SignalContext,
-    ) -> list[str]:
-        confirmations: list[str] = []
+        if payload.snapshot.has_orderbook:
+            tags.append(self.cvd_config.tag_orderbook)
 
-        if side == SignalSide.LONG:
-            if stats.buy_ratio > stats.sell_ratio:
-                confirmations.append("buy_flow_dominance")
-            if stats.delta_ratio > 0:
-                confirmations.append("positive_volume_delta")
-            if stats.notional_delta > 0:
-                confirmations.append("positive_notional_delta")
-            if stats.cvd_close >= stats.cvd_open:
-                confirmations.append("cvd_close_above_open")
-
-        elif side == SignalSide.SHORT:
-            if stats.sell_ratio > stats.buy_ratio:
-                confirmations.append("sell_flow_dominance")
-            if stats.delta_ratio < 0:
-                confirmations.append("negative_volume_delta")
-            if stats.notional_delta < 0:
-                confirmations.append("negative_notional_delta")
-            if stats.cvd_close <= stats.cvd_open:
-                confirmations.append("cvd_close_below_open")
-
-        if context.price is not None and context.price.spread_bps is not None:
-            if context.price.spread_bps <= self.config.filters.max_spread_bps:
-                confirmations.append("spread_filter_ok")
-
-        if context.regime is not None and context.regime.regime in self.supported_regimes:
-            confirmations.append("regime_alignment_ok")
-
-        return confirmations
-
-    # ------------------------------------------------------------------
-    # Signal build
-    # ------------------------------------------------------------------
-
-    def _build_signal(
-        self,
-        *,
-        context: SignalContext,
-        stats: CvdStats,
-        side: SignalSide,
-        score: float,
-        confidence: float,
-        reasons: list[str],
-        confirmations: list[str],
-    ) -> StrategySignal:
-        entry_plan = self._build_entry_plan(context, stats, side)
-        exit_plan = self._build_exit_plan(context, stats, side, entry_plan)
-        invalidation_plan = self._build_invalidation_plan(context, stats, side, entry_plan)
-        execution_plan = self._build_execution_plan(
-            context=context,
-            stats=stats,
-            side=side,
-            entry_plan=entry_plan,
-            exit_plan=exit_plan,
-            invalidation_plan=invalidation_plan,
-        )
-
-        signal = StrategySignal(
-            symbol=stats.symbol,
-            side=side,
-            strategy_name=self.STRATEGY_NAME,
-            category=self.CATEGORY,
-            timeframe=context.timeframe or self.DEFAULT_TIMEFRAME,
-            setup_type=SetupType.REVERSAL,
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=self._map_strength(confidence),
-            confidence_grade=self._map_confidence_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=TriggerType.PRIMARY,
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self._resolve_priority(confidence),
-            regime=context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN,
-            entry_plan=entry_plan,
-            exit_plan=exit_plan,
-            invalidation_plan=invalidation_plan,
-            execution_plan=execution_plan,
-            metadata={
-                "source": self.STRATEGY_NAME,
-                "analytics_metric": "cvd",
-                "scope": self._stats_scope_payload(stats),
-                "scope_key": orderflow_key_to_string(stats.key),
-                "key": list(stats.key),
-                "uses_orderflow_analyzer_fallback": self.orderflow_analyzer is not None,
-                "cvd_snapshot": self._cvd_snapshot_payload(stats),
-            },
-        )
-
-        for reason in reasons:
-            signal.add_reason(reason)
-
-        for confirmation in confirmations:
-            signal.add_confirmation(confirmation)
-
-        for feature_name in self.required_features():
-            signal.add_source_feature(feature_name)
-
-        signal.add_source_feature("orderflow.cvd")
-
-        return signal
-
-    # ------------------------------------------------------------------
-    # Plans
-    # ------------------------------------------------------------------
-
-    def _build_entry_plan(
-        self,
-        context: SignalContext,
-        stats: CvdStats,
-        side: SignalSide,
-    ) -> EntryPlan:
-        ref_price = self._resolve_reference_price(context, stats)
-        entry_price = None
-
-        if ref_price is not None:
-            offset = ref_price * self.thresholds.max_entry_offset_pct
-
-            if side == SignalSide.LONG:
-                entry_price = ref_price - offset
-            elif side == SignalSide.SHORT:
-                entry_price = ref_price + offset
-
-        return EntryPlan(
-            entry_type=getattr(self.config.builders, "default_entry_type", EntryType.MARKET),
-            price=entry_price,
-            confirmation_required=False,
-            notes=[
-                "entry_based_on_cvd_divergence",
-                "prefer_execution_near_reference_price",
-            ],
-            metadata={
-                "reference_price": ref_price,
-                "entry_offset_pct": self.thresholds.max_entry_offset_pct,
-                "scope": self._stats_scope_payload(stats),
-                "scope_key": orderflow_key_to_string(stats.key),
-            },
-        )
-
-    def _build_exit_plan(
-        self,
-        context: SignalContext,
-        stats: CvdStats,
-        side: SignalSide,
-        entry_plan: EntryPlan,
-    ) -> ExitPlan:
-        ref_price = entry_plan.price or self._resolve_reference_price(context, stats)
-
-        stop_loss = None
-        tp_price = None
-
-        rr = getattr(
-            self.config.builders,
-            "default_rr_ratio",
-            self.thresholds.default_tp_rr,
-        )
-        rr = rr if rr and rr > 0 else self.thresholds.default_tp_rr
-
-        if ref_price is not None:
-            stop_buffer = ref_price * self.thresholds.default_stop_buffer_pct
-
-            if side == SignalSide.LONG:
-                stop_loss = ref_price - stop_buffer
-                risk = max(ref_price - stop_loss, 0.0)
-                tp_price = ref_price + (risk * rr)
-
-            elif side == SignalSide.SHORT:
-                stop_loss = ref_price + stop_buffer
-                risk = max(stop_loss - ref_price, 0.0)
-                tp_price = ref_price - (risk * rr)
-
-        targets: list[TargetPlan] = []
-
-        if tp_price is not None and tp_price > 0:
-            targets.append(
-                TargetPlan(
-                    price=tp_price,
-                    size_fraction=1.0,
-                    rr=rr,
-                    label="tp1",
-                )
-            )
-
-        return ExitPlan(
-            exit_types=[
-                ExitType.STOP_LOSS,
-                ExitType.TAKE_PROFIT,
-                ExitType.INVALIDATION,
-            ],
-            stop_loss=stop_loss,
-            take_profit_levels=targets,
-            partial_exit_enabled=getattr(
-                self.config.builders,
-                "enable_partial_take_profit",
-                True,
-            ),
-            metadata={
-                "rr_ratio": rr,
-                "strategy": self.STRATEGY_NAME,
-                "scope": self._stats_scope_payload(stats),
-                "scope_key": orderflow_key_to_string(stats.key),
-            },
-        )
-
-    def _build_invalidation_plan(
-        self,
-        context: SignalContext,
-        stats: CvdStats,
-        side: SignalSide,
-        entry_plan: EntryPlan,
-    ) -> InvalidationPlan:
-        ref_price = entry_plan.price or self._resolve_reference_price(context, stats)
-        invalidation_price = None
-
-        if ref_price is not None:
-            buffer = ref_price * self.thresholds.default_stop_buffer_pct
-
-            if side == SignalSide.LONG:
-                invalidation_price = ref_price - buffer
-            elif side == SignalSide.SHORT:
-                invalidation_price = ref_price + buffer
-
-        return InvalidationPlan(
-            price=invalidation_price,
-            reason="cvd_divergence_failed",
-            conditions=[
-                "delta_ratio_flips_against_position",
-                "cvd_slope_reverts_against_position",
-                "cvd_change_pct_reverts_against_position",
-                "notional_delta_confirms_failed_divergence",
-            ],
-            metadata={
-                "strategy": self.STRATEGY_NAME,
-                "scope": self._stats_scope_payload(stats),
-                "scope_key": orderflow_key_to_string(stats.key),
-            },
-        )
-
-    def _build_execution_plan(
-        self,
-        *,
-        context: SignalContext,
-        stats: CvdStats,
-        side: SignalSide,
-        entry_plan: EntryPlan,
-        exit_plan: ExitPlan,
-        invalidation_plan: InvalidationPlan,
-    ) -> ExecutionPlanDraft:
-        return ExecutionPlanDraft(
-            symbol=stats.symbol,
-            side=side,
-            entry=entry_plan,
-            exit=exit_plan,
-            invalidation=invalidation_plan,
-            expected_holding_seconds=self.thresholds.max_expected_holding_seconds,
-            notes=[
-                "generated_from_cvd_divergence_strategy",
-            ],
-            metadata={
-                "timeframe": str(context.timeframe),
-                "strategy_name": self.STRATEGY_NAME,
-                "scope": self._stats_scope_payload(stats),
-                "scope_key": orderflow_key_to_string(stats.key),
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # CVD helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _total_volume(stats: CvdStats) -> float:
-        return max(float(stats.buy_volume) + float(stats.sell_volume), 0.0)
-
-    @staticmethod
-    def _total_notional(stats: CvdStats) -> float:
-        return max(float(stats.buy_notional) + float(stats.sell_notional), 0.0)
-
-    def _notional_delta_ratio(self, stats: CvdStats) -> float:
-        total_notional = self._total_notional(stats)
-        if total_notional <= 0:
-            return 0.0
-        return float(stats.notional_delta) / total_notional
-
-    @staticmethod
-    def _cvd_range_component(stats: CvdStats) -> float:
-        cvd_range = abs(float(stats.cvd_high) - float(stats.cvd_low))
-        if cvd_range <= 0:
-            return 0.0
-
-        return max(0.0, min(abs(float(stats.cvd_change)) / cvd_range, 1.0))
-
-    @staticmethod
-    def _stats_scope_payload(stats: CvdStats) -> dict[str, Any]:
-        return {
-            "exchange": stats.exchange,
-            "market_type": stats.market_type,
-            "symbol": stats.symbol,
-            "exchange_symbol": stats.exchange_symbol,
-            "timeframe": stats.timeframe,
-        }
-
-    def _cvd_snapshot_payload(self, stats: CvdStats) -> dict[str, Any]:
-        return {
-            "exchange": stats.exchange,
-            "market_type": stats.market_type,
-            "symbol": stats.symbol,
-            "exchange_symbol": stats.exchange_symbol,
-            "timeframe": stats.timeframe,
-            "key": list(stats.key),
-            "scope": self._stats_scope_payload(stats),
-            "scope_key": orderflow_key_to_string(stats.key),
-            "timestamp": stats.timestamp,
-            "window_seconds": stats.window_seconds,
-            "trades_count": stats.trades_count,
-            "buy_volume": stats.buy_volume,
-            "sell_volume": stats.sell_volume,
-            "total_volume": self._total_volume(stats),
-            "volume_delta": stats.volume_delta,
-            "buy_notional": stats.buy_notional,
-            "sell_notional": stats.sell_notional,
-            "total_notional": self._total_notional(stats),
-            "notional_delta": stats.notional_delta,
-            "notional_delta_ratio": self._notional_delta_ratio(stats),
-            "cvd_value": stats.cvd_value,
-            "cvd_open": stats.cvd_open,
-            "cvd_high": stats.cvd_high,
-            "cvd_low": stats.cvd_low,
-            "cvd_close": stats.cvd_close,
-            "cvd_change": stats.cvd_change,
-            "cvd_change_pct": stats.cvd_change_pct,
-            "cvd_slope": stats.cvd_slope,
-            "cvd_range_component": self._cvd_range_component(stats),
-            "delta_ratio": stats.delta_ratio,
-            "buy_ratio": stats.buy_ratio,
-            "sell_ratio": stats.sell_ratio,
-            "avg_trade_size": stats.avg_trade_size,
-            "avg_trade_notional": stats.avg_trade_notional,
-            "last_price": stats.last_price,
-            "price_change": stats.price_change,
-            "price_change_pct": stats.price_change_pct,
-        }
+        return list(dict.fromkeys(tags))
