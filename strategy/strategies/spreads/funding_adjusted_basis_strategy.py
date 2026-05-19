@@ -1,4 +1,4 @@
-# trading_system/strategy/strategies/spreads/spot_futures_basis_strategy.py
+# trading_system/strategy/strategies/spreads/funding_adjusted_basis_strategy.py
 
 from __future__ import annotations
 
@@ -7,11 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from analytics.spreads.enums import (
-    InstrumentType,
-    SpreadRegime,
-    SpreadType,
-)
+from analytics.spreads.enums import SpreadRegime, SpreadType
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
 from .base import (
@@ -27,11 +23,10 @@ from .utils import (
     average_score,
     basis_to_bias,
     basis_to_signal_side,
-    confidence_from_components,
-    decimal_abs,
     edge_component,
     extract_timestamp,
     freshness_score,
+    funding_adjusted_source_features,
     has_tradeable_edge,
     is_anomaly_signal,
     is_directional_side,
@@ -44,11 +39,11 @@ from .utils import (
     regime_component,
     serialize_for_metadata,
     spot_futures_contract_error,
-    spot_futures_source_features,
     spread_quality_filter_reason,
     unit_score,
     weighted_score,
     zscore_component,
+    confidence_from_components,
 )
 from ...config import StrategyConfig, StrategyDefinitionConfig
 from ...enums import (
@@ -64,23 +59,24 @@ from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)
-class SpotFuturesBasisPayload:
+class FundingAdjustedBasisPayload:
     """
-    Normalized strategy-level payload for spot/futures basis mean reversion.
+    Normalized strategy-level payload для funding-adjusted basis.
 
     Direction convention:
-    - positive funding-adjusted edge / basis -> SHORT_BASIS -> SignalSide.SHORT;
-    - negative funding-adjusted edge / basis -> LONG_BASIS -> SignalSide.LONG.
+    - positive funding-adjusted edge -> SHORT_BASIS -> SignalSide.SHORT;
+    - negative funding-adjusted edge -> LONG_BASIS -> SignalSide.LONG.
 
-    Concrete leg construction remains a SignalProcessor / SignalBuilder concern.
+    Exact multi-leg construction belongs to SignalProcessor / SignalBuilder.
     """
 
     snapshot: SpreadCompositeSnapshot
     side: SignalSide
     basis_bias: str
 
-    edge: Decimal
-    abs_edge: Decimal
+    funding_adjusted_edge: Decimal
+    abs_funding_adjusted_edge: Decimal
+    raw_basis: Decimal | None
     abs_zscore: Decimal
 
     event_time: datetime | None = None
@@ -89,30 +85,28 @@ class SpotFuturesBasisPayload:
 
 
 @dataclass(slots=True)
-class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
+class FundingAdjustedBasisStrategyConfig(SpreadsStrategyConfig):
     """
-    Unified spot/futures basis strategy config.
+    Funding-adjusted basis strategy config.
 
-    Strategy idea:
-    - read normalized spot/futures spread snapshot/signal from StrategyContext;
-    - require valid spot/futures contract and quote quality;
-    - require basis/funding-adjusted edge and z-score dislocation;
-    - map basis bias to internal StrategySignal side;
-    - return StrategySignal only.
+    This strategy is stricter than generic spot/futures basis:
+    entry is allowed only when funding-adjusted edge is present and strong enough.
     """
 
-    entry_zscore: Decimal = Decimal("2.0")
+    entry_zscore: Decimal = Decimal("1.75")
     stop_zscore: Decimal = Decimal("4.5")
 
-    min_funding_adjusted_edge: Decimal = Decimal("0")
-    min_basis_abs: Decimal = Decimal("0")
+    min_funding_adjusted_edge: Decimal = Decimal("1")
+    min_raw_basis_abs: Decimal = Decimal("0")
+    min_edge_to_basis_ratio: float = 0.25
 
+    require_spot_futures_contract: bool = True
     require_valid_quote: bool = True
     require_snapshot_edge: bool = True
-    require_spot_futures_contract: bool = True
+    require_funding_adjusted_edge: bool = True
+    require_same_edge_sign_as_basis: bool = False
 
     require_mean_reversion_signal: bool = False
-    require_regime_shift_confirmation: bool = False
     allow_regime_shift_entry: bool = True
     allow_anomaly_entry: bool = True
     allow_widening_entry: bool = False
@@ -128,32 +122,35 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
     allowed_spot_exchanges: set[str] = field(default_factory=set)
     allowed_futures_exchanges: set[str] = field(default_factory=set)
 
-    score_zscore_weight: float = 0.30
-    score_edge_weight: float = 0.24
-    score_regime_weight: float = 0.16
-    score_confirmation_weight: float = 0.15
-    score_quote_weight: float = 0.10
-    score_freshness_weight: float = 0.05
+    score_funding_edge_weight: float = 0.34
+    score_zscore_weight: float = 0.22
+    score_basis_confluence_weight: float = 0.16
+    score_regime_weight: float = 0.12
+    score_confirmation_weight: float = 0.10
+    score_freshness_weight: float = 0.06
 
     confidence_primary_weight: float = 0.55
     confidence_context_weight: float = 0.25
     confidence_confirmation_weight: float = 0.15
     confidence_freshness_weight: float = 0.05
 
+    strong_funding_edge_bonus: float = 0.05
     zscore_entry_bonus: float = 0.04
+    basis_confluence_bonus: float = 0.04
     extreme_regime_bonus: float = 0.04
     dislocated_regime_bonus: float = 0.05
-    funding_adjusted_bonus: float = 0.04
     mean_reversion_confirmation_bonus: float = 0.04
     anomaly_confirmation_bonus: float = 0.03
     regime_shift_confirmation_bonus: float = 0.03
 
+    strong_funding_edge_multiplier: Decimal = Decimal("2")
+
     default_priority: SignalPriority = SignalPriority.HIGH
     default_setup_type: SetupType = SetupType.MEAN_REVERSION
 
-    tag_spot_futures_basis: str = "spot_futures_basis"
-    tag_basis_mean_reversion: str = "basis_mean_reversion"
-    tag_funding_adjusted: str = "funding_adjusted"
+    tag_funding_adjusted_basis: str = "funding_adjusted_basis"
+    tag_funding_edge: str = "funding_edge"
+    tag_basis_confluence: str = "basis_confluence"
     tag_short_basis: str = "short_basis"
     tag_long_basis: str = "long_basis"
     tag_zscore_entry: str = "zscore_entry"
@@ -161,7 +158,7 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
     execution_entry_offset_bps_hint: float | None = None
     execution_stop_buffer_bps_hint: float | None = None
     execution_take_profit_bps_hint: float | None = None
-    basis_tp_multiplier_hint: float | None = None
+    funding_adjusted_tp_multiplier_hint: float | None = None
 
     required_spreads_features: tuple[str, ...] = (
         SPREADS_FEATURES.SNAPSHOT,
@@ -179,15 +176,21 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
         if self.min_funding_adjusted_edge < DECIMAL_ZERO:
             raise StrategyConfigError("min_funding_adjusted_edge must be >= 0")
 
-        if self.min_basis_abs < DECIMAL_ZERO:
-            raise StrategyConfigError("min_basis_abs must be >= 0")
+        if self.min_raw_basis_abs < DECIMAL_ZERO:
+            raise StrategyConfigError("min_raw_basis_abs must be >= 0")
+
+        if not 0.0 <= float(self.min_edge_to_basis_ratio) <= 1.0:
+            raise StrategyConfigError("min_edge_to_basis_ratio must be between 0.0 and 1.0")
+
+        if self.strong_funding_edge_multiplier < DECIMAL_ZERO:
+            raise StrategyConfigError("strong_funding_edge_multiplier must be >= 0")
 
         score_weights = {
+            "score_funding_edge_weight": self.score_funding_edge_weight,
             "score_zscore_weight": self.score_zscore_weight,
-            "score_edge_weight": self.score_edge_weight,
+            "score_basis_confluence_weight": self.score_basis_confluence_weight,
             "score_regime_weight": self.score_regime_weight,
             "score_confirmation_weight": self.score_confirmation_weight,
-            "score_quote_weight": self.score_quote_weight,
             "score_freshness_weight": self.score_freshness_weight,
         }
         confidence_weights = {
@@ -208,10 +211,11 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
             raise StrategyConfigError("confidence weights sum must be > 0")
 
         unit_fields = {
+            "strong_funding_edge_bonus": self.strong_funding_edge_bonus,
             "zscore_entry_bonus": self.zscore_entry_bonus,
+            "basis_confluence_bonus": self.basis_confluence_bonus,
             "extreme_regime_bonus": self.extreme_regime_bonus,
             "dislocated_regime_bonus": self.dislocated_regime_bonus,
-            "funding_adjusted_bonus": self.funding_adjusted_bonus,
             "mean_reversion_confirmation_bonus": self.mean_reversion_confirmation_bonus,
             "anomaly_confirmation_bonus": self.anomaly_confirmation_bonus,
             "regime_shift_confirmation_bonus": self.regime_shift_confirmation_bonus,
@@ -224,16 +228,16 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
             "execution_entry_offset_bps_hint": self.execution_entry_offset_bps_hint,
             "execution_stop_buffer_bps_hint": self.execution_stop_buffer_bps_hint,
             "execution_take_profit_bps_hint": self.execution_take_profit_bps_hint,
-            "basis_tp_multiplier_hint": self.basis_tp_multiplier_hint,
+            "funding_adjusted_tp_multiplier_hint": self.funding_adjusted_tp_multiplier_hint,
         }
         for field_name, value in hint_fields.items():
             if value is not None and value < 0:
                 raise StrategyConfigError(f"{field_name} must be >= 0")
 
         for attr in (
-            "tag_spot_futures_basis",
-            "tag_basis_mean_reversion",
-            "tag_funding_adjusted",
+            "tag_funding_adjusted_basis",
+            "tag_funding_edge",
+            "tag_basis_confluence",
             "tag_short_basis",
             "tag_long_basis",
             "tag_zscore_entry",
@@ -246,9 +250,9 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
             raise StrategyConfigError("required_spreads_features cannot be empty")
 
 
-class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
+class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
     """
-    Unified spot/futures basis mean-reversion strategy.
+    Unified funding-adjusted basis strategy.
 
     Input:
         StrategyContext with FeatureSource.SPREADS domain data / features.
@@ -260,7 +264,7 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    component_namespace = "strategy.spreads.spot_futures_basis"
+    component_namespace = "strategy.spreads.funding_adjusted_basis"
     category: StrategyCategory = StrategyCategory.SPREADS
     default_setup_type: SetupType = SetupType.MEAN_REVERSION
 
@@ -271,10 +275,10 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         scheduler: Scheduler | None = None,
         *,
         definition: StrategyDefinitionConfig | None = None,
-        spreads_config: SpotFuturesBasisStrategyConfig | None = None,
+        spreads_config: FundingAdjustedBasisStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
-        resolved_spreads_config = spreads_config or SpotFuturesBasisStrategyConfig()
+        resolved_spreads_config = spreads_config or FundingAdjustedBasisStrategyConfig()
         resolved_spreads_config.validate()
 
         super().__init__(
@@ -286,11 +290,13 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             service_name=service_name,
         )
 
-        self.basis_config: SpotFuturesBasisStrategyConfig = resolved_spreads_config
+        self.funding_basis_config: FundingAdjustedBasisStrategyConfig = (
+            resolved_spreads_config
+        )
 
     @property
     def strategy_name(self) -> str:
-        return "spot_futures_basis"
+        return "funding_adjusted_basis"
 
     @property
     def metadata(self) -> StrategyMetadata:
@@ -299,18 +305,18 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             category=StrategyCategory.SPREADS,
             timeframe=Timeframe.M1,
             tags=[
-                self.basis_config.tag_spreads,
-                self.basis_config.tag_spot_futures,
-                self.basis_config.tag_basis,
-                self.basis_config.tag_spot_futures_basis,
-                self.basis_config.tag_basis_mean_reversion,
-                self.basis_config.tag_funding_adjusted,
+                self.funding_basis_config.tag_spreads,
+                self.funding_basis_config.tag_spot_futures,
+                self.funding_basis_config.tag_basis,
+                self.funding_basis_config.tag_funding_adjusted,
+                self.funding_basis_config.tag_funding_adjusted_basis,
+                self.funding_basis_config.tag_funding_edge,
                 "analytics_spreads",
             ],
             version="2.0.0",
             description=(
-                "Interprets spot/futures basis dislocation and funding-adjusted "
-                "edge from normalized StrategyContext and returns internal StrategySignal."
+                "Interprets funding-adjusted spot/futures basis edge from "
+                "normalized StrategyContext and returns internal StrategySignal."
             ),
             required_features=set(self.required_features()),
             supported_regimes={
@@ -324,11 +330,11 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             },
             metadata={
                 "source": "analytics.spreads",
-                "strategy_type": "spot_futures_basis",
+                "strategy_type": "funding_adjusted_basis",
                 "base_class": "SpreadsTradingStrategy",
                 "canonical_payload": "SpreadCompositeSnapshot",
                 "uses_spot_futures": True,
-                "uses_funding_adjusted_edge": True,
+                "requires_funding_adjusted_edge": True,
                 "uses_zscore": True,
                 "emits_signal_generated": False,
                 "risk_ready_payload_owner": "SignalProcessor",
@@ -337,7 +343,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
     def required_features(self) -> set[str]:
         base_required = super().required_features()
-        return set(base_required).union(self.basis_config.required_spreads_features)
+        return set(base_required).union(
+            self.funding_basis_config.required_spreads_features
+        )
 
     async def generate_signal(
         self,
@@ -347,13 +355,13 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
         if not self.has_any_spreads_data(
             context,
-            tuple(self.basis_config.required_spreads_features),
+            tuple(self.funding_basis_config.required_spreads_features),
         ):
             return None
 
         if self.has_stale_spreads_features(
             context,
-            tuple(self.basis_config.required_spreads_features),
+            tuple(self.funding_basis_config.required_spreads_features),
         ):
             return None
 
@@ -364,18 +372,18 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         if is_stale(
             event_time=payload.event_time,
             now=context.timestamp,
-            stale_after_seconds=self.basis_config.stale_feature_max_age_seconds,
+            stale_after_seconds=self.funding_basis_config.stale_feature_max_age_seconds,
         ):
             return None
 
         rejection = spread_quality_filter_reason(
             payload.snapshot.to_signal_payload(),
-            min_score=self.basis_config.min_score,
-            min_confidence=self.basis_config.min_confidence,
-            require_valid_quote=self.basis_config.require_valid_quote,
-            require_edge=self.basis_config.require_snapshot_edge,
-            allowed_regimes=self.basis_config.allowed_regimes,
-            stale_after_seconds=self.basis_config.stale_feature_max_age_seconds,
+            min_score=self.funding_basis_config.min_score,
+            min_confidence=self.funding_basis_config.min_confidence,
+            require_valid_quote=self.funding_basis_config.require_valid_quote,
+            require_edge=self.funding_basis_config.require_snapshot_edge,
+            allowed_regimes=self.funding_basis_config.allowed_regimes,
+            stale_after_seconds=self.funding_basis_config.stale_feature_max_age_seconds,
             now=context.timestamp,
         )
         if rejection is not None:
@@ -383,15 +391,15 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
         if not self.accepts_spread_snapshot(
             payload.snapshot,
-            require_valid_quote=self.basis_config.require_valid_quote,
-            require_edge=self.basis_config.require_snapshot_edge,
+            require_valid_quote=self.funding_basis_config.require_valid_quote,
+            require_edge=self.funding_basis_config.require_snapshot_edge,
         ):
             return None
 
         if not self._passes_contract_filters(payload.snapshot):
             return None
 
-        if not self._passes_basis_filters(payload):
+        if not self._passes_funding_adjusted_filters(payload):
             return None
 
         if not self._passes_confirmation_filters(payload):
@@ -402,10 +410,10 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             payload=payload,
         )
 
-        if breakdown.score < self.basis_config.min_score:
+        if breakdown.score < self.funding_basis_config.min_score:
             return None
 
-        if breakdown.confidence < self.basis_config.min_confidence:
+        if breakdown.confidence < self.funding_basis_config.min_confidence:
             return None
 
         source_features = self._source_features(payload)
@@ -414,7 +422,7 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         reasons = list(
             dict.fromkeys(
                 [
-                    "spot_futures_basis_signal",
+                    "funding_adjusted_basis_signal",
                     f"side:{payload.side.value}",
                     f"basis_bias:{payload.basis_bias}",
                     *payload.reasons,
@@ -425,7 +433,7 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         confirmations = list(dict.fromkeys(breakdown.confirmations))
 
         metadata = {
-            "spreads_setup_family": "spot_futures_basis",
+            "spreads_setup_family": "funding_adjusted_basis",
             "spreads_strategy_version": "2.0.0",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,
@@ -435,13 +443,13 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             "spread_type": normalize_label(payload.snapshot.spread_type),
             "basis_bias": payload.basis_bias,
             "mapped_side": payload.side.value,
-            "edge": str(payload.edge),
-            "abs_edge": str(payload.abs_edge),
+            "funding_adjusted_edge": str(payload.funding_adjusted_edge),
+            "abs_funding_adjusted_edge": str(payload.abs_funding_adjusted_edge),
+            "raw_basis": str(payload.raw_basis)
+            if payload.raw_basis is not None
+            else None,
             "basis": str(payload.snapshot.basis)
             if payload.snapshot.basis is not None
-            else None,
-            "funding_adjusted_spread": str(payload.snapshot.funding_adjusted_spread)
-            if payload.snapshot.funding_adjusted_spread is not None
             else None,
             "spread_bps": str(payload.snapshot.spread_bps)
             if payload.snapshot.spread_bps is not None
@@ -464,12 +472,12 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             side=payload.side,
             confidence=breakdown.confidence,
             score=breakdown.score,
-            setup_type=self.basis_config.default_setup_type,
+            setup_type=self.funding_basis_config.default_setup_type,
             reasons=reasons,
             confirmations=confirmations,
             source_features=source_features,
             metadata=metadata,
-            priority=self.basis_config.default_priority,
+            priority=self.funding_basis_config.default_priority,
         )
 
     # ------------------------------------------------------------------
@@ -479,20 +487,35 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
     def _extract_payload(
         self,
         context: StrategyContext,
-    ) -> SpotFuturesBasisPayload | None:
+    ) -> FundingAdjustedBasisPayload | None:
         snapshot = self.resolve_spread_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
 
-        edge = self._basis_edge(snapshot)
-        if edge is None or edge == DECIMAL_ZERO:
+        funding_edge = snapshot.funding_adjusted_spread
+        if funding_edge is None:
             return None
 
-        side = basis_to_signal_side(snapshot.to_signal_payload())
+        if funding_edge == DECIMAL_ZERO:
+            return None
+
+        side = basis_to_signal_side(
+            {
+                "funding_adjusted_spread": funding_edge,
+                "basis": snapshot.basis,
+                "spread_bps": snapshot.spread_bps,
+            }
+        )
         if not is_directional_side(side):
             return None
 
-        bias = basis_to_bias(snapshot.to_signal_payload())
+        bias = basis_to_bias(
+            {
+                "funding_adjusted_spread": funding_edge,
+                "basis": snapshot.basis,
+                "spread_bps": snapshot.spread_bps,
+            }
+        )
         if bias is None:
             return None
 
@@ -503,20 +526,21 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         )
 
         reasons = [
-            "spot_futures_basis_context",
+            "funding_adjusted_basis_context",
             f"spread_type:{normalize_label(snapshot.spread_type)}",
             f"basis_bias:{bias}",
-            f"edge:{edge}",
+            f"funding_adjusted_edge:{funding_edge}",
             f"abs_zscore:{snapshot.abs_zscore}",
             f"confidence:{snapshot.confidence:.4f}",
         ]
 
-        return SpotFuturesBasisPayload(
+        return FundingAdjustedBasisPayload(
             snapshot=snapshot,
             side=side,
             basis_bias=bias,
-            edge=edge,
-            abs_edge=abs(edge),
+            funding_adjusted_edge=funding_edge,
+            abs_funding_adjusted_edge=abs(funding_edge),
+            raw_basis=snapshot.basis or snapshot.spread_bps,
             abs_zscore=snapshot.abs_zscore,
             event_time=event_time,
             reasons=list(dict.fromkeys(reasons)),
@@ -527,19 +551,6 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             },
         )
 
-    def _basis_edge(
-        self,
-        snapshot: SpreadCompositeSnapshot,
-    ) -> Decimal | None:
-        for candidate in (
-            snapshot.funding_adjusted_spread,
-            snapshot.basis,
-            snapshot.spread_bps,
-        ):
-            if candidate is not None:
-                return candidate
-        return None
-
     # ------------------------------------------------------------------
     # Filters
     # ------------------------------------------------------------------
@@ -548,7 +559,7 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
-        if not self.basis_config.require_spot_futures_contract:
+        if not self.funding_basis_config.require_spot_futures_contract:
             return True
 
         if snapshot.spread_type is not None and snapshot.spread_type is not SpreadType.SPOT_FUTURES:
@@ -558,56 +569,71 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         if contract_error is not None:
             return False
 
-        if self.basis_config.allowed_spot_exchanges:
+        if self.funding_basis_config.allowed_spot_exchanges:
             if snapshot.exchange_a not in {
                 exchange.lower()
-                for exchange in self.basis_config.allowed_spot_exchanges
+                for exchange in self.funding_basis_config.allowed_spot_exchanges
             }:
                 return False
 
-        if self.basis_config.allowed_futures_exchanges:
+        if self.funding_basis_config.allowed_futures_exchanges:
             if snapshot.exchange_b not in {
                 exchange.lower()
-                for exchange in self.basis_config.allowed_futures_exchanges
+                for exchange in self.funding_basis_config.allowed_futures_exchanges
             }:
                 return False
 
         return True
 
-    def _passes_basis_filters(
+    def _passes_funding_adjusted_filters(
         self,
-        payload: SpotFuturesBasisPayload,
+        payload: FundingAdjustedBasisPayload,
     ) -> bool:
         snapshot = payload.snapshot
 
-        if self.basis_config.require_valid_quote and not snapshot.is_quote_valid:
+        if self.funding_basis_config.require_valid_quote and not snapshot.is_quote_valid:
             return False
 
-        if self.basis_config.require_snapshot_edge and not has_tradeable_edge(
+        if self.funding_basis_config.require_snapshot_edge and not has_tradeable_edge(
             snapshot.to_signal_payload()
         ):
             return False
 
-        if payload.abs_zscore < self.basis_config.entry_zscore:
-            return False
-
-        if payload.abs_zscore >= self.basis_config.stop_zscore:
-            return False
-
-        if self.basis_config.min_funding_adjusted_edge > DECIMAL_ZERO:
-            funding_edge = decimal_abs(snapshot.funding_adjusted_spread)
-            if funding_edge < self.basis_config.min_funding_adjusted_edge:
+        if self.funding_basis_config.require_funding_adjusted_edge:
+            if snapshot.funding_adjusted_spread is None:
                 return False
 
-        if self.basis_config.min_basis_abs > DECIMAL_ZERO:
-            basis_abs = decimal_abs(snapshot.basis or snapshot.spread_bps)
-            if basis_abs < self.basis_config.min_basis_abs:
+        if payload.abs_funding_adjusted_edge < self.funding_basis_config.min_funding_adjusted_edge:
+            return False
+
+        if payload.raw_basis is not None:
+            if abs(payload.raw_basis) < self.funding_basis_config.min_raw_basis_abs:
                 return False
 
-        if self.basis_config.allowed_regimes:
+        if payload.abs_zscore < self.funding_basis_config.entry_zscore:
+            return False
+
+        if payload.abs_zscore >= self.funding_basis_config.stop_zscore:
+            return False
+
+        if self.funding_basis_config.require_same_edge_sign_as_basis:
+            if payload.raw_basis is not None and payload.raw_basis != DECIMAL_ZERO:
+                if (payload.raw_basis > DECIMAL_ZERO) != (
+                    payload.funding_adjusted_edge > DECIMAL_ZERO
+                ):
+                    return False
+
+        if payload.raw_basis is not None and payload.raw_basis != DECIMAL_ZERO:
+            ratio = float(
+                payload.abs_funding_adjusted_edge / max(abs(payload.raw_basis), DECIMAL_ONE)
+            )
+            if ratio < self.funding_basis_config.min_edge_to_basis_ratio:
+                return False
+
+        if self.funding_basis_config.allowed_regimes:
             if normalize_label(snapshot.regime) not in {
                 item.lower()
-                for item in self.basis_config.allowed_regimes
+                for item in self.funding_basis_config.allowed_regimes
             }:
                 return False
 
@@ -615,29 +641,25 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
     def _passes_confirmation_filters(
         self,
-        payload: SpotFuturesBasisPayload,
+        payload: FundingAdjustedBasisPayload,
     ) -> bool:
         signal = payload.snapshot.raw_signal
 
-        if self.basis_config.require_mean_reversion_signal:
+        if self.funding_basis_config.require_mean_reversion_signal:
             if not is_mean_reversion_signal(signal):
                 return False
 
-        if self.basis_config.require_regime_shift_confirmation:
-            if not is_regime_shift_signal(signal):
-                return False
-
         if is_widening_signal(signal):
-            if not self.basis_config.allow_widening_entry:
+            if not self.funding_basis_config.allow_widening_entry:
                 return False
 
-            if self.basis_config.widening_requires_wait:
+            if self.funding_basis_config.widening_requires_wait:
                 return False
 
-        if is_regime_shift_signal(signal) and not self.basis_config.allow_regime_shift_entry:
+        if is_regime_shift_signal(signal) and not self.funding_basis_config.allow_regime_shift_entry:
             return False
 
-        if is_anomaly_signal(signal) and not self.basis_config.allow_anomaly_entry:
+        if is_anomaly_signal(signal) and not self.funding_basis_config.allow_anomaly_entry:
             return False
 
         return True
@@ -650,108 +672,115 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         *,
         context: StrategyContext,
-        payload: SpotFuturesBasisPayload,
+        payload: FundingAdjustedBasisPayload,
     ) -> ScoreBreakdown:
         snapshot = payload.snapshot
 
-        z_component = zscore_component(
-            snapshot.to_signal_payload(),
-            entry_zscore=self.basis_config.entry_zscore,
-            stop_zscore=self.basis_config.stop_zscore,
-        )
         edge_scale = max(
-            self.basis_config.min_funding_adjusted_edge,
-            self.basis_config.min_basis_abs,
+            self.funding_basis_config.min_funding_adjusted_edge,
             DECIMAL_ONE,
         )
-        e_component = edge_component(
-            snapshot.to_signal_payload(),
+
+        funding_edge_component = edge_component(
+            {
+                "funding_adjusted_spread": payload.funding_adjusted_edge,
+            },
             min_edge=edge_scale,
             scale=edge_scale * Decimal("3"),
         )
-        r_component = regime_component(snapshot.to_signal_payload())
-        c_component = self._confirmation_component(snapshot)
-        q_component = quote_component(snapshot.to_signal_payload())
-        f_component = freshness_score(
+        z_component = zscore_component(
+            snapshot.to_signal_payload(),
+            entry_zscore=self.funding_basis_config.entry_zscore,
+            stop_zscore=self.funding_basis_config.stop_zscore,
+        )
+        basis_confluence_component = self._basis_confluence_component(payload)
+        regime_component_value = regime_component(snapshot.to_signal_payload())
+        confirmation_component = self._confirmation_component(snapshot)
+        freshness_component = freshness_score(
             event_time=payload.event_time,
             now=context.timestamp,
-            stale_after_seconds=self.basis_config.stale_feature_max_age_seconds,
+            stale_after_seconds=self.funding_basis_config.stale_feature_max_age_seconds,
         )
 
         components = {
+            "funding_edge": funding_edge_component,
             "zscore": z_component,
-            "edge": e_component,
-            "regime": r_component,
-            "confirmation": c_component,
-            "quote": q_component,
-            "freshness": f_component,
+            "basis_confluence": basis_confluence_component,
+            "regime": regime_component_value,
+            "confirmation": confirmation_component,
+            "freshness": freshness_component,
         }
         weights = {
-            "zscore": self.basis_config.score_zscore_weight,
-            "edge": self.basis_config.score_edge_weight,
-            "regime": self.basis_config.score_regime_weight,
-            "confirmation": self.basis_config.score_confirmation_weight,
-            "quote": self.basis_config.score_quote_weight,
-            "freshness": self.basis_config.score_freshness_weight,
+            "funding_edge": self.funding_basis_config.score_funding_edge_weight,
+            "zscore": self.funding_basis_config.score_zscore_weight,
+            "basis_confluence": self.funding_basis_config.score_basis_confluence_weight,
+            "regime": self.funding_basis_config.score_regime_weight,
+            "confirmation": self.funding_basis_config.score_confirmation_weight,
+            "freshness": self.funding_basis_config.score_freshness_weight,
         }
 
-        score = weighted_score(components, weights, default=z_component)
+        score = weighted_score(components, weights, default=funding_edge_component)
         confidence = confidence_from_components(
-            primary=average_score(snapshot.confidence, z_component),
-            context=average_score(e_component, r_component),
-            confirmation=average_score(c_component, q_component),
-            freshness=f_component,
-            primary_weight=self.basis_config.confidence_primary_weight,
-            context_weight=self.basis_config.confidence_context_weight,
-            confirmation_weight=self.basis_config.confidence_confirmation_weight,
-            freshness_weight=self.basis_config.confidence_freshness_weight,
+            primary=average_score(snapshot.confidence, funding_edge_component),
+            context=average_score(basis_confluence_component, regime_component_value),
+            confirmation=average_score(confirmation_component, z_component),
+            freshness=freshness_component,
+            primary_weight=self.funding_basis_config.confidence_primary_weight,
+            context_weight=self.funding_basis_config.confidence_context_weight,
+            confirmation_weight=self.funding_basis_config.confidence_confirmation_weight,
+            freshness_weight=self.funding_basis_config.confidence_freshness_weight,
         )
 
         reasons: list[str] = []
         confirmations: list[str] = [
-            "spot_futures_basis_context",
+            "funding_adjusted_basis_context",
             f"basis_bias:{payload.basis_bias}",
             f"side:{payload.side.value}",
+            f"funding_adjusted_edge:{payload.funding_adjusted_edge}",
             f"abs_zscore:{payload.abs_zscore}",
-            f"abs_edge:{payload.abs_edge}",
         ]
 
-        if payload.abs_zscore >= self.basis_config.entry_zscore:
-            score += self.basis_config.zscore_entry_bonus
+        if (
+            payload.abs_funding_adjusted_edge
+            >= self.funding_basis_config.min_funding_adjusted_edge
+            * self.funding_basis_config.strong_funding_edge_multiplier
+        ):
+            score += self.funding_basis_config.strong_funding_edge_bonus
+            confirmations.append("strong_funding_adjusted_edge")
+
+        if payload.abs_zscore >= self.funding_basis_config.entry_zscore:
+            score += self.funding_basis_config.zscore_entry_bonus
             confirmations.append("zscore_entry_threshold_passed")
 
+        if basis_confluence_component >= 0.75:
+            score += self.funding_basis_config.basis_confluence_bonus
+            confirmations.append("basis_funding_confluence")
+
         if snapshot.regime is SpreadRegime.EXTREME:
-            score += self.basis_config.extreme_regime_bonus
+            score += self.funding_basis_config.extreme_regime_bonus
             confirmations.append("extreme_spread_regime")
 
         if snapshot.regime is SpreadRegime.DISLOCATED:
-            score += self.basis_config.dislocated_regime_bonus
+            score += self.funding_basis_config.dislocated_regime_bonus
             confirmations.append("dislocated_spread_regime")
 
-        if snapshot.funding_adjusted_spread is not None:
-            score += self.basis_config.funding_adjusted_bonus
-            confirmations.append("funding_adjusted_edge_available")
-
         if is_mean_reversion_signal(snapshot.raw_signal):
-            score += self.basis_config.mean_reversion_confirmation_bonus
+            score += self.funding_basis_config.mean_reversion_confirmation_bonus
             confirmations.append("mean_reversion_signal_confirmation")
 
         if is_anomaly_signal(snapshot.raw_signal):
-            score += self.basis_config.anomaly_confirmation_bonus
+            score += self.funding_basis_config.anomaly_confirmation_bonus
             confirmations.append("spread_anomaly_confirmation")
 
         if is_regime_shift_signal(snapshot.raw_signal):
-            score += self.basis_config.regime_shift_confirmation_bonus
+            score += self.funding_basis_config.regime_shift_confirmation_bonus
             confirmations.append("regime_shift_confirmation")
+
+        if payload.raw_basis is not None:
+            reasons.append(f"raw_basis:{payload.raw_basis}")
 
         if snapshot.spread_bps is not None:
             reasons.append(f"spread_bps:{snapshot.spread_bps}")
-
-        if snapshot.basis is not None:
-            reasons.append(f"basis:{snapshot.basis}")
-
-        if snapshot.funding_adjusted_spread is not None:
-            reasons.append(f"funding_adjusted_spread:{snapshot.funding_adjusted_spread}")
 
         return ScoreBreakdown(
             score=unit_score(score),
@@ -761,6 +790,33 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             reasons=reasons,
             confirmations=list(dict.fromkeys(confirmations)),
         ).normalize()
+
+    def _basis_confluence_component(
+        self,
+        payload: FundingAdjustedBasisPayload,
+    ) -> float:
+        raw_basis = payload.raw_basis
+        if raw_basis is None or raw_basis == DECIMAL_ZERO:
+            return 0.0
+
+        same_sign = (raw_basis > DECIMAL_ZERO) == (
+            payload.funding_adjusted_edge > DECIMAL_ZERO
+        )
+        sign_component = 1.0 if same_sign else 0.25
+
+        ratio = payload.abs_funding_adjusted_edge / max(abs(raw_basis), DECIMAL_ONE)
+        ratio_component = unit_score(ratio)
+
+        return weighted_score(
+            {
+                "sign": sign_component,
+                "ratio": ratio_component,
+            },
+            {
+                "sign": 0.60,
+                "ratio": 0.40,
+            },
+        )
 
     def _confirmation_component(
         self,
@@ -773,15 +829,17 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             "regime_shift": 0.75 if is_regime_shift_signal(signal) else 0.0,
             "anomaly": 0.70 if is_anomaly_signal(signal) else 0.0,
             "not_widening": 0.0 if is_widening_signal(signal) else 1.0,
+            "quote": quote_component(snapshot.to_signal_payload()),
         }
 
         return weighted_score(
             components,
             {
-                "mean_reversion": 0.40,
-                "regime_shift": 0.20,
-                "anomaly": 0.20,
-                "not_widening": 0.20,
+                "mean_reversion": 0.32,
+                "regime_shift": 0.18,
+                "anomaly": 0.18,
+                "not_widening": 0.17,
+                "quote": 0.15,
             },
             default=0.0,
         )
@@ -792,10 +850,10 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
     def _source_features(
         self,
-        payload: SpotFuturesBasisPayload,
+        payload: FundingAdjustedBasisPayload,
     ) -> list[str]:
         features = [
-            *spot_futures_source_features(),
+            *funding_adjusted_source_features(),
             SPREADS_FEATURES.SNAPSHOT,
             SPREADS_FEATURES.SIGNAL,
             SPREADS_FEATURES.SPREAD_TYPE,
@@ -804,9 +862,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
             SPREADS_FEATURES.EXCHANGE_B,
             SPREADS_FEATURES.MARKET_TYPE_A,
             SPREADS_FEATURES.MARKET_TYPE_B,
-            SPREADS_FEATURES.SPREAD_BPS,
             SPREADS_FEATURES.BASIS,
             SPREADS_FEATURES.FUNDING_ADJUSTED_SPREAD,
+            SPREADS_FEATURES.SPREAD_BPS,
             SPREADS_FEATURES.ZSCORE,
             SPREADS_FEATURES.REGIME,
             SPREADS_FEATURES.DIRECTION,
@@ -819,27 +877,28 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
     def _tags(
         self,
-        payload: SpotFuturesBasisPayload,
+        payload: FundingAdjustedBasisPayload,
     ) -> list[str]:
         tags = [
-            self.basis_config.tag_spreads,
-            self.basis_config.tag_spot_futures,
-            self.basis_config.tag_basis,
-            self.basis_config.tag_spot_futures_basis,
-            self.basis_config.tag_basis_mean_reversion,
-            self.basis_config.tag_zscore_entry,
+            self.funding_basis_config.tag_spreads,
+            self.funding_basis_config.tag_spot_futures,
+            self.funding_basis_config.tag_basis,
+            self.funding_basis_config.tag_funding_adjusted,
+            self.funding_basis_config.tag_funding_adjusted_basis,
+            self.funding_basis_config.tag_funding_edge,
+            self.funding_basis_config.tag_zscore_entry,
             f"side:{payload.side.value}",
             f"bias:{payload.basis_bias.lower()}",
         ]
 
         if payload.basis_bias == "SHORT_BASIS":
-            tags.append(self.basis_config.tag_short_basis)
+            tags.append(self.funding_basis_config.tag_short_basis)
 
         if payload.basis_bias == "LONG_BASIS":
-            tags.append(self.basis_config.tag_long_basis)
+            tags.append(self.funding_basis_config.tag_long_basis)
 
-        if payload.snapshot.funding_adjusted_spread is not None:
-            tags.append(self.basis_config.tag_funding_adjusted)
+        if self._basis_confluence_component(payload) >= 0.75:
+            tags.append(self.funding_basis_config.tag_basis_confluence)
 
         if payload.snapshot.regime is not None:
             tags.append(f"regime:{normalize_label(payload.snapshot.regime)}")
@@ -851,7 +910,7 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
     def _leg_semantics(
         self,
-        payload: SpotFuturesBasisPayload,
+        payload: FundingAdjustedBasisPayload,
     ) -> dict[str, Any]:
         snapshot = payload.snapshot
 
@@ -873,13 +932,11 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
                 "exchange": snapshot.exchange_a,
                 "market_type": snapshot.market_type_a,
                 "symbol": snapshot.exchange_symbol_a,
-                "instrument_type": InstrumentType.SPOT.value,
             },
             "futures_leg": {
                 "exchange": snapshot.exchange_b,
                 "market_type": snapshot.market_type_b,
                 "symbol": snapshot.exchange_symbol_b,
-                "instrument_type": "derivative",
             },
             "note": (
                 "StrategySignal.side is generic LONG/SHORT. Exact multi-leg "
@@ -893,8 +950,10 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         is owned by SignalProcessor / SignalBuilder.
         """
         return {
-            "entry_offset_bps": self.basis_config.execution_entry_offset_bps_hint,
-            "stop_buffer_bps": self.basis_config.execution_stop_buffer_bps_hint,
-            "take_profit_bps": self.basis_config.execution_take_profit_bps_hint,
-            "basis_tp_multiplier": self.basis_config.basis_tp_multiplier_hint,
+            "entry_offset_bps": self.funding_basis_config.execution_entry_offset_bps_hint,
+            "stop_buffer_bps": self.funding_basis_config.execution_stop_buffer_bps_hint,
+            "take_profit_bps": self.funding_basis_config.execution_take_profit_bps_hint,
+            "funding_adjusted_tp_multiplier": (
+                self.funding_basis_config.funding_adjusted_tp_multiplier_hint
+            ),
         }

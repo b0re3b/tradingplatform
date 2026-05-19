@@ -1,1587 +1,1778 @@
-# strategy/strategies/whales/base.py
+# trading_system/strategy/strategies/whales/base.py
 
 from __future__ import annotations
 
-import logging
-import time
-from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field, fields
+from datetime import datetime
 from typing import Any
 
-from core.event_bus import Event, EventBus, EventPriority
-from core.logger import TradingLoggerAdapter, get_logger
+from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from strategy.base import ContextAwareComponent, NamedEntityMixin, PrioritizedMixin
-from strategy.config import StrategyConfig
-from strategy.enums import (
-    ConfidenceGrade,
-    FilterDecision,
-    MarketRegime,
+from .utils import (
+    DEFAULT_WHALE_FEATURE_MAX_AGE_SECONDS,
+    FUTURES_MARKET_TYPES,
+    as_dict,
+    base_whales_source_features,
+    extract_cluster_side,
+    extract_context_strength,
+    extract_dominant_side,
+    extract_event_time,
+    extract_exchange,
+    extract_exchange_symbol,
+    extract_exhausted_side,
+    extract_large_trade_notional,
+    extract_large_trade_payload,
+    extract_large_trade_zscore,
+    extract_liquidation_notional,
+    extract_liquidation_side,
+    extract_market_type,
+    extract_metadata,
+    extract_notional,
+    extract_reference_price,
+    extract_symbol,
+    extract_timeframe,
+    extract_total_notional,
+    extract_trade_count,
+    extract_whale_activity_payload,
+    extract_whale_cluster_exhaustion_payload,
+    extract_whale_cluster_payload,
+    extract_whale_cluster_update_payload,
+    extract_whale_liquidation_context_payload,
+    extract_whale_pressure_payload,
+    extract_whale_side,
+    extract_imbalance_ratio,
+    extract_pressure_score,
+    freshness_score,
+    is_directional_side,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_symbol,
+    parse_datetime,
+    resolve_cluster_score,
+    resolve_cluster_side,
+    resolve_continuation_probability,
+    resolve_exhausted_side,
+    resolve_exhaustion_probability,
+    serialize_for_metadata,
+    side_label_to_signal_side,
+    timestamp_ms,
+    to_bool,
+    to_float,
+    to_int,
+    to_str,
+    unit_score,
+    whale_payload_validation_reason,
+    whale_quality_filter_reason,
+    whales_domain,
+    whales_item,
+    whales_path,
+)
+from ..base_strategy import TradingStrategy
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    EntryType,
+    ExitType,
+    FeatureSource,
+    SetupType,
+    SignalOrigin,
     SignalPriority,
-    SignalStrength,
+    SignalSide,
+    SignalStatus,
     StrategyCategory,
+    StrategyMarginMode,
+    StrategyMarketType,
+    StrategyOrderIntent,
+    StrategyTradeTier,
+    Timeframe,
+    TriggerType,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    FilterResult,
-    SignalContext,
-    StrategyEvaluation,
-    StrategySignal,
-)
-
-LoggerLike = logging.Logger | TradingLoggerAdapter
+from ...exceptions import StrategyConfigError, StrategyEvaluationError
+from ...models import FeatureSnapshot, StrategyContext, StrategySignal
 
 
-FUTURES_MARKET_TYPES: frozenset[str] = frozenset(
-    {
-        "perpetual",
-        "futures",
-        "linear",
-        "inverse",
-        "swap",
-        "usdm_futures",
-        "coinm_futures",
-    }
-)
+# =============================================================================
+# Feature contract
+# =============================================================================
 
 
-DEFAULT_WHALE_FEATURE_MAX_AGE_MS = 90_000
-DEFAULT_WHALE_CONTEXT_TOPIC = "strategy.context.whales"
-
-
-@dataclass(slots=True)
-class WhaleStrategyEventConfig:
+@dataclass(frozen=True, slots=True)
+class WhalesFeatureNames:
     """
-    Тимчасовий event-driven adapter config для whale-стратегій.
+    Stable whales feature names expected in StrategyContext.
 
-    Важливо:
-    - це проміжний контракт для конкретного strategy/strategies/whales пакету;
-    - пізніше publishing/filtering/building треба буде винести у StrategyEngine /
-      SignalProcessor;
-    - зараз залишаємо цей шар, щоб узгодити strategy/strategies/* з analytics/*.
+    StrategyContextBuilder / SignalNormalizer should populate these from
+    analytics.whales.* payloads. Concrete strategies may also read equivalent
+    values from FeatureSource.WHALES domain_data aliases.
     """
 
-    context_topic: str = DEFAULT_WHALE_CONTEXT_TOPIC
+    PRESSURE: str = "whales.pressure"
+    ACTIVITY: str = "whales.activity"
+    LARGE_TRADE: str = "whales.large_trade"
 
-    generated_signal_topic: str = "signal.generated"
-    rejected_signal_topic: str = "signal.rejected"
-    evaluation_completed_topic: str = "strategy.evaluation.completed"
-    evaluation_failed_topic: str = "strategy.evaluation.failed"
+    CLUSTER: str = "whales.cluster"
+    CLUSTER_UPDATE: str = "whales.cluster_update"
+    CLUSTER_EXHAUSTION: str = "whales.cluster_exhaustion"
 
-    subscribe_enabled: bool = True
-    publish_generated_signals: bool = True
-    publish_rejected_signals: bool = True
-    publish_evaluations: bool = False
-    publish_failures: bool = True
+    LIQUIDATION_CONTEXT: str = "whales.liquidation_context"
 
-    scheduler_healthcheck_enabled: bool = False
-    scheduler_healthcheck_interval: float = 60.0
+    SYMBOL: str = "whales.symbol"
+    EXCHANGE: str = "whales.exchange"
+    MARKET_TYPE: str = "whales.market_type"
+    TIMEFRAME: str = "whales.timeframe"
+    EXCHANGE_SYMBOL: str = "whales.exchange_symbol"
 
-    # Domain validation toggles.
-    validate_scope_enabled: bool = True
-    validate_freshness_enabled: bool = True
-    validate_futures_market_type_enabled: bool = True
+    DOMINANT_SIDE: str = "whales.dominant_side"
+    WHALE_SIDE: str = "whales.whale_side"
+    LIQUIDATION_SIDE: str = "whales.liquidation_side"
+    EXHAUSTED_SIDE: str = "whales.exhausted_side"
+    CLUSTER_SIDE: str = "whales.cluster_side"
 
-    # Whale analytics often uses realtime aggregation while strategies can run on
-    # 1m/5m/15m contexts, тому timeframe strict-match вимкнений за замовчуванням.
-    strict_timeframe_scope: bool = False
+    IMBALANCE_RATIO: str = "whales.imbalance_ratio"
+    PRESSURE_SCORE: str = "whales.pressure_score"
+    CONTEXT_STRENGTH: str = "whales.context_strength"
+    CLUSTER_SCORE: str = "whales.cluster_score"
+    CONTINUATION_PROBABILITY: str = "whales.continuation_probability"
+    EXHAUSTION_PROBABILITY: str = "whales.exhaustion_probability"
 
-    # Якщо payload не має exchange/market_type/symbol/timeframe, не блокуємо його,
-    # бо StrategyContextBuilder може вже гарантувати scope на рівні context.
-    require_payload_scope: bool = False
+    TOTAL_NOTIONAL: str = "whales.total_notional"
+    LIQUIDATION_NOTIONAL: str = "whales.liquidation_notional"
+    TRADE_COUNT: str = "whales.trade_count"
+    LARGE_TRADE_NOTIONAL: str = "whales.large_trade_notional"
+    LARGE_TRADE_ZSCORE: str = "whales.large_trade_zscore"
 
-    # Якщо True, invalid whale payload повертається як {}, щоб стратегія не
-    # будувала сигнал на stale/wrong-scope даних.
-    drop_invalid_payloads: bool = True
+    REFERENCE_PRICE: str = "whales.reference_price"
+    CONFIDENCE: str = "whales.confidence"
+    TIMESTAMP: str = "whales.timestamp"
+    METADATA: str = "whales.metadata"
 
-    whale_feature_max_age_ms: int = DEFAULT_WHALE_FEATURE_MAX_AGE_MS
+    @classmethod
+    def all(cls) -> set[str]:
+        instance = cls()
+        return {
+            getattr(instance, item.name)
+            for item in fields(cls)
+            if isinstance(getattr(instance, item.name), str)
+            and getattr(instance, item.name).strip()
+        }
 
 
-@dataclass(slots=True)
+WHALES_FEATURES = WhalesFeatureNames()
+
+
+# =============================================================================
+# Lightweight validation / feature DTOs
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
 class WhalePayloadValidation:
-    """
-    Результат validation одного analytics.whales payload.
-    """
-
     valid: bool
-    present: bool
-    fresh: bool = True
-    scope_valid: bool = True
-    futures_market_type_valid: bool = True
-    reasons: list[str] = field(default_factory=list)
+    reason: str | None = None
+    payload_age_seconds: float | None = None
+    source: str = "unknown"
 
-    def add_reason(self, reason: str) -> None:
-        if reason:
-            self.reasons.append(reason)
+    @classmethod
+    def ok(
+        cls,
+        *,
+        payload_age_seconds: float | None = None,
+        source: str = "unknown",
+    ) -> WhalePayloadValidation:
+        return cls(
+            valid=True,
+            reason=None,
+            payload_age_seconds=payload_age_seconds,
+            source=source,
+        )
+
+    @classmethod
+    def failed(
+        cls,
+        reason: str,
+        *,
+        payload_age_seconds: float | None = None,
+        source: str = "unknown",
+    ) -> WhalePayloadValidation:
+        return cls(
+            valid=False,
+            reason=reason,
+            payload_age_seconds=payload_age_seconds,
+            source=source,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "reason": self.reason,
+            "payload_age_seconds": self.payload_age_seconds,
+            "source": self.source,
+        }
 
 
 @dataclass(slots=True)
 class WhaleFeaturePayload:
-    """
-    Нормалізований wrapper для одного whale feature payload.
-    """
-
-    canonical_name: str
-    aliases: tuple[str, ...]
-    payload: dict[str, Any]
-    source_name: str | None = None
-    source_location: str | None = None
+    name: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    event_time: datetime | None = None
     validation: WhalePayloadValidation = field(
-        default_factory=lambda: WhalePayloadValidation(valid=False, present=False)
+        default_factory=WhalePayloadValidation.ok
     )
 
-    @property
-    def present(self) -> bool:
-        return bool(self.payload)
+    def __post_init__(self) -> None:
+        self.payload = as_dict(self.payload)
+        self.event_time = parse_datetime(self.event_time)
 
     @property
-    def valid(self) -> bool:
-        return self.validation.valid
+    def available(self) -> bool:
+        return bool(self.payload) and self.validation.valid
+
+    def age_seconds(self, now: datetime | None = None) -> float | None:
+        if self.event_time is None:
+            return None
+        current = parse_datetime(now) or parse_datetime(datetime.utcnow())
+        if current is None:
+            return None
+        return max(0.0, (current - self.event_time).total_seconds())
 
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.payload)
+        return {
+            "name": self.name,
+            "available": self.available,
+            "event_time": self.event_time.isoformat() if self.event_time else None,
+            "timestamp_ms": timestamp_ms(self.event_time),
+            "validation": self.validation.to_dict(),
+            "payload": serialize_for_metadata(self.payload),
+        }
+
+
+# =============================================================================
+# Scope
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class WhalesStrategyScope:
+    exchange: str
+    market_type: str
+    symbol: str
+    timeframe: str = Timeframe.M1.value
+    exchange_symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        exchange = normalize_exchange(self.exchange) or "unknown"
+        market_type = normalize_market_type(self.market_type) or "unknown"
+        symbol = normalize_symbol(self.symbol)
+        timeframe = str(self.timeframe or Timeframe.M1.value).strip().lower()
+        exchange_symbol = to_str(self.exchange_symbol) or symbol
+
+        if not symbol:
+            raise StrategyEvaluationError("WhalesStrategyScope.symbol cannot be empty")
+
+        object.__setattr__(self, "exchange", exchange)
+        object.__setattr__(self, "market_type", market_type)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "timeframe", timeframe)
+        object.__setattr__(self, "exchange_symbol", exchange_symbol)
+
+    @property
+    def key(self) -> str:
+        return (
+            f"{self.exchange}:"
+            f"{self.market_type}:"
+            f"{self.symbol}:"
+            f"{self.timeframe}"
+        )
+
+    @property
+    def legacy_key(self) -> str:
+        return f"{self.exchange}:{self.symbol}"
+
+    @property
+    def is_futures(self) -> bool:
+        if not self.market_type or self.market_type == "unknown":
+            return True
+        return self.market_type in FUTURES_MARKET_TYPES
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "key": self.key,
+            "legacy_key": self.legacy_key,
+            "is_futures": self.is_futures,
+        }
+
+
+# =============================================================================
+# Config
+# =============================================================================
 
 
 @dataclass(slots=True)
-class WhaleStrategyInputSnapshot:
+class WhalesStrategyConfig:
     """
-    Нормалізований набір whale inputs для конкретної стратегії.
+    Stateless domain config shared by concrete whale strategies.
 
-    Це не заміна SignalContext. Це легкий domain snapshot над:
-    - context.whales;
-    - context.feature_map;
-    - context feature snapshots.
+    No EventBus topics, no context subscription, no local evaluator lifecycle,
+    no StrategyEvaluation publishing. Concrete strategies consume StrategyContext
+    and return StrategySignal only.
     """
 
-    strategy_name: str
+    min_score: float = 0.60
+    min_confidence: float = 0.55
+    stale_feature_max_age_seconds: float | None = DEFAULT_WHALE_FEATURE_MAX_AGE_SECONDS
+
+    require_futures_market_type: bool = True
+    allowed_market_types: set[str] = field(
+        default_factory=lambda: set(FUTURES_MARKET_TYPES)
+    )
+    validate_scope: bool = True
+    strict_timeframe_scope: bool = False
+
+    default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
+    default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
+    default_order_intent: StrategyOrderIntent = StrategyOrderIntent.OPEN
+    default_trade_tier: StrategyTradeTier = StrategyTradeTier.T2
+
+    default_entry_type: EntryType = EntryType.MARKET
+    default_exit_types: tuple[ExitType, ...] = (
+        ExitType.TAKE_PROFIT,
+        ExitType.STOP_LOSS,
+        ExitType.INVALIDATION,
+    )
+
+    requested_leverage: float | None = None
+    max_slippage_bps: float | None = None
+    entry_timeout_seconds: int | None = None
+    max_holding_seconds: int | None = None
+
+    attach_whale_context_metadata: bool = True
+    attach_scope_metadata: bool = True
+    attach_raw_payload_metadata: bool = True
+    attach_feature_validation_metadata: bool = True
+
+    tag_whales: str = "whales"
+    tag_absorption: str = "whale_absorption"
+    tag_breakout: str = "whale_breakout"
+    tag_accumulation: str = "whale_accumulation"
+    tag_distribution: str = "whale_distribution"
+    tag_liquidation_reversal: str = "whale_liquidation_reversal"
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        bounded = {
+            "min_score": self.min_score,
+            "min_confidence": self.min_confidence,
+        }
+        for name, value in bounded.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{name} must be between 0.0 and 1.0")
+
+        if (
+            self.stale_feature_max_age_seconds is not None
+            and self.stale_feature_max_age_seconds <= 0
+        ):
+            raise StrategyConfigError("stale_feature_max_age_seconds must be > 0")
+
+        if self.requested_leverage is not None and self.requested_leverage <= 0:
+            raise StrategyConfigError("requested_leverage must be > 0")
+
+        if self.max_slippage_bps is not None and self.max_slippage_bps < 0:
+            raise StrategyConfigError("max_slippage_bps must be >= 0")
+
+        if self.entry_timeout_seconds is not None and self.entry_timeout_seconds <= 0:
+            raise StrategyConfigError("entry_timeout_seconds must be > 0")
+
+        if self.max_holding_seconds is not None and self.max_holding_seconds <= 0:
+            raise StrategyConfigError("max_holding_seconds must be > 0")
+
+        if not self.allowed_market_types:
+            raise StrategyConfigError("allowed_market_types cannot be empty")
+
+        for market_type in self.allowed_market_types:
+            if not isinstance(market_type, str) or not market_type.strip():
+                raise StrategyConfigError("allowed_market_types must contain strings only")
+
+        for attr in (
+            "tag_whales",
+            "tag_absorption",
+            "tag_breakout",
+            "tag_accumulation",
+            "tag_distribution",
+            "tag_liquidation_reversal",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+
+# =============================================================================
+# Composite snapshot
+# =============================================================================
+
+
+@dataclass(slots=True)
+class WhaleCompositeSnapshot:
+    """
+    Strategy-level normalized projection over analytics.whales payloads.
+
+    This is not an analytics model. It is a stable strategy-side DTO that lets
+    concrete whale strategies consume pressure/activity/cluster/liquidation
+    payloads through one contract.
+    """
+
     symbol: str
-    timestamp_ms: int | None
-    features: dict[str, WhaleFeaturePayload] = field(default_factory=dict)
+    exchange: str = "unknown"
+    market_type: str = "unknown"
+    timeframe: str = Timeframe.M1.value
+    exchange_symbol: str | None = None
 
-    def get(self, name: str) -> dict[str, Any]:
-        feature = self.features.get(name)
-        if feature is None:
-            return {}
-        return feature.to_dict()
+    pressure: dict[str, Any] = field(default_factory=dict)
+    activity: dict[str, Any] = field(default_factory=dict)
+    large_trade: dict[str, Any] = field(default_factory=dict)
+    cluster: dict[str, Any] = field(default_factory=dict)
+    cluster_update: dict[str, Any] = field(default_factory=dict)
+    cluster_exhaustion: dict[str, Any] = field(default_factory=dict)
+    liquidation_context: dict[str, Any] = field(default_factory=dict)
 
-    def feature(self, name: str) -> WhaleFeaturePayload | None:
-        return self.features.get(name)
+    dominant_side: str = "unknown"
+    whale_side: str = "unknown"
+    liquidation_side: str = "unknown"
+    exhausted_side: str = "unknown"
+    cluster_side: str = "unknown"
+
+    imbalance_ratio: float = 0.0
+    pressure_score: float = 0.0
+    context_strength: float = 0.0
+    cluster_score: float | None = None
+    continuation_probability: float | None = None
+    exhaustion_probability: float | None = None
+
+    total_notional: float = 0.0
+    liquidation_notional: float = 0.0
+    trade_count: int = 0
+    large_trade_notional: float = 0.0
+    large_trade_zscore: float | None = None
+
+    reference_price: float | None = None
+    confidence: float = 0.0
+    timestamp: datetime | None = None
+    source: str = "unknown"
+
+    feature_validations: dict[str, WhalePayloadValidation] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.symbol = normalize_symbol(self.symbol)
+        self.exchange = normalize_exchange(self.exchange) or "unknown"
+        self.market_type = normalize_market_type(self.market_type) or "unknown"
+        self.timeframe = str(self.timeframe or Timeframe.M1.value).strip().lower()
+        self.exchange_symbol = to_str(self.exchange_symbol) or self.symbol
+
+        if not self.symbol:
+            raise StrategyEvaluationError("WhaleCompositeSnapshot.symbol cannot be empty")
+
+        self.pressure = as_dict(self.pressure)
+        self.activity = as_dict(self.activity)
+        self.large_trade = as_dict(self.large_trade)
+        self.cluster = as_dict(self.cluster)
+        self.cluster_update = as_dict(self.cluster_update)
+        self.cluster_exhaustion = as_dict(self.cluster_exhaustion)
+        self.liquidation_context = as_dict(self.liquidation_context)
+
+        self.imbalance_ratio = unit_score(self.imbalance_ratio)
+        self.pressure_score = unit_score(self.pressure_score)
+        self.context_strength = unit_score(self.context_strength)
+        self.cluster_score = (
+            unit_score(self.cluster_score)
+            if self.cluster_score is not None
+            else None
+        )
+        self.continuation_probability = (
+            unit_score(self.continuation_probability)
+            if self.continuation_probability is not None
+            else None
+        )
+        self.exhaustion_probability = (
+            unit_score(self.exhaustion_probability)
+            if self.exhaustion_probability is not None
+            else None
+        )
+
+        self.total_notional = max(0.0, float(self.total_notional))
+        self.liquidation_notional = max(0.0, float(self.liquidation_notional))
+        self.trade_count = max(0, int(self.trade_count))
+        self.large_trade_notional = max(0.0, float(self.large_trade_notional))
+        self.large_trade_zscore = (
+            max(0.0, float(self.large_trade_zscore))
+            if self.large_trade_zscore is not None
+            else None
+        )
+        self.reference_price = (
+            max(0.0, float(self.reference_price))
+            if self.reference_price is not None
+            else None
+        )
+        self.confidence = unit_score(self.confidence)
+        self.timestamp = parse_datetime(self.timestamp)
+        self.metadata = as_dict(self.metadata)
 
     @property
-    def missing_features(self) -> list[str]:
-        return [
-            name
-            for name, feature in self.features.items()
-            if not feature.present
-        ]
+    def scope(self) -> WhalesStrategyScope:
+        return WhalesStrategyScope(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            exchange_symbol=self.exchange_symbol,
+        )
 
     @property
-    def invalid_features(self) -> list[str]:
-        return [
-            name
-            for name, feature in self.features.items()
-            if feature.present and not feature.valid
-        ]
+    def scope_key(self) -> str:
+        return self.scope.key
 
     @property
-    def valid(self) -> bool:
-        return not self.invalid_features
+    def is_futures(self) -> bool:
+        return self.scope.is_futures
+
+    @property
+    def whale_signal_side(self) -> SignalSide:
+        for candidate in (
+            self.dominant_side,
+            self.whale_side,
+            self.cluster_side,
+            self.exhausted_side,
+        ):
+            side = side_label_to_signal_side(candidate)
+            if is_directional_side(side):
+                return side
+        return SignalSide.UNKNOWN
+
+    @property
+    def has_pressure(self) -> bool:
+        return bool(self.pressure)
+
+    @property
+    def has_activity(self) -> bool:
+        return bool(self.activity)
+
+    @property
+    def has_large_trade(self) -> bool:
+        return bool(self.large_trade)
+
+    @property
+    def has_cluster(self) -> bool:
+        return bool(self.cluster or self.cluster_update or self.cluster_exhaustion)
+
+    @property
+    def has_liquidation_context(self) -> bool:
+        return bool(self.liquidation_context)
+
+    def has_minimum_data(self) -> bool:
+        return any(
+            (
+                self.has_pressure,
+                self.has_activity,
+                self.has_large_trade,
+                self.has_cluster,
+                self.has_liquidation_context,
+                self.imbalance_ratio > 0.0,
+                self.context_strength > 0.0,
+                self.total_notional > 0.0,
+                self.large_trade_notional > 0.0,
+                self.confidence > 0.0,
+            )
+        )
+
+    def inputs(self) -> dict[str, dict[str, Any]]:
+        return {
+            "pressure": self.pressure,
+            "activity": self.activity,
+            "large_trade": self.large_trade,
+            "cluster": self.cluster,
+            "cluster_update": self.cluster_update,
+            "cluster_exhaustion": self.cluster_exhaustion,
+            "liquidation_context": self.liquidation_context,
+        }
+
+    def to_signal_payload(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "dominant_side": self.dominant_side,
+            "whale_side": self.whale_side,
+            "liquidation_side": self.liquidation_side,
+            "exhausted_side": self.exhausted_side,
+            "cluster_side": self.cluster_side,
+            "imbalance_ratio": self.imbalance_ratio,
+            "pressure_score": self.pressure_score,
+            "context_strength": self.context_strength,
+            "cluster_score": self.cluster_score,
+            "continuation_probability": self.continuation_probability,
+            "exhaustion_probability": self.exhaustion_probability,
+            "total_notional": self.total_notional,
+            "liquidation_notional": self.liquidation_notional,
+            "trade_count": self.trade_count,
+            "large_trade_notional": self.large_trade_notional,
+            "large_trade_zscore": self.large_trade_zscore,
+            "reference_price": self.reference_price,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp,
+            "metadata": self.metadata,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol,
+            "scope": self.scope.to_dict(),
+            "scope_key": self.scope_key,
+            "is_futures": self.is_futures,
+            "dominant_side": self.dominant_side,
+            "whale_side": self.whale_side,
+            "liquidation_side": self.liquidation_side,
+            "exhausted_side": self.exhausted_side,
+            "cluster_side": self.cluster_side,
+            "whale_signal_side": self.whale_signal_side.value,
+            "imbalance_ratio": self.imbalance_ratio,
+            "pressure_score": self.pressure_score,
+            "context_strength": self.context_strength,
+            "cluster_score": self.cluster_score,
+            "continuation_probability": self.continuation_probability,
+            "exhaustion_probability": self.exhaustion_probability,
+            "total_notional": self.total_notional,
+            "liquidation_notional": self.liquidation_notional,
+            "trade_count": self.trade_count,
+            "large_trade_notional": self.large_trade_notional,
+            "large_trade_zscore": self.large_trade_zscore,
+            "reference_price": self.reference_price,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "timestamp_ms": timestamp_ms(self.timestamp),
+            "source": self.source,
+            "available_inputs": {
+                "pressure": self.has_pressure,
+                "activity": self.has_activity,
+                "large_trade": self.has_large_trade,
+                "cluster": self.has_cluster,
+                "liquidation_context": self.has_liquidation_context,
+            },
+            "feature_validations": {
+                name: validation.to_dict()
+                for name, validation in self.feature_validations.items()
+            },
+            "raw": {
+                "pressure": serialize_for_metadata(self.pressure),
+                "activity": serialize_for_metadata(self.activity),
+                "large_trade": serialize_for_metadata(self.large_trade),
+                "cluster": serialize_for_metadata(self.cluster),
+                "cluster_update": serialize_for_metadata(self.cluster_update),
+                "cluster_exhaustion": serialize_for_metadata(self.cluster_exhaustion),
+                "liquidation_context": serialize_for_metadata(self.liquidation_context),
+            },
+            "metadata": serialize_for_metadata(self.metadata),
+        }
 
 
-class WhaleStrategyBase(
-    ContextAwareComponent,
-    NamedEntityMixin,
-    PrioritizedMixin,
-    ABC,
-):
+# =============================================================================
+# Base whales strategy
+# =============================================================================
+
+
+class WhalesTradingStrategy(TradingStrategy):
     """
-    Базовий клас для strategy/strategies/whales.
+    Base class for concrete strategy/strategies/whales/* classes.
 
-    Поточний тимчасовий scope:
-    - конкретні whale-стратегії ще можуть працювати як самодостатні evaluator-и;
-    - EventBus/Scheduler/config передаються всередину конкретних стратегій;
-    - register()/on_context_event() залишені для compatibility;
-    - пізніше publishing/filtering/final scoring буде винесено в StrategyEngine /
-      SignalProcessor.
+    Responsibilities:
+    - read whale analytics data from StrategyContext only;
+    - provide helpers for pressure/activity/cluster/liquidation payloads;
+    - validate scope/freshness/futures-only guards;
+    - build internal StrategySignal objects;
+    - attach whale metadata for SignalProcessor.
 
-    Що цей base робить зараз:
-    - DI через config/event_bus/scheduler/logger;
-    - EventBus subscription на strategy.context.whales;
-    - evaluate(context) dispatch;
-    - signal.generated / signal.rejected publishing;
-    - common whale payload resolving;
-    - scope validation: exchange / market_type / symbol / timeframe;
-    - freshness validation;
-    - futures-only market_type guard;
-    - common filters;
-    - shared scoring/market helpers.
-
-    Чого цей base НЕ має робити:
-    - не читати exchange adapters напряму;
-    - не читати raw market data напряму;
-    - не запускати власні uncontrolled asyncio loops;
-    - не містити analytics.whales detection logic;
-    - не дублювати whale analytics calculations.
+    Forbidden:
+    - no direct analytics.whales.* EventBus subscriptions;
+    - no local evaluator lifecycle;
+    - no direct signal.generated / signal.rejected publishing;
+    - no StrategyEvaluation as concrete strategy output;
+    - no RiskManager / Execution calls;
+    - no raw market data reads.
     """
 
-    DEFAULT_CONTEXT_TOPIC = DEFAULT_WHALE_CONTEXT_TOPIC
+    component_namespace = "strategy.whales"
+    category: StrategyCategory = StrategyCategory.WHALES
+    default_setup_type: SetupType = SetupType.UNKNOWN
+    default_timeframe: Timeframe = Timeframe.M1
+
+    feature_names = WHALES_FEATURES
 
     def __init__(
         self,
-        *,
         config: StrategyConfig,
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
-        event_config: WhaleStrategyEventConfig | None = None,
-        logger: LoggerLike | None = None,
-        strategy_name: str,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        whales_config: WhalesStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
-        self.strategy_name = strategy_name
-        self.event_bus: EventBus | None = event_bus
-        self.scheduler: Scheduler | None = scheduler
-        self.event_config = event_config or WhaleStrategyEventConfig()
-
-        self._logger: LoggerLike = logger or get_logger(
-            __name__,
-            event_type="strategy",
-            strategy_name=strategy_name,
-            category=StrategyCategory.WHALES.value,
-        )
+        self.whales_config = whales_config or WhalesStrategyConfig()
+        self.whales_config.validate()
 
         super().__init__(
             config=config,
             event_bus=event_bus,
-            logger=self._logger,
+            scheduler=scheduler,
+            definition=definition,
+            service_name=service_name,
         )
 
-        self._subscription: Any | None = None
-        self._healthcheck_job_id: str | None = None
-        self._last_validation_warnings: dict[str, float] = {}
+    def validate_config(self) -> None:
+        super().validate_config()
+        self.whales_config.validate()
 
-        self.validate_config()
+    # ------------------------------------------------------------------
+    # Context/domain access
+    # ------------------------------------------------------------------
 
-    # =========================================================================
-    # Required strategy contract
-    # =========================================================================
+    def whales_domain(self, context: StrategyContext) -> dict[str, Any]:
+        self.validate_context(context)
+        return whales_domain(context)
 
-    @property
-    def name(self) -> str:
-        return self.strategy_name
+    def whales_item(
+        self,
+        context: StrategyContext,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        self.validate_context(context)
+        return whales_item(context, key, default)
 
-    @property
-    def category(self) -> StrategyCategory:
-        return StrategyCategory.WHALES
+    def whales_path(
+        self,
+        context: StrategyContext,
+        path: str,
+        default: Any = None,
+    ) -> Any:
+        self.validate_context(context)
 
-    @property
-    def priority(self) -> int:
-        definition = self._strategy_definition
-        if definition is None:
-            return 100
-        return int(definition.priority)
+        if not isinstance(path, str) or not path.strip():
+            raise StrategyEvaluationError("whales path cannot be empty")
 
-    @property
-    def required_features(self) -> set[str]:
-        return set()
+        return whales_path(context, path, default)
 
-    @property
-    def _strategy_definition(self) -> Any | None:
-        return self.config.get_strategy(self.strategy_name)
+    def whales_float(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: float | None = None,
+    ) -> float | None:
+        return to_float(self.whales_path(context, path, default), default)
 
-    @property
-    def _runtime_config(self) -> Any:
-        definition = self._strategy_definition
-        if definition is not None:
-            return definition.runtime
-        return self.config.runtime
+    def whales_int(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: int | None = None,
+    ) -> int | None:
+        return to_int(self.whales_path(context, path, default), default)
 
-    @property
-    def _metadata(self) -> dict[str, Any]:
-        definition = self._strategy_definition
-        if definition is None:
-            return {}
-        return dict(definition.metadata)
+    def whales_score(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: float = 0.0,
+    ) -> float:
+        return unit_score(self.whales_path(context, path, default), default)
 
-    @abstractmethod
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        """
-        Основна sync-evaluation логіка конкретної whale-стратегії.
+    def whales_bool(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: bool = False,
+    ) -> bool:
+        return to_bool(self.whales_path(context, path, default), default)
 
-        Дочірній клас відповідає за:
-        - extraction domain inputs;
-        - setup detection;
-        - domain score/confidence;
-        - signal building;
-        - temporary local filters;
-        - temporary execution draft.
-        """
-        raise NotImplementedError
+    def whales_str(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: str | None = None,
+    ) -> str | None:
+        return to_str(self.whales_path(context, path, default), default)
 
-    # =========================================================================
-    # Event-driven lifecycle
-    # =========================================================================
+    def whales_datetime(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: datetime | None = None,
+    ) -> datetime | None:
+        return parse_datetime(self.whales_path(context, path, default))
 
-    def register(self) -> None:
-        """
-        Реєструє strategy evaluator в EventBus.
+    def whales_feature_snapshot(
+        self,
+        context: StrategyContext,
+        feature_name: str,
+    ) -> FeatureSnapshot | None:
+        self.validate_context(context)
 
-        Тимчасовий compatibility path:
-            strategy.context.whales -> evaluate(context) -> signal.generated/rejected
+        if not isinstance(feature_name, str) or not feature_name.strip():
+            raise StrategyEvaluationError("feature_name cannot be empty")
 
-        Пізніше цей шлях має перейти у StrategyEventHandler / StrategyEngine.
-        """
-        if self.event_bus is None:
-            self._logger.warning(
-                "Whale strategy register skipped: event_bus is not provided | strategy=%s",
-                self.strategy_name,
-            )
-            return
-
-        if not self.event_config.subscribe_enabled:
-            self._logger.info(
-                "Whale strategy subscription disabled | strategy=%s",
-                self.strategy_name,
-            )
-            return
-
-        if self._subscription is not None:
-            self._logger.debug(
-                "Whale strategy already registered | strategy=%s topic=%s",
-                self.strategy_name,
-                self.event_config.context_topic,
-            )
-            return
-
-        self._subscription = self.event_bus.subscribe(
-            self.event_config.context_topic,
-            self.on_context_event,
-            name=f"{self.strategy_name}.on_context_event",
-        )
-
-        self._register_scheduler_jobs()
-
-        self._logger.info(
-            "Whale strategy registered | strategy=%s topic=%s",
-            self.strategy_name,
-            self.event_config.context_topic,
-        )
-
-    async def stop(self) -> None:
-        """
-        Best-effort cleanup для тимчасового event-driven режиму.
-        """
-        self._remove_scheduler_job()
-        self._unsubscribe()
-
-        self._logger.info(
-            "Whale strategy stopped | strategy=%s",
-            self.strategy_name,
-        )
-
-    async def on_context_event(self, event: Event) -> None:
-        """
-        EventBus handler.
-
-        Не містить торгової логіки:
-        - дістає SignalContext;
-        - викликає evaluate();
-        - публікує результат.
-        """
-        context = self._extract_context_from_event(event)
-
-        if context is None:
-            await self._emit_evaluation_failed(
-                event=event,
-                error="Invalid event payload: SignalContext is missing",
-            )
-            return
-
-        try:
-            evaluation = self.evaluate(context)
-        except Exception as exc:
-            self._logger.exception(
-                "Whale strategy evaluation failed | strategy=%s symbol=%s event_id=%s",
-                self.strategy_name,
-                getattr(context, "symbol", None),
-                getattr(event, "event_id", None),
-            )
-
-            await self._emit_evaluation_failed(
-                event=event,
-                error=str(exc),
-                context=context,
-            )
-            return
-
-        await self._publish_evaluation_result(
-            evaluation=evaluation,
-            source_event=event,
-        )
-
-    def _extract_context_from_event(self, event: Event) -> SignalContext | None:
-        payload = event.payload
-
-        if isinstance(payload, SignalContext):
-            return payload
-
-        if isinstance(payload, Mapping):
-            context = payload.get("context")
-            if isinstance(context, SignalContext):
-                return context
+        features_map = getattr(context, "features", None)
+        if isinstance(features_map, Mapping):
+            raw = features_map.get(feature_name)
+            if isinstance(raw, FeatureSnapshot):
+                return raw
 
         return None
 
-    def _register_scheduler_jobs(self) -> None:
-        """
-        Реєструє periodic jobs тільки через core.scheduler.Scheduler.
-
-        За замовчуванням healthcheck вимкнений, бо strategy evaluator зазвичай
-        не потребує background задач.
-        """
-        if self.scheduler is None:
-            return
-
-        if not self.event_config.scheduler_healthcheck_enabled:
-            return
-
-        job_name = f"{self.strategy_name}.healthcheck"
-
-        existing = self.scheduler.get_job_by_name(job_name)
-        if existing is not None:
-            self._healthcheck_job_id = existing.job_id
-            return
-
-        self._healthcheck_job_id = self.scheduler.add_interval_job(
-            name=job_name,
-            func=self._scheduler_healthcheck,
-            interval=self.event_config.scheduler_healthcheck_interval,
-            run_immediately=False,
-            max_retries=1,
-            retry_delay=1.0,
-            timeout=5.0,
-            allow_overlap=False,
-            enabled=True,
-        )
-
-        self._logger.info(
-            "Whale strategy healthcheck job registered | strategy=%s job_id=%s",
-            self.strategy_name,
-            self._healthcheck_job_id,
-        )
-
-    def _remove_scheduler_job(self) -> None:
-        if self.scheduler is None or self._healthcheck_job_id is None:
-            return
-
-        try:
-            self.scheduler.remove_job(self._healthcheck_job_id)
-        except Exception:
-            self._logger.debug(
-                "Failed to remove whale strategy scheduler job | strategy=%s job_id=%s",
-                self.strategy_name,
-                self._healthcheck_job_id,
-                exc_info=True,
-            )
-        finally:
-            self._healthcheck_job_id = None
-
-    def _unsubscribe(self) -> None:
-        if self._subscription is None:
-            return
-
-        try:
-            if hasattr(self._subscription, "unsubscribe"):
-                self._subscription.unsubscribe()
-            elif self.event_bus is not None and hasattr(self.event_bus, "unsubscribe"):
-                self.event_bus.unsubscribe(self._subscription)
-        except Exception:
-            self._logger.debug(
-                "Failed to unsubscribe whale strategy | strategy=%s",
-                self.strategy_name,
-                exc_info=True,
-            )
-        finally:
-            self._subscription = None
-
-    async def _scheduler_healthcheck(self) -> None:
-        """
-        Легкий healthcheck для scheduler.
-
-        Не запускає торгову логіку.
-        Не polling-ить ринок.
-        Не дублює StrategyEngine.
-        """
-        if self.event_bus is None:
-            return
-
-        await self.event_bus.emit(
-            "system.strategy.healthcheck",
-            {
-                "strategy_name": self.strategy_name,
-                "category": self.category.value,
-                "registered": self._subscription is not None,
-                "required_features": sorted(self.required_features),
-                "event_config": {
-                    "validate_scope_enabled": self.event_config.validate_scope_enabled,
-                    "validate_freshness_enabled": self.event_config.validate_freshness_enabled,
-                    "validate_futures_market_type_enabled": (
-                        self.event_config.validate_futures_market_type_enabled
-                    ),
-                    "strict_timeframe_scope": self.event_config.strict_timeframe_scope,
-                    "whale_feature_max_age_ms": self.event_config.whale_feature_max_age_ms,
-                },
-            },
-            source=self.strategy_name,
-        )
-
-    # =========================================================================
-    # Event publishing
-    # =========================================================================
-
-    async def _publish_evaluation_result(
+    def whales_feature_age_seconds(
         self,
-        *,
-        evaluation: StrategyEvaluation,
-        source_event: Event,
-    ) -> None:
-        if self.event_bus is None:
-            return
+        context: StrategyContext,
+        feature_name: str,
+    ) -> float | None:
+        snapshot = self.whales_feature_snapshot(context, feature_name)
+        if snapshot is None:
+            return None
+        return snapshot.age_seconds(context.timestamp)
 
-        if self.event_config.publish_evaluations:
-            await self.event_bus.emit(
-                self.event_config.evaluation_completed_topic,
-                self._evaluation_to_event_payload(evaluation),
-                priority=EventPriority.NORMAL,
-                source=self.strategy_name,
-                correlation_id=source_event.correlation_id,
-                headers=self._build_child_headers(source_event),
-            )
-
-        if evaluation.passed and evaluation.signal is not None:
-            if self.event_config.publish_generated_signals:
-                await self.event_bus.emit(
-                    self.event_config.generated_signal_topic,
-                    self._signal_to_event_payload(evaluation.signal),
-                    priority=self._event_priority_from_signal(evaluation.signal),
-                    source=self.strategy_name,
-                    correlation_id=source_event.correlation_id,
-                    headers=self._build_child_headers(source_event),
-                )
-            return
-
-        if self.event_config.publish_rejected_signals:
-            await self.event_bus.emit(
-                self.event_config.rejected_signal_topic,
-                self._evaluation_to_event_payload(evaluation),
-                priority=EventPriority.LOW,
-                source=self.strategy_name,
-                correlation_id=source_event.correlation_id,
-                headers=self._build_child_headers(source_event),
-            )
-
-    async def _emit_evaluation_failed(
+    def whales_feature_is_stale(
         self,
-        *,
-        event: Event,
-        error: str,
-        context: SignalContext | None = None,
-    ) -> None:
-        if self.event_bus is None or not self.event_config.publish_failures:
-            return
+        context: StrategyContext,
+        feature_name: str,
+    ) -> bool:
+        max_age = self.whales_config.stale_feature_max_age_seconds
+        if max_age is None:
+            return False
 
-        payload: dict[str, Any] = {
-            "strategy_name": self.strategy_name,
-            "category": self.category.value,
-            "error": error,
-            "source_event_id": event.event_id,
-            "source_topic": event.topic,
-        }
+        age = self.whales_feature_age_seconds(context, feature_name)
+        if age is None:
+            return False
 
-        if context is not None:
-            payload.update(
-                {
-                    "symbol": context.symbol,
-                    "timeframe": str(context.timeframe),
-                    "timestamp": context.timestamp,
-                }
-            )
+        return age > max_age
 
-        await self.event_bus.emit(
-            self.event_config.evaluation_failed_topic,
-            payload,
-            priority=EventPriority.HIGH,
-            source=self.strategy_name,
-            correlation_id=event.correlation_id,
-            headers=self._build_child_headers(event),
+    def has_any_whales_data(
+        self,
+        context: StrategyContext,
+        feature_names: tuple[str, ...] = (),
+    ) -> bool:
+        self.validate_context(context)
+
+        if self.whales_domain(context):
+            return True
+
+        return any(context.has_feature(name) for name in feature_names)
+
+    def has_stale_whales_features(
+        self,
+        context: StrategyContext,
+        feature_names: tuple[str, ...] | None = None,
+    ) -> bool:
+        names = feature_names or tuple(self.required_features())
+
+        return any(
+            self.whales_feature_is_stale(context, feature_name)
+            for feature_name in names
         )
 
-    def _build_child_headers(self, event: Event) -> dict[str, Any]:
-        headers = dict(event.headers)
-        headers.update(
-            {
-                "parent_event_id": event.event_id,
-                "parent_topic": event.topic,
-                "strategy_name": self.strategy_name,
-                "strategy_category": self.category.value,
-            }
-        )
-        return headers
+    # ------------------------------------------------------------------
+    # Scope
+    # ------------------------------------------------------------------
 
-    def _signal_to_event_payload(self, signal: StrategySignal) -> dict[str, Any]:
-        if hasattr(signal, "to_event") and callable(signal.to_event):
-            result = signal.to_event()
-            if isinstance(result, dict):
-                return result
+    def whales_scope(self, context: StrategyContext) -> WhalesStrategyScope:
+        domain = self.whales_domain(context)
 
-        if hasattr(signal, "to_dict") and callable(signal.to_dict):
-            result = signal.to_dict()
-            if isinstance(result, dict):
-                return result
-
-        return {
-            "symbol": signal.symbol,
-            "side": signal.side.value if hasattr(signal.side, "value") else str(signal.side),
-            "strategy_name": signal.strategy_name,
-            "category": (
-                signal.category.value
-                if hasattr(signal.category, "value")
-                else str(signal.category)
-            ),
-            "timeframe": str(signal.timeframe),
-            "timestamp": signal.timestamp,
-            "confidence": signal.confidence,
-            "score": signal.score,
-            "priority": (
-                signal.priority.value
-                if hasattr(signal.priority, "value")
-                else str(signal.priority)
-            ),
-            "metadata": dict(signal.metadata),
-            "reasons": list(signal.reasons),
-            "confirmations": list(signal.confirmations),
-            "source_features": list(signal.source_features),
-        }
-
-    def _evaluation_to_event_payload(self, evaluation: StrategyEvaluation) -> dict[str, Any]:
-        if hasattr(evaluation, "to_event") and callable(evaluation.to_event):
-            result = evaluation.to_event()
-            if isinstance(result, dict):
-                return result
-
-        if hasattr(evaluation, "to_dict") and callable(evaluation.to_dict):
-            result = evaluation.to_dict()
-            if isinstance(result, dict):
-                return result
-
-        return {
-            "strategy_name": evaluation.strategy_name,
-            "symbol": evaluation.symbol,
-            "timestamp": evaluation.timestamp,
-            "passed": evaluation.passed,
-            "score": evaluation.score,
-            "confidence": evaluation.confidence,
-            "reasons": list(evaluation.reasons),
-            "signal": (
-                self._signal_to_event_payload(evaluation.signal)
-                if evaluation.signal is not None
-                else None
-            ),
-        }
-
-    def _event_priority_from_signal(self, signal: StrategySignal) -> EventPriority:
-        priority = signal.priority
-
-        if priority == SignalPriority.CRITICAL:
-            return EventPriority.CRITICAL
-        if priority == SignalPriority.HIGH:
-            return EventPriority.HIGH
-        if priority == SignalPriority.MEDIUM:
-            return EventPriority.NORMAL
-        return EventPriority.LOW
-
-    # =========================================================================
-    # Whale input snapshot helpers
-    # =========================================================================
-
-    def build_whale_input_snapshot(
-        self,
-        context: SignalContext,
-        *,
-        feature_specs: Mapping[str, tuple[str, ...]],
-    ) -> WhaleStrategyInputSnapshot:
-        """
-        Створює normalized whale input snapshot для конкретної стратегії.
-
-        feature_specs example:
-            {
-                "pressure": (
-                    "whale_pressure",
-                    "whale_pressure_signal",
-                    "analytics.whales.whale_pressure",
-                ),
-                ...
-            }
-        """
-        snapshot = WhaleStrategyInputSnapshot(
-            strategy_name=self.strategy_name,
-            symbol=str(context.symbol),
-            timestamp_ms=self._context_timestamp_ms(context),
+        candidate = (
+            self.whales_item(context, "pressure")
+            or self.whales_item(context, "activity")
+            or self.whales_item(context, "large_trade")
+            or self.whales_item(context, "cluster")
+            or self.whales_item(context, "liquidation_context")
+            or domain
         )
 
-        for canonical_name, aliases in feature_specs.items():
-            snapshot.features[canonical_name] = self._resolve_whale_feature(
-                context,
-                canonical_name=canonical_name,
-                names=aliases,
-            )
+        symbol = (
+            extract_symbol(candidate)
+            or normalize_symbol(context.symbol)
+        )
+        exchange = (
+            extract_exchange(candidate)
+            or normalize_exchange(context.metadata.get("exchange"))
+            or "unknown"
+        )
+        market_type = (
+            extract_market_type(candidate)
+            or normalize_market_type(context.metadata.get("market_type"))
+            or self.whales_config.default_market_type.value
+        )
+        timeframe_value = (
+            extract_timeframe(candidate, "")
+            or str(getattr(context.timeframe, "value", context.timeframe) or Timeframe.M1.value)
+        )
 
-        return snapshot
+        return WhalesStrategyScope(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe_value,
+            exchange_symbol=extract_exchange_symbol(candidate) or symbol,
+        )
 
-    def _resolve_payload(
+    # ------------------------------------------------------------------
+    # Payload resolution
+    # ------------------------------------------------------------------
+
+    def resolve_whale_snapshot(
         self,
-        context: SignalContext,
-        *,
-        names: tuple[str, ...],
-    ) -> dict[str, Any]:
-        """
-        Backward-compatible helper для наявних конкретних стратегій.
+        context: StrategyContext,
+    ) -> WhaleCompositeSnapshot | None:
+        self.validate_context(context)
 
-        Старі WhaleAbsorptionStrategy / WhaleBreakoutStrategy очікують dict.
-        Тепер цей dict уже проходить:
-        - object -> dict conversion;
-        - optional scope validation;
-        - optional freshness validation;
-        - optional futures market type guard.
-        """
-        feature = self._resolve_whale_feature(
+        scope = self.whales_scope(context)
+
+        pressure = self._resolve_feature_payload(
             context,
-            canonical_name=names[0] if names else "unknown",
-            names=names,
+            key="pressure",
+            feature_name=WHALES_FEATURES.PRESSURE,
+            extractor=extract_whale_pressure_payload,
+        )
+        activity = self._resolve_feature_payload(
+            context,
+            key="activity",
+            feature_name=WHALES_FEATURES.ACTIVITY,
+            extractor=extract_whale_activity_payload,
+        )
+        large_trade = self._resolve_feature_payload(
+            context,
+            key="large_trade",
+            feature_name=WHALES_FEATURES.LARGE_TRADE,
+            extractor=extract_large_trade_payload,
+        )
+        cluster = self._resolve_feature_payload(
+            context,
+            key="cluster",
+            feature_name=WHALES_FEATURES.CLUSTER,
+            extractor=extract_whale_cluster_payload,
+        )
+        cluster_update = self._resolve_feature_payload(
+            context,
+            key="cluster_update",
+            feature_name=WHALES_FEATURES.CLUSTER_UPDATE,
+            extractor=extract_whale_cluster_update_payload,
+        )
+        cluster_exhaustion = self._resolve_feature_payload(
+            context,
+            key="cluster_exhaustion",
+            feature_name=WHALES_FEATURES.CLUSTER_EXHAUSTION,
+            extractor=extract_whale_cluster_exhaustion_payload,
+        )
+        liquidation_context = self._resolve_feature_payload(
+            context,
+            key="liquidation_context",
+            feature_name=WHALES_FEATURES.LIQUIDATION_CONTEXT,
+            extractor=extract_whale_liquidation_context_payload,
         )
 
-        if not feature.present:
-            return {}
+        payloads = {
+            "pressure": pressure.payload,
+            "activity": activity.payload,
+            "large_trade": large_trade.payload,
+            "cluster": cluster.payload,
+            "cluster_update": cluster_update.payload,
+            "cluster_exhaustion": cluster_exhaustion.payload,
+            "liquidation_context": liquidation_context.payload,
+        }
 
-        if not feature.valid and self.event_config.drop_invalid_payloads:
-            self._log_payload_validation_warning(feature)
-            return {}
-
-        return feature.to_dict()
-
-    def _resolve_whale_feature(
-        self,
-        context: SignalContext,
-        *,
-        canonical_name: str,
-        names: tuple[str, ...],
-    ) -> WhaleFeaturePayload:
-        if not names:
-            return WhaleFeaturePayload(
-                canonical_name=canonical_name,
-                aliases=(),
-                payload={},
-                validation=WhalePayloadValidation(
-                    valid=False,
-                    present=False,
-                    reasons=["No aliases provided"],
-                ),
-            )
-
-        candidates = self._iter_feature_candidates(context, names)
-
-        for source_name, source_location, raw_value in candidates:
-            payload = self._object_to_dict(raw_value)
-            if not payload:
-                continue
-
-            validation = self._validate_whale_payload(
+        if not any(payloads.values()):
+            feature_snapshot = self._build_snapshot_from_features(
                 context=context,
-                payload=payload,
-                source_name=source_name,
-                source_location=source_location,
+                scope=scope,
             )
+            if feature_snapshot is not None and feature_snapshot.has_minimum_data():
+                return feature_snapshot
+            return None
 
-            feature = WhaleFeaturePayload(
-                canonical_name=canonical_name,
-                aliases=names,
-                payload=payload,
-                source_name=source_name,
-                source_location=source_location,
+        metadata: dict[str, Any] = {}
+        for payload in payloads.values():
+            metadata.update(extract_metadata(payload))
+
+        timestamp = self._resolve_snapshot_timestamp(
+            context=context,
+            payloads=payloads,
+            fallback=context.timestamp,
+        )
+
+        snapshot = WhaleCompositeSnapshot(
+            symbol=self._first_non_empty_symbol(payloads, scope.symbol),
+            exchange=self._first_non_empty_exchange(payloads, scope.exchange),
+            market_type=self._first_non_empty_market_type(payloads, scope.market_type),
+            timeframe=self._first_non_empty_timeframe(payloads, scope.timeframe),
+            exchange_symbol=self._first_non_empty_exchange_symbol(
+                payloads,
+                scope.exchange_symbol,
+            ),
+            pressure=pressure.payload,
+            activity=activity.payload,
+            large_trade=large_trade.payload,
+            cluster=cluster.payload,
+            cluster_update=cluster_update.payload,
+            cluster_exhaustion=cluster_exhaustion.payload,
+            liquidation_context=liquidation_context.payload,
+            dominant_side=self._resolve_dominant_side(payloads),
+            whale_side=self._resolve_whale_side(payloads),
+            liquidation_side=self._resolve_liquidation_side(payloads),
+            exhausted_side=resolve_exhausted_side(payloads),
+            cluster_side=resolve_cluster_side(payloads),
+            imbalance_ratio=extract_imbalance_ratio(pressure.payload),
+            pressure_score=extract_pressure_score(pressure.payload),
+            context_strength=extract_context_strength(liquidation_context.payload),
+            cluster_score=resolve_cluster_score(payloads),
+            continuation_probability=resolve_continuation_probability(payloads),
+            exhaustion_probability=resolve_exhaustion_probability(payloads),
+            total_notional=self._resolve_total_notional(payloads),
+            liquidation_notional=extract_liquidation_notional(
+                liquidation_context.payload
+            ),
+            trade_count=self._resolve_trade_count(payloads),
+            large_trade_notional=extract_large_trade_notional(large_trade.payload),
+            large_trade_zscore=extract_large_trade_zscore(large_trade.payload),
+            reference_price=self._resolve_reference_price(payloads),
+            confidence=self._resolve_confidence(payloads),
+            timestamp=timestamp,
+            source="context.domain",
+            feature_validations={
+                "pressure": pressure.validation,
+                "activity": activity.validation,
+                "large_trade": large_trade.validation,
+                "cluster": cluster.validation,
+                "cluster_update": cluster_update.validation,
+                "cluster_exhaustion": cluster_exhaustion.validation,
+                "liquidation_context": liquidation_context.validation,
+            },
+            metadata={
+                **metadata,
+                "scope": scope.to_dict(),
+                "source": "context.domain",
+            },
+        )
+
+        if snapshot.has_minimum_data():
+            return snapshot
+
+        return None
+
+    def accepts_whale_snapshot(
+        self,
+        snapshot: WhaleCompositeSnapshot,
+        *,
+        require_futures_market_type: bool | None = None,
+        min_confidence: float | None = None,
+    ) -> bool:
+        if not snapshot.has_minimum_data():
+            return False
+
+        require_futures = (
+            self.whales_config.require_futures_market_type
+            if require_futures_market_type is None
+            else require_futures_market_type
+        )
+        if require_futures and not snapshot.is_futures:
+            return False
+
+        if snapshot.market_type != "unknown":
+            if snapshot.market_type not in {
+                normalize_market_type(item)
+                for item in self.whales_config.allowed_market_types
+            }:
+                return False
+
+        confidence_threshold = (
+            self.whales_config.min_confidence
+            if min_confidence is None
+            else min_confidence
+        )
+        if snapshot.confidence < confidence_threshold:
+            return False
+
+        return True
+
+    def _resolve_feature_payload(
+        self,
+        context: StrategyContext,
+        *,
+        key: str,
+        feature_name: str,
+        extractor: Any,
+    ) -> WhaleFeaturePayload:
+        candidate = (
+            self.whales_item(context, key)
+            or self.whales_path(context, key, None)
+            or self._feature_value(context, feature_name)
+        )
+
+        payload = extractor(candidate) if candidate is not None else {}
+        event_time = extract_event_time(payload)
+
+        validation_reason = whale_payload_validation_reason(
+            payload,
+            context=context,
+            require_futures_market_type=self.whales_config.require_futures_market_type,
+            validate_scope=self.whales_config.validate_scope,
+            strict_timeframe=self.whales_config.strict_timeframe_scope,
+            stale_after_seconds=self.whales_config.stale_feature_max_age_seconds,
+            now=context.timestamp,
+        )
+
+        validation = (
+            WhalePayloadValidation.ok(
+                payload_age_seconds=self._payload_age_seconds(
+                    event_time=event_time,
+                    now=context.timestamp,
+                ),
+                source=feature_name,
+            )
+            if validation_reason is None
+            else WhalePayloadValidation.failed(
+                validation_reason,
+                payload_age_seconds=self._payload_age_seconds(
+                    event_time=event_time,
+                    now=context.timestamp,
+                ),
+                source=feature_name,
+            )
+        )
+
+        if validation_reason is not None:
+            return WhaleFeaturePayload(
+                name=feature_name,
+                payload={},
+                event_time=event_time,
                 validation=validation,
             )
 
-            if validation.valid or not self.event_config.drop_invalid_payloads:
-                return feature
-
-            self._log_payload_validation_warning(feature)
-
         return WhaleFeaturePayload(
-            canonical_name=canonical_name,
-            aliases=names,
-            payload={},
-            validation=WhalePayloadValidation(
-                valid=False,
-                present=False,
-                reasons=["Feature payload not found"],
-            ),
+            name=feature_name,
+            payload=payload,
+            event_time=event_time,
+            validation=validation,
         )
 
-    def _iter_feature_candidates(
-        self,
-        context: SignalContext,
-        names: tuple[str, ...],
-    ) -> list[tuple[str, str, Any]]:
-        candidates: list[tuple[str, str, Any]] = []
-
-        whales = getattr(context, "whales", None)
-        if isinstance(whales, Mapping):
-            for name in names:
-                if name in whales:
-                    candidates.append((name, "context.whales", whales[name]))
-
-        for name in names:
-            try:
-                feature_value = context.get_feature(name)
-            except Exception:
-                feature_value = None
-
-            if feature_value is not None:
-                candidates.append((name, "context.feature_map", feature_value))
-
-            try:
-                snapshot = context.get_feature_snapshot(name)
-            except Exception:
-                snapshot = None
-
-            if snapshot is not None:
-                candidates.append((name, "context.feature_snapshot", snapshot.value))
-
-        return candidates
-
-    def _validate_whale_payload(
+    def _build_snapshot_from_features(
         self,
         *,
-        context: SignalContext,
-        payload: Mapping[str, Any],
-        source_name: str,
-        source_location: str,
-    ) -> WhalePayloadValidation:
-        validation = WhalePayloadValidation(
-            valid=True,
-            present=bool(payload),
-        )
-
-        if not payload:
-            validation.valid = False
-            validation.present = False
-            validation.add_reason("Payload is empty")
-            return validation
-
-        scope = self._extract_payload_scope(payload)
-
-        if self.event_config.require_payload_scope:
-            required_scope_fields = ("symbol", "market_type")
-            missing = [
-                field_name
-                for field_name in required_scope_fields
-                if not scope.get(field_name)
-            ]
-
-            if missing:
-                validation.scope_valid = False
-                validation.add_reason(
-                    f"Payload scope is missing required fields: {', '.join(missing)}"
-                )
-
-        if self.event_config.validate_scope_enabled:
-            scope_valid, scope_reason = self._is_payload_scope_valid(
-                context=context,
-                payload_scope=scope,
-            )
-            validation.scope_valid = scope_valid
-            if not scope_valid:
-                validation.add_reason(scope_reason)
-
-        if self.event_config.validate_freshness_enabled:
-            fresh, freshness_reason = self._is_payload_fresh(
-                context=context,
-                payload=payload,
-            )
-            validation.fresh = fresh
-            if not fresh:
-                validation.add_reason(freshness_reason)
-
-        if self.event_config.validate_futures_market_type_enabled:
-            futures_valid, futures_reason = self._is_futures_market_type_payload(
-                context=context,
-                payload_scope=scope,
-            )
-            validation.futures_market_type_valid = futures_valid
-            if not futures_valid:
-                validation.add_reason(futures_reason)
-
-        validation.valid = (
-            validation.present
-            and validation.scope_valid
-            and validation.fresh
-            and validation.futures_market_type_valid
-        )
-
-        if not validation.valid:
-            validation.add_reason(
-                f"Invalid whale payload source={source_location}.{source_name}"
-            )
-
-        return validation
-
-    def _extract_payload_scope(self, payload: Mapping[str, Any]) -> dict[str, str | None]:
-        nested_scope = payload.get("scope")
-        scope_mapping = nested_scope if isinstance(nested_scope, Mapping) else {}
-
-        exchange = payload.get("exchange", scope_mapping.get("exchange"))
-        market_type = payload.get("market_type", scope_mapping.get("market_type"))
-        symbol = payload.get("symbol", scope_mapping.get("symbol"))
-        timeframe = payload.get("timeframe", scope_mapping.get("timeframe"))
-        exchange_symbol = payload.get(
-            "exchange_symbol",
-            scope_mapping.get("exchange_symbol"),
-        )
-
-        return {
-            "exchange": self._normalize_exchange(exchange),
-            "market_type": self._normalize_market_type(market_type),
-            "symbol": self._normalize_symbol_or_none(symbol),
-            "timeframe": self._normalize_timeframe(timeframe),
-            "exchange_symbol": (
-                str(exchange_symbol).strip()
-                if exchange_symbol is not None and str(exchange_symbol).strip()
-                else None
+        context: StrategyContext,
+        scope: WhalesStrategyScope,
+    ) -> WhaleCompositeSnapshot | None:
+        payload = {
+            "symbol": self._feature_value(context, WHALES_FEATURES.SYMBOL),
+            "exchange": self._feature_value(context, WHALES_FEATURES.EXCHANGE),
+            "market_type": self._feature_value(context, WHALES_FEATURES.MARKET_TYPE),
+            "timeframe": self._feature_value(context, WHALES_FEATURES.TIMEFRAME),
+            "exchange_symbol": self._feature_value(
+                context,
+                WHALES_FEATURES.EXCHANGE_SYMBOL,
             ),
+            "dominant_side": self._feature_value(
+                context,
+                WHALES_FEATURES.DOMINANT_SIDE,
+            ),
+            "whale_side": self._feature_value(context, WHALES_FEATURES.WHALE_SIDE),
+            "liquidation_side": self._feature_value(
+                context,
+                WHALES_FEATURES.LIQUIDATION_SIDE,
+            ),
+            "exhausted_side": self._feature_value(
+                context,
+                WHALES_FEATURES.EXHAUSTED_SIDE,
+            ),
+            "cluster_side": self._feature_value(
+                context,
+                WHALES_FEATURES.CLUSTER_SIDE,
+            ),
+            "imbalance_ratio": self._feature_value(
+                context,
+                WHALES_FEATURES.IMBALANCE_RATIO,
+            ),
+            "pressure_score": self._feature_value(
+                context,
+                WHALES_FEATURES.PRESSURE_SCORE,
+            ),
+            "context_strength": self._feature_value(
+                context,
+                WHALES_FEATURES.CONTEXT_STRENGTH,
+            ),
+            "cluster_score": self._feature_value(
+                context,
+                WHALES_FEATURES.CLUSTER_SCORE,
+            ),
+            "continuation_probability": self._feature_value(
+                context,
+                WHALES_FEATURES.CONTINUATION_PROBABILITY,
+            ),
+            "exhaustion_probability": self._feature_value(
+                context,
+                WHALES_FEATURES.EXHAUSTION_PROBABILITY,
+            ),
+            "total_notional": self._feature_value(
+                context,
+                WHALES_FEATURES.TOTAL_NOTIONAL,
+            ),
+            "liquidation_notional": self._feature_value(
+                context,
+                WHALES_FEATURES.LIQUIDATION_NOTIONAL,
+            ),
+            "trade_count": self._feature_value(context, WHALES_FEATURES.TRADE_COUNT),
+            "large_trade_notional": self._feature_value(
+                context,
+                WHALES_FEATURES.LARGE_TRADE_NOTIONAL,
+            ),
+            "large_trade_zscore": self._feature_value(
+                context,
+                WHALES_FEATURES.LARGE_TRADE_ZSCORE,
+            ),
+            "reference_price": self._feature_value(
+                context,
+                WHALES_FEATURES.REFERENCE_PRICE,
+            ),
+            "confidence": self._feature_value(context, WHALES_FEATURES.CONFIDENCE),
+            "timestamp": self._feature_value(context, WHALES_FEATURES.TIMESTAMP),
+            "metadata": self._feature_value(context, WHALES_FEATURES.METADATA),
         }
 
-    def _is_payload_scope_valid(
-        self,
-        *,
-        context: SignalContext,
-        payload_scope: Mapping[str, str | None],
-    ) -> tuple[bool, str]:
-        context_scope = self._extract_context_scope(context)
+        if not self._has_any_value(payload):
+            return None
 
-        # Symbol mismatch is the most dangerous. If payload has symbol, it must
-        # match context.symbol.
-        payload_symbol = payload_scope.get("symbol")
-        context_symbol = context_scope.get("symbol")
-        if payload_symbol and context_symbol and payload_symbol != context_symbol:
-            return (
-                False,
-                f"Whale payload symbol mismatch: payload={payload_symbol} context={context_symbol}",
-            )
+        snapshot = WhaleCompositeSnapshot(
+            symbol=extract_symbol(payload) or scope.symbol,
+            exchange=extract_exchange(payload) or scope.exchange,
+            market_type=extract_market_type(payload) or scope.market_type,
+            timeframe=extract_timeframe(payload, scope.timeframe),
+            exchange_symbol=extract_exchange_symbol(payload) or scope.exchange_symbol,
+            pressure={},
+            activity={},
+            large_trade={},
+            cluster={},
+            cluster_update={},
+            cluster_exhaustion={},
+            liquidation_context={},
+            dominant_side=extract_dominant_side(payload),
+            whale_side=extract_whale_side(payload),
+            liquidation_side=extract_liquidation_side(payload),
+            exhausted_side=extract_exhausted_side(payload),
+            cluster_side=extract_cluster_side(payload),
+            imbalance_ratio=to_float(payload.get("imbalance_ratio"), 0.0) or 0.0,
+            pressure_score=to_float(payload.get("pressure_score"), 0.0) or 0.0,
+            context_strength=to_float(payload.get("context_strength"), 0.0) or 0.0,
+            cluster_score=to_float(payload.get("cluster_score"), None),
+            continuation_probability=to_float(
+                payload.get("continuation_probability"),
+                None,
+            ),
+            exhaustion_probability=to_float(
+                payload.get("exhaustion_probability"),
+                None,
+            ),
+            total_notional=to_float(payload.get("total_notional"), 0.0) or 0.0,
+            liquidation_notional=to_float(
+                payload.get("liquidation_notional"),
+                0.0,
+            ) or 0.0,
+            trade_count=to_int(payload.get("trade_count"), 0) or 0,
+            large_trade_notional=to_float(
+                payload.get("large_trade_notional"),
+                0.0,
+            ) or 0.0,
+            large_trade_zscore=to_float(payload.get("large_trade_zscore"), None),
+            reference_price=to_float(payload.get("reference_price"), None),
+            confidence=to_float(payload.get("confidence"), 0.0) or 0.0,
+            timestamp=parse_datetime(payload.get("timestamp")) or context.timestamp,
+            source="context.features",
+            metadata={
+                **as_dict(payload.get("metadata")),
+                "scope": scope.to_dict(),
+                "source": "context.features",
+            },
+        )
 
-        payload_exchange = payload_scope.get("exchange")
-        context_exchange = context_scope.get("exchange")
-        if payload_exchange and context_exchange and payload_exchange != context_exchange:
-            return (
-                False,
-                f"Whale payload exchange mismatch: payload={payload_exchange} context={context_exchange}",
-            )
-
-        payload_market_type = payload_scope.get("market_type")
-        context_market_type = context_scope.get("market_type")
-        if (
-            payload_market_type
-            and context_market_type
-            and payload_market_type != context_market_type
-        ):
-            return (
-                False,
-                "Whale payload market_type mismatch: "
-                f"payload={payload_market_type} context={context_market_type}",
-            )
-
-        if self.event_config.strict_timeframe_scope:
-            payload_timeframe = payload_scope.get("timeframe")
-            context_timeframe = context_scope.get("timeframe")
-            if payload_timeframe and context_timeframe and payload_timeframe != context_timeframe:
-                return (
-                    False,
-                    "Whale payload timeframe mismatch: "
-                    f"payload={payload_timeframe} context={context_timeframe}",
-                )
-
-        return True, "Scope valid"
-
-    def _is_payload_fresh(
-        self,
-        *,
-        context: SignalContext,
-        payload: Mapping[str, Any],
-    ) -> tuple[bool, str]:
-        payload_ts_ms = self._payload_timestamp_ms(payload)
-        context_ts_ms = self._context_timestamp_ms(context)
-
-        if payload_ts_ms is None or context_ts_ms is None:
-            return True, "Freshness skipped: timestamp unavailable"
-
-        age_ms = max(0, context_ts_ms - payload_ts_ms)
-        max_age_ms = max(1, int(self.event_config.whale_feature_max_age_ms))
-
-        if age_ms > max_age_ms:
-            return (
-                False,
-                f"Whale payload stale: age_ms={age_ms} max_age_ms={max_age_ms}",
-            )
-
-        return True, "Freshness valid"
-
-    def _is_futures_market_type_payload(
-        self,
-        *,
-        context: SignalContext,
-        payload_scope: Mapping[str, str | None],
-    ) -> tuple[bool, str]:
-        market_type = payload_scope.get("market_type")
-
-        if not market_type:
-            context_scope = self._extract_context_scope(context)
-            market_type = context_scope.get("market_type")
-
-        if not market_type:
-            return True, "Futures market_type guard skipped: market_type unavailable"
-
-        if market_type not in FUTURES_MARKET_TYPES:
-            return (
-                False,
-                f"Non-futures whale payload market_type={market_type}",
-            )
-
-        return True, "Futures market_type valid"
-
-    def _extract_context_scope(self, context: SignalContext) -> dict[str, str | None]:
-        exchange = self._context_value(context, "exchange")
-        market_type = self._context_value(context, "market_type")
-        timeframe = self._context_value(context, "timeframe")
-        symbol = getattr(context, "symbol", None)
-
-        return {
-            "exchange": self._normalize_exchange(exchange),
-            "market_type": self._normalize_market_type(market_type),
-            "symbol": self._normalize_symbol_or_none(symbol),
-            "timeframe": self._normalize_timeframe(timeframe),
-        }
-
-    def _context_value(self, context: SignalContext, name: str) -> Any:
-        if hasattr(context, name):
-            value = getattr(context, name)
-            if value is not None:
-                return value
-
-        try:
-            value = context.get_feature(name)
-            if value is not None:
-                return value
-        except Exception:
-            pass
-
-        try:
-            snapshot = context.get_feature_snapshot(name)
-            if snapshot is not None:
-                return snapshot.value
-        except Exception:
-            pass
-
-        metadata = getattr(context, "metadata", None)
-        if isinstance(metadata, Mapping):
-            value = metadata.get(name)
-            if value is not None:
-                return value
+        if snapshot.has_minimum_data():
+            return snapshot
 
         return None
 
-    def _log_payload_validation_warning(self, feature: WhaleFeaturePayload) -> None:
-        if feature.validation.valid:
-            return
+    # ------------------------------------------------------------------
+    # Signal builder
+    # ------------------------------------------------------------------
 
-        reason_key = "|".join(feature.validation.reasons) or feature.canonical_name
-        now = time.monotonic()
-        last_logged = self._last_validation_warnings.get(reason_key, 0.0)
+    def build_whale_signal(
+        self,
+        *,
+        context: StrategyContext,
+        side: SignalSide,
+        confidence: float,
+        score: float,
+        setup_type: SetupType | None = None,
+        reasons: list[str] | None = None,
+        confirmations: list[str] | None = None,
+        source_features: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        priority: SignalPriority = SignalPriority.MEDIUM,
+        trigger_type: TriggerType = TriggerType.PRIMARY,
+        origin: SignalOrigin = SignalOrigin.SINGLE_STRATEGY,
+        status: SignalStatus = SignalStatus.NEW,
+    ) -> StrategySignal:
+        if not is_directional_side(side):
+            raise StrategyEvaluationError(
+                f"{self.strategy_name}: whale signal side must be LONG or SHORT"
+            )
 
-        # Rate-limit noisy validation warnings.
-        if now - last_logged < 30.0:
-            return
+        scope = self.whales_scope(context)
 
-        self._last_validation_warnings[reason_key] = now
-
-        self._logger.warning(
-            "Invalid whale feature payload dropped | strategy=%s feature=%s source=%s reasons=%s",
-            self.strategy_name,
-            feature.canonical_name,
-            feature.source_location,
-            "; ".join(feature.validation.reasons),
+        signal_metadata = dict(metadata or {})
+        signal_metadata.setdefault("domain", FeatureSource.WHALES.value)
+        signal_metadata.setdefault("whales_strategy_version", "2.0.0")
+        signal_metadata.setdefault(
+            "order_intent",
+            self.whales_config.default_order_intent.value,
+        )
+        signal_metadata.setdefault(
+            "margin_mode",
+            self.whales_config.default_margin_mode.value,
+        )
+        signal_metadata.setdefault(
+            "market_type",
+            self.whales_config.default_market_type.value,
+        )
+        signal_metadata.setdefault(
+            "tier",
+            self.whales_config.default_trade_tier.value,
         )
 
-    # =========================================================================
-    # Shared payload conversion helpers
-    # =========================================================================
+        if self.whales_config.requested_leverage is not None:
+            signal_metadata.setdefault(
+                "requested_leverage",
+                float(self.whales_config.requested_leverage),
+            )
 
-    def _object_to_dict(self, value: Any) -> dict[str, Any]:
+        if self.whales_config.max_slippage_bps is not None:
+            signal_metadata.setdefault(
+                "max_slippage_bps",
+                float(self.whales_config.max_slippage_bps),
+            )
+
+        if self.whales_config.entry_timeout_seconds is not None:
+            signal_metadata.setdefault(
+                "entry_timeout_seconds",
+                int(self.whales_config.entry_timeout_seconds),
+            )
+
+        if self.whales_config.max_holding_seconds is not None:
+            signal_metadata.setdefault(
+                "max_holding_seconds",
+                int(self.whales_config.max_holding_seconds),
+            )
+
+        if self.whales_config.attach_scope_metadata:
+            signal_metadata.setdefault("scope", scope.to_dict())
+
+        if self.whales_config.attach_whale_context_metadata:
+            signal_metadata.setdefault(
+                "whale_context",
+                self.whale_context_metadata(context),
+            )
+
+        if self.whales_config.metadata:
+            signal_metadata.setdefault(
+                "whales_config_metadata",
+                serialize_for_metadata(self.whales_config.metadata),
+            )
+
+        final_reasons = list(
+            dict.fromkeys(
+                [
+                    "whales_strategy_signal",
+                    *(reasons or []),
+                ]
+            )
+        )
+        final_confirmations = list(dict.fromkeys(confirmations or []))
+        final_features = list(
+            dict.fromkeys(source_features or base_whales_source_features())
+        )
+
+        signal = self.build_signal(
+            context=context,
+            side=side,
+            confidence=confidence,
+            score=score,
+            setup_type=setup_type or self.default_setup_type,
+            reasons=final_reasons,
+            confirmations=final_confirmations,
+            source_features=final_features,
+            metadata=serialize_for_metadata(signal_metadata),
+            trigger_type=trigger_type,
+            origin=origin,
+            priority=priority,
+            status=status,
+        )
+
+        signal.validate()
+        return signal
+
+    def whale_context_metadata(
+        self,
+        context: StrategyContext,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+
+        snapshot = self.resolve_whale_snapshot(context)
+        if snapshot is not None:
+            metadata["snapshot"] = snapshot.to_dict()
+
+            if self.whales_config.attach_raw_payload_metadata:
+                metadata["raw"] = {
+                    "pressure": snapshot.pressure,
+                    "activity": snapshot.activity,
+                    "large_trade": snapshot.large_trade,
+                    "cluster": snapshot.cluster,
+                    "cluster_update": snapshot.cluster_update,
+                    "cluster_exhaustion": snapshot.cluster_exhaustion,
+                    "liquidation_context": snapshot.liquidation_context,
+                }
+
+            if self.whales_config.attach_feature_validation_metadata:
+                metadata["feature_validations"] = {
+                    name: validation.to_dict()
+                    for name, validation in snapshot.feature_validations.items()
+                }
+
+        metadata["feature_values"] = {
+            "dominant_side": self.whales_path(context, "dominant_side", None),
+            "whale_side": self.whales_path(context, "whale_side", None),
+            "liquidation_side": self.whales_path(context, "liquidation_side", None),
+            "exhausted_side": self.whales_path(context, "exhausted_side", None),
+            "cluster_side": self.whales_path(context, "cluster_side", None),
+            "imbalance_ratio": self.whales_path(context, "imbalance_ratio", None),
+            "pressure_score": self.whales_path(context, "pressure_score", None),
+            "context_strength": self.whales_path(context, "context_strength", None),
+            "cluster_score": self.whales_path(context, "cluster_score", None),
+            "continuation_probability": self.whales_path(
+                context,
+                "continuation_probability",
+                None,
+            ),
+            "exhaustion_probability": self.whales_path(
+                context,
+                "exhaustion_probability",
+                None,
+            ),
+            "total_notional": self.whales_path(context, "total_notional", None),
+            "liquidation_notional": self.whales_path(
+                context,
+                "liquidation_notional",
+                None,
+            ),
+            "large_trade_notional": self.whales_path(
+                context,
+                "large_trade_notional",
+                None,
+            ),
+            "large_trade_zscore": self.whales_path(
+                context,
+                "large_trade_zscore",
+                None,
+            ),
+        }
+
+        return serialize_for_metadata(metadata)
+
+    # ------------------------------------------------------------------
+    # Shared quality helpers for concrete strategies
+    # ------------------------------------------------------------------
+
+    def whale_quality_rejection_reason(
+        self,
+        *,
+        snapshot: WhaleCompositeSnapshot,
+        score: float,
+        confidence: float,
+        required_inputs: tuple[str, ...] = (),
+    ) -> str | None:
+        return whale_quality_filter_reason(
+            inputs=snapshot.inputs(),
+            min_score=self.whales_config.min_score,
+            min_confidence=self.whales_config.min_confidence,
+            score=score,
+            confidence=confidence,
+            required_keys=required_inputs,
+        )
+
+    def snapshot_freshness_score(
+        self,
+        snapshot: WhaleCompositeSnapshot,
+        *,
+        now: datetime | None = None,
+    ) -> float:
+        return freshness_score(
+            event_time=snapshot.timestamp,
+            now=now,
+            stale_after_seconds=self.whales_config.stale_feature_max_age_seconds,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal extraction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        if not isinstance(feature_name, str) or not feature_name.strip():
+            return None
+
+        if not context.has_feature(feature_name):
+            return None
+
+        value = context.get_feature(feature_name)
+
+        if isinstance(value, FeatureSnapshot):
+            return value.value
+
+        return value
+
+    @staticmethod
+    def _has_any_value(value: Any) -> bool:
         if value is None:
-            return {}
-
-        if isinstance(value, dict):
-            return dict(value)
+            return False
 
         if isinstance(value, Mapping):
-            return dict(value)
+            return any(
+                WhalesTradingStrategy._has_any_value(item)
+                for item in value.values()
+            )
 
-        if hasattr(value, "to_event") and callable(value.to_event):
-            try:
-                result = value.to_event()
-                if isinstance(result, Mapping):
-                    return dict(result)
-            except Exception:
-                self._logger.debug(
-                    "Failed to convert object using to_event() | strategy=%s type=%s",
-                    self.strategy_name,
-                    type(value).__name__,
-                    exc_info=True,
-                )
+        if isinstance(value, (list, tuple, set)):
+            return any(
+                WhalesTradingStrategy._has_any_value(item)
+                for item in value
+            )
 
-        if hasattr(value, "to_payload") and callable(value.to_payload):
-            try:
-                result = value.to_payload()
-                if isinstance(result, Mapping):
-                    return dict(result)
-            except Exception:
-                self._logger.debug(
-                    "Failed to convert object using to_payload() | strategy=%s type=%s",
-                    self.strategy_name,
-                    type(value).__name__,
-                    exc_info=True,
-                )
+        return value is not None
 
-        if hasattr(value, "to_dict") and callable(value.to_dict):
-            try:
-                result = value.to_dict()
-                if isinstance(result, Mapping):
-                    return dict(result)
-            except Exception:
-                self._logger.debug(
-                    "Failed to convert object using to_dict() | strategy=%s type=%s",
-                    self.strategy_name,
-                    type(value).__name__,
-                    exc_info=True,
-                )
-
-        if hasattr(value, "__dict__"):
-            try:
-                return dict(vars(value))
-            except Exception:
-                self._logger.debug(
-                    "Failed to convert object using vars() | strategy=%s type=%s",
-                    self.strategy_name,
-                    type(value).__name__,
-                    exc_info=True,
-                )
-
-        return {}
-
-    # =========================================================================
-    # Shared filters
-    # =========================================================================
-
-    def _run_common_filters(
-        self,
+    @staticmethod
+    def _payload_age_seconds(
         *,
-        context: SignalContext,
-        signal: StrategySignal,
-    ) -> list[FilterResult]:
-        results: list[FilterResult] = []
-
-        results.extend(self._run_regime_filter(context, signal))
-        results.extend(self._run_spread_filter(context))
-        results.extend(self._run_liquidity_filter(context))
-        results.extend(self._run_volatility_filter(context))
-
-        return results
-
-    def _run_regime_filter(
-        self,
-        context: SignalContext,
-        signal: StrategySignal,
-    ) -> list[FilterResult]:
-        if not self.config.filters.enable_regime_filter:
-            return []
-
-        allowed_regimes = set(self._runtime_config.allowed_regimes)
-        regime = self._resolve_regime(context)
-
-        if not allowed_regimes:
-            return []
-
-        if MarketRegime.UNKNOWN in allowed_regimes and regime == MarketRegime.UNKNOWN:
-            return [
-                FilterResult(
-                    name="regime_filter",
-                    decision=FilterDecision.WARN,
-                    reason="Regime unknown but allowed by runtime config",
-                )
-            ]
-
-        if regime not in allowed_regimes:
-            return [
-                FilterResult(
-                    name="regime_filter",
-                    decision=FilterDecision.BLOCK,
-                    reason=f"Regime {regime.value} is not allowed",
-                )
-            ]
-
-        return [
-            FilterResult(
-                name="regime_filter",
-                decision=FilterDecision.PASS,
-                reason=f"Regime {regime.value} allowed",
-            )
-        ]
-
-    def _run_spread_filter(self, context: SignalContext) -> list[FilterResult]:
-        if not self.config.filters.enable_spread_filter:
-            return []
-
-        spread_bps = None
-        if context.price is not None:
-            spread_bps = context.price.spread_bps
-
-        if spread_bps is None:
-            return [
-                FilterResult(
-                    name="spread_filter",
-                    decision=FilterDecision.WARN,
-                    reason="Spread unavailable",
-                )
-            ]
-
-        if spread_bps > self.config.filters.max_spread_bps:
-            return [
-                FilterResult(
-                    name="spread_filter",
-                    decision=FilterDecision.BLOCK,
-                    reason=f"Spread too high: {spread_bps:.4f} bps",
-                )
-            ]
-
-        return [
-            FilterResult(
-                name="spread_filter",
-                decision=FilterDecision.PASS,
-                reason=f"Spread acceptable: {spread_bps:.4f} bps",
-            )
-        ]
-
-    def _run_liquidity_filter(self, context: SignalContext) -> list[FilterResult]:
-        if not self.config.filters.enable_liquidity_filter:
-            return []
-
-        liquidity_score = self._safe_float(
-            context.get_feature("liquidity_score"),
-            default=None,
-        )
-
-        if liquidity_score is None:
-            return [
-                FilterResult(
-                    name="liquidity_filter",
-                    decision=FilterDecision.WARN,
-                    reason="Liquidity score unavailable",
-                )
-            ]
-
-        if liquidity_score < self.config.filters.min_liquidity_score:
-            return [
-                FilterResult(
-                    name="liquidity_filter",
-                    decision=FilterDecision.BLOCK,
-                    reason=f"Liquidity score too low: {liquidity_score:.4f}",
-                )
-            ]
-
-        return [
-            FilterResult(
-                name="liquidity_filter",
-                decision=FilterDecision.PASS,
-                reason=f"Liquidity score acceptable: {liquidity_score:.4f}",
-            )
-        ]
-
-    def _run_volatility_filter(self, context: SignalContext) -> list[FilterResult]:
-        if not self.config.filters.enable_volatility_filter:
-            return []
-
-        volatility_zscore = self._safe_float(
-            context.get_feature("volatility_zscore"),
-            default=None,
-        )
-
-        if volatility_zscore is None:
-            return [
-                FilterResult(
-                    name="volatility_filter",
-                    decision=FilterDecision.WARN,
-                    reason="Volatility z-score unavailable",
-                )
-            ]
-
-        if volatility_zscore > self.config.filters.max_volatility_zscore:
-            return [
-                FilterResult(
-                    name="volatility_filter",
-                    decision=FilterDecision.BLOCK,
-                    reason=f"Volatility too high: {volatility_zscore:.4f}",
-                )
-            ]
-
-        return [
-            FilterResult(
-                name="volatility_filter",
-                decision=FilterDecision.PASS,
-                reason=f"Volatility acceptable: {volatility_zscore:.4f}",
-            )
-        ]
-
-    # =========================================================================
-    # Shared market/context helpers
-    # =========================================================================
-
-    def _resolve_regime(self, context: SignalContext) -> MarketRegime:
-        if context.regime is None:
-            return MarketRegime.UNKNOWN
-        return context.regime.regime
-
-    def _resolve_reference_price(self, context: SignalContext) -> float | None:
-        if context.price is None:
-            return None
-
-        if context.price.mid_price is not None and context.price.mid_price > 0:
-            return context.price.mid_price
-
-        if context.price.last_price is not None and context.price.last_price > 0:
-            return context.price.last_price
-
-        if context.price.mark_price is not None and context.price.mark_price > 0:
-            return context.price.mark_price
-
-        return None
-
-    def _suggest_holding_seconds(self, context: SignalContext) -> int:
-        mapping = {
-            "1s": 60,
-            "5s": 180,
-            "15s": 300,
-            "1m": 900,
-            "3m": 1800,
-            "5m": 3600,
-            "15m": 4 * 3600,
-            "30m": 6 * 3600,
-            "1h": 12 * 3600,
-            "4h": 24 * 3600,
-            "1d": 3 * 24 * 3600,
-        }
-        return mapping.get(str(context.timeframe), 1800)
-
-    # =========================================================================
-    # Shared scoring helpers
-    # =========================================================================
-
-    def _resolve_strength(self, score: float, confidence: float) -> SignalStrength:
-        composite = (score + confidence) / 2.0
-
-        if composite >= 0.90:
-            return SignalStrength.EXTREME
-
-        if composite >= 0.75:
-            return SignalStrength.STRONG
-
-        if composite >= 0.55:
-            return SignalStrength.MODERATE
-
-        return SignalStrength.WEAK
-
-    def _resolve_confidence_grade(self, confidence: float) -> ConfidenceGrade:
-        cfg = self.config.confidence
-
-        if confidence >= cfg.high_threshold:
-            return ConfidenceGrade.VERY_HIGH
-
-        if confidence >= cfg.medium_threshold:
-            return ConfidenceGrade.HIGH
-
-        if confidence >= cfg.low_threshold:
-            return ConfidenceGrade.MEDIUM
-
-        if confidence >= cfg.very_low_threshold:
-            return ConfidenceGrade.LOW
-
-        return ConfidenceGrade.VERY_LOW
-
-    def _map_priority(self, priority: int) -> SignalPriority:
-        if priority <= 25:
-            return SignalPriority.CRITICAL
-
-        if priority <= 50:
-            return SignalPriority.HIGH
-
-        if priority <= 100:
-            return SignalPriority.MEDIUM
-
-        return SignalPriority.LOW
-
-    # =========================================================================
-    # Safe conversion / normalization helpers
-    # =========================================================================
-
-    def _safe_float(
-        self,
-        value: Any,
-        default: float | None = None,
+        event_time: datetime | None,
+        now: datetime | None,
     ) -> float | None:
-        if value is None:
-            return default
-
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _safe_int(
-        self,
-        value: Any,
-        default: int = 0,
-    ) -> int:
-        if value is None:
-            return default
-
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _clamp(
-        self,
-        value: float,
-        minimum: float,
-        maximum: float,
-    ) -> float:
-        return max(minimum, min(value, maximum))
-
-    def _normalize_exchange(self, value: Any) -> str | None:
-        if value is None:
+        event_ts = parse_datetime(event_time)
+        now_ts = parse_datetime(now)
+        if event_ts is None or now_ts is None:
             return None
+        return max(0.0, (now_ts - event_ts).total_seconds())
 
-        normalized = str(value).strip().lower()
-        return normalized or None
+    @staticmethod
+    def _resolve_snapshot_timestamp(
+        *,
+        context: StrategyContext,
+        payloads: Mapping[str, Mapping[str, Any]],
+        fallback: datetime | None,
+    ) -> datetime | None:
+        timestamps: list[datetime] = []
 
-    def _normalize_market_type(self, value: Any) -> str | None:
-        if value is None:
-            return None
+        for payload in payloads.values():
+            event_time = extract_event_time(payload)
+            if event_time is not None:
+                timestamps.append(event_time)
 
-        normalized = str(value).strip().lower()
-        return normalized or None
+        if timestamps:
+            return max(timestamps)
 
-    def _normalize_timeframe(self, value: Any) -> str | None:
-        if value is None:
-            return None
+        return parse_datetime(fallback) or context.timestamp
 
-        normalized = str(value).strip()
-        return normalized or None
+    @staticmethod
+    def _first_non_empty_symbol(
+        payloads: Mapping[str, Mapping[str, Any]],
+        fallback: str,
+    ) -> str:
+        for payload in payloads.values():
+            symbol = extract_symbol(payload)
+            if symbol:
+                return symbol
+        return normalize_symbol(fallback)
 
-    def _normalize_symbol_or_none(self, value: Any) -> str | None:
-        if value is None:
-            return None
+    @staticmethod
+    def _first_non_empty_exchange(
+        payloads: Mapping[str, Mapping[str, Any]],
+        fallback: str,
+    ) -> str:
+        for payload in payloads.values():
+            exchange = extract_exchange(payload)
+            if exchange:
+                return exchange
+        return normalize_exchange(fallback) or "unknown"
 
-        normalized = (
-            str(value)
-            .replace("-", "")
-            .replace("/", "")
-            .replace("_", "")
-            .upper()
-            .strip()
-        )
+    @staticmethod
+    def _first_non_empty_market_type(
+        payloads: Mapping[str, Mapping[str, Any]],
+        fallback: str,
+    ) -> str:
+        for payload in payloads.values():
+            market_type = extract_market_type(payload)
+            if market_type:
+                return market_type
+        return normalize_market_type(fallback) or "unknown"
 
-        return normalized or None
+    @staticmethod
+    def _first_non_empty_timeframe(
+        payloads: Mapping[str, Mapping[str, Any]],
+        fallback: str,
+    ) -> str:
+        for payload in payloads.values():
+            timeframe = extract_timeframe(payload, "")
+            if timeframe:
+                return timeframe
+        return str(fallback or Timeframe.M1.value).lower()
 
-    def _context_timestamp_ms(self, context: SignalContext) -> int | None:
-        return self._to_timestamp_ms(getattr(context, "timestamp", None))
+    @staticmethod
+    def _first_non_empty_exchange_symbol(
+        payloads: Mapping[str, Mapping[str, Any]],
+        fallback: str | None,
+    ) -> str | None:
+        for payload in payloads.values():
+            exchange_symbol = extract_exchange_symbol(payload)
+            if exchange_symbol:
+                return exchange_symbol
+        return fallback
 
-    def _payload_timestamp_ms(self, payload: Mapping[str, Any]) -> int | None:
-        for field_name in (
-            "timestamp_ms",
-            "created_at_ms",
-            "updated_at_ms",
-            "event_time_ms",
-            "received_at_ms",
-            "last_seen_ms",
-            "timestamp",
+    @staticmethod
+    def _resolve_dominant_side(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> str:
+        for key in (
+            "pressure",
+            "activity",
+            "large_trade",
+            "cluster_update",
+            "cluster",
         ):
-            if field_name in payload:
-                ts = self._to_timestamp_ms(payload.get(field_name))
-                if ts is not None:
-                    return ts
+            side = extract_dominant_side(payloads.get(key) or {})
+            if side not in {"unknown", ""}:
+                return side
+        return "unknown"
 
-        metadata = payload.get("metadata")
-        if isinstance(metadata, Mapping):
-            for field_name in (
-                "timestamp_ms",
-                "created_at_ms",
-                "updated_at_ms",
-                "event_time_ms",
-                "received_at_ms",
-                "last_seen_ms",
-                "timestamp",
-            ):
-                if field_name in metadata:
-                    ts = self._to_timestamp_ms(metadata.get(field_name))
-                    if ts is not None:
-                        return ts
+    @staticmethod
+    def _resolve_whale_side(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> str:
+        for key in (
+            "liquidation_context",
+            "pressure",
+            "activity",
+            "large_trade",
+            "cluster_update",
+            "cluster",
+        ):
+            side = extract_whale_side(payloads.get(key) or {})
+            if side not in {"unknown", ""}:
+                return side
+        return "unknown"
 
+    @staticmethod
+    def _resolve_liquidation_side(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> str:
+        for key in ("liquidation_context", "cluster_exhaustion", "cluster_update"):
+            side = extract_liquidation_side(payloads.get(key) or {})
+            if side not in {"unknown", ""}:
+                return side
+        return "unknown"
+
+    @staticmethod
+    def _resolve_total_notional(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> float:
+        values = [
+            extract_total_notional(payloads.get("activity") or {}),
+            extract_notional(payloads.get("pressure") or {}),
+            extract_notional(payloads.get("cluster") or {}),
+            extract_notional(payloads.get("cluster_update") or {}),
+            extract_notional(payloads.get("cluster_exhaustion") or {}),
+            extract_liquidation_notional(payloads.get("liquidation_context") or {}),
+            extract_large_trade_notional(payloads.get("large_trade") or {}),
+        ]
+        return max(values or [0.0])
+
+    @staticmethod
+    def _resolve_trade_count(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> int:
+        values = [
+            extract_trade_count(payloads.get("activity") or {}),
+            extract_trade_count(payloads.get("pressure") or {}),
+            extract_trade_count(payloads.get("large_trade") or {}),
+            extract_trade_count(payloads.get("cluster") or {}),
+            extract_trade_count(payloads.get("cluster_update") or {}),
+        ]
+        return max(values or [0])
+
+    @staticmethod
+    def _resolve_reference_price(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> float | None:
+        for key in (
+            "large_trade",
+            "activity",
+            "pressure",
+            "liquidation_context",
+            "cluster",
+            "cluster_update",
+            "cluster_exhaustion",
+        ):
+            price = extract_reference_price(payloads.get(key) or {})
+            if price is not None and price > 0:
+                return price
         return None
 
-    def _to_timestamp_ms(self, value: Any) -> int | None:
-        if value is None:
-            return None
+    @staticmethod
+    def _resolve_confidence(
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> float:
+        candidates = [
+            extract_pressure_score(payloads.get("pressure") or {}),
+            extract_context_strength(payloads.get("liquidation_context") or {}),
+            resolve_cluster_score(payloads),
+            resolve_continuation_probability(payloads),
+            resolve_exhaustion_probability(payloads),
+        ]
 
-        if isinstance(value, datetime):
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            return int(value.timestamp() * 1000)
+        valid = [
+            unit_score(value)
+            for value in candidates
+            if value is not None
+        ]
 
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return None
+        if not valid:
+            return 0.0
 
-        if numeric <= 0:
-            return None
+        return sum(valid) / len(valid)
 
-        # Heuristic:
-        # - seconds timestamp ~ 1_700_000_000
-        # - milliseconds timestamp ~ 1_700_000_000_000
-        if numeric < 10_000_000_000:
-            numeric *= 1000
 
-        return int(numeric)
-
-    # =========================================================================
-    # Evaluation guard helper
-    # =========================================================================
-
-    def _wrap_evaluation_error(
-        self,
-        *,
-        context: SignalContext,
-        exc: Exception,
-    ) -> StrategyEvaluationError:
-        return StrategyEvaluationError(
-            f"{self.strategy_name} failed for symbol={context.symbol}: {exc}"
-        )
+# Backward-compatible aliases while concrete whale strategies are migrated.
+WhaleStrategyBase = WhalesTradingStrategy
+WhaleStrategyConfig = WhalesStrategyConfig

@@ -4,7 +4,7 @@ from __future__ import annotations
 # Base contracts
 # ============================================================
 
-from .base_spread_strategy import (
+from .base import (
     # Input analytics.spreads events
     SPOT_FUTURES_SNAPSHOT_EVENT,
     CROSS_EXCHANGE_SNAPSHOT_EVENT,
