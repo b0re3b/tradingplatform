@@ -13,8 +13,6 @@ from analytics.whales.base import BaseWhaleComponent
 from analytics.whales.config import WhaleTrackerConfig
 from analytics.whales.enums import WhaleComponentName, WhaleTradeSide
 from analytics.whales.models import (
-    DEFAULT_MARKET_TYPE,
-    DEFAULT_TIMEFRAME,
     LiquidationRecord,
     SymbolTrackerState,
     WhaleActivitySignal,
@@ -72,7 +70,8 @@ class WhaleTracker(BaseWhaleComponent):
     - не слухає raw market.liquidation у production, якщо legacy mode не дозволений;
     - state не змішує різні біржі / market_type / timeframe;
     - cleanup запускається тільки через Scheduler.add_interval_job();
-    - власних uncontrolled asyncio cleanup loops немає.
+    - власних uncontrolled asyncio cleanup loops немає;
+    - state mutation блокується per WhaleKey, а не глобально на весь tracker.
     """
 
     def __init__(
@@ -95,7 +94,11 @@ class WhaleTracker(BaseWhaleComponent):
         self.config.validate()
 
         self._states: dict[WhaleKey, SymbolTrackerState] = {}
-        self._lock = asyncio.Lock()
+
+        # Registry lock захищає створення lock-ів і короткі registry/snapshot операції.
+        # Бізнес-обробка блокує тільки конкретний WhaleKey.
+        self._state_locks: dict[WhaleKey, asyncio.Lock] = {}
+        self._registry_lock = asyncio.Lock()
 
     # =========================================================================
     # Lifecycle
@@ -190,6 +193,7 @@ class WhaleTracker(BaseWhaleComponent):
                 "subscribe_liquidations": self.config.subscribe_liquidations,
                 "cleanup_interval_sec": self.config.cleanup_interval_sec,
                 "scope": "exchange:market_type:symbol:timeframe",
+                "locking": "per_whale_key",
             },
         )
 
@@ -314,6 +318,10 @@ class WhaleTracker(BaseWhaleComponent):
         - EventBus handler-ом;
         - тестами;
         - backtesting/replay.
+
+        Locking:
+        - normalization виконується без lock;
+        - mutation/detection блокується тільки для record.key.
         """
         if not self.config.enabled:
             return WhaleTrackerResult()
@@ -325,7 +333,9 @@ class WhaleTracker(BaseWhaleComponent):
         if not self.config.should_process_key(record.key):
             return WhaleTrackerResult()
 
-        async with self._lock:
+        state_lock = await self._get_state_lock(record.key)
+
+        async with state_lock:
             state = self._get_or_create_state(record)
             state.large_trades.append(record)
             state.total_large_trades_seen += 1
@@ -374,6 +384,10 @@ class WhaleTracker(BaseWhaleComponent):
 
         Production payload має приходити з data-layer / liquidation analytics topic.
         Raw market.liquidation дозволений тільки якщо allow_raw_payload=True.
+
+        Locking:
+        - normalization виконується без lock;
+        - mutation/detection блокується тільки для record.key.
         """
         if not self.config.enabled or not self.config.subscribe_liquidations:
             return None
@@ -389,7 +403,9 @@ class WhaleTracker(BaseWhaleComponent):
         if not self.config.should_process_key(record.key):
             return None
 
-        async with self._lock:
+        state_lock = await self._get_state_lock(record.key)
+
+        async with state_lock:
             state = self._get_or_create_state(record)
             state.liquidations.append(record)
             state.total_liquidations_seen += 1
@@ -851,13 +867,41 @@ class WhaleTracker(BaseWhaleComponent):
             )
 
     # =========================================================================
-    # State management
+    # State locking / state management
     # =========================================================================
+
+    async def _get_state_lock(self, key: WhaleKey) -> asyncio.Lock:
+        """
+        Повертає lock для конкретного scoped state.
+
+        Registry lock використовується тільки для безпечного створення lock-а.
+        Processing не блокує весь WhaleTracker, а лише один WhaleKey.
+        """
+        lock = self._state_locks.get(key)
+        if lock is not None:
+            return lock
+
+        async with self._registry_lock:
+            lock = self._state_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._state_locks[key] = lock
+            return lock
+
+    async def _snapshot_state_keys(self) -> list[WhaleKey]:
+        """
+        Повертає snapshot ключів для cleanup/reset без довгого утримання registry lock.
+        """
+        async with self._registry_lock:
+            return list(self._states.keys())
 
     def _get_or_create_state(
         self,
         record: WhaleTradeRecord | LiquidationRecord,
     ) -> SymbolTrackerState:
+        """
+        Має викликатися під lock-ом конкретного record.key.
+        """
         key = record.key
         state = self._states.get(key)
         if state is not None:
@@ -880,6 +924,9 @@ class WhaleTracker(BaseWhaleComponent):
         state: SymbolTrackerState,
         current_ts_ms: int,
     ) -> None:
+        """
+        Має викликатися під lock-ом конкретного state.key.
+        """
         cluster_cutoff_ms = current_ts_ms - self.config.cluster_window_sec * 1000
         pressure_cutoff_ms = current_ts_ms - self.config.pressure_window_sec * 1000
         liquidation_cutoff_ms = current_ts_ms - self.config.liquidation_window_sec * 1000
@@ -907,22 +954,32 @@ class WhaleTracker(BaseWhaleComponent):
         Видаляє неактивні scoped states.
 
         Запускається через core Scheduler.add_interval_job().
+
+        Важливо:
+        - видаляємо тільки state;
+        - per-key lock залишаємо, щоб не створювати race condition, коли coroutine
+          вже чекає старий lock, а інший coroutine створює новий lock для того ж key.
         """
         ttl = self.config.stats_ttl_sec
         if ttl <= 0:
             return
 
         now_mono = time.monotonic()
+        stale_keys: list[WhaleKey] = []
 
-        async with self._lock:
-            stale_keys = [
-                key
-                for key, state in self._states.items()
-                if (now_mono - state.last_update_ts_monotonic) >= ttl
-            ]
+        for key in await self._snapshot_state_keys():
+            state_lock = await self._get_state_lock(key)
 
-            for key in stale_keys:
+            async with state_lock:
+                state = self._states.get(key)
+                if state is None:
+                    continue
+
+                if (now_mono - state.last_update_ts_monotonic) < ttl:
+                    continue
+
                 self._states.pop(key, None)
+                stale_keys.append(key)
 
         if stale_keys:
             self.logger.info(
@@ -942,6 +999,12 @@ class WhaleTracker(BaseWhaleComponent):
     # =========================================================================
 
     def get_key_state(self, key: WhaleKey) -> dict[str, Any]:
+        """
+        Read-only snapshot API.
+
+        Це sync read API, тому він не бере async lock.
+        Для dashboard/stats це прийнятно; mutation path захищений per-key lock-ами.
+        """
         state = self._states.get(key)
         scope = whale_key_to_dict(key)
 
@@ -1010,7 +1073,15 @@ class WhaleTracker(BaseWhaleComponent):
         }
 
     async def reset_key(self, key: WhaleKey) -> None:
-        async with self._lock:
+        """
+        Reset одного scoped state.
+
+        Lock не видаляється спеціально, щоб не створювати race condition з coroutine,
+        який уже очікує цей per-key lock.
+        """
+        state_lock = await self._get_state_lock(key)
+
+        async with state_lock:
             self._states.pop(key, None)
 
         self.logger.info(
@@ -1040,23 +1111,26 @@ class WhaleTracker(BaseWhaleComponent):
         except ValueError:
             return
 
-        async with self._lock:
-            if exchange is not None or market_type is not None or timeframe is not None:
-                key = self.make_key(
+        if exchange is not None or market_type is not None or timeframe is not None:
+            removed_keys = [
+                self.make_key(
                     exchange=exchange or self.default_exchange,
                     market_type=market_type or self.default_market_type,
                     symbol=normalized_symbol,
                     timeframe=timeframe or self.default_timeframe,
                 )
-                removed_keys = [key]
-            else:
-                removed_keys = [
-                    key
-                    for key in self._states.keys()
-                    if whale_key_to_dict(key)["symbol"] == normalized_symbol
-                ]
+            ]
+        else:
+            removed_keys = [
+                key
+                for key in await self._snapshot_state_keys()
+                if whale_key_to_dict(key)["symbol"] == normalized_symbol
+            ]
 
-            for key in removed_keys:
+        for key in removed_keys:
+            state_lock = await self._get_state_lock(key)
+
+            async with state_lock:
                 self._states.pop(key, None)
 
         self.logger.info(
@@ -1069,8 +1143,16 @@ class WhaleTracker(BaseWhaleComponent):
         )
 
     async def reset_all(self) -> None:
-        async with self._lock:
-            self._states.clear()
+        """
+        Reset усіх scoped states.
+
+        Використовувати для manual/test/replay reset.
+        """
+        for key in await self._snapshot_state_keys():
+            state_lock = await self._get_state_lock(key)
+
+            async with state_lock:
+                self._states.pop(key, None)
 
         self.logger.info(
             "Reset all WhaleTracker states",
@@ -1083,6 +1165,8 @@ class WhaleTracker(BaseWhaleComponent):
             {
                 "enabled": self.config.enabled,
                 "tracked_scopes": len(self._states),
+                "state_locks": len(self._state_locks),
+                "locking": "per_whale_key",
                 "production_input_topics": list(self.config.production_input_topics),
                 "legacy_raw_input_topics": list(self.config.legacy_raw_input_topics),
                 "allow_legacy_raw_topics": self.config.allow_legacy_raw_topics,

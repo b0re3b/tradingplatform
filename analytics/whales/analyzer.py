@@ -67,6 +67,13 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
         - дочірні компоненти самі виконують register(), emit() і scheduler jobs;
         - facade не підписується напряму на market.* topics;
         - direct API залишений тільки для tests/backtesting/replay/manual path.
+
+    Lifecycle semantics:
+        - register() завжди реєструє EventBus subscriptions дочірніх компонентів;
+        - start() з auto_start_components=True запускає дочірні компоненти повністю;
+        - start() з auto_start_components=False тільки реєструє дочірні компоненти,
+          але не стартує їхні scheduler jobs;
+        - facade не переходить у стан started, якщо pipeline не зареєстрований.
     """
 
     def __init__(
@@ -118,6 +125,101 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
         )
 
     # =========================================================================
+    # Internal helpers
+    # =========================================================================
+
+    @property
+    def _child_components(self) -> tuple[Any, Any, Any]:
+        return (
+            self.large_trade_detector,
+            self.whale_tracker,
+            self.whale_cluster_analyzer,
+        )
+
+    @property
+    def _child_components_stop_order(self) -> tuple[Any, Any, Any]:
+        return (
+            self.whale_cluster_analyzer,
+            self.whale_tracker,
+            self.large_trade_detector,
+        )
+
+    def _children_registered(self) -> bool:
+        return all(
+            bool(getattr(component, "is_registered", False))
+            for component in self._child_components
+        )
+
+    def _children_started(self) -> bool:
+        return all(
+            bool(getattr(component, "is_started", False))
+            for component in self._child_components
+        )
+
+    def _has_child_runtime_state(self) -> bool:
+        return any(
+            bool(getattr(component, "is_started", False))
+            or bool(getattr(component, "is_registered", False))
+            for component in self._child_components
+        )
+
+    def _direct_api_enabled(self) -> bool:
+        """
+        Backward-compatible guard для manual/test/backtesting/replay API.
+
+        Поточний WhalesConfig ще не має allow_direct_raw_api.
+        Якщо поле буде додано в config — production може вимкнути direct raw path.
+        За замовчуванням True, щоб не зламати існуючі тести/backtesting.
+        """
+        return bool(getattr(self.config, "allow_direct_raw_api", True))
+
+    async def _register_child_components(self) -> None:
+        """
+        Зареєструвати EventBus subscriptions дочірніх компонентів.
+
+        Важливо:
+        - це не стартує scheduler jobs;
+        - це тільки підписує pipeline на EventBus;
+        - порядок відповідає data-flow pipeline.
+        """
+        for component in self._child_components:
+            await component.register()
+
+    async def _start_child_components(self) -> list[Any]:
+        """
+        Повністю стартує дочірні компоненти.
+
+        Повертає список реально стартованих компонентів для rollback.
+        """
+        started_components: list[Any] = []
+
+        for component in self._child_components:
+            await component.start()
+            started_components.append(component)
+
+        return started_components
+
+    async def _rollback_started_components(
+        self,
+        started_components: list[Any],
+    ) -> None:
+        for component in reversed(started_components):
+            try:
+                await component.stop()
+            except Exception:
+                self.logger.exception(
+                    "Failed to rollback whale component during startup failure",
+                    extra={
+                        "component": self.component_name,
+                        "child_component": getattr(
+                            component,
+                            "component_name",
+                            "unknown",
+                        ),
+                    },
+                )
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
@@ -126,8 +228,13 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
         Зареєструвати EventBus subscriptions дочірніх компонентів.
 
         Facade сам напряму не підписується на market/analytics topics.
+
+        Виправлена semantics:
+        - register() більше не залежить від auto_start_components;
+        - auto_start_components контролює start(), а не EventBus registration;
+        - після register() pipeline уже слухає production topics.
         """
-        if self._registered:
+        if self._registered and self._children_registered():
             return
 
         if not self.config.enabled:
@@ -137,25 +244,77 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
             )
             return
 
-        if self.config.auto_start_components:
-            await self.large_trade_detector.register()
-            await self.whale_tracker.register()
-            await self.whale_cluster_analyzer.register()
+        registered_components: list[Any] = []
 
-        self._registered = True
+        try:
+            for component in self._child_components:
+                if not getattr(component, "is_registered", False):
+                    await component.register()
+                registered_components.append(component)
 
-        self.logger.info(
-            "WhaleAnalyzer registered",
-            extra={
-                "component": self.component_name,
-                "auto_start_components": self.config.auto_start_components,
-                "production_input_topics": self.config.production_input_topics,
-                "legacy_raw_input_topics": self.config.legacy_raw_input_topics,
-                "scope": "exchange:market_type:symbol:timeframe",
-            },
-        )
+            if not self._children_registered():
+                raise RuntimeError(
+                    "WhaleAnalyzer registration failed: not all child components "
+                    "became registered"
+                )
+
+            self._registered = True
+
+            self.logger.info(
+                "WhaleAnalyzer registered",
+                extra={
+                    "component": self.component_name,
+                    "auto_start_components": self.config.auto_start_components,
+                    "children_registered": self._children_registered(),
+                    "children_started": self._children_started(),
+                    "production_input_topics": self.config.production_input_topics,
+                    "legacy_raw_input_topics": self.config.legacy_raw_input_topics,
+                    "scope": "exchange:market_type:symbol:timeframe",
+                },
+            )
+
+        except Exception:
+            self.logger.exception(
+                "WhaleAnalyzer registration failed; rolling back registered components",
+                extra={"component": self.component_name},
+            )
+
+            for component in reversed(registered_components):
+                try:
+                    if getattr(component, "is_registered", False):
+                        await component.stop()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to rollback whale component during registration failure",
+                        extra={
+                            "component": self.component_name,
+                            "child_component": getattr(
+                                component,
+                                "component_name",
+                                "unknown",
+                            ),
+                        },
+                    )
+
+            self._registered = False
+            self._started = False
+            raise
 
     async def start(self) -> None:
+        """
+        Запустити WhaleAnalyzer.
+
+        Якщо config.auto_start_components=True:
+            - стартує всі дочірні компоненти;
+            - дочірні компоненти самі роблять register();
+            - scheduler cleanup jobs також запускаються.
+
+        Якщо config.auto_start_components=False:
+            - тільки реєструє дочірні компоненти через register();
+            - EventBus pipeline працює;
+            - scheduler jobs дочірніх компонентів не стартують;
+            - це корисно для bootstrap/container режиму, де lifecycle керується зовні.
+        """
         if self._started:
             self.logger.warning("WhaleAnalyzer already started")
             return
@@ -168,16 +327,39 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
 
         try:
             if self.config.auto_start_components:
-                await self.large_trade_detector.start()
-                started_components.append(self.large_trade_detector)
+                started_components = await self._start_child_components()
 
-                await self.whale_tracker.start()
-                started_components.append(self.whale_tracker)
+                if not self._children_started():
+                    raise RuntimeError(
+                        "WhaleAnalyzer startup failed: not all child components "
+                        "became started"
+                    )
 
-                await self.whale_cluster_analyzer.start()
-                started_components.append(self.whale_cluster_analyzer)
+                self._registered = self._children_registered()
+                lifecycle_mode = "auto_started_components"
+
             else:
                 await self.register()
+
+                if not self._children_registered():
+                    raise RuntimeError(
+                        "WhaleAnalyzer startup failed: child components are not "
+                        "registered while auto_start_components=False"
+                    )
+
+                lifecycle_mode = "registered_components_only"
+
+                self.logger.warning(
+                    "WhaleAnalyzer started in registration-only mode; "
+                    "child Scheduler jobs are not started because "
+                    "auto_start_components=False",
+                    extra={
+                        "component": self.component_name,
+                        "auto_start_components": self.config.auto_start_components,
+                        "children_registered": self._children_registered(),
+                        "children_started": self._children_started(),
+                    },
+                )
 
             self._started = True
 
@@ -185,7 +367,10 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
                 "WhaleAnalyzer started",
                 extra={
                     "component": self.component_name,
+                    "lifecycle_mode": lifecycle_mode,
                     "auto_start_components": self.config.auto_start_components,
+                    "children_registered": self._children_registered(),
+                    "children_started": self._children_started(),
                     "production_input_topics": self.config.production_input_topics,
                     "legacy_raw_input_topics": self.config.legacy_raw_input_topics,
                     "large_trade_input_topics": list(
@@ -234,39 +419,34 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
                 extra={"component": self.component_name},
             )
 
-            for component in reversed(started_components):
-                try:
-                    await component.stop()
-                except Exception:
-                    self.logger.exception(
-                        "Failed to rollback whale component during startup failure",
-                        extra={
-                            "component": self.component_name,
-                            "child_component": getattr(
-                                component,
-                                "component_name",
-                                "unknown",
-                            ),
-                        },
-                    )
+            if started_components:
+                await self._rollback_started_components(started_components)
+            else:
+                for component in reversed(self._child_components):
+                    try:
+                        if getattr(component, "is_registered", False):
+                            await component.stop()
+                    except Exception:
+                        self.logger.exception(
+                            "Failed to rollback whale component during startup failure",
+                            extra={
+                                "component": self.component_name,
+                                "child_component": getattr(
+                                    component,
+                                    "component_name",
+                                    "unknown",
+                                ),
+                            },
+                        )
 
             self._started = False
             self._registered = False
             raise
 
     async def stop(self) -> None:
-        children = (
-            self.whale_cluster_analyzer,
-            self.whale_tracker,
-            self.large_trade_detector,
-        )
+        children = self._child_components_stop_order
 
-        has_child_runtime_state = any(
-            child.is_started or child.is_registered
-            for child in children
-        )
-
-        if not self._started and not self._registered and not has_child_runtime_state:
+        if not self._started and not self._registered and not self._has_child_runtime_state():
             return
 
         for child in children:
@@ -287,9 +467,16 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
 
         await super().stop()
 
+        self._registered = False
+        self._started = False
+
         self.logger.info(
             "WhaleAnalyzer stopped",
-            extra={"component": self.component_name},
+            extra={
+                "component": self.component_name,
+                "children_registered": self._children_registered(),
+                "children_started": self._children_started(),
+            },
         )
 
     async def shutdown(self) -> None:
@@ -312,9 +499,32 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
         У production trade payload має йти так:
             market.trade -> TradesCache -> market.trades.updated -> LargeTradeDetector
 
-        Цей direct API обходить EventBus source topic guard, тому явно
-        передає allow_raw_payload=True.
+        Цей direct API обходить EventBus source topic guard, тому має бути
+        дозволений тільки для tests/backtesting/replay/manual path.
+
+        Якщо у WhalesConfig буде додано allow_direct_raw_api=False,
+        цей метод почне блокувати прямий raw path у production.
         """
+        if not self._direct_api_enabled():
+            raise RuntimeError(
+                "WhaleAnalyzer direct trade API is disabled by config. "
+                "Use production EventBus flow: market.trade -> TradesCache "
+                "-> market.trades.updated -> LargeTradeDetector."
+            )
+
+        process_trades_payload = getattr(
+            self.large_trade_detector,
+            "process_trades_payload",
+            None,
+        )
+
+        if callable(process_trades_payload):
+            return await process_trades_payload(
+                payload,
+                source_topic="manual.direct.trade",
+                allow_raw_payload=True,
+            )
+
         return await self.large_trade_detector.process_trade_payload(
             payload,
             source_topic="manual.direct.trade",
@@ -333,6 +543,14 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
             -> market.liquidations.updated / analytics.liquidations.*
             -> WhaleTracker
         """
+        if not self._direct_api_enabled():
+            raise RuntimeError(
+                "WhaleAnalyzer direct liquidation API is disabled by config. "
+                "Use production EventBus flow: market.liquidation -> "
+                "market.liquidations.updated / analytics.liquidations.* "
+                "-> WhaleTracker."
+            )
+
         return await self.whale_tracker.process_liquidation_payload(
             payload,
             source_topic="manual.direct.liquidation",
@@ -398,6 +616,14 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
             {
                 "enabled": self.config.enabled,
                 "auto_start_components": self.config.auto_start_components,
+                "direct_api_enabled": self._direct_api_enabled(),
+                "children_registered": self._children_registered(),
+                "children_started": self._children_started(),
+                "lifecycle_mode": (
+                    "auto_started_components"
+                    if self.config.auto_start_components
+                    else "registered_components_only"
+                ),
                 "scope": "exchange:market_type:symbol:timeframe",
                 "production_input_topics": self.config.production_input_topics,
                 "legacy_raw_input_topics": self.config.legacy_raw_input_topics,
@@ -452,6 +678,9 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
             "analyzer_registered": self._registered,
             "enabled": self.config.enabled,
             "auto_start_components": self.config.auto_start_components,
+            "direct_api_enabled": self._direct_api_enabled(),
+            "children_registered": self._children_registered(),
+            "children_started": self._children_started(),
             "scope": "exchange:market_type:symbol:timeframe",
             "production_input_topics": self.config.production_input_topics,
             "legacy_raw_input_topics": self.config.legacy_raw_input_topics,

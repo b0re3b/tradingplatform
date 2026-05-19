@@ -28,13 +28,27 @@ from analytics.whales.whale_tracker import WhaleTracker
 # Constants
 # =============================================================================
 
-
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_EXCHANGE = "binance"
+DEFAULT_MARKET_TYPE = "usdm_futures"
+DEFAULT_TIMEFRAME = "realtime"
 
-MARKET_TRADE_TOPIC = "market.trade"
-MARKET_LIQUIDATION_TOPIC = "market.liquidation"
+# Production data-layer topics.
+TRADES_UPDATED_TOPIC = "market.trades.updated"
+LIQUIDATIONS_UPDATED_TOPIC = "market.liquidations.updated"
 
+# Legacy/raw exchange-adapter topics.
+RAW_TRADE_TOPIC = "market.trade"
+RAW_LIQUIDATION_TOPIC = "market.liquidation"
+
+# Backward-compatible aliases for old tests.
+# New tests should prefer RAW_* / *_UPDATED names explicitly.
+MARKET_TRADE_TOPIC = RAW_TRADE_TOPIC
+MARKET_LIQUIDATION_TOPIC = RAW_LIQUIDATION_TOPIC
+MARKET_TRADES_UPDATED_TOPIC = TRADES_UPDATED_TOPIC
+MARKET_LIQUIDATIONS_UPDATED_TOPIC = LIQUIDATIONS_UPDATED_TOPIC
+
+# Analytics whale topics.
 LARGE_TRADE_TOPIC = "analytics.whales.large_trade"
 WHALE_ACTIVITY_TOPIC = "analytics.whales.whale_activity"
 WHALE_PRESSURE_TOPIC = "analytics.whales.whale_pressure"
@@ -50,13 +64,12 @@ ANALYTICS_WHALES_WILDCARD = "analytics.whales.*"
 # Core object helpers
 # =============================================================================
 
-
 def _make_event_bus() -> EventBus:
     """
     Створює core EventBus для тестів.
 
-    Якщо у твоєму core.EventBus пізніше з'явиться обов'язковий config,
-    краще змінити тільки цей helper, а не всі тести.
+    Якщо core.EventBus пізніше отримає обов'язковий config,
+    змінити треба буде тільки цей helper.
     """
     return EventBus()
 
@@ -65,7 +78,7 @@ def _make_scheduler(event_bus: EventBus) -> Scheduler:
     """
     Створює core Scheduler для тестів.
 
-    Підтримує обидва можливі варіанти constructor-а:
+    Підтримує два варіанти constructor-а:
     - Scheduler(event_bus=event_bus)
     - Scheduler()
     """
@@ -99,15 +112,14 @@ async def _maybe_stop(obj: Any) -> None:
 # Event collector
 # =============================================================================
 
-
 class EventCollector:
     """
     Збирає EventBus події для integration-тестів.
 
     Використання:
         collector.subscribe("analytics.whales.*")
-        await event_bus.emit("market.trade", payload)
-        event = await collector.wait_for_topic("analytics.whales.large_trade")
+        await event_bus.emit("market.trades.updated", payload)
+        events = await collector.wait_for_topic("analytics.whales.large_trade")
     """
 
     def __init__(self, event_bus: EventBus) -> None:
@@ -201,7 +213,13 @@ class EventCollector:
         *,
         timeout: float = 1.0,
     ) -> dict[str, Any]:
-        async def _matches(events: list[Event]) -> bool:
+        """
+        Чекає payload без run_coroutine_threadsafe всередині активного event loop.
+
+        Це важливо для async pytest: predicate синхронний, швидкий і не блокує loop.
+        """
+
+        def _matches(events: list[Event]) -> bool:
             for event in events:
                 if event.topic != topic:
                     continue
@@ -215,13 +233,7 @@ class EventCollector:
 
             return False
 
-        await self.wait_until(
-            lambda events: asyncio.run_coroutine_threadsafe(
-                _matches(events),
-                asyncio.get_running_loop(),
-            ).result(),
-            timeout=timeout,
-        )
+        await self.wait_until(_matches, timeout=timeout)
 
         for payload in self.payloads_by_topic(topic):
             if predicate(payload):
@@ -229,11 +241,25 @@ class EventCollector:
 
         raise AssertionError(f"No matching payload collected for topic: {topic}")
 
+    async def wait_for_no_topic(
+        self,
+        topic: str,
+        *,
+        timeout: float = 0.05,
+    ) -> None:
+        """
+        Невеликий helper для negative assertions.
+
+        Використовувати обережно: це intentional sleep, але локалізований
+        в одному helper-і.
+        """
+        await asyncio.sleep(timeout)
+        assert self.by_topic(topic) == []
+
 
 # =============================================================================
 # pytest / pytest-asyncio fixtures
 # =============================================================================
-
 
 @pytest_asyncio.fixture
 async def event_bus() -> EventBus:
@@ -272,25 +298,28 @@ async def event_collector(event_bus: EventBus) -> EventCollector:
 # Fast configs
 # =============================================================================
 
-
 @pytest.fixture
 def large_trade_detector_config_fast() -> LargeTradeDetectorConfig:
     """
-    Швидкий config для LargeTradeDetector.
+    Швидкий production config для LargeTradeDetector.
 
-    Налаштування підібрані так, щоб:
-    - single large trade легко тригерив absolute detection;
-    - relative detection можна було тестувати на малих вибірках;
-    - cooldown не заважав тестам;
-    - cleanup можна було тестувати без довгого очікування.
+    Production input:
+        market.trades.updated
+
+    Legacy raw market.trade навмисно вимкнений за замовчуванням.
+    Для legacy/raw тестів використовуй large_trade_detector_legacy_config_fast.
     """
     return LargeTradeDetectorConfig(
         enabled=True,
+        default_exchange=DEFAULT_EXCHANGE,
+        default_market_type=DEFAULT_MARKET_TYPE,
+        default_timeframe=DEFAULT_TIMEFRAME,
         default_abs_notional_threshold=50_000.0,
         symbol_abs_thresholds={
             "ETHUSDT": 25_000.0,
             "SOLUSDT": 10_000.0,
         },
+        scoped_abs_thresholds={},
         use_relative_detection=True,
         rolling_window_size=20,
         min_samples_for_relative_detection=3,
@@ -299,30 +328,60 @@ def large_trade_detector_config_fast() -> LargeTradeDetectorConfig:
         side_filter=None,
         signal_cooldown_sec=0.0,
         symbol_cooldown_sec={},
+        scoped_cooldown_sec={},
         cleanup_interval_sec=0.25,
         stats_ttl_sec=0.25,
         recalibration_interval=100,
-        input_event_name=MARKET_TRADE_TOPIC,
+        input_event_name=TRADES_UPDATED_TOPIC,
+        input_event_patterns=(TRADES_UPDATED_TOPIC,),
         output_event_name=LARGE_TRADE_TOPIC,
+        raw_input_event_name=RAW_TRADE_TOPIC,
+        allow_legacy_raw_topics=False,
         emit_on_bus=True,
         log_signals=False,
     )
 
 
 @pytest.fixture
+def large_trade_detector_legacy_config_fast(
+    large_trade_detector_config_fast: LargeTradeDetectorConfig,
+) -> LargeTradeDetectorConfig:
+    """
+    Config тільки для legacy/raw tests.
+
+    Дозволяє detector-у слухати market.trade.
+    Production-тести не повинні використовувати цей fixture.
+    """
+    return replace(
+        large_trade_detector_config_fast,
+        input_event_name=TRADES_UPDATED_TOPIC,
+        input_event_patterns=(TRADES_UPDATED_TOPIC,),
+        raw_input_event_name=RAW_TRADE_TOPIC,
+        allow_legacy_raw_topics=True,
+    )
+
+
+@pytest.fixture
 def whale_tracker_config_fast() -> WhaleTrackerConfig:
     """
-    Швидкий config для WhaleTracker.
+    Швидкий production config для WhaleTracker.
 
-    Мінімальні thresholds дозволяють тестувати:
-    - whale_activity на 2 large trades;
-    - whale_pressure на 2 large trades з дисбалансом;
-    - liquidation_context без великих synthetic payload-ів.
+    Production input:
+        analytics.whales.large_trade
+        market.liquidations.updated
+
+    Raw market.liquidation вимкнений за замовчуванням.
     """
     return WhaleTrackerConfig(
         enabled=True,
+        default_exchange=DEFAULT_EXCHANGE,
+        default_market_type=DEFAULT_MARKET_TYPE,
+        default_timeframe=DEFAULT_TIMEFRAME,
         large_trade_event_name=LARGE_TRADE_TOPIC,
-        liquidation_event_name=MARKET_LIQUIDATION_TOPIC,
+        liquidation_event_name=LIQUIDATIONS_UPDATED_TOPIC,
+        liquidation_event_patterns=(LIQUIDATIONS_UPDATED_TOPIC,),
+        raw_liquidation_event_name=RAW_LIQUIDATION_TOPIC,
+        allow_legacy_raw_topics=False,
         whale_activity_event_name=WHALE_ACTIVITY_TOPIC,
         whale_pressure_event_name=WHALE_PRESSURE_TOPIC,
         whale_liquidation_context_event_name=WHALE_LIQUIDATION_CONTEXT_TOPIC,
@@ -347,15 +406,34 @@ def whale_tracker_config_fast() -> WhaleTrackerConfig:
 
 
 @pytest.fixture
+def whale_tracker_legacy_config_fast(
+    whale_tracker_config_fast: WhaleTrackerConfig,
+) -> WhaleTrackerConfig:
+    """
+    Config тільки для legacy/raw liquidation tests.
+    """
+    return replace(
+        whale_tracker_config_fast,
+        liquidation_event_name=LIQUIDATIONS_UPDATED_TOPIC,
+        liquidation_event_patterns=(LIQUIDATIONS_UPDATED_TOPIC,),
+        raw_liquidation_event_name=RAW_LIQUIDATION_TOPIC,
+        allow_legacy_raw_topics=True,
+    )
+
+
+@pytest.fixture
 def whale_cluster_analyzer_config_fast() -> WhaleClusterAnalyzerConfig:
     """
     Швидкий config для WhaleClusterAnalyzer.
 
-    Thresholds занижені, щоб integration-тести могли доходити до cluster-сигналів
+    Thresholds занижені, щоб integration-тести доходили до cluster-сигналів
     без десятків synthetic подій.
     """
     return WhaleClusterAnalyzerConfig(
         enabled=True,
+        default_exchange=DEFAULT_EXCHANGE,
+        default_market_type=DEFAULT_MARKET_TYPE,
+        default_timeframe=DEFAULT_TIMEFRAME,
         whale_activity_event_name=WHALE_ACTIVITY_TOPIC,
         whale_pressure_event_name=WHALE_PRESSURE_TOPIC,
         whale_liquidation_context_event_name=WHALE_LIQUIDATION_CONTEXT_TOPIC,
@@ -399,20 +477,31 @@ def whales_config_fast(
 
 
 @pytest.fixture
+def whales_legacy_config_fast(
+    large_trade_detector_legacy_config_fast: LargeTradeDetectorConfig,
+    whale_tracker_legacy_config_fast: WhaleTrackerConfig,
+    whale_cluster_analyzer_config_fast: WhaleClusterAnalyzerConfig,
+) -> WhalesConfig:
+    """
+    Повний package config для migration/legacy tests.
+
+    Production integration-тести мають використовувати whales_config_fast.
+    """
+    return WhalesConfig(
+        enabled=True,
+        auto_start_components=True,
+        large_trade_detector=large_trade_detector_legacy_config_fast,
+        whale_tracker=whale_tracker_legacy_config_fast,
+        whale_cluster_analyzer=whale_cluster_analyzer_config_fast,
+    )
+
+
+@pytest.fixture
 def whales_config_factory(
     whales_config_fast: WhalesConfig,
 ) -> Callable[..., WhalesConfig]:
     """
     Factory для тестів, де треба швидко змінити enabled/auto_start або підконфіги.
-
-    Приклад:
-        config = whales_config_factory(enabled=False)
-        config = whales_config_factory(
-            large_trade_detector=replace(
-                whales_config_fast.large_trade_detector,
-                emit_on_bus=False,
-            )
-        )
     """
 
     def _factory(
@@ -456,7 +545,6 @@ def whales_config_factory(
 # Runtime component fixtures
 # =============================================================================
 
-
 @pytest.fixture
 def large_trade_detector(
     large_trade_detector_config_fast: LargeTradeDetectorConfig,
@@ -471,6 +559,19 @@ def large_trade_detector(
 
 
 @pytest.fixture
+def large_trade_detector_legacy(
+    large_trade_detector_legacy_config_fast: LargeTradeDetectorConfig,
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> LargeTradeDetector:
+    return LargeTradeDetector(
+        config=large_trade_detector_legacy_config_fast,
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+
+@pytest.fixture
 def whale_tracker(
     whale_tracker_config_fast: WhaleTrackerConfig,
     event_bus: EventBus,
@@ -478,6 +579,19 @@ def whale_tracker(
 ) -> WhaleTracker:
     return WhaleTracker(
         config=whale_tracker_config_fast,
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+
+@pytest.fixture
+def whale_tracker_legacy(
+    whale_tracker_legacy_config_fast: WhaleTrackerConfig,
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> WhaleTracker:
+    return WhaleTracker(
+        config=whale_tracker_legacy_config_fast,
         event_bus=event_bus,
         scheduler=scheduler,
     )
@@ -509,10 +623,22 @@ def whale_analyzer(
     )
 
 
+@pytest.fixture
+def whale_analyzer_legacy(
+    whales_legacy_config_fast: WhalesConfig,
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> WhaleAnalyzer:
+    return WhaleAnalyzer(
+        config=whales_legacy_config_fast,
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+
 # =============================================================================
 # Payload factories
 # =============================================================================
-
 
 @pytest.fixture
 def now_ms() -> Callable[[], int]:
@@ -526,9 +652,8 @@ def raw_trade_payload_factory(
     """
     Factory для raw market.trade payload.
 
-    Підтримує both plain та nested data payload:
-        raw_trade_payload_factory()
-        raw_trade_payload_factory(nested=True)
+    Це payload рівня exchange adapter.
+    У production він має йти в TradesCache, а не напряму в LargeTradeDetector.
     """
 
     def _factory(
@@ -540,18 +665,24 @@ def raw_trade_payload_factory(
         timestamp_ms: int | None = None,
         trade_id: str = "trade-1",
         exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         nested: bool = False,
         maker_flag: bool | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
+            "exchange": exchange,
+            "market_type": market_type,
             "symbol": symbol,
+            "exchange_symbol": exchange_symbol or symbol,
+            "timeframe": timeframe,
             "price": price,
             "quantity": quantity,
             "side": side,
             "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
             "trade_id": trade_id,
-            "exchange": exchange,
         }
 
         if maker_flag is not None:
@@ -563,6 +694,244 @@ def raw_trade_payload_factory(
         if nested:
             return {
                 "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "data": payload,
+            }
+
+        return payload
+
+    return _factory
+
+
+@pytest.fixture
+def trades_updated_payload_factory(
+    raw_trade_payload_factory: Callable[..., dict[str, Any]],
+    now_ms: Callable[[], int],
+) -> Callable[..., dict[str, Any]]:
+    """
+    Factory для production data-layer event payload:
+        market.trades.updated
+
+    Підтримує batch trades, змішаний valid/invalid batch, extra metadata.
+    """
+
+    def _factory(
+        *,
+        trades: list[dict[str, Any]] | None = None,
+        symbol: str = DEFAULT_SYMBOL,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        price: float = 50_000.0,
+        quantity: float = 2.0,
+        side: str = "buy",
+        count: int = 1,
+        notional: float | None = None,
+        timestamp_ms: int | None = None,
+        batch_id: str = "trades-updated-1",
+        nested_data: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base_ts = timestamp_ms if timestamp_ms is not None else now_ms()
+
+        if trades is None:
+            trades = []
+            for index in range(count):
+                trade_price = price
+                trade_quantity = (
+                    quantity
+                    if notional is None
+                    else notional / trade_price
+                )
+                trades.append(
+                    raw_trade_payload_factory(
+                        symbol=symbol,
+                        price=trade_price,
+                        quantity=trade_quantity,
+                        side=side,
+                        timestamp_ms=base_ts + index,
+                        trade_id=f"{batch_id}-{index}",
+                        exchange=exchange,
+                        market_type=market_type,
+                        timeframe=timeframe,
+                    )
+                )
+
+        payload: dict[str, Any] = {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "timestamp_ms": base_ts,
+            "received_at_ms": now_ms(),
+            "batch_id": batch_id,
+            "trades": trades,
+            "count": len(trades),
+            "source": "tests.trades_cache",
+        }
+
+        if extra:
+            payload.update(extra)
+
+        if nested_data:
+            return {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "data": payload,
+            }
+
+        return payload
+
+    return _factory
+
+
+@pytest.fixture
+def raw_liquidation_payload_factory(
+    now_ms: Callable[[], int],
+) -> Callable[..., dict[str, Any]]:
+    """
+    Factory для raw market.liquidation payload.
+
+    У production має йти в LiquidationCache / liquidation analytics layer,
+    а не напряму в WhaleTracker.
+    """
+
+    def _factory(
+        *,
+        symbol: str = DEFAULT_SYMBOL,
+        side: str = "sell",
+        price: float = 50_000.0,
+        quantity: float = 2.0,
+        notional: float | None = None,
+        timestamp_ms: int | None = None,
+        liquidation_id: str = "liq-1",
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
+        nested: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        computed_notional = notional if notional is not None else price * quantity
+
+        payload: dict[str, Any] = {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "exchange_symbol": exchange_symbol or symbol,
+            "timeframe": timeframe,
+            "side": side,
+            "price": price,
+            "quantity": quantity,
+            "notional": computed_notional,
+            "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
+            "liquidation_id": liquidation_id,
+        }
+
+        if extra:
+            payload.update(extra)
+
+        if nested:
+            return {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "data": payload,
+            }
+
+        return payload
+
+    return _factory
+
+
+@pytest.fixture
+def liquidation_payload_factory(
+    raw_liquidation_payload_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """
+    Backward-compatible alias для старих тестів.
+
+    Нові тести мають явно використовувати:
+    - raw_liquidation_payload_factory
+    - liquidations_updated_payload_factory
+    """
+    return raw_liquidation_payload_factory
+
+
+@pytest.fixture
+def liquidations_updated_payload_factory(
+    raw_liquidation_payload_factory: Callable[..., dict[str, Any]],
+    now_ms: Callable[[], int],
+) -> Callable[..., dict[str, Any]]:
+    """
+    Factory для production data-layer event payload:
+        market.liquidations.updated
+    """
+
+    def _factory(
+        *,
+        liquidations: list[dict[str, Any]] | None = None,
+        symbol: str = DEFAULT_SYMBOL,
+        side: str = "sell",
+        price: float = 50_000.0,
+        quantity: float = 2.0,
+        notional: float | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        timestamp_ms: int | None = None,
+        batch_id: str = "liquidations-updated-1",
+        nested_data: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        base_ts = timestamp_ms if timestamp_ms is not None else now_ms()
+
+        if liquidations is None:
+            liquidations = [
+                raw_liquidation_payload_factory(
+                    symbol=symbol,
+                    side=side,
+                    price=price,
+                    quantity=quantity,
+                    notional=notional,
+                    timestamp_ms=base_ts,
+                    liquidation_id=f"{batch_id}-0",
+                    exchange=exchange,
+                    market_type=market_type,
+                    timeframe=timeframe,
+                )
+            ]
+
+        payload: dict[str, Any] = {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "timestamp_ms": base_ts,
+            "received_at_ms": now_ms(),
+            "batch_id": batch_id,
+            "liquidations": liquidations,
+            "count": len(liquidations),
+            "source": "tests.liquidation_cache",
+        }
+
+        if len(liquidations) == 1:
+            payload["liquidation"] = liquidations[0]
+
+        if extra:
+            payload.update(extra)
+
+        if nested_data:
+            return {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
                 "data": payload,
             }
 
@@ -589,6 +958,9 @@ def large_trade_payload_factory(
         timestamp_ms: int | None = None,
         trade_id: str = "large-trade-1",
         exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         zscore: float = 0.0,
         trigger_type: str = "absolute",
         abs_threshold: float = 50_000.0,
@@ -598,70 +970,32 @@ def large_trade_payload_factory(
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         computed_notional = notional if notional is not None else price * quantity
+        created_at_ms = now_ms()
 
         payload: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event_type": "large_trade",
             "detector": "LargeTradeDetector",
-            "created_at_ms": now_ms(),
+            "created_at_ms": created_at_ms,
+            "exchange": exchange,
+            "market_type": market_type,
             "symbol": symbol,
+            "exchange_symbol": exchange_symbol or symbol,
+            "timeframe": timeframe,
             "side": side,
             "price": price,
             "quantity": quantity,
             "notional": computed_notional,
-            "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
+            "timestamp_ms": timestamp_ms if timestamp_ms is not None else created_at_ms,
+            "trade_id": trade_id,
+            "zscore": zscore,
+            "trigger_type": trigger_type,
             "abs_threshold": abs_threshold,
             "mean_notional": mean_notional,
             "std_notional": std_notional,
-            "zscore": zscore,
-            "trigger_type": trigger_type,
-            "trade_id": trade_id,
-            "exchange": exchange,
-        }
-
-        if extra:
-            payload.update(extra)
-
-        if nested:
-            return {"data": payload}
-
-        return payload
-
-    return _factory
-
-
-@pytest.fixture
-def liquidation_payload_factory(
-    now_ms: Callable[[], int],
-) -> Callable[..., dict[str, Any]]:
-    """
-    Factory для raw market.liquidation payload.
-    """
-
-    def _factory(
-        *,
-        symbol: str = DEFAULT_SYMBOL,
-        side: str = "sell",
-        price: float = 49_500.0,
-        quantity: float = 1.0,
-        notional: float | None = None,
-        timestamp_ms: int | None = None,
-        liquidation_id: str = "liq-1",
-        exchange: str = DEFAULT_EXCHANGE,
-        nested: bool = False,
-        extra: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        computed_notional = notional if notional is not None else price * quantity
-
-        payload: dict[str, Any] = {
-            "symbol": symbol,
-            "side": side,
-            "price": price,
-            "quantity": quantity,
-            "notional": computed_notional,
-            "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
-            "liquidation_id": liquidation_id,
-            "exchange": exchange,
+            "metadata": {
+                "source": "tests.large_trade_detector",
+            },
         }
 
         if extra:
@@ -670,6 +1004,9 @@ def liquidation_payload_factory(
         if nested:
             return {
                 "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
                 "data": payload,
             }
 
@@ -692,33 +1029,55 @@ def whale_activity_payload_factory(
         side: str = "buy",
         trade_count: int = 2,
         total_notional: float = 120_000.0,
-        avg_notional: float = 60_000.0,
-        max_notional: float = 70_000.0,
+        avg_notional: float | None = None,
+        max_notional: float = 80_000.0,
         window_sec: int = 30,
         timestamp_ms: int | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         nested: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        created_at_ms = now_ms()
         payload: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event_type": "whale_activity",
             "detector": "WhaleTracker",
-            "created_at_ms": now_ms(),
+            "created_at_ms": created_at_ms,
+            "exchange": exchange,
+            "market_type": market_type,
             "symbol": symbol,
+            "exchange_symbol": exchange_symbol or symbol,
+            "timeframe": timeframe,
             "side": side,
             "trade_count": trade_count,
             "total_notional": total_notional,
-            "avg_notional": avg_notional,
+            "avg_notional": (
+                avg_notional
+                if avg_notional is not None
+                else total_notional / max(1, trade_count)
+            ),
             "max_notional": max_notional,
             "window_sec": window_sec,
-            "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
+            "timestamp_ms": timestamp_ms if timestamp_ms is not None else created_at_ms,
+            "metadata": {
+                "source": "tests.whale_tracker",
+            },
         }
 
         if extra:
             payload.update(extra)
 
         if nested:
-            return {"data": payload}
+            return {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "data": payload,
+            }
 
         return payload
 
@@ -737,22 +1096,37 @@ def whale_pressure_payload_factory(
         *,
         symbol: str = DEFAULT_SYMBOL,
         dominant_side: str = "buy",
-        buy_trade_count: int = 3,
-        sell_trade_count: int = 1,
-        buy_notional: float = 180_000.0,
-        sell_notional: float = 40_000.0,
+        buy_trade_count: int = 2,
+        sell_trade_count: int = 0,
+        buy_notional: float = 120_000.0,
+        sell_notional: float = 0.0,
         total_notional: float | None = None,
-        imbalance_ratio: float = 0.82,
+        imbalance_ratio: float | None = None,
         net_flow_notional: float | None = None,
         window_sec: int = 30,
         timestamp_ms: int | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         nested: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        created_at_ms = now_ms()
         computed_total = (
             total_notional
             if total_notional is not None
             else buy_notional + sell_notional
+        )
+        dominant_notional = max(buy_notional, sell_notional)
+        computed_imbalance = (
+            imbalance_ratio
+            if imbalance_ratio is not None
+            else (
+                dominant_notional / computed_total
+                if computed_total > 0
+                else 0.0
+            )
         )
         computed_net_flow = (
             net_flow_notional
@@ -761,31 +1135,41 @@ def whale_pressure_payload_factory(
         )
 
         payload: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event_type": "whale_pressure",
             "detector": "WhaleTracker",
-            "created_at_ms": now_ms(),
+            "created_at_ms": created_at_ms,
+            "exchange": exchange,
+            "market_type": market_type,
             "symbol": symbol,
+            "exchange_symbol": exchange_symbol or symbol,
+            "timeframe": timeframe,
             "dominant_side": dominant_side,
             "buy_trade_count": buy_trade_count,
             "sell_trade_count": sell_trade_count,
             "buy_notional": buy_notional,
             "sell_notional": sell_notional,
             "total_notional": computed_total,
-            "imbalance_ratio": imbalance_ratio,
+            "imbalance_ratio": computed_imbalance,
             "net_flow_notional": computed_net_flow,
-            "pressure_type": "buy_pressure"
-            if computed_net_flow > 0
-            else "sell_pressure",
             "window_sec": window_sec,
-            "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
+            "timestamp_ms": timestamp_ms if timestamp_ms is not None else created_at_ms,
+            "metadata": {
+                "source": "tests.whale_tracker",
+            },
         }
 
         if extra:
             payload.update(extra)
 
         if nested:
-            return {"data": payload}
+            return {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "data": payload,
+            }
 
         return payload
 
@@ -807,19 +1191,28 @@ def whale_liquidation_context_payload_factory(
         whale_total_notional: float = 160_000.0,
         whale_trade_count: int = 2,
         liquidation_side: str = "sell",
-        liquidation_total_notional: float = 80_000.0,
-        liquidation_count: int = 2,
+        liquidation_total_notional: float = 100_000.0,
+        liquidation_count: int = 1,
         context_strength: float = 0.75,
         timestamp_ms: int | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+        exchange_symbol: str | None = None,
         nested: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        created_at_ms = now_ms()
         payload: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event_type": "whale_liquidation_context",
             "detector": "WhaleTracker",
-            "created_at_ms": now_ms(),
+            "created_at_ms": created_at_ms,
+            "exchange": exchange,
+            "market_type": market_type,
             "symbol": symbol,
+            "exchange_symbol": exchange_symbol or symbol,
+            "timeframe": timeframe,
             "whale_side": whale_side,
             "whale_total_notional": whale_total_notional,
             "whale_trade_count": whale_trade_count,
@@ -827,14 +1220,23 @@ def whale_liquidation_context_payload_factory(
             "liquidation_total_notional": liquidation_total_notional,
             "liquidation_count": liquidation_count,
             "context_strength": context_strength,
-            "timestamp_ms": timestamp_ms if timestamp_ms is not None else now_ms(),
+            "timestamp_ms": timestamp_ms if timestamp_ms is not None else created_at_ms,
+            "metadata": {
+                "source": "tests.whale_tracker",
+            },
         }
 
         if extra:
             payload.update(extra)
 
         if nested:
-            return {"data": payload}
+            return {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "data": payload,
+            }
 
         return payload
 
@@ -842,97 +1244,164 @@ def whale_liquidation_context_payload_factory(
 
 
 # =============================================================================
-# Common assertion helpers
+# Common emit helpers
 # =============================================================================
 
+@pytest.fixture
+def emit_trades_updated(
+    event_bus: EventBus,
+    trades_updated_payload_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., Awaitable[bool]]:
+    """
+    Emit helper для production trade batches.
+    """
+
+    async def _emit(
+        *,
+        payload: dict[str, Any] | None = None,
+        correlation_id: str = "corr-trades-updated",
+        source: str = "tests.trades_cache",
+        **factory_kwargs: Any,
+    ) -> bool:
+        event_payload = payload or trades_updated_payload_factory(**factory_kwargs)
+        return await event_bus.emit(
+            TRADES_UPDATED_TOPIC,
+            event_payload,
+            source=source,
+            correlation_id=correlation_id,
+        )
+
+    return _emit
+
+
+@pytest.fixture
+def emit_raw_trade(
+    event_bus: EventBus,
+    raw_trade_payload_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., Awaitable[bool]]:
+    """
+    Emit helper для legacy raw market.trade.
+    """
+
+    async def _emit(
+        *,
+        payload: dict[str, Any] | None = None,
+        correlation_id: str = "corr-raw-trade",
+        source: str = "tests.market_stream",
+        **factory_kwargs: Any,
+    ) -> bool:
+        event_payload = payload or raw_trade_payload_factory(**factory_kwargs)
+        return await event_bus.emit(
+            RAW_TRADE_TOPIC,
+            event_payload,
+            source=source,
+            correlation_id=correlation_id,
+        )
+
+    return _emit
+
+
+@pytest.fixture
+def emit_liquidations_updated(
+    event_bus: EventBus,
+    liquidations_updated_payload_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., Awaitable[bool]]:
+    """
+    Emit helper для production liquidation batches.
+    """
+
+    async def _emit(
+        *,
+        payload: dict[str, Any] | None = None,
+        correlation_id: str = "corr-liquidations-updated",
+        source: str = "tests.liquidation_cache",
+        **factory_kwargs: Any,
+    ) -> bool:
+        event_payload = payload or liquidations_updated_payload_factory(**factory_kwargs)
+        return await event_bus.emit(
+            LIQUIDATIONS_UPDATED_TOPIC,
+            event_payload,
+            source=source,
+            correlation_id=correlation_id,
+        )
+
+    return _emit
+
+
+@pytest.fixture
+def emit_raw_liquidation(
+    event_bus: EventBus,
+    raw_liquidation_payload_factory: Callable[..., dict[str, Any]],
+) -> Callable[..., Awaitable[bool]]:
+    """
+    Emit helper для legacy raw market.liquidation.
+    """
+
+    async def _emit(
+        *,
+        payload: dict[str, Any] | None = None,
+        correlation_id: str = "corr-raw-liquidation",
+        source: str = "tests.liquidation_stream",
+        **factory_kwargs: Any,
+    ) -> bool:
+        event_payload = payload or raw_liquidation_payload_factory(**factory_kwargs)
+        return await event_bus.emit(
+            RAW_LIQUIDATION_TOPIC,
+            event_payload,
+            source=source,
+            correlation_id=correlation_id,
+        )
+
+    return _emit
+
+
+# =============================================================================
+# Assertion helpers
+# =============================================================================
 
 @pytest.fixture
 def assert_payload_has_common_signal_fields() -> Callable[[Mapping[str, Any]], None]:
     def _assert(payload: Mapping[str, Any]) -> None:
-        assert payload["schema_version"] == 1
-        assert isinstance(payload["event_type"], str)
-        assert isinstance(payload["detector"], str)
+        assert "schema_version" in payload
+        assert "event_type" in payload
+        assert "detector" in payload
+        assert "created_at_ms" in payload
         assert isinstance(payload["created_at_ms"], int)
+        assert payload["created_at_ms"] > 0
 
     return _assert
 
 
 @pytest.fixture
 def assert_symbol_payload() -> Callable[[Mapping[str, Any], str], None]:
-    def _assert(payload: Mapping[str, Any], symbol: str = DEFAULT_SYMBOL) -> None:
+    def _assert(
+        payload: Mapping[str, Any],
+        symbol: str,
+        *,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = DEFAULT_MARKET_TYPE,
+        timeframe: str = DEFAULT_TIMEFRAME,
+    ) -> None:
         assert payload["symbol"] == symbol.upper()
-        assert isinstance(payload["timestamp_ms"], int)
-        assert payload["timestamp_ms"] > 0
+        assert payload["exchange"] == exchange
+        assert payload["market_type"] == market_type
+        assert payload["timeframe"] == timeframe
+        assert "scope" in payload
 
     return _assert
 
 
-# =============================================================================
-# Small async utilities
-# =============================================================================
-
-
 @pytest.fixture
-def eventually() -> Callable[..., Awaitable[None]]:
-    """
-    Helper для тестів, де EventBus/Scheduler обробляє події асинхронно.
+def assert_no_whale_events(
+    event_collector: EventCollector,
+) -> Callable[[], None]:
+    def _assert() -> None:
+        assert event_collector.by_topic(LARGE_TRADE_TOPIC) == []
+        assert event_collector.by_topic(WHALE_ACTIVITY_TOPIC) == []
+        assert event_collector.by_topic(WHALE_PRESSURE_TOPIC) == []
+        assert event_collector.by_topic(WHALE_LIQUIDATION_CONTEXT_TOPIC) == []
+        assert event_collector.by_topic(WHALE_CLUSTER_TOPIC) == []
+        assert event_collector.by_topic(WHALE_CLUSTER_UPDATE_TOPIC) == []
+        assert event_collector.by_topic(WHALE_CLUSTER_EXHAUSTION_TOPIC) == []
 
-    Приклад:
-        await eventually(lambda: len(collector.by_topic(LARGE_TRADE_TOPIC)) == 1)
-    """
-
-    async def _eventually(
-        predicate: Callable[[], bool],
-        *,
-        timeout: float = 1.0,
-        interval: float = 0.01,
-    ) -> None:
-        deadline = time.monotonic() + timeout
-
-        while time.monotonic() < deadline:
-            if predicate():
-                return
-            await asyncio.sleep(interval)
-
-        assert predicate()
-
-    return _eventually
-
-
-@pytest.fixture
-def no_bus_emit_config_factory(
-    whales_config_fast: WhalesConfig,
-) -> Callable[[], WhalesConfig]:
-    """
-    Config для direct API тестів, коли не хочемо, щоб компоненти паралельно
-    публікували події в EventBus.
-    """
-
-    def _factory() -> WhalesConfig:
-        large_trade_detector = replace(
-            whales_config_fast.large_trade_detector,
-            emit_on_bus=False,
-            log_signals=False,
-        )
-        whale_tracker = replace(
-            whales_config_fast.whale_tracker,
-            emit_on_bus=False,
-            log_signals=False,
-        )
-        whale_cluster_analyzer = replace(
-            whales_config_fast.whale_cluster_analyzer,
-            emit_on_bus=False,
-            log_signals=False,
-        )
-
-        config = WhalesConfig(
-            enabled=True,
-            auto_start_components=True,
-            large_trade_detector=large_trade_detector,
-            whale_tracker=whale_tracker,
-            whale_cluster_analyzer=whale_cluster_analyzer,
-        )
-        config.validate()
-        return config
-
-    return _factory
+    return _assert

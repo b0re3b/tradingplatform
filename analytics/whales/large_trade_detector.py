@@ -227,7 +227,7 @@ class LargeTradeDetector(BaseWhaleComponent):
         try:
             payload = self._payload_from_event(event)
 
-            await self.process_trade_payload(
+            await self.process_trades_payload(
                 payload,
                 correlation_id=self._event_correlation_id(event),
                 source_event_id=getattr(event, "event_id", None),
@@ -252,6 +252,56 @@ class LargeTradeDetector(BaseWhaleComponent):
     # Public processing API
     # =========================================================================
 
+    async def process_trades_payload(
+        self,
+        payload: Mapping[str, Any] | dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+        source_event_id: str | None = None,
+        source_topic: str | None = None,
+        allow_raw_payload: bool = False,
+    ) -> list[LargeTradeSignal]:
+        """
+        Основний production-safe метод обробки trade update payload.
+
+        Production payload очікується з TradesCache / data-layer:
+            market.trades.updated
+
+        На відміну від старого single-trade API, цей метод коректно обробляє
+        batch payload-и:
+            {"trades": [{...}, {...}]}
+            {"data": {"trades": [{...}, {...}]}}
+            {"data": [{...}, {...}]}
+            {"trade": {...}}
+            plain trade dict
+
+        Повертає всі LargeTradeSignal, згенеровані з одного EventBus update.
+        """
+        if not self.config.enabled:
+            return []
+
+        trades = self._normalize_trade_payloads(
+            payload,
+            allow_raw_payload=allow_raw_payload,
+            source_topic=source_topic,
+        )
+        if not trades:
+            return []
+
+        signals: list[LargeTradeSignal] = []
+
+        for trade in trades:
+            signal = await self._process_trade_record(
+                trade,
+                correlation_id=correlation_id,
+                source_event_id=source_event_id,
+                source_topic=source_topic,
+            )
+            if signal is not None:
+                signals.append(signal)
+
+        return signals
+
     async def process_trade_payload(
         self,
         payload: Mapping[str, Any] | dict[str, Any],
@@ -262,30 +312,52 @@ class LargeTradeDetector(BaseWhaleComponent):
         allow_raw_payload: bool = False,
     ) -> LargeTradeSignal | None:
         """
-        Основний метод обробки trade payload.
+        Backward-compatible single-result API.
 
-        Використовується:
-        - EventBus handler-ом;
-        - тестами;
-        - backtesting/replay.
-
-        Production payload очікується з TradesCache / data-layer:
-            market.trades.updated
-
-        Raw payload з exchange adapter дозволений тільки якщо:
-            allow_raw_payload=True
+        Новий production EventBus шлях має використовувати process_trades_payload(),
+        бо market.trades.updated може містити batch trades. Цей метод залишений
+        для tests/backtesting/replay і старого коду: якщо payload містить batch,
+        він обробляє весь batch, але повертає перший згенерований сигнал або None.
         """
-        if not self.config.enabled:
-            return None
-
-        trade = self._normalize_trade_payload(
+        signals = await self.process_trades_payload(
             payload,
-            allow_raw_payload=allow_raw_payload,
+            correlation_id=correlation_id,
+            source_event_id=source_event_id,
             source_topic=source_topic,
+            allow_raw_payload=allow_raw_payload,
         )
-        if trade is None:
-            return None
+        return signals[0] if signals else None
 
+    async def process_trade(
+        self,
+        event: Mapping[str, Any] | dict[str, Any],
+    ) -> LargeTradeSignal | None:
+        """
+        Backward-compatible alias для старого direct API.
+
+        Новий код має використовувати process_trade_payload() для single-result
+        сумісності або process_trades_payload() для batch-aware обробки.
+        """
+        return await self.process_trade_payload(event)
+
+    # =========================================================================
+    # Core detection logic
+    # =========================================================================
+
+    async def _process_trade_record(
+        self,
+        trade: TradeRecord,
+        *,
+        correlation_id: str | None = None,
+        source_event_id: str | None = None,
+        source_topic: str | None = None,
+    ) -> LargeTradeSignal | None:
+        """
+        Обробляє вже нормалізований TradeRecord.
+
+        Винесено окремо, щоб batch path і backward-compatible single path
+        використовували одну й ту саму detection / cooldown / emit логіку.
+        """
         if not self.config.should_process_key(trade.key):
             return None
 
@@ -359,24 +431,77 @@ class LargeTradeDetector(BaseWhaleComponent):
                 signal,
                 correlation_id=correlation_id,
                 source_event_id=source_event_id,
+                source_topic=source_topic,
             )
 
         return signal
 
-    async def process_trade(
+    def _normalize_trade_payloads(
         self,
-        event: Mapping[str, Any] | dict[str, Any],
-    ) -> LargeTradeSignal | None:
+        event_payload: Mapping[str, Any] | dict[str, Any],
+        *,
+        allow_raw_payload: bool,
+        source_topic: str | None = None,
+    ) -> list[TradeRecord]:
         """
-        Backward-compatible alias для старого direct API.
+        Нормалізація event/update payload у список TradeRecord.
 
-        Новий код має використовувати process_trade_payload().
+        Production підтримує data-layer payload-и:
+        - {"trade": {...}}
+        - {"trades": [{...}, ...]}
+        - {"data": {"trade": {...}}}
+        - {"data": {"trades": [{...}, ...]}}
+        - {"data": [{...}, ...]}
+        - plain trade dict
+
+        Event-level поля exchange/market_type/symbol/timeframe використовуються
+        як fallback для кожного child trade з batch payload.
         """
-        return await self.process_trade_payload(event)
+        try:
+            event = dict(event_payload)
 
-    # =========================================================================
-    # Core detection logic
-    # =========================================================================
+            if self._is_raw_topic(source_topic) and not allow_raw_payload:
+                self.logger.warning(
+                    "Trade payload dropped: raw topic is not allowed in production path",
+                    extra={
+                        "component": self.component_name,
+                        "source_topic": source_topic,
+                    },
+                )
+                return []
+
+            raw_payloads = self._extract_trade_payloads(event)
+            if not raw_payloads:
+                self.logger.debug(
+                    "Trade event dropped: cannot extract trade payloads",
+                    extra={
+                        "component": self.component_name,
+                        "payload_keys": list(event.keys()),
+                    },
+                )
+                return []
+
+            trades: list[TradeRecord] = []
+            for raw_payload in raw_payloads:
+                trade = self._normalize_single_trade_payload(
+                    event,
+                    raw_payload,
+                    source_topic=source_topic,
+                )
+                if trade is not None:
+                    trades.append(trade)
+
+            return trades
+
+        except Exception:
+            self.logger.exception(
+                "Failed to normalize trade payloads",
+                extra={
+                    "component": self.component_name,
+                    "source_topic": source_topic,
+                },
+            )
+            return []
 
     def _normalize_trade_payload(
         self,
@@ -386,11 +511,28 @@ class LargeTradeDetector(BaseWhaleComponent):
         source_topic: str | None = None,
     ) -> TradeRecord | None:
         """
-        Нормалізація trade payload у TradeRecord.
+        Backward-compatible single-trade normalizer.
 
-        Production підтримує data-layer payload-и:
-        - payload["trade"] / payload["data"] / plain payload;
-        - payload["trades"] як список — бере останній trade.
+        Якщо payload містить batch, повертає останній валідний TradeRecord,
+        щоб не ламати старий код, який очікував single object.
+        Production detection path використовує _normalize_trade_payloads().
+        """
+        trades = self._normalize_trade_payloads(
+            event_payload,
+            allow_raw_payload=allow_raw_payload,
+            source_topic=source_topic,
+        )
+        return trades[-1] if trades else None
+
+    def _normalize_single_trade_payload(
+        self,
+        event: Mapping[str, Any],
+        raw_payload: Mapping[str, Any],
+        *,
+        source_topic: str | None = None,
+    ) -> TradeRecord | None:
+        """
+        Нормалізація одного raw trade payload у TradeRecord.
 
         Підтримує поля:
         - exchange;
@@ -404,37 +546,9 @@ class LargeTradeDetector(BaseWhaleComponent):
         - timestamp_ms / timestamp / ts / T / E.
         """
         try:
-            event = dict(event_payload)
-
-            if self._is_raw_topic(source_topic) and not allow_raw_payload:
-                self.logger.warning(
-                    "Trade payload dropped: raw topic is not allowed in production path",
-                    extra={
-                        "component": self.component_name,
-                        "source_topic": source_topic,
-                    },
-                )
-                return None
-
-            raw_payload = self._extract_trade_payload(event)
-            if raw_payload is None:
-                self.logger.debug(
-                    "Trade event dropped: cannot extract trade payload",
-                    extra={
-                        "component": self.component_name,
-                        "payload_keys": list(event.keys()),
-                    },
-                )
-                return None
-
             payload = dict(raw_payload)
 
-            symbol = self._normalize_symbol(
-                payload.get("symbol")
-                or payload.get("s")
-                or payload.get("instrument")
-                or event.get("symbol")
-            )
+            symbol = self._extract_symbol_from_trade_payload(payload, event)
             if not symbol:
                 self.logger.debug(
                     "Trade event dropped: missing symbol",
@@ -527,7 +641,8 @@ class LargeTradeDetector(BaseWhaleComponent):
                 fallback_symbol=normalized_symbol,
             )
 
-            metadata = dict(payload.get("metadata") or {})
+            metadata = dict(event.get("metadata") or {})
+            metadata.update(dict(payload.get("metadata") or {}))
             metadata.update(
                 {
                     "source_topic": source_topic,
@@ -546,13 +661,13 @@ class LargeTradeDetector(BaseWhaleComponent):
                 market_type=normalized_market_type,
                 timeframe=normalized_timeframe,
                 exchange_symbol=normalized_exchange_symbol,
-                raw_event=event,
+                raw_event=dict(payload),
                 metadata=metadata,
             )
 
         except Exception:
             self.logger.exception(
-                "Failed to normalize trade payload",
+                "Failed to normalize single trade payload",
                 extra={
                     "component": self.component_name,
                     "source_topic": source_topic,
@@ -561,34 +676,57 @@ class LargeTradeDetector(BaseWhaleComponent):
             return None
 
     @staticmethod
-    def _extract_trade_payload(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    def _extract_trade_payloads(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         """
-        Витягує один trade payload із data-layer event.
+        Витягує всі trade payload-и з data-layer event.
 
         Підтримує:
         - {"trade": {...}}
-        - {"data": {...}}
         - {"trades": [{...}, ...]}
+        - {"data": {"trade": {...}}}
+        - {"data": {"trades": [{...}, ...]}}
+        - {"data": [{...}, ...]}
         - plain trade dict
         """
         trade = event.get("trade")
         if isinstance(trade, Mapping):
-            return trade
+            return [trade]
+
+        trades = event.get("trades")
+        if isinstance(trades, list):
+            return [item for item in trades if isinstance(item, Mapping)]
 
         data = event.get("data")
         if isinstance(data, Mapping):
-            return data
+            nested_trade = data.get("trade")
+            if isinstance(nested_trade, Mapping):
+                return [nested_trade]
 
-        trades = event.get("trades")
-        if isinstance(trades, list) and trades:
-            last_trade = trades[-1]
-            if isinstance(last_trade, Mapping):
-                return last_trade
+            nested_trades = data.get("trades")
+            if isinstance(nested_trades, list):
+                return [item for item in nested_trades if isinstance(item, Mapping)]
+
+            if "price" in data or "p" in data:
+                return [data]
+
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, Mapping)]
 
         if "price" in event or "p" in event:
-            return event
+            return [event]
 
-        return None
+        return []
+
+    @staticmethod
+    def _extract_trade_payload(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """
+        Backward-compatible single payload extractor.
+
+        Якщо event містить batch trades, повертає останній trade, як і стара
+        реалізація. Новий production path використовує _extract_trade_payloads().
+        """
+        payloads = LargeTradeDetector._extract_trade_payloads(event)
+        return payloads[-1] if payloads else None
 
     def _passes_basic_filters(self, trade: TradeRecord) -> bool:
         if trade.notional < self.config.min_notional_filter:
@@ -647,6 +785,7 @@ class LargeTradeDetector(BaseWhaleComponent):
         *,
         correlation_id: str | None = None,
         source_event_id: str | None = None,
+        source_topic: str | None = None,
     ) -> None:
         if not self.config.emit_on_bus:
             return
@@ -656,6 +795,8 @@ class LargeTradeDetector(BaseWhaleComponent):
         }
         if source_event_id is not None:
             headers["source_event_id"] = source_event_id
+        if source_topic is not None:
+            headers["source_topic"] = source_topic
 
         await self._emit(
             self.config.output_event_name,
@@ -891,6 +1032,8 @@ class LargeTradeDetector(BaseWhaleComponent):
             {
                 "enabled": self.config.enabled,
                 "tracked_scopes": len(self._stats),
+                "state_locks": len(self._state_locks),
+                "locking": "per_whale_key",
                 "production_input_topics": list(self.config.production_input_topics),
                 "legacy_raw_input_topics": list(self.config.legacy_raw_input_topics),
                 "allow_legacy_raw_topics": self.config.allow_legacy_raw_topics,
@@ -903,6 +1046,31 @@ class LargeTradeDetector(BaseWhaleComponent):
     # =========================================================================
     # Parsing / normalization helpers
     # =========================================================================
+
+    def _extract_symbol_from_trade_payload(
+        self,
+        payload: Mapping[str, Any],
+        event: Mapping[str, Any],
+    ) -> str | None:
+        """
+        Витягує symbol для одного child trade payload.
+
+        Важливе правило для batch payload-ів:
+        - якщо child trade явно містить symbol/s/instrument, але значення пусте
+          або невалідне — trade відкидається;
+        - fallback на event-level symbol дозволений тільки якщо child trade
+          взагалі не містить жодного symbol-поля.
+
+        Це не дозволяє невалідному child trade на кшталт {"symbol": ""}
+        випадково стати валідним через parent batch symbol.
+        """
+        child_symbol_keys = ("symbol", "s", "instrument")
+
+        for key in child_symbol_keys:
+            if key in payload:
+                return self._normalize_symbol(payload.get(key))
+
+        return self._normalize_symbol(event.get("symbol"))
 
     @staticmethod
     def _normalize_symbol(value: Any) -> str | None:
