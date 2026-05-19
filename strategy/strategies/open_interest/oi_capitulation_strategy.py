@@ -1,3 +1,5 @@
+# trading_system/strategy/strategies/open_interest/oi_capitulation_strategy.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -13,25 +15,49 @@ from analytics.open_interest.models import (
     OIFeatures,
     OIRegimeResult,
 )
-from strategy.config import StrategyConfig
-from strategy.enums import (
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+from .base import (
+    OPEN_INTEREST_FEATURES,
+    OpenInterestStrategyConfig,
+    OpenInterestTradingStrategy,
+)
+from .utils import (
+    ScoreBreakdown,
+    confidence_from_components,
+    contrarian_side_from_crowding,
+    divergence_side_hint,
+    extract_aggressive_flow_imbalance,
+    extract_confidence,
+    extract_event_time,
+    extract_funding_rate,
+    extract_liquidation_pressure,
+    extract_oi_delta_pct,
+    extract_oi_pressure_score,
+    extract_price_delta_pct,
+    extract_reasons,
+    extract_score,
+    freshness_score,
+    get_attr_or_key,
+    is_directional_side,
+    is_stale,
+    reversal_side_from_flush,
+    serialize_for_metadata,
+    side_from_oi_regime,
+    unit_score,
+    weighted_score,
+)
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
     MarketRegime,
     SetupType,
-    SignalOrigin,
+    SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
     Timeframe,
-    TriggerType,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    SignalContext,
-    StrategyEvaluation,
-    StrategyMetadata,
-    StrategySignal,
-)
-from .base import OpenInterestStrategyBase
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)
@@ -41,14 +67,14 @@ class OICapitulationPayload:
 
     Source of truth:
         analytics.open_interest:
-        - OIRegimeResult(regime=CAPITULATION)
-        - OIAnomalyResult із deleveraging/liquidation-driven anomaly
-        - OIFeatures
-        - optional OIDivergenceResult
+        - OIRegimeResult(regime=CAPITULATION);
+        - OIAnomalyResult із forced deleveraging / liquidation-driven anomaly;
+        - OIFeatures;
+        - optional OIDivergenceResult.
 
-    Стратегія не детектить capitulation самостійно. Вона інтерпретує
-    готовий analytics context і будує reversal/risk signal лише коли
-    capitulation має достатній directional context.
+    Стратегія не детектить capitulation самостійно. Вона інтерпретує готовий
+    analytics context і будує reversal/risk signal лише коли capitulation має
+    достатній directional context.
     """
 
     regime: OIRegimeResult | None = None
@@ -68,7 +94,7 @@ class OICapitulationPayload:
     def has_capitulation_anomaly(self) -> bool:
         return (
             self.anomaly is not None
-            and self.anomaly.detected
+            and bool(self.anomaly.detected)
             and self.anomaly.anomaly_type
             in {
                 OIAnomalyType.LIQUIDATION_DRIVEN_OI_DROP,
@@ -86,65 +112,204 @@ class OICapitulationPayload:
         values: list[float] = []
 
         if self.regime is not None:
-            values.append(self.regime.confidence)
+            values.append(unit_score(self.regime.confidence))
 
         if self.anomaly is not None and self.anomaly.detected:
-            values.append(self.anomaly.confidence)
+            values.append(unit_score(self.anomaly.confidence))
 
         if self.analysis_confidence > 0:
-            values.append(self.analysis_confidence)
+            values.append(unit_score(self.analysis_confidence))
 
         if not values:
             return 0.0
 
-        return sum(values) / len(values)
+        return unit_score(sum(values) / len(values))
 
     @property
     def score(self) -> float:
         values: list[float] = []
 
         if self.regime is not None:
-            values.append(self.regime.score)
+            values.append(extract_score(self.regime, default=self.regime.confidence))
 
         if self.anomaly is not None and self.anomaly.detected:
-            values.append(self.anomaly.score)
+            values.append(extract_score(self.anomaly, default=self.anomaly.confidence))
 
         if not values:
             return self.confidence
 
-        return max(values)
+        return unit_score(max(values))
 
 
-class OICapitulationStrategy(OpenInterestStrategyBase):
+@dataclass(slots=True)
+class OICapitulationStrategyConfig(OpenInterestStrategyConfig):
     """
-    Strategy для capitulation / forced deleveraging reversal context.
+    Unified OI capitulation / forced deleveraging reversal strategy config.
 
-    Важливо:
-    - strategy не читає raw market data;
-    - strategy не рахує regime/anomaly/features самостійно;
-    - strategy працює з готовими результатами analytics.open_interest;
-    - основний input — context.open_interest = OIAnalysisResult.to_dict();
-    - specialized analytics.oi.capitulation payload також підтримується через base.
+    Strategy idea:
+    - read normalized OI regime/anomaly/features context from StrategyContext;
+    - accept capitulation regime or liquidation-driven/deleveraging anomaly;
+    - generate reversal signal after forced unwind / OI collapse;
+    - use divergence, funding, liquidations and flow only as context;
+    - return internal StrategySignal only;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
     """
 
-    STRATEGY_NAME = "oi_capitulation_strategy"
-    DEFAULT_PRIORITY = 95
+    require_detected_context: bool = True
+    require_actionable_side: bool = True
+    require_fresh_capitulation: bool = True
+    require_features_for_direction: bool = True
 
-    REQUIRED_FEATURES: set[str] = {
-        "analytics.open_interest.regime",
-        "analytics.open_interest.anomaly",
-        "analytics.open_interest.features",
-    }
+    min_capitulation_confidence: float = 0.62
+    min_capitulation_score: float = 0.40
+    min_analysis_confidence_bonus_threshold: float = 0.50
 
-    MINIMUM_OI_CONTEXT_KEYS: tuple[str, ...] = (
-        "oi.regime.type",
-        "oi.anomaly.type",
-        "oi.anomaly.detected",
-        "oi.features.price_delta_pct",
-        "oi.features.oi_delta_pct",
-        "open_interest.regime.type",
-        "open_interest.anomaly.type",
+    min_regime_confidence: float = 0.55
+    min_anomaly_confidence: float = 0.55
+
+    min_abs_price_delta_for_flush: float = 0.0
+    min_abs_oi_delta_for_flush: float = 0.0
+    liquidation_flush_threshold: float = 0.20
+    pressure_flush_threshold: float = 0.15
+    flow_stabilization_threshold: float = 0.05
+
+    allow_regime_only_capitulation: bool = True
+    allow_anomaly_only_capitulation: bool = True
+    allow_divergence_confirmation: bool = True
+
+    aligned_divergence_bonus: float = 0.06
+    opposing_divergence_penalty: float = 0.10
+    capitulation_regime_bonus: float = 0.08
+    capitulation_anomaly_bonus: float = 0.08
+    liquidation_flush_bonus: float = 0.06
+    funding_extreme_bonus: float = 0.03
+    stabilization_bonus: float = 0.04
+
+    score_capitulation_weight: float = 0.46
+    score_features_weight: float = 0.28
+    score_divergence_weight: float = 0.10
+    score_analysis_weight: float = 0.08
+    score_freshness_weight: float = 0.08
+
+    confidence_capitulation_weight: float = 0.55
+    confidence_context_weight: float = 0.25
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    tag_oi_capitulation: str = "oi_capitulation"
+    tag_capitulation: str = "capitulation"
+    tag_deleveraging: str = "deleveraging"
+    tag_liquidations: str = "liquidations"
+    tag_forced_unwind: str = "forced_unwind"
+    tag_reversal: str = "reversal"
+    tag_risk: str = "risk"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.REVERSAL
+
+    required_open_interest_features: tuple[str, ...] = (
+        OPEN_INTEREST_FEATURES.REGIME,
+        OPEN_INTEREST_FEATURES.ANOMALY,
+        OPEN_INTEREST_FEATURES.FEATURES,
     )
+
+    def validate(self) -> None:
+        OpenInterestStrategyConfig.validate(self)
+
+        unit_fields = {
+            "min_capitulation_confidence": self.min_capitulation_confidence,
+            "min_capitulation_score": self.min_capitulation_score,
+            "min_analysis_confidence_bonus_threshold": self.min_analysis_confidence_bonus_threshold,
+            "min_regime_confidence": self.min_regime_confidence,
+            "min_anomaly_confidence": self.min_anomaly_confidence,
+            "liquidation_flush_threshold": self.liquidation_flush_threshold,
+            "pressure_flush_threshold": self.pressure_flush_threshold,
+            "flow_stabilization_threshold": self.flow_stabilization_threshold,
+            "aligned_divergence_bonus": self.aligned_divergence_bonus,
+            "opposing_divergence_penalty": self.opposing_divergence_penalty,
+            "capitulation_regime_bonus": self.capitulation_regime_bonus,
+            "capitulation_anomaly_bonus": self.capitulation_anomaly_bonus,
+            "liquidation_flush_bonus": self.liquidation_flush_bonus,
+            "funding_extreme_bonus": self.funding_extreme_bonus,
+            "stabilization_bonus": self.stabilization_bonus,
+        }
+
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
+        if self.min_abs_price_delta_for_flush < 0:
+            raise StrategyConfigError("min_abs_price_delta_for_flush must be >= 0")
+
+        if self.min_abs_oi_delta_for_flush < 0:
+            raise StrategyConfigError("min_abs_oi_delta_for_flush must be >= 0")
+
+        score_weights = {
+            "score_capitulation_weight": self.score_capitulation_weight,
+            "score_features_weight": self.score_features_weight,
+            "score_divergence_weight": self.score_divergence_weight,
+            "score_analysis_weight": self.score_analysis_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+
+        confidence_weights = {
+            "confidence_capitulation_weight": self.confidence_capitulation_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_oi_capitulation",
+            "tag_capitulation",
+            "tag_deleveraging",
+            "tag_liquidations",
+            "tag_forced_unwind",
+            "tag_reversal",
+            "tag_risk",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_open_interest_features:
+            raise StrategyConfigError("required_open_interest_features cannot be empty")
+
+        for feature in self.required_open_interest_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_open_interest_features cannot contain empty feature names"
+                )
+
+
+class OICapitulationStrategy(OpenInterestTradingStrategy):
+    """
+    Unified OI capitulation / forced deleveraging strategy.
+
+    Input:
+        StrategyContext with FeatureSource.OPEN_INTEREST domain data / features.
+
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
+    """
+
+    component_namespace = "strategy.open_interest.capitulation"
+    category: StrategyCategory = StrategyCategory.OPEN_INTEREST
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     CAPITULATION_ANOMALIES: set[OIAnomalyType] = {
         OIAnomalyType.LIQUIDATION_DRIVEN_OI_DROP,
@@ -161,34 +326,60 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
     def __init__(
         self,
         config: StrategyConfig,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        open_interest_config: OICapitulationStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
-        super().__init__(config=config, event_bus=event_bus)
+        resolved_open_interest_config = (
+            open_interest_config or OICapitulationStrategyConfig()
+        )
+        resolved_open_interest_config.validate()
+
+        super().__init__(
+            config=config,
+            event_bus=event_bus,
+            scheduler=scheduler,
+            definition=definition,
+            open_interest_config=resolved_open_interest_config,
+            service_name=service_name,
+        )
+
+        self.capitulation_config: OICapitulationStrategyConfig = (
+            resolved_open_interest_config
+        )
+
+    @property
+    def strategy_name(self) -> str:
+        return "oi_capitulation"
 
     @property
     def metadata(self) -> StrategyMetadata:
         return StrategyMetadata(
-            strategy_name=self.STRATEGY_NAME,
+            strategy_name=self.strategy_name,
             category=StrategyCategory.OPEN_INTEREST,
             timeframe=Timeframe.M1,
             tags=[
-                "open_interest",
-                "capitulation",
-                "deleveraging",
-                "liquidations",
-                "forced_unwind",
-                "reversal",
-                "risk",
+                self.capitulation_config.tag_open_interest,
+                self.capitulation_config.tag_oi_capitulation,
+                self.capitulation_config.tag_capitulation,
+                self.capitulation_config.tag_deleveraging,
+                self.capitulation_config.tag_liquidations,
+                self.capitulation_config.tag_forced_unwind,
+                self.capitulation_config.tag_reversal,
+                self.capitulation_config.tag_risk,
                 "analytics_open_interest",
             ],
-            version="1.0.0",
+            version="2.0.0",
             description=(
-                "Інтерпретує capitulation / forced deleveraging context з "
-                "analytics.open_interest і будує reversal signals з урахуванням "
-                "liquidations, OI collapse, price shock, funding, orderflow, "
-                "divergence та full OIFeatures context."
+                "Інтерпретує OI capitulation / forced deleveraging context з "
+                "analytics.open_interest і будує internal reversal StrategySignal "
+                "з урахуванням OI collapse, liquidation pressure, funding, "
+                "divergence та futures context."
             ),
-            required_features=set(self.REQUIRED_FEATURES),
+            required_features=set(self.required_features()),
             supported_regimes={
                 MarketRegime.TRENDING_UP,
                 MarketRegime.TRENDING_DOWN,
@@ -201,182 +392,171 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
             metadata={
                 "source": "analytics.open_interest",
                 "strategy_type": "capitulation_reversal",
-                "base_class": "OpenInterestStrategyBase",
+                "base_class": "OpenInterestTradingStrategy",
                 "canonical_payload": "OIAnalysisResult",
                 "primary_regime": OIRegime.CAPITULATION.value,
+                "primary_anomalies": [
+                    item.value for item in sorted(
+                        self.CAPITULATION_ANOMALIES,
+                        key=lambda enum_item: enum_item.value,
+                    )
+                ],
                 "uses_features": True,
                 "uses_regime": True,
                 "uses_anomaly": True,
                 "uses_divergence": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
             },
         )
 
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        try:
-            self.validate_context(context)
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.capitulation_config.required_open_interest_features
+        )
 
-            evaluation = StrategyEvaluation(
-                strategy_name=self.STRATEGY_NAME,
-                symbol=context.symbol,
-                timestamp=context.timestamp,
-                signal=None,
-                passed=False,
-                score=0.0,
-                confidence=0.0,
-                reasons=[],
-                metadata={},
+    async def generate_signal(
+        self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_open_interest_data(
+            context,
+            tuple(self.capitulation_config.required_open_interest_features),
+        ):
+            return None
+
+        if self.has_stale_open_interest_features(
+            context,
+            tuple(self.capitulation_config.required_open_interest_features),
+        ):
+            return None
+
+        payload = self._extract_payload(context)
+        if payload is None:
+            return None
+
+        event_time = self._event_time(payload)
+        if (
+            self.capitulation_config.require_fresh_capitulation
+            and is_stale(
+                event_time=event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.capitulation_config.stale_feature_max_age_seconds,
             )
+        ):
+            return None
 
-            strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
+        if self.capitulation_config.require_detected_context and not payload.detected:
+            return None
 
-            runtime_allowed, runtime_reason = self.is_strategy_runtime_allowed(context)
-            if not runtime_allowed:
-                evaluation.reasons.append(runtime_reason or "strategy_runtime_not_allowed")
-                return evaluation
+        if not self._passes_capitulation_thresholds(payload):
+            return None
 
-            if strategy_cfg is None:
-                evaluation.reasons.append("strategy_config_not_found")
-                return evaluation
+        side = self._map_capitulation_to_side(payload)
+        if self.capitulation_config.require_actionable_side and not is_directional_side(side):
+            return None
 
-            if not self.context_has_any_oi_data(context, self.MINIMUM_OI_CONTEXT_KEYS):
-                evaluation.reasons.append("missing_open_interest_context")
-                return evaluation
+        blocked_reason = self._block_reason(payload=payload, side=side)
+        if blocked_reason is not None:
+            return None
 
-            if self.has_stale_required_features(context):
-                evaluation.reasons.append("required_oi_features_are_stale")
-                return evaluation
+        setup_type = self._map_setup_type(payload)
 
-            payload = self._extract_payload(context)
-            if payload is None:
-                evaluation.reasons.append("missing_oi_capitulation_context")
-                return evaluation
+        breakdown = self._build_score_breakdown(
+            context=context,
+            payload=payload,
+            side=side,
+            event_time=event_time,
+        )
 
-            evaluation.metadata.update(
+        if breakdown.score < self.capitulation_config.min_signal_score:
+            return None
+
+        if breakdown.confidence < self.capitulation_config.min_signal_confidence:
+            return None
+
+        source_features = self._source_features(payload)
+        tags = self._tags(payload=payload, setup_type=setup_type)
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "oi_capitulation_signal",
+                    f"side:{side.value}",
+                    f"setup_type:{setup_type.value}",
+                    *payload.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "open_interest_setup_family": "oi_capitulation",
+            "open_interest_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "event_time": event_time.isoformat() if event_time else None,
+            "regime": serialize_for_metadata(payload.regime),
+            "anomaly": serialize_for_metadata(payload.anomaly),
+            "features": serialize_for_metadata(payload.features),
+            "divergence": serialize_for_metadata(payload.divergence),
+            "raw": serialize_for_metadata(payload.raw),
+            "capitulation_detected": payload.detected,
+            "has_capitulation_regime": payload.has_capitulation_regime,
+            "has_capitulation_anomaly": payload.has_capitulation_anomaly,
+            "capitulation_confidence": payload.confidence,
+            "capitulation_score": payload.score,
+            "analysis_confidence": payload.analysis_confidence,
+            "mapped_side": side.value,
+            "setup_type": setup_type.value,
+        }
+
+        if payload.regime is not None:
+            metadata.update(
                 {
-                    "oi_payload": payload.raw,
-                    "oi_capitulation_detected": payload.detected,
-                    "oi_has_capitulation_regime": payload.has_capitulation_regime,
-                    "oi_has_capitulation_anomaly": payload.has_capitulation_anomaly,
-                    "oi_capitulation_confidence": payload.confidence,
-                    "oi_capitulation_score": payload.score,
-                    "oi_analysis_confidence": payload.analysis_confidence,
-                    "strategy_market_regime": self.get_market_regime(context).value,
+                    "oi_regime": payload.regime.regime.value,
+                    "oi_regime_confidence": payload.regime.confidence,
+                    "oi_regime_score": payload.regime.score,
                 }
             )
 
-            if payload.regime is not None:
-                evaluation.metadata.update(
-                    {
-                        "oi_regime": payload.regime.regime.value,
-                        "oi_regime_confidence": payload.regime.confidence,
-                        "oi_regime_score": payload.regime.score,
-                    }
-                )
-
-            if payload.anomaly is not None:
-                evaluation.metadata.update(
-                    {
-                        "oi_anomaly_detected": payload.anomaly.detected,
-                        "oi_anomaly_type": payload.anomaly.anomaly_type.value,
-                        "oi_anomaly_strength": payload.anomaly.strength.value,
-                        "oi_anomaly_confidence": payload.anomaly.confidence,
-                        "oi_anomaly_score": payload.anomaly.score,
-                    }
-                )
-
-            if payload.divergence is not None:
-                evaluation.metadata.update(
-                    {
-                        "oi_divergence_detected": payload.divergence.detected,
-                        "oi_divergence_type": payload.divergence.divergence_type.value,
-                        "oi_divergence_confidence": payload.divergence.confidence,
-                        "oi_divergence_score": payload.divergence.score,
-                    }
-                )
-
-            if not payload.detected:
-                evaluation.reasons.append("capitulation_not_detected")
-                evaluation.score = payload.score
-                evaluation.confidence = payload.confidence
-                return evaluation
-
-            regime_allowed, regime_reason = self.is_market_regime_allowed(context)
-            if not regime_allowed:
-                evaluation.reasons.append(regime_reason or "regime_not_allowed")
-                return evaluation
-
-            side = self._map_capitulation_to_side(payload)
-            if side is SignalSide.UNKNOWN:
-                evaluation.reasons.append("capitulation_not_directional")
-                evaluation.score = payload.score
-                evaluation.confidence = payload.confidence
-                return evaluation
-
-            blocked_reason = self._block_reason(payload=payload, side=side)
-            if blocked_reason is not None:
-                evaluation.reasons.append(blocked_reason)
-                evaluation.score = payload.score
-                evaluation.confidence = payload.confidence
-                return evaluation
-
-            setup_type = self._map_setup_type(payload)
-            score = self._compute_score(
-                context=context,
-                payload=payload,
-                side=side,
-            )
-            confidence = self._compute_confidence(
-                payload=payload,
-                side=side,
-            )
-
-            evaluation.score = score
-            evaluation.confidence = confidence
-
-            if confidence < strategy_cfg.runtime.min_confidence:
-                evaluation.reasons.append("confidence_below_strategy_threshold")
-                evaluation.metadata["min_confidence_required"] = strategy_cfg.runtime.min_confidence
-                return evaluation
-
-            if score < strategy_cfg.runtime.min_score:
-                evaluation.reasons.append("score_below_strategy_threshold")
-                evaluation.metadata["min_score_required"] = strategy_cfg.runtime.min_score
-                return evaluation
-
-            signal = self._build_signal(
-                context=context,
-                payload=payload,
-                side=side,
-                setup_type=setup_type,
-                score=score,
-                confidence=confidence,
-            )
-            signal.validate()
-
-            evaluation.signal = signal
-            evaluation.passed = True
-            evaluation.reasons.extend(payload.reasons)
-            evaluation.reasons.append("oi_capitulation_signal_generated")
-            evaluation.metadata.update(
+        if payload.anomaly is not None:
+            metadata.update(
                 {
-                    "signal_side": side.value,
-                    "setup_type": setup_type.value,
+                    "oi_anomaly_detected": payload.anomaly.detected,
+                    "oi_anomaly_type": payload.anomaly.anomaly_type.value,
+                    "oi_anomaly_confidence": payload.anomaly.confidence,
+                    "oi_anomaly_score": payload.anomaly.score,
+                    "oi_anomaly_strength": self._anomaly_strength(payload),
                 }
             )
-            return evaluation
 
-        except StrategyEvaluationError:
-            raise
-        except Exception as exc:
-            self.logger.exception(
-                "Strategy evaluation failed | strategy=%s symbol=%s",
-                self.STRATEGY_NAME,
-                getattr(context, "symbol", "UNKNOWN"),
+        if payload.divergence is not None:
+            metadata.update(
+                {
+                    "oi_divergence_detected": payload.divergence.detected,
+                    "oi_divergence_type": payload.divergence.divergence_type.value,
+                    "oi_divergence_confidence": payload.divergence.confidence,
+                    "oi_divergence_score": payload.divergence.score,
+                }
             )
-            raise StrategyEvaluationError(
-                f"{self.STRATEGY_NAME}: failed to evaluate context for "
-                f"{getattr(context, 'symbol', 'UNKNOWN')}: {exc}"
-            ) from exc
+
+        return self.build_open_interest_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.capitulation_config.default_priority,
+        )
 
     # ------------------------------------------------------------------
     # Extraction
@@ -384,7 +564,7 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
 
     def _extract_payload(
         self,
-        context: SignalContext,
+        context: StrategyContext,
     ) -> OICapitulationPayload | None:
         regime = self.extract_oi_regime_result(context)
         anomaly = self.extract_oi_anomaly_result(context)
@@ -397,13 +577,19 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
         reasons: list[str] = []
 
         if regime is not None:
-            reasons.extend(regime.reasons)
+            reasons.extend(extract_reasons(regime))
 
         if anomaly is not None and anomaly.detected:
-            reasons.extend(f"anomaly:{reason}" for reason in anomaly.reasons)
+            reasons.extend(
+                f"anomaly:{reason}"
+                for reason in extract_reasons(anomaly)
+            )
 
         if divergence is not None and divergence.detected:
-            reasons.extend(f"divergence:{reason}" for reason in divergence.reasons)
+            reasons.extend(
+                f"divergence:{reason}"
+                for reason in extract_reasons(divergence)
+            )
 
         return OICapitulationPayload(
             regime=regime,
@@ -412,8 +598,53 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
             divergence=divergence,
             analysis_confidence=self.oi_analysis_confidence(context),
             reasons=list(dict.fromkeys(reasons)),
-            raw=self.extract_oi_domain(context),
+            raw=self.open_interest_domain(context),
         )
+
+    def _event_time(self, payload: OICapitulationPayload) -> Any:
+        if payload.anomaly is not None:
+            anomaly_time = extract_event_time(payload.anomaly)
+            if anomaly_time is not None:
+                return anomaly_time
+
+        if payload.regime is not None:
+            regime_time = extract_event_time(payload.regime)
+            if regime_time is not None:
+                return regime_time
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Detection / threshold checks
+    # ------------------------------------------------------------------
+
+    def _passes_capitulation_thresholds(self, payload: OICapitulationPayload) -> bool:
+        if not payload.detected:
+            return False
+
+        if payload.confidence < self.capitulation_config.min_capitulation_confidence:
+            return False
+
+        if payload.score < self.capitulation_config.min_capitulation_score:
+            return False
+
+        if payload.regime is not None:
+            if payload.regime.regime is OIRegime.CAPITULATION:
+                if payload.regime.confidence < self.capitulation_config.min_regime_confidence:
+                    return False
+
+        if payload.anomaly is not None and payload.anomaly.detected:
+            if payload.anomaly.anomaly_type in self.CAPITULATION_ANOMALIES:
+                if payload.anomaly.confidence < self.capitulation_config.min_anomaly_confidence:
+                    return False
+
+        if payload.has_capitulation_regime and not self.capitulation_config.allow_regime_only_capitulation:
+            return payload.has_capitulation_anomaly
+
+        if payload.has_capitulation_anomaly and not self.capitulation_config.allow_anomaly_only_capitulation:
+            return payload.has_capitulation_regime
+
+        return True
 
     # ------------------------------------------------------------------
     # Direction / setup mapping
@@ -425,53 +656,84 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
     ) -> SignalSide:
         """
         Capitulation зазвичай є reversal context:
-        - сильний down flush / long liquidation -> LONG reversal;
-        - blow-off / short liquidation / upside squeeze exhaustion -> SHORT reversal.
+        - downside OI flush / long liquidation pressure -> LONG;
+        - upside squeeze exhaustion / short liquidation pressure -> SHORT.
         """
         features = payload.features
 
-        if features is None:
-            return SignalSide.UNKNOWN
+        if features is not None:
+            side = reversal_side_from_flush(features)
+            if is_directional_side(side):
+                return side
 
-        if features.liquidation_imbalance is not None:
-            if features.liquidation_imbalance <= -0.20:
-                return SignalSide.LONG
+        if payload.anomaly is not None and payload.anomaly.detected:
+            side = self._side_from_capitulation_anomaly(payload)
+            if is_directional_side(side):
+                return side
 
-            if features.liquidation_imbalance >= 0.20:
-                return SignalSide.SHORT
+        if payload.regime is not None:
+            regime_side = side_from_oi_regime(
+                payload.regime.regime,
+                features=payload.features,
+            )
+            if is_directional_side(regime_side):
+                return self.opposite_side(regime_side)
 
-        if features.price_delta_pct is not None:
-            if features.price_delta_pct <= -0.75:
-                return SignalSide.LONG
-
-            if features.price_delta_pct >= 0.75:
-                return SignalSide.SHORT
-
-        if features.oi_pressure_score is not None:
-            if features.oi_pressure_score <= -0.60:
-                return SignalSide.LONG
-
-            if features.oi_pressure_score >= 0.60:
-                return SignalSide.SHORT
-
-        if features.aggressive_flow_imbalance is not None:
-            if features.aggressive_flow_imbalance <= -0.30:
-                return SignalSide.LONG
-
-            if features.aggressive_flow_imbalance >= 0.30:
-                return SignalSide.SHORT
+        if payload.divergence is not None and payload.divergence.detected:
+            side = self._side_from_divergence(payload.divergence)
+            if is_directional_side(side):
+                return side
 
         return SignalSide.UNKNOWN
 
-    @staticmethod
-    def _map_setup_type(payload: OICapitulationPayload) -> SetupType:
-        if payload.has_capitulation_regime:
+    def _side_from_capitulation_anomaly(
+        self,
+        payload: OICapitulationPayload,
+    ) -> SignalSide:
+        anomaly = payload.anomaly
+        if anomaly is None:
+            return SignalSide.UNKNOWN
+
+        features = payload.features
+
+        if anomaly.anomaly_type in self.CAPITULATION_ANOMALIES:
+            side = reversal_side_from_flush(features)
+            if is_directional_side(side):
+                return side
+
+        if anomaly.anomaly_type in self.SUPPORTING_RISK_ANOMALIES:
+            return contrarian_side_from_crowding(
+                features=features,
+                regime=payload.regime.regime if payload.regime is not None else None,
+            )
+
+        return SignalSide.UNKNOWN
+
+    def _side_from_divergence(
+        self,
+        divergence: OIDivergenceResult,
+    ) -> SignalSide:
+        hint = divergence_side_hint(divergence.divergence_type)
+
+        if hint == "bullish":
+            return SignalSide.LONG
+
+        if hint == "bearish":
+            return SignalSide.SHORT
+
+        return SignalSide.UNKNOWN
+
+    def _map_setup_type(
+        self,
+        payload: OICapitulationPayload,
+    ) -> SetupType:
+        if payload.has_capitulation_regime or payload.has_capitulation_anomaly:
             return SetupType.REVERSAL
 
-        if payload.has_capitulation_anomaly:
-            return SetupType.REVERSAL
+        if payload.regime is not None and payload.regime.regime is OIRegime.SQUEEZE_SETUP:
+            return SetupType.SQUEEZE
 
-        return SetupType.EXHAUSTION
+        return self.capitulation_config.default_setup_type
 
     # ------------------------------------------------------------------
     # Blockers
@@ -483,65 +745,61 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> str | None:
-        features = payload.features
+        if self.capitulation_config.require_features_for_direction and payload.features is None:
+            return "capitulation_requires_features_for_direction"
 
-        if not payload.detected:
-            return "capitulation_context_not_detected"
+        if not payload.has_capitulation_regime and not payload.has_capitulation_anomaly:
+            return "capitulation_not_detected"
 
-        if features is None:
-            return "capitulation_missing_features"
+        if payload.features is not None:
+            if not self._features_support_reversal_side(payload=payload, side=side):
+                return f"capitulation_features_do_not_support_side:{side.value}"
 
-        if not self._has_flush_confirmation(features):
-            return "capitulation_missing_flush_confirmation"
-
-        if side is SignalSide.LONG:
-            if features.price_delta_pct is not None and features.price_delta_pct > 0.25:
-                return "long_capitulation_blocked_by_positive_price_delta"
-
-            if (
-                features.liquidation_imbalance is not None
-                and features.liquidation_imbalance > 0.20
-            ):
-                return "long_capitulation_blocked_by_short_liquidation_context"
-
-        if side is SignalSide.SHORT:
-            if features.price_delta_pct is not None and features.price_delta_pct < -0.25:
-                return "short_capitulation_blocked_by_negative_price_delta"
-
-            if (
-                features.liquidation_imbalance is not None
-                and features.liquidation_imbalance < -0.20
-            ):
-                return "short_capitulation_blocked_by_long_liquidation_context"
-
-        divergence = payload.divergence
-        if divergence is not None and divergence.detected:
-            hint = self.divergence_to_side_hint(divergence.divergence_type)
+        if payload.divergence is not None and payload.divergence.detected:
+            hint = divergence_side_hint(payload.divergence.divergence_type)
 
             if side is SignalSide.LONG and hint == "bearish":
-                return f"long_capitulation_blocked_by_divergence:{divergence.divergence_type.value}"
+                return "long_capitulation_rejected_by_bearish_divergence"
 
             if side is SignalSide.SHORT and hint == "bullish":
-                return f"short_capitulation_blocked_by_divergence:{divergence.divergence_type.value}"
+                return "short_capitulation_rejected_by_bullish_divergence"
 
         return None
 
-    @staticmethod
-    def _has_flush_confirmation(features: OIFeatures) -> bool:
-        if features.price_delta_pct is not None and abs(features.price_delta_pct) >= 0.75:
-            return True
+    def _features_support_reversal_side(
+        self,
+        *,
+        payload: OICapitulationPayload,
+        side: SignalSide,
+    ) -> bool:
+        features = payload.features
+        if features is None:
+            return False
 
-        if features.oi_delta_pct is not None and features.oi_delta_pct <= -0.75:
-            return True
+        price_delta = extract_price_delta_pct(features)
+        oi_delta = extract_oi_delta_pct(features)
+        liquidation_pressure = extract_liquidation_pressure(features)
+        pressure = extract_oi_pressure_score(features)
 
-        if features.liquidation_imbalance is not None and abs(features.liquidation_imbalance) >= 0.20:
-            return True
+        if abs(price_delta) < self.capitulation_config.min_abs_price_delta_for_flush:
+            return False
 
-        if features.oi_zscore is not None and abs(features.oi_zscore) >= 2.0:
-            return True
+        if abs(oi_delta) < self.capitulation_config.min_abs_oi_delta_for_flush:
+            return False
 
-        if features.volume_ratio is not None and features.volume_ratio >= 1.25:
-            return True
+        if side is SignalSide.LONG:
+            return (
+                price_delta <= 0
+                or liquidation_pressure <= -self.capitulation_config.liquidation_flush_threshold
+                or pressure <= -self.capitulation_config.pressure_flush_threshold
+            )
+
+        if side is SignalSide.SHORT:
+            return (
+                price_delta >= 0
+                or liquidation_pressure >= self.capitulation_config.liquidation_flush_threshold
+                or pressure >= self.capitulation_config.pressure_flush_threshold
+            )
 
         return False
 
@@ -549,328 +807,411 @@ class OICapitulationStrategy(OpenInterestStrategyBase):
     # Scoring / confidence
     # ------------------------------------------------------------------
 
-    def _compute_score(
+    def _build_score_breakdown(
         self,
         *,
-        context: SignalContext,
+        context: StrategyContext,
         payload: OICapitulationPayload,
         side: SignalSide,
-    ) -> float:
-        market_regime = self.get_market_regime(context)
-        base_score = payload.score if payload.score > 0 else payload.confidence
-        score = self.weighted_score(base_score, market_regime)
+        event_time: Any,
+    ) -> ScoreBreakdown:
+        capitulation_score = unit_score(payload.score)
+        features_score = self._feature_context_score(payload=payload, side=side)
+        divergence_score = self._divergence_context_score(payload=payload, side=side)
+        analysis_score = unit_score(payload.analysis_confidence)
+        fresh_score = freshness_score(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.capitulation_config.stale_feature_max_age_seconds,
+        )
+
+        components = {
+            "capitulation": capitulation_score,
+            "features": features_score,
+            "divergence": divergence_score,
+            "analysis": analysis_score,
+            "freshness": fresh_score,
+        }
+        weights = {
+            "capitulation": self.capitulation_config.score_capitulation_weight,
+            "features": self.capitulation_config.score_features_weight,
+            "divergence": self.capitulation_config.score_divergence_weight,
+            "analysis": self.capitulation_config.score_analysis_weight,
+            "freshness": self.capitulation_config.score_freshness_weight,
+        }
+
+        score = weighted_score(components, weights, default=capitulation_score)
+        confidence = confidence_from_components(
+            primary=payload.confidence,
+            context=features_score,
+            confirmation=divergence_score,
+            freshness=fresh_score,
+            primary_weight=self.capitulation_config.confidence_capitulation_weight,
+            context_weight=self.capitulation_config.confidence_context_weight,
+            confirmation_weight=self.capitulation_config.confidence_confirmation_weight,
+            freshness_weight=self.capitulation_config.confidence_freshness_weight,
+        )
+
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            f"side:{side.value}",
+            "capitulation_context",
+        ]
 
         if payload.has_capitulation_regime:
-            score += 0.08
+            score += self.capitulation_config.capitulation_regime_bonus
+            confidence += 0.04
+            confirmations.append("capitulation_regime")
 
         if payload.has_capitulation_anomaly:
-            score += 0.08
+            score += self.capitulation_config.capitulation_anomaly_bonus
+            confidence += 0.04
+            confirmations.append("capitulation_anomaly")
 
         if payload.analysis_confidence >= 0.75:
             score += 0.04
-        elif payload.analysis_confidence >= 0.50:
+            confidence += 0.04
+            confirmations.append("high_analysis_confidence")
+        elif (
+            payload.analysis_confidence
+            >= self.capitulation_config.min_analysis_confidence_bonus_threshold
+        ):
             score += 0.02
+            confidence += 0.02
+            confirmations.append("moderate_analysis_confidence")
 
-        if payload.features is not None:
-            score += self._feature_score_adjustment(
-                features=payload.features,
-                side=side,
-            )
+        feature_adjustment = self._feature_score_adjustment(
+            payload=payload,
+            side=side,
+        )
+        score += feature_adjustment
 
-        if payload.divergence is not None and payload.divergence.detected:
-            hint = self.divergence_to_side_hint(payload.divergence.divergence_type)
+        confidence += self._feature_confidence_adjustment(
+            payload=payload,
+            side=side,
+        )
 
-            if side is SignalSide.LONG and hint == "bullish":
-                score += min(0.06, payload.divergence.score * 0.10)
-            elif side is SignalSide.SHORT and hint == "bearish":
-                score += min(0.06, payload.divergence.score * 0.10)
-            else:
-                score -= min(0.10, payload.divergence.score * 0.12)
+        divergence_adjustment = self._divergence_score_adjustment(
+            payload=payload,
+            side=side,
+        )
+        score += divergence_adjustment
 
-        return self.clamp(score)
+        if divergence_adjustment > 0:
+            confidence += min(0.04, divergence_adjustment)
+            confirmations.append("aligned_divergence_context")
+        elif divergence_adjustment < 0:
+            confidence -= min(0.06, abs(divergence_adjustment))
+            reasons.append("opposing_divergence_penalty")
 
-    def _compute_confidence(
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
+
+    def _feature_context_score(
         self,
         *,
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
-        confidence = payload.confidence
+        features = payload.features
+        if features is None:
+            return 0.0
 
-        if payload.has_capitulation_regime:
-            confidence += 0.04
+        price_delta = extract_price_delta_pct(features)
+        oi_delta = extract_oi_delta_pct(features)
+        liquidation_pressure = extract_liquidation_pressure(features)
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
 
-        if payload.has_capitulation_anomaly:
-            confidence += 0.04
+        components: dict[str, float] = {
+            "price_flush": unit_score(abs(price_delta)),
+            "oi_flush": unit_score(abs(oi_delta)),
+            "liquidation_pressure": unit_score(abs(liquidation_pressure)),
+            "oi_pressure": unit_score(abs(pressure)),
+            "flow": unit_score(abs(flow)),
+        }
 
-        if payload.analysis_confidence >= 0.75:
-            confidence += 0.04
-        elif payload.analysis_confidence >= 0.50:
-            confidence += 0.02
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        if volume_ratio is not None:
+            components["volume"] = unit_score(float(volume_ratio) / 2.0)
 
-        if payload.features is not None:
-            confidence += self._feature_confidence_adjustment(
-                features=payload.features,
-                side=side,
+        oi_zscore = get_attr_or_key(features, "oi_zscore")
+        if oi_zscore is not None:
+            components["oi_zscore"] = unit_score(abs(float(oi_zscore)) / 3.0)
+
+        if side is SignalSide.LONG:
+            components["side_alignment"] = unit_score(
+                max(0.0, -price_delta)
+                + max(0.0, -liquidation_pressure)
+                + max(0.0, -pressure)
             )
 
-        if payload.divergence is not None and payload.divergence.detected:
-            hint = self.divergence_to_side_hint(payload.divergence.divergence_type)
+        elif side is SignalSide.SHORT:
+            components["side_alignment"] = unit_score(
+                max(0.0, price_delta)
+                + max(0.0, liquidation_pressure)
+                + max(0.0, pressure)
+            )
 
-            if side is SignalSide.LONG and hint == "bullish":
-                confidence += min(0.04, payload.divergence.confidence * 0.06)
-            elif side is SignalSide.SHORT and hint == "bearish":
-                confidence += min(0.04, payload.divergence.confidence * 0.06)
-            else:
-                confidence -= min(0.08, payload.divergence.confidence * 0.10)
+        weights = {key: 1.0 for key in components}
+        return weighted_score(components, weights)
 
-        return self.clamp(confidence)
+    def _divergence_context_score(
+        self,
+        *,
+        payload: OICapitulationPayload,
+        side: SignalSide,
+    ) -> float:
+        divergence = payload.divergence
+        if divergence is None or not divergence.detected:
+            return 0.0
+
+        hint = divergence_side_hint(divergence.divergence_type)
+        base = extract_score(divergence, default=extract_confidence(divergence))
+
+        if side is SignalSide.LONG and hint == "bullish":
+            return unit_score(base)
+
+        if side is SignalSide.SHORT and hint == "bearish":
+            return unit_score(base)
+
+        if hint in {"bullish", "bearish"}:
+            return unit_score(1.0 - base)
+
+        return unit_score(base * 0.5)
 
     def _feature_score_adjustment(
         self,
         *,
-        features: OIFeatures,
+        payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        features = payload.features
+        if features is None:
+            return 0.0
+
         adjustment = 0.0
 
-        if features.price_delta_pct is not None:
-            if abs(features.price_delta_pct) >= 1.50:
-                adjustment += 0.07
-            elif abs(features.price_delta_pct) >= 0.75:
-                adjustment += 0.05
+        price_delta = extract_price_delta_pct(features)
+        liquidation_pressure = extract_liquidation_pressure(features)
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
+        funding_rate = extract_funding_rate(features)
 
-        if features.oi_delta_pct is not None:
-            if features.oi_delta_pct <= -1.50:
-                adjustment += 0.07
-            elif features.oi_delta_pct <= -0.75:
-                adjustment += 0.05
+        if side is SignalSide.LONG:
+            if liquidation_pressure <= -self.capitulation_config.liquidation_flush_threshold:
+                adjustment += self.capitulation_config.liquidation_flush_bonus
 
-        if features.volume_ratio is not None:
-            if features.volume_ratio >= 1.75:
-                adjustment += 0.06
-            elif features.volume_ratio >= 1.25:
-                adjustment += 0.04
-
-        if features.oi_zscore is not None:
-            if abs(features.oi_zscore) >= 3.0:
-                adjustment += 0.06
-            elif abs(features.oi_zscore) >= 2.0:
-                adjustment += 0.04
-
-        if features.liquidation_imbalance is not None:
-            if side is SignalSide.LONG and features.liquidation_imbalance <= -0.20:
-                adjustment += 0.07
-            elif side is SignalSide.SHORT and features.liquidation_imbalance >= 0.20:
-                adjustment += 0.07
-
-        if features.funding_rate is not None:
-            if side is SignalSide.LONG and features.funding_rate < 0:
-                adjustment += 0.04
-            elif side is SignalSide.SHORT and features.funding_rate > 0:
-                adjustment += 0.04
-
-        if features.aggressive_flow_imbalance is not None:
-            if side is SignalSide.LONG and features.aggressive_flow_imbalance > -0.05:
+            if pressure <= -self.capitulation_config.pressure_flush_threshold:
                 adjustment += 0.03
-            elif side is SignalSide.SHORT and features.aggressive_flow_imbalance < 0.05:
+
+            if price_delta < 0:
                 adjustment += 0.03
+
+            if flow >= -self.capitulation_config.flow_stabilization_threshold:
+                adjustment += self.capitulation_config.stabilization_bonus
+
+            if funding_rate is not None and funding_rate < 0:
+                adjustment += self.capitulation_config.funding_extreme_bonus
+
+        elif side is SignalSide.SHORT:
+            if liquidation_pressure >= self.capitulation_config.liquidation_flush_threshold:
+                adjustment += self.capitulation_config.liquidation_flush_bonus
+
+            if pressure >= self.capitulation_config.pressure_flush_threshold:
+                adjustment += 0.03
+
+            if price_delta > 0:
+                adjustment += 0.03
+
+            if flow <= self.capitulation_config.flow_stabilization_threshold:
+                adjustment += self.capitulation_config.stabilization_bonus
+
+            if funding_rate is not None and funding_rate > 0:
+                adjustment += self.capitulation_config.funding_extreme_bonus
 
         return adjustment
 
     def _feature_confidence_adjustment(
         self,
         *,
-        features: OIFeatures,
+        payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        features = payload.features
+        if features is None:
+            return 0.0
+
         adjustment = 0.0
 
-        if features.price_delta_pct is not None and abs(features.price_delta_pct) >= 0.75:
-            adjustment += 0.04
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        if volume_ratio is not None and float(volume_ratio) >= 1.0:
+            adjustment += 0.02
 
-        if features.oi_delta_pct is not None and features.oi_delta_pct <= -0.75:
-            adjustment += 0.04
-
-        if features.volume_ratio is not None and features.volume_ratio >= 1.25:
+        oi_zscore = get_attr_or_key(features, "oi_zscore")
+        if oi_zscore is not None and abs(float(oi_zscore)) >= 1.0:
             adjustment += 0.03
 
-        if features.liquidation_imbalance is not None:
-            if side is SignalSide.LONG and features.liquidation_imbalance <= -0.20:
-                adjustment += 0.04
-            elif side is SignalSide.SHORT and features.liquidation_imbalance >= 0.20:
-                adjustment += 0.04
+        liquidation_pressure = extract_liquidation_pressure(features)
+        pressure = extract_oi_pressure_score(features)
 
-        if features.oi_zscore is not None and abs(features.oi_zscore) >= 2.0:
-            adjustment += 0.03
+        if side is SignalSide.LONG:
+            if liquidation_pressure <= -self.capitulation_config.liquidation_flush_threshold:
+                adjustment += 0.03
+            if pressure <= -self.capitulation_config.pressure_flush_threshold:
+                adjustment += 0.02
+
+        elif side is SignalSide.SHORT:
+            if liquidation_pressure >= self.capitulation_config.liquidation_flush_threshold:
+                adjustment += 0.03
+            if pressure >= self.capitulation_config.pressure_flush_threshold:
+                adjustment += 0.02
 
         return adjustment
 
-    # ------------------------------------------------------------------
-    # Signal building
-    # ------------------------------------------------------------------
-
-    def _build_signal(
+    def _divergence_score_adjustment(
         self,
         *,
-        context: SignalContext,
         payload: OICapitulationPayload,
         side: SignalSide,
-        setup_type: SetupType,
-        score: float,
-        confidence: float,
-    ) -> StrategySignal:
-        signal = StrategySignal(
-            symbol=context.symbol,
-            side=side,
-            strategy_name=self.STRATEGY_NAME,
-            category=StrategyCategory.OPEN_INTEREST,
-            timeframe=context.timeframe,
-            setup_type=setup_type,
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=self.strength_from_score(score),
-            confidence_grade=self.confidence_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=TriggerType.PRIMARY,
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self.priority_from_score(score),
-            regime=self.get_market_regime(context),
-            metadata={
-                "oi_capitulation_detected": payload.detected,
-                "oi_has_capitulation_regime": payload.has_capitulation_regime,
-                "oi_has_capitulation_anomaly": payload.has_capitulation_anomaly,
-                "oi_capitulation_confidence": payload.confidence,
-                "oi_capitulation_score": payload.score,
-                "oi_analysis_confidence": payload.analysis_confidence,
-                "oi_raw_payload": payload.raw,
-            },
+    ) -> float:
+        divergence = payload.divergence
+        if (
+            divergence is None
+            or not divergence.detected
+            or not self.capitulation_config.allow_divergence_confirmation
+        ):
+            return 0.0
+
+        hint = divergence_side_hint(divergence.divergence_type)
+        divergence_strength = extract_score(
+            divergence,
+            default=extract_confidence(divergence),
         )
 
+        if side is SignalSide.LONG and hint == "bullish":
+            return min(
+                self.capitulation_config.aligned_divergence_bonus,
+                divergence_strength * 0.08,
+            )
+
+        if side is SignalSide.SHORT and hint == "bearish":
+            return min(
+                self.capitulation_config.aligned_divergence_bonus,
+                divergence_strength * 0.08,
+            )
+
+        if hint in {"bullish", "bearish"}:
+            return -min(
+                self.capitulation_config.opposing_divergence_penalty,
+                divergence_strength * 0.14,
+            )
+
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Source features / tags
+    # ------------------------------------------------------------------
+
+    def _source_features(self, payload: OICapitulationPayload) -> list[str]:
+        features: list[str] = []
+
         if payload.regime is not None:
-            signal.metadata.update(
-                {
-                    "oi_regime": payload.regime.regime.value,
-                    "oi_regime_confidence": payload.regime.confidence,
-                    "oi_regime_score": payload.regime.score,
-                    "oi_regime_confidence_band": payload.regime.confidence_band.value,
-                }
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.REGIME,
+                    OPEN_INTEREST_FEATURES.REGIME_TYPE,
+                    OPEN_INTEREST_FEATURES.REGIME_CONFIDENCE,
+                    OPEN_INTEREST_FEATURES.REGIME_SCORE,
+                ]
             )
 
         if payload.anomaly is not None:
-            signal.metadata.update(
-                {
-                    "oi_anomaly_detected": payload.anomaly.detected,
-                    "oi_anomaly_type": payload.anomaly.anomaly_type.value,
-                    "oi_anomaly_strength": payload.anomaly.strength.value,
-                    "oi_anomaly_confidence": payload.anomaly.confidence,
-                    "oi_anomaly_score": payload.anomaly.score,
-                    "oi_anomaly_confidence_band": payload.anomaly.confidence_band.value,
-                }
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.ANOMALY,
+                    OPEN_INTEREST_FEATURES.ANOMALY_TYPE,
+                    OPEN_INTEREST_FEATURES.ANOMALY_DETECTED,
+                    OPEN_INTEREST_FEATURES.ANOMALY_CONFIDENCE,
+                    OPEN_INTEREST_FEATURES.ANOMALY_SCORE,
+                ]
+            )
+
+        if payload.features is not None:
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.FEATURES,
+                    OPEN_INTEREST_FEATURES.OI_DELTA_PCT,
+                    OPEN_INTEREST_FEATURES.PRICE_DELTA_PCT,
+                    OPEN_INTEREST_FEATURES.OI_PRESSURE_SCORE,
+                    OPEN_INTEREST_FEATURES.AGGRESSIVE_FLOW_IMBALANCE,
+                ]
             )
 
         if payload.divergence is not None:
-            signal.metadata.update(
-                {
-                    "oi_divergence_detected": payload.divergence.detected,
-                    "oi_divergence_type": payload.divergence.divergence_type.value,
-                    "oi_divergence_confidence": payload.divergence.confidence,
-                    "oi_divergence_score": payload.divergence.score,
-                    "oi_divergence_confidence_band": payload.divergence.confidence_band.value,
-                }
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.DIVERGENCE,
+                    OPEN_INTEREST_FEATURES.DIVERGENCE_TYPE,
+                    OPEN_INTEREST_FEATURES.DIVERGENCE_CONFIDENCE,
+                ]
             )
 
-        signal.add_reason("oi_capitulation_context_detected")
-        signal.add_reason(f"setup_type:{setup_type.value}")
+        return list(dict.fromkeys(features))
 
-        if payload.regime is not None:
-            signal.add_reason(f"oi_regime:{payload.regime.regime.value}")
-
-        if payload.anomaly is not None and payload.anomaly.detected:
-            signal.add_reason(f"oi_anomaly:{payload.anomaly.anomaly_type.value}")
-
-        for reason in payload.reasons:
-            signal.add_reason(reason)
-
-        self.add_oi_source_features(signal, context)
-        self.append_oi_analysis_metadata(signal, context)
-        self.append_oi_analysis_reasons(signal, context)
-
-        if payload.features is not None:
-            self.append_oi_feature_reasons(signal, payload.features)
-
-        for confirmation in self._build_confirmations(
-            side=side,
-            payload=payload,
-        ):
-            signal.add_confirmation(confirmation)
-
-        return signal
-
-    def _build_confirmations(
+    def _tags(
         self,
         *,
-        side: SignalSide,
         payload: OICapitulationPayload,
+        setup_type: SetupType,
     ) -> list[str]:
-        confirmations: list[str] = ["capitulation_context"]
-
-        if payload.has_capitulation_regime:
-            confirmations.append("capitulation_regime")
+        tags = [
+            self.capitulation_config.tag_open_interest,
+            self.capitulation_config.tag_oi_capitulation,
+            self.capitulation_config.tag_capitulation,
+            self.capitulation_config.tag_reversal,
+            self.capitulation_config.tag_risk,
+            setup_type.value,
+        ]
 
         if payload.has_capitulation_anomaly:
-            confirmations.append("capitulation_anomaly")
-
-        if payload.analysis_confidence >= 0.75:
-            confirmations.append("high_confidence_oi_analysis")
+            tags.extend(
+                [
+                    self.capitulation_config.tag_deleveraging,
+                    self.capitulation_config.tag_liquidations,
+                    self.capitulation_config.tag_forced_unwind,
+                ]
+            )
 
         if payload.regime is not None:
-            confirmations.append(f"oi_regime:{payload.regime.regime.value}")
+            tags.append(f"oi_regime:{payload.regime.regime.value}")
 
         if payload.anomaly is not None and payload.anomaly.detected:
-            confirmations.append(f"oi_anomaly:{payload.anomaly.anomaly_type.value}")
+            tags.append(f"oi_anomaly:{payload.anomaly.anomaly_type.value}")
 
         if payload.divergence is not None and payload.divergence.detected:
-            hint = self.divergence_to_side_hint(payload.divergence.divergence_type)
+            tags.append(f"oi_divergence:{payload.divergence.divergence_type.value}")
 
-            if side is SignalSide.LONG and hint == "bullish":
-                confirmations.append("bullish_divergence_support")
-            elif side is SignalSide.SHORT and hint == "bearish":
-                confirmations.append("bearish_divergence_support")
-            else:
-                confirmations.append("divergence_risk_context")
+        return list(dict.fromkeys(tags))
 
-        features = payload.features
-        if features is None:
-            return list(dict.fromkeys(confirmations))
+    @staticmethod
+    def _anomaly_strength(payload: OICapitulationPayload) -> str | None:
+        if payload.anomaly is None:
+            return None
 
-        if features.price_delta_pct is not None and abs(features.price_delta_pct) >= 0.75:
-            confirmations.append("price_shock_confirmation")
+        strength = getattr(payload.anomaly, "strength", None)
 
-        if features.oi_delta_pct is not None and features.oi_delta_pct <= -0.75:
-            confirmations.append("oi_collapse_confirmation")
+        if strength is None:
+            return None
 
-        if features.volume_ratio is not None and features.volume_ratio >= 1.25:
-            confirmations.append("high_volume_flush")
+        value = getattr(strength, "value", None)
+        if isinstance(value, str):
+            return value
 
-        if features.oi_zscore is not None and abs(features.oi_zscore) >= 2.0:
-            confirmations.append("extreme_oi_zscore_context")
-
-        if side is SignalSide.LONG:
-            if features.liquidation_imbalance is not None and features.liquidation_imbalance <= -0.20:
-                confirmations.append("long_flush_context")
-            if features.funding_rate is not None and features.funding_rate < 0:
-                confirmations.append("negative_funding_context")
-            if features.aggressive_flow_imbalance is not None and features.aggressive_flow_imbalance > -0.05:
-                confirmations.append("sell_aggression_fading")
-
-        elif side is SignalSide.SHORT:
-            if features.liquidation_imbalance is not None and features.liquidation_imbalance >= 0.20:
-                confirmations.append("short_flush_context")
-            if features.funding_rate is not None and features.funding_rate > 0:
-                confirmations.append("positive_funding_context")
-            if features.aggressive_flow_imbalance is not None and features.aggressive_flow_imbalance < 0.05:
-                confirmations.append("buy_aggression_fading")
-
-        return list(dict.fromkeys(confirmations))
+        return str(strength)

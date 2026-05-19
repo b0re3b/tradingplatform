@@ -12,20 +12,8 @@ from analytics.liquidity.models import (
     LiquidityMapSnapshot,
     StopCluster,
 )
-
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from ...config import StrategyConfig, StrategyDefinitionConfig
-from ...enums import (
-    FilterDecision,
-    SetupType,
-    SignalPriority,
-    SignalSide,
-    StrategyCategory,
-)
-from ...exceptions import StrategyConfigError
-from ...models import FilterResult, StrategyContext, StrategySignal, TargetPlan
 from .base import (
     LIQUIDITY_FEATURES,
     LiquidityStrategyConfig,
@@ -37,7 +25,6 @@ from .utils import (
     collect_targets_below,
     confidence_from_components,
     distance_pct,
-    distance_score,
     evidence_type,
     is_directional_side,
     item_strength,
@@ -56,6 +43,16 @@ from .utils import (
     unit_score,
     weighted_score,
 )
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    FilterDecision,
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+)
+from ...exceptions import StrategyConfigError
+from ...models import FilterResult, StrategyContext, StrategySignal, TargetPlan
 
 
 @dataclass(slots=True)
@@ -1137,7 +1134,7 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         combined = unit_score(0.55 * score + 0.45 * confidence)
 
         if combined >= self.stop_hunt_config.critical_priority_score:
-            return SignalPriority.CRITICAL
+            return SignalPriority.URGENT
 
         if combined >= self.stop_hunt_config.high_priority_score:
             return SignalPriority.HIGH

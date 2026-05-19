@@ -14,7 +14,6 @@ from analytics.liquidity.enums import (
     LiquidityBias,
     LiquidityLevelType,
     LiquiditySide,
-    SweepStatus,
 )
 from analytics.liquidity.models import (
     LiquidityLevel,
@@ -22,10 +21,8 @@ from analytics.liquidity.models import (
     LiquidityZone,
     StopCluster,
 )
-
 from ...enums import FeatureSource, SignalSide
 from ...models import StrategyContext, clamp, ensure_aware_utc, utcnow
-
 
 DECIMAL_ZERO = Decimal("0")
 

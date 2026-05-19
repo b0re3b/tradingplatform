@@ -1,3 +1,5 @@
+# trading_system/strategy/strategies/open_interest/oi_breakout_confirmation_strategy.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,26 +16,49 @@ from analytics.open_interest.models import (
     OIFeatures,
     OIRegimeResult,
 )
-from strategy.config import StrategyConfig
-from strategy.enums import (
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
     MarketRegime,
     SetupType,
-    SignalOrigin,
+    SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
     Timeframe,
-    TriggerType,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    SignalContext,
-    StrategyEvaluation,
-    StrategyMetadata,
-    StrategySignal,
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
+from .base import (
+    OPEN_INTEREST_FEATURES,
+    OpenInterestStrategyConfig,
+    OpenInterestTradingStrategy,
 )
-
-from .base import OpenInterestStrategyBase
+from .utils import (
+    ScoreBreakdown,
+    confidence_from_components,
+    divergence_side_hint,
+    extract_aggressive_flow_imbalance,
+    extract_confidence,
+    extract_event_time,
+    extract_funding_rate,
+    extract_liquidation_pressure,
+    extract_oi_delta_pct,
+    extract_oi_pressure_score,
+    extract_price_delta_pct,
+    extract_reasons,
+    extract_score,
+    freshness_score,
+    get_attr_or_key,
+    is_directional_side,
+    is_stale,
+    parse_side,
+    serialize_for_metadata,
+    side_from_oi_features,
+    unit_score,
+    weighted_score,
+)
 
 
 @dataclass(slots=True)
@@ -43,10 +68,10 @@ class OIBreakoutConfirmationPayload:
 
     Source of truth:
         analytics.open_interest:
-        - OIRegimeResult
-        - OIDivergenceResult
-        - OIAnomalyResult
-        - OIFeatures
+        - OIRegimeResult;
+        - OIFeatures;
+        - optional OIDivergenceResult;
+        - optional OIAnomalyResult.
 
     Стратегія не шукає breakout самостійно. Вона підтверджує directional
     breakout / continuation context через open interest, volume, pressure,
@@ -69,11 +94,11 @@ class OIBreakoutConfirmationPayload:
 
     @property
     def regime_confidence(self) -> float:
-        return self.regime.confidence
+        return unit_score(getattr(self.regime, "confidence", 0.0))
 
     @property
     def regime_score(self) -> float:
-        return self.regime.score
+        return unit_score(getattr(self.regime, "score", self.regime_confidence))
 
     @property
     def divergence_type(self) -> OIDivergenceType:
@@ -83,41 +108,206 @@ class OIBreakoutConfirmationPayload:
 
     @property
     def divergence_detected(self) -> bool:
-        return self.divergence is not None and self.divergence.detected
+        return self.divergence is not None and bool(self.divergence.detected)
 
     @property
     def anomaly_detected(self) -> bool:
-        return self.anomaly is not None and self.anomaly.detected
+        return self.anomaly is not None and bool(self.anomaly.detected)
 
 
-class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
+@dataclass(slots=True)
+class OIBreakoutConfirmationStrategyConfig(OpenInterestStrategyConfig):
     """
-    Стратегія підтвердження breakout / continuation через Open Interest analytics.
+    Unified OI breakout / continuation confirmation strategy config.
 
-    Важливо:
-    - strategy не читає raw market data;
-    - strategy не рахує OI features/regime/divergence/anomaly самостійно;
-    - strategy використовує canonical context.open_interest payload від
-      analytics.open_interest;
-    - старі oi.* feature keys підтримуються тільки через base fallback.
+    Strategy idea:
+    - read normalized OI regime/features context from StrategyContext;
+    - confirm breakout / continuation side using OI regime and OIFeatures;
+    - reject hard risk anomalies and opposing divergences;
+    - build internal StrategySignal only;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
     """
 
-    STRATEGY_NAME = "oi_breakout_confirmation_strategy"
-    DEFAULT_PRIORITY = 80
+    require_regime_result: bool = True
+    require_features: bool = False
+    require_actionable_side: bool = True
+    require_fresh_regime: bool = True
 
-    REQUIRED_FEATURES: set[str] = {
-        "analytics.open_interest.regime",
-        "analytics.open_interest.features",
-    }
+    min_regime_confidence: float = 0.58
+    min_regime_score: float = 0.35
+    min_analysis_confidence_bonus_threshold: float = 0.50
 
-    MINIMUM_OI_CONTEXT_KEYS: tuple[str, ...] = (
-        "oi.regime.type",
-        "oi.regime.confidence",
-        "oi.features.oi_delta_pct",
-        "oi.features.price_delta_pct",
-        "open_interest.regime.type",
-        "open_interest.regime.confidence",
+    require_positive_oi_growth: bool = True
+    require_positive_efficiency: bool = True
+
+    min_oi_delta_pct: float = 0.0
+    min_volume_ratio: float = 1.0
+    strong_volume_ratio: float = 1.5
+    min_abs_oi_zscore_for_confirmation: float = 1.0
+
+    min_long_pressure_score: float = -0.10
+    max_short_pressure_score: float = 0.10
+    min_long_aggressive_flow: float = -0.10
+    max_short_aggressive_flow: float = 0.10
+
+    squeeze_funding_long_threshold: float = 0.0
+    squeeze_funding_short_threshold: float = 0.0
+    squeeze_liquidation_imbalance_threshold: float = 0.25
+
+    block_hard_anomalies: bool = True
+    block_extreme_crowding: bool = True
+    extreme_crowding_block_confidence: float = 0.75
+
+    soft_risk_anomaly_penalty: float = 0.10
+    max_soft_risk_penalty: float = 0.12
+    opposing_divergence_penalty: float = 0.14
+    aligned_divergence_bonus: float = 0.05
+    oi_spike_bonus: float = 0.04
+
+    score_regime_weight: float = 0.42
+    score_features_weight: float = 0.30
+    score_analysis_weight: float = 0.10
+    score_divergence_weight: float = 0.10
+    score_freshness_weight: float = 0.08
+
+    confidence_regime_weight: float = 0.55
+    confidence_context_weight: float = 0.25
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    tag_oi_breakout: str = "oi_breakout"
+    tag_confirmation: str = "confirmation"
+    tag_continuation: str = "continuation"
+    tag_squeeze: str = "squeeze"
+    tag_pressure: str = "pressure"
+    tag_aggressive_flow: str = "aggressive_flow"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.CONTINUATION
+
+    required_open_interest_features: tuple[str, ...] = (
+        OPEN_INTEREST_FEATURES.REGIME,
+        OPEN_INTEREST_FEATURES.FEATURES,
     )
+
+    def validate(self) -> None:
+        OpenInterestStrategyConfig.validate(self)
+
+        bounded_fields = {
+            "min_regime_confidence": self.min_regime_confidence,
+            "min_regime_score": self.min_regime_score,
+            "min_analysis_confidence_bonus_threshold": self.min_analysis_confidence_bonus_threshold,
+            "min_oi_delta_pct": self.min_oi_delta_pct,
+            "min_long_pressure_score": self.min_long_pressure_score,
+            "max_short_pressure_score": self.max_short_pressure_score,
+            "min_long_aggressive_flow": self.min_long_aggressive_flow,
+            "max_short_aggressive_flow": self.max_short_aggressive_flow,
+            "squeeze_liquidation_imbalance_threshold": self.squeeze_liquidation_imbalance_threshold,
+            "extreme_crowding_block_confidence": self.extreme_crowding_block_confidence,
+            "soft_risk_anomaly_penalty": self.soft_risk_anomaly_penalty,
+            "max_soft_risk_penalty": self.max_soft_risk_penalty,
+            "opposing_divergence_penalty": self.opposing_divergence_penalty,
+            "aligned_divergence_bonus": self.aligned_divergence_bonus,
+            "oi_spike_bonus": self.oi_spike_bonus,
+        }
+
+        for field_name, value in bounded_fields.items():
+            if not -1.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between -1.0 and 1.0")
+
+        unit_fields = {
+            "min_regime_confidence": self.min_regime_confidence,
+            "min_regime_score": self.min_regime_score,
+            "min_analysis_confidence_bonus_threshold": self.min_analysis_confidence_bonus_threshold,
+            "squeeze_liquidation_imbalance_threshold": self.squeeze_liquidation_imbalance_threshold,
+            "extreme_crowding_block_confidence": self.extreme_crowding_block_confidence,
+            "soft_risk_anomaly_penalty": self.soft_risk_anomaly_penalty,
+            "max_soft_risk_penalty": self.max_soft_risk_penalty,
+            "opposing_divergence_penalty": self.opposing_divergence_penalty,
+            "aligned_divergence_bonus": self.aligned_divergence_bonus,
+            "oi_spike_bonus": self.oi_spike_bonus,
+        }
+
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
+        if self.min_volume_ratio < 0:
+            raise StrategyConfigError("min_volume_ratio must be >= 0")
+
+        if self.strong_volume_ratio < self.min_volume_ratio:
+            raise StrategyConfigError("strong_volume_ratio must be >= min_volume_ratio")
+
+        if self.min_abs_oi_zscore_for_confirmation < 0:
+            raise StrategyConfigError(
+                "min_abs_oi_zscore_for_confirmation must be >= 0"
+            )
+
+        score_weights = {
+            "score_regime_weight": self.score_regime_weight,
+            "score_features_weight": self.score_features_weight,
+            "score_analysis_weight": self.score_analysis_weight,
+            "score_divergence_weight": self.score_divergence_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+
+        confidence_weights = {
+            "confidence_regime_weight": self.confidence_regime_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_oi_breakout",
+            "tag_confirmation",
+            "tag_continuation",
+            "tag_squeeze",
+            "tag_pressure",
+            "tag_aggressive_flow",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_open_interest_features:
+            raise StrategyConfigError("required_open_interest_features cannot be empty")
+
+        for feature in self.required_open_interest_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_open_interest_features cannot contain empty feature names"
+                )
+
+
+class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
+    """
+    Unified OI breakout / continuation confirmation strategy.
+
+    Input:
+        StrategyContext with FeatureSource.OPEN_INTEREST domain data / features.
+
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
+    """
+
+    component_namespace = "strategy.open_interest.breakout_confirmation"
+    category: StrategyCategory = StrategyCategory.OPEN_INTEREST
+    default_setup_type: SetupType = SetupType.CONTINUATION
 
     LONG_CONFIRMATION_REGIMES: set[OIRegime] = {
         OIRegime.LONG_BUILDUP,
@@ -150,24 +340,48 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
     def __init__(
         self,
         config: StrategyConfig,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        open_interest_config: OIBreakoutConfirmationStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
-        super().__init__(config=config, event_bus=event_bus)
+        resolved_open_interest_config = (
+            open_interest_config or OIBreakoutConfirmationStrategyConfig()
+        )
+        resolved_open_interest_config.validate()
+
+        super().__init__(
+            config=config,
+            event_bus=event_bus,
+            scheduler=scheduler,
+            definition=definition,
+            open_interest_config=resolved_open_interest_config,
+            service_name=service_name,
+        )
+
+        self.breakout_config: OIBreakoutConfirmationStrategyConfig = (
+            resolved_open_interest_config
+        )
+
+    @property
+    def strategy_name(self) -> str:
+        return "oi_breakout_confirmation"
 
     @property
     def metadata(self) -> StrategyMetadata:
         return StrategyMetadata(
-            strategy_name=self.STRATEGY_NAME,
+            strategy_name=self.strategy_name,
             category=StrategyCategory.OPEN_INTEREST,
             timeframe=Timeframe.M1,
             tags=[
-                "open_interest",
-                "breakout",
-                "confirmation",
-                "continuation",
-                "pressure",
-                "volume",
-                "aggressive_flow",
+                self.breakout_config.tag_open_interest,
+                self.breakout_config.tag_oi_breakout,
+                self.breakout_config.tag_confirmation,
+                self.breakout_config.tag_continuation,
+                self.breakout_config.tag_pressure,
+                self.breakout_config.tag_aggressive_flow,
                 "analytics_open_interest",
             ],
             version="2.0.0",
@@ -176,7 +390,7 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
                 "volume, pressure, aggressive flow, funding, liquidations, "
                 "divergence rejection та anomaly/risk context."
             ),
-            required_features=set(self.REQUIRED_FEATURES),
+            required_features=set(self.required_features()),
             supported_regimes={
                 MarketRegime.TRENDING_UP,
                 MarketRegime.TRENDING_DOWN,
@@ -188,167 +402,158 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
             metadata={
                 "source": "analytics.open_interest",
                 "strategy_type": "confirmation",
-                "base_class": "OpenInterestStrategyBase",
+                "base_class": "OpenInterestTradingStrategy",
                 "canonical_payload": "OIAnalysisResult",
                 "primary_result": "OIRegimeResult",
                 "uses_features": True,
                 "uses_regime": True,
                 "uses_divergence": True,
                 "uses_anomaly": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
             },
         )
 
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        try:
-            self.validate_context(context)
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.breakout_config.required_open_interest_features
+        )
 
-            evaluation = StrategyEvaluation(
-                strategy_name=self.STRATEGY_NAME,
-                symbol=context.symbol,
-                timestamp=context.timestamp,
-                signal=None,
-                passed=False,
-                score=0.0,
-                confidence=0.0,
-                reasons=[],
-                metadata={},
+    async def generate_signal(
+        self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_open_interest_data(
+            context,
+            tuple(self.breakout_config.required_open_interest_features),
+        ):
+            return None
+
+        if self.has_stale_open_interest_features(
+            context,
+            tuple(self.breakout_config.required_open_interest_features),
+        ):
+            return None
+
+        payload = self._extract_payload(context)
+        if payload is None:
+            return None
+
+        event_time = extract_event_time(payload.regime)
+        if (
+            self.breakout_config.require_fresh_regime
+            and is_stale(
+                event_time=event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.breakout_config.stale_feature_max_age_seconds,
             )
+        ):
+            return None
 
-            strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
+        if payload.regime_confidence < self.breakout_config.min_regime_confidence:
+            return None
 
-            runtime_allowed, runtime_reason = self.is_strategy_runtime_allowed(context)
-            if not runtime_allowed:
-                evaluation.reasons.append(runtime_reason or "strategy_runtime_not_allowed")
-                return evaluation
+        if payload.regime_score < self.breakout_config.min_regime_score:
+            return None
 
-            if strategy_cfg is None:
-                evaluation.reasons.append("strategy_config_not_found")
-                return evaluation
+        if self.breakout_config.require_features and payload.features is None:
+            return None
 
-            if not self.context_has_any_oi_data(context, self.MINIMUM_OI_CONTEXT_KEYS):
-                evaluation.reasons.append("missing_open_interest_context")
-                return evaluation
+        side = self._infer_side(payload)
+        if self.breakout_config.require_actionable_side and not is_directional_side(side):
+            return None
 
-            if self.has_stale_required_features(context):
-                evaluation.reasons.append("required_oi_features_are_stale")
-                return evaluation
+        blocked_reason = self._block_reason(payload=payload, side=side)
+        if blocked_reason is not None:
+            return None
 
-            payload = self._extract_payload(context)
-            if payload is None:
-                evaluation.reasons.append("missing_oi_regime_result")
-                return evaluation
+        setup_type = self._infer_setup_type(payload)
 
-            market_regime = self.get_market_regime(context)
+        breakdown = self._build_score_breakdown(
+            context=context,
+            payload=payload,
+            side=side,
+            event_time=event_time,
+        )
 
-            evaluation.metadata.update(
+        if breakdown.score < self.breakout_config.min_signal_score:
+            return None
+
+        if breakdown.confidence < self.breakout_config.min_signal_confidence:
+            return None
+
+        source_features = self._source_features(payload)
+        tags = self._tags(payload=payload, setup_type=setup_type)
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "oi_breakout_confirmation_signal",
+                    f"side:{side.value}",
+                    f"oi_regime:{payload.oi_regime.value}",
+                    f"setup_type:{setup_type.value}",
+                    *payload.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "open_interest_setup_family": "oi_breakout_confirmation",
+            "open_interest_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "event_time": event_time.isoformat() if event_time else None,
+            "regime": serialize_for_metadata(payload.regime),
+            "features": serialize_for_metadata(payload.features),
+            "divergence": serialize_for_metadata(payload.divergence),
+            "anomaly": serialize_for_metadata(payload.anomaly),
+            "raw": serialize_for_metadata(payload.raw),
+            "oi_regime": payload.oi_regime.value,
+            "oi_regime_confidence": payload.regime_confidence,
+            "oi_regime_score": payload.regime_score,
+            "analysis_confidence": payload.analysis_confidence,
+            "explicit_side": payload.explicit_side.value,
+            "mapped_side": side.value,
+            "setup_type": setup_type.value,
+            "divergence_detected": payload.divergence_detected,
+            "divergence_type": payload.divergence_type.value,
+            "anomaly_detected": payload.anomaly_detected,
+        }
+
+        if payload.divergence is not None:
+            metadata.update(
                 {
-                    "oi_payload": payload.raw,
-                    "oi_regime": payload.oi_regime.value,
-                    "oi_regime_confidence": payload.regime_confidence,
-                    "oi_regime_score": payload.regime_score,
-                    "oi_analysis_confidence": payload.analysis_confidence,
-                    "strategy_market_regime": market_regime.value,
-                    "explicit_side": payload.explicit_side.value,
+                    "oi_divergence_confidence": payload.divergence.confidence,
+                    "oi_divergence_score": payload.divergence.score,
                 }
             )
 
-            if payload.divergence is not None:
-                evaluation.metadata.update(
-                    {
-                        "oi_divergence_detected": payload.divergence.detected,
-                        "oi_divergence_type": payload.divergence.divergence_type.value,
-                        "oi_divergence_confidence": payload.divergence.confidence,
-                        "oi_divergence_score": payload.divergence.score,
-                    }
-                )
-
-            if payload.anomaly is not None:
-                evaluation.metadata.update(
-                    {
-                        "oi_anomaly_detected": payload.anomaly.detected,
-                        "oi_anomaly_type": payload.anomaly.anomaly_type.value,
-                        "oi_anomaly_confidence": payload.anomaly.confidence,
-                        "oi_anomaly_score": payload.anomaly.score,
-                    }
-                )
-
-            regime_allowed, regime_reason = self.is_market_regime_allowed(context)
-            if not regime_allowed:
-                evaluation.reasons.append(regime_reason or "regime_not_allowed")
-                return evaluation
-
-            side = self._infer_side(payload)
-            if side is SignalSide.UNKNOWN:
-                evaluation.reasons.append("breakout_direction_not_confirmed")
-                evaluation.score = payload.regime_score
-                evaluation.confidence = payload.regime_confidence
-                return evaluation
-
-            blocked_reason = self._block_reason(payload=payload, side=side)
-            if blocked_reason is not None:
-                evaluation.reasons.append(blocked_reason)
-                evaluation.score = payload.regime_score
-                evaluation.confidence = payload.regime_confidence
-                return evaluation
-
-            setup_type = self._infer_setup_type(payload)
-            score = self._compute_score(
-                context=context,
-                payload=payload,
-                side=side,
-            )
-            confidence = self._compute_confidence(
-                payload=payload,
-                side=side,
-            )
-
-            evaluation.score = score
-            evaluation.confidence = confidence
-
-            if confidence < strategy_cfg.runtime.min_confidence:
-                evaluation.reasons.append("confidence_below_strategy_threshold")
-                evaluation.metadata["min_confidence_required"] = strategy_cfg.runtime.min_confidence
-                return evaluation
-
-            if score < strategy_cfg.runtime.min_score:
-                evaluation.reasons.append("score_below_strategy_threshold")
-                evaluation.metadata["min_score_required"] = strategy_cfg.runtime.min_score
-                return evaluation
-
-            signal = self._build_signal(
-                context=context,
-                payload=payload,
-                side=side,
-                setup_type=setup_type,
-                score=score,
-                confidence=confidence,
-            )
-            signal.validate()
-
-            evaluation.signal = signal
-            evaluation.passed = True
-            evaluation.reasons.extend(payload.reasons)
-            evaluation.reasons.append("oi_breakout_confirmation_signal_generated")
-            evaluation.metadata.update(
+        if payload.anomaly is not None:
+            metadata.update(
                 {
-                    "signal_side": side.value,
-                    "setup_type": setup_type.value,
+                    "oi_anomaly_type": payload.anomaly.anomaly_type.value,
+                    "oi_anomaly_confidence": payload.anomaly.confidence,
+                    "oi_anomaly_score": payload.anomaly.score,
                 }
             )
-            return evaluation
 
-        except StrategyEvaluationError:
-            raise
-        except Exception as exc:
-            self.logger.exception(
-                "Strategy evaluation failed | strategy=%s symbol=%s",
-                self.STRATEGY_NAME,
-                getattr(context, "symbol", "UNKNOWN"),
-            )
-            raise StrategyEvaluationError(
-                f"{self.STRATEGY_NAME}: failed to evaluate context for "
-                f"{getattr(context, 'symbol', 'UNKNOWN')}: {exc}"
-            ) from exc
+        return self.build_open_interest_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.breakout_config.default_priority,
+        )
 
     # ------------------------------------------------------------------
     # Extraction
@@ -356,7 +561,7 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
 
     def _extract_payload(
         self,
-        context: SignalContext,
+        context: StrategyContext,
     ) -> OIBreakoutConfirmationPayload | None:
         regime = self.extract_oi_regime_result(context)
         if regime is None:
@@ -365,16 +570,22 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
         features = self.extract_oi_features(context)
         divergence = self.extract_oi_divergence_result(context)
         anomaly = self.extract_oi_anomaly_result(context)
-        raw = self.extract_oi_domain(context)
+        raw = self.open_interest_domain(context)
 
         reasons: list[str] = []
-        reasons.extend(regime.reasons)
+        reasons.extend(extract_reasons(regime))
 
         if divergence is not None:
-            reasons.extend(f"divergence:{reason}" for reason in divergence.reasons)
+            reasons.extend(
+                f"divergence:{reason}"
+                for reason in extract_reasons(divergence)
+            )
 
         if anomaly is not None and anomaly.detected:
-            reasons.extend(f"anomaly:{reason}" for reason in anomaly.reasons)
+            reasons.extend(
+                f"anomaly:{reason}"
+                for reason in extract_reasons(anomaly)
+            )
 
         return OIBreakoutConfirmationPayload(
             regime=regime,
@@ -390,7 +601,7 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
     def _extract_explicit_side(self, raw: dict[str, Any]) -> SignalSide:
         """
         Best-effort extraction для випадку, коли StrategyContextBuilder
-        уже передав breakout direction у context.open_interest або metadata.
+        уже передав breakout direction у FeatureSource.OPEN_INTEREST domain.
         """
         for key in (
             "side",
@@ -400,8 +611,7 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
             "direction",
             "trend_direction",
         ):
-            value = raw.get(key)
-            side = self._parse_side(value)
+            side = parse_side(raw.get(key))
             if side is not SignalSide.UNKNOWN:
                 return side
 
@@ -415,27 +625,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
                 "direction",
                 "trend_direction",
             ):
-                value = metadata.get(key)
-                side = self._parse_side(value)
+                side = parse_side(metadata.get(key))
                 if side is not SignalSide.UNKNOWN:
                     return side
-
-        return SignalSide.UNKNOWN
-
-    @staticmethod
-    def _parse_side(value: Any) -> SignalSide:
-        if isinstance(value, SignalSide):
-            return value
-
-        if value is None:
-            return SignalSide.UNKNOWN
-
-        text = str(value).strip().upper()
-        if text in {"LONG", "BUY", "BULL", "BULLISH", "UP", "UPSIDE"}:
-            return SignalSide.LONG
-
-        if text in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN", "DOWNSIDE"}:
-            return SignalSide.SHORT
 
         return SignalSide.UNKNOWN
 
@@ -483,22 +675,26 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
         if features is None:
             return SignalSide.UNKNOWN
 
-        price_delta = features.price_delta_pct
-        oi_delta = features.oi_delta_pct
-        pressure = features.oi_pressure_score
-        flow = features.aggressive_flow_imbalance
+        price_delta = extract_price_delta_pct(features)
+        oi_delta = extract_oi_delta_pct(features)
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
 
-        if price_delta is not None and price_delta > 0:
-            if oi_delta is not None and oi_delta > 0:
-                if pressure is None or pressure >= -0.10:
-                    if flow is None or flow >= -0.10:
+        if price_delta > 0:
+            if oi_delta > self.breakout_config.min_oi_delta_pct:
+                if pressure >= self.breakout_config.min_long_pressure_score:
+                    if flow >= self.breakout_config.min_long_aggressive_flow:
                         return SignalSide.LONG
 
-        if price_delta is not None and price_delta < 0:
-            if oi_delta is not None and oi_delta > 0:
-                if pressure is None or pressure <= 0.10:
-                    if flow is None or flow <= 0.10:
+        if price_delta < 0:
+            if oi_delta > self.breakout_config.min_oi_delta_pct:
+                if pressure <= self.breakout_config.max_short_pressure_score:
+                    if flow <= self.breakout_config.max_short_aggressive_flow:
                         return SignalSide.SHORT
+
+        utility_side = side_from_oi_features(features)
+        if is_directional_side(utility_side):
+            return utility_side
 
         return SignalSide.UNKNOWN
 
@@ -509,17 +705,21 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
         if features is None:
             return SignalSide.UNKNOWN
 
-        if features.funding_rate is not None:
-            if features.funding_rate < 0:
+        funding_rate = extract_funding_rate(features)
+        if funding_rate is not None:
+            if funding_rate < self.breakout_config.squeeze_funding_long_threshold:
                 return SignalSide.LONG
-            if features.funding_rate > 0:
+            if funding_rate > self.breakout_config.squeeze_funding_short_threshold:
                 return SignalSide.SHORT
 
-        if features.liquidation_imbalance is not None:
-            if features.liquidation_imbalance <= -0.25:
-                return SignalSide.LONG
-            if features.liquidation_imbalance >= 0.25:
-                return SignalSide.SHORT
+        liquidation_pressure = extract_liquidation_pressure(features)
+        threshold = self.breakout_config.squeeze_liquidation_imbalance_threshold
+
+        if liquidation_pressure <= -threshold:
+            return SignalSide.LONG
+
+        if liquidation_pressure >= threshold:
+            return SignalSide.SHORT
 
         return self._infer_side_from_features(features)
 
@@ -576,12 +776,19 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
         if anomaly is None or not anomaly.detected:
             return None
 
-        if anomaly.anomaly_type in self.HARD_BLOCKING_ANOMALIES:
-            return f"breakout_blocked_by_hard_oi_anomaly:{anomaly.anomaly_type.value}"
+        if self.breakout_config.block_hard_anomalies:
+            if anomaly.anomaly_type in self.HARD_BLOCKING_ANOMALIES:
+                return (
+                    "breakout_blocked_by_hard_oi_anomaly:"
+                    f"{anomaly.anomaly_type.value}"
+                )
 
-        if anomaly.anomaly_type is OIAnomalyType.EXTREME_CROWDING:
-            if anomaly.confidence >= 0.75:
-                return "breakout_blocked_by_extreme_crowding"
+        if (
+            self.breakout_config.block_extreme_crowding
+            and anomaly.anomaly_type is OIAnomalyType.EXTREME_CROWDING
+            and anomaly.confidence >= self.breakout_config.extreme_crowding_block_confidence
+        ):
+            return "breakout_blocked_by_extreme_crowding"
 
         return None
 
@@ -598,13 +805,19 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
         if divergence.divergence_type is OIDivergenceType.NONE:
             return None
 
-        hint = self.divergence_to_side_hint(divergence.divergence_type)
+        hint = divergence_side_hint(divergence.divergence_type)
 
         if side is SignalSide.LONG and hint == "bearish":
-            return f"long_breakout_rejected_by_divergence:{divergence.divergence_type.value}"
+            return (
+                "long_breakout_rejected_by_divergence:"
+                f"{divergence.divergence_type.value}"
+            )
 
         if side is SignalSide.SHORT and hint == "bullish":
-            return f"short_breakout_rejected_by_divergence:{divergence.divergence_type.value}"
+            return (
+                "short_breakout_rejected_by_divergence:"
+                f"{divergence.divergence_type.value}"
+            )
 
         return None
 
@@ -618,36 +831,40 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
         if features is None:
             return None
 
-        if features.oi_delta_pct is not None and features.oi_delta_pct <= 0:
-            return f"{side.value.lower()}_breakout_not_supported_by_oi_growth"
+        oi_delta = extract_oi_delta_pct(features)
+        efficiency = get_attr_or_key(features, "oi_price_efficiency")
+        price_delta = extract_price_delta_pct(features)
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
 
-        if features.oi_price_efficiency is not None and features.oi_price_efficiency <= 0:
-            return f"{side.value.lower()}_breakout_not_supported_by_oi_price_efficiency"
+        if self.breakout_config.require_positive_oi_growth:
+            if oi_delta <= self.breakout_config.min_oi_delta_pct:
+                return f"{side.value.lower()}_breakout_not_supported_by_oi_growth"
+
+        if self.breakout_config.require_positive_efficiency:
+            if efficiency is not None and float(efficiency) <= 0:
+                return (
+                    f"{side.value.lower()}_breakout_not_supported_by_oi_price_efficiency"
+                )
 
         if side is SignalSide.LONG:
-            if features.price_delta_pct is not None and features.price_delta_pct < 0:
+            if price_delta < 0:
                 return "long_breakout_negative_price_delta"
 
-            if features.oi_pressure_score is not None and features.oi_pressure_score < -0.10:
+            if pressure < self.breakout_config.min_long_pressure_score:
                 return "long_breakout_negative_oi_pressure"
 
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance < -0.10
-            ):
+            if flow < self.breakout_config.min_long_aggressive_flow:
                 return "long_breakout_negative_aggressive_flow"
 
         if side is SignalSide.SHORT:
-            if features.price_delta_pct is not None and features.price_delta_pct > 0:
+            if price_delta > 0:
                 return "short_breakout_positive_price_delta"
 
-            if features.oi_pressure_score is not None and features.oi_pressure_score > 0.10:
+            if pressure > self.breakout_config.max_short_pressure_score:
                 return "short_breakout_positive_oi_pressure"
 
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance > 0.10
-            ):
+            if flow > self.breakout_config.max_short_aggressive_flow:
                 return "short_breakout_positive_aggressive_flow"
 
         return None
@@ -678,404 +895,466 @@ class OIBreakoutConfirmationStrategy(OpenInterestStrategyBase):
 
         return False
 
-    @staticmethod
-    def _positive_breakout_support(features: OIFeatures) -> bool:
+    def _positive_breakout_support(self, features: OIFeatures) -> bool:
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        oi_delta = extract_oi_delta_pct(features)
+        price_delta = extract_price_delta_pct(features)
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
+
         return (
-            features.oi_delta_pct is not None
-            and features.oi_delta_pct > 0
-            and (features.price_delta_pct is None or features.price_delta_pct >= 0)
-            and (features.volume_ratio is None or features.volume_ratio >= 1.0)
-            and (features.oi_pressure_score is None or features.oi_pressure_score >= 0.10)
+            oi_delta > self.breakout_config.min_oi_delta_pct
+            and price_delta >= 0
             and (
-                features.aggressive_flow_imbalance is None
-                or features.aggressive_flow_imbalance >= -0.05
+                volume_ratio is None
+                or float(volume_ratio) >= self.breakout_config.min_volume_ratio
             )
+            and pressure >= self.breakout_config.min_long_pressure_score
+            and flow >= self.breakout_config.min_long_aggressive_flow
         )
 
-    @staticmethod
-    def _negative_breakout_support(features: OIFeatures) -> bool:
+    def _negative_breakout_support(self, features: OIFeatures) -> bool:
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        oi_delta = extract_oi_delta_pct(features)
+        price_delta = extract_price_delta_pct(features)
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
+
         return (
-            features.oi_delta_pct is not None
-            and features.oi_delta_pct > 0
-            and (features.price_delta_pct is None or features.price_delta_pct <= 0)
-            and (features.volume_ratio is None or features.volume_ratio >= 1.0)
-            and (features.oi_pressure_score is None or features.oi_pressure_score <= -0.10)
+            oi_delta > self.breakout_config.min_oi_delta_pct
+            and price_delta <= 0
             and (
-                features.aggressive_flow_imbalance is None
-                or features.aggressive_flow_imbalance <= 0.05
+                volume_ratio is None
+                or float(volume_ratio) >= self.breakout_config.min_volume_ratio
             )
+            and pressure <= self.breakout_config.max_short_pressure_score
+            and flow <= self.breakout_config.max_short_aggressive_flow
         )
 
     # ------------------------------------------------------------------
     # Scoring / confidence
     # ------------------------------------------------------------------
 
-    def _compute_score(
+    def _build_score_breakdown(
         self,
         *,
-        context: SignalContext,
+        context: StrategyContext,
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
-    ) -> float:
-        market_regime = self.get_market_regime(context)
-        base_score = payload.regime_score if payload.regime_score > 0 else payload.regime_confidence
-        score = self.weighted_score(base_score, market_regime)
+        event_time: Any,
+    ) -> ScoreBreakdown:
+        base_score = (
+            payload.regime_score
+            if payload.regime_score > 0
+            else payload.regime_confidence
+        )
+        regime_score = unit_score(base_score)
+        features_score = self._feature_context_score(payload=payload, side=side)
+        analysis_score = unit_score(payload.analysis_confidence)
+        divergence_score = self._divergence_context_score(payload=payload, side=side)
+        fresh_score = freshness_score(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.breakout_config.stale_feature_max_age_seconds,
+        )
+
+        components = {
+            "regime": regime_score,
+            "features": features_score,
+            "analysis": analysis_score,
+            "divergence": divergence_score,
+            "freshness": fresh_score,
+        }
+        weights = {
+            "regime": self.breakout_config.score_regime_weight,
+            "features": self.breakout_config.score_features_weight,
+            "analysis": self.breakout_config.score_analysis_weight,
+            "divergence": self.breakout_config.score_divergence_weight,
+            "freshness": self.breakout_config.score_freshness_weight,
+        }
+
+        score = weighted_score(components, weights, default=regime_score)
+        confidence = confidence_from_components(
+            primary=payload.regime_confidence,
+            context=features_score,
+            confirmation=divergence_score,
+            freshness=fresh_score,
+            primary_weight=self.breakout_config.confidence_regime_weight,
+            context_weight=self.breakout_config.confidence_context_weight,
+            confirmation_weight=self.breakout_config.confidence_confirmation_weight,
+            freshness_weight=self.breakout_config.confidence_freshness_weight,
+        )
+
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            f"oi_regime:{payload.oi_regime.value}",
+            f"side:{side.value}",
+        ]
 
         if payload.analysis_confidence >= 0.75:
             score += 0.04
-        elif payload.analysis_confidence >= 0.50:
+            confidence += 0.04
+            confirmations.append("high_analysis_confidence")
+        elif (
+            payload.analysis_confidence
+            >= self.breakout_config.min_analysis_confidence_bonus_threshold
+        ):
             score += 0.02
-
-        features = payload.features
-        if features is not None:
-            score += self._feature_score_adjustment(features=features, side=side)
-
-        divergence = payload.divergence
-        if divergence is not None and divergence.detected:
-            hint = self.divergence_to_side_hint(divergence.divergence_type)
-            if side is SignalSide.LONG and hint == "bullish":
-                score += min(0.05, divergence.score * 0.08)
-            elif side is SignalSide.SHORT and hint == "bearish":
-                score += min(0.05, divergence.score * 0.08)
-            else:
-                score -= min(0.12, divergence.score * 0.16)
-
-        anomaly = payload.anomaly
-        if anomaly is not None and anomaly.detected:
-            if anomaly.anomaly_type in self.SOFT_RISK_ANOMALIES:
-                score -= min(0.12, anomaly.score * 0.12)
-
-            if anomaly.anomaly_type is OIAnomalyType.OI_SPIKE:
-                score += min(0.04, anomaly.score * 0.05)
+            confidence += 0.02
+            confirmations.append("moderate_analysis_confidence")
 
         if payload.oi_regime is OIRegime.SQUEEZE_SETUP:
             score += 0.04
+            confidence += 0.02
+            confirmations.append("squeeze_setup_context")
 
         if payload.oi_regime is OIRegime.TREND_CONFIRMATION:
             score += 0.03
+            confidence += 0.02
+            confirmations.append("trend_confirmation_context")
 
-        return self.clamp(score)
+        feature_adjustment = self._feature_score_adjustment(
+            features=payload.features,
+            side=side,
+        )
+        score += feature_adjustment
 
-    def _compute_confidence(
+        feature_confidence_adjustment = self._feature_confidence_adjustment(
+            features=payload.features,
+            side=side,
+        )
+        confidence += feature_confidence_adjustment
+
+        divergence = payload.divergence
+        if divergence is not None and divergence.detected:
+            hint = divergence_side_hint(divergence.divergence_type)
+
+            if side is SignalSide.LONG and hint == "bullish":
+                bonus = min(
+                    self.breakout_config.aligned_divergence_bonus,
+                    extract_score(divergence) * 0.08,
+                )
+                score += bonus
+                confidence += min(0.03, extract_confidence(divergence) * 0.05)
+                confirmations.append("aligned_bullish_divergence")
+
+            elif side is SignalSide.SHORT and hint == "bearish":
+                bonus = min(
+                    self.breakout_config.aligned_divergence_bonus,
+                    extract_score(divergence) * 0.08,
+                )
+                score += bonus
+                confidence += min(0.03, extract_confidence(divergence) * 0.05)
+                confirmations.append("aligned_bearish_divergence")
+
+            else:
+                penalty = min(
+                    self.breakout_config.opposing_divergence_penalty,
+                    extract_score(divergence) * 0.16,
+                )
+                score -= penalty
+                confidence -= min(0.08, extract_confidence(divergence) * 0.10)
+                reasons.append("opposing_divergence_penalty")
+
+        anomaly = payload.anomaly
+        if anomaly is not None and anomaly.detected:
+            confirmations.append(f"oi_anomaly:{anomaly.anomaly_type.value}")
+
+            if anomaly.anomaly_type in self.SOFT_RISK_ANOMALIES:
+                penalty = min(
+                    self.breakout_config.max_soft_risk_penalty,
+                    extract_score(anomaly) * self.breakout_config.soft_risk_anomaly_penalty,
+                )
+                score -= penalty
+                confidence -= min(0.08, penalty)
+                reasons.append("soft_risk_anomaly_penalty")
+
+            if anomaly.anomaly_type is OIAnomalyType.OI_SPIKE:
+                bonus = min(
+                    self.breakout_config.oi_spike_bonus,
+                    extract_score(anomaly) * 0.05,
+                )
+                score += bonus
+                confidence += min(0.02, extract_confidence(anomaly) * 0.04)
+                confirmations.append("oi_spike_confirms_breakout")
+
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
+
+    def _feature_context_score(
         self,
         *,
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> float:
-        confidence = (
-            payload.regime_confidence
-            if payload.regime_confidence > 0
-            else payload.regime_score
-        )
-
-        if payload.analysis_confidence >= 0.75:
-            confidence += 0.04
-        elif payload.analysis_confidence >= 0.50:
-            confidence += 0.02
-
         features = payload.features
-        if features is not None:
-            confidence += self._feature_confidence_adjustment(features=features, side=side)
+        if features is None:
+            return 0.0
 
+        components: dict[str, float] = {}
+
+        oi_delta = extract_oi_delta_pct(features)
+        components["oi_growth"] = unit_score(max(0.0, oi_delta))
+
+        price_delta = extract_price_delta_pct(features)
+        if side is SignalSide.LONG:
+            components["price_alignment"] = unit_score(max(0.0, price_delta))
+        elif side is SignalSide.SHORT:
+            components["price_alignment"] = unit_score(abs(min(0.0, price_delta)))
+
+        pressure = extract_oi_pressure_score(features)
+        if side is SignalSide.LONG:
+            components["pressure"] = unit_score((pressure + 1.0) / 2.0)
+        elif side is SignalSide.SHORT:
+            components["pressure"] = unit_score((1.0 - pressure) / 2.0)
+
+        flow = extract_aggressive_flow_imbalance(features)
+        if side is SignalSide.LONG:
+            components["aggressive_flow"] = unit_score((flow + 1.0) / 2.0)
+        elif side is SignalSide.SHORT:
+            components["aggressive_flow"] = unit_score((1.0 - flow) / 2.0)
+
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        if volume_ratio is not None:
+            components["volume"] = unit_score(float(volume_ratio) / 2.0)
+
+        oi_zscore = get_attr_or_key(features, "oi_zscore")
+        if oi_zscore is not None:
+            components["oi_zscore"] = unit_score(abs(float(oi_zscore)) / 3.0)
+
+        efficiency = get_attr_or_key(features, "oi_price_efficiency")
+        if efficiency is not None:
+            components["efficiency"] = unit_score(abs(float(efficiency)))
+
+        if not components:
+            return 0.0
+
+        weights = {key: 1.0 for key in components}
+        return weighted_score(components, weights)
+
+    def _divergence_context_score(
+        self,
+        *,
+        payload: OIBreakoutConfirmationPayload,
+        side: SignalSide,
+    ) -> float:
         divergence = payload.divergence
-        if divergence is not None and divergence.detected:
-            hint = self.divergence_to_side_hint(divergence.divergence_type)
-            if side is SignalSide.LONG and hint == "bullish":
-                confidence += min(0.03, divergence.confidence * 0.05)
-            elif side is SignalSide.SHORT and hint == "bearish":
-                confidence += min(0.03, divergence.confidence * 0.05)
-            else:
-                confidence -= min(0.10, divergence.confidence * 0.15)
+        if divergence is None or not divergence.detected:
+            return 0.0
 
-        anomaly = payload.anomaly
-        if anomaly is not None and anomaly.detected:
-            if anomaly.anomaly_type in self.SOFT_RISK_ANOMALIES:
-                confidence -= min(0.10, anomaly.confidence * 0.10)
+        hint = divergence_side_hint(divergence.divergence_type)
+        base = extract_score(divergence, default=extract_confidence(divergence))
 
-        return self.clamp(confidence)
+        if side is SignalSide.LONG and hint == "bullish":
+            return unit_score(base)
+
+        if side is SignalSide.SHORT and hint == "bearish":
+            return unit_score(base)
+
+        if hint in {"bullish", "bearish"}:
+            return unit_score(1.0 - base)
+
+        return unit_score(base * 0.5)
 
     def _feature_score_adjustment(
         self,
         *,
-        features: OIFeatures,
+        features: OIFeatures | None,
         side: SignalSide,
     ) -> float:
+        if features is None:
+            return 0.0
+
         adjustment = 0.0
 
-        if features.volume_ratio is not None:
-            if features.volume_ratio >= 1.50:
-                adjustment += 0.06
-            elif features.volume_ratio >= 1.00:
-                adjustment += 0.04
-
-        if features.oi_delta_pct is not None:
-            if features.oi_delta_pct >= 0.75:
-                adjustment += 0.07
-            elif features.oi_delta_pct >= 0.25:
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        if volume_ratio is not None:
+            volume = float(volume_ratio)
+            if volume >= self.breakout_config.strong_volume_ratio:
                 adjustment += 0.05
+            elif volume >= self.breakout_config.min_volume_ratio:
+                adjustment += 0.03
 
-        if features.oi_zscore is not None and abs(features.oi_zscore) >= 1.0:
+        oi_zscore = get_attr_or_key(features, "oi_zscore")
+        if (
+            oi_zscore is not None
+            and abs(float(oi_zscore))
+            >= self.breakout_config.min_abs_oi_zscore_for_confirmation
+        ):
             adjustment += 0.03
 
-        if features.oi_price_efficiency is not None:
-            if features.oi_price_efficiency >= 1.0:
-                adjustment += 0.06
-            elif features.oi_price_efficiency >= 0.50:
-                adjustment += 0.04
+        efficiency = get_attr_or_key(features, "oi_price_efficiency")
+        if efficiency is not None and float(efficiency) > 0:
+            adjustment += min(0.05, abs(float(efficiency)) * 0.04)
 
-        if side is SignalSide.LONG:
-            if features.oi_pressure_score is not None and features.oi_pressure_score >= 0.25:
-                adjustment += 0.06
+        pressure = extract_oi_pressure_score(features)
+        if side is SignalSide.LONG and pressure >= 0.10:
+            adjustment += 0.04
+        elif side is SignalSide.SHORT and pressure <= -0.10:
+            adjustment += 0.04
 
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance >= 0.10
-            ):
-                adjustment += 0.04
+        flow = extract_aggressive_flow_imbalance(features)
+        if side is SignalSide.LONG and flow >= 0.10:
+            adjustment += 0.03
+        elif side is SignalSide.SHORT and flow <= -0.10:
+            adjustment += 0.03
 
-            if features.funding_rate is not None and 0 <= features.funding_rate < 0.01:
-                adjustment += 0.02
+        funding_rate = extract_funding_rate(features)
+        if funding_rate is not None and payload_like_squeeze(side, funding_rate):
+            adjustment += 0.02
 
-            if features.liquidation_imbalance is not None and features.liquidation_imbalance <= -0.20:
-                adjustment += 0.03
-
-        elif side is SignalSide.SHORT:
-            if features.oi_pressure_score is not None and features.oi_pressure_score <= -0.25:
-                adjustment += 0.06
-
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance <= -0.10
-            ):
-                adjustment += 0.04
-
-            if features.funding_rate is not None and -0.01 < features.funding_rate <= 0:
-                adjustment += 0.02
-
-            if features.liquidation_imbalance is not None and features.liquidation_imbalance >= 0.20:
-                adjustment += 0.03
+        liquidation_pressure = extract_liquidation_pressure(features)
+        if side is SignalSide.LONG and liquidation_pressure <= -0.20:
+            adjustment += 0.02
+        elif side is SignalSide.SHORT and liquidation_pressure >= 0.20:
+            adjustment += 0.02
 
         return adjustment
 
     def _feature_confidence_adjustment(
         self,
         *,
-        features: OIFeatures,
+        features: OIFeatures | None,
         side: SignalSide,
     ) -> float:
+        if features is None:
+            return 0.0
+
         adjustment = 0.0
 
-        if features.volume_ratio is not None and features.volume_ratio >= 1.0:
+        volume_ratio = get_attr_or_key(features, "volume_ratio")
+        if (
+            volume_ratio is not None
+            and float(volume_ratio) >= self.breakout_config.min_volume_ratio
+        ):
             adjustment += 0.03
 
-        if features.oi_delta_pct is not None and features.oi_delta_pct >= 0.25:
-            adjustment += 0.04
-
-        if features.oi_ma_fast is not None and features.oi_ma_slow is not None:
-            if features.oi_ma_fast > features.oi_ma_slow:
-                adjustment += 0.03
-
-        if features.oi_price_efficiency is not None and features.oi_price_efficiency > 0.50:
+        oi_zscore = get_attr_or_key(features, "oi_zscore")
+        if (
+            oi_zscore is not None
+            and abs(float(oi_zscore))
+            >= self.breakout_config.min_abs_oi_zscore_for_confirmation
+        ):
             adjustment += 0.03
+
+        efficiency = get_attr_or_key(features, "oi_price_efficiency")
+        if efficiency is not None and float(efficiency) > 0:
+            adjustment += 0.03
+
+        pressure = extract_oi_pressure_score(features)
+        flow = extract_aggressive_flow_imbalance(features)
 
         if side is SignalSide.LONG:
-            if features.oi_pressure_score is not None and features.oi_pressure_score >= 0.25:
-                adjustment += 0.04
-
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance >= 0.10
-            ):
-                adjustment += 0.03
+            if pressure >= 0.10:
+                adjustment += 0.02
+            if flow >= 0.10:
+                adjustment += 0.02
 
         elif side is SignalSide.SHORT:
-            if features.oi_pressure_score is not None and features.oi_pressure_score <= -0.25:
-                adjustment += 0.04
-
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance <= -0.10
-            ):
-                adjustment += 0.03
+            if pressure <= -0.10:
+                adjustment += 0.02
+            if flow <= -0.10:
+                adjustment += 0.02
 
         return adjustment
 
     # ------------------------------------------------------------------
-    # Signal building
+    # Source features / tags
     # ------------------------------------------------------------------
 
-    def _build_signal(
-        self,
-        *,
-        context: SignalContext,
-        payload: OIBreakoutConfirmationPayload,
-        side: SignalSide,
-        setup_type: SetupType,
-        score: float,
-        confidence: float,
-    ) -> StrategySignal:
-        signal = StrategySignal(
-            symbol=context.symbol,
-            side=side,
-            strategy_name=self.STRATEGY_NAME,
-            category=StrategyCategory.OPEN_INTEREST,
-            timeframe=context.timeframe,
-            setup_type=setup_type,
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=self.strength_from_score(score),
-            confidence_grade=self.confidence_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=TriggerType.CONFIRMATION,
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self.priority_from_score(score),
-            regime=self.get_market_regime(context),
-            metadata={
-                "oi_regime": payload.oi_regime.value,
-                "oi_regime_confidence": payload.regime_confidence,
-                "oi_regime_score": payload.regime_score,
-                "oi_regime_confidence_band": payload.regime.confidence_band.value,
-                "oi_analysis_confidence": payload.analysis_confidence,
-                "oi_raw_payload": payload.raw,
-            },
-        )
+    def _source_features(self, payload: OIBreakoutConfirmationPayload) -> list[str]:
+        features = [
+            OPEN_INTEREST_FEATURES.REGIME,
+            OPEN_INTEREST_FEATURES.REGIME_TYPE,
+            OPEN_INTEREST_FEATURES.REGIME_CONFIDENCE,
+            OPEN_INTEREST_FEATURES.REGIME_SCORE,
+        ]
+
+        if payload.features is not None:
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.FEATURES,
+                    OPEN_INTEREST_FEATURES.OI_DELTA_PCT,
+                    OPEN_INTEREST_FEATURES.PRICE_DELTA_PCT,
+                    OPEN_INTEREST_FEATURES.OI_PRESSURE_SCORE,
+                    OPEN_INTEREST_FEATURES.AGGRESSIVE_FLOW_IMBALANCE,
+                ]
+            )
 
         if payload.divergence is not None:
-            signal.metadata.update(
-                {
-                    "oi_divergence_detected": payload.divergence.detected,
-                    "oi_divergence_type": payload.divergence.divergence_type.value,
-                    "oi_divergence_confidence": payload.divergence.confidence,
-                    "oi_divergence_score": payload.divergence.score,
-                    "oi_divergence_confidence_band": payload.divergence.confidence_band.value,
-                }
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.DIVERGENCE,
+                    OPEN_INTEREST_FEATURES.DIVERGENCE_TYPE,
+                    OPEN_INTEREST_FEATURES.DIVERGENCE_CONFIDENCE,
+                ]
             )
 
         if payload.anomaly is not None:
-            signal.metadata.update(
-                {
-                    "oi_anomaly_detected": payload.anomaly.detected,
-                    "oi_anomaly_type": payload.anomaly.anomaly_type.value,
-                    "oi_anomaly_strength": payload.anomaly.strength.value,
-                    "oi_anomaly_confidence": payload.anomaly.confidence,
-                    "oi_anomaly_score": payload.anomaly.score,
-                    "oi_anomaly_confidence_band": payload.anomaly.confidence_band.value,
-                }
+            features.extend(
+                [
+                    OPEN_INTEREST_FEATURES.ANOMALY,
+                    OPEN_INTEREST_FEATURES.ANOMALY_TYPE,
+                    OPEN_INTEREST_FEATURES.ANOMALY_CONFIDENCE,
+                ]
             )
 
-        signal.add_reason(f"oi_regime:{payload.oi_regime.value}")
-        signal.add_reason(f"setup_type:{setup_type.value}")
+        return list(dict.fromkeys(features))
 
-        for reason in payload.reasons:
-            signal.add_reason(reason)
-
-        self.add_oi_source_features(signal, context)
-        self.append_oi_analysis_metadata(signal, context)
-        self.append_oi_analysis_reasons(signal, context)
-
-        if payload.features is not None:
-            self.append_oi_feature_reasons(signal, payload.features)
-
-        for confirmation in self._build_confirmations(
-            side=side,
-            payload=payload,
-        ):
-            signal.add_confirmation(confirmation)
-
-        return signal
-
-    def _build_confirmations(
+    def _tags(
         self,
         *,
-        side: SignalSide,
         payload: OIBreakoutConfirmationPayload,
+        setup_type: SetupType,
     ) -> list[str]:
-        confirmations: list[str] = [
-            f"regime:{payload.oi_regime.value}",
+        tags = [
+            self.breakout_config.tag_open_interest,
+            self.breakout_config.tag_oi_breakout,
+            self.breakout_config.tag_confirmation,
+            setup_type.value,
+            payload.oi_regime.value,
         ]
 
-        if payload.analysis_confidence >= 0.75:
-            confirmations.append("high_confidence_oi_analysis")
+        if setup_type is SetupType.CONTINUATION:
+            tags.append(self.breakout_config.tag_continuation)
 
-        if payload.regime_confidence >= 0.75:
-            confirmations.append("high_confidence_oi_regime")
+        if setup_type is SetupType.SQUEEZE:
+            tags.append(self.breakout_config.tag_squeeze)
 
-        if payload.oi_regime is OIRegime.TREND_CONFIRMATION:
-            confirmations.append("trend_confirmation_regime")
-
-        if payload.oi_regime is OIRegime.SQUEEZE_SETUP:
-            confirmations.append("squeeze_setup_regime")
+        if payload.features is not None:
+            tags.extend(
+                [
+                    self.breakout_config.tag_pressure,
+                    self.breakout_config.tag_aggressive_flow,
+                ]
+            )
 
         if payload.divergence is not None and payload.divergence.detected:
-            hint = self.divergence_to_side_hint(payload.divergence.divergence_type)
-
-            if side is SignalSide.LONG and hint == "bullish":
-                confirmations.append("bullish_divergence_support")
-            elif side is SignalSide.SHORT and hint == "bearish":
-                confirmations.append("bearish_divergence_support")
-            else:
-                confirmations.append("divergence_risk_context")
+            tags.append(f"oi_divergence:{payload.divergence.divergence_type.value}")
 
         if payload.anomaly is not None and payload.anomaly.detected:
-            confirmations.append(f"oi_anomaly_context:{payload.anomaly.anomaly_type.value}")
+            tags.append(f"oi_anomaly:{payload.anomaly.anomaly_type.value}")
 
-            if payload.anomaly.anomaly_type is OIAnomalyType.OI_SPIKE:
-                confirmations.append("oi_spike_confirmation")
+        return list(dict.fromkeys(tags))
 
-            if payload.anomaly.anomaly_type in self.SOFT_RISK_ANOMALIES:
-                confirmations.append("soft_risk_anomaly_context")
 
-        features = payload.features
-        if features is None:
-            return list(dict.fromkeys(confirmations))
+def payload_like_squeeze(side: SignalSide, funding_rate: float) -> bool:
+    """
+    Small local helper for squeeze-like funding confirmation.
 
-        if features.volume_ratio is not None and features.volume_ratio >= 1.0:
-            confirmations.append("volume_confirmation")
+    Negative funding can support LONG squeeze continuation.
+    Positive funding can support SHORT squeeze continuation.
+    """
+    if side is SignalSide.LONG:
+        return funding_rate < 0
 
-        if features.oi_delta_pct is not None and features.oi_delta_pct >= 0.25:
-            confirmations.append("oi_build_confirmation")
+    if side is SignalSide.SHORT:
+        return funding_rate > 0
 
-        if features.oi_ma_fast is not None and features.oi_ma_slow is not None:
-            if features.oi_ma_fast > features.oi_ma_slow:
-                confirmations.append("fast_oi_above_slow_oi")
-
-        if features.oi_price_efficiency is not None and features.oi_price_efficiency > 0.50:
-            confirmations.append("price_move_supported_by_oi")
-
-        if features.oi_zscore is not None and abs(features.oi_zscore) >= 1.0:
-            confirmations.append("oi_zscore_context")
-
-        if side is SignalSide.LONG:
-            if features.oi_pressure_score is not None and features.oi_pressure_score >= 0.25:
-                confirmations.append("positive_pressure_confirmation")
-
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance >= 0.10
-            ):
-                confirmations.append("aggressive_buy_confirmation")
-
-            if features.funding_rate is not None and 0 <= features.funding_rate < 0.01:
-                confirmations.append("healthy_long_funding_context")
-
-            if features.liquidation_imbalance is not None and features.liquidation_imbalance <= -0.20:
-                confirmations.append("short_liquidation_support")
-
-        elif side is SignalSide.SHORT:
-            if features.oi_pressure_score is not None and features.oi_pressure_score <= -0.25:
-                confirmations.append("negative_pressure_confirmation")
-
-            if (
-                features.aggressive_flow_imbalance is not None
-                and features.aggressive_flow_imbalance <= -0.10
-            ):
-                confirmations.append("aggressive_sell_confirmation")
-
-            if features.funding_rate is not None and -0.01 < features.funding_rate <= 0:
-                confirmations.append("healthy_short_funding_context")
-
-            if features.liquidation_imbalance is not None and features.liquidation_imbalance >= 0.20:
-                confirmations.append("long_liquidation_support")
-
-        return list(dict.fromkeys(confirmations))
+    return False

@@ -1,8 +1,13 @@
+# trading_system/strategy/strategies/open_interest/base.py
+
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
+from datetime import datetime, timezone
+from decimal import Decimal
+from enum import Enum
+from typing import Any
 
 from analytics.open_interest.enums import (
     OIAnomalyType,
@@ -18,262 +23,952 @@ from analytics.open_interest.models import (
     OIRegimeResult,
     OISnapshot,
 )
-from core.logger import get_logger
-from strategy.base import ContextAwareComponent, NamedEntityMixin, PrioritizedMixin
-from strategy.config import StrategyConfig
-from strategy.enums import (
-    ConfidenceGrade,
-    MarketRegime,
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    EntryType,
+    ExitType,
+    FeatureSource,
+    SetupType,
+    SignalOrigin,
     SignalPriority,
-    SignalStrength,
+    SignalSide,
+    SignalStatus,
     StrategyCategory,
+    StrategyMarginMode,
+    StrategyMarketType,
+    StrategyOrderIntent,
+    StrategyTradeTier,
+    Timeframe,
+    TriggerType,
 )
-from strategy.models import SignalContext, StrategySignal
+from ...exceptions import StrategyConfigError, StrategyEvaluationError
+from ...models import (
+    FeatureSnapshot,
+    StrategyContext,
+    StrategySignal,
+    clamp,
+    ensure_aware_utc,
+    utcnow,
+)
+from ..base_strategy import TradingStrategy
+
+
+# =============================================================================
+# Generic helpers
+# =============================================================================
+
+
+def utc_now() -> datetime:
+    return utcnow()
+
+
+def ensure_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return ensure_aware_utc(value)
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    """
+    Parse timestamps used inside normalized open-interest domain payloads.
+
+    Concrete strategies normally receive StrategyContext.timestamp, but nested
+    analytics payloads may still contain detected_at / event_time / timestamp.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return ensure_aware_utc(value)
+
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            raw = float(value)
+            timestamp = raw / 1000.0 if raw > 10_000_000_000 else raw
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        try:
+            return ensure_aware_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+        except ValueError:
+            try:
+                return parse_datetime(float(raw))
+            except ValueError:
+                return None
+
+    return None
+
+
+def serialize_for_metadata(value: Any) -> Any:
+    """
+    Serialize nested analytics values for StrategySignal.metadata.
+
+    This is not a RiskReadySignalPayload builder. SignalProcessor / SignalBuilder
+    owns final risk-ready payload conversion.
+    """
+    if isinstance(value, datetime):
+        return ensure_aware_utc(value).isoformat()
+
+    if isinstance(value, Decimal):
+        return str(value)
+
+    if isinstance(value, Enum):
+        return value.value
+
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return serialize_for_metadata(value.to_dict())
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): serialize_for_metadata(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [serialize_for_metadata(item) for item in value]
+
+    return value
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
+
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, Mapping):
+            return converted
+
+    return None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    mapping = _as_mapping(value)
+    return dict(mapping) if mapping is not None else {}
+
+
+def _get_attr_or_key(value: Any, key: str, default: Any = None) -> Any:
+    mapping = _as_mapping(value)
+    if mapping is not None:
+        return mapping.get(key, default)
+
+    return getattr(value, key, default)
+
+
+def _get_path(value: Any, path: str, default: Any = None) -> Any:
+    """
+    Read dotted path from dict-like or object-like nested data.
+
+    Examples:
+        regime.confidence
+        divergence.divergence_type
+        anomaly.anomaly_type
+        features.oi_delta_pct
+    """
+    if not isinstance(path, str) or not path.strip():
+        return default
+
+    current = value
+
+    for part in path.split("."):
+        if current is None:
+            return default
+
+        part = part.strip()
+        if not part:
+            return default
+
+        current = _get_attr_or_key(current, part, default=None)
+
+    return default if current is None else current
+
+
+def _first_present(
+    value: Any,
+    paths: tuple[str, ...],
+    *,
+    default: Any = None,
+) -> Any:
+    for path in paths:
+        item = _get_path(value, path, default=None)
+        if item is not None:
+            return item
+    return default
+
+
+def _to_float(value: Any, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return float(value)
+
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+
+    if isinstance(value, Enum):
+        return _to_float(value.value, default)
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return default
+
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    return default
+
+
+def _to_int(value: Any, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return int(value)
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, (float, Decimal)):
+        return int(value)
+
+    if isinstance(value, Enum):
+        return _to_int(value.value, default)
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return default
+
+        try:
+            return int(raw)
+        except ValueError:
+            try:
+                return int(float(raw))
+            except ValueError:
+                return default
+
+    return default
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, Enum):
+        return _to_bool(value.value, default)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+            "confirmed",
+            "valid",
+            "active",
+            "detected",
+        }:
+            return True
+
+        if normalized in {
+            "0",
+            "false",
+            "no",
+            "n",
+            "off",
+            "rejected",
+            "invalid",
+            "expired",
+            "inactive",
+            "none",
+        }:
+            return False
+
+    if isinstance(value, (int, float, Decimal)):
+        return bool(value)
+
+    return default
+
+
+def _to_str(value: Any, default: str | None = None) -> str | None:
+    if value is None:
+        return default
+
+    if isinstance(value, Enum):
+        return str(value.value)
+
+    text = str(value).strip()
+    return text if text else default
+
+
+def _normalize_label(value: Any) -> str:
+    if isinstance(value, Enum):
+        value = value.value
+
+    if value is None:
+        return ""
+
+    return str(value).strip().lower()
+
+
+def _unit_score(value: Any, default: float = 0.0) -> float:
+    parsed = _to_float(value, default)
+    return clamp(float(parsed if parsed is not None else default), 0.0, 1.0)
+
+
+def _signed_score(value: Any, default: float = 0.0) -> float:
+    parsed = _to_float(value, default)
+    return clamp(float(parsed if parsed is not None else default), -1.0, 1.0)
+
+
+# =============================================================================
+# Open-interest feature contract
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class OpenInterestFeatureNames:
+    """
+    Stable feature names expected in StrategyContext.
+
+    Generic SignalNormalizer may create these names from analytics.open_interest.*
+    payloads, or strategies can read equivalent values from domain_data aliases.
+    """
+
+    ANALYSIS: str = "open_interest.analysis"
+
+    SNAPSHOT: str = "open_interest.snapshot"
+    MARKET_CONTEXT: str = "open_interest.context"
+    FEATURES: str = "open_interest.features"
+
+    REGIME: str = "open_interest.regime"
+    REGIME_TYPE: str = "open_interest.regime.type"
+    REGIME_CONFIDENCE: str = "open_interest.regime.confidence"
+    REGIME_SCORE: str = "open_interest.regime.score"
+
+    DIVERGENCE: str = "open_interest.divergence"
+    DIVERGENCE_DETECTED: str = "open_interest.divergence.detected"
+    DIVERGENCE_TYPE: str = "open_interest.divergence.type"
+    DIVERGENCE_CONFIDENCE: str = "open_interest.divergence.confidence"
+    DIVERGENCE_SCORE: str = "open_interest.divergence.score"
+    DIVERGENCE_WINDOW_SIZE: str = "open_interest.divergence.window_size"
+
+    ANOMALY: str = "open_interest.anomaly"
+    ANOMALY_DETECTED: str = "open_interest.anomaly.detected"
+    ANOMALY_TYPE: str = "open_interest.anomaly.type"
+    ANOMALY_CONFIDENCE: str = "open_interest.anomaly.confidence"
+    ANOMALY_SCORE: str = "open_interest.anomaly.score"
+    ANOMALY_STRENGTH: str = "open_interest.anomaly.strength"
+
+    OI_DELTA_PCT: str = "open_interest.features.oi_delta_pct"
+    PRICE_DELTA_PCT: str = "open_interest.features.price_delta_pct"
+    OI_PRESSURE_SCORE: str = "open_interest.features.oi_pressure_score"
+    AGGRESSIVE_FLOW_IMBALANCE: str = (
+        "open_interest.features.aggressive_flow_imbalance"
+    )
+    FUNDING_RATE: str = "open_interest.features.funding_rate"
+    LIQUIDATION_PRESSURE: str = "open_interest.features.liquidation_pressure"
+
+    @classmethod
+    def all(cls) -> set[str]:
+        instance = cls()
+        return {
+            getattr(instance, item.name)
+            for item in fields(cls)
+            if isinstance(getattr(instance, item.name), str)
+            and getattr(instance, item.name).strip()
+        }
+
+
+OPEN_INTEREST_FEATURES = OpenInterestFeatureNames()
+
+
+OPEN_INTEREST_DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
+    "analysis": (
+        "analysis",
+        "oi_analysis",
+        "open_interest_analysis",
+        "result",
+    ),
+    "snapshot": (
+        "snapshot",
+        "oi_snapshot",
+        "open_interest_snapshot",
+        "analysis.snapshot",
+    ),
+    "market_context": (
+        "context",
+        "market_context",
+        "oi_context",
+        "open_interest_context",
+        "analysis.context",
+    ),
+    "features": (
+        "features",
+        "oi_features",
+        "open_interest_features",
+        "analysis.features",
+    ),
+    "regime": (
+        "regime",
+        "regime_result",
+        "oi_regime",
+        "open_interest_regime",
+        "new_regime",
+        "analysis.regime",
+    ),
+    "divergence": (
+        "divergence",
+        "divergence_result",
+        "oi_divergence",
+        "open_interest_divergence",
+        "analysis.divergence",
+    ),
+    "anomaly": (
+        "anomaly",
+        "anomaly_result",
+        "oi_anomaly",
+        "open_interest_anomaly",
+        "analysis.anomaly",
+    ),
+    "signal": (
+        "signal",
+        "oi_signal",
+        "open_interest_signal",
+        "analytics_signal",
+    ),
+}
+
+
+# =============================================================================
+# Scope
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class OpenInterestStrategyScope:
+    """
+    Futures open-interest scope used only for metadata and normalization.
+
+    Concrete strategies still make decisions from StrategyContext.
+    """
+
+    exchange: str
+    market_type: str
+    symbol: str
+    timeframe: str
+    exchange_symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        exchange = str(self.exchange or "unknown").strip().lower()
+        market_type = str(
+            self.market_type or StrategyMarketType.USDM_FUTURES.value
+        ).strip()
+        symbol = str(self.symbol or "").strip().upper()
+        timeframe = str(self.timeframe or Timeframe.M1.value).strip().lower()
+        exchange_symbol = str(self.exchange_symbol or symbol).strip().upper()
+
+        if not symbol:
+            raise StrategyEvaluationError(
+                "OpenInterestStrategyScope.symbol cannot be empty"
+            )
+
+        object.__setattr__(self, "exchange", exchange)
+        object.__setattr__(self, "market_type", market_type)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "timeframe", timeframe)
+        object.__setattr__(self, "exchange_symbol", exchange_symbol)
+
+    @property
+    def key(self) -> str:
+        return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
+
+    @property
+    def legacy_key(self) -> str:
+        return f"{self.symbol}:{self.exchange}"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "exchange": self.exchange,
+            "market_type": self.market_type,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "exchange_symbol": self.exchange_symbol or self.symbol,
+            "key": self.key,
+            "legacy_key": self.legacy_key,
+        }
+
+
+# =============================================================================
+# Config
+# =============================================================================
 
 
 @dataclass(slots=True)
-class OIBasePayload:
+class OpenInterestStrategyConfig:
     """
-    Універсальний контейнер для open-interest strategy extraction.
+    Domain config shared by concrete open-interest strategies.
 
-    Це не replacement для domain-specific payload-ів окремих стратегій.
-    Він потрібен як спільний normalized view над analytics.open_interest payload.
-    """
-
-    analysis: OIAnalysisResult | None = None
-    snapshot: OISnapshot | None = None
-    market_context: OIMarketContext | None = None
-    features: OIFeatures | None = None
-    regime: OIRegimeResult | None = None
-    divergence: OIDivergenceResult | None = None
-    anomaly: OIAnomalyResult | None = None
-
-    scope: dict[str, Any] = field(default_factory=dict)
-    reasons: list[str] = field(default_factory=list)
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-class OpenInterestStrategyBase(
-    ContextAwareComponent,
-    NamedEntityMixin,
-    PrioritizedMixin,
-):
-    """
-    Base class для strategy/strategies/open_interest.
-
-    Роль цього класу:
-    - читати canonical payload від analytics.open_interest;
-    - підтримувати specialized OI events як fallback;
-    - централізувати extraction для analysis/features/regime/divergence/anomaly;
-    - не рахувати аналітику повторно;
-    - не створювати EventBus/Scheduler напряму;
-    - залишити backward-compatible fallback на старі feature-map keys.
-
-    Canonical input:
-        context.open_interest = OIAnalysisResult.to_dict()
-
-    Supported fallback inputs:
-        - analytics.oi.regime_changed payload;
-        - analytics.oi.divergence payload;
-        - analytics.oi.anomaly payload;
-        - analytics.oi.squeeze_setup payload;
-        - analytics.oi.capitulation payload;
-        - old context feature keys: oi.* / open_interest.*.
+    Runtime enabled/symbol/timeframe/regime checks belong to StrategyConfig /
+    StrategyDefinitionConfig. This config keeps OI-specific defaults and
+    quality thresholds.
     """
 
-    STRATEGY_NAME: str = "open_interest_base_strategy"
-    DEFAULT_PRIORITY: int = 80
-    REQUIRED_FEATURES: set[str] = set()
+    default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
+    default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
+    default_order_intent: StrategyOrderIntent = StrategyOrderIntent.OPEN
+    default_trade_tier: StrategyTradeTier = StrategyTradeTier.T2
+
+    default_entry_type: EntryType = EntryType.MARKET
+    default_exit_types: tuple[ExitType, ...] = (
+        ExitType.TAKE_PROFIT,
+        ExitType.STOP_LOSS,
+        ExitType.INVALIDATION,
+    )
+
+    min_context_confidence: float = 0.0
+    min_signal_confidence: float = 0.50
+    min_signal_score: float = 0.35
+
+    min_regime_confidence: float = 0.0
+    min_divergence_confidence: float = 0.0
+    min_anomaly_confidence: float = 0.0
+
+    requested_leverage: float | None = None
+    max_slippage_bps: float | None = None
+    entry_timeout_seconds: int | None = None
+    max_holding_seconds: int | None = None
+
+    stale_feature_max_age_seconds: float | None = None
+
+    attach_open_interest_context_metadata: bool = True
+    attach_scope_metadata: bool = True
+    attach_feature_values_metadata: bool = True
+
+    tag_open_interest: str = "open_interest"
+    tag_regime: str = "oi_regime"
+    tag_divergence: str = "oi_divergence"
+    tag_anomaly: str = "oi_anomaly"
+    tag_capitulation: str = "oi_capitulation"
+    tag_breakout: str = "oi_breakout"
+    tag_reversal: str = "reversal"
+    tag_continuation: str = "continuation"
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        bounded = {
+            "min_context_confidence": self.min_context_confidence,
+            "min_signal_confidence": self.min_signal_confidence,
+            "min_signal_score": self.min_signal_score,
+            "min_regime_confidence": self.min_regime_confidence,
+            "min_divergence_confidence": self.min_divergence_confidence,
+            "min_anomaly_confidence": self.min_anomaly_confidence,
+        }
+
+        for name, value in bounded.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{name} must be between 0.0 and 1.0")
+
+        if self.requested_leverage is not None and self.requested_leverage <= 0:
+            raise StrategyConfigError("requested_leverage must be > 0")
+
+        if self.max_slippage_bps is not None and self.max_slippage_bps < 0:
+            raise StrategyConfigError("max_slippage_bps must be >= 0")
+
+        if self.entry_timeout_seconds is not None and self.entry_timeout_seconds <= 0:
+            raise StrategyConfigError("entry_timeout_seconds must be > 0")
+
+        if self.max_holding_seconds is not None and self.max_holding_seconds <= 0:
+            raise StrategyConfigError("max_holding_seconds must be > 0")
+
+        if (
+            self.stale_feature_max_age_seconds is not None
+            and self.stale_feature_max_age_seconds <= 0
+        ):
+            raise StrategyConfigError("stale_feature_max_age_seconds must be > 0")
+
+        for attr in (
+            "tag_open_interest",
+            "tag_regime",
+            "tag_divergence",
+            "tag_anomaly",
+            "tag_capitulation",
+            "tag_breakout",
+            "tag_reversal",
+            "tag_continuation",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+
+# =============================================================================
+# Base open-interest strategy
+# =============================================================================
+
+
+class OpenInterestTradingStrategy(TradingStrategy):
+    """
+    Base class for concrete strategy/strategies/open_interest/* classes.
+
+    Responsibilities:
+    - read open-interest analytics data from StrategyContext only;
+    - provide helper methods for OI domain extraction and scoring;
+    - build internal StrategySignal objects through TradingStrategy helpers;
+    - attach futures/open-interest metadata for SignalProcessor.
+
+    Forbidden:
+    - no direct analytics.open_interest.* EventBus subscriptions;
+    - no local signal/rejection state machine;
+    - no diagnostics scheduler jobs;
+    - no EventBus emit of signal.generated;
+    - no RiskManager / Execution calls;
+    - no raw market data reads.
+    """
+
+    component_namespace = "strategy.open_interest"
+    category: StrategyCategory = StrategyCategory.OPEN_INTEREST
+    default_setup_type: SetupType = SetupType.UNKNOWN
+    default_timeframe: Timeframe = Timeframe.M1
+
+    feature_names = OPEN_INTEREST_FEATURES
 
     def __init__(
         self,
         config: StrategyConfig,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        open_interest_config: OpenInterestStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        self.open_interest_config = (
+            open_interest_config or OpenInterestStrategyConfig()
+        )
+        self.open_interest_config.validate()
+
         super().__init__(
             config=config,
             event_bus=event_bus,
-            logger=get_logger(
-                __name__,
-                service_name="strategy",
-                event_type=self.STRATEGY_NAME,
-            ),
-        )
-        self.validate_config()
-
-    @property
-    def priority(self) -> int:
-        strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
-        if strategy_cfg is not None:
-            return strategy_cfg.priority
-        return self.DEFAULT_PRIORITY
-
-    # ------------------------------------------------------------------
-    # Common validation helpers
-    # ------------------------------------------------------------------
-
-    def is_strategy_runtime_allowed(
-        self,
-        context: SignalContext,
-    ) -> tuple[bool, str | None]:
-        strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
-        if strategy_cfg is None:
-            return False, "strategy_config_not_found"
-
-        if not strategy_cfg.runtime.enabled:
-            return False, "strategy_disabled"
-
-        if strategy_cfg.runtime.symbols and context.symbol not in strategy_cfg.runtime.symbols:
-            return False, "symbol_not_enabled_for_strategy"
-
-        if strategy_cfg.runtime.timeframes and context.timeframe not in strategy_cfg.runtime.timeframes:
-            return False, "timeframe_not_enabled_for_strategy"
-
-        return True, None
-
-    def is_market_regime_allowed(
-        self,
-        context: SignalContext,
-    ) -> tuple[bool, str | None]:
-        strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
-        if strategy_cfg is None:
-            return False, "strategy_config_not_found"
-
-        regime = self.get_market_regime(context)
-        if strategy_cfg.runtime.allowed_regimes and regime not in strategy_cfg.runtime.allowed_regimes:
-            return False, "regime_not_allowed"
-
-        return True, None
-
-    def context_has_any_oi_data(
-        self,
-        context: SignalContext,
-        keys: tuple[str, ...] = (),
-    ) -> bool:
-        if self.extract_oi_domain(context):
-            return True
-
-        if self.extract_oi_analysis(context) is not None:
-            return True
-
-        if self.extract_oi_features(context) is not None:
-            return True
-
-        return any(context.has_feature(name) for name in keys)
-
-    def has_stale_required_features(self, context: SignalContext) -> bool:
-        """
-        Backward-compatible stale check.
-
-        Для нового canonical context.open_interest payload freshness має
-        контролювати StrategyContextBuilder / SignalContext creation layer.
-        Тут лишаємо перевірку старих feature-map keys.
-        """
-        for name in self.REQUIRED_FEATURES:
-            if context.has_feature(name) and context.feature_is_stale(name):
-                return True
-        return False
-
-    # ------------------------------------------------------------------
-    # Canonical OI domain extraction
-    # ------------------------------------------------------------------
-
-    def extract_oi_domain(self, context: SignalContext) -> dict[str, Any]:
-        """
-        Повертає raw open_interest domain payload із SignalContext.
-
-        Expected canonical shape:
-            OIAnalysisResult.to_dict()
-
-        Але метод також приймає будь-який dict-подібний payload від
-        specialized analytics.oi.* events.
-        """
-        domain = getattr(context, "open_interest", None)
-
-        if isinstance(domain, OIAnalysisResult):
-            return domain.to_dict()
-
-        if isinstance(domain, Mapping):
-            return dict(domain)
-
-        return {}
-
-    def extract_base_payload(self, context: SignalContext) -> OIBasePayload:
-        """
-        Unified normalized view для дочірніх OI-стратегій.
-
-        Окремі стратегії можуть використовувати цей метод як стартову точку,
-        а потім будувати власний domain-specific payload.
-        """
-        raw = self.extract_oi_domain(context)
-        analysis = self.extract_oi_analysis(context)
-        features = self.extract_oi_features(context)
-        regime = self.extract_oi_regime_result(context)
-        divergence = self.extract_oi_divergence_result(context)
-        anomaly = self.extract_oi_anomaly_result(context)
-        snapshot = self.extract_oi_snapshot(context)
-        market_context = self.extract_oi_market_context(context)
-
-        reasons: list[str] = []
-        if regime is not None:
-            reasons.extend(regime.reasons)
-        if divergence is not None:
-            reasons.extend(divergence.reasons)
-        if anomaly is not None:
-            reasons.extend(anomaly.reasons)
-
-        return OIBasePayload(
-            analysis=analysis,
-            snapshot=snapshot,
-            market_context=market_context,
-            features=features,
-            regime=regime,
-            divergence=divergence,
-            anomaly=anomaly,
-            scope=self.extract_oi_scope(context),
-            reasons=list(dict.fromkeys(reasons)),
-            raw=raw,
+            scheduler=scheduler,
+            definition=definition,
+            service_name=service_name,
         )
 
-    def extract_oi_analysis(self, context: SignalContext) -> OIAnalysisResult | None:
+    def validate_config(self) -> None:
+        super().validate_config()
+        self.open_interest_config.validate()
+
+    # ------------------------------------------------------------------
+    # Context / domain access
+    # ------------------------------------------------------------------
+
+    def open_interest_domain(self, context: StrategyContext) -> dict[str, Any]:
         """
-        Extract full OIAnalysisResult.
+        Return open-interest domain data from StrategyContext.
 
-        Працює тільки коли context.open_interest містить повний
-        analytics.oi.updated payload.
+        Generic SignalNormalizer / StrategyContextBuilder should populate this
+        from analytics.open_interest.* payloads.
         """
-        domain = getattr(context, "open_interest", None)
+        self.validate_context(context)
+        domain = context.domain_dict(FeatureSource.OPEN_INTEREST)
+        return dict(domain)
 
-        if isinstance(domain, OIAnalysisResult):
-            return domain
+    def open_interest_item(
+        self,
+        context: StrategyContext,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        domain = self.open_interest_domain(context)
 
-        if not isinstance(domain, Mapping):
-            return None
+        if key in domain:
+            return domain[key]
 
-        data = dict(domain)
-        required = {"symbol", "timestamp", "snapshot", "context", "features", "regime"}
-        if not required.issubset(data.keys()):
-            return None
+        for alias in OPEN_INTEREST_DOMAIN_ALIASES.get(key, ()):
+            value = _get_path(domain, alias, default=None)
+            if value is not None:
+                return value
 
-        try:
-            return OIAnalysisResult.from_dict(data)
-        except Exception as exc:
-            self.logger.warning(
-                "Failed to parse OIAnalysisResult",
-                extra={
-                    "strategy": self.STRATEGY_NAME,
-                    "symbol": getattr(context, "symbol", None),
-                    "error": repr(exc),
-                },
+        return default
+
+    def open_interest_path(
+        self,
+        context: StrategyContext,
+        path: str,
+        default: Any = None,
+    ) -> Any:
+        """
+        Read open-interest value by dotted path.
+
+        Priority:
+        1. exact StrategyContext feature name;
+        2. open_interest-prefixed feature name;
+        3. oi-prefixed legacy feature name;
+        4. open-interest domain dotted path.
+        """
+        self.validate_context(context)
+
+        if not isinstance(path, str) or not path.strip():
+            raise StrategyEvaluationError("open_interest path cannot be empty")
+
+        normalized = path.strip()
+        open_interest_feature_name = (
+            normalized
+            if normalized.startswith("open_interest.")
+            else f"open_interest.{normalized}"
+        )
+        legacy_feature_name = (
+            normalized
+            if normalized.startswith("oi.")
+            else f"oi.{normalized}"
+        )
+
+        if context.has_feature(normalized):
+            return self._feature_value(context.get_feature(normalized), default)
+
+        if context.has_feature(open_interest_feature_name):
+            return self._feature_value(
+                context.get_feature(open_interest_feature_name),
+                default,
             )
-            return None
 
-    def extract_oi_snapshot(self, context: SignalContext) -> OISnapshot | None:
+        if context.has_feature(legacy_feature_name):
+            return self._feature_value(
+                context.get_feature(legacy_feature_name),
+                default,
+            )
+
+        domain = self.open_interest_domain(context)
+
+        if normalized.startswith("open_interest."):
+            normalized = normalized.removeprefix("open_interest.")
+        elif normalized.startswith("oi."):
+            normalized = normalized.removeprefix("oi.")
+
+        return _get_path(domain, normalized, default)
+
+    def open_interest_float(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: float | None = None,
+    ) -> float | None:
+        return _to_float(self.open_interest_path(context, path, default), default)
+
+    def open_interest_score(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: float = 0.0,
+    ) -> float:
+        value = self.open_interest_float(context, path, default=default)
+        return clamp(float(value if value is not None else default), 0.0, 1.0)
+
+    def open_interest_signed_score(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: float = 0.0,
+    ) -> float:
+        value = self.open_interest_float(context, path, default=default)
+        return clamp(float(value if value is not None else default), -1.0, 1.0)
+
+    def open_interest_bool(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: bool = False,
+    ) -> bool:
+        return _to_bool(self.open_interest_path(context, path, default), default)
+
+    def open_interest_str(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: str | None = None,
+    ) -> str | None:
+        return _to_str(self.open_interest_path(context, path, default), default)
+
+    def open_interest_datetime(
+        self,
+        context: StrategyContext,
+        path: str,
+        *,
+        default: datetime | None = None,
+    ) -> datetime | None:
+        return parse_datetime(self.open_interest_path(context, path, default))
+
+    def open_interest_feature_snapshot(
+        self,
+        context: StrategyContext,
+        feature_name: str,
+    ) -> FeatureSnapshot | None:
+        """
+        Return full FeatureSnapshot if StrategyContext stores one.
+
+        Best-effort helper because StrategyContext may store raw values or
+        FeatureSnapshot objects depending on normalization.
+        """
+        self.validate_context(context)
+
+        if not isinstance(feature_name, str) or not feature_name.strip():
+            raise StrategyEvaluationError("feature_name cannot be empty")
+
+        features_map = getattr(context, "features", None)
+        if isinstance(features_map, Mapping):
+            raw = features_map.get(feature_name)
+            if isinstance(raw, FeatureSnapshot):
+                return raw
+
+        return None
+
+    def open_interest_feature_age_seconds(
+        self,
+        context: StrategyContext,
+        feature_name: str,
+    ) -> float | None:
+        snapshot = self.open_interest_feature_snapshot(context, feature_name)
+        if snapshot is None:
+            return None
+        return snapshot.age_seconds(context.timestamp)
+
+    def open_interest_feature_is_stale(
+        self,
+        context: StrategyContext,
+        feature_name: str,
+    ) -> bool:
+        max_age = self.open_interest_config.stale_feature_max_age_seconds
+        if max_age is None:
+            return False
+
+        age = self.open_interest_feature_age_seconds(context, feature_name)
+        if age is None:
+            return False
+
+        return age > max_age
+
+    def has_any_open_interest_data(
+        self,
+        context: StrategyContext,
+        feature_names: tuple[str, ...] = (),
+    ) -> bool:
+        self.validate_context(context)
+
+        if self.open_interest_domain(context):
+            return True
+
+        return any(context.has_feature(name) for name in feature_names)
+
+    def has_stale_open_interest_features(
+        self,
+        context: StrategyContext,
+        feature_names: tuple[str, ...] | None = None,
+    ) -> bool:
+        names = feature_names or tuple(self.required_features())
+
+        return any(
+            self.open_interest_feature_is_stale(context, feature_name)
+            for feature_name in names
+        )
+
+    # ------------------------------------------------------------------
+    # Scope
+    # ------------------------------------------------------------------
+
+    def open_interest_scope(self, context: StrategyContext) -> OpenInterestStrategyScope:
+        domain = self.open_interest_domain(context)
+
+        exchange = (
+            _to_str(domain.get("exchange"))
+            or _to_str(_get_path(domain, "scope.exchange"))
+            or _to_str(context.metadata.get("exchange"))
+            or "unknown"
+        )
+        market_type = (
+            _to_str(domain.get("market_type"))
+            or _to_str(_get_path(domain, "scope.market_type"))
+            or _to_str(context.metadata.get("market_type"))
+            or self.open_interest_config.default_market_type.value
+        )
+        exchange_symbol = (
+            _to_str(domain.get("exchange_symbol"))
+            or _to_str(_get_path(domain, "scope.exchange_symbol"))
+            or _to_str(context.metadata.get("exchange_symbol"))
+            or context.symbol
+        )
+
+        return OpenInterestStrategyScope(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=context.symbol,
+            timeframe=context.timeframe.value,
+            exchange_symbol=exchange_symbol,
+        )
+
+    # ------------------------------------------------------------------
+    # Analytics model extraction
+    # ------------------------------------------------------------------
+
+    def extract_oi_analysis(
+        self,
+        context: StrategyContext,
+    ) -> OIAnalysisResult | None:
+        """
+        Extract full OIAnalysisResult from StrategyContext.
+
+        Preferred domain shape:
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["analysis"]
+
+        Supported fallback:
+            domain itself can be OIAnalysisResult.to_dict().
+        """
+        raw_analysis = self.open_interest_item(context, "analysis")
+
+        if isinstance(raw_analysis, OIAnalysisResult):
+            return raw_analysis
+
+        if isinstance(raw_analysis, Mapping):
+            parsed = self._parse_oi_analysis(raw_analysis)
+            if parsed is not None:
+                return parsed
+
+        domain = self.open_interest_domain(context)
+        if self._looks_like_oi_analysis(domain):
+            return self._parse_oi_analysis(domain)
+
+        return None
+
+    def extract_oi_snapshot(self, context: StrategyContext) -> OISnapshot | None:
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.snapshot
 
-        raw = self.extract_oi_domain(context).get("snapshot")
+        raw = self.open_interest_item(context, "snapshot")
         if isinstance(raw, OISnapshot):
             return raw
 
@@ -281,26 +976,23 @@ class OpenInterestStrategyBase(
             try:
                 return OISnapshot.from_dict(dict(raw))
             except Exception as exc:
-                self.logger.debug(
+                self.log_debug(
                     "Failed to parse OISnapshot",
-                    extra={
-                        "strategy": self.STRATEGY_NAME,
-                        "symbol": getattr(context, "symbol", None),
-                        "error": repr(exc),
-                    },
+                    symbol=context.symbol,
+                    error=repr(exc),
                 )
 
         return None
 
     def extract_oi_market_context(
         self,
-        context: SignalContext,
+        context: StrategyContext,
     ) -> OIMarketContext | None:
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.context
 
-        raw = self.extract_oi_domain(context).get("context")
+        raw = self.open_interest_item(context, "market_context")
         if isinstance(raw, OIMarketContext):
             return raw
 
@@ -308,80 +1000,58 @@ class OpenInterestStrategyBase(
             try:
                 return OIMarketContext.from_dict(dict(raw))
             except Exception as exc:
-                self.logger.debug(
+                self.log_debug(
                     "Failed to parse OIMarketContext",
-                    extra={
-                        "strategy": self.STRATEGY_NAME,
-                        "symbol": getattr(context, "symbol", None),
-                        "error": repr(exc),
-                    },
+                    symbol=context.symbol,
+                    error=repr(exc),
                 )
 
         return None
 
-    def extract_oi_features(self, context: SignalContext) -> OIFeatures | None:
+    def extract_oi_features(self, context: StrategyContext) -> OIFeatures | None:
         """
         Extract OIFeatures from:
         1. full OIAnalysisResult;
-        2. context.open_interest["features"];
-        3. legacy context feature-map values.
+        2. FeatureSource.OPEN_INTEREST domain["features"];
+        3. open_interest.* / oi.* feature-map values.
         """
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.features
 
-        domain = self.extract_oi_domain(context)
-        raw = domain.get("features")
-
+        raw = self.open_interest_item(context, "features")
         if isinstance(raw, OIFeatures):
             return raw
 
         if isinstance(raw, Mapping):
-            data = dict(raw)
-            try:
-                return OIFeatures.from_dict(data)
-            except Exception:
-                try:
-                    return OIFeatures(**data)
-                except Exception as exc:
-                    self.logger.warning(
-                        "Failed to parse OIFeatures",
-                        extra={
-                            "strategy": self.STRATEGY_NAME,
-                            "symbol": getattr(context, "symbol", None),
-                            "error": repr(exc),
-                        },
-                    )
+            parsed = self._parse_oi_features(raw, context=context)
+            if parsed is not None:
+                return parsed
 
-        legacy = self._extract_legacy_feature_payload(context)
+        legacy = self._extract_feature_payload(context)
         if legacy:
-            try:
-                return OIFeatures.from_dict(legacy)
-            except Exception:
-                try:
-                    return OIFeatures(**legacy)
-                except Exception:
-                    return None
+            parsed = self._parse_oi_features(legacy, context=context)
+            if parsed is not None:
+                return parsed
 
         return None
 
     def extract_oi_regime_result(
         self,
-        context: SignalContext,
+        context: StrategyContext,
     ) -> OIRegimeResult | None:
         """
         Extract OIRegimeResult from:
         - analysis.regime;
-        - context.open_interest["regime"];
-        - regime_changed specialized payload;
-        - old feature keys.
+        - domain["regime"];
+        - specialized regime_changed payload shape;
+        - open_interest.* / oi.* feature names.
         """
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.regime
 
-        domain = self.extract_oi_domain(context)
-        raw = domain.get("regime")
+        raw = self.open_interest_item(context, "regime")
 
         if isinstance(raw, OIRegimeResult):
             return raw
@@ -407,6 +1077,7 @@ class OpenInterestStrategyBase(
                 except Exception:
                     pass
 
+        domain = self.open_interest_domain(context)
         flat_regime = (
             domain.get("new_regime")
             or domain.get("regime_type")
@@ -424,36 +1095,40 @@ class OpenInterestStrategyBase(
                             else domain.get("confidence", 0.0)
                         ),
                         "score": domain.get("regime_score", domain.get("score")),
-                        "reasons": list(domain.get("reasons") or domain.get("regime_reasons") or []),
+                        "reasons": self.normalize_reasons(
+                            domain.get("reasons")
+                            or domain.get("regime_reasons")
+                            or []
+                        ),
                     }
                 )
             except Exception:
                 pass
 
         legacy_regime = (
-            self.get_feature_value(context, "oi.regime.type")
-            or self.get_feature_value(context, "open_interest.regime.type")
+            self.open_interest_path(context, "regime.type", None)
+            or self.open_interest_path(context, "regime.regime", None)
         )
         if legacy_regime is not None:
             try:
                 return OIRegimeResult.from_dict(
                     {
                         "regime": legacy_regime,
-                        "confidence": self.get_feature_value(
+                        "confidence": self.open_interest_path(
                             context,
-                            "oi.regime.confidence",
-                            default=0.0,
+                            "regime.confidence",
+                            0.0,
                         ),
-                        "score": self.get_feature_value(
+                        "score": self.open_interest_path(
                             context,
-                            "oi.regime.score",
-                            default=None,
+                            "regime.score",
+                            None,
                         ),
                         "reasons": self.normalize_reasons(
-                            self.get_feature_value(
+                            self.open_interest_path(
                                 context,
-                                "oi.regime.reasons",
-                                default=[],
+                                "regime.reasons",
+                                [],
                             )
                         ),
                     }
@@ -465,21 +1140,20 @@ class OpenInterestStrategyBase(
 
     def extract_oi_divergence_result(
         self,
-        context: SignalContext,
+        context: StrategyContext,
     ) -> OIDivergenceResult | None:
         """
         Extract OIDivergenceResult from:
         - analysis.divergence;
-        - context.open_interest["divergence"];
-        - divergence specialized payload;
-        - old feature keys.
+        - domain["divergence"];
+        - specialized divergence payload shape;
+        - open_interest.* / oi.* feature names.
         """
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.divergence
 
-        domain = self.extract_oi_domain(context)
-        raw = domain.get("divergence")
+        raw = self.open_interest_item(context, "divergence")
 
         if isinstance(raw, OIDivergenceResult):
             return raw
@@ -491,6 +1165,7 @@ class OpenInterestStrategyBase(
             except Exception:
                 pass
 
+        domain = self.open_interest_domain(context)
         flat_type = (
             domain.get("divergence_type")
             or domain.get("oi_divergence_type")
@@ -505,41 +1180,39 @@ class OpenInterestStrategyBase(
                 pass
 
         legacy_type = (
-            self.get_feature_value(context, "oi.divergence.type")
-            or self.get_feature_value(context, "open_interest.divergence.type")
+            self.open_interest_path(context, "divergence.type", None)
+            or self.open_interest_path(context, "divergence.divergence_type", None)
         )
         if legacy_type is not None:
             try:
                 return OIDivergenceResult.from_dict(
                     {
-                        "detected": self.safe_bool(
-                            self.get_feature_value(
-                                context,
-                                "oi.divergence.detected",
-                                default=legacy_type != OIDivergenceType.NONE.value,
-                            )
+                        "detected": self.open_interest_bool(
+                            context,
+                            "divergence.detected",
+                            default=legacy_type != OIDivergenceType.NONE.value,
                         ),
                         "divergence_type": legacy_type,
-                        "confidence": self.get_feature_value(
+                        "confidence": self.open_interest_path(
                             context,
-                            "oi.divergence.confidence",
-                            default=0.0,
+                            "divergence.confidence",
+                            0.0,
                         ),
-                        "score": self.get_feature_value(
+                        "score": self.open_interest_path(
                             context,
-                            "oi.divergence.score",
-                            default=None,
+                            "divergence.score",
+                            None,
                         ),
-                        "window_size": self.get_feature_value(
+                        "window_size": self.open_interest_path(
                             context,
-                            "oi.divergence.window_size",
-                            default=None,
+                            "divergence.window_size",
+                            None,
                         ),
                         "reasons": self.normalize_reasons(
-                            self.get_feature_value(
+                            self.open_interest_path(
                                 context,
-                                "oi.divergence.reasons",
-                                default=[],
+                                "divergence.reasons",
+                                [],
                             )
                         ),
                     }
@@ -551,21 +1224,20 @@ class OpenInterestStrategyBase(
 
     def extract_oi_anomaly_result(
         self,
-        context: SignalContext,
+        context: StrategyContext,
     ) -> OIAnomalyResult | None:
         """
         Extract OIAnomalyResult from:
         - analysis.anomaly;
-        - context.open_interest["anomaly"];
-        - anomaly/capitulation specialized payload;
-        - old feature keys.
+        - domain["anomaly"];
+        - anomaly/capitulation specialized payload shape;
+        - open_interest.* / oi.* feature names.
         """
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.anomaly
 
-        domain = self.extract_oi_domain(context)
-        raw = domain.get("anomaly")
+        raw = self.open_interest_item(context, "anomaly")
 
         if isinstance(raw, OIAnomalyResult):
             return raw
@@ -577,6 +1249,7 @@ class OpenInterestStrategyBase(
             except Exception:
                 pass
 
+        domain = self.open_interest_domain(context)
         flat_type = (
             domain.get("anomaly_type")
             or domain.get("oi_anomaly_type")
@@ -590,41 +1263,39 @@ class OpenInterestStrategyBase(
                 pass
 
         legacy_type = (
-            self.get_feature_value(context, "oi.anomaly.type")
-            or self.get_feature_value(context, "open_interest.anomaly.type")
+            self.open_interest_path(context, "anomaly.type", None)
+            or self.open_interest_path(context, "anomaly.anomaly_type", None)
         )
         if legacy_type is not None:
             try:
                 return OIAnomalyResult.from_dict(
                     {
-                        "detected": self.safe_bool(
-                            self.get_feature_value(
-                                context,
-                                "oi.anomaly.detected",
-                                default=legacy_type != OIAnomalyType.NONE.value,
-                            )
+                        "detected": self.open_interest_bool(
+                            context,
+                            "anomaly.detected",
+                            default=legacy_type != OIAnomalyType.NONE.value,
                         ),
                         "anomaly_type": legacy_type,
-                        "strength": self.get_feature_value(
+                        "confidence": self.open_interest_path(
                             context,
-                            "oi.anomaly.strength",
-                            default=None,
+                            "anomaly.confidence",
+                            0.0,
                         ),
-                        "confidence": self.get_feature_value(
+                        "score": self.open_interest_path(
                             context,
-                            "oi.anomaly.confidence",
-                            default=0.0,
+                            "anomaly.score",
+                            None,
                         ),
-                        "score": self.get_feature_value(
+                        "strength": self.open_interest_path(
                             context,
-                            "oi.anomaly.score",
-                            default=None,
+                            "anomaly.strength",
+                            None,
                         ),
                         "reasons": self.normalize_reasons(
-                            self.get_feature_value(
+                            self.open_interest_path(
                                 context,
-                                "oi.anomaly.reasons",
-                                default=[],
+                                "anomaly.reasons",
+                                [],
                             )
                         ),
                     }
@@ -634,661 +1305,491 @@ class OpenInterestStrategyBase(
 
         return None
 
-    def extract_oi_scope(self, context: SignalContext) -> dict[str, Any]:
+    def oi_analysis_confidence(self, context: StrategyContext) -> float:
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
-            return analysis.scope_payload()
+            return _unit_score(getattr(analysis, "confidence", 0.0))
 
-        domain = self.extract_oi_domain(context)
-        scope = domain.get("scope")
-        result: dict[str, Any] = dict(scope) if isinstance(scope, Mapping) else {}
-
-        for key in (
-            "exchange",
-            "market_type",
-            "symbol",
-            "timeframe",
-            "exchange_symbol",
-            "scope_key",
-            "oi_key",
-            "key",
-        ):
-            if key in domain and key not in result:
-                result[key] = domain[key]
-
-        result.setdefault("symbol", getattr(context, "symbol", None))
-        result.setdefault("timeframe", getattr(context, "timeframe", None))
-
-        return {key: value for key, value in result.items() if value is not None}
+        value = (
+            self.open_interest_path(context, "analysis.confidence", None)
+            or self.open_interest_path(context, "confidence", None)
+            or self.open_interest_path(context, "score", None)
+        )
+        return _unit_score(value, 0.0)
 
     # ------------------------------------------------------------------
-    # Specialized OI context predicates
+    # Direction helpers
     # ------------------------------------------------------------------
 
-    def has_oi_analysis(self, context: SignalContext) -> bool:
-        return self.extract_oi_analysis(context) is not None
+    @staticmethod
+    def parse_side(value: Any) -> SignalSide:
+        if isinstance(value, SignalSide):
+            return value
 
-    def has_oi_divergence(self, context: SignalContext) -> bool:
+        if value is None:
+            return SignalSide.UNKNOWN
+
+        label = _normalize_label(value)
+
+        if label in {
+            "long",
+            "buy",
+            "bull",
+            "bullish",
+            "up",
+            "upside",
+            "positive",
+        }:
+            return SignalSide.LONG
+
+        if label in {
+            "short",
+            "sell",
+            "bear",
+            "bearish",
+            "down",
+            "downside",
+            "negative",
+        }:
+            return SignalSide.SHORT
+
+        return SignalSide.UNKNOWN
+
+    @staticmethod
+    def opposite_side(side: SignalSide) -> SignalSide:
+        if side is SignalSide.LONG:
+            return SignalSide.SHORT
+        if side is SignalSide.SHORT:
+            return SignalSide.LONG
+        return SignalSide.UNKNOWN
+
+    @staticmethod
+    def is_directional_side(side: SignalSide) -> bool:
+        return side in {SignalSide.LONG, SignalSide.SHORT}
+
+    def regime_to_side_hint(self, regime: OIRegime | Any) -> str:
+        """
+        Semantic side hint from OIRegime.
+
+        Returns:
+            bullish | bearish | contextual | neutral
+        """
+        label = _normalize_label(regime)
+
+        if label in {
+            "long_buildup",
+            "short_covering",
+            "bullish_oi_expansion",
+        }:
+            return "bullish"
+
+        if label in {
+            "short_buildup",
+            "long_unwind",
+            "bearish_oi_expansion",
+        }:
+            return "bearish"
+
+        if label in {
+            "trend_confirmation",
+            "squeeze_setup",
+            "capitulation",
+            "trend_exhaustion",
+            "overheated",
+        }:
+            return "contextual"
+
+        return "neutral"
+
+    def divergence_to_side_hint(self, divergence_type: OIDivergenceType | Any) -> str:
+        """
+        Semantic side hint from OIDivergenceType.
+
+        The exact enum values may evolve in analytics.open_interest, so this
+        method is label-based and tolerant.
+        """
+        label = _normalize_label(divergence_type)
+
+        if not label or label in {"none", "unknown", "neutral"}:
+            return "neutral"
+
+        if "bull" in label or "positive" in label or "long" in label:
+            return "bullish"
+
+        if "bear" in label or "negative" in label or "short" in label:
+            return "bearish"
+
+        if "exhaustion" in label or "reversal" in label:
+            return "contextual"
+
+        return "neutral"
+
+    def anomaly_to_setup_hint(self, anomaly_type: OIAnomalyType | Any) -> str:
+        label = _normalize_label(anomaly_type)
+
+        if label in {
+            "oi_collapse",
+            "liquidation_driven_oi_drop",
+            "sudden_deleveraging",
+            "overheated_buildup",
+            "extreme_crowding",
+            "funding_oi_imbalance",
+            "oi_price_dislocation",
+        }:
+            return "reversal"
+
+        if label in {
+            "oi_spike",
+            "oi_volume_dislocation",
+        }:
+            return "continuation"
+
+        return "unknown"
+
+    def side_from_features(
+        self,
+        features: OIFeatures | None,
+        *,
+        dead_zone: float = 0.0,
+    ) -> SignalSide:
+        if features is None:
+            return SignalSide.UNKNOWN
+
+        price_delta = _to_float(getattr(features, "price_delta_pct", None))
+        oi_delta = _to_float(getattr(features, "oi_delta_pct", None))
+        pressure = _to_float(getattr(features, "oi_pressure_score", None))
+        flow = _to_float(getattr(features, "aggressive_flow_imbalance", None))
+
+        if price_delta is not None and oi_delta is not None:
+            if price_delta > dead_zone and oi_delta > dead_zone:
+                if pressure is None or pressure >= -dead_zone:
+                    if flow is None or flow >= -dead_zone:
+                        return SignalSide.LONG
+
+            if price_delta < -dead_zone and oi_delta > dead_zone:
+                if pressure is None or pressure <= dead_zone:
+                    if flow is None or flow <= dead_zone:
+                        return SignalSide.SHORT
+
+        if pressure is not None:
+            if pressure > dead_zone:
+                return SignalSide.LONG
+            if pressure < -dead_zone:
+                return SignalSide.SHORT
+
+        if flow is not None:
+            if flow > dead_zone:
+                return SignalSide.LONG
+            if flow < -dead_zone:
+                return SignalSide.SHORT
+
+        return SignalSide.UNKNOWN
+
+    # ------------------------------------------------------------------
+    # Signal builder
+    # ------------------------------------------------------------------
+
+    def build_open_interest_signal(
+        self,
+        *,
+        context: StrategyContext,
+        side: SignalSide,
+        confidence: float,
+        score: float,
+        setup_type: SetupType | None = None,
+        reasons: list[str] | None = None,
+        confirmations: list[str] | None = None,
+        source_features: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        priority: SignalPriority = SignalPriority.MEDIUM,
+        trigger_type: TriggerType = TriggerType.PRIMARY,
+        origin: SignalOrigin = SignalOrigin.SINGLE_STRATEGY,
+        status: SignalStatus = SignalStatus.NEW,
+    ) -> StrategySignal:
+        """
+        Build internal StrategySignal with open-interest/futures metadata.
+
+        Final risk-ready payload conversion belongs to SignalProcessor /
+        SignalBuilder, not to this domain strategy.
+        """
+        if side not in {SignalSide.LONG, SignalSide.SHORT}:
+            raise StrategyEvaluationError(
+                f"{self.strategy_name}: OI signal side must be LONG or SHORT"
+            )
+
+        scope = self.open_interest_scope(context)
+
+        signal_metadata = dict(metadata or {})
+        signal_metadata.setdefault("domain", FeatureSource.OPEN_INTEREST.value)
+        signal_metadata.setdefault("open_interest_strategy_version", "2.0.0")
+        signal_metadata.setdefault("order_intent", self.open_interest_config.default_order_intent.value)
+        signal_metadata.setdefault("margin_mode", self.open_interest_config.default_margin_mode.value)
+        signal_metadata.setdefault("market_type", self.open_interest_config.default_market_type.value)
+        signal_metadata.setdefault("tier", self.open_interest_config.default_trade_tier.value)
+
+        if self.open_interest_config.requested_leverage is not None:
+            signal_metadata.setdefault(
+                "requested_leverage",
+                float(self.open_interest_config.requested_leverage),
+            )
+
+        if self.open_interest_config.max_slippage_bps is not None:
+            signal_metadata.setdefault(
+                "max_slippage_bps",
+                float(self.open_interest_config.max_slippage_bps),
+            )
+
+        if self.open_interest_config.entry_timeout_seconds is not None:
+            signal_metadata.setdefault(
+                "entry_timeout_seconds",
+                int(self.open_interest_config.entry_timeout_seconds),
+            )
+
+        if self.open_interest_config.max_holding_seconds is not None:
+            signal_metadata.setdefault(
+                "max_holding_seconds",
+                int(self.open_interest_config.max_holding_seconds),
+            )
+
+        if self.open_interest_config.attach_scope_metadata:
+            signal_metadata.setdefault("scope", scope.to_dict())
+
+        if self.open_interest_config.attach_open_interest_context_metadata:
+            signal_metadata.setdefault(
+                "open_interest_context",
+                self.open_interest_context_metadata(context),
+            )
+
+        if self.open_interest_config.metadata:
+            signal_metadata.setdefault(
+                "open_interest_config_metadata",
+                serialize_for_metadata(self.open_interest_config.metadata),
+            )
+
+        final_reasons = list(
+            dict.fromkeys(
+                [
+                    "open_interest_strategy_signal",
+                    *(reasons or []),
+                ]
+            )
+        )
+        final_confirmations = list(dict.fromkeys(confirmations or []))
+        final_features = list(dict.fromkeys(source_features or []))
+
+        signal = self.build_signal(
+            context=context,
+            side=side,
+            confidence=confidence,
+            score=score,
+            setup_type=setup_type or self.default_setup_type,
+            reasons=final_reasons,
+            confirmations=final_confirmations,
+            source_features=final_features,
+            metadata=signal_metadata,
+            trigger_type=trigger_type,
+            origin=origin,
+            priority=priority,
+            status=status,
+        )
+
+        signal.validate()
+        return signal
+
+    def open_interest_context_metadata(
+        self,
+        context: StrategyContext,
+    ) -> dict[str, Any]:
+        """
+        Compact serialized OI context for StrategySignal.metadata.
+        """
+        metadata: dict[str, Any] = {}
+
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
-            return analysis.has_divergence
-
-        divergence = self.extract_oi_divergence_result(context)
-        return divergence is not None and divergence.detected
-
-    def has_oi_anomaly(self, context: SignalContext) -> bool:
-        analysis = self.extract_oi_analysis(context)
-        if analysis is not None:
-            return analysis.has_anomaly
-
-        anomaly = self.extract_oi_anomaly_result(context)
-        return anomaly is not None and anomaly.detected
-
-    def has_risk_anomaly(self, context: SignalContext) -> bool:
-        anomaly = self.extract_oi_anomaly_result(context)
-        if anomaly is None or not anomaly.detected:
-            return False
-        return anomaly.anomaly_type.is_risk_anomaly
-
-    def is_squeeze_context(self, context: SignalContext) -> bool:
-        regime = self.extract_oi_regime_result(context)
-        return regime is not None and regime.regime is OIRegime.SQUEEZE_SETUP
-
-    def is_capitulation_context(self, context: SignalContext) -> bool:
-        regime = self.extract_oi_regime_result(context)
-        if regime is not None and regime.regime is OIRegime.CAPITULATION:
-            return True
-
-        anomaly = self.extract_oi_anomaly_result(context)
-        if anomaly is None or not anomaly.detected:
-            return False
-
-        return anomaly.anomaly_type in {
-            OIAnomalyType.LIQUIDATION_DRIVEN_OI_DROP,
-            OIAnomalyType.SUDDEN_DELEVERAGING,
-            OIAnomalyType.OI_COLLAPSE,
-        }
-
-    def oi_analysis_confidence(self, context: SignalContext) -> float:
-        analysis = self.extract_oi_analysis(context)
-        if analysis is not None:
-            return self.clamp(analysis.confidence)
-
-        values: list[float] = []
+            metadata["analysis"] = serialize_for_metadata(analysis)
 
         regime = self.extract_oi_regime_result(context)
         if regime is not None:
-            values.append(regime.confidence)
+            metadata["regime"] = serialize_for_metadata(regime)
 
         divergence = self.extract_oi_divergence_result(context)
-        if divergence is not None and divergence.detected:
-            values.append(divergence.confidence)
+        if divergence is not None:
+            metadata["divergence"] = serialize_for_metadata(divergence)
 
         anomaly = self.extract_oi_anomaly_result(context)
-        if anomaly is not None and anomaly.detected:
-            values.append(anomaly.confidence)
+        if anomaly is not None:
+            metadata["anomaly"] = serialize_for_metadata(anomaly)
 
-        if not values:
-            return 0.0
+        features = self.extract_oi_features(context)
+        if features is not None:
+            metadata["features"] = serialize_for_metadata(features)
 
-        return self.clamp(sum(values) / len(values))
-
-    # ------------------------------------------------------------------
-    # Generic section / alias helpers
-    # ------------------------------------------------------------------
-
-    def extract_domain_section(
-        self,
-        context: SignalContext,
-        section: str,
-        *,
-        prefix_nested_keys: bool = False,
-    ) -> dict[str, Any]:
-        domain = self.extract_oi_domain(context)
-        raw: dict[str, Any] = {}
-
-        nested = domain.get(section)
-        if isinstance(nested, Mapping):
-            if prefix_nested_keys:
-                raw.update({f"{section}_{key}": value for key, value in nested.items()})
-            else:
-                raw.update(dict(nested))
-
-        return raw
-
-    def merge_domain_keys(
-        self,
-        *,
-        raw: dict[str, Any],
-        domain: Mapping[str, Any],
-        keys: tuple[str, ...],
-    ) -> None:
-        for key in keys:
-            if key in domain and key not in raw:
-                raw[key] = domain[key]
-
-    def merge_aliases(
-        self,
-        *,
-        raw: dict[str, Any],
-        domain: Mapping[str, Any],
-        aliases: dict[str, str],
-    ) -> None:
-        for src_key, dst_key in aliases.items():
-            if src_key in domain and dst_key not in raw:
-                raw[dst_key] = domain[src_key]
-
-    def merge_feature_aliases(
-        self,
-        *,
-        raw: dict[str, Any],
-        context: SignalContext,
-        feature_aliases: dict[str, str],
-    ) -> None:
-        for feature_name, dst_key in feature_aliases.items():
-            if dst_key not in raw and context.has_feature(feature_name):
-                raw[dst_key] = context.get_feature(feature_name)
-
-    # ------------------------------------------------------------------
-    # Market regime helper
-    # ------------------------------------------------------------------
-
-    def get_market_regime(self, context: SignalContext) -> MarketRegime:
-        return context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN
-
-    # ------------------------------------------------------------------
-    # Enum parsing helpers
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def parse_oi_regime(cls, value: Any) -> OIRegime:
-        if isinstance(value, OIRegime):
-            return value
-
-        text = cls.safe_str(value).upper()
-        if not text:
-            return OIRegime.NEUTRAL
-
-        for item in OIRegime:
-            if item.value.upper() == text or item.name.upper() == text:
-                return item
-
-        return OIRegime.NEUTRAL
-
-    @classmethod
-    def parse_divergence_type(cls, value: Any) -> OIDivergenceType:
-        if isinstance(value, OIDivergenceType):
-            return value
-
-        text = cls.safe_str(value).upper()
-        if not text:
-            return OIDivergenceType.NONE
-
-        for item in OIDivergenceType:
-            if item.value.upper() == text or item.name.upper() == text:
-                return item
-
-        return OIDivergenceType.NONE
-
-    @classmethod
-    def parse_anomaly_type(cls, value: Any) -> OIAnomalyType:
-        if isinstance(value, OIAnomalyType):
-            return value
-
-        text = cls.safe_str(value).upper()
-        if not text:
-            return OIAnomalyType.NONE
-
-        for item in OIAnomalyType:
-            if item.value.upper() == text or item.name.upper() == text:
-                return item
-
-        return OIAnomalyType.NONE
-
-    @staticmethod
-    def divergence_to_side_hint(divergence_type: OIDivergenceType) -> str:
-        """
-        Centralized semantic hint for OI divergence strategies.
-
-        Окремі стратегії можуть мапити це на SignalSide, але не повинні
-        дублювати semantic interpretation enum-ів у кожному класі.
-        """
-        if divergence_type.is_bullish_context:
-            return "bullish"
-        if divergence_type.is_bearish_context:
-            return "bearish"
-        return "neutral"
-
-    # ------------------------------------------------------------------
-    # Common parsing helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
-        if low > high:
-            raise ValueError("low must be <= high")
-
-        try:
-            number = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return low
-
-        if not math.isfinite(number):
-            return low
-
-        return max(low, min(high, number))
-
-    @staticmethod
-    def safe_float(value: Any, default: float = 0.0) -> float:
-        try:
-            if value is None:
-                return default
-            number = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return default
-
-        if not math.isfinite(number):
-            return default
-
-        return number
-
-    @staticmethod
-    def safe_int(value: Any, default: int | None = None) -> int | None:
-        try:
-            if value is None:
-                return default
-            number = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return default
-
-        if not math.isfinite(number):
-            return default
-
-        try:
-            return int(number)
-        except (TypeError, ValueError, OverflowError):
-            return default
-
-    @staticmethod
-    def safe_bool(value: Any, default: bool = False) -> bool:
-        if isinstance(value, bool):
-            return value
-
-        if value is None:
-            return default
-
-        if isinstance(value, str):
-            return value.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
-                "detected",
+        if self.open_interest_config.attach_feature_values_metadata:
+            metadata["feature_values"] = {
+                "analysis_confidence": self.oi_analysis_confidence(context),
+                "oi_delta_pct": self.open_interest_path(
+                    context,
+                    "features.oi_delta_pct",
+                    None,
+                ),
+                "price_delta_pct": self.open_interest_path(
+                    context,
+                    "features.price_delta_pct",
+                    None,
+                ),
+                "oi_pressure_score": self.open_interest_path(
+                    context,
+                    "features.oi_pressure_score",
+                    None,
+                ),
+                "aggressive_flow_imbalance": self.open_interest_path(
+                    context,
+                    "features.aggressive_flow_imbalance",
+                    None,
+                ),
             }
 
-        return bool(value)
+        return serialize_for_metadata(metadata)
+
+    # ------------------------------------------------------------------
+    # Normalization internals
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def safe_str(value: Any, default: str = "") -> str:
-        if value is None:
-            return default
-        return str(value).strip()
-
-    @classmethod
-    def normalize_reasons(cls, value: Any) -> list[str]:
+    def normalize_reasons(value: Any) -> list[str]:
         if value is None:
             return []
 
-        if isinstance(value, list):
-            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
 
-        if isinstance(value, tuple | set):
-            return [str(v).strip() for v in value if str(v).strip()]
+        if isinstance(value, (list, tuple, set)):
+            result: list[str] = []
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    result.append(text)
+            return list(dict.fromkeys(result))
 
         text = str(value).strip()
         return [text] if text else []
 
-    def get_feature_value(
+    @staticmethod
+    def _feature_value(value: Any, default: Any = None) -> Any:
+        if isinstance(value, FeatureSnapshot):
+            return value.value
+        return default if value is None else value
+
+    @staticmethod
+    def _looks_like_oi_analysis(value: Mapping[str, Any]) -> bool:
+        required = {"symbol", "timestamp", "snapshot", "context", "features", "regime"}
+        return required.issubset(set(value.keys()))
+
+    def _parse_oi_analysis(
         self,
-        context: SignalContext,
-        name: str,
+        value: Mapping[str, Any],
+    ) -> OIAnalysisResult | None:
+        try:
+            return OIAnalysisResult.from_dict(dict(value))
+        except Exception as exc:
+            self.log_debug(
+                "Failed to parse OIAnalysisResult",
+                error=repr(exc),
+            )
+            return None
+
+    def _parse_oi_features(
+        self,
+        value: Mapping[str, Any],
         *,
-        default: Any = None,
-    ) -> Any:
-        if context.has_feature(name):
-            return context.get_feature(name)
-        return default
+        context: StrategyContext,
+    ) -> OIFeatures | None:
+        data = dict(value)
 
-    # ------------------------------------------------------------------
-    # Common scoring helpers
-    # ------------------------------------------------------------------
+        try:
+            return OIFeatures.from_dict(data)
+        except Exception:
+            try:
+                return OIFeatures(**data)
+            except Exception as exc:
+                self.log_debug(
+                    "Failed to parse OIFeatures",
+                    symbol=context.symbol,
+                    error=repr(exc),
+                )
+                return None
 
-    def category_weight(self) -> float:
-        if hasattr(self.config, "get_category_weight"):
-            return self.config.get_category_weight(StrategyCategory.OPEN_INTEREST)
-        return self.config.weighting.category_weights.get(StrategyCategory.OPEN_INTEREST, 1.0)
-
-    def strategy_weight(self) -> float:
-        if hasattr(self.config, "get_strategy_weight"):
-            return self.config.get_strategy_weight(self.STRATEGY_NAME, default=1.0)
-
-        strategy_cfg = self.config.get_strategy(self.STRATEGY_NAME)
-        return strategy_cfg.weight if strategy_cfg is not None else 1.0
-
-    def regime_adjustment(self, regime: MarketRegime) -> float:
-        if hasattr(self.config, "get_regime_adjustment"):
-            return self.config.get_regime_adjustment(regime)
-        return self.config.weighting.regime_adjustments.get(regime, 1.0)
-
-    def weighted_score(self, base_score: float, regime: MarketRegime) -> float:
-        return self.clamp(
-            base_score
-            * self.category_weight()
-            * self.strategy_weight()
-            * self.regime_adjustment(regime)
-        )
-
-    def confidence_grade(self, confidence: float) -> ConfidenceGrade:
-        cfg = self.config.confidence
-        if confidence >= cfg.high_threshold:
-            return ConfidenceGrade.VERY_HIGH
-        if confidence >= cfg.medium_threshold:
-            return ConfidenceGrade.HIGH
-        if confidence >= cfg.low_threshold:
-            return ConfidenceGrade.MEDIUM
-        if confidence >= cfg.very_low_threshold:
-            return ConfidenceGrade.LOW
-        return ConfidenceGrade.VERY_LOW
-
-    @staticmethod
-    def strength_from_score(score: float) -> SignalStrength:
-        if score >= 0.90:
-            return SignalStrength.EXTREME
-        if score >= 0.75:
-            return SignalStrength.STRONG
-        if score >= 0.55:
-            return SignalStrength.MODERATE
-        return SignalStrength.WEAK
-
-    @staticmethod
-    def priority_from_score(score: float) -> SignalPriority:
-        if score >= 0.90:
-            return SignalPriority.CRITICAL
-        if score >= 0.75:
-            return SignalPriority.HIGH
-        if score >= 0.50:
-            return SignalPriority.MEDIUM
-        return SignalPriority.LOW
-
-    # ------------------------------------------------------------------
-    # Common signal enrichment helpers
-    # ------------------------------------------------------------------
-
-    def add_required_source_features(
-        self,
-        signal: StrategySignal,
-        context: SignalContext,
-    ) -> None:
-        for feature_name in self.REQUIRED_FEATURES:
-            if context.has_feature(feature_name):
-                signal.add_source_feature(feature_name)
-
-    def add_oi_source_features(
-        self,
-        signal: StrategySignal,
-        context: SignalContext,
-    ) -> None:
+    def _extract_feature_payload(self, context: StrategyContext) -> dict[str, Any]:
         """
-        Додає source features для canonical OI payload.
+        Best-effort legacy feature-map extraction.
 
-        Для нового pipeline source-фічі можуть не бути розсипані в feature_map,
-        тому додаємо logical names, якщо відповідні секції реально присутні.
+        This keeps compatibility with old oi.* / open_interest.* feature names
+        while new strategies should prefer FeatureSource.OPEN_INTEREST domain data.
         """
-        if self.extract_oi_features(context) is not None:
-            signal.add_source_feature("analytics.open_interest.features")
-
-        if self.extract_oi_regime_result(context) is not None:
-            signal.add_source_feature("analytics.open_interest.regime")
-
-        divergence = self.extract_oi_divergence_result(context)
-        if divergence is not None:
-            signal.add_source_feature("analytics.open_interest.divergence")
-
-        anomaly = self.extract_oi_anomaly_result(context)
-        if anomaly is not None:
-            signal.add_source_feature("analytics.open_interest.anomaly")
-
-        self.add_required_source_features(signal, context)
-
-    def append_oi_analysis_metadata(
-        self,
-        signal: StrategySignal,
-        context: SignalContext,
-    ) -> None:
-        base = self.extract_base_payload(context)
-
-        if base.scope:
-            signal.metadata["oi_scope"] = dict(base.scope)
-
-        if base.analysis is not None:
-            signal.metadata.update(
-                {
-                    "oi_analysis_confidence": base.analysis.confidence,
-                    "oi_analysis_confidence_band": base.analysis.confidence_band.value,
-                    "oi_has_divergence": base.analysis.has_divergence,
-                    "oi_has_anomaly": base.analysis.has_anomaly,
-                    "oi_analysis_metadata": dict(base.analysis.metadata),
-                }
-            )
-
-        if base.snapshot is not None:
-            signal.metadata["oi_snapshot"] = base.snapshot.to_dict()
-
-        if base.market_context is not None:
-            signal.metadata["oi_market_context"] = base.market_context.to_dict()
-
-        if base.regime is not None:
-            signal.metadata["oi_regime_result"] = base.regime.to_dict()
-            signal.metadata["oi_regime"] = base.regime.regime.value
-            signal.metadata["oi_regime_confidence"] = base.regime.confidence
-            signal.metadata["oi_regime_score"] = base.regime.score
-            signal.metadata["oi_regime_confidence_band"] = base.regime.confidence_band.value
-
-        if base.divergence is not None:
-            signal.metadata["oi_divergence_result"] = base.divergence.to_dict()
-            signal.metadata["oi_divergence_detected"] = base.divergence.detected
-            signal.metadata["oi_divergence_type"] = base.divergence.divergence_type.value
-            signal.metadata["oi_divergence_confidence"] = base.divergence.confidence
-            signal.metadata["oi_divergence_score"] = base.divergence.score
-            signal.metadata["oi_divergence_confidence_band"] = base.divergence.confidence_band.value
-
-        if base.anomaly is not None:
-            signal.metadata["oi_anomaly_result"] = base.anomaly.to_dict()
-            signal.metadata["oi_anomaly_detected"] = base.anomaly.detected
-            signal.metadata["oi_anomaly_type"] = base.anomaly.anomaly_type.value
-            signal.metadata["oi_anomaly_strength"] = base.anomaly.strength.value
-            signal.metadata["oi_anomaly_confidence"] = base.anomaly.confidence
-            signal.metadata["oi_anomaly_score"] = base.anomaly.score
-            signal.metadata["oi_anomaly_confidence_band"] = base.anomaly.confidence_band.value
-            signal.metadata["oi_is_risk_anomaly"] = base.anomaly.anomaly_type.is_risk_anomaly
-
-        if base.features is not None:
-            self.append_oi_feature_metadata(signal, base.features)
-
-    def append_oi_analysis_reasons(
-        self,
-        signal: StrategySignal,
-        context: SignalContext,
-    ) -> None:
-        regime = self.extract_oi_regime_result(context)
-        if regime is not None:
-            signal.add_reason(f"oi_regime:{regime.regime.value}")
-            for reason in regime.reasons:
-                signal.add_reason(f"oi_regime_reason:{reason}")
-
-        divergence = self.extract_oi_divergence_result(context)
-        if divergence is not None:
-            signal.add_reason(f"oi_divergence:{divergence.divergence_type.value}")
-            for reason in divergence.reasons:
-                signal.add_reason(f"oi_divergence_reason:{reason}")
-
-        anomaly = self.extract_oi_anomaly_result(context)
-        if anomaly is not None and anomaly.detected:
-            signal.add_reason(f"oi_anomaly:{anomaly.anomaly_type.value}")
-            for reason in anomaly.reasons:
-                signal.add_reason(f"oi_anomaly_reason:{reason}")
-
-    def append_oi_feature_reasons(
-        self,
-        signal: StrategySignal,
-        features: OIFeatures,
-    ) -> None:
-        if features.oi_delta_pct is not None:
-            signal.add_reason(f"oi_delta_pct:{features.oi_delta_pct:.4f}")
-
-        if features.price_delta_pct is not None:
-            signal.add_reason(f"price_delta_pct:{features.price_delta_pct:.4f}")
-
-        if features.volume_ratio is not None:
-            signal.add_reason(f"volume_ratio:{features.volume_ratio:.4f}")
-
-        if features.oi_zscore is not None:
-            signal.add_reason(f"oi_zscore:{features.oi_zscore:.4f}")
-
-        if features.funding_rate is not None:
-            signal.add_reason(f"funding_rate:{features.funding_rate:.6f}")
-
-        if features.liquidation_imbalance is not None:
-            signal.add_reason(f"liquidation_imbalance:{features.liquidation_imbalance:.4f}")
-
-        if features.aggressive_flow_imbalance is not None:
-            signal.add_reason(
-                f"aggressive_flow_imbalance:{features.aggressive_flow_imbalance:.4f}"
-            )
-
-        if features.oi_pressure_score is not None:
-            signal.add_reason(f"oi_pressure_score:{features.oi_pressure_score:.4f}")
-
-        if features.oi_price_efficiency is not None:
-            signal.add_reason(f"oi_price_efficiency:{features.oi_price_efficiency:.4f}")
-
-    def append_oi_feature_metadata(
-        self,
-        signal: StrategySignal,
-        features: OIFeatures,
-    ) -> None:
-        """
-        Додає повний OIFeatures payload.
-
-        Старі flat metadata keys залишені для сумісності.
-        Новий canonical формат також доступний як signal.metadata["oi_features"].
-        """
-        features_payload = features.to_dict()
-        signal.metadata["oi_features"] = features_payload
-
-        signal.metadata.update(
-            {
-                "oi": features.oi,
-                "open_interest_value": features.open_interest_value,
-                "oi_delta": features.oi_delta,
-                "oi_delta_pct": features.oi_delta_pct,
-                "oi_ma_fast": features.oi_ma_fast,
-                "oi_ma_slow": features.oi_ma_slow,
-                "oi_std": features.oi_std,
-                "oi_zscore": features.oi_zscore,
-                "oi_velocity": features.oi_velocity,
-                "oi_acceleration": features.oi_acceleration,
-                "price": features.price,
-                "price_delta": features.price_delta,
-                "price_delta_pct": features.price_delta_pct,
-                "volume": features.volume,
-                "quote_volume": features.quote_volume,
-                "volume_ma": features.volume_ma,
-                "volume_ratio": features.volume_ratio,
-                "funding_rate": features.funding_rate,
-                "predicted_funding_rate": features.predicted_funding_rate,
-                "long_liquidations": features.long_liquidations,
-                "short_liquidations": features.short_liquidations,
-                "liquidation_imbalance": features.liquidation_imbalance,
-                "cvd_delta": features.cvd_delta,
-                "aggressive_buy_volume": features.aggressive_buy_volume,
-                "aggressive_sell_volume": features.aggressive_sell_volume,
-                "aggressive_flow_imbalance": features.aggressive_flow_imbalance,
-                "oi_change_per_volume": features.oi_change_per_volume,
-                "oi_price_efficiency": features.oi_price_efficiency,
-                "oi_pressure_score": features.oi_pressure_score,
-                "oi_direction": features.oi_direction.value,
-                "price_direction": features.price_direction.value,
-                "oi_feature_metadata": dict(features.metadata),
-            }
-        )
-
-    # ------------------------------------------------------------------
-    # Internal normalization helpers
-    # ------------------------------------------------------------------
-
-    def _extract_legacy_feature_payload(
-        self,
-        context: SignalContext,
-    ) -> dict[str, Any]:
-        """
-        Best-effort fallback для старого StrategyContextBuilder, який клав
-        OI values у feature_map, а не в context.open_interest.
-        """
-        names = {
-            "exchange": "oi.features.exchange",
-            "market_type": "oi.features.market_type",
-            "symbol": "oi.features.symbol",
-            "timeframe": "oi.features.timeframe",
-            "timestamp": "oi.features.timestamp",
-            "oi": "oi.features.oi",
-            "open_interest_value": "oi.features.open_interest_value",
-            "oi_delta": "oi.features.oi_delta",
-            "oi_delta_pct": "oi.features.oi_delta_pct",
-            "oi_ma_fast": "oi.features.oi_ma_fast",
-            "oi_ma_slow": "oi.features.oi_ma_slow",
-            "oi_std": "oi.features.oi_std",
-            "oi_zscore": "oi.features.oi_zscore",
-            "oi_velocity": "oi.features.oi_velocity",
-            "oi_acceleration": "oi.features.oi_acceleration",
-            "price": "oi.features.price",
-            "price_delta": "oi.features.price_delta",
-            "price_delta_pct": "oi.features.price_delta_pct",
-            "volume": "oi.features.volume",
-            "quote_volume": "oi.features.quote_volume",
-            "volume_ma": "oi.features.volume_ma",
-            "volume_ratio": "oi.features.volume_ratio",
-            "funding_rate": "oi.features.funding_rate",
-            "predicted_funding_rate": "oi.features.predicted_funding_rate",
-            "long_liquidations": "oi.features.long_liquidations",
-            "short_liquidations": "oi.features.short_liquidations",
-            "liquidation_imbalance": "oi.features.liquidation_imbalance",
-            "cvd_delta": "oi.features.cvd_delta",
-            "aggressive_buy_volume": "oi.features.aggressive_buy_volume",
-            "aggressive_sell_volume": "oi.features.aggressive_sell_volume",
-            "aggressive_flow_imbalance": "oi.features.aggressive_flow_imbalance",
-            "oi_change_per_volume": "oi.features.oi_change_per_volume",
-            "oi_price_efficiency": "oi.features.oi_price_efficiency",
-            "oi_pressure_score": "oi.features.oi_pressure_score",
-            "oi_direction": "oi.features.oi_direction",
-            "price_direction": "oi.features.price_direction",
+        candidates = {
+            "oi_delta_pct": (
+                "features.oi_delta_pct",
+                "oi_delta_pct",
+                "open_interest.features.oi_delta_pct",
+                "oi.features.oi_delta_pct",
+            ),
+            "price_delta_pct": (
+                "features.price_delta_pct",
+                "price_delta_pct",
+                "open_interest.features.price_delta_pct",
+                "oi.features.price_delta_pct",
+            ),
+            "oi_pressure_score": (
+                "features.oi_pressure_score",
+                "oi_pressure_score",
+                "open_interest.features.oi_pressure_score",
+                "oi.features.oi_pressure_score",
+            ),
+            "aggressive_flow_imbalance": (
+                "features.aggressive_flow_imbalance",
+                "aggressive_flow_imbalance",
+                "open_interest.features.aggressive_flow_imbalance",
+                "oi.features.aggressive_flow_imbalance",
+            ),
+            "funding_rate": (
+                "features.funding_rate",
+                "funding_rate",
+                "open_interest.features.funding_rate",
+                "oi.features.funding_rate",
+            ),
+            "liquidation_pressure": (
+                "features.liquidation_pressure",
+                "liquidation_pressure",
+                "open_interest.features.liquidation_pressure",
+                "oi.features.liquidation_pressure",
+            ),
         }
 
         payload: dict[str, Any] = {}
-        for dst, feature_name in names.items():
-            if context.has_feature(feature_name):
-                payload[dst] = context.get_feature(feature_name)
 
-        payload.setdefault("symbol", getattr(context, "symbol", None))
-        payload.setdefault("timeframe", getattr(context, "timeframe", None))
+        for target_key, paths in candidates.items():
+            for path in paths:
+                try:
+                    value = self.open_interest_path(context, path, None)
+                except StrategyEvaluationError:
+                    value = None
 
-        return {key: value for key, value in payload.items() if value is not None}
+                if value is not None:
+                    payload[target_key] = value
+                    break
+
+        return payload
 
     def _normalize_divergence_payload(
         self,
-        data: Mapping[str, Any],
+        payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        data = dict(payload)
+
         divergence_type = (
             data.get("divergence_type")
             or data.get("type")
@@ -1297,28 +1798,23 @@ class OpenInterestStrategyBase(
             or OIDivergenceType.NONE.value
         )
 
+        detected_default = divergence_type != OIDivergenceType.NONE.value
+
         return {
-            "detected": self.safe_bool(
-                data.get("detected", data.get("is_detected")),
-                default=self.parse_divergence_type(divergence_type) is not OIDivergenceType.NONE,
-            ),
+            "detected": _to_bool(data.get("detected"), detected_default),
             "divergence_type": divergence_type,
-            "confidence": data.get(
-                "confidence",
-                data.get("divergence_confidence", data.get("oi_divergence_confidence", 0.0)),
-            ),
-            "score": data.get(
-                "score",
-                data.get("divergence_score", data.get("oi_divergence_score")),
-            ),
-            "window_size": data.get("window_size"),
-            "reasons": list(data.get("reasons") or data.get("divergence_reasons") or []),
+            "confidence": _unit_score(data.get("confidence"), 0.0),
+            "score": data.get("score"),
+            "window_size": _to_int(data.get("window_size")),
+            "reasons": self.normalize_reasons(data.get("reasons")),
         }
 
     def _normalize_anomaly_payload(
         self,
-        data: Mapping[str, Any],
+        payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        data = dict(payload)
+
         anomaly_type = (
             data.get("anomaly_type")
             or data.get("type")
@@ -1327,20 +1823,22 @@ class OpenInterestStrategyBase(
             or OIAnomalyType.NONE.value
         )
 
-        return {
-            "detected": self.safe_bool(
-                data.get("detected", data.get("is_detected")),
-                default=self.parse_anomaly_type(anomaly_type) is not OIAnomalyType.NONE,
-            ),
+        detected_default = anomaly_type != OIAnomalyType.NONE.value
+
+        normalized = {
+            "detected": _to_bool(data.get("detected"), detected_default),
             "anomaly_type": anomaly_type,
-            "strength": data.get("strength", data.get("anomaly_strength")),
-            "confidence": data.get(
-                "confidence",
-                data.get("anomaly_confidence", data.get("oi_anomaly_confidence", 0.0)),
-            ),
-            "score": data.get(
-                "score",
-                data.get("anomaly_score", data.get("oi_anomaly_score")),
-            ),
-            "reasons": list(data.get("reasons") or data.get("anomaly_reasons") or []),
+            "confidence": _unit_score(data.get("confidence"), 0.0),
+            "score": data.get("score"),
+            "reasons": self.normalize_reasons(data.get("reasons")),
         }
+
+        strength = data.get("strength")
+        if strength is not None:
+            normalized["strength"] = strength
+
+        return normalized
+
+
+# Backward-compatible alias while concrete OI strategies are migrated.
+OpenInterestStrategyBase = OpenInterestTradingStrategy

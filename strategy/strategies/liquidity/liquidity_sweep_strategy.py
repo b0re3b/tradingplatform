@@ -11,20 +11,8 @@ from analytics.liquidity.models import (
     LiquidityMapSnapshot,
     StopCluster,
 )
-
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from ...config import StrategyConfig, StrategyDefinitionConfig
-from ...enums import (
-    FilterDecision,
-    SetupType,
-    SignalPriority,
-    SignalSide,
-    StrategyCategory,
-)
-from ...exceptions import StrategyConfigError
-from ...models import FilterResult, StrategyContext, StrategySignal, TargetPlan
 from .base import (
     LIQUIDITY_FEATURES,
     LiquidityStrategyConfig,
@@ -37,7 +25,6 @@ from .utils import (
     collect_targets_below,
     confidence_from_components,
     distance_pct,
-    distance_score,
     freshness_score,
     is_directional_side,
     is_terminal_item,
@@ -52,8 +39,17 @@ from .utils import (
     sweep_risk_up,
     unit_score,
     weighted_score,
-    zone_score,
 )
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    FilterDecision,
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+)
+from ...exceptions import StrategyConfigError
+from ...models import FilterResult, StrategyContext, StrategySignal, TargetPlan
 
 
 @dataclass(slots=True)
@@ -1088,7 +1084,7 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         combined = unit_score(0.55 * score + 0.45 * confidence)
 
         if combined >= self.sweep_config.critical_priority_score:
-            return SignalPriority.CRITICAL
+            return SignalPriority.URGENT
 
         if combined >= self.sweep_config.high_priority_score:
             return SignalPriority.HIGH
