@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from core.event_bus import Event, EventBus, EventPriority
@@ -11,7 +11,7 @@ from core.scheduler import Scheduler
 
 from .base import BaseStrategy, BaseStrategyComponent
 from .config import StrategyConfig
-from .enums import FeatureSource, Timeframe
+from .enums import FeatureSource, SignalStatus, Timeframe
 from .exceptions import StrategyEvaluationError, StrategyStateError
 from .models import (
     FeatureSnapshot,
@@ -20,7 +20,6 @@ from .models import (
     RegimeSnapshot,
     StrategyContext,
     StrategyEvaluation,
-    StrategySignal,
     ensure_aware_utc,
     utcnow,
 )
@@ -29,10 +28,48 @@ from .registry import StrategyRegistry
 from .state import StrategyRuntimeState
 
 
+def _payload_from_event(event: Event | Any) -> dict[str, Any]:
+    payload = getattr(event, "payload", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _event_name_from_event(event: Event | Any) -> str:
+    for attr in ("topic", "name", "event_name", "type"):
+        value = getattr(event, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "unknown"
+
+
+def _event_timestamp(event: Event | Any | None) -> datetime | None:
+    if event is None:
+        return None
+
+    raw = getattr(event, "timestamp", None)
+    if raw is None:
+        raw = getattr(event, "created_at", None)
+
+    if raw is None:
+        return None
+
+    if isinstance(raw, datetime):
+        return ensure_aware_utc(raw)
+
+    if isinstance(raw, (int, float)):
+        if raw > 10_000_000_000:
+            return datetime.fromtimestamp(raw / 1000.0, tz=timezone.utc)
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+
+    return None
+
+
 @dataclass(slots=True)
 class StrategyEngineStats:
     """
     Lightweight runtime stats for StrategyEngine.
+
+    Це тільки engine-level лічильники. Детальна signal/scoring/build/routing
+    статистика має залишатися в SignalProcessor/StrategyRuntimeState.
     """
 
     events_received: int = 0
@@ -92,11 +129,11 @@ class StrategyEngineStats:
             "contexts_updated": self.contexts_updated,
             "batches_accepted": self.batches_accepted,
             "batches_rejected": self.batches_rejected,
-            "started_at": self.started_at,
-            "stopped_at": self.stopped_at,
-            "last_event_at": self.last_event_at,
-            "last_error_at": self.last_error_at,
-            "last_processed_at": self.last_processed_at,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "stopped_at": self.stopped_at.isoformat() if self.stopped_at else None,
+            "last_event_at": self.last_event_at.isoformat() if self.last_event_at else None,
+            "last_error_at": self.last_error_at.isoformat() if self.last_error_at else None,
+            "last_processed_at": self.last_processed_at.isoformat() if self.last_processed_at else None,
             "recent_errors": list(self.errors[-10:]),
         }
 
@@ -105,8 +142,8 @@ class StrategyContextBuilder(BaseStrategyComponent):
     """
     Builds and updates StrategyContext objects.
 
-    Це заміна старого strategy/context.py на рівні orchestration.
-    Сам StrategyContext тепер живе в models.py.
+    Це orchestration helper. Він не запускає стратегії, не scoring-ить сигнали
+    і не формує risk payload.
     """
 
     component_namespace = "strategy.context_builder"
@@ -137,22 +174,24 @@ class StrategyContextBuilder(BaseStrategyComponent):
         features: list[FeatureSnapshot] | None = None,
         domain_data: dict[FeatureSource, dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
+        persist: bool = True,
     ) -> StrategyContext:
         if not symbol.strip():
             raise StrategyStateError("symbol cannot be empty")
 
         context = StrategyContext(
-            symbol=symbol,
+            symbol=symbol.strip(),
             timestamp=ensure_aware_utc(timestamp or utcnow()),
             timeframe=timeframe,
             price=price,
             regime=regime,
             portfolio=portfolio or self.state.contexts.portfolio,
-            metadata=metadata or {},
+            metadata=dict(metadata or {}),
         )
 
         if features:
             for snapshot in features:
+                snapshot.validate()
                 context.put_feature(snapshot)
 
                 if snapshot.freshness_seconds is not None:
@@ -160,9 +199,13 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
         if domain_data:
             for source, values in domain_data.items():
-                context.domain_dict(source).update(values)
+                context.domain_dict(source).update(dict(values))
 
         context.validate()
+
+        if persist:
+            self.state.update_context(context)
+
         return context
 
     def get_or_build(
@@ -172,15 +215,20 @@ class StrategyContextBuilder(BaseStrategyComponent):
         timestamp: datetime | None = None,
         timeframe: Timeframe = Timeframe.M1,
     ) -> StrategyContext:
-        existing = self.state.contexts.get_context(symbol)
+        if not symbol.strip():
+            raise StrategyStateError("symbol cannot be empty")
+
+        existing = self.state.contexts.get_context(symbol.strip())
 
         if existing is not None:
             if timestamp is not None:
                 existing.timestamp = ensure_aware_utc(timestamp)
+            existing.timeframe = timeframe
+            existing.validate()
             return existing
 
         context = self.state.build_context(
-            symbol,
+            symbol.strip(),
             timestamp=timestamp or utcnow(),
             include_regime=True,
             include_portfolio=True,
@@ -197,11 +245,13 @@ class StrategyContextBuilder(BaseStrategyComponent):
         timestamp: datetime | None = None,
     ) -> StrategyContext:
         """
-        Lightweight direct context update.
+        Lightweight manual/system context update.
 
-        Основна нормалізація analytics payload усе одно живе в SignalProcessor,
-        але цей метод корисний для manual/system context updates.
+        Основна analytics normalization лишається в SignalProcessor.
         """
+        if not event_name.strip():
+            raise StrategyStateError("event_name cannot be empty")
+
         if not isinstance(payload, dict):
             raise StrategyStateError("payload must be a dict")
 
@@ -215,11 +265,19 @@ class StrategyContextBuilder(BaseStrategyComponent):
             timeframe=timeframe,
         )
 
-        price = self._extract_price_snapshot(symbol=symbol, payload=payload, timestamp=ts)
+        price = self._extract_price_snapshot(
+            symbol=symbol,
+            payload=payload,
+            timestamp=ts,
+        )
         if price is not None:
             context.price = price
 
-        regime = self._extract_regime_snapshot(symbol=symbol, payload=payload, timestamp=ts)
+        regime = self._extract_regime_snapshot(
+            symbol=symbol,
+            payload=payload,
+            timestamp=ts,
+        )
         if regime is not None:
             context.regime = regime
 
@@ -242,14 +300,15 @@ class StrategyContextBuilder(BaseStrategyComponent):
         context.validate()
         self.state.update_context(context)
 
-    def _extract_symbol(self, payload: dict[str, Any]) -> str:
+    @staticmethod
+    def _extract_symbol(payload: dict[str, Any]) -> str:
         raw = payload.get("symbol") or payload.get("instrument") or payload.get("market")
         if not isinstance(raw, str) or not raw.strip():
             raise StrategyStateError("payload does not contain valid symbol")
         return raw.strip()
 
+    @staticmethod
     def _extract_timestamp(
-        self,
         payload: dict[str, Any],
         fallback: datetime | None = None,
     ) -> datetime:
@@ -263,12 +322,13 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
         if isinstance(raw, (int, float)):
             if raw > 10_000_000_000:
-                return datetime.fromtimestamp(raw / 1000.0).astimezone()
-            return datetime.fromtimestamp(raw).astimezone()
+                return datetime.fromtimestamp(raw / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
 
         raise StrategyStateError("unsupported timestamp type in payload")
 
-    def _extract_timeframe(self, payload: dict[str, Any]) -> Timeframe:
+    @staticmethod
+    def _extract_timeframe(payload: dict[str, Any]) -> Timeframe:
         raw = payload.get("timeframe")
 
         if isinstance(raw, Timeframe):
@@ -282,6 +342,25 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
         return Timeframe.M1
 
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+
+        if isinstance(value, bool):
+            return float(value)
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+
+        return None
+
     def _extract_price_snapshot(
         self,
         *,
@@ -292,6 +371,7 @@ class StrategyContextBuilder(BaseStrategyComponent):
         price_keys = {
             "last_price",
             "price",
+            "close",
             "bid",
             "ask",
             "mark_price",
@@ -302,23 +382,37 @@ class StrategyContextBuilder(BaseStrategyComponent):
         if not any(key in payload for key in price_keys):
             return None
 
-        last_price = payload.get("last_price", payload.get("price"))
+        last = (
+            self._float_or_none(payload.get("last_price"))
+            or self._float_or_none(payload.get("price"))
+            or self._float_or_none(payload.get("close"))
+            or self._float_or_none(payload.get("mark_price"))
+        )
+
+        bid = self._float_or_none(payload.get("bid"))
+        ask = self._float_or_none(payload.get("ask"))
+        mark_price = self._float_or_none(payload.get("mark_price"))
+        index_price = self._float_or_none(payload.get("index_price"))
+        spread_bps = self._float_or_none(payload.get("spread_bps"))
 
         snapshot = PriceSnapshot(
             symbol=symbol,
-            last_price=self._optional_float(last_price),
-            bid=self._optional_float(payload.get("bid")),
-            ask=self._optional_float(payload.get("ask")),
-            mark_price=self._optional_float(payload.get("mark_price")),
-            index_price=self._optional_float(payload.get("index_price")),
-            spread_bps=self._optional_float(payload.get("spread_bps")),
             timestamp=timestamp,
+            last=last,
+            bid=bid,
+            ask=ask,
+            mark_price=mark_price,
+            index_price=index_price,
+            spread_bps=spread_bps,
+            metadata={
+                "source": self.component_name,
+            },
         )
         snapshot.validate()
         return snapshot
 
+    @staticmethod
     def _extract_regime_snapshot(
-        self,
         *,
         symbol: str,
         payload: dict[str, Any],
@@ -328,46 +422,28 @@ class StrategyContextBuilder(BaseStrategyComponent):
         if raw is None:
             return None
 
-        from .enums import MarketRegime
-
-        if isinstance(raw, MarketRegime):
-            regime = raw
-        elif isinstance(raw, str):
-            try:
-                regime = MarketRegime(raw)
-            except ValueError:
-                regime = MarketRegime.UNKNOWN
-        else:
-            regime = MarketRegime.UNKNOWN
-
-        confidence = self._optional_float(payload.get("regime_confidence")) or 0.0
+        if isinstance(raw, RegimeSnapshot):
+            return raw
 
         snapshot = RegimeSnapshot(
             symbol=symbol,
-            regime=regime,
-            confidence=confidence,
             timestamp=timestamp,
-            reasons=list(payload.get("regime_reasons") or []),
+            regime=raw,
+            confidence=payload.get("regime_confidence", 0.0),
+            metadata={
+                "source": "payload",
+            },
         )
         snapshot.validate()
         return snapshot
 
-    @staticmethod
-    def _optional_float(value: Any) -> float | None:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        return None
-
 
 class StrategyEventHandler(BaseStrategyComponent):
     """
-    EventBus-facing handler for strategy layer.
+    Owns EventBus subscriptions for StrategyEngine.
 
-    Слухає analytics/context/system events і передає їх у StrategyEngine.
+    Він тільки приймає events і делегує в StrategyEngine. Не містить scoring,
+    building, confluence, risk-payload або execution logic.
     """
 
     component_namespace = "strategy.event_handler"
@@ -375,7 +451,7 @@ class StrategyEventHandler(BaseStrategyComponent):
     def __init__(
         self,
         config: StrategyConfig,
-        engine: StrategyEngineProtocol,
+        engine: "StrategyEngineProtocol",
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
@@ -385,20 +461,78 @@ class StrategyEventHandler(BaseStrategyComponent):
             scheduler=scheduler,
         )
         self.engine = engine
+        self._subscriptions: list[Any] = []
 
     def register(self) -> None:
-        bus = self.ensure_event_bus()
+        if self.event_bus is None:
+            self.log_warning("Cannot register StrategyEventHandler: event_bus is not configured")
+            self._registered = True
+            return
 
-        bus.subscribe("analytics.*", self.on_analytics_event)
-        bus.subscribe("strategy.context.update", self.on_context_update)
-        bus.subscribe("strategy.command.evaluate_symbol", self.on_evaluate_symbol)
-        bus.subscribe("strategy.command.prune", self.on_prune_command)
+        if self._subscriptions:
+            self._registered = True
+            return
+
+        topics = self._analytics_topics()
+        for topic in topics:
+            subscription = self.event_bus.subscribe(
+                topic,
+                self._handle_analytics_event,
+                name=f"strategy_on_{topic.replace('*', 'wildcard').replace('.', '_')}",
+            )
+            self._subscriptions.append(subscription)
+
+        # Lifecycle/status feedback. These handlers only update local signal state.
+        feedback_topics = {
+            "signal.confirmed": self._handle_signal_confirmed,
+            "risk.position_blocked": self._handle_signal_blocked,
+            "execution.order_rejected": self._handle_execution_rejected,
+            "execution.order_failed": self._handle_execution_failed,
+            "execution.order_filled": self._handle_execution_filled,
+            "execution.order_cancelled": self._handle_execution_cancelled,
+            "system.strategy.context_update": self._handle_context_update,
+        }
+
+        for topic, handler in feedback_topics.items():
+            subscription = self.event_bus.subscribe(
+                topic,
+                handler,
+                name=f"strategy_on_{topic.replace('.', '_')}",
+            )
+            self._subscriptions.append(subscription)
 
         self._registered = True
 
-    async def on_analytics_event(self, event: Event) -> None:
-        event_name = self._event_topic(event)
-        payload = self._event_payload(event)
+        self.log_info(
+            "StrategyEventHandler registered",
+            subscriptions=len(self._subscriptions),
+        )
+
+    def unregister(self) -> None:
+        if self.event_bus is None:
+            self._subscriptions.clear()
+            self._registered = False
+            return
+
+        for subscription in list(self._subscriptions):
+            try:
+                self.event_bus.unsubscribe(subscription)
+            except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                self.log_warning(
+                    "Failed to unsubscribe strategy event handler",
+                    error=str(exc),
+                )
+
+        self._subscriptions.clear()
+        self._registered = False
+
+    async def stop(self) -> None:
+        self.unregister()
+        await super().stop()
+
+    async def _handle_analytics_event(self, event: Event | Any) -> None:
+        event_name = _event_name_from_event(event)
+        payload = _payload_from_event(event)
 
         await self.engine.process_analytics_event(
             event_name=event_name,
@@ -406,55 +540,112 @@ class StrategyEventHandler(BaseStrategyComponent):
             event=event,
         )
 
-    async def on_context_update(self, event: Event) -> None:
-        event_name = self._event_topic(event)
-        payload = self._event_payload(event)
+    async def _handle_context_update(self, event: Event | Any) -> None:
+        event_name = _event_name_from_event(event)
+        payload = _payload_from_event(event)
 
         self.engine.update_context_from_payload(
             event_name=event_name,
             payload=payload,
         )
 
-    async def on_evaluate_symbol(self, event: Event) -> None:
-        payload = self._event_payload(event)
-
-        symbol = payload.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
-            raise StrategyEvaluationError("strategy.command.evaluate_symbol requires symbol")
-
-        await self.engine.evaluate_symbol(symbol.strip())
-
-    async def on_prune_command(self, event: Event) -> None:
-        self.engine.prune()
-
-    def _event_topic(self, event: Event) -> str:
-        return (
-            getattr(event, "topic", None)
-            or getattr(event, "name", None)
-            or getattr(event, "event_name", None)
-            or "analytics.unknown"
+    async def _handle_signal_confirmed(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.CONFIRMED,
+            reason=payload.get("reason") or "risk_confirmed",
         )
 
-    def _event_payload(self, event: Event) -> dict[str, Any]:
-        payload = getattr(event, "payload", None)
+    async def _handle_signal_blocked(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.REJECTED,
+            reason=payload.get("reason") or "risk_position_blocked",
+        )
 
-        if payload is None:
-            return {}
+    async def _handle_execution_rejected(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.REJECTED,
+            reason=payload.get("reason") or "execution_order_rejected",
+        )
 
-        if not isinstance(payload, dict):
-            raise StrategyEvaluationError("Event payload must be a dict")
+    async def _handle_execution_failed(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.FAILED,
+            reason=payload.get("reason") or "execution_order_failed",
+        )
 
-        return payload
+    async def _handle_execution_cancelled(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.CANCELLED,
+            reason=payload.get("reason") or "execution_order_cancelled",
+        )
+
+    async def _handle_execution_filled(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.EXECUTED,
+            reason=payload.get("reason") or "execution_order_filled",
+        )
+
+    def _mark_signal_status(
+        self,
+        *,
+        payload: dict[str, Any],
+        status: SignalStatus,
+        reason: str,
+    ) -> None:
+        signal_id = payload.get("signal_id")
+        symbol = payload.get("symbol")
+
+        state = getattr(self.engine, "state", None)
+        if state is None:
+            return
+
+        signal = None
+
+        signals_state = getattr(state, "signals", None)
+        if signals_state is not None:
+            by_id = getattr(signals_state, "signal_by_id", None)
+            if isinstance(by_id, dict) and isinstance(signal_id, str):
+                signal = by_id.get(signal_id)
+
+            if signal is None and isinstance(symbol, str):
+                signal = signals_state.get_last_for_symbol(symbol)
+
+        if signal is None:
+            return
+
+        signal.status = status
+        signal.add_reason(reason)
+        state.update_signal(signal, active=signal.is_active)
+
+    def _analytics_topics(self) -> list[str]:
+        configured = getattr(self.config.routing, "event_to_categories", {}) or {}
+        topics = [topic for topic in configured.keys() if isinstance(topic, str) and topic.strip()]
+
+        if topics:
+            return list(dict.fromkeys(topics))
+
+        return [
+            "analytics.*",
+        ]
 
 
 class StrategyLifecycleManager(BaseStrategyComponent):
     """
-    Lifecycle manager for strategy package.
+    Starts/stops strategy subcomponents and owns scheduled maintenance jobs.
 
-    Відповідає за:
-    - start/stop дочірніх компонентів;
-    - Scheduler cleanup jobs;
-    - lifecycle events.
+    Не запускає signal processing самостійно і не містить strategy logic.
     """
 
     component_namespace = "strategy.lifecycle"
@@ -474,11 +665,15 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         )
         self.state = state
         self.components = components
-        self._cleanup_job_name = "strategy_runtime_state_cleanup"
+        self._cleanup_job_name = "strategy.runtime.cleanup"
 
     async def start(self) -> None:
         if self.is_started:
             return
+
+        for component in self.components:
+            if not component.is_registered:
+                component.register()
 
         for component in self.components:
             await component.start()
@@ -491,7 +686,7 @@ class StrategyLifecycleManager(BaseStrategyComponent):
             "strategy.engine.started",
             {
                 "component": self.component_name,
-                "state": self.state.summary(),
+                "components": [component.component_name for component in self.components],
             },
             priority=EventPriority.LOW,
             source=self.component_name,
@@ -501,20 +696,10 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         if not self.is_started:
             return
 
-        await self.emit_event(
-            "strategy.engine.stopping",
-            {
-                "component": self.component_name,
-                "state": self.state.summary(),
-            },
-            priority=EventPriority.LOW,
-            source=self.component_name,
-        )
-
         for component in reversed(self.components):
             try:
                 await component.stop()
-            except Exception as exc:
+            except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                 self.log_warning(
                     "Component stop failed",
                     component_name=component.component_name,
@@ -549,7 +734,6 @@ class StrategyLifecycleManager(BaseStrategyComponent):
                 run_immediately=False,
             )
         except TypeError:
-            # Fallback for Scheduler versions with a smaller signature.
             self.scheduler.add_interval_job(
                 self._cleanup_job_name,
                 self._cleanup_state_job,
@@ -569,10 +753,12 @@ class StrategyLifecycleManager(BaseStrategyComponent):
 
 class StrategyEngineProtocol:
     """
-    Lightweight protocol-like base for StrategyEventHandler typing.
+    Runtime protocol-like base for StrategyEventHandler typing.
 
     Не використовує typing.Protocol, щоб не ускладнювати runtime imports.
     """
+
+    state: StrategyRuntimeState
 
     async def process_analytics_event(
         self,
@@ -600,16 +786,17 @@ class StrategyEngineProtocol:
 
 class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
     """
-    Main orchestration layer for strategy package.
+    Main orchestration facade for strategy package.
 
     StrategyEngine:
     - owns StrategyRegistry;
     - owns StrategyRuntimeState;
+    - owns StrategyContextBuilder;
     - owns SignalProcessor;
-    - subscribes to analytics events through StrategyEventHandler;
+    - owns StrategyEventHandler;
+    - owns StrategyLifecycleManager;
     - delegates signal pipeline to SignalProcessor;
-    - emits strategy/system events through EventBus;
-    - does not contain trading execution or risk logic.
+    - does not contain scoring/building/risk-payload/execution logic.
     """
 
     component_namespace = "strategy.engine"
@@ -742,7 +929,8 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
             batch = await self.processor.process_event(
                 event_name=event_name,
                 payload=payload,
-                timestamp=self._event_timestamp(event),
+                timestamp=_event_timestamp(event),
+                emit=True,
             )
 
             self.stats.record_processed(batch.accepted)
@@ -752,8 +940,10 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
                 {
                     "symbol": batch.symbol,
                     "accepted": batch.accepted,
+                    "emitted": batch.emitted,
                     "final_signal_count": len(batch.final_signals),
-                    "reasons": batch.reasons,
+                    "risk_payload_count": len(batch.risk_payloads),
+                    "reasons": list(batch.reasons),
                     "timestamp": batch.timestamp.isoformat(),
                 },
                 priority=EventPriority.LOW,
@@ -762,9 +952,16 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
 
             return batch
 
-        except Exception as exc:
+        except (
+            StrategyEvaluationError,
+            StrategyStateError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            AttributeError,
+        ) as exc:
             self.stats.record_error(exc)
-            self.state.metrics.record_error()
+            self._record_metric_error()
 
             self.log_exception(
                 "StrategyEngine failed to process analytics event",
@@ -823,135 +1020,93 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
             features=features,
             domain_data=domain_data,
             metadata=metadata,
+            persist=persist,
         )
 
         self.stats.contexts_built += 1
-
-        if persist:
-            self.context_builder.persist(context)
-            self.stats.contexts_updated += 1
-
         return context
 
     async def evaluate_symbol(self, symbol: str) -> list[StrategyEvaluation]:
-        if not symbol.strip():
-            raise StrategyEvaluationError("symbol cannot be empty")
+        """
+        Manual strategy evaluation helper.
 
-        context = self.state.contexts.get_context(symbol)
-        if context is None:
-            context = self.state.build_context(symbol)
+        Не публікує signal.generated і не будує risk payload.
+        Для повного pipeline використовувати process_analytics_event().
+        """
+        context = self.context_builder.get_or_build(symbol=symbol)
+        strategies = self.registry.select(context=context)
 
-        strategies = self.registry.find_applicable(context)
+        result: list[StrategyEvaluation] = []
 
-        if not strategies:
-            self.state.metrics.record_applicability_skip()
-            return []
-
-        evaluations = await self.processor.evaluate_strategies(
-            strategies=strategies,
-            context=context,
-        )
-
-        return evaluations
-
-    async def evaluate_context(
-        self,
-        context: StrategyContext,
-    ) -> list[StrategyEvaluation]:
-        context.validate()
-        self.state.update_context(context)
-
-        strategies = self.registry.find_applicable(context)
-
-        if not strategies:
-            self.state.metrics.record_applicability_skip()
-            return []
-
-        return await self.processor.evaluate_strategies(
-            strategies=strategies,
-            context=context,
-        )
-
-    def update_price(self, snapshot: PriceSnapshot) -> None:
-        snapshot.validate()
-
-        context = self.context_builder.get_or_build(
-            symbol=snapshot.symbol,
-            timestamp=snapshot.timestamp,
-        )
-        context.price = snapshot
-        self.state.update_context(context)
-
-    def update_regime(self, snapshot: RegimeSnapshot) -> None:
-        snapshot.validate()
-        self.state.set_regime(snapshot)
-
-        context = self.context_builder.get_or_build(
-            symbol=snapshot.symbol,
-            timestamp=snapshot.timestamp,
-        )
-        context.regime = snapshot
-        self.state.update_context(context)
-
-    def update_portfolio(self, snapshot: PortfolioSnapshot) -> None:
-        snapshot.validate()
-        self.state.set_portfolio_snapshot(snapshot)
-
-    def upsert_feature(self, snapshot: FeatureSnapshot) -> None:
-        snapshot.validate()
-
-        context = self.context_builder.get_or_build(
-            symbol=snapshot.symbol,
-            timestamp=snapshot.timestamp,
-        )
-        context.put_feature(snapshot)
-
-        if snapshot.freshness_seconds is not None:
-            context.freshness_map[snapshot.name] = snapshot.freshness_seconds
-
-        self.state.update_context(context)
-
-    def record_signal(
-        self,
-        signal: StrategySignal,
-        *,
-        active: bool | None = None,
-    ) -> None:
-        signal.validate()
-        self.state.update_signal(signal, active=active)
-
-    def prune(self) -> dict[str, int]:
-        result = self.state.prune(
-            max_signal_age_seconds=self.config.runtime.max_signal_age_seconds,
-        )
-
-        self.log_debug(
-            "StrategyEngine state pruned",
-            **result,
-        )
+        for strategy in strategies:
+            try:
+                evaluation = await strategy.evaluate(context)
+                evaluation.validate()
+                result.append(evaluation)
+                self.state.update_evaluation(evaluation)
+            except (
+                StrategyEvaluationError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                AttributeError,
+            ) as exc:
+                failed = StrategyEvaluation(
+                    strategy_name=strategy.strategy_name,
+                    symbol=symbol,
+                    timestamp=context.timestamp,
+                    passed=False,
+                    reasons=[f"manual_evaluation_error:{exc}"],
+                    metadata={
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    },
+                )
+                failed.validate()
+                result.append(failed)
+                self._record_metric_error(strategy_name=strategy.strategy_name)
 
         return result
 
+    def prune(self) -> dict[str, int]:
+        return self.state.prune(
+            max_signal_age_seconds=self.config.runtime.max_signal_age_seconds,
+        )
+
     def summary(self) -> dict[str, Any]:
         return {
-            "component": self.component_name,
-            "started": self.is_started,
-            "registered": self.is_registered,
+            "engine": {
+                "started": self.is_started,
+                "registered": self.is_registered,
+                "stats": self.stats.summary(),
+            },
             "registry": self.registry.summary(),
             "state": self.state.summary(),
-            "stats": self.stats.summary(),
         }
 
-    def _event_timestamp(self, event: Event | None) -> datetime | None:
-        if event is None:
-            return None
+    def _record_metric_error(self, strategy_name: str | None = None) -> None:
+        metrics = getattr(self.state, "metrics", None)
+        if metrics is None:
+            return
 
-        raw = getattr(event, "timestamp", None)
+        record_error = getattr(metrics, "record_error", None)
+        if not callable(record_error):
+            return
 
-        if raw is None:
-            return None
+        try:
+            if strategy_name is not None:
+                record_error(strategy_name=strategy_name)
+            else:
+                record_error()
+        except TypeError:
+            record_error()
 
-        if isinstance(raw, datetime):
-            return ensure_aware_utc(raw)
 
-        return None
+__all__ = [
+    "StrategyEngineStats",
+    "StrategyContextBuilder",
+    "StrategyEventHandler",
+    "StrategyLifecycleManager",
+    "StrategyEngineProtocol",
+    "StrategyEngine",
+]

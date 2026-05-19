@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
-
-import datetime
+from datetime import datetime, timezone
+from typing import Any, TypeVar
 
 from core.event_bus import EventBus, EventPriority
 from core.scheduler import Scheduler
 
-from .base import BaseStrategy, BaseStrategyComponent, ContextAwareStrategyComponent
+from .base import BaseStrategy, BaseStrategyComponent
 from .config import (
     BuilderConfig,
     ConfluenceConfig,
-    FilterConfig,
     PortfolioCoordinatorConfig,
     RoutingConfig,
     StrategyConfig,
 )
 from .enums import (
-    ConfidenceGrade,
     ConflictType,
     EntryType,
     ExitType,
@@ -29,17 +26,19 @@ from .enums import (
     FilterDecision,
     MarketRegime,
     SignalOrigin,
-    SignalPriority,
     SignalSide,
-    SignalStatus,
-    SignalStrength,
     StrategyCategory,
+    StrategyExecutionQuality,
+    StrategyLiquidityClass,
+    StrategyMarginMode,
+    StrategyMarketType,
+    StrategyOrderIntent,
+    StrategyTradeTier,
     TriggerType,
 )
 from .exceptions import (
     BuilderError,
     ConfluenceError,
-    FilterExecutionError,
     PortfolioCoordinationError,
     SignalNormalizationError,
     SignalRoutingError,
@@ -49,11 +48,13 @@ from .models import (
     ConflictRecord,
     ConfluenceResult,
     EntryPlan,
+    ExecutionCostPayload,
     ExecutionPlanDraft,
     ExitPlan,
     FeatureSnapshot,
     FilterResult,
     InvalidationPlan,
+    RiskReadySignalPayload,
     StrategyContext,
     StrategyEvaluation,
     StrategySignal,
@@ -66,6 +67,90 @@ from .models import (
 )
 from .registry import StrategyRegistry
 from .state import StrategyRuntimeState
+
+
+EnumT = TypeVar("EnumT")
+
+
+# =============================================================================
+# Small typed helpers
+# =============================================================================
+
+
+def _to_float(value: Any, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return float(value)
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+
+    return default
+
+
+def _to_int(value: Any, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return int(value)
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        return int(value)
+
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+
+    return default
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    return default
+
+
+def _parse_enum(enum_cls: type[EnumT], value: Any, default: EnumT) -> EnumT:
+    if isinstance(value, enum_cls):
+        return value
+
+    if isinstance(value, str):
+        try:
+            return enum_cls(value)  # type: ignore[misc, call-arg]
+        except ValueError:
+            return default
+
+    return default
+
+
+# =============================================================================
+# Pipeline DTOs
+# =============================================================================
 
 
 @dataclass(slots=True)
@@ -122,6 +207,7 @@ class WeightedSignal:
 
     def validate(self) -> None:
         self.signal.validate()
+
         if self.category_weight < 0:
             raise ConfluenceError("WeightedSignal.category_weight must be >= 0")
         if self.regime_weight < 0:
@@ -202,13 +288,13 @@ class FilterEvaluation:
         result.validate()
         self.results.append(result)
 
-        if result.decision == FilterDecision.BLOCK:
+        if result.decision is FilterDecision.BLOCK:
             self.accepted = False
             self.blocking_filters.append(result.name)
             if result.reason:
                 self.reasons.append(result.reason)
 
-        elif result.decision == FilterDecision.WARN:
+        elif result.decision is FilterDecision.WARN:
             self.warning_filters.append(result.name)
             if result.reason:
                 self.reasons.append(result.reason)
@@ -280,7 +366,9 @@ class ProcessedSignalBatch:
     confluence: ConfluenceEvaluation | None = None
     coordinated: CoordinationDecision | None = None
     final_signals: list[StrategySignal] = field(default_factory=list)
+    risk_payloads: list[RiskReadySignalPayload] = field(default_factory=list)
     accepted: bool = False
+    emitted: bool = False
     reasons: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -288,11 +376,14 @@ class ProcessedSignalBatch:
         self.timestamp = ensure_aware_utc(self.timestamp)
 
 
+# =============================================================================
+# SignalNormalizer
+# =============================================================================
+
+
 class SignalNormalizer(BaseStrategyComponent):
     """
-    Normalizes analytics payloads into:
-    - domain data inside StrategyContext;
-    - FeatureSnapshot entries for StrategyContextStore.
+    Normalizes analytics payloads into StrategyContext domain data and features.
     """
 
     component_namespace = "strategy.processor.normalizer"
@@ -327,13 +418,16 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp=ts,
             domain_data=domain_data,
             features=features,
-            metadata={"event_name": event_name},
+            metadata={
+                "event_name": event_name,
+                "raw_payload_keys": sorted(payload.keys()),
+            },
         )
 
         self.log_debug(
             "Analytics event normalized",
             event_name=event_name,
-            source=str(source),
+            source=source.value,
             symbol=symbol,
             features_count=len(features),
         )
@@ -360,6 +454,10 @@ class SignalNormalizer(BaseStrategyComponent):
             context.put_feature(snapshot)
             if snapshot.freshness_seconds is not None:
                 context.freshness_map[snapshot.name] = snapshot.freshness_seconds
+
+        context.metadata.setdefault("updated_by", self.component_name)
+        context.metadata["last_source"] = normalized.source.value
+        context.metadata["last_event_name"] = normalized.metadata.get("event_name")
 
         context.validate()
         return context
@@ -399,7 +497,8 @@ class SignalNormalizer(BaseStrategyComponent):
             f"unable to resolve FeatureSource for event '{event_name}'"
         )
 
-    def _resolve_source_from_text(self, value: str) -> FeatureSource | None:
+    @staticmethod
+    def _resolve_source_from_text(value: str) -> FeatureSource | None:
         text = value.lower()
 
         if "orderflow" in text or "cvd" in text or "imbalance" in text or "volume_delta" in text:
@@ -423,14 +522,15 @@ class SignalNormalizer(BaseStrategyComponent):
 
         return None
 
-    def _extract_symbol(self, payload: dict[str, Any]) -> str:
+    @staticmethod
+    def _extract_symbol(payload: dict[str, Any]) -> str:
         raw = payload.get("symbol") or payload.get("instrument") or payload.get("market")
         if not isinstance(raw, str) or not raw.strip():
             raise SignalNormalizationError("payload does not contain valid symbol")
         return raw.strip()
 
+    @staticmethod
     def _extract_timestamp(
-        self,
         payload: dict[str, Any],
         fallback: datetime | None = None,
     ) -> datetime:
@@ -444,14 +544,13 @@ class SignalNormalizer(BaseStrategyComponent):
 
         if isinstance(raw, (int, float)):
             if raw > 10_000_000_000:
-                from datetime import datetime, timezone
                 return datetime.fromtimestamp(raw / 1000.0, tz=timezone.utc)
-            from datetime import datetime, timezone
             return datetime.fromtimestamp(raw, tz=timezone.utc)
 
         raise SignalNormalizationError("unsupported timestamp type in payload")
 
-    def _extract_domain_data(self, payload: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _extract_domain_data(payload: dict[str, Any]) -> dict[str, Any]:
         excluded = {
             "symbol",
             "instrument",
@@ -496,18 +595,19 @@ class SignalNormalizer(BaseStrategyComponent):
             if not isinstance(name, str) or not name.strip():
                 raise SignalNormalizationError("feature item must contain non-empty 'name'")
 
+            confidence = self._safe_confidence(
+                item.get("confidence", payload.get("confidence", 0.0))
+            )
+            normalized_value = self._safe_normalized_value(item.get("normalized_value"))
+
             snapshot = FeatureSnapshot(
                 name=name.strip(),
                 value=item.get("value"),
                 source=source,
                 symbol=symbol,
                 timestamp=timestamp,
-                confidence=self._safe_confidence(
-                    item.get("confidence", payload.get("confidence", 0.0))
-                ),
-                normalized_value=self._safe_normalized_value(
-                    item.get("normalized_value")
-                ),
+                confidence=confidence,
+                normalized_value=normalized_value,
                 freshness_seconds=self._resolve_freshness_seconds(
                     feature_name=name.strip(),
                     explicit=item.get("freshness_seconds"),
@@ -567,45 +667,50 @@ class SignalNormalizer(BaseStrategyComponent):
         explicit: Any,
     ) -> float | None:
         if explicit is not None:
-            if not isinstance(explicit, (int, float)) or explicit <= 0:
+            explicit_f = _to_float(explicit)
+            if explicit_f is None or explicit_f <= 0:
                 raise SignalNormalizationError(
                     f"freshness_seconds must be positive for feature '{feature_name}'"
                 )
-            return float(explicit)
+            return explicit_f
 
-        return float(self.config.freshness.get_ttl(feature_name))
+        return float(self.config.get_feature_ttl(feature_name))
 
-    def _safe_confidence(self, value: Any) -> float:
-        if value is None:
-            return 0.0
-        if isinstance(value, bool):
-            return 1.0 if value else 0.0
-        if isinstance(value, (int, float)):
-            return clamp(float(value), 0.0, 1.0)
-        raise SignalNormalizationError(f"unsupported confidence value: {value!r}")
+    @staticmethod
+    def _safe_confidence(value: Any) -> float:
+        parsed = _to_float(value, default=0.0)
+        return clamp(parsed if parsed is not None else 0.0, 0.0, 1.0)
 
-    def _safe_normalized_value(self, value: Any) -> float | None:
-        if value is None:
+    @staticmethod
+    def _safe_normalized_value(value: Any) -> float | None:
+        parsed = _to_float(value)
+        if parsed is None:
             return None
-        if isinstance(value, bool):
-            return 1.0 if value else 0.0
-        if isinstance(value, (int, float)):
-            return clamp(float(value), -1.0, 1.0)
-        raise SignalNormalizationError(f"unsupported normalized_value: {value!r}")
+        return clamp(parsed, -1.0, 1.0)
 
-    def _infer_normalized_value(self, value: Any) -> float | None:
+    @staticmethod
+    def _infer_normalized_value(value: Any) -> float | None:
         if isinstance(value, bool):
             return 1.0 if value else 0.0
-        if isinstance(value, (int, float)):
-            numeric = float(value)
-            if -1.0 <= numeric <= 1.0:
-                return numeric
+
+        parsed = _to_float(value)
+        if parsed is None:
+            return None
+
+        if -1.0 <= parsed <= 1.0:
+            return parsed
+
         return None
+
+
+# =============================================================================
+# SignalRouter
+# =============================================================================
 
 
 class SignalRouter(BaseStrategyComponent):
     """
-    Selects strategies for an incoming normalized analytics event.
+    Selects strategies for analytics events and emits final risk-ready signals.
     """
 
     component_namespace = "strategy.processor.router"
@@ -619,10 +724,7 @@ class SignalRouter(BaseStrategyComponent):
     ) -> None:
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
         self.registry = registry
-
-    @property
-    def routing_config(self) -> RoutingConfig:
-        return self.config.routing
+        self.routing_config: RoutingConfig = config.routing
 
     def route(
         self,
@@ -638,206 +740,100 @@ class SignalRouter(BaseStrategyComponent):
 
         context.validate()
 
-        resolved_source = source or self._resolve_source_from_event_name(event_name)
-        changed_features = changed_features or []
-
-        decision = RouteDecision(
+        categories = self._resolve_categories(
             event_name=event_name,
-            symbol=context.symbol,
-            source=resolved_source,
-            timestamp=context.timestamp,
-            metadata=metadata or {},
+            source=source,
         )
 
-        candidates = self._collect_candidates(
-            event_name=event_name,
-            source=resolved_source,
-            changed_features=changed_features,
-            decision=decision,
-        )
+        selected: list[BaseStrategy] = []
+        skipped: dict[str, str] = {}
 
-        decision.selected = self._filter_applicable(
-            candidates=candidates,
-            context=context,
-            changed_features=changed_features,
-            decision=decision,
-        )
-
-        self.log_debug(
-            "Routing completed",
-            event_name=event_name,
-            symbol=context.symbol,
-            selected=decision.selected_names,
-            skipped=decision.skipped,
-        )
-        return decision
-
-    def route_from_features(
-        self,
-        *,
-        context: StrategyContext,
-        features: list[FeatureSnapshot],
-        event_name: str = "strategy.feature_update",
-        metadata: dict[str, Any] | None = None,
-    ) -> RouteDecision:
-        return self.route(
-            event_name=event_name,
-            context=context,
-            source=features[0].source if features else None,
-            changed_features=[feature.name for feature in features],
-            metadata=metadata,
-        )
-
-    def _collect_candidates(
-        self,
-        *,
-        event_name: str,
-        source: FeatureSource | None,
-        changed_features: list[str],
-        decision: RouteDecision,
-    ) -> list[BaseStrategy]:
-        candidates: dict[str, BaseStrategy] = {}
-
-        categories = self._resolve_categories_for_event(event_name, source)
-        if categories:
-            decision.categories_used.extend(categories)
-            for strategy in self.registry.find_by_categories(categories):
-                candidates[strategy.strategy_name] = strategy
-
-        for feature_name in changed_features:
-            matched = self.registry.find_by_required_feature(feature_name)
-            if matched:
-                decision.matched_features.append(feature_name)
-
-            for strategy in matched:
-                candidates[strategy.strategy_name] = strategy
-
-        if self.routing_config.reevaluate_on_any_update and not candidates:
-            for strategy in self.registry.list_enabled():
-                candidates[strategy.strategy_name] = strategy
-
-        if (
-            self.routing_config.route_hybrid_on_domain_signal
-            and source is not None
-            and source != FeatureSource.SYSTEM
-        ):
-            for strategy in self.registry.list_by_category(StrategyCategory.HYBRID, only_enabled=True):
-                candidates[strategy.strategy_name] = strategy
-                if StrategyCategory.HYBRID not in decision.categories_used:
-                    decision.categories_used.append(StrategyCategory.HYBRID)
-
-        return sorted(
-            candidates.values(),
-            key=lambda strategy: (strategy.priority, strategy.strategy_name),
-        )
-
-    def _filter_applicable(
-        self,
-        *,
-        candidates: list[BaseStrategy],
-        context: StrategyContext,
-        changed_features: list[str],
-        decision: RouteDecision,
-    ) -> list[BaseStrategy]:
-        applicable: list[BaseStrategy] = []
+        if hasattr(self.registry, "select"):
+            candidates = self.registry.select(
+                context=context,
+                categories=categories or None,
+                changed_features=changed_features or None,
+            )
+        else:
+            candidates = self.registry.list_all()
 
         for strategy in candidates:
-            reason = self._skip_reason(
-                strategy=strategy,
-                context=context,
-                changed_features=changed_features,
-            )
-            if reason is not None:
-                decision.skipped[strategy.strategy_name] = reason
-                continue
+            try:
+                if not strategy.should_evaluate(context):
+                    skipped[strategy.strategy_name] = "strategy_not_applicable"
+                    continue
+                selected.append(strategy)
+            except (StrategyEvaluationError, ValueError, TypeError, AttributeError) as exc:
+                skipped[strategy.strategy_name] = f"route_check_failed:{exc}"
 
-            applicable.append(strategy)
+        selected.sort(key=lambda item: (item.priority, item.strategy_name))
 
-        return sorted(
-            applicable,
-            key=lambda strategy: (strategy.priority, strategy.strategy_name),
+        return RouteDecision(
+            event_name=event_name,
+            symbol=context.symbol,
+            source=source,
+            timestamp=context.timestamp,
+            selected=selected,
+            skipped=skipped,
+            categories_used=categories,
+            matched_features=list(changed_features or []),
+            metadata=dict(metadata or {}),
         )
 
-    def _skip_reason(
+    async def emit_signal_generated(
         self,
         *,
-        strategy: BaseStrategy,
-        context: StrategyContext,
-        changed_features: list[str],
-    ) -> str | None:
-        if not strategy.is_enabled():
-            return "strategy_disabled"
+        payload: RiskReadySignalPayload,
+    ) -> None:
+        """
+        Emit the final signal.generated event consumed by RiskManager.
+        """
+        payload.validate()
 
-        runtime = self.config.get_strategy_runtime(strategy.strategy_name)
-
-        if not runtime.allows_symbol(context.symbol):
-            return "symbol_not_allowed"
-
-        if not runtime.allows_timeframe(context.timeframe):
-            return "timeframe_not_supported"
-
-        if not runtime.allows_regime(context.current_regime):
-            return "regime_not_supported"
-
-        required = strategy.required_features()
-        missing = [name for name in required if not context.has_feature(name)]
-        if missing and not self.routing_config.allow_partial_context:
-            return f"missing_required_features:{','.join(sorted(missing))}"
-
-        stale = [
-            name
-            for name in required
-            if context.has_feature(name) and self._feature_is_stale(context, name)
-        ]
-        if stale:
-            return f"stale_required_features:{','.join(sorted(stale))}"
-
-        if changed_features and not self._strategy_relevant_for_feature_change(
-            strategy,
-            changed_features,
-        ):
-            return "no_relevant_feature_change"
-
-        try:
-            if not strategy.should_evaluate(context):
-                return "strategy_should_evaluate_false"
-        except Exception as exc:
-            return f"strategy_should_evaluate_error:{exc}"
-
-        return None
-
-    def _feature_is_stale(self, context: StrategyContext, feature_name: str) -> bool:
-        snapshot = context.get_feature_snapshot(feature_name)
-        if snapshot is None:
-            return True
-
-        ttl = context.freshness_map.get(
-            feature_name,
-            self.routing_config.stale_feature_threshold_seconds,
+        await self.emit_event(
+            "signal.generated",
+            payload.to_dict(),
+            priority=self._event_priority(payload),
+            source=self.component_name,
         )
-        return snapshot.age_seconds(context.timestamp) > ttl
 
-    def _strategy_relevant_for_feature_change(
+    async def emit_signal_rejected(
         self,
-        strategy: BaseStrategy,
-        changed_features: list[str],
-    ) -> bool:
-        required = strategy.required_features()
-        if not required:
-            return True
-        return bool(required.intersection(changed_features))
+        *,
+        signal: StrategySignal | None,
+        symbol: str,
+        reason: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "signal_id": getattr(signal, "signal_id", None),
+            "symbol": symbol,
+            "strategy_name": getattr(signal, "strategy_name", None),
+            "reason": reason,
+            "metadata": dict(metadata or {}),
+        }
 
-    def _resolve_categories_for_event(
+        await self.emit_event(
+            "signal.rejected",
+            payload,
+            priority=EventPriority.LOW,
+            source=self.component_name,
+        )
+
+    @staticmethod
+    def _event_priority(payload: RiskReadySignalPayload) -> EventPriority:
+        if payload.priority_score >= 0.85:
+            return EventPriority.HIGH
+        return EventPriority.NORMAL
+
+    def _resolve_categories(
         self,
+        *,
         event_name: str,
         source: FeatureSource | None,
     ) -> list[StrategyCategory]:
-        configured = self.routing_config.event_to_categories.get(event_name)
-        if configured:
-            return list(dict.fromkeys(configured))
-
-        event_lower = event_name.lower()
         categories: list[StrategyCategory] = []
+        event_lower = event_name.lower()
 
         for configured_event, configured_categories in self.routing_config.event_to_categories.items():
             if configured_event and configured_event.lower() in event_lower:
@@ -852,9 +848,6 @@ class SignalRouter(BaseStrategyComponent):
                 categories.append(mapped)
 
         return list(dict.fromkeys(categories))
-
-    def _resolve_source_from_event_name(self, event_name: str) -> FeatureSource | None:
-        return SignalNormalizer(self.config)._resolve_source_from_text(event_name)
 
     @staticmethod
     def _map_source_to_category(source: FeatureSource) -> StrategyCategory | None:
@@ -872,16 +865,54 @@ class SignalRouter(BaseStrategyComponent):
         return mapping.get(source)
 
 
+# =============================================================================
+# SignalScorer / ConfluenceEngine
+# =============================================================================
+
+
 class SignalScorer(BaseStrategyComponent):
     """
-    Scoring facade:
-    - weights;
-    - voting;
-    - conflicts;
-    - confidence aggregation.
+    Scores and enriches StrategySignal objects before confluence/filter/build.
     """
 
     component_namespace = "strategy.processor.scorer"
+
+    def score_signal(
+        self,
+        *,
+        signal: StrategySignal,
+        context: StrategyContext,
+    ) -> StrategySignal:
+        signal.validate()
+        context.validate()
+
+        priority_score = self._calculate_priority_score(signal, context)
+        signal.metadata["priority_score"] = priority_score
+
+        if signal.metadata.get("tier") is None:
+            signal.metadata["tier"] = self._tier_from_priority_score(priority_score).value
+
+        if signal.metadata.get("liquidity_class") is None:
+            signal.metadata["liquidity_class"] = self._liquidity_class(context).value
+
+        if signal.metadata.get("execution_quality") is None:
+            signal.metadata["execution_quality"] = self._execution_quality(signal).value
+
+        signal.score = clamp(max(signal.score, priority_score), 0.0, 1.0)
+        signal.confidence = clamp(signal.confidence, 0.0, 1.0)
+        signal.confidence_grade = confidence_to_grade(signal.confidence)
+        signal.strength = confidence_to_strength(signal.confidence)
+
+        signal.validate()
+        return signal
+
+    def score_many(
+        self,
+        *,
+        signals: list[StrategySignal],
+        context: StrategyContext,
+    ) -> list[StrategySignal]:
+        return [self.score_signal(signal=signal, context=context) for signal in signals]
 
     def score_signals(
         self,
@@ -904,18 +935,63 @@ class SignalScorer(BaseStrategyComponent):
         conflict_summary = self._resolve_conflicts(
             signals=signals,
             dominant_side=vote_summary.dominant_side,
-            context=context,
         )
+
+        timestamp = context.timestamp if context is not None else max(signal.timestamp for signal in signals)
 
         result = self._to_confluence_result(
             symbol=symbol,
-            timestamp=context.timestamp if context is not None else max(s.timestamp for s in signals),
+            timestamp=timestamp,
             weighted_signals=weighted,
             vote_summary=vote_summary,
             conflict_summary=conflict_summary,
         )
         result.validate()
         return result
+
+    def _calculate_priority_score(
+        self,
+        signal: StrategySignal,
+        context: StrategyContext,
+    ) -> float:
+        components = signal.metadata.get("priority_components")
+
+        if isinstance(components, dict):
+            setup_quality = _to_float(components.get("setup_quality"), signal.score) or signal.score
+            confluence_score = _to_float(components.get("confluence_score"), 0.0) or 0.0
+            liquidity_score = _to_float(components.get("liquidity_score"), self._liquidity_score(context)) or 0.0
+            risk_reward_score = _to_float(components.get("risk_reward_score"), self._risk_reward_score(signal)) or 0.0
+            execution_quality_score = _to_float(
+                components.get("execution_quality_score"),
+                self._execution_quality_score(signal),
+            ) or 0.0
+            regime_alignment_score = _to_float(
+                components.get("regime_alignment_score"),
+                self._regime_alignment_score(signal, context),
+            ) or 0.0
+            freshness_score = _to_float(components.get("freshness_score"), self._freshness_score(context)) or 0.0
+
+            return clamp(
+                0.25 * setup_quality
+                + 0.20 * confluence_score
+                + 0.15 * liquidity_score
+                + 0.15 * risk_reward_score
+                + 0.10 * execution_quality_score
+                + 0.10 * regime_alignment_score
+                + 0.05 * freshness_score,
+                0.0,
+                1.0,
+            )
+
+        return clamp(
+            0.35 * signal.score
+            + 0.25 * signal.confidence
+            + 0.15 * self._liquidity_score(context)
+            + 0.15 * self._risk_reward_score(signal)
+            + 0.10 * self._execution_quality_score(signal),
+            0.0,
+            1.0,
+        )
 
     def _apply_weights(
         self,
@@ -927,6 +1003,7 @@ class SignalScorer(BaseStrategyComponent):
 
         for signal in signals:
             regime = context.current_regime if context is not None else signal.regime
+
             category_weight = self.config.get_category_weight(signal.category)
             regime_weight = self.config.get_regime_adjustment(regime)
             strategy_weight = self.config.get_strategy_weight(signal.strategy_name, default=1.0)
@@ -942,8 +1019,8 @@ class SignalScorer(BaseStrategyComponent):
                 weighted_score=signal.score * final_weight,
                 weighted_confidence=signal.confidence * final_weight,
                 metadata={
-                    "category": str(signal.category),
-                    "regime": str(regime),
+                    "category": signal.category.value,
+                    "regime": regime.value if isinstance(regime, MarketRegime) else str(regime),
                 },
             )
             weighted.validate()
@@ -951,47 +1028,34 @@ class SignalScorer(BaseStrategyComponent):
 
         return result
 
-    def _summarize_votes(self, signals: list[StrategySignal]) -> VoteSummary:
+    @staticmethod
+    def _summarize_votes(signals: list[StrategySignal]) -> VoteSummary:
         summary = VoteSummary(total_votes=len(signals))
 
         for signal in signals:
-            if signal.side == SignalSide.LONG:
+            if signal.side is SignalSide.LONG:
                 summary.long_votes += 1
-            elif signal.side == SignalSide.SHORT:
+            elif signal.side is SignalSide.SHORT:
                 summary.short_votes += 1
-            elif signal.side == SignalSide.FLAT:
+            else:
                 summary.flat_votes += 1
 
-            if signal.trigger_type == TriggerType.CONFIRMATION:
+            if signal.trigger_type is TriggerType.CONFIRMATION:
                 summary.confirmation_count += 1
-            if signal.trigger_type == TriggerType.PRIMARY:
+            if signal.trigger_type is TriggerType.PRIMARY:
                 summary.primary_count += 1
 
-        if summary.long_votes > summary.short_votes and summary.long_votes > 0:
+        if summary.long_votes > summary.short_votes:
             summary.dominant_side = SignalSide.LONG
-        elif summary.short_votes > summary.long_votes and summary.short_votes > 0:
+        elif summary.short_votes > summary.long_votes:
             summary.dominant_side = SignalSide.SHORT
-        elif summary.flat_votes > 0 and summary.long_votes == 0 and summary.short_votes == 0:
-            summary.dominant_side = SignalSide.FLAT
         else:
             summary.dominant_side = SignalSide.UNKNOWN
 
-        reasons: list[str] = []
+        summary.accepted = summary.dominant_side in {SignalSide.LONG, SignalSide.SHORT}
+        if not summary.accepted:
+            summary.reasons.append("no_dominant_direction")
 
-        if summary.total_votes < self.config.voting.min_total_votes:
-            reasons.append("not_enough_total_votes")
-
-        if summary.confirmation_count < self.config.voting.min_confirmations:
-            reasons.append("not_enough_confirmations")
-
-        if self.config.voting.require_primary_trigger and summary.primary_count < 1:
-            reasons.append("primary_trigger_required")
-
-        if summary.dominant_side == SignalSide.UNKNOWN:
-            reasons.append("no_dominant_side")
-
-        summary.reasons = reasons
-        summary.accepted = not reasons
         return summary
 
     def _resolve_conflicts(
@@ -999,54 +1063,24 @@ class SignalScorer(BaseStrategyComponent):
         *,
         signals: list[StrategySignal],
         dominant_side: SignalSide,
-        context: StrategyContext | None,
     ) -> ConflictSummary:
         summary = ConflictSummary()
 
-        if dominant_side in {SignalSide.LONG, SignalSide.SHORT}:
-            opposite = SignalSide.SHORT if dominant_side == SignalSide.LONG else SignalSide.LONG
+        for signal in signals:
+            if dominant_side.is_directional and signal.side != dominant_side:
+                conflict = ConflictRecord(
+                    conflict_type=ConflictType.SIDE_CONFLICT,
+                    source=signal.strategy_name,
+                    message=f"signal side {signal.side.value} conflicts with dominant {dominant_side.value}",
+                    penalty=self.config.confluence.conflict_penalty,
+                )
+                summary.add_conflict(conflict)
 
-            for signal in signals:
-                if signal.side == opposite:
-                    summary.add_conflict(
-                        ConflictRecord(
-                            conflict_type=ConflictType.SIDE_CONFLICT,
-                            source=signal.strategy_name,
-                            message=f"signal side {signal.side.value} conflicts with dominant side {dominant_side.value}",
-                            penalty=self.config.confluence.conflict_penalty,
-                        )
-                    )
-
-        if context is not None:
-            for signal in signals:
-                if (
-                    signal.regime != MarketRegime.UNKNOWN
-                    and context.current_regime != MarketRegime.UNKNOWN
-                    and signal.regime != context.current_regime
-                ):
-                    summary.add_conflict(
-                        ConflictRecord(
-                            conflict_type=ConflictType.REGIME_CONFLICT,
-                            source=signal.strategy_name,
-                            message=f"signal regime {signal.regime.value} conflicts with context regime {context.current_regime.value}",
-                            penalty=self.config.confluence.conflict_penalty,
-                        )
-                    )
-
-        if self.config.conflict.reject_on_side_conflict and any(
-            c.conflict_type == ConflictType.SIDE_CONFLICT for c in summary.conflicts
-        ):
-            summary.reasons.append("rejected_on_side_conflict")
-
-        if self.config.conflict.reject_on_regime_conflict and any(
-            c.conflict_type == ConflictType.REGIME_CONFLICT for c in summary.conflicts
-        ):
-            summary.reasons.append("rejected_on_regime_conflict")
-
-        if summary.total_penalty > self.config.conflict.max_total_penalty:
+        max_penalty = self.config.confluence.conflict_penalty * 3
+        if summary.total_penalty >= max_penalty:
+            summary.accepted = False
             summary.reasons.append("conflict_penalty_too_high")
 
-        summary.accepted = not summary.reasons
         return summary
 
     def _to_confluence_result(
@@ -1059,102 +1093,221 @@ class SignalScorer(BaseStrategyComponent):
         conflict_summary: ConflictSummary,
     ) -> ConfluenceResult:
         if not weighted_signals:
-            return ConfluenceResult(
-                symbol=symbol,
-                timestamp=timestamp,
-                accepted=False,
-                reasons=["no_weighted_signals"],
-            )
+            raise ConfluenceError("weighted_signals cannot be empty")
 
-        dominant_side = vote_summary.dominant_side
-        side_signals = [
-            item
-            for item in weighted_signals
-            if item.signal.side == dominant_side
-        ]
-
-        if not side_signals:
-            return ConfluenceResult(
-                symbol=symbol,
-                timestamp=timestamp,
-                side=dominant_side,
-                accepted=False,
-                reasons=["no_signals_for_dominant_side"],
-            )
-
-        total_weight = sum(item.final_weight for item in side_signals)
+        total_weight = sum(item.final_weight for item in weighted_signals)
         if total_weight <= 0:
-            confidence = 0.0
-            score = 0.0
-        else:
-            score = sum(item.weighted_score for item in side_signals) / total_weight
-            confidence = sum(item.weighted_confidence for item in side_signals) / total_weight
+            total_weight = float(len(weighted_signals))
 
-        confidence = clamp(confidence - conflict_summary.total_penalty, 0.0, 1.0)
-        score = max(0.0, score - conflict_summary.total_penalty)
+        score = sum(item.weighted_score for item in weighted_signals) / total_weight
+        confidence = sum(item.weighted_confidence for item in weighted_signals) / total_weight
 
-        reasons: list[str] = []
-        confirmations: list[str] = []
+        adjusted_score = clamp(score - conflict_summary.total_penalty, 0.0, 1.0)
+        adjusted_confidence = clamp(confidence - conflict_summary.total_penalty, 0.0, 1.0)
 
-        for item in side_signals:
-            for reason in item.signal.reasons:
-                if reason not in reasons:
-                    reasons.append(reason)
-
-            for confirmation in item.signal.confirmations:
-                if confirmation not in confirmations:
-                    confirmations.append(confirmation)
-
-        for reason in vote_summary.reasons:
-            if reason not in reasons:
-                reasons.append(f"vote:{reason}")
-
-        for reason in conflict_summary.reasons:
-            if reason not in reasons:
-                reasons.append(f"conflict:{reason}")
-
+        config = self.config.confluence
         accepted = (
             vote_summary.accepted
             and conflict_summary.accepted
-            and confidence >= self.config.confluence.min_confidence
-            and score >= self.config.confluence.min_score
+            and vote_summary.total_votes >= config.min_agreement_count
+            and adjusted_confidence >= config.min_confidence
+            and adjusted_score >= config.min_score
         )
+
+        reasons = []
+        reasons.extend(vote_summary.reasons)
+        reasons.extend(conflict_summary.reasons)
+
+        if vote_summary.total_votes < config.min_agreement_count:
+            reasons.append("insufficient_agreement_count")
+        if adjusted_confidence < config.min_confidence:
+            reasons.append("confluence_confidence_too_low")
+        if adjusted_score < config.min_score:
+            reasons.append("confluence_score_too_low")
 
         return ConfluenceResult(
             symbol=symbol,
             timestamp=timestamp,
-            side=dominant_side,
-            score=score,
-            confidence=confidence,
-            confidence_grade=confidence_to_grade(confidence),
-            strength=confidence_to_strength(confidence),
-            strategy_names=[item.signal.strategy_name for item in side_signals],
+            side=vote_summary.dominant_side,
+            score=adjusted_score,
+            confidence=adjusted_confidence,
+            confidence_grade=confidence_to_grade(adjusted_confidence),
+            strength=confidence_to_strength(adjusted_confidence),
+            strategy_names=[item.signal.strategy_name for item in weighted_signals],
             reasons=reasons,
-            confirmations=confirmations,
-            conflicts=conflict_summary.conflicts,
+            confirmations=[
+                reason
+                for item in weighted_signals
+                for reason in item.signal.reasons
+            ],
+            conflicts=list(conflict_summary.conflicts),
             accepted=accepted,
             metadata={
-                "total_weight": total_weight,
-                "vote_summary": {
-                    "total_votes": vote_summary.total_votes,
-                    "long_votes": vote_summary.long_votes,
-                    "short_votes": vote_summary.short_votes,
-                    "dominant_side": str(vote_summary.dominant_side),
-                    "accepted": vote_summary.accepted,
-                    "reasons": vote_summary.reasons,
+                "votes": {
+                    "total": vote_summary.total_votes,
+                    "long": vote_summary.long_votes,
+                    "short": vote_summary.short_votes,
+                    "flat": vote_summary.flat_votes,
                 },
-                "conflict_summary": {
-                    "accepted": conflict_summary.accepted,
-                    "total_penalty": conflict_summary.total_penalty,
-                    "reasons": conflict_summary.reasons,
-                },
+                "conflict_penalty": conflict_summary.total_penalty,
             },
         )
+
+    @staticmethod
+    def _tier_from_priority_score(value: float) -> StrategyTradeTier:
+        score = clamp(value, 0.0, 1.0)
+        if score >= 0.88:
+            return StrategyTradeTier.T4
+        if score >= 0.74:
+            return StrategyTradeTier.T3
+        if score >= 0.58:
+            return StrategyTradeTier.T2
+        return StrategyTradeTier.T1
+
+    def _liquidity_class(self, context: StrategyContext) -> StrategyLiquidityClass:
+        score = self._liquidity_score(context)
+
+        if score >= 0.90:
+            return StrategyLiquidityClass.TOP
+        if score >= 0.75:
+            return StrategyLiquidityClass.HIGH
+        if score >= 0.50:
+            return StrategyLiquidityClass.NORMAL
+        if score >= 0.30:
+            return StrategyLiquidityClass.LOW
+        if score >= 0.15:
+            return StrategyLiquidityClass.ILLIQUID
+        return StrategyLiquidityClass.SHITCOIN
+
+    def _execution_quality(self, signal: StrategySignal) -> StrategyExecutionQuality:
+        score = self._execution_quality_score(signal)
+
+        if score >= 0.90:
+            return StrategyExecutionQuality.EXCELLENT
+        if score >= 0.75:
+            return StrategyExecutionQuality.GOOD
+        if score >= 0.50:
+            return StrategyExecutionQuality.ACCEPTABLE
+        if score >= 0.25:
+            return StrategyExecutionQuality.POOR
+        return StrategyExecutionQuality.BLOCKED
+
+    @staticmethod
+    def _liquidity_score(context: StrategyContext) -> float:
+        for name in ("liquidity_score", "market_liquidity_score", "depth_score"):
+            value = context.get_feature(name, None)
+            parsed = _to_float(value)
+            if parsed is not None:
+                return clamp(parsed, 0.0, 1.0)
+
+        return 0.5
+
+    @staticmethod
+    def _risk_reward_score(signal: StrategySignal) -> float:
+        rr = _to_float(signal.metadata.get("rr"))
+
+        if rr is None:
+            entry = signal.primary_entry_price
+            stop = signal.primary_stop_loss
+            target = signal.primary_take_profit
+
+            if entry is None or stop is None or target is None:
+                return 0.5
+
+            if signal.side is SignalSide.LONG:
+                risk = entry - stop
+                reward = target - entry
+            elif signal.side is SignalSide.SHORT:
+                risk = stop - entry
+                reward = entry - target
+            else:
+                return 0.0
+
+            if risk <= 0:
+                return 0.0
+
+            rr = reward / risk
+
+        if rr >= 3.0:
+            return 1.0
+        if rr >= 2.0:
+            return 0.8
+        if rr >= 1.5:
+            return 0.65
+        if rr >= 1.0:
+            return 0.45
+        return 0.2
+
+    @staticmethod
+    def _execution_quality_score(signal: StrategySignal) -> float:
+        raw_score = _to_float(signal.metadata.get("execution_quality_score"))
+        if raw_score is not None:
+            return clamp(raw_score, 0.0, 1.0)
+
+        raw_quality = signal.metadata.get("execution_quality")
+        quality = _parse_enum(
+            StrategyExecutionQuality,
+            raw_quality,
+            StrategyExecutionQuality.ACCEPTABLE,
+        )
+
+        return {
+            StrategyExecutionQuality.EXCELLENT: 1.0,
+            StrategyExecutionQuality.GOOD: 0.8,
+            StrategyExecutionQuality.ACCEPTABLE: 0.6,
+            StrategyExecutionQuality.POOR: 0.3,
+            StrategyExecutionQuality.BLOCKED: 0.0,
+        }[quality]
+
+    @staticmethod
+    def _regime_alignment_score(signal: StrategySignal, context: StrategyContext) -> float:
+        regime = context.current_regime
+
+        if regime is MarketRegime.UNKNOWN:
+            return 0.5
+
+        if signal.side is SignalSide.LONG and regime in {
+            MarketRegime.TRENDING_UP,
+            MarketRegime.BREAKOUT,
+        }:
+            return 1.0
+
+        if signal.side is SignalSide.SHORT and regime in {
+            MarketRegime.TRENDING_DOWN,
+            MarketRegime.BREAKOUT,
+        }:
+            return 1.0
+
+        if regime in {MarketRegime.RANGING, MarketRegime.SQUEEZE}:
+            return 0.7
+
+        if regime.is_risky:
+            return 0.35
+
+        return 0.5
+
+    @staticmethod
+    def _freshness_score(context: StrategyContext) -> float:
+        if not context.feature_map:
+            return 0.5
+
+        total = 0
+        stale_count = 0
+
+        for feature in context.feature_map.values():
+            total += 1
+            if feature.is_stale():
+                stale_count += 1
+
+        if total <= 0:
+            return 0.5
+
+        return clamp(1.0 - stale_count / total, 0.0, 1.0)
 
 
 class ConfluenceEngine(BaseStrategyComponent):
     """
-    Merges multiple strategy signals into consensus.
+    Builds one confluence evaluation and optionally merges compatible signals.
     """
 
     component_namespace = "strategy.processor.confluence"
@@ -1166,284 +1319,126 @@ class ConfluenceEngine(BaseStrategyComponent):
         scheduler: Scheduler | None = None,
     ) -> None:
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
+        self.confluence_config: ConfluenceConfig = config.confluence
         self.scorer = SignalScorer(config=config, event_bus=event_bus, scheduler=scheduler)
-
-    @property
-    def confluence_config(self) -> ConfluenceConfig:
-        return self.config.confluence
 
     def evaluate(
         self,
         *,
         signals: list[StrategySignal],
-        context: StrategyContext | None = None,
-        merge_signal: bool = True,
+        context: StrategyContext,
     ) -> ConfluenceEvaluation:
-        if not signals:
-            raise ConfluenceError("signals cannot be empty")
-
-        for signal in signals:
-            signal.validate()
-
-        symbol = self._ensure_same_symbol(signals)
-        timestamp = context.timestamp if context is not None else max(s.timestamp for s in signals)
-
         evaluation = ConfluenceEvaluation(
-            symbol=symbol,
-            timestamp=timestamp,
+            symbol=context.symbol,
+            timestamp=context.timestamp,
             raw_signals=list(signals),
         )
 
-        eligible, rejected = self._pre_filter_signals(signals=signals, context=context)
+        if not self.confluence_config.enabled:
+            evaluation.eligible_signals = list(signals)
+            evaluation.accepted_signals = list(signals)
+            evaluation.reasons.append("confluence_disabled")
+            return evaluation
+
+        eligible = [
+            signal
+            for signal in signals
+            if signal.side in {SignalSide.LONG, SignalSide.SHORT}
+        ]
         evaluation.eligible_signals = eligible
-        evaluation.rejected_signals = rejected
 
         if not eligible:
-            evaluation.result = ConfluenceResult(
-                symbol=symbol,
-                timestamp=timestamp,
-                accepted=False,
-                reasons=["no_eligible_signals"],
-            )
-            evaluation.reasons.append("no_eligible_signals")
+            evaluation.rejected_signals = {
+                signal.strategy_name: "non_directional_signal"
+                for signal in signals
+            }
+            evaluation.reasons.append("no_directional_signals")
             return evaluation
 
         result = self.scorer.score_signals(signals=eligible, context=context)
         evaluation.result = result
 
-        accepted, rejected_by_side = self._select_consensus_signals(
-            signals=eligible,
-            dominant_side=result.side,
-        )
+        if not result.accepted:
+            evaluation.rejected_signals = {
+                signal.strategy_name: "confluence_rejected"
+                for signal in eligible
+            }
+            evaluation.reasons.extend(result.reasons)
+            return evaluation
+
+        accepted = [
+            signal
+            for signal in eligible
+            if signal.side == result.side
+        ]
         evaluation.accepted_signals = accepted
-        evaluation.rejected_signals.update(rejected_by_side)
-
-        acceptance_reasons = self._evaluate_acceptance(
+        evaluation.merged_signal = self._merge(
             result=result,
-            accepted_signals=accepted,
+            signals=accepted,
         )
-        if acceptance_reasons:
-            result.accepted = False
-            for reason in acceptance_reasons:
-                if reason not in result.reasons:
-                    result.reasons.append(reason)
-                if reason not in evaluation.reasons:
-                    evaluation.reasons.append(reason)
-
-        if merge_signal and result.accepted and accepted:
-            evaluation.merged_signal = self._merge_signals(
-                signals=accepted,
-                result=result,
-                context=context,
-            )
-
+        evaluation.reasons.extend(result.reasons)
         return evaluation
 
-    def merge_only(
-        self,
-        *,
-        signals: list[StrategySignal],
-        context: StrategyContext | None = None,
-    ) -> StrategySignal:
-        evaluation = self.evaluate(signals=signals, context=context, merge_signal=True)
-        if evaluation.merged_signal is None:
-            raise ConfluenceError("unable to build merged signal from provided signals")
-        return evaluation.merged_signal
-
-    def _ensure_same_symbol(self, signals: list[StrategySignal]) -> str:
-        symbol = signals[0].symbol
-        if any(signal.symbol != symbol for signal in signals):
-            raise ConfluenceError("all signals must belong to the same symbol")
-        return symbol
-
-    def _pre_filter_signals(
-        self,
-        *,
-        signals: list[StrategySignal],
-        context: StrategyContext | None,
-    ) -> tuple[list[StrategySignal], dict[str, str]]:
-        eligible: list[StrategySignal] = []
-        rejected: dict[str, str] = {}
-
-        for signal in signals:
-            reason = self._pre_filter_reason(signal=signal, context=context)
-            if reason is not None:
-                rejected[signal.strategy_name] = reason
-                continue
-            eligible.append(signal)
-
-        return eligible, rejected
-
-    def _pre_filter_reason(
-        self,
-        *,
-        signal: StrategySignal,
-        context: StrategyContext | None,
-    ) -> str | None:
-        if signal.status in {
-            SignalStatus.REJECTED,
-            SignalStatus.CANCELLED,
-            SignalStatus.EXPIRED,
-            SignalStatus.FAILED,
-        }:
-            return f"signal_status:{signal.status.value}"
-
-        if not signal.is_directional:
-            return "non_directional_signal"
-
-        if signal.confidence < 0:
-            return "negative_confidence"
-
-        if signal.score < 0:
-            return "negative_score"
-
-        if context is not None and signal.symbol != context.symbol:
-            return "symbol_mismatch"
-
-        return None
-
-    def _select_consensus_signals(
-        self,
-        *,
-        signals: list[StrategySignal],
-        dominant_side: SignalSide,
-    ) -> tuple[list[StrategySignal], dict[str, str]]:
-        if dominant_side not in {SignalSide.LONG, SignalSide.SHORT}:
-            return [], {
-                signal.strategy_name: "no_dominant_side"
-                for signal in signals
-            }
-
-        accepted: list[StrategySignal] = []
-        rejected: dict[str, str] = {}
-
-        for signal in signals:
-            if signal.side == dominant_side:
-                accepted.append(signal)
-            else:
-                rejected[signal.strategy_name] = "not_in_consensus_side"
-
-        return accepted, rejected
-
-    def _evaluate_acceptance(
-        self,
+    @staticmethod
+    def _merge(
         *,
         result: ConfluenceResult,
-        accepted_signals: list[StrategySignal],
-    ) -> list[str]:
-        reasons: list[str] = []
-
-        if not result.accepted:
-            return reasons
-
-        if len(accepted_signals) < self.confluence_config.min_agreement_count:
-            reasons.append("not_enough_agreeing_strategies")
-
-        if result.confidence < self.confluence_config.min_confidence:
-            reasons.append("confluence_confidence_too_low")
-
-        if result.score < self.confluence_config.min_score:
-            reasons.append("confluence_score_too_low")
-
-        return reasons
-
-    def _merge_signals(
-        self,
-        *,
         signals: list[StrategySignal],
-        result: ConfluenceResult,
-        context: StrategyContext | None,
-    ) -> StrategySignal:
-        first = signals[0]
-        timestamp = context.timestamp if context is not None else result.timestamp
+    ) -> StrategySignal | None:
+        if not signals:
+            return None
 
-        reasons: list[str] = list(result.reasons)
-        confirmations: list[str] = list(result.confirmations)
-        source_features: list[str] = []
-        combined_from: list[str] = []
+        if len(signals) == 1:
+            signal = signals[0]
+            signal.origin = SignalOrigin.CONFLUENCE
+            signal.confirmations = list(dict.fromkeys(signal.confirmations + result.confirmations))
+            signal.conflicts = list(dict.fromkeys(signal.conflicts + result.conflicts))
+            signal.metadata["confluence_score"] = result.score
+            signal.metadata["confluence_confidence"] = result.confidence
+            signal.metadata["confluence_strategy_names"] = list(result.strategy_names)
+            signal.validate()
+            return signal
 
-        for signal in signals:
-            combined_from.append(signal.strategy_name)
+        best = sorted(
+            signals,
+            key=lambda item: (
+                -float(item.metadata.get("priority_score", item.score)),
+                -item.confidence,
+                -item.score,
+                item.strategy_name,
+            ),
+        )[0]
 
-            for feature_name in signal.source_features:
-                if feature_name not in source_features:
-                    source_features.append(feature_name)
-
-        return StrategySignal(
-            symbol=first.symbol,
-            side=result.side,
-            strategy_name="ConfluenceEngine",
-            category=StrategyCategory.HYBRID,
-            timeframe=first.timeframe,
-            setup_type=first.setup_type,
-            timestamp=timestamp,
-            confidence=result.confidence,
-            score=result.score,
-            strength=result.strength,
-            confidence_grade=result.confidence_grade,
-            status=SignalStatus.NEW,
-            trigger_type=TriggerType.CONFLUENCE,
-            origin=SignalOrigin.CONFLUENCE,
-            priority=SignalPriority.HIGH,
-            reasons=reasons,
-            confirmations=confirmations,
-            source_features=source_features,
-            combined_from=combined_from,
-            conflicts=list(result.conflicts),
-            regime=context.current_regime if context is not None else first.regime,
-            metadata={
-                "confluence": result.metadata,
-                "source_signal_count": len(signals),
-            },
+        best.origin = SignalOrigin.CONFLUENCE
+        best.score = max(best.score, result.score)
+        best.confidence = max(best.confidence, result.confidence)
+        best.confidence_grade = confidence_to_grade(best.confidence)
+        best.strength = confidence_to_strength(best.confidence)
+        best.combined_from = list(dict.fromkeys(best.combined_from + result.strategy_names))
+        best.confirmations = list(dict.fromkeys(best.confirmations + result.confirmations))
+        best.metadata["confluence_score"] = result.score
+        best.metadata["confluence_confidence"] = result.confidence
+        best.metadata["confluence_strategy_names"] = list(result.strategy_names)
+        best.metadata["priority_score"] = max(
+            _to_float(best.metadata.get("priority_score"), best.score) or best.score,
+            result.score,
         )
 
+        best.validate()
+        return best
 
-class SignalFilterChain(ContextAwareStrategyComponent):
+
+# =============================================================================
+# SignalFilterChain
+# =============================================================================
+
+
+class SignalFilterChain(BaseStrategyComponent):
     """
-    Applies common strategy filters.
+    Applies strategy-level signal filters before SignalBuilder.
     """
 
     component_namespace = "strategy.processor.filters"
-
-    @property
-    def filters_config(self) -> FilterConfig:
-        return self.config.filters
-
-    def evaluate(
-        self,
-        *,
-        signal: StrategySignal,
-        context: StrategyContext,
-    ) -> FilterEvaluation:
-        self.validate_context(context)
-        signal.validate()
-
-        if signal.symbol != context.symbol:
-            raise FilterExecutionError("signal symbol must match context symbol")
-
-        evaluation = FilterEvaluation(
-            signal=signal,
-            context_symbol=context.symbol,
-            timestamp=context.timestamp,
-        )
-
-        for result in (
-            self._regime_filter(signal, context),
-            self._volatility_filter(signal, context),
-            self._liquidity_filter(signal, context),
-            self._spread_filter(signal, context),
-            self._funding_filter(signal, context),
-        ):
-            evaluation.add_result(result)
-
-        signal.filter_results.extend(evaluation.results)
-
-        for result in evaluation.results:
-            if result.score_impact:
-                signal.score = max(0.0, signal.score + result.score_impact)
-
-        signal.validate()
-        return evaluation
 
     def apply(
         self,
@@ -1454,256 +1449,167 @@ class SignalFilterChain(ContextAwareStrategyComponent):
         accepted: list[StrategySignal] = []
 
         for signal in signals:
-            evaluation = self.evaluate(signal=signal, context=context)
+            evaluation = self.evaluate_signal(signal=signal, context=context)
+
+            for result in evaluation.results:
+                signal.add_filter_result(result)
+
             if evaluation.accepted:
                 accepted.append(signal)
             else:
                 signal.to_rejected()
-                signal.add_reason("blocked_by_filter_chain")
+                for reason in evaluation.reasons:
+                    signal.add_reason(reason)
 
         return accepted
 
-    def _pass(self, name: str, reason: str, **metadata: Any) -> FilterResult:
-        return FilterResult(
-            name=name,
-            decision=FilterDecision.PASS,
-            reason=reason,
-            metadata=metadata,
-        )
-
-    def _warn(
+    def evaluate_signal(
         self,
-        name: str,
-        reason: str,
         *,
-        score_impact: float = 0.0,
-        **metadata: Any,
-    ) -> FilterResult:
-        return FilterResult(
-            name=name,
-            decision=FilterDecision.WARN,
-            reason=reason,
-            score_impact=score_impact,
-            metadata=metadata,
+        signal: StrategySignal,
+        context: StrategyContext,
+    ) -> FilterEvaluation:
+        signal.validate()
+        context.validate()
+
+        evaluation = FilterEvaluation(
+            signal=signal,
+            context_symbol=context.symbol,
+            timestamp=context.timestamp,
         )
 
-    def _block(
-        self,
-        name: str,
-        reason: str,
-        *,
-        score_impact: float = 0.0,
-        **metadata: Any,
-    ) -> FilterResult:
-        return FilterResult(
-            name=name,
-            decision=FilterDecision.BLOCK,
-            reason=reason,
-            score_impact=score_impact,
-            metadata=metadata,
+        self._filter_symbol_match(evaluation, context)
+        self._filter_directional(evaluation)
+        self._filter_confidence(evaluation)
+        self._filter_score(evaluation)
+        self._filter_age(evaluation)
+        self._filter_freshness(evaluation, context)
+        self._filter_execution_quality(evaluation)
+
+        return evaluation
+
+    @staticmethod
+    def _filter_symbol_match(
+        evaluation: FilterEvaluation,
+        context: StrategyContext,
+    ) -> None:
+        if evaluation.signal.symbol != context.symbol:
+            evaluation.add_result(
+                FilterResult(
+                    name="symbol_match",
+                    decision=FilterDecision.BLOCK,
+                    reason="signal_symbol_does_not_match_context",
+                )
+            )
+
+    @staticmethod
+    def _filter_directional(evaluation: FilterEvaluation) -> None:
+        if evaluation.signal.side not in {SignalSide.LONG, SignalSide.SHORT}:
+            evaluation.add_result(
+                FilterResult(
+                    name="directional_signal",
+                    decision=FilterDecision.BLOCK,
+                    reason="signal_side_is_not_directional",
+                )
+            )
+
+    def _filter_confidence(self, evaluation: FilterEvaluation) -> None:
+        threshold = self.config.runtime.min_confidence
+
+        if evaluation.signal.confidence < threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="min_confidence",
+                    decision=FilterDecision.BLOCK,
+                    reason="confidence_below_runtime_threshold",
+                    score_impact=threshold - evaluation.signal.confidence,
+                )
+            )
+
+    def _filter_score(self, evaluation: FilterEvaluation) -> None:
+        threshold = self.config.runtime.min_score
+
+        if evaluation.signal.score < threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="min_score",
+                    decision=FilterDecision.BLOCK,
+                    reason="score_below_runtime_threshold",
+                    score_impact=threshold - evaluation.signal.score,
+                )
+            )
+
+    def _filter_age(self, evaluation: FilterEvaluation) -> None:
+        max_age = self.config.runtime.max_signal_age_seconds
+        age = (utcnow() - evaluation.signal.timestamp).total_seconds()
+
+        if age > max_age:
+            evaluation.add_result(
+                FilterResult(
+                    name="signal_age",
+                    decision=FilterDecision.BLOCK,
+                    reason="signal_expired_before_routing",
+                    metadata={"age_seconds": age, "max_age_seconds": max_age},
+                )
+            )
+
+    @staticmethod
+    def _filter_freshness(
+        evaluation: FilterEvaluation,
+        context: StrategyContext,
+    ) -> None:
+        stale_features = [
+            name
+            for name, snapshot in context.feature_map.items()
+            if snapshot.is_stale()
+        ]
+
+        if stale_features:
+            evaluation.add_result(
+                FilterResult(
+                    name="feature_freshness",
+                    decision=FilterDecision.WARN,
+                    reason="context_has_stale_features",
+                    metadata={"stale_features": stale_features},
+                )
+            )
+
+    @staticmethod
+    def _filter_execution_quality(evaluation: FilterEvaluation) -> None:
+        raw = evaluation.signal.metadata.get("execution_quality")
+        if raw is None:
+            return
+
+        quality = _parse_enum(
+            StrategyExecutionQuality,
+            raw,
+            StrategyExecutionQuality.ACCEPTABLE,
         )
 
-    def _skip(self, name: str, reason: str) -> FilterResult:
-        return FilterResult(
-            name=name,
-            decision=FilterDecision.SKIP,
-            reason=reason,
-        )
-
-    def _regime_filter(
-        self,
-        signal: StrategySignal,
-        context: StrategyContext,
-    ) -> FilterResult:
-        name = "regime_filter"
-
-        if not self.filters_config.enable_regime_filter:
-            return self._skip(name, "regime_filter_disabled")
-
-        regime = context.current_regime
-
-        if regime == MarketRegime.UNKNOWN:
-            return self._warn(name, "unknown_market_regime", score_impact=-0.05)
-
-        if regime == MarketRegime.ILLIQUID:
-            return self._block(name, "illiquid_market_regime", score_impact=-0.25)
-
-        if regime == MarketRegime.NEWS_DRIVEN:
-            return self._warn(name, "news_driven_market_regime", score_impact=-0.15)
-
-        if regime == MarketRegime.RISK_OFF:
-            return self._warn(name, "risk_off_market_regime", score_impact=-0.10)
-
-        return self._pass(name, "regime_ok", regime=str(regime))
-
-    def _volatility_filter(
-        self,
-        signal: StrategySignal,
-        context: StrategyContext,
-    ) -> FilterResult:
-        name = "volatility_filter"
-
-        if not self.filters_config.enable_volatility_filter:
-            return self._skip(name, "volatility_filter_disabled")
-
-        value = context.get_feature("volatility_zscore")
-        if value is None:
-            value = context.get_feature("realized_volatility_zscore")
-
-        if value is None:
-            return self._warn(name, "volatility_data_missing", score_impact=-0.03)
-
-        if not isinstance(value, (int, float)):
-            return self._warn(name, "invalid_volatility_value", score_impact=-0.05)
-
-        threshold = self.filters_config.max_volatility_zscore
-        value = float(value)
-
-        if value > threshold * 1.5:
-            return self._block(
-                name,
-                "volatility_too_high",
-                score_impact=-0.25,
-                volatility_zscore=value,
-                threshold=threshold,
+        if quality is StrategyExecutionQuality.BLOCKED:
+            evaluation.add_result(
+                FilterResult(
+                    name="execution_quality",
+                    decision=FilterDecision.BLOCK,
+                    reason="execution_quality_blocked",
+                )
             )
 
-        if value > threshold:
-            return self._warn(
-                name,
-                "elevated_volatility",
-                score_impact=-0.10,
-                volatility_zscore=value,
-                threshold=threshold,
-            )
 
-        return self._pass(name, "volatility_ok", volatility_zscore=value)
-
-    def _liquidity_filter(
-        self,
-        signal: StrategySignal,
-        context: StrategyContext,
-    ) -> FilterResult:
-        name = "liquidity_filter"
-
-        if not self.filters_config.enable_liquidity_filter:
-            return self._skip(name, "liquidity_filter_disabled")
-
-        value = context.get_feature("liquidity_score")
-        if value is None:
-            value = context.liquidity.get("liquidity_score")
-
-        if value is None:
-            return self._warn(name, "liquidity_data_missing", score_impact=-0.05)
-
-        if not isinstance(value, (int, float)):
-            return self._warn(name, "invalid_liquidity_score", score_impact=-0.05)
-
-        value = float(value)
-        threshold = self.filters_config.min_liquidity_score
-
-        if value < threshold * 0.5:
-            return self._block(
-                name,
-                "liquidity_too_low",
-                score_impact=-0.25,
-                liquidity_score=value,
-            )
-
-        if value < threshold:
-            return self._warn(
-                name,
-                "suboptimal_liquidity",
-                score_impact=-0.10,
-                liquidity_score=value,
-            )
-
-        return self._pass(name, "liquidity_ok", liquidity_score=value)
-
-    def _spread_filter(
-        self,
-        signal: StrategySignal,
-        context: StrategyContext,
-    ) -> FilterResult:
-        name = "spread_filter"
-
-        if not self.filters_config.enable_spread_filter:
-            return self._skip(name, "spread_filter_disabled")
-
-        value = context.price.spread_bps if context.price is not None else None
-        if value is None:
-            value = context.get_feature("spread_bps")
-
-        if value is None:
-            return self._warn(name, "spread_data_missing", score_impact=-0.03)
-
-        if not isinstance(value, (int, float)):
-            return self._warn(name, "invalid_spread_value", score_impact=-0.05)
-
-        value = float(value)
-        threshold = self.filters_config.max_spread_bps
-
-        if value > threshold * 2:
-            return self._block(
-                name,
-                "spread_too_wide",
-                score_impact=-0.25,
-                spread_bps=value,
-            )
-
-        if value > threshold:
-            return self._warn(
-                name,
-                "spread_elevated",
-                score_impact=-0.10,
-                spread_bps=value,
-            )
-
-        return self._pass(name, "spread_ok", spread_bps=value)
-
-    def _funding_filter(
-        self,
-        signal: StrategySignal,
-        context: StrategyContext,
-    ) -> FilterResult:
-        name = "funding_filter"
-
-        if not self.filters_config.enable_funding_filter:
-            return self._skip(name, "funding_filter_disabled")
-
-        alignment = context.get_feature("funding_alignment")
-        if alignment is None:
-            alignment = context.funding.get("funding_alignment")
-
-        if alignment is None:
-            return self._warn(name, "funding_data_missing", score_impact=-0.02)
-
-        if not isinstance(alignment, (int, float)):
-            return self._warn(name, "invalid_funding_alignment", score_impact=-0.05)
-
-        alignment = float(alignment)
-        threshold = self.filters_config.min_funding_alignment
-
-        if alignment < threshold:
-            return self._warn(
-                name,
-                "funding_alignment_weak",
-                score_impact=-0.05,
-                funding_alignment=alignment,
-            )
-
-        return self._pass(name, "funding_ok", funding_alignment=alignment)
+# =============================================================================
+# SignalBuilder
+# =============================================================================
 
 
-class SignalBuilder(ContextAwareStrategyComponent):
+class SignalBuilder(BaseStrategyComponent):
     """
-    Builds entry / invalidation / targets / exit / execution plan.
+    Ensures every final signal has entry/exit/invalidation/execution plan.
     """
 
     component_namespace = "strategy.processor.builder"
 
     @property
-    def builders_config(self) -> BuilderConfig:
+    def builder_config(self) -> BuilderConfig:
         return self.config.builders
 
     def build(
@@ -1712,11 +1618,8 @@ class SignalBuilder(ContextAwareStrategyComponent):
         signal: StrategySignal,
         context: StrategyContext,
     ) -> BuildEvaluation:
-        self.validate_context(context)
         signal.validate()
-
-        if signal.symbol != context.symbol:
-            raise BuilderError("signal symbol must match context symbol")
+        context.validate()
 
         evaluation = BuildEvaluation(
             signal=signal,
@@ -1724,62 +1627,86 @@ class SignalBuilder(ContextAwareStrategyComponent):
         )
 
         try:
-            entry = self._build_entry(signal=signal, context=context)
-            invalidation = self._build_invalidation(
+            entry = self._resolve_entry(signal, context)
+            invalidation = self._resolve_invalidation(signal, entry=entry)
+            targets = self._resolve_targets(signal, entry=entry, invalidation=invalidation)
+            exit_plan = self._resolve_exit_plan(signal, invalidation=invalidation, targets=targets)
+            execution_plan = self._resolve_execution_plan(
                 signal=signal,
-                context=context,
                 entry=entry,
-            )
-            targets = self._build_targets(
-                signal=signal,
-                context=context,
-                entry=entry,
+                exit_plan=exit_plan,
                 invalidation=invalidation,
             )
-            exit_plan = self._build_exit(
-                signal=signal,
-                context=context,
-                invalidation=invalidation,
-                targets=targets,
-            )
-            execution_plan = ExecutionPlanDraft(
-                symbol=signal.symbol,
-                side=signal.side,
-                entry=entry,
-                exit=exit_plan,
-                invalidation=invalidation,
-                leverage=self._feature_float(context, "leverage"),
-                reduce_only=bool(context.get_feature("reduce_only", False)),
-                post_only=bool(context.get_feature("post_only", False)),
-                expected_holding_seconds=self._feature_int(
-                    context,
-                    "expected_holding_seconds",
-                ),
-                notes=list(signal.reasons[:5]),
-                metadata={"builder": self.component_name},
-            )
-            execution_plan.validate()
 
-        except Exception as exc:
-            evaluation.reject(str(exc))
-            return evaluation
+            signal.entry_plan = entry
+            signal.invalidation_plan = invalidation
+            signal.exit_plan = exit_plan
+            signal.execution_plan = execution_plan
 
-        signal.entry_plan = entry
-        signal.invalidation_plan = invalidation
-        signal.exit_plan = exit_plan
-        signal.execution_plan = execution_plan
-        signal.validate()
+            signal.metadata.setdefault("entry_price", entry.price)
+            signal.metadata.setdefault("stop_loss", exit_plan.stop_loss or invalidation.price)
+            if targets:
+                signal.metadata.setdefault("take_profit", targets[0].price)
 
-        evaluation.entry = entry
-        evaluation.invalidation = invalidation
-        evaluation.targets = targets
-        evaluation.exit_plan = exit_plan
-        evaluation.execution_plan = execution_plan
+            signal.validate()
+
+            evaluation.entry = entry
+            evaluation.invalidation = invalidation
+            evaluation.targets = targets
+            evaluation.exit_plan = exit_plan
+            evaluation.execution_plan = execution_plan
+            evaluation.accepted = True
+
+        except (BuilderError, ValueError, TypeError, AttributeError) as exc:
+            evaluation.reject(f"build_failed:{exc}")
+            signal.to_rejected()
+            signal.add_reason(f"build_failed:{exc}")
+
         return evaluation
 
-    def _build_entry(
+    def build_many(
         self,
         *,
+        signals: list[StrategySignal],
+        context: StrategyContext,
+    ) -> tuple[list[StrategySignal], dict[str, str]]:
+        accepted: list[StrategySignal] = []
+        rejected: dict[str, str] = {}
+
+        for signal in signals:
+            evaluation = self.build(signal=signal, context=context)
+
+            if evaluation.accepted:
+                accepted.append(signal)
+            else:
+                rejected[signal.strategy_name] = ";".join(evaluation.reasons) or "build_failed"
+
+        return accepted, rejected
+
+    @staticmethod
+    def assert_risk_ready(signal: StrategySignal) -> None:
+        signal.validate()
+
+        if signal.execution_plan is None:
+            raise BuilderError("signal.execution_plan is required")
+
+        entry_price = signal.primary_entry_price
+        stop_loss = signal.primary_stop_loss
+
+        if entry_price is None or entry_price <= 0:
+            raise BuilderError("risk-ready signal requires entry_price > 0")
+
+        if stop_loss is None or stop_loss <= 0:
+            raise BuilderError("risk-ready signal requires stop_loss > 0")
+
+        if signal.side is SignalSide.LONG and stop_loss >= entry_price:
+            raise BuilderError("long signal stop_loss must be below entry_price")
+
+        if signal.side is SignalSide.SHORT and stop_loss <= entry_price:
+            raise BuilderError("short signal stop_loss must be above entry_price")
+
+    def _resolve_entry(
+        self,
         signal: StrategySignal,
         context: StrategyContext,
     ) -> EntryPlan:
@@ -1787,206 +1714,254 @@ class SignalBuilder(ContextAwareStrategyComponent):
             signal.entry_plan.validate()
             return signal.entry_plan
 
-        price = self._reference_price(signal=signal, context=context)
-        plan = EntryPlan(
-            entry_type=self._entry_type(context),
-            price=price,
-            timeout_seconds=self._feature_int(context, "entry_timeout_seconds"),
-            max_slippage_bps=self._feature_float(context, "max_slippage_bps"),
-            confirmation_required=bool(context.get_feature("entry_confirmation_required", False)),
-            notes=[f"entry_type:{self._entry_type(context).value}"],
-            metadata={"builder": "SignalBuilder"},
-        )
-        plan.validate()
-        return plan
+        price = _to_float(signal.metadata.get("entry_price"))
 
-    def _build_invalidation(
+        if price is None and context.price is not None:
+            price = (
+                _to_float(getattr(context.price, "last", None))
+                or _to_float(getattr(context.price, "close", None))
+                or _to_float(getattr(context.price, "mark_price", None))
+                or _to_float(getattr(context.price, "price", None))
+            )
+
+        if price is None or price <= 0:
+            raise BuilderError("unable to resolve entry price")
+
+        entry = EntryPlan(
+            entry_type=self._entry_type(signal),
+            price=price,
+            timeout_seconds=_to_int(signal.metadata.get("entry_timeout_seconds")),
+            max_slippage_bps=_to_float(signal.metadata.get("max_slippage_bps")),
+            confirmation_required=_to_bool(signal.metadata.get("entry_confirmation_required")),
+            metadata={"built_by": self.component_name},
+        )
+        entry.validate()
+        return entry
+
+    def _resolve_invalidation(
         self,
-        *,
         signal: StrategySignal,
-        context: StrategyContext,
+        *,
         entry: EntryPlan,
     ) -> InvalidationPlan:
         if signal.invalidation_plan is not None:
             signal.invalidation_plan.validate()
             return signal.invalidation_plan
 
-        if not self.builders_config.require_invalidation:
-            return InvalidationPlan(reason="invalidation_not_required")
+        stop = _to_float(signal.metadata.get("stop_loss"))
 
-        if entry.price is None:
-            raise BuilderError("entry price is required to build invalidation")
+        if stop is None and signal.exit_plan is not None:
+            stop = _to_float(signal.exit_plan.stop_loss)
 
-        explicit = self._feature_float(context, "invalidation_price")
-        if explicit is None:
-            explicit = self._feature_float(context, "stop_loss")
+        if stop is None:
+            stop = self._infer_stop_loss(signal, entry_price=entry.price)
 
-        if explicit is None:
-            fallback_pct = self._feature_float(context, "fallback_stop_pct", 0.003)
-            if signal.is_long:
-                explicit = entry.price * (1.0 - fallback_pct)
-            elif signal.is_short:
-                explicit = entry.price * (1.0 + fallback_pct)
+        if stop is None or stop <= 0:
+            raise BuilderError("unable to resolve stop_loss/invalidation price")
 
-        plan = InvalidationPlan(
-            price=explicit,
-            reason=str(context.get_feature("invalidation_reason", "setup_invalidated")),
-            timeout_seconds=self._feature_int(context, "invalidation_timeout_seconds"),
-            conditions=self._list_feature(context, "invalidation_conditions"),
-            metadata={"builder": "SignalBuilder"},
+        invalidation = InvalidationPlan(
+            price=stop,
+            reason=str(signal.metadata.get("invalidation_reason", "strategy_invalidation")),
+            timeout_seconds=_to_int(signal.metadata.get("invalidation_timeout_seconds")),
+            metadata={"built_by": self.component_name},
         )
-        plan.validate()
-        return plan
+        invalidation.validate()
+        return invalidation
 
-    def _build_targets(
+    def _resolve_targets(
         self,
-        *,
         signal: StrategySignal,
-        context: StrategyContext,
+        *,
         entry: EntryPlan,
         invalidation: InvalidationPlan,
     ) -> list[TargetPlan]:
-        explicit = context.get_feature("targets")
-        if isinstance(explicit, list):
-            targets: list[TargetPlan] = []
-            for item in explicit:
+        if signal.exit_plan is not None and signal.exit_plan.take_profit_levels:
+            for target in signal.exit_plan.take_profit_levels:
+                target.validate()
+            return list(signal.exit_plan.take_profit_levels)
+
+        raw_targets = signal.metadata.get("targets")
+        targets: list[TargetPlan] = []
+
+        if isinstance(raw_targets, list):
+            for item in raw_targets:
                 if isinstance(item, TargetPlan):
                     item.validate()
                     targets.append(item)
-                elif isinstance(item, dict):
+                    continue
+
+                if isinstance(item, dict):
+                    price = _to_float(item.get("price"))
+                    if price is None or price <= 0:
+                        continue
+
+                    size_fraction = _to_float(item.get("size_fraction"), 1.0)
+                    if size_fraction is None:
+                        size_fraction = 1.0
+
                     target = TargetPlan(
-                        price=float(item["price"]),
-                        size_fraction=float(item.get("size_fraction", 1.0)),
-                        rr=float(item["rr"]) if item.get("rr") is not None else None,
+                        price=price,
+                        size_fraction=size_fraction,
+                        rr=_to_float(item.get("rr")),
                         label=item.get("label"),
                         metadata=dict(item.get("metadata") or {}),
                     )
                     target.validate()
                     targets.append(target)
-            if targets:
-                return targets
 
-        if entry.price is None or invalidation.price is None:
-            raise BuilderError("entry and invalidation prices are required to build targets")
+        if targets:
+            return targets
 
-        risk = abs(entry.price - invalidation.price)
-        if risk <= 0:
-            raise BuilderError("risk distance must be > 0")
+        take_profit = _to_float(signal.metadata.get("take_profit"))
+        if take_profit is None:
+            take_profit = self._infer_take_profit(
+                signal,
+                entry_price=entry.price,
+                stop_loss=invalidation.price,
+            )
 
-        rr = self._feature_float(context, "rr_ratio", self.builders_config.default_rr_ratio)
-        levels = self.builders_config.default_partial_tp_levels
-
-        targets: list[TargetPlan] = []
-        for index, fraction in enumerate(levels, start=1):
-            if signal.is_long:
-                price = entry.price + risk * rr * index
-            else:
-                price = entry.price - risk * rr * index
-
+        if take_profit is not None and take_profit > 0:
             target = TargetPlan(
-                price=price,
-                size_fraction=fraction,
-                rr=rr * index,
-                label=f"tp_{index}",
-                metadata={"builder": "SignalBuilder"},
+                price=take_profit,
+                size_fraction=1.0,
+                label="primary",
             )
             target.validate()
             targets.append(target)
 
         return targets
 
-    def _build_exit(
+    def _resolve_exit_plan(
         self,
-        *,
         signal: StrategySignal,
-        context: StrategyContext,
+        *,
         invalidation: InvalidationPlan,
         targets: list[TargetPlan],
     ) -> ExitPlan:
         if signal.exit_plan is not None:
+            if signal.exit_plan.stop_loss is None:
+                signal.exit_plan.stop_loss = invalidation.price
+            if not signal.exit_plan.take_profit_levels and targets:
+                signal.exit_plan.take_profit_levels = list(targets)
             signal.exit_plan.validate()
             return signal.exit_plan
 
-        exit_types = [ExitType.TAKE_PROFIT, ExitType.STOP_LOSS]
-        max_holding = self._feature_int(context, "max_holding_seconds")
+        exit_types = [ExitType.STOP_LOSS]
+        if targets:
+            exit_types.append(ExitType.TAKE_PROFIT)
 
-        plan = ExitPlan(
+        exit_plan = ExitPlan(
             exit_types=exit_types,
             stop_loss=invalidation.price,
-            take_profit_levels=targets,
-            trailing_distance=self._feature_float(context, "trailing_distance"),
-            max_holding_seconds=max_holding,
-            partial_exit_enabled=self.builders_config.enable_partial_take_profit,
-            metadata={"builder": "SignalBuilder"},
+            take_profit_levels=list(targets),
+            trailing_distance=_to_float(signal.metadata.get("trailing_distance")),
+            max_holding_seconds=_to_int(signal.metadata.get("max_holding_seconds")),
+            partial_exit_enabled=_to_bool(signal.metadata.get("partial_exit_enabled")),
+            metadata={"built_by": self.component_name},
         )
-        plan.validate()
-        return plan
+        exit_plan.validate()
+        return exit_plan
 
-    def _reference_price(
+    def _resolve_execution_plan(
         self,
         *,
         signal: StrategySignal,
-        context: StrategyContext,
-    ) -> float:
-        if signal.entry_plan is not None and signal.entry_plan.price is not None:
-            return float(signal.entry_plan.price)
+        entry: EntryPlan,
+        exit_plan: ExitPlan,
+        invalidation: InvalidationPlan,
+    ) -> ExecutionPlanDraft:
+        if signal.execution_plan is not None:
+            signal.execution_plan.validate()
+            return signal.execution_plan
 
-        if context.mid_price is not None:
-            return float(context.mid_price)
+        execution_plan = ExecutionPlanDraft(
+            symbol=signal.symbol,
+            side=signal.side,
+            entry=entry,
+            exit=exit_plan,
+            invalidation=invalidation,
+            leverage=_to_float(signal.metadata.get("requested_leverage")),
+            reduce_only=_to_bool(signal.metadata.get("reduce_only")),
+            post_only=_to_bool(signal.metadata.get("post_only")),
+            expected_holding_seconds=_to_int(signal.metadata.get("expected_holding_seconds")),
+            metadata={
+                "built_by": self.component_name,
+                "order_intent": signal.metadata.get("order_intent", StrategyOrderIntent.OPEN.value),
+                "margin_mode": signal.metadata.get("margin_mode", StrategyMarginMode.ISOLATED.value),
+                "market_type": signal.metadata.get("market_type", StrategyMarketType.USDM_FUTURES.value),
+            },
+        )
+        execution_plan.validate()
+        return execution_plan
 
-        entry_price = self._feature_float(context, "entry_price")
-        if entry_price is not None and entry_price > 0:
-            return entry_price
-
-        raise BuilderError("unable to resolve reference price")
-
-    def _entry_type(self, context: StrategyContext) -> EntryType:
-        raw = context.get_feature("entry_type")
-        if isinstance(raw, EntryType):
-            return raw
-        if isinstance(raw, str):
-            try:
-                return EntryType(raw)
-            except ValueError:
-                pass
-        return self.builders_config.default_entry_type
-
-    def _feature_float(
-        self,
-        context: StrategyContext,
-        name: str,
-        default: float | None = None,
+    @staticmethod
+    def _infer_stop_loss(
+        signal: StrategySignal,
+        *,
+        entry_price: float,
     ) -> float | None:
-        value = context.get_feature(name)
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            return float(value)
-        return default
+        stop_distance = _to_float(signal.metadata.get("stop_distance"))
 
-    def _feature_int(
+        if stop_distance is None:
+            atr = _to_float(signal.metadata.get("atr"))
+            multiplier = _to_float(signal.metadata.get("atr_stop_multiplier"), 1.5) or 1.5
+            if atr is not None:
+                stop_distance = atr * multiplier
+
+        if stop_distance is None or stop_distance <= 0:
+            return None
+
+        if signal.side is SignalSide.LONG:
+            return entry_price - stop_distance
+
+        if signal.side is SignalSide.SHORT:
+            return entry_price + stop_distance
+
+        return None
+
+    def _infer_take_profit(
         self,
-        context: StrategyContext,
-        name: str,
-        default: int | None = None,
-    ) -> int | None:
-        value = context.get_feature(name)
-        if value is None:
-            return default
-        if isinstance(value, int):
-            return value
-        return default
+        signal: StrategySignal,
+        *,
+        entry_price: float,
+        stop_loss: float,
+    ) -> float | None:
+        rr = _to_float(signal.metadata.get("rr"))
+        if rr is None:
+            rr = _to_float(getattr(self.builder_config, "default_rr", None), 2.0) or 2.0
 
-    def _list_feature(self, context: StrategyContext, name: str) -> list[str]:
-        value = context.get_feature(name)
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        return []
+        if rr <= 0:
+            return None
+
+        risk_distance = abs(entry_price - stop_loss)
+        if risk_distance <= 0:
+            return None
+
+        if signal.side is SignalSide.LONG:
+            return entry_price + risk_distance * rr
+
+        if signal.side is SignalSide.SHORT:
+            return entry_price - risk_distance * rr
+
+        return None
+
+    @staticmethod
+    def _entry_type(signal: StrategySignal) -> EntryType:
+        raw = signal.metadata.get("entry_type")
+        return _parse_enum(EntryType, raw, EntryType.LIMIT)
+
+
+# =============================================================================
+# PortfolioCoordinator
+# =============================================================================
 
 
 class PortfolioCoordinator(BaseStrategyComponent):
     """
-    Final portfolio-level signal coordination.
+    Pre-risk portfolio coordination.
+
+    It does not approve risk. It only decides which already built signals are
+    worth sending to RiskManager.
     """
 
     component_namespace = "strategy.processor.portfolio"
@@ -2000,128 +1975,57 @@ class PortfolioCoordinator(BaseStrategyComponent):
     ) -> None:
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
         self.state = state
-
-    @property
-    def portfolio_config(self) -> PortfolioCoordinatorConfig:
-        return self.config.portfolio
+        self.portfolio_config: PortfolioCoordinatorConfig = config.portfolio
 
     def coordinate(
         self,
         *,
         signals: list[StrategySignal],
-        context: StrategyContext | None = None,
+        context: StrategyContext,
     ) -> CoordinationDecision:
-        if not signals:
-            raise PortfolioCoordinationError("signals cannot be empty")
-
-        for signal in signals:
-            signal.validate()
-
-        symbol = self._ensure_same_symbol(signals)
-        now = context.timestamp if context is not None else utcnow()
-
         decision = CoordinationDecision(
-            symbol=symbol,
-            timestamp=now,
+            symbol=context.symbol,
+            timestamp=context.timestamp,
             raw_signals=list(signals),
         )
 
-        accepted, rejected = self._apply_prechecks(signals=signals, context=context)
-        decision.accepted_signals = accepted
-        decision.rejected_signals.update(rejected)
-
-        if not accepted:
+        if not signals:
             decision.accepted = False
-            decision.reasons.append("no_signals_after_prechecks")
+            decision.reasons.append("no_signals_to_coordinate")
             return decision
 
-        accepted, suppressed = self._suppress_repeating_signals(
-            symbol=symbol,
-            signals=accepted,
-            now=now,
-        )
-        decision.accepted_signals = accepted
-        decision.suppressed_signals.update(suppressed)
-        decision.rejected_signals.update(suppressed)
+        try:
+            accepted, rejected = self._suppress_repeating_signals(
+                symbol=context.symbol,
+                signals=signals,
+                now=context.timestamp,
+            )
+            decision.rejected_signals.update(rejected)
 
-        accepted, rejected_dedup = self._deduplicate_by_side(accepted)
-        decision.accepted_signals = accepted
-        decision.rejected_signals.update(rejected_dedup)
+            accepted, rejected = self._deduplicate_by_side(accepted)
+            decision.rejected_signals.update(rejected)
 
-        accepted, rejected_limits = self._apply_symbol_limits(symbol, accepted)
-        decision.accepted_signals = accepted
-        decision.rejected_signals.update(rejected_limits)
+            accepted, rejected = self._apply_symbol_limits(context.symbol, accepted)
+            decision.rejected_signals.update(rejected)
 
-        if not accepted:
-            decision.accepted = False
-            decision.reasons.append("no_signals_after_symbol_limits")
+            merged = self._merge_similar_signals(accepted)
+
+            decision.accepted_signals = accepted
+            decision.merged_signals = merged
+            decision.accepted = bool(decision.final_signals)
+
+            if not decision.accepted:
+                decision.reasons.append("all_signals_suppressed_by_portfolio_coordinator")
+
+            self._update_state_after_acceptance(
+                symbol=context.symbol,
+                signals=decision.final_signals,
+            )
+
             return decision
 
-        merged = self._merge_similar_signals(accepted) if self.portfolio_config.merge_similar_signals else accepted
-        decision.merged_signals = merged
-
-        if not merged:
-            decision.accepted = False
-            decision.reasons.append("no_signals_after_merge")
-            return decision
-
-        self._update_state_after_acceptance(symbol=symbol, signals=merged)
-
-        return decision
-
-    def coordinate_one(
-        self,
-        *,
-        signal: StrategySignal,
-        context: StrategyContext | None = None,
-    ) -> CoordinationDecision:
-        return self.coordinate(signals=[signal], context=context)
-
-    def _ensure_same_symbol(self, signals: list[StrategySignal]) -> str:
-        symbol = signals[0].symbol
-        if any(signal.symbol != symbol for signal in signals):
-            raise PortfolioCoordinationError("all signals must belong to the same symbol")
-        return symbol
-
-    def _apply_prechecks(
-        self,
-        *,
-        signals: list[StrategySignal],
-        context: StrategyContext | None,
-    ) -> tuple[list[StrategySignal], dict[str, str]]:
-        symbol = signals[0].symbol
-        accepted: list[StrategySignal] = []
-        rejected: dict[str, str] = {}
-
-        if self.state.is_symbol_blocked(symbol):
-            return [], {signal.strategy_name: "symbol_blocked" for signal in signals}
-
-        for signal in signals:
-            if self.state.is_blocked_by_cooldown(
-                symbol=symbol,
-                strategy_name=signal.strategy_name,
-                side=signal.side,
-                now=context.timestamp if context is not None else None,
-            ):
-                rejected[signal.strategy_name] = "cooldown_blocked"
-                continue
-
-            if signal.status in {
-                SignalStatus.REJECTED,
-                SignalStatus.CANCELLED,
-                SignalStatus.EXPIRED,
-                SignalStatus.FAILED,
-            }:
-                rejected[signal.strategy_name] = f"invalid_signal_status:{signal.status.value}"
-                continue
-
-            if not signal.is_directional:
-                rejected[signal.strategy_name] = "non_directional_signal"
-                continue
-
-            accepted.append(signal)
-
-        return accepted, rejected
+        except (PortfolioCoordinationError, ValueError, TypeError, AttributeError) as exc:
+            raise PortfolioCoordinationError(f"portfolio coordination failed: {exc}") from exc
 
     def _suppress_repeating_signals(
         self,
@@ -2171,8 +2075,11 @@ class PortfolioCoordinator(BaseStrategyComponent):
                 best[signal.side] = signal
                 continue
 
+            challenger_score = _to_float(signal.metadata.get("priority_score"), signal.score) or signal.score
+            current_score = _to_float(current.metadata.get("priority_score"), current.score) or current.score
+
             challenger_wins = (
-                signal.priority.value > current.priority.value
+                challenger_score > current_score
                 or signal.confidence > current.confidence
                 or signal.score > current.score
             )
@@ -2184,7 +2091,14 @@ class PortfolioCoordinator(BaseStrategyComponent):
                 rejected[signal.strategy_name] = f"deduplicated_by_side:{current.strategy_name}"
 
         accepted = list(best.values())
-        accepted.sort(key=lambda item: (-item.confidence, -item.score, item.strategy_name))
+        accepted.sort(
+            key=lambda item: (
+                -(_to_float(item.metadata.get("priority_score"), item.score) or item.score),
+                -item.confidence,
+                -item.score,
+                item.strategy_name,
+            )
+        )
         return accepted, rejected
 
     def _apply_symbol_limits(
@@ -2202,7 +2116,15 @@ class PortfolioCoordinator(BaseStrategyComponent):
             }
 
         available = max(0, limit - active_count)
-        ordered = sorted(signals, key=lambda item: (-item.confidence, -item.score, item.strategy_name))
+        ordered = sorted(
+            signals,
+            key=lambda item: (
+                -(_to_float(item.metadata.get("priority_score"), item.score) or item.score),
+                -item.confidence,
+                -item.score,
+                item.strategy_name,
+            ),
+        )
 
         accepted = ordered[:available]
         rejected = {
@@ -2211,7 +2133,8 @@ class PortfolioCoordinator(BaseStrategyComponent):
         }
         return accepted, rejected
 
-    def _merge_similar_signals(self, signals: list[StrategySignal]) -> list[StrategySignal]:
+    @staticmethod
+    def _merge_similar_signals(signals: list[StrategySignal]) -> list[StrategySignal]:
         if len(signals) <= 1:
             return signals
 
@@ -2220,14 +2143,31 @@ class PortfolioCoordinator(BaseStrategyComponent):
             grouped.setdefault(signal.side, []).append(signal)
 
         merged: list[StrategySignal] = []
-        for side, group in grouped.items():
+
+        for group in grouped.values():
             if len(group) == 1:
                 merged.append(group[0])
                 continue
 
-            best = sorted(group, key=lambda item: (-item.confidence, -item.score))[0]
-            best.combined_from = list(dict.fromkeys(best.combined_from + [s.strategy_name for s in group]))
-            best.confirmations = list(dict.fromkeys(best.confirmations + [r for s in group for r in s.reasons]))
+            best = sorted(
+                group,
+                key=lambda item: (
+                    -(_to_float(item.metadata.get("priority_score"), item.score) or item.score),
+                    -item.confidence,
+                    -item.score,
+                ),
+            )[0]
+
+            best.combined_from = list(
+                dict.fromkeys(best.combined_from + [signal.strategy_name for signal in group])
+            )
+            best.confirmations = list(
+                dict.fromkeys(
+                    best.confirmations
+                    + [reason for signal in group for reason in signal.reasons]
+                )
+            )
+            best.origin = SignalOrigin.MULTI_STRATEGY
             merged.append(best)
 
         return merged
@@ -2239,19 +2179,11 @@ class PortfolioCoordinator(BaseStrategyComponent):
         signals: list[StrategySignal],
     ) -> None:
         for signal in signals:
+            signal.to_pending()
             self.state.update_signal(signal, active=True)
 
-            cooldown = self.config.get_strategy_runtime(signal.strategy_name).cooldown_seconds
-            if cooldown > 0:
-                self.state.add_strategy_cooldown(
-                    symbol=symbol,
-                    strategy_name=signal.strategy_name,
-                    seconds=cooldown,
-                    reason="signal_accepted",
-                )
-
             if self.portfolio_config.side_cooldown_seconds > 0:
-                self.state.add_side_cooldown(
+                self.state.cooldowns.add_side_cooldown(
                     symbol=symbol,
                     side=signal.side,
                     seconds=self.portfolio_config.side_cooldown_seconds,
@@ -2259,20 +2191,14 @@ class PortfolioCoordinator(BaseStrategyComponent):
                 )
 
 
+# =============================================================================
+# SignalProcessor
+# =============================================================================
+
+
 class SignalProcessor(BaseStrategyComponent):
     """
     Facade class for full strategy signal processing.
-
-    Pipeline:
-    1. normalize analytics event;
-    2. update/build StrategyContext;
-    3. route to strategies;
-    4. evaluate strategies;
-    5. filter signals;
-    6. confluence;
-    7. build execution plans;
-    8. portfolio coordination;
-    9. emit signal.generated / signal.rejected events.
     """
 
     component_namespace = "strategy.processor"
@@ -2333,6 +2259,7 @@ class SignalProcessor(BaseStrategyComponent):
         event_name: str,
         payload: dict[str, Any],
         timestamp: datetime | None = None,
+        emit: bool = True,
     ) -> ProcessedSignalBatch:
         normalized = self.normalizer.normalize_event(
             event_name=event_name,
@@ -2371,11 +2298,11 @@ class SignalProcessor(BaseStrategyComponent):
         )
         batch.evaluations = evaluations
 
-        raw_signals = [
-            evaluation.signal
-            for evaluation in evaluations
-            if evaluation.signal is not None and evaluation.passed
-        ]
+        raw_signals: list[StrategySignal] = []
+        for evaluation in evaluations:
+            if evaluation.signal is not None and evaluation.passed:
+                raw_signals.append(evaluation.signal)
+
         batch.raw_signals = raw_signals
 
         if not raw_signals:
@@ -2383,7 +2310,9 @@ class SignalProcessor(BaseStrategyComponent):
             await self._emit_rejected_batch(batch, reason="no_passed_strategy_signals")
             return batch
 
-        filtered = self.filters.apply(signals=raw_signals, context=context)
+        scored = self.scorer.score_many(signals=raw_signals, context=context)
+
+        filtered = self.filters.apply(signals=scored, context=context)
         batch.filtered_signals = filtered
 
         if not filtered:
@@ -2391,67 +2320,60 @@ class SignalProcessor(BaseStrategyComponent):
             await self._emit_rejected_batch(batch, reason="all_signals_filtered")
             return batch
 
-        confluence_eval = self.confluence.evaluate(
-            signals=filtered,
-            context=context,
-            merge_signal=True,
-        )
-        batch.confluence = confluence_eval
+        confluence = self.confluence.evaluate(signals=filtered, context=context)
+        batch.confluence = confluence
 
-        confluence_signals = (
-            [confluence_eval.merged_signal]
-            if confluence_eval.merged_signal is not None
-            else confluence_eval.accepted_signals
-        )
-
+        confluence_signals = self._signals_after_confluence(confluence, filtered)
         if not confluence_signals:
-            batch.reasons.append("no_confluence_signal")
-            await self._emit_rejected_batch(batch, reason="no_confluence_signal")
+            batch.reasons.append("confluence_rejected")
+            await self._emit_rejected_batch(batch, reason="confluence_rejected")
             return batch
 
-        built_signals: list[StrategySignal] = []
-        for signal in confluence_signals:
-            build_result = self.builder.build(signal=signal, context=context)
-            if build_result.accepted:
-                built_signals.append(signal)
-            else:
-                signal.to_rejected()
-                signal.reasons.extend(build_result.reasons)
+        built_signals, build_rejected = self.builder.build_many(
+            signals=confluence_signals,
+            context=context,
+        )
+
+        if build_rejected:
+            batch.metadata["build_rejected"] = build_rejected
 
         if not built_signals:
-            batch.reasons.append("no_signals_after_building")
-            await self._emit_rejected_batch(batch, reason="no_signals_after_building")
+            batch.reasons.append("all_signals_failed_builder")
+            await self._emit_rejected_batch(batch, reason="all_signals_failed_builder")
             return batch
 
-        coordination = self.portfolio.coordinate(
+        coordinated = self.portfolio.coordinate(
             signals=built_signals,
             context=context,
         )
-        batch.coordinated = coordination
-        batch.final_signals = coordination.final_signals
-        batch.accepted = coordination.accepted and bool(coordination.final_signals)
+        batch.coordinated = coordinated
+        batch.final_signals = list(coordinated.final_signals)
 
-        if not batch.accepted:
-            batch.reasons.extend(coordination.reasons)
+        if not coordinated.accepted or not batch.final_signals:
+            batch.reasons.append("portfolio_coordination_rejected")
             await self._emit_rejected_batch(batch, reason="portfolio_coordination_rejected")
             return batch
 
+        risk_payloads: list[RiskReadySignalPayload] = []
+
         for signal in batch.final_signals:
-            self.state.update_signal(signal, active=True)
-            await self.emit_event(
-                "signal.generated",
-                {
-                    "symbol": signal.symbol,
-                    "strategy_name": signal.strategy_name,
-                    "side": signal.side.value,
-                    "confidence": signal.confidence,
-                    "score": signal.score,
-                    "timestamp": signal.timestamp.isoformat(),
-                    "signal": signal,
-                },
-                priority=EventPriority.HIGH,
-                source=self.component_name,
+            self.builder.assert_risk_ready(signal)
+
+            risk_payload = self.to_risk_payload(
+                signal=signal,
+                context=context,
             )
+            risk_payloads.append(risk_payload)
+
+        batch.risk_payloads = risk_payloads
+        batch.accepted = bool(risk_payloads)
+
+        if emit:
+            for risk_payload in risk_payloads:
+                await self.router.emit_signal_generated(payload=risk_payload)
+            batch.emitted = True
+
+        self._record_final_signals(batch.final_signals)
 
         return batch
 
@@ -2461,23 +2383,163 @@ class SignalProcessor(BaseStrategyComponent):
         strategies: list[BaseStrategy],
         context: StrategyContext,
     ) -> list[StrategyEvaluation]:
-        evaluations: list[StrategyEvaluation] = []
+        result: list[StrategyEvaluation] = []
 
         for strategy in strategies:
             try:
-                evaluation = await strategy.evaluate(context)
-                evaluations.append(evaluation)
-                self.state.update_evaluation(evaluation)
-            except Exception as exc:
-                self.state.metrics.record_error(strategy_name=strategy.strategy_name)
-                self.log_warning(
+                evaluation_result = strategy.evaluate(context)
+                if inspect.isawaitable(evaluation_result):
+                    evaluation_result = await evaluation_result
+
+                evaluation_result.validate()
+                result.append(evaluation_result)
+                self.state.update_evaluation(evaluation_result)
+
+            except (
+                StrategyEvaluationError,
+                ValueError,
+                TypeError,
+                AttributeError,
+                RuntimeError,
+            ) as exc:
+                strategy_name = getattr(strategy, "strategy_name", strategy.__class__.__name__)
+
+                self.log_exception(
                     "Strategy evaluation failed",
-                    strategy_name=strategy.strategy_name,
+                    strategy_name=strategy_name,
                     symbol=context.symbol,
                     error=str(exc),
                 )
 
-        return evaluations
+                failed = StrategyEvaluation(
+                    strategy_name=strategy_name,
+                    symbol=context.symbol,
+                    timestamp=context.timestamp,
+                    passed=False,
+                    reasons=[f"strategy_evaluation_error:{exc}"],
+                    metadata={
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    },
+                )
+                failed.validate()
+                result.append(failed)
+                self.state.metrics.record_error(strategy_name=strategy_name)
+
+        return result
+
+    def to_risk_payload(
+        self,
+        *,
+        signal: StrategySignal,
+        context: StrategyContext,
+    ) -> RiskReadySignalPayload:
+        """
+        Convert final built StrategySignal into signal.generated payload.
+        """
+        signal.validate()
+        context.validate()
+        self.builder.assert_risk_ready(signal)
+
+        execution = signal.execution_plan
+        if execution is None:
+            raise SignalRoutingError("signal.execution_plan is required")
+
+        entry_price = signal.primary_entry_price
+        stop_loss = signal.primary_stop_loss
+        take_profit = signal.primary_take_profit
+
+        if entry_price is None or stop_loss is None:
+            raise SignalRoutingError("risk payload requires entry_price and stop_loss")
+
+        priority_score = _to_float(
+            signal.metadata.get("priority_score"),
+            max(signal.score, signal.confidence),
+        )
+        if priority_score is None:
+            priority_score = max(signal.score, signal.confidence)
+
+        tier = _parse_enum(
+            StrategyTradeTier,
+            signal.metadata.get("tier"),
+            self._tier_from_priority_score(priority_score),
+        )
+        order_intent = _parse_enum(
+            StrategyOrderIntent,
+            signal.metadata.get("order_intent"),
+            StrategyOrderIntent.OPEN,
+        )
+        liquidity_class = _parse_enum(
+            StrategyLiquidityClass,
+            signal.metadata.get("liquidity_class"),
+            StrategyLiquidityClass.NORMAL,
+        )
+        execution_quality = _parse_enum(
+            StrategyExecutionQuality,
+            signal.metadata.get("execution_quality"),
+            StrategyExecutionQuality.ACCEPTABLE,
+        )
+        margin_mode = _parse_enum(
+            StrategyMarginMode,
+            signal.metadata.get("margin_mode"),
+            StrategyMarginMode.ISOLATED,
+        )
+        market_type = _parse_enum(
+            StrategyMarketType,
+            signal.metadata.get("market_type") or context.metadata.get("market_type"),
+            StrategyMarketType.USDM_FUTURES,
+        )
+
+        execution_cost = self._execution_cost_from_metadata(signal)
+
+        payload = RiskReadySignalPayload(
+            signal_id=signal.signal_id,
+            symbol=signal.symbol,
+            side=signal.side,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strategy_name=signal.strategy_name,
+            tier=tier,
+            order_intent=order_intent,
+            confidence=signal.confidence,
+            edge_score=clamp(signal.score, 0.0, 1.0),
+            priority_score=priority_score,
+            liquidity_class=liquidity_class,
+            execution_quality=execution_quality,
+            expected_reward=_to_float(signal.metadata.get("expected_reward")),
+            expected_loss=_to_float(signal.metadata.get("expected_loss")),
+            expected_win_probability=_to_float(signal.metadata.get("expected_win_probability")),
+            expected_cost=_to_float(signal.metadata.get("expected_cost")),
+            execution_cost=execution_cost,
+            requested_size=_to_float(signal.metadata.get("requested_size")),
+            requested_margin=_to_float(signal.metadata.get("requested_margin")),
+            requested_leverage=execution.leverage or _to_float(signal.metadata.get("requested_leverage")),
+            reduce_only=bool(getattr(execution, "reduce_only", False)),
+            margin_mode=margin_mode,
+            exchange=signal.metadata.get("exchange") or context.metadata.get("exchange"),
+            market_type=market_type,
+            timeframe=signal.timeframe,
+            timestamp=signal.timestamp,
+            metadata={
+                "category": signal.category.value,
+                "setup_type": signal.setup_type.value,
+                "trigger_type": signal.trigger_type.value,
+                "origin": signal.origin.value,
+                "priority": signal.priority.value,
+                "strength": signal.strength.value,
+                "confidence_grade": signal.confidence_grade.value,
+                "regime": signal.regime.value if isinstance(signal.regime, MarketRegime) else str(signal.regime),
+                "reasons": list(signal.reasons),
+                "confirmations": list(signal.confirmations),
+                "source_features": list(signal.source_features),
+                "combined_from": list(signal.combined_from),
+                "processor": self.component_name,
+                **dict(signal.metadata),
+            },
+        )
+        payload.validate()
+        return payload
 
     def _resolve_context(self, normalized: NormalizedPayload) -> StrategyContext:
         existing = self.state.contexts.get_context(normalized.symbol)
@@ -2488,7 +2550,25 @@ class SignalProcessor(BaseStrategyComponent):
         return self.state.build_context(
             normalized.symbol,
             timestamp=normalized.timestamp,
+            include_regime=True,
+            include_portfolio=True,
         )
+
+    @staticmethod
+    def _signals_after_confluence(
+        confluence: ConfluenceEvaluation,
+        fallback: list[StrategySignal],
+    ) -> list[StrategySignal]:
+        if confluence.result is None:
+            return list(confluence.accepted_signals or fallback)
+
+        if not confluence.result.accepted:
+            return []
+
+        if confluence.merged_signal is not None:
+            return [confluence.merged_signal]
+
+        return list(confluence.accepted_signals)
 
     async def _emit_rejected_batch(
         self,
@@ -2496,14 +2576,94 @@ class SignalProcessor(BaseStrategyComponent):
         *,
         reason: str,
     ) -> None:
+        if self.event_bus is None:
+            return
+
         await self.emit_event(
             "signal.rejected",
             {
                 "symbol": batch.symbol,
                 "reason": reason,
-                "reasons": batch.reasons,
-                "timestamp": batch.timestamp.isoformat(),
+                "route": batch.route.selected_names if batch.route else [],
+                "reasons": list(batch.reasons),
+                "metadata": dict(batch.metadata),
             },
-            priority=EventPriority.NORMAL,
+            priority=EventPriority.LOW,
             source=self.component_name,
         )
+
+    def _record_final_signals(self, signals: list[StrategySignal]) -> None:
+        for signal in signals:
+            signal.to_pending()
+            self.state.update_signal(signal, active=True)
+            self.state.metrics.record_signal(signal)
+
+    @staticmethod
+    def _execution_cost_from_metadata(
+        signal: StrategySignal,
+    ) -> ExecutionCostPayload | None:
+        raw = signal.metadata.get("execution_cost")
+
+        if raw is None:
+            return None
+
+        if isinstance(raw, ExecutionCostPayload):
+            raw.validate()
+            return raw
+
+        if isinstance(raw, dict):
+            quality = _parse_enum(
+                StrategyExecutionQuality,
+                raw.get("quality"),
+                StrategyExecutionQuality.ACCEPTABLE,
+            )
+
+            payload = ExecutionCostPayload(
+                spread_cost=_to_float(raw.get("spread_cost"), 0.0) or 0.0,
+                slippage_cost=_to_float(raw.get("slippage_cost"), 0.0) or 0.0,
+                fee_cost=_to_float(raw.get("fee_cost"), 0.0) or 0.0,
+                funding_cost=_to_float(raw.get("funding_cost"), 0.0) or 0.0,
+                other_cost=_to_float(raw.get("other_cost"), 0.0) or 0.0,
+                spread_pct=_to_float(raw.get("spread_pct")),
+                slippage_pct=_to_float(raw.get("slippage_pct")),
+                quality=quality,
+                metadata=dict(raw.get("metadata") or {}),
+            )
+            payload.validate()
+            return payload
+
+        raise SignalRoutingError("execution_cost metadata must be dict or ExecutionCostPayload")
+
+    @staticmethod
+    def _tier_from_priority_score(value: float) -> StrategyTradeTier:
+        score = clamp(value, 0.0, 1.0)
+
+        if score >= 0.88:
+            return StrategyTradeTier.T4
+        if score >= 0.74:
+            return StrategyTradeTier.T3
+        if score >= 0.58:
+            return StrategyTradeTier.T2
+        return StrategyTradeTier.T1
+
+
+__all__ = [
+    "NormalizedPayload",
+    "RouteDecision",
+    "WeightedSignal",
+    "VoteSummary",
+    "ConflictSummary",
+    "ConfluenceEvaluation",
+    "FilterEvaluation",
+    "BuildEvaluation",
+    "CoordinationDecision",
+    "ProcessedSignalBatch",
+    "SignalNormalizer",
+    "SignalRouter",
+    "SignalScorer",
+    "ConfluenceEngine",
+    "SignalFilterChain",
+    "SignalBuilder",
+    "PortfolioCoordinator",
+    "SignalProcessor",
+]

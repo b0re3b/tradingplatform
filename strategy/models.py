@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Any
+from uuid import uuid4
 
 from .enums import (
     ConfidenceGrade,
@@ -20,6 +22,12 @@ from .enums import (
     SignalStatus,
     SignalStrength,
     StrategyCategory,
+    StrategyExecutionQuality,
+    StrategyLiquidityClass,
+    StrategyMarginMode,
+    StrategyMarketType,
+    StrategyOrderIntent,
+    StrategyTradeTier,
     Timeframe,
     TriggerType,
 )
@@ -271,6 +279,14 @@ class ConflictRecord:
 
 @dataclass(slots=True)
 class StrategySignal:
+    """
+    Internal strategy-layer signal.
+
+    Concrete strategies return StrategySignal. It is not sent to RiskManager
+    directly. SignalProcessor/SignalRouter converts it into RiskReadySignalPayload
+    and emits signal.generated.
+    """
+
     symbol: str
     side: SignalSide
     strategy_name: str
@@ -278,6 +294,8 @@ class StrategySignal:
     timeframe: Timeframe
     setup_type: SetupType
     timestamp: datetime
+
+    signal_id: str = field(default_factory=lambda: uuid4().hex)
 
     confidence: float = 0.0
     score: float = 0.0
@@ -307,7 +325,15 @@ class StrategySignal:
 
     def __post_init__(self) -> None:
         self.timestamp = ensure_aware_utc(self.timestamp)
+        self.symbol = self.symbol.strip()
+        self.strategy_name = self.strategy_name.strip()
+        self.signal_id = str(self.signal_id or uuid4().hex)
         self.confidence = clamp(self.confidence, 0.0, 1.0)
+        self.score = max(0.0, float(self.score))
+
+        # Keep a stable copy inside metadata for old state/event handlers that
+        # still look up metadata["signal_id"].
+        self.metadata.setdefault("signal_id", self.signal_id)
 
         if self.strength == SignalStrength.WEAK:
             self.strength = confidence_to_strength(self.confidence)
@@ -316,12 +342,19 @@ class StrategySignal:
             self.confidence_grade = confidence_to_grade(self.confidence)
 
     def validate(self) -> None:
+        if not self.signal_id.strip():
+            raise ValidationError("StrategySignal.signal_id cannot be empty")
         if not self.symbol.strip():
             raise ValidationError("StrategySignal.symbol cannot be empty")
         if not self.strategy_name.strip():
             raise ValidationError("StrategySignal.strategy_name cannot be empty")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValidationError("StrategySignal.confidence must be between 0.0 and 1.0")
+        if self.score < 0:
+            raise ValidationError("StrategySignal.score must be >= 0")
+
+        if not self.is_directional and self.status in {SignalStatus.PENDING, SignalStatus.CONFIRMED}:
+            raise ValidationError("non-directional StrategySignal cannot be pending/confirmed")
 
         for conflict in self.conflicts:
             conflict.validate()
@@ -369,6 +402,36 @@ class StrategySignal:
     def total_conflict_penalty(self) -> float:
         return sum(conflict.penalty for conflict in self.conflicts)
 
+    @property
+    def primary_entry_price(self) -> float | None:
+        if self.execution_plan is not None and self.execution_plan.entry.price is not None:
+            return self.execution_plan.entry.price
+        if self.entry_plan is not None:
+            return self.entry_plan.price
+        return None
+
+    @property
+    def primary_stop_loss(self) -> float | None:
+        if self.execution_plan is not None:
+            if self.execution_plan.exit.stop_loss is not None:
+                return self.execution_plan.exit.stop_loss
+            if self.execution_plan.invalidation.price is not None:
+                return self.execution_plan.invalidation.price
+        if self.exit_plan is not None and self.exit_plan.stop_loss is not None:
+            return self.exit_plan.stop_loss
+        if self.invalidation_plan is not None:
+            return self.invalidation_plan.price
+        return None
+
+    @property
+    def primary_take_profit(self) -> float | None:
+        targets: list[TargetPlan] = []
+        if self.execution_plan is not None:
+            targets = self.execution_plan.exit.take_profit_levels
+        elif self.exit_plan is not None:
+            targets = self.exit_plan.take_profit_levels
+        return targets[0].price if targets else None
+
     def add_reason(self, reason: str) -> None:
         if reason and reason not in self.reasons:
             self.reasons.append(reason)
@@ -389,6 +452,9 @@ class StrategySignal:
         conflict.validate()
         self.conflicts.append(conflict)
 
+    def to_pending(self) -> None:
+        self.status = SignalStatus.PENDING
+
     def to_confirmed(self) -> None:
         self.status = SignalStatus.CONFIRMED
 
@@ -406,6 +472,35 @@ class StrategySignal:
 
     def to_failed(self) -> None:
         self.status = SignalStatus.FAILED
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "signal_id": self.signal_id,
+            "symbol": self.symbol,
+            "side": self.side.value,
+            "strategy_name": self.strategy_name,
+            "category": self.category.value,
+            "timeframe": self.timeframe.value,
+            "setup_type": self.setup_type.value,
+            "timestamp": self.timestamp.timestamp(),
+            "confidence": self.confidence,
+            "score": self.score,
+            "strength": self.strength.value,
+            "confidence_grade": self.confidence_grade.value,
+            "status": self.status.value,
+            "trigger_type": self.trigger_type.value,
+            "origin": self.origin.value,
+            "priority": self.priority.value,
+            "reasons": list(self.reasons),
+            "confirmations": list(self.confirmations),
+            "source_features": list(self.source_features),
+            "combined_from": list(self.combined_from),
+            "regime": self.regime.value,
+            "entry_price": self.primary_entry_price,
+            "stop_loss": self.primary_stop_loss,
+            "take_profit": self.primary_take_profit,
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(slots=True)
@@ -455,6 +550,336 @@ class TradeIdea:
         current = ensure_aware_utc(now or utcnow())
         return current >= self.expires_at
 
+
+
+
+def _is_finite_number(value: float | int | None) -> bool:
+    if value is None:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _optional_finite(value: float | int | None, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if not _is_finite_number(value):
+        raise ValidationError(f"{field_name} must be finite")
+    return float(value)
+
+
+def _required_positive(value: float | int | None, field_name: str) -> float:
+    if value is None or not _is_finite_number(value):
+        raise ValidationError(f"{field_name} must be a finite positive number")
+    value_f = float(value)
+    if value_f <= 0:
+        raise ValidationError(f"{field_name} must be > 0")
+    return value_f
+
+
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+@dataclass(slots=True)
+class ExecutionCostPayload:
+    """
+    Strategy-side execution-cost estimate sent inside signal.generated.
+
+    RiskManager converts this dictionary into risk.models.ExecutionCostEstimate.
+    """
+
+    spread_cost: float = 0.0
+    slippage_cost: float = 0.0
+    fee_cost: float = 0.0
+    funding_cost: float = 0.0
+    other_cost: float = 0.0
+    spread_pct: float | None = None
+    slippage_pct: float | None = None
+    quality: StrategyExecutionQuality = StrategyExecutionQuality.ACCEPTABLE
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        for field_name, value in {
+            "spread_cost": self.spread_cost,
+            "slippage_cost": self.slippage_cost,
+            "fee_cost": self.fee_cost,
+            "funding_cost": self.funding_cost,
+            "other_cost": self.other_cost,
+            "spread_pct": self.spread_pct,
+            "slippage_pct": self.slippage_pct,
+        }.items():
+            if value is None:
+                continue
+            if not _is_finite_number(value):
+                raise ValidationError(f"ExecutionCostPayload.{field_name} must be finite")
+            if float(value) < 0:
+                raise ValidationError(f"ExecutionCostPayload.{field_name} must be >= 0")
+
+    @property
+    def total_cost(self) -> float:
+        return (
+            self.spread_cost
+            + self.slippage_cost
+            + self.fee_cost
+            + self.funding_cost
+            + self.other_cost
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "spread_cost": float(self.spread_cost),
+            "slippage_cost": float(self.slippage_cost),
+            "fee_cost": float(self.fee_cost),
+            "funding_cost": float(self.funding_cost),
+            "other_cost": float(self.other_cost),
+            "spread_pct": self.spread_pct,
+            "slippage_pct": self.slippage_pct,
+            "quality": self.quality.value,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(slots=True)
+class RiskReadySignalPayload:
+    """
+    Stable EventBus contract emitted as signal.generated and consumed by RiskManager.
+
+    This class is the adapter between strategy and risk. It mirrors the fields
+    that RiskManager._request_from_payload(...) reads, without importing risk.enums
+    or risk.models into strategy.
+    """
+
+    signal_id: str
+    symbol: str
+    side: SignalSide
+
+    entry_price: float
+    stop_loss: float | None
+    take_profit: float | None
+
+    strategy_name: str
+    tier: StrategyTradeTier = StrategyTradeTier.T2
+    order_intent: StrategyOrderIntent = StrategyOrderIntent.OPEN
+
+    confidence: float = 0.0
+    edge_score: float = 0.0
+    priority_score: float = 0.0
+    volatility: float | None = None
+
+    liquidity_class: StrategyLiquidityClass = StrategyLiquidityClass.NORMAL
+    execution_quality: StrategyExecutionQuality = StrategyExecutionQuality.ACCEPTABLE
+
+    expected_reward: float | None = None
+    expected_loss: float | None = None
+    expected_win_probability: float | None = None
+    expected_cost: float | None = None
+    execution_cost: ExecutionCostPayload | None = None
+
+    requested_size: float | None = None
+    requested_margin: float | None = None
+    requested_leverage: float | None = None
+
+    reduce_only: bool = False
+    margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
+
+    exchange: str | None = None
+    market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
+    timeframe: Timeframe | None = None
+    timestamp: datetime = field(default_factory=utcnow)
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.signal_id = str(self.signal_id or uuid4().hex)
+        self.symbol = self.symbol.strip()
+        self.strategy_name = self.strategy_name.strip()
+        self.timestamp = ensure_aware_utc(self.timestamp)
+        self.confidence = clamp(float(self.confidence), 0.0, 1.0)
+        self.edge_score = clamp(float(self.edge_score), 0.0, 1.0)
+        self.priority_score = clamp(float(self.priority_score), 0.0, 1.0)
+        self.entry_price = _required_positive(self.entry_price, "entry_price")
+        self.stop_loss = _optional_finite(self.stop_loss, "stop_loss")
+        self.take_profit = _optional_finite(self.take_profit, "take_profit")
+        self.volatility = _optional_finite(self.volatility, "volatility")
+        self.expected_reward = _optional_finite(self.expected_reward, "expected_reward")
+        self.expected_loss = _optional_finite(self.expected_loss, "expected_loss")
+        self.expected_win_probability = _optional_finite(
+            self.expected_win_probability,
+            "expected_win_probability",
+        )
+        self.expected_cost = _optional_finite(self.expected_cost, "expected_cost")
+        self.requested_size = _optional_finite(self.requested_size, "requested_size")
+        self.requested_margin = _optional_finite(self.requested_margin, "requested_margin")
+        self.requested_leverage = _optional_finite(self.requested_leverage, "requested_leverage")
+
+        self.metadata.setdefault("signal_id", self.signal_id)
+        self.metadata.setdefault("priority_score", self.priority_score)
+        self.metadata.setdefault("exchange", self.exchange)
+        self.metadata.setdefault("market_type", self.market_type.value)
+
+    def validate(self) -> None:
+        if not self.signal_id.strip():
+            raise ValidationError("RiskReadySignalPayload.signal_id cannot be empty")
+        if not self.symbol.strip():
+            raise ValidationError("RiskReadySignalPayload.symbol cannot be empty")
+        if not self.strategy_name.strip():
+            raise ValidationError("RiskReadySignalPayload.strategy_name cannot be empty")
+        if self.side not in {SignalSide.LONG, SignalSide.SHORT}:
+            raise ValidationError("RiskReadySignalPayload.side must be LONG or SHORT")
+        if self.entry_price <= 0:
+            raise ValidationError("RiskReadySignalPayload.entry_price must be > 0")
+        if self.stop_loss is None or self.stop_loss <= 0:
+            raise ValidationError("RiskReadySignalPayload.stop_loss is required and must be > 0")
+        if self.take_profit is not None and self.take_profit <= 0:
+            raise ValidationError("RiskReadySignalPayload.take_profit must be > 0 when provided")
+        if self.requested_leverage is not None and self.requested_leverage <= 0:
+            raise ValidationError("RiskReadySignalPayload.requested_leverage must be > 0")
+        if self.requested_size is not None and self.requested_size <= 0:
+            raise ValidationError("RiskReadySignalPayload.requested_size must be > 0")
+        if self.requested_margin is not None and self.requested_margin <= 0:
+            raise ValidationError("RiskReadySignalPayload.requested_margin must be > 0")
+        if self.expected_win_probability is not None and not 0.0 <= self.expected_win_probability <= 1.0:
+            raise ValidationError("RiskReadySignalPayload.expected_win_probability must be between 0.0 and 1.0")
+
+        if self.side is SignalSide.LONG:
+            if self.stop_loss >= self.entry_price:
+                raise ValidationError("LONG signal requires stop_loss < entry_price")
+            if self.take_profit is not None and self.take_profit <= self.entry_price:
+                raise ValidationError("LONG signal requires take_profit > entry_price")
+
+        if self.side is SignalSide.SHORT:
+            if self.stop_loss <= self.entry_price:
+                raise ValidationError("SHORT signal requires stop_loss > entry_price")
+            if self.take_profit is not None and self.take_profit >= self.entry_price:
+                raise ValidationError("SHORT signal requires take_profit < entry_price")
+
+        if self.execution_cost is not None:
+            self.execution_cost.validate()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+
+        payload = {
+            "signal_id": self.signal_id,
+            "symbol": self.symbol,
+            "side": self.side.value,
+            "entry_price": self.entry_price,
+            "stop_loss": self.stop_loss,
+            "take_profit": self.take_profit,
+            "strategy_name": self.strategy_name,
+            "tier": self.tier.value,
+            "order_intent": self.order_intent.value,
+            "confidence": self.confidence,
+            "edge_score": self.edge_score,
+            "priority_score": self.priority_score,
+            "volatility": self.volatility,
+            "liquidity_class": self.liquidity_class.value,
+            "execution_quality": self.execution_quality.value,
+            "expected_reward": self.expected_reward,
+            "expected_loss": self.expected_loss,
+            "expected_win_probability": self.expected_win_probability,
+            "expected_cost": self.expected_cost,
+            "requested_size": self.requested_size,
+            "requested_margin": self.requested_margin,
+            "requested_leverage": self.requested_leverage,
+            "reduce_only": self.reduce_only,
+            "margin_mode": self.margin_mode.value,
+            "exchange": self.exchange,
+            "market_type": self.market_type.value,
+            "timeframe": self.timeframe.value if self.timeframe else None,
+            "timestamp": self.timestamp.timestamp(),
+            "metadata": dict(self.metadata),
+        }
+
+        if self.execution_cost is not None:
+            payload["execution_cost"] = self.execution_cost.to_dict()
+
+        return payload
+
+    @classmethod
+    def from_signal(
+        cls,
+        signal: StrategySignal,
+        *,
+        tier: StrategyTradeTier = StrategyTradeTier.T2,
+        order_intent: StrategyOrderIntent = StrategyOrderIntent.OPEN,
+        liquidity_class: StrategyLiquidityClass = StrategyLiquidityClass.NORMAL,
+        execution_quality: StrategyExecutionQuality = StrategyExecutionQuality.ACCEPTABLE,
+        priority_score: float | None = None,
+        expected_reward: float | None = None,
+        expected_loss: float | None = None,
+        expected_win_probability: float | None = None,
+        expected_cost: float | None = None,
+        execution_cost: ExecutionCostPayload | None = None,
+        exchange: str | None = None,
+        market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES,
+        margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED,
+    ) -> "RiskReadySignalPayload":
+        signal.validate()
+
+        entry_price = signal.primary_entry_price
+        stop_loss = signal.primary_stop_loss
+        take_profit = signal.primary_take_profit
+
+        requested_leverage = None
+        reduce_only = False
+        if signal.execution_plan is not None:
+            requested_leverage = signal.execution_plan.leverage
+            reduce_only = signal.execution_plan.reduce_only
+
+        metadata = {
+            "category": signal.category.value,
+            "setup_type": signal.setup_type.value,
+            "trigger_type": signal.trigger_type.value,
+            "origin": signal.origin.value,
+            "priority": signal.priority.value,
+            "strength": signal.strength.value,
+            "confidence_grade": signal.confidence_grade.value,
+            "regime": signal.regime.value,
+            "reasons": list(signal.reasons),
+            "confirmations": list(signal.confirmations),
+            "source_features": list(signal.source_features),
+            "combined_from": list(signal.combined_from),
+            **dict(signal.metadata),
+        }
+
+        if exchange is None:
+            raw_exchange = metadata.get("exchange")
+            exchange = str(raw_exchange) if raw_exchange else None
+
+        return cls(
+            signal_id=signal.signal_id,
+            symbol=signal.symbol,
+            side=signal.side,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strategy_name=signal.strategy_name,
+            tier=tier,
+            order_intent=order_intent,
+            confidence=signal.confidence,
+            edge_score=signal.score,
+            priority_score=signal.score if priority_score is None else priority_score,
+            liquidity_class=liquidity_class,
+            execution_quality=execution_quality,
+            expected_reward=expected_reward,
+            expected_loss=expected_loss,
+            expected_win_probability=expected_win_probability,
+            expected_cost=expected_cost,
+            execution_cost=execution_cost,
+            requested_leverage=requested_leverage,
+            reduce_only=reduce_only,
+            margin_mode=margin_mode,
+            exchange=exchange,
+            market_type=market_type,
+            timeframe=signal.timeframe,
+            timestamp=signal.timestamp,
+            metadata=metadata,
+        )
 
 @dataclass(slots=True)
 class StrategyEvaluation:
@@ -886,3 +1311,36 @@ def confidence_to_strength(confidence: float) -> SignalStrength:
 
 
 StrategyContext = SignalContext
+
+__all__ = [
+    "utcnow",
+    "ensure_aware_utc",
+    "clamp",
+    "FeatureSnapshot",
+    "StrategyMetadata",
+    "EntryPlan",
+    "TargetPlan",
+    "InvalidationPlan",
+    "ExitPlan",
+    "ExecutionPlanDraft",
+    "FilterResult",
+    "ConflictRecord",
+    "StrategySignal",
+    "RawStrategySignal",
+    "ConfirmedSignal",
+    "TradeIdea",
+    "ExecutionCostPayload",
+    "RiskReadySignalPayload",
+    "StrategyEvaluation",
+    "ConfluenceResult",
+    "PortfolioSnapshot",
+    "RegimeSnapshot",
+    "PriceSnapshot",
+    "SignalContext",
+    "StrategyContext",
+    "SignalEnvelope",
+    "CooldownState",
+    "SignalWindow",
+    "confidence_to_grade",
+    "confidence_to_strength",
+]

@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Deque
 
-from .enums import SignalSide, SignalStatus, StrategyCategory
-from .exceptions import FeatureStoreError, StrategyStateError, ValidationError
+from .enums import SignalSide, SignalStatus, StrategyCategory, Timeframe
+from .exceptions import StrategyStateError, ValidationError
 from .models import (
     CooldownState,
     FeatureSnapshot,
@@ -28,18 +28,21 @@ class SignalState:
     Runtime state для strategy signals.
 
     Відповідає за:
-    - останній signal по symbol;
+    - lookup by signal_id;
     - active signals;
+    - last signal by symbol/strategy/symbol+side;
     - signal history;
-    - lookup by strategy/symbol/side;
-    - cleanup inactive/expired signals.
+    - rejected/expired/terminal buckets;
+    - status updates from StrategyEventHandler.
 
-    Не виконує risk/execution логіку.
+    Не містить EventBus logic, risk logic або execution logic.
     """
 
     max_history_size: int = 1000
 
     active_signals: dict[str, StrategySignal] = field(default_factory=dict)
+
+    signal_by_id: dict[str, StrategySignal] = field(default_factory=dict)
     last_signal_by_symbol: dict[str, StrategySignal] = field(default_factory=dict)
     last_signal_by_strategy: dict[str, StrategySignal] = field(default_factory=dict)
     last_signal_by_symbol_side: dict[tuple[str, SignalSide], StrategySignal] = field(
@@ -49,6 +52,10 @@ class SignalState:
     history: Deque[StrategySignal] = field(default_factory=deque)
     rejected_signals: Deque[StrategySignal] = field(default_factory=deque)
     expired_signals: Deque[StrategySignal] = field(default_factory=deque)
+    confirmed_signals: Deque[StrategySignal] = field(default_factory=deque)
+    executed_signals: Deque[StrategySignal] = field(default_factory=deque)
+    failed_signals: Deque[StrategySignal] = field(default_factory=deque)
+    cancelled_signals: Deque[StrategySignal] = field(default_factory=deque)
 
     updated_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -62,6 +69,9 @@ class SignalState:
             raise ValidationError("SignalState.max_history_size must be > 0")
 
         for signal in self.active_signals.values():
+            signal.validate()
+
+        for signal in self.signal_by_id.values():
             signal.validate()
 
         for signal in self.last_signal_by_symbol.values():
@@ -90,8 +100,12 @@ class SignalState:
         """
         signal.validate()
 
-        is_active = signal.is_active if active is None else active
+        signal_id = self._signal_id(signal)
+        if signal_id:
+            self.signal_by_id[signal_id] = signal
+
         key = self._signal_key(signal)
+        is_active = signal.is_active if active is None else active
 
         if is_active:
             self.active_signals[key] = signal
@@ -103,13 +117,7 @@ class SignalState:
         self.last_signal_by_symbol_side[(signal.symbol, signal.side)] = signal
 
         self._append_history(signal)
-
-        if signal.status == SignalStatus.REJECTED:
-            self._append_bounded(self.rejected_signals, signal)
-
-        if signal.status == SignalStatus.EXPIRED:
-            self._append_bounded(self.expired_signals, signal)
-
+        self._append_status_bucket(signal)
         self.touch()
 
     def remember_evaluation(self, evaluation: StrategyEvaluation) -> None:
@@ -117,53 +125,10 @@ class SignalState:
         if evaluation.signal is not None:
             self.remember(evaluation.signal, active=evaluation.passed)
 
-    def mark_rejected(
-        self,
-        signal: StrategySignal,
-        *,
-        reason: str | None = None,
-    ) -> None:
-        signal.validate()
-
-        if reason:
-            signal.add_reason(reason)
-
-        signal.to_rejected()
-        self.remember(signal, active=False)
-
-    def mark_expired(
-        self,
-        signal: StrategySignal,
-        *,
-        reason: str | None = None,
-    ) -> None:
-        signal.validate()
-
-        if reason:
-            signal.add_reason(reason)
-
-        signal.to_expired()
-        self.remember(signal, active=False)
-
-    def remove_active(self, signal: StrategySignal) -> None:
-        signal.validate()
-        self.active_signals.pop(self._signal_key(signal), None)
-        self.touch()
-
-    def remove_active_by_key(
-        self,
-        *,
-        symbol: str,
-        strategy_name: str,
-        side: SignalSide,
-    ) -> None:
-        key = self._make_signal_key(
-            symbol=symbol,
-            strategy_name=strategy_name,
-            side=side,
-        )
-        self.active_signals.pop(key, None)
-        self.touch()
+    def get_by_signal_id(self, signal_id: str | None) -> StrategySignal | None:
+        if not isinstance(signal_id, str) or not signal_id.strip():
+            return None
+        return self.signal_by_id.get(signal_id.strip())
 
     def get_active(self) -> list[StrategySignal]:
         return sorted(
@@ -199,14 +164,215 @@ class SignalState:
     ) -> StrategySignal | None:
         return self.last_signal_by_symbol_side.get((symbol, side))
 
+    def find_signal(
+        self,
+        *,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        side: SignalSide | None = None,
+    ) -> StrategySignal | None:
+        """
+        Best-effort lookup used by StrategyEventHandler.
+
+        Priority:
+        1. signal_id;
+        2. symbol + side;
+        3. symbol;
+        4. strategy_name.
+        """
+        signal = self.get_by_signal_id(signal_id)
+        if signal is not None:
+            return signal
+
+        if symbol and side is not None:
+            signal = self.get_last_for_symbol_side(symbol, side)
+            if signal is not None:
+                return signal
+
+        if symbol:
+            signal = self.get_last_for_symbol(symbol)
+            if signal is not None:
+                return signal
+
+        if strategy_name:
+            return self.get_last_for_strategy(strategy_name)
+
+        return None
+
+    def mark_status_by_signal_id(
+        self,
+        signal_id: str,
+        *,
+        status: SignalStatus,
+        reason: str | None = None,
+        active: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> StrategySignal | None:
+        signal = self.get_by_signal_id(signal_id)
+        if signal is None:
+            return None
+
+        return self.mark_status(
+            signal,
+            status=status,
+            reason=reason,
+            active=active,
+            metadata=metadata,
+        )
+
+    def mark_status(
+        self,
+        signal: StrategySignal,
+        *,
+        status: SignalStatus,
+        reason: str | None = None,
+        active: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> StrategySignal:
+        """
+        Mutate signal status and re-index it.
+
+        This method is intentionally state-only. StrategyEventHandler decides
+        when to call it after signal.confirmed / risk.position_blocked /
+        execution.* events.
+        """
+        signal.validate()
+
+        signal.status = status
+
+        if reason:
+            self._add_reason(signal, reason)
+
+        if metadata:
+            signal.metadata.update(metadata)
+
+        if active is None:
+            active = signal.is_active
+
+        self.remember(signal, active=active)
+        return signal
+
+    def mark_status_from_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        status: SignalStatus,
+        default_reason: str,
+    ) -> StrategySignal | None:
+        """
+        Convenience method for StrategyEventHandler.
+
+        Expected payload can contain:
+        - signal_id;
+        - symbol;
+        - strategy_name;
+        - side;
+        - reason;
+        - metadata.
+        """
+        signal_id = payload.get("signal_id")
+        symbol = payload.get("symbol")
+        strategy_name = payload.get("strategy_name")
+        raw_side = payload.get("side")
+
+        side = self._parse_side(raw_side)
+
+        signal = self.find_signal(
+            signal_id=signal_id if isinstance(signal_id, str) else None,
+            symbol=symbol if isinstance(symbol, str) else None,
+            strategy_name=strategy_name if isinstance(strategy_name, str) else None,
+            side=side,
+        )
+
+        if signal is None:
+            return None
+
+        reason = payload.get("reason")
+        reason_text = reason if isinstance(reason, str) and reason.strip() else default_reason
+
+        event_metadata = payload.get("metadata")
+        metadata = event_metadata if isinstance(event_metadata, dict) else {}
+
+        return self.mark_status(
+            signal,
+            status=status,
+            reason=reason_text,
+            active=status in {SignalStatus.NEW, SignalStatus.PENDING, SignalStatus.CONFIRMED},
+            metadata={
+                "last_status_event_payload": dict(payload),
+                **metadata,
+            },
+        )
+
+    def mark_rejected(
+        self,
+        signal: StrategySignal,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        if reason:
+            self._add_reason(signal, reason)
+
+        if hasattr(signal, "to_rejected"):
+            signal.to_rejected()
+        else:
+            signal.status = SignalStatus.REJECTED
+
+        self.remember(signal, active=False)
+
+    def mark_expired(
+        self,
+        signal: StrategySignal,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        if reason:
+            self._add_reason(signal, reason)
+
+        if hasattr(signal, "to_expired"):
+            signal.to_expired()
+        else:
+            signal.status = SignalStatus.EXPIRED
+
+        self.remember(signal, active=False)
+
+    def remove_active(self, signal: StrategySignal) -> None:
+        signal.validate()
+        self.active_signals.pop(self._signal_key(signal), None)
+        self.touch()
+
+    def remove_active_by_key(
+        self,
+        *,
+        symbol: str,
+        strategy_name: str,
+        side: SignalSide,
+    ) -> None:
+        key = self._make_signal_key(
+            symbol=symbol,
+            strategy_name=strategy_name,
+            side=side,
+        )
+        self.active_signals.pop(key, None)
+        self.touch()
+
     def history_list(
         self,
         *,
         symbol: str | None = None,
         strategy_name: str | None = None,
+        signal_id: str | None = None,
         limit: int | None = None,
     ) -> list[StrategySignal]:
         items = list(self.history)
+
+        if signal_id is not None:
+            items = [
+                signal
+                for signal in items
+                if self._signal_id(signal) == signal_id
+            ]
 
         if symbol is not None:
             items = [signal for signal in items if signal.symbol == symbol]
@@ -237,37 +403,38 @@ class SignalState:
         }
         self.touch()
 
-    def prune_older_than(self, cutoff: datetime) -> None:
+    def prune_older_than(self, cutoff: datetime) -> dict[str, int]:
         cutoff = ensure_aware_utc(cutoff)
 
-        self.history = deque(
-            [
-                signal
-                for signal in self.history
-                if signal.timestamp >= cutoff
-            ],
-            maxlen=self.max_history_size,
-        )
+        before_history = len(self.history)
+        before_rejected = len(self.rejected_signals)
+        before_expired = len(self.expired_signals)
+        before_confirmed = len(self.confirmed_signals)
+        before_executed = len(self.executed_signals)
+        before_failed = len(self.failed_signals)
+        before_cancelled = len(self.cancelled_signals)
 
-        self.rejected_signals = deque(
-            [
-                signal
-                for signal in self.rejected_signals
-                if signal.timestamp >= cutoff
-            ],
-            maxlen=self.max_history_size,
-        )
+        self.history = self._filtered_deque(self.history, cutoff)
+        self.rejected_signals = self._filtered_deque(self.rejected_signals, cutoff)
+        self.expired_signals = self._filtered_deque(self.expired_signals, cutoff)
+        self.confirmed_signals = self._filtered_deque(self.confirmed_signals, cutoff)
+        self.executed_signals = self._filtered_deque(self.executed_signals, cutoff)
+        self.failed_signals = self._filtered_deque(self.failed_signals, cutoff)
+        self.cancelled_signals = self._filtered_deque(self.cancelled_signals, cutoff)
 
-        self.expired_signals = deque(
-            [
-                signal
-                for signal in self.expired_signals
-                if signal.timestamp >= cutoff
-            ],
-            maxlen=self.max_history_size,
-        )
-
+        self._rebuild_indexes_from_history()
+        self.prune_inactive()
         self.touch()
+
+        return {
+            "history": before_history - len(self.history),
+            "rejected": before_rejected - len(self.rejected_signals),
+            "expired": before_expired - len(self.expired_signals),
+            "confirmed": before_confirmed - len(self.confirmed_signals),
+            "executed": before_executed - len(self.executed_signals),
+            "failed": before_failed - len(self.failed_signals),
+            "cancelled": before_cancelled - len(self.cancelled_signals),
+        }
 
     def clear_symbol(self, symbol: str) -> None:
         self.active_signals = {
@@ -284,33 +451,48 @@ class SignalState:
             if key[0] != symbol
         }
 
-        self.history = deque(
-            [
-                signal
-                for signal in self.history
-                if signal.symbol != symbol
-            ],
-            maxlen=self.max_history_size,
-        )
+        self.signal_by_id = {
+            signal_id: signal
+            for signal_id, signal in self.signal_by_id.items()
+            if signal.symbol != symbol
+        }
+
+        self.history = self._remove_symbol_from_deque(self.history, symbol)
+        self.rejected_signals = self._remove_symbol_from_deque(self.rejected_signals, symbol)
+        self.expired_signals = self._remove_symbol_from_deque(self.expired_signals, symbol)
+        self.confirmed_signals = self._remove_symbol_from_deque(self.confirmed_signals, symbol)
+        self.executed_signals = self._remove_symbol_from_deque(self.executed_signals, symbol)
+        self.failed_signals = self._remove_symbol_from_deque(self.failed_signals, symbol)
+        self.cancelled_signals = self._remove_symbol_from_deque(self.cancelled_signals, symbol)
 
         self.touch()
 
     def clear(self) -> None:
         self.active_signals.clear()
+        self.signal_by_id.clear()
         self.last_signal_by_symbol.clear()
         self.last_signal_by_strategy.clear()
         self.last_signal_by_symbol_side.clear()
         self.history.clear()
         self.rejected_signals.clear()
         self.expired_signals.clear()
+        self.confirmed_signals.clear()
+        self.executed_signals.clear()
+        self.failed_signals.clear()
+        self.cancelled_signals.clear()
         self.touch()
 
     def summary(self) -> dict[str, Any]:
         return {
             "active": len(self.active_signals),
+            "signal_by_id": len(self.signal_by_id),
             "history": len(self.history),
             "rejected": len(self.rejected_signals),
             "expired": len(self.expired_signals),
+            "confirmed": len(self.confirmed_signals),
+            "executed": len(self.executed_signals),
+            "failed": len(self.failed_signals),
+            "cancelled": len(self.cancelled_signals),
             "symbols": sorted(self.last_signal_by_symbol.keys()),
             "strategies": sorted(self.last_signal_by_strategy.keys()),
             "updated_at": self.updated_at,
@@ -318,6 +500,20 @@ class SignalState:
 
     def _append_history(self, signal: StrategySignal) -> None:
         self._append_bounded(self.history, signal)
+
+    def _append_status_bucket(self, signal: StrategySignal) -> None:
+        if signal.status == SignalStatus.REJECTED:
+            self._append_bounded(self.rejected_signals, signal)
+        elif signal.status == SignalStatus.EXPIRED:
+            self._append_bounded(self.expired_signals, signal)
+        elif signal.status == SignalStatus.CONFIRMED:
+            self._append_bounded(self.confirmed_signals, signal)
+        elif signal.status == SignalStatus.EXECUTED:
+            self._append_bounded(self.executed_signals, signal)
+        elif signal.status == SignalStatus.FAILED:
+            self._append_bounded(self.failed_signals, signal)
+        elif signal.status == SignalStatus.CANCELLED:
+            self._append_bounded(self.cancelled_signals, signal)
 
     def _append_bounded(
         self,
@@ -329,12 +525,73 @@ class SignalState:
         while len(target) > self.max_history_size:
             target.popleft()
 
+    def _filtered_deque(
+        self,
+        source: Deque[StrategySignal],
+        cutoff: datetime,
+    ) -> Deque[StrategySignal]:
+        return deque(
+            [
+                signal
+                for signal in source
+                if signal.timestamp >= cutoff
+            ],
+            maxlen=self.max_history_size,
+        )
+
+    def _remove_symbol_from_deque(
+        self,
+        source: Deque[StrategySignal],
+        symbol: str,
+    ) -> Deque[StrategySignal]:
+        return deque(
+            [
+                signal
+                for signal in source
+                if signal.symbol != symbol
+            ],
+            maxlen=self.max_history_size,
+        )
+
+    def _rebuild_indexes_from_history(self) -> None:
+        self.active_signals.clear()
+        self.signal_by_id.clear()
+        self.last_signal_by_symbol.clear()
+        self.last_signal_by_strategy.clear()
+        self.last_signal_by_symbol_side.clear()
+
+        for signal in self.history:
+            signal_id = self._signal_id(signal)
+            if signal_id:
+                self.signal_by_id[signal_id] = signal
+
+            if signal.is_active:
+                self.active_signals[self._signal_key(signal)] = signal
+
+            self.last_signal_by_symbol[signal.symbol] = signal
+            self.last_signal_by_strategy[signal.strategy_name] = signal
+            self.last_signal_by_symbol_side[(signal.symbol, signal.side)] = signal
+
     def _signal_key(self, signal: StrategySignal) -> str:
         return self._make_signal_key(
             symbol=signal.symbol,
             strategy_name=signal.strategy_name,
             side=signal.side,
         )
+
+    @staticmethod
+    def _signal_id(signal: StrategySignal) -> str | None:
+        value = getattr(signal, "signal_id", None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+        metadata = getattr(signal, "metadata", None)
+        if isinstance(metadata, dict):
+            value = metadata.get("signal_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return None
 
     @staticmethod
     def _make_signal_key(
@@ -345,6 +602,29 @@ class SignalState:
     ) -> str:
         return f"{symbol}:{strategy_name}:{side.value}"
 
+    @staticmethod
+    def _parse_side(value: Any) -> SignalSide | None:
+        if isinstance(value, SignalSide):
+            return value
+
+        if isinstance(value, str):
+            try:
+                return SignalSide(value)
+            except ValueError:
+                return None
+
+        return None
+
+    @staticmethod
+    def _add_reason(signal: StrategySignal, reason: str) -> None:
+        add_reason = getattr(signal, "add_reason", None)
+        if callable(add_reason):
+            add_reason(reason)
+            return
+
+        if reason not in signal.reasons:
+            signal.reasons.append(reason)
+
 
 @dataclass(slots=True)
 class StrategyContextStore:
@@ -352,13 +632,13 @@ class StrategyContextStore:
     In-memory context/feature store для strategy layer.
 
     Відповідає за:
-    - збереження останнього StrategyContext по symbol;
-    - збереження FeatureSnapshot по symbol/feature;
+    - останній StrategyContext по symbol;
+    - FeatureSnapshot по symbol/feature;
     - regime snapshots;
     - portfolio snapshot;
     - побудову StrategyContext з feature store.
 
-    Це локальний strategy-layer state, не storage persistence.
+    Це локальний runtime store, не persistence/storage.
     """
 
     contexts: dict[str, StrategyContext] = field(default_factory=dict)
@@ -381,23 +661,10 @@ class StrategyContextStore:
         for symbol, feature_map in self.features.items():
             if not symbol.strip():
                 raise ValidationError("StrategyContextStore.features contains empty symbol")
+            for feature in feature_map.values():
+                feature.validate()
 
-            for feature_name, snapshot in feature_map.items():
-                if feature_name != snapshot.name:
-                    raise ValidationError(
-                        f"Feature key '{feature_name}' does not match snapshot.name '{snapshot.name}'"
-                    )
-                if snapshot.symbol != symbol:
-                    raise ValidationError(
-                        f"FeatureSnapshot.symbol '{snapshot.symbol}' does not match symbol key '{symbol}'"
-                    )
-                snapshot.validate()
-
-        for symbol, regime in self.regimes.items():
-            if symbol != regime.symbol:
-                raise ValidationError(
-                    f"Regime key '{symbol}' does not match regime.symbol '{regime.symbol}'"
-                )
+        for regime in self.regimes.values():
             regime.validate()
 
         self.portfolio.validate()
@@ -405,109 +672,98 @@ class StrategyContextStore:
     def touch(self, symbol: str | None = None) -> None:
         now = utcnow()
         self.updated_at = now
-
         if symbol is not None:
             self.updated_at_by_symbol[symbol] = now
-
-    def set_context(self, context: StrategyContext) -> None:
-        context.validate()
-
-        self.contexts[context.symbol] = context
-
-        for snapshot in context.feature_map.values():
-            self.upsert_feature(snapshot)
-
-        if context.regime is not None:
-            self.set_regime(context.regime)
-
-        if context.portfolio is not None:
-            self.set_portfolio(context.portfolio)
-
-        self.touch(context.symbol)
 
     def get_context(self, symbol: str) -> StrategyContext | None:
         return self.contexts.get(symbol)
 
-    def require_context(self, symbol: str) -> StrategyContext:
-        context = self.get_context(symbol)
-        if context is None:
-            raise FeatureStoreError(f"context for symbol '{symbol}' is not available")
-        return context
+    def set_context(self, context: StrategyContext) -> None:
+        context.validate()
+        self.contexts[context.symbol] = context
 
-    def upsert_feature(self, snapshot: FeatureSnapshot) -> None:
+        self.features.setdefault(context.symbol, {})
+        self.features[context.symbol].update(context.feature_map)
+
+        if context.regime is not None:
+            self.regimes[context.symbol] = context.regime
+
+        if context.portfolio is not None:
+            self.portfolio = context.portfolio
+
+        self.touch(context.symbol)
+
+    def put_feature(self, snapshot: FeatureSnapshot) -> None:
         snapshot.validate()
 
-        symbol_features = self.features.setdefault(snapshot.symbol, {})
-        symbol_features[snapshot.name] = snapshot
+        self.features.setdefault(snapshot.symbol, {})[snapshot.name] = snapshot
+
+        context = self.contexts.get(snapshot.symbol)
+        if context is not None:
+            context.put_feature(snapshot)
+            if snapshot.freshness_seconds is not None:
+                context.freshness_map[snapshot.name] = snapshot.freshness_seconds
+            context.timestamp = snapshot.timestamp
 
         self.touch(snapshot.symbol)
 
-    def bulk_upsert_features(self, snapshots: list[FeatureSnapshot]) -> None:
-        for snapshot in snapshots:
-            self.upsert_feature(snapshot)
+    def set_regime(self, snapshot: RegimeSnapshot) -> None:
+        snapshot.validate()
+        self.regimes[snapshot.symbol] = snapshot
+
+        context = self.contexts.get(snapshot.symbol)
+        if context is not None:
+            context.regime = snapshot
+            context.timestamp = snapshot.timestamp
+
+        self.touch(snapshot.symbol)
+
+    def set_portfolio(self, snapshot: PortfolioSnapshot) -> None:
+        snapshot.validate()
+        self.portfolio = snapshot
+
+        for context in self.contexts.values():
+            context.portfolio = snapshot
+
+        self.touch()
+
+    def build_context(
+        self,
+        symbol: str,
+        *,
+        timestamp: datetime | None = None,
+        timeframe: Timeframe = Timeframe.M1,
+        include_regime: bool = True,
+        include_portfolio: bool = True,
+    ) -> StrategyContext:
+        if not symbol.strip():
+            raise StrategyStateError("symbol cannot be empty")
+
+        ts = ensure_aware_utc(timestamp or utcnow())
+
+        context = StrategyContext(
+            symbol=symbol.strip(),
+            timestamp=ts,
+            timeframe=timeframe,
+            regime=self.regimes.get(symbol) if include_regime else None,
+            portfolio=self.portfolio if include_portfolio else None,
+        )
+
+        for snapshot in self.features.get(symbol, {}).values():
+            context.put_feature(snapshot)
+            if snapshot.freshness_seconds is not None:
+                context.freshness_map[snapshot.name] = snapshot.freshness_seconds
+
+        context.validate()
+        self.set_context(context)
+        return context
 
     def get_feature(
         self,
         symbol: str,
-        feature_name: str,
+        name: str,
     ) -> FeatureSnapshot | None:
-        return self.features.get(symbol, {}).get(feature_name)
-
-    def require_feature(
-        self,
-        symbol: str,
-        feature_name: str,
-    ) -> FeatureSnapshot:
-        snapshot = self.get_feature(symbol, feature_name)
-        if snapshot is None:
-            raise FeatureStoreError(
-                f"feature '{feature_name}' for symbol '{symbol}' is not available"
-            )
-        return snapshot
-
-    def get_feature_value(
-        self,
-        symbol: str,
-        feature_name: str,
-        default: Any = None,
-    ) -> Any:
-        snapshot = self.get_feature(symbol, feature_name)
-        if snapshot is None:
-            return default
-        return snapshot.value
-
-    def get_normalized_feature_value(
-        self,
-        symbol: str,
-        feature_name: str,
-        default: float | None = None,
-    ) -> float | None:
-        snapshot = self.get_feature(symbol, feature_name)
-        if snapshot is None:
-            return default
-
-        if snapshot.normalized_value is None:
-            return default
-
-        return snapshot.normalized_value
-
-    def get_symbol_features(self, symbol: str) -> dict[str, FeatureSnapshot]:
-        return dict(self.features.get(symbol, {}))
-
-    def has_feature(self, symbol: str, feature_name: str) -> bool:
-        return feature_name in self.features.get(symbol, {})
-
-    def remove_feature(self, symbol: str, feature_name: str) -> None:
-        symbol_features = self.features.get(symbol)
-        if not symbol_features:
-            return
-
-        symbol_features.pop(feature_name, None)
-
-        if not symbol_features:
-            self.features.pop(symbol, None)
-
-        self.touch(symbol)
+        return self.features.get(symbol, {}).get(name)
 
     def remove_symbol(self, symbol: str) -> None:
         self.contexts.pop(symbol, None)
@@ -516,63 +772,22 @@ class StrategyContextStore:
         self.updated_at_by_symbol.pop(symbol, None)
         self.touch()
 
-    def set_regime(self, snapshot: RegimeSnapshot) -> None:
-        snapshot.validate()
-        self.regimes[snapshot.symbol] = snapshot
-        self.touch(snapshot.symbol)
-
-    def get_regime_snapshot(self, symbol: str) -> RegimeSnapshot | None:
-        return self.regimes.get(symbol)
-
-    def set_portfolio(self, snapshot: PortfolioSnapshot) -> None:
-        snapshot.validate()
-        self.portfolio = snapshot
-        self.touch()
-
-    def build_context(
-        self,
-        symbol: str,
-        *,
-        timestamp: datetime | None = None,
-        include_regime: bool = True,
-        include_portfolio: bool = True,
-    ) -> StrategyContext:
-        if not symbol.strip():
-            raise FeatureStoreError("symbol cannot be empty")
-
-        context = StrategyContext(
-            symbol=symbol,
-            timestamp=ensure_aware_utc(timestamp or utcnow()),
-            regime=self.regimes.get(symbol) if include_regime else None,
-            portfolio=self.portfolio if include_portfolio else None,
-        )
-
-        for snapshot in self.get_symbol_features(symbol).values():
-            context.put_feature(snapshot)
-
-        return context
-
-    def prune_expired_features(self, now: datetime | None = None) -> int:
-        current = ensure_aware_utc(now or utcnow())
+    def prune_stale_features(self) -> int:
         removed = 0
-        symbols_to_remove: list[str] = []
 
-        for symbol, feature_map in self.features.items():
-            expired_names = [
-                feature_name
-                for feature_name, snapshot in feature_map.items()
-                if snapshot.is_expired(current)
-            ]
+        for symbol, feature_map in list(self.features.items()):
+            for name, snapshot in list(feature_map.items()):
+                if snapshot.is_expired():
+                    feature_map.pop(name, None)
+                    removed += 1
 
-            for feature_name in expired_names:
-                feature_map.pop(feature_name, None)
-                removed += 1
-
-            if not feature_map:
-                symbols_to_remove.append(symbol)
-
-        for symbol in symbols_to_remove:
-            self.features.pop(symbol, None)
+            context = self.contexts.get(symbol)
+            if context is not None:
+                context.feature_map = {
+                    name: snapshot
+                    for name, snapshot in context.feature_map.items()
+                    if not snapshot.is_expired()
+                }
 
         if removed:
             self.touch()
@@ -583,25 +798,17 @@ class StrategyContextStore:
         self.contexts.clear()
         self.features.clear()
         self.regimes.clear()
-        self.portfolio = PortfolioSnapshot()
         self.updated_at_by_symbol.clear()
+        self.portfolio = PortfolioSnapshot()
         self.touch()
-
-    @property
-    def symbols(self) -> list[str]:
-        return sorted(
-            set(self.contexts.keys())
-            | set(self.features.keys())
-            | set(self.regimes.keys())
-        )
 
     def summary(self) -> dict[str, Any]:
         return {
             "contexts": len(self.contexts),
-            "feature_symbols": len(self.features),
-            "features_total": sum(len(features) for features in self.features.values()),
+            "features_symbols": len(self.features),
+            "features_total": sum(len(items) for items in self.features.values()),
             "regimes": len(self.regimes),
-            "symbols": self.symbols,
+            "portfolio_updated_at": getattr(self.portfolio, "timestamp", None),
             "updated_at": self.updated_at,
         }
 
@@ -609,34 +816,21 @@ class StrategyContextStore:
 @dataclass(slots=True)
 class StrategyCooldownState:
     """
-    Cooldown state для strategy layer.
+    Runtime cooldowns for strategy layer.
 
-    Підтримує:
-    - cooldown по strategy+symbol;
-    - cooldown по symbol+side;
-    - global symbol cooldown;
-    - cleanup expired cooldowns.
+    Використовується до risk layer тільки як pre-risk throttling.
     """
 
-    strategy_cooldowns: dict[tuple[str, str], CooldownState] = field(
-        default_factory=dict
-    )
-    side_cooldowns: dict[tuple[str, SignalSide], CooldownState] = field(
-        default_factory=dict
-    )
-    symbol_cooldowns: dict[str, CooldownState] = field(default_factory=dict)
+    strategy_cooldowns: dict[tuple[str, str], CooldownState] = field(default_factory=dict)
+    side_cooldowns: dict[tuple[str, SignalSide], CooldownState] = field(default_factory=dict)
 
     updated_at: datetime | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         for cooldown in self.strategy_cooldowns.values():
             cooldown.validate()
 
         for cooldown in self.side_cooldowns.values():
-            cooldown.validate()
-
-        for cooldown in self.symbol_cooldowns.values():
             cooldown.validate()
 
     def touch(self) -> None:
@@ -647,24 +841,22 @@ class StrategyCooldownState:
         *,
         symbol: str,
         strategy_name: str,
-        seconds: int,
+        seconds: int | float,
         reason: str | None = None,
     ) -> None:
-        if not symbol.strip():
-            raise StrategyStateError("symbol cannot be empty")
-        if not strategy_name.strip():
-            raise StrategyStateError("strategy_name cannot be empty")
-        if seconds < 0:
-            raise StrategyStateError("cooldown seconds must be >= 0")
+        if seconds <= 0:
+            return
 
-        until = utcnow() + timedelta(seconds=seconds)
-
-        self.strategy_cooldowns[(symbol, strategy_name)] = CooldownState(
+        until = utcnow() + timedelta(seconds=float(seconds))
+        cooldown = CooldownState(
             symbol=symbol,
             strategy_name=strategy_name,
             until=until,
             reason=reason,
         )
+        cooldown.validate()
+
+        self.strategy_cooldowns[(symbol, strategy_name)] = cooldown
         self.touch()
 
     def add_side_cooldown(
@@ -672,47 +864,25 @@ class StrategyCooldownState:
         *,
         symbol: str,
         side: SignalSide,
-        seconds: int,
+        seconds: int | float,
         reason: str | None = None,
     ) -> None:
-        if not symbol.strip():
-            raise StrategyStateError("symbol cannot be empty")
-        if seconds < 0:
-            raise StrategyStateError("side cooldown seconds must be >= 0")
+        if seconds <= 0:
+            return
 
-        until = utcnow() + timedelta(seconds=seconds)
-
-        self.side_cooldowns[(symbol, side)] = CooldownState(
+        until = utcnow() + timedelta(seconds=float(seconds))
+        cooldown = CooldownState(
             symbol=symbol,
-            strategy_name=f"__side__:{side.value}",
+            strategy_name=f"side:{side.value}",
             until=until,
             reason=reason,
         )
+        cooldown.validate()
+
+        self.side_cooldowns[(symbol, side)] = cooldown
         self.touch()
 
-    def add_symbol_cooldown(
-        self,
-        *,
-        symbol: str,
-        seconds: int,
-        reason: str | None = None,
-    ) -> None:
-        if not symbol.strip():
-            raise StrategyStateError("symbol cannot be empty")
-        if seconds < 0:
-            raise StrategyStateError("symbol cooldown seconds must be >= 0")
-
-        until = utcnow() + timedelta(seconds=seconds)
-
-        self.symbol_cooldowns[symbol] = CooldownState(
-            symbol=symbol,
-            strategy_name="__symbol__",
-            until=until,
-            reason=reason,
-        )
-        self.touch()
-
-    def is_strategy_on_cooldown(
+    def is_strategy_blocked(
         self,
         *,
         symbol: str,
@@ -724,7 +894,7 @@ class StrategyCooldownState:
             return False
         return cooldown.is_active(now)
 
-    def is_side_on_cooldown(
+    def is_side_blocked(
         self,
         *,
         symbol: str,
@@ -736,132 +906,34 @@ class StrategyCooldownState:
             return False
         return cooldown.is_active(now)
 
-    def is_symbol_on_cooldown(
-        self,
-        *,
-        symbol: str,
-        now: datetime | None = None,
-    ) -> bool:
-        cooldown = self.symbol_cooldowns.get(symbol)
-        if cooldown is None:
-            return False
-        return cooldown.is_active(now)
+    def prune_expired(self) -> int:
+        now = utcnow()
+        removed = 0
 
-    def is_blocked(
-        self,
-        *,
-        symbol: str,
-        strategy_name: str | None = None,
-        side: SignalSide | None = None,
-        now: datetime | None = None,
-    ) -> bool:
-        if self.is_symbol_on_cooldown(symbol=symbol, now=now):
-            return True
+        for key, cooldown in list(self.strategy_cooldowns.items()):
+            if not cooldown.is_active(now):
+                self.strategy_cooldowns.pop(key, None)
+                removed += 1
 
-        if strategy_name is not None and self.is_strategy_on_cooldown(
-            symbol=symbol,
-            strategy_name=strategy_name,
-            now=now,
-        ):
-            return True
-
-        if side is not None and self.is_side_on_cooldown(
-            symbol=symbol,
-            side=side,
-            now=now,
-        ):
-            return True
-
-        return False
-
-    def clear_strategy_cooldown(
-        self,
-        *,
-        symbol: str,
-        strategy_name: str,
-    ) -> None:
-        self.strategy_cooldowns.pop((symbol, strategy_name), None)
-        self.touch()
-
-    def clear_side_cooldown(
-        self,
-        *,
-        symbol: str,
-        side: SignalSide,
-    ) -> None:
-        self.side_cooldowns.pop((symbol, side), None)
-        self.touch()
-
-    def clear_symbol_cooldown(self, symbol: str) -> None:
-        self.symbol_cooldowns.pop(symbol, None)
-        self.touch()
-
-    def clear_symbol(self, symbol: str) -> None:
-        self.symbol_cooldowns.pop(symbol, None)
-
-        self.strategy_cooldowns = {
-            key: cooldown
-            for key, cooldown in self.strategy_cooldowns.items()
-            if key[0] != symbol
-        }
-
-        self.side_cooldowns = {
-            key: cooldown
-            for key, cooldown in self.side_cooldowns.items()
-            if key[0] != symbol
-        }
-
-        self.touch()
-
-    def prune_expired(self, now: datetime | None = None) -> int:
-        current = ensure_aware_utc(now or utcnow())
-
-        before = self.count()
-
-        self.strategy_cooldowns = {
-            key: cooldown
-            for key, cooldown in self.strategy_cooldowns.items()
-            if cooldown.is_active(current)
-        }
-
-        self.side_cooldowns = {
-            key: cooldown
-            for key, cooldown in self.side_cooldowns.items()
-            if cooldown.is_active(current)
-        }
-
-        self.symbol_cooldowns = {
-            symbol: cooldown
-            for symbol, cooldown in self.symbol_cooldowns.items()
-            if cooldown.is_active(current)
-        }
-
-        removed = before - self.count()
+        for key, cooldown in list(self.side_cooldowns.items()):
+            if not cooldown.is_active(now):
+                self.side_cooldowns.pop(key, None)
+                removed += 1
 
         if removed:
             self.touch()
 
         return removed
 
-    def count(self) -> int:
-        return (
-            len(self.strategy_cooldowns)
-            + len(self.side_cooldowns)
-            + len(self.symbol_cooldowns)
-        )
-
     def clear(self) -> None:
         self.strategy_cooldowns.clear()
         self.side_cooldowns.clear()
-        self.symbol_cooldowns.clear()
         self.touch()
 
     def summary(self) -> dict[str, Any]:
         return {
             "strategy_cooldowns": len(self.strategy_cooldowns),
             "side_cooldowns": len(self.side_cooldowns),
-            "symbol_cooldowns": len(self.symbol_cooldowns),
-            "total": self.count(),
             "updated_at": self.updated_at,
         }
 
@@ -869,36 +941,31 @@ class StrategyCooldownState:
 @dataclass(slots=True)
 class StrategyMetricsState:
     """
-    In-memory metrics для strategy layer.
+    Runtime metrics for strategy layer.
 
-    Це lightweight runtime metrics, не Prometheus exporter.
-    Prometheus/Grafana можна будувати окремо на основі цих counters.
+    Не є storage/persistence. Для dashboard/storage можна робити snapshots.
     """
 
     evaluations_total: int = 0
     evaluations_passed: int = 0
     evaluations_failed: int = 0
+
     signals_generated: int = 0
     signals_rejected: int = 0
     signals_expired: int = 0
+    signals_confirmed: int = 0
+    signals_executed: int = 0
+    signals_failed: int = 0
+    signals_cancelled: int = 0
+
     applicability_skipped: int = 0
     errors_total: int = 0
 
-    evaluations_by_strategy: dict[str, int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
-    signals_by_strategy: dict[str, int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
-    signals_by_symbol: dict[str, int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
-    signals_by_category: dict[StrategyCategory, int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
-    errors_by_strategy: dict[str, int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
+    evaluations_by_strategy: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    signals_by_strategy: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    signals_by_symbol: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    signals_by_category: dict[StrategyCategory, int] = field(default_factory=lambda: defaultdict(int))
+    errors_by_strategy: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
     last_evaluation_at: dict[str, datetime] = field(default_factory=dict)
     last_signal_at: dict[str, datetime] = field(default_factory=dict)
@@ -906,7 +973,6 @@ class StrategyMetricsState:
 
     started_at: datetime = field(default_factory=utcnow)
     updated_at: datetime | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.started_at = ensure_aware_utc(self.started_at)
@@ -940,13 +1006,22 @@ class StrategyMetricsState:
         self.signals_by_category[signal.category] += 1
         self.last_signal_at[signal.strategy_name] = signal.timestamp
 
-        if signal.status == SignalStatus.REJECTED:
-            self.signals_rejected += 1
-
-        if signal.status == SignalStatus.EXPIRED:
-            self.signals_expired += 1
-
+        self.record_status(signal.status)
         self.touch()
+
+    def record_status(self, status: SignalStatus) -> None:
+        if status == SignalStatus.REJECTED:
+            self.signals_rejected += 1
+        elif status == SignalStatus.EXPIRED:
+            self.signals_expired += 1
+        elif status == SignalStatus.CONFIRMED:
+            self.signals_confirmed += 1
+        elif status == SignalStatus.EXECUTED:
+            self.signals_executed += 1
+        elif status == SignalStatus.FAILED:
+            self.signals_failed += 1
+        elif status == SignalStatus.CANCELLED:
+            self.signals_cancelled += 1
 
     def record_rejected_signal(self, signal: StrategySignal) -> None:
         signal.validate()
@@ -1003,9 +1078,15 @@ class StrategyMetricsState:
         self.evaluations_total = 0
         self.evaluations_passed = 0
         self.evaluations_failed = 0
+
         self.signals_generated = 0
         self.signals_rejected = 0
         self.signals_expired = 0
+        self.signals_confirmed = 0
+        self.signals_executed = 0
+        self.signals_failed = 0
+        self.signals_cancelled = 0
+
         self.applicability_skipped = 0
         self.errors_total = 0
 
@@ -1031,6 +1112,10 @@ class StrategyMetricsState:
             "signals_generated": self.signals_generated,
             "signals_rejected": self.signals_rejected,
             "signals_expired": self.signals_expired,
+            "signals_confirmed": self.signals_confirmed,
+            "signals_executed": self.signals_executed,
+            "signals_failed": self.signals_failed,
+            "signals_cancelled": self.signals_cancelled,
             "applicability_skipped": self.applicability_skipped,
             "errors_total": self.errors_total,
             "error_rate": self.error_rate,
@@ -1038,7 +1123,7 @@ class StrategyMetricsState:
             "signals_by_strategy": dict(self.signals_by_strategy),
             "signals_by_symbol": dict(self.signals_by_symbol),
             "signals_by_category": {
-                str(category): count
+                category.value: count
                 for category, count in self.signals_by_category.items()
             },
             "errors_by_strategy": dict(self.errors_by_strategy),
@@ -1062,7 +1147,7 @@ class StrategyRuntimeState:
 
     Не має EventBus subscription і не виконує торгову логіку.
     Його використовують StrategyEngine, SignalProcessor, PortfolioCoordinator
-    та domain strategies як shared in-memory runtime state.
+    та StrategyEventHandler як shared in-memory runtime state.
     """
 
     signals: SignalState = field(default_factory=SignalState)
@@ -1106,15 +1191,20 @@ class StrategyRuntimeState:
         symbol: str,
         *,
         timestamp: datetime | None = None,
+        timeframe: Timeframe = Timeframe.M1,
         include_regime: bool = True,
         include_portfolio: bool = True,
     ) -> StrategyContext:
-        return self.contexts.build_context(
+        context = self.contexts.build_context(
             symbol,
             timestamp=timestamp,
+            timeframe=timeframe,
             include_regime=include_regime,
             include_portfolio=include_portfolio,
         )
+        self.active_symbols.add(context.symbol)
+        self.touch()
+        return context
 
     def update_signal(
         self,
@@ -1142,6 +1232,61 @@ class StrategyRuntimeState:
 
         self.touch()
 
+    def mark_signal_status(
+        self,
+        *,
+        signal_id: str | None = None,
+        symbol: str | None = None,
+        strategy_name: str | None = None,
+        side: SignalSide | None = None,
+        status: SignalStatus,
+        reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> StrategySignal | None:
+        signal = self.signals.find_signal(
+            signal_id=signal_id,
+            symbol=symbol,
+            strategy_name=strategy_name,
+            side=side,
+        )
+
+        if signal is None:
+            return None
+
+        updated = self.signals.mark_status(
+            signal,
+            status=status,
+            reason=reason,
+            active=status in {SignalStatus.NEW, SignalStatus.PENDING, SignalStatus.CONFIRMED},
+            metadata=metadata,
+        )
+
+        self.metrics.record_status(status)
+        self.touch()
+        return updated
+
+    def mark_signal_status_from_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        status: SignalStatus,
+        default_reason: str,
+    ) -> StrategySignal | None:
+        updated = self.signals.mark_status_from_payload(
+            payload=payload,
+            status=status,
+            default_reason=default_reason,
+        )
+
+        if updated is not None:
+            self.metrics.record_status(status)
+            self.touch()
+
+        return updated
+
+    def get_signal_by_id(self, signal_id: str | None) -> StrategySignal | None:
+        return self.signals.get_by_signal_id(signal_id)
+
     def set_regime(self, snapshot: RegimeSnapshot) -> None:
         snapshot.validate()
 
@@ -1155,10 +1300,16 @@ class StrategyRuntimeState:
         self.contexts.set_portfolio(snapshot)
         self.touch()
 
+    def upsert_feature(self, snapshot: FeatureSnapshot) -> None:
+        snapshot.validate()
+
+        self.contexts.put_feature(snapshot)
+        self.active_symbols.add(snapshot.symbol)
+        self.touch()
+
     def block_symbol(self, symbol: str) -> None:
         if not symbol.strip():
             raise StrategyStateError("symbol cannot be empty")
-
         self.blocked_symbols.add(symbol)
         self.touch()
 
@@ -1167,118 +1318,51 @@ class StrategyRuntimeState:
         self.touch()
 
     def is_symbol_blocked(self, symbol: str) -> bool:
-        return (
-            symbol in self.blocked_symbols
-            or symbol in self.contexts.portfolio.blocked_symbols
-        )
-
-    def add_strategy_cooldown(
-        self,
-        *,
-        symbol: str,
-        strategy_name: str,
-        seconds: int,
-        reason: str | None = None,
-    ) -> None:
-        self.cooldowns.add_strategy_cooldown(
-            symbol=symbol,
-            strategy_name=strategy_name,
-            seconds=seconds,
-            reason=reason,
-        )
-        self.touch()
-
-    def add_side_cooldown(
-        self,
-        *,
-        symbol: str,
-        side: SignalSide,
-        seconds: int,
-        reason: str | None = None,
-    ) -> None:
-        self.cooldowns.add_side_cooldown(
-            symbol=symbol,
-            side=side,
-            seconds=seconds,
-            reason=reason,
-        )
-        self.touch()
-
-    def add_symbol_cooldown(
-        self,
-        *,
-        symbol: str,
-        seconds: int,
-        reason: str | None = None,
-    ) -> None:
-        self.cooldowns.add_symbol_cooldown(
-            symbol=symbol,
-            seconds=seconds,
-            reason=reason,
-        )
-        self.touch()
-
-    def is_blocked_by_cooldown(
-        self,
-        *,
-        symbol: str,
-        strategy_name: str | None = None,
-        side: SignalSide | None = None,
-        now: datetime | None = None,
-    ) -> bool:
-        return self.cooldowns.is_blocked(
-            symbol=symbol,
-            strategy_name=strategy_name,
-            side=side,
-            now=now,
-        )
-
-    def prune(
-        self,
-        *,
-        max_signal_age_seconds: int | None = None,
-        now: datetime | None = None,
-    ) -> dict[str, int]:
-        current = ensure_aware_utc(now or utcnow())
-
-        removed_cooldowns = self.cooldowns.prune_expired(current)
-        removed_features = self.contexts.prune_expired_features(current)
-
-        self.signals.prune_inactive()
-
-        removed_old_signals = 0
-        if max_signal_age_seconds is not None:
-            if max_signal_age_seconds <= 0:
-                raise StrategyStateError("max_signal_age_seconds must be > 0")
-
-            before = len(self.signals.history)
-            cutoff = current - timedelta(seconds=max_signal_age_seconds)
-            self.signals.prune_older_than(cutoff)
-            removed_old_signals = before - len(self.signals.history)
-
-        self.touch()
-
-        return {
-            "removed_cooldowns": removed_cooldowns,
-            "removed_features": removed_features,
-            "removed_old_signals": removed_old_signals,
-        }
+        return symbol in self.blocked_symbols
 
     def clear_symbol(self, symbol: str) -> None:
-        self.contexts.remove_symbol(symbol)
         self.signals.clear_symbol(symbol)
-        self.cooldowns.clear_symbol(symbol)
+        self.contexts.remove_symbol(symbol)
         self.blocked_symbols.discard(symbol)
         self.active_symbols.discard(symbol)
         self.touch()
 
-    def clear(self) -> None:
+    def prune(
+        self,
+        *,
+        max_signal_age_seconds: int,
+    ) -> dict[str, int]:
+        if max_signal_age_seconds <= 0:
+            raise StrategyStateError("max_signal_age_seconds must be > 0")
+
+        cutoff = utcnow() - timedelta(seconds=max_signal_age_seconds)
+
+        removed_signals = self.signals.prune_older_than(cutoff)
+        removed_cooldowns = self.cooldowns.prune_expired()
+        removed_features = self.contexts.prune_stale_features()
+
+        self.touch()
+
+        return {
+            "signals_history": removed_signals.get("history", 0),
+            "signals_rejected": removed_signals.get("rejected", 0),
+            "signals_expired": removed_signals.get("expired", 0),
+            "signals_confirmed": removed_signals.get("confirmed", 0),
+            "signals_executed": removed_signals.get("executed", 0),
+            "signals_failed": removed_signals.get("failed", 0),
+            "signals_cancelled": removed_signals.get("cancelled", 0),
+            "cooldowns": removed_cooldowns,
+            "features": removed_features,
+        }
+
+    def reset(self) -> None:
         self.signals.clear()
         self.contexts.clear()
         self.cooldowns.clear()
         self.metrics.reset()
         self.blocked_symbols.clear()
         self.active_symbols.clear()
+        self.started_at = utcnow()
         self.touch()
 
     def summary(self) -> dict[str, Any]:
@@ -1291,4 +1375,14 @@ class StrategyRuntimeState:
             "active_symbols": sorted(self.active_symbols),
             "started_at": self.started_at,
             "updated_at": self.updated_at,
+            "metadata": dict(self.metadata),
         }
+
+
+__all__ = [
+    "SignalState",
+    "StrategyContextStore",
+    "StrategyCooldownState",
+    "StrategyMetricsState",
+    "StrategyRuntimeState",
+]

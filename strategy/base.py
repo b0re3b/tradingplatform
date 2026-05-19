@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Awaitable, Callable
@@ -10,7 +11,7 @@ from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
-from .config import StrategyConfig, StrategyDefinitionConfig
+from .config import StrategyConfig, StrategyDefinitionConfig, StrategyRuntimeConfig
 from .enums import (
     MarketRegime,
     SetupType,
@@ -29,6 +30,7 @@ from .models import (
     StrategySignal,
     confidence_to_grade,
     confidence_to_strength,
+    ensure_aware_utc,
     utcnow,
 )
 
@@ -45,6 +47,7 @@ class BaseStrategyComponent(ABC):
     - StrategyContextBuilder
     - StrategyEventHandler
     - StrategyLifecycleManager
+    - StrategyRegistry
     - SignalProcessor
     - SignalNormalizer
     - SignalRouter
@@ -53,14 +56,15 @@ class BaseStrategyComponent(ABC):
     - SignalScorer
     - SignalFilterChain
     - SignalBuilder
-    - concrete strategies
+    - BaseStrategy / concrete strategies
 
     Правила:
     - config передається через constructor dependency injection;
     - EventBus передається через constructor dependency injection;
     - Scheduler передається через constructor dependency injection;
     - logger береться через core.logger.get_logger();
-    - міжмодульна комунікація йде через EventBus.
+    - міжмодульна комунікація йде через EventBus;
+    - periodic/background jobs мають іти через Scheduler, не через unmanaged loops.
     """
 
     component_namespace: str = "strategy"
@@ -70,14 +74,24 @@ class BaseStrategyComponent(ABC):
         config: StrategyConfig,
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
+        *,
+        service_name: str | None = None,
     ) -> None:
         self.config = config
         self.event_bus = event_bus
         self.scheduler = scheduler
-        self.logger = get_logger(__name__)
+
+        self._service_name = service_name or self.component_namespace
+        self.logger = get_logger(
+            __name__,
+            service=self._service_name,
+            event_type=self.component_name,
+        )
 
         self._started: bool = False
         self._registered: bool = False
+        self._subscriptions: list[Any] = []
+        self._scheduler_jobs: list[Any] = []
 
         self.validate_config()
 
@@ -93,35 +107,69 @@ class BaseStrategyComponent(ABC):
     def is_registered(self) -> bool:
         return self._registered
 
+    @property
+    def subscriptions_count(self) -> int:
+        return len(self._subscriptions)
+
+    @property
+    def scheduler_jobs_count(self) -> int:
+        return len(self._scheduler_jobs)
+
     def validate_config(self) -> None:
         if self.config is None:
             raise StrategyConfigError(f"{self.component_name}: config is required")
 
-        self.config.validate()
+        validate = getattr(self.config, "validate", None)
+        if callable(validate):
+            validate()
 
     def register(self) -> None:
         """
         Register EventBus subscriptions.
 
-        Компоненти, які слухають події, перевизначають цей метод.
+        Компоненти, які реально слухають події, мають перевизначити цей метод.
+        Базова реалізація тільки позначає компонент як registered.
         """
         self._registered = True
+
+    def unregister(self) -> None:
+        """
+        Unregister EventBus subscriptions owned by this component.
+
+        Concrete components should use subscribe_event(), щоб підписки були
+        збережені в _subscriptions і могли бути коректно зняті під час stop().
+        """
+        if self.event_bus is not None:
+            for subscription in list(self._subscriptions):
+                try:
+                    self.event_bus.unsubscribe(subscription)
+                except Exception:
+                    self.log_exception(
+                        "Failed to unsubscribe strategy component",
+                        subscription=str(subscription),
+                    )
+
+        self._subscriptions.clear()
+        self._registered = False
 
     async def start(self) -> None:
         """
         Async lifecycle hook.
         """
         if self._started:
+            self.log_debug("Component already started")
             return
 
         if not self._registered:
             self.register()
 
         self._started = True
-        self.logger.info(
-            "%s started",
-            self.component_name,
-            extra={"component": self.component_name},
+
+        self.log_info(
+            "Component started",
+            registered=self._registered,
+            subscriptions=len(self._subscriptions),
+            scheduler_jobs=len(self._scheduler_jobs),
         )
 
     async def stop(self) -> None:
@@ -129,14 +177,13 @@ class BaseStrategyComponent(ABC):
         Async cleanup hook.
         """
         if not self._started:
+            self.log_debug("Component already stopped")
             return
 
+        self.unregister()
         self._started = False
-        self.logger.info(
-            "%s stopped",
-            self.component_name,
-            extra={"component": self.component_name},
-        )
+
+        self.log_info("Component stopped")
 
     def ensure_event_bus(self) -> EventBus:
         if self.event_bus is None:
@@ -160,16 +207,19 @@ class BaseStrategyComponent(ABC):
         """
         Publish event through EventBus.
 
-        Використовувати тільки для реальних domain/system events,
-        а не для локальних helper-обчислень.
+        Використовувати тільки для domain/system events, не для локальних
+        helper-обчислень.
         """
+        if not topic.strip():
+            raise ValueError("topic cannot be empty")
+
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+
         if self.event_bus is None:
-            self.logger.debug(
+            self.log_debug(
                 "Event skipped because event_bus is not configured",
-                extra={
-                    "component": self.component_name,
-                    "topic": topic,
-                },
+                topic=topic,
             )
             return
 
@@ -181,37 +231,102 @@ class BaseStrategyComponent(ABC):
             **kwargs,
         )
 
+    def emit_event_nowait_best_effort(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority = EventPriority.NORMAL,
+        source: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Best-effort EventBus emit for sync code paths.
+
+        Використовувати обережно: для важливих signal/risk подій краще await
+        emit_event().
+        """
+        if self.event_bus is None:
+            self.log_debug(
+                "Best-effort event skipped because event_bus is not configured",
+                topic=topic,
+            )
+            return
+
+        publish_nowait = getattr(self.event_bus, "publish_nowait_best_effort", None)
+        if callable(publish_nowait):
+            publish_nowait(
+                topic,
+                payload,
+                priority=priority,
+                source=source or self.component_name,
+                **kwargs,
+            )
+            return
+
+        self.log_warning(
+            "EventBus does not support publish_nowait_best_effort",
+            topic=topic,
+        )
+
     def subscribe_event(
         self,
         topic: str,
         handler: EventHandler,
         **kwargs: Any,
-    ) -> None:
+    ) -> Any:
         """
-        Subscribe component to EventBus topic.
+        Subscribe component to EventBus topic and remember subscription.
         """
+        if not topic.strip():
+            raise ValueError("topic cannot be empty")
+
         bus = self.ensure_event_bus()
-        bus.subscribe(topic, handler, **kwargs)
+        subscription = bus.subscribe(topic, handler, **kwargs)
+        self._subscriptions.append(subscription)
+        return subscription
+
+    def remember_scheduler_job(self, job: Any) -> Any:
+        """
+        Store Scheduler job reference for stats/lifecycle visibility.
+        """
+        self._scheduler_jobs.append(job)
+        return job
 
     def log_debug(self, message: str, **extra: Any) -> None:
-        self.logger.debug(message, extra={"component": self.component_name, **extra})
+        self.logger.debug(
+            message,
+            extra={"component": self.component_name, **extra},
+        )
 
     def log_info(self, message: str, **extra: Any) -> None:
-        self.logger.info(message, extra={"component": self.component_name, **extra})
+        self.logger.info(
+            message,
+            extra={"component": self.component_name, **extra},
+        )
 
     def log_warning(self, message: str, **extra: Any) -> None:
-        self.logger.warning(message, extra={"component": self.component_name, **extra})
+        self.logger.warning(
+            message,
+            extra={"component": self.component_name, **extra},
+        )
 
     def log_error(self, message: str, **extra: Any) -> None:
-        self.logger.error(message, extra={"component": self.component_name, **extra})
+        self.logger.error(
+            message,
+            extra={"component": self.component_name, **extra},
+        )
 
     def log_exception(self, message: str, **extra: Any) -> None:
-        self.logger.exception(message, extra={"component": self.component_name, **extra})
+        self.logger.exception(
+            message,
+            extra={"component": self.component_name, **extra},
+        )
 
 
 class StatefulStrategyComponent(BaseStrategyComponent, ABC):
     """
-    Base class for components that keep internal runtime state.
+    Base class for strategy components that keep local runtime state.
     """
 
     @abstractmethod
@@ -224,57 +339,112 @@ class StatefulStrategyComponent(BaseStrategyComponent, ABC):
 class ContextAwareStrategyComponent(BaseStrategyComponent, ABC):
     """
     Base class for components that consume StrategyContext.
+
+    Важливо:
+    - StrategyContext живе в models.py;
+    - старий context.py більше не потрібен;
+    - concrete strategies читають тільки StrategyContext, а не analytics/data напряму.
     """
 
     def validate_context(self, context: StrategyContext) -> None:
         if context is None:
             raise StrategyEvaluationError(f"{self.component_name}: context is required")
 
+        if not isinstance(context, StrategyContext):
+            raise StrategyEvaluationError(
+                f"{self.component_name}: context must be StrategyContext, got {type(context)!r}"
+            )
+
         context.validate()
 
+    def require_feature(self, context: StrategyContext, feature_name: str) -> Any:
+        """
+        Return required feature value or raise StrategyEvaluationError.
+        """
+        self.validate_context(context)
 
-class NamedEntityMixin:
+        if not feature_name.strip():
+            raise StrategyEvaluationError("feature_name cannot be empty")
+
+        if not context.has_feature(feature_name):
+            raise StrategyEvaluationError(
+                f"{self.component_name}: missing required feature '{feature_name}' "
+                f"for symbol {context.symbol}"
+            )
+
+        return context.get_feature(feature_name)
+
+    def optional_feature(
+        self,
+        context: StrategyContext,
+        feature_name: str,
+        default: Any = None,
+    ) -> Any:
+        """
+        Return optional feature value from StrategyContext.
+        """
+        self.validate_context(context)
+
+        if not feature_name.strip():
+            raise StrategyEvaluationError("feature_name cannot be empty")
+
+        if not context.has_feature(feature_name):
+            return default
+
+        return context.get_feature(feature_name)
+
+    def has_required_features(
+        self,
+        context: StrategyContext,
+        required_features: set[str],
+    ) -> bool:
+        self.validate_context(context)
+        return all(context.has_feature(feature) for feature in required_features)
+
+
+class BaseStrategy(ContextAwareStrategyComponent, ABC):
     """
-    Unified name accessor for registry, metrics and logs.
-    """
+    Фінальний базовий клас для всіх concrete strategy classes.
 
-    @property
-    def name(self) -> str:
-        return self.__class__.__name__
-
-
-class PrioritizedMixin:
-    """
-    Unified priority accessor for sorting components/strategies.
-    """
-
-    @property
-    def priority(self) -> int:
-        return 100
-
-
-class BaseStrategy(
-    ContextAwareStrategyComponent,
-    NamedEntityMixin,
-    PrioritizedMixin,
-    ABC,
-):
-    """
-    Base class for all concrete trading strategies.
-
-    Contract:
+    Контракт:
     - strategy читає тільки StrategyContext;
-    - strategy не викликає analytics/risk/execution напряму;
+    - strategy не читає analytics/data напряму;
+    - strategy не викликає risk/execution напряму;
+    - strategy не публікує signal.generated;
     - strategy повертає StrategyEvaluation;
-    - публікація signal.generated має бути в StrategyEngine / SignalProcessor.
+    - SignalProcessor/SignalRouter перетворює StrategySignal у risk-ready payload.
     """
+
+    component_namespace: str = "strategy.base_strategy"
 
     category: StrategyCategory = StrategyCategory.HYBRID
     default_setup_type: SetupType = SetupType.UNKNOWN
     default_timeframe: Timeframe = Timeframe.M1
+    default_trigger_type: TriggerType = TriggerType.PRIMARY
+
+    def __init__(
+        self,
+        config: StrategyConfig,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        service_name: str | None = None,
+    ) -> None:
+        self._definition_override = definition
+
+        super().__init__(
+            config=config,
+            event_bus=event_bus,
+            scheduler=scheduler,
+            service_name=service_name or f"strategy.{self.__class__.__name__}",
+        )
 
     @property
     def strategy_name(self) -> str:
+        definition = self.get_definition_config()
+        if definition is not None and definition.name.strip():
+            return definition.name
         return self.__class__.__name__
 
     @property
@@ -283,79 +453,151 @@ class BaseStrategy(
 
     @property
     def priority(self) -> int:
-        return self.config.get_strategy_priority(self.strategy_name, default=100)
+        definition = self.get_definition_config()
+        if definition is None:
+            return 100
+        return definition.priority
+
+    @property
+    def weight(self) -> float:
+        definition = self.get_definition_config()
+        if definition is None:
+            return 1.0
+        return definition.weight
 
     def get_definition_config(self) -> StrategyDefinitionConfig | None:
-        return self.config.get_strategy(self.strategy_name)
+        """
+        Resolve per-strategy definition config.
 
-    def is_enabled(self) -> bool:
-        return (
-            self.config.is_strategy_enabled(self.strategy_name, default=True)
-            and self.config.is_strategy_allowed_by_preset(self.strategy_name)
-        )
+        Підтримує:
+        - explicit definition override;
+        - StrategyConfig.get_strategy(name);
+        - StrategyConfig.strategies dict fallback.
+        """
+        if self._definition_override is not None:
+            return self._definition_override
 
-    def required_features(self) -> set[str]:
-        return self.config.get_strategy_required_features(self.strategy_name)
+        getter = getattr(self.config, "get_strategy", None)
+        if callable(getter):
+            definition = getter(self.__class__.__name__)
+            if definition is not None:
+                return definition
 
-    def supported_regimes(self) -> set[MarketRegime]:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return set(runtime.allowed_regimes)
+            definition = getter(self.strategy_name) if self.strategy_name != self.__class__.__name__ else None
+            if definition is not None:
+                return definition
 
-    def supported_timeframes(self) -> set[Timeframe]:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return set(runtime.timeframes)
+        strategies = getattr(self.config, "strategies", None)
+        if isinstance(strategies, dict):
+            definition = strategies.get(self.__class__.__name__)
+            if definition is not None:
+                return definition
 
-    def min_confidence(self) -> float:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return runtime.min_confidence
+            definition = strategies.get(self.strategy_name)
+            if definition is not None:
+                return definition
 
-    def min_score(self) -> float:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return runtime.min_score
+        return None
 
-    def allowed_symbols(self) -> set[str]:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return set(runtime.symbols)
+    def get_runtime_config(self) -> StrategyRuntimeConfig:
+        definition = self.get_definition_config()
+        if definition is not None:
+            return definition.runtime
 
-    def cooldown_seconds(self) -> int:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return runtime.cooldown_seconds
+        runtime = getattr(self.config, "runtime", None)
+        if runtime is None:
+            raise StrategyConfigError(
+                f"{self.strategy_name}: StrategyConfig.runtime is required"
+            )
 
-    def max_signal_age_seconds(self) -> int:
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-        return runtime.max_signal_age_seconds
+        return runtime
 
     def validate_config(self) -> None:
         super().validate_config()
 
-        definition = self.get_definition_config()
+        definition = self._definition_override
         if definition is not None:
             definition.validate()
+
+        runtime = self.get_runtime_config()
+        runtime.validate()
+
+    def is_enabled(self) -> bool:
+        return self.get_runtime_config().enabled
+
+    def required_features(self) -> set[str]:
+        definition = self.get_definition_config()
+        if definition is not None:
+            return set(definition.required_features)
+        return set()
+
+    def supported_regimes(self) -> set[MarketRegime]:
+        runtime = self.get_runtime_config()
+        return set(runtime.allowed_regimes)
+
+    def supported_timeframes(self) -> set[Timeframe]:
+        runtime = self.get_runtime_config()
+        return set(runtime.timeframes)
+
+    def allowed_symbols(self) -> set[str]:
+        runtime = self.get_runtime_config()
+        return set(runtime.symbols)
+
+    def min_confidence(self) -> float:
+        return float(self.get_runtime_config().min_confidence)
+
+    def min_score(self) -> float:
+        return float(self.get_runtime_config().min_score)
+
+    def cooldown_seconds(self) -> int:
+        return int(self.get_runtime_config().cooldown_seconds)
+
+    def max_signal_age_seconds(self) -> int:
+        return int(self.get_runtime_config().max_signal_age_seconds)
+
+    def supports_symbol(self, symbol: str) -> bool:
+        if not symbol.strip():
+            return False
+
+        allowed = self.allowed_symbols()
+        if not allowed:
+            return True
+
+        return symbol in allowed
+
+    def supports_timeframe(self, timeframe: Timeframe) -> bool:
+        return timeframe in self.supported_timeframes()
+
+    def supports_regime(self, regime: MarketRegime) -> bool:
+        regimes = self.supported_regimes()
+
+        if MarketRegime.UNKNOWN in regimes:
+            return True
+
+        return regime in regimes
 
     def validate_context_requirements(self, context: StrategyContext) -> None:
         self.validate_context(context)
 
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-
-        if not runtime.allows_symbol(context.symbol):
+        if not self.supports_symbol(context.symbol):
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: symbol {context.symbol} is not allowed"
             )
 
-        if not runtime.allows_timeframe(context.timeframe):
+        if not self.supports_timeframe(context.timeframe):
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: timeframe {context.timeframe} is not supported"
             )
 
-        if not runtime.allows_regime(context.current_regime):
+        regime = self._context_regime(context)
+        if not self.supports_regime(regime):
             raise StrategyEvaluationError(
-                f"{self.strategy_name}: regime {context.current_regime} is not supported"
+                f"{self.strategy_name}: regime {regime.value} is not supported"
             )
 
-        required = self.required_features()
         missing = [
             feature
-            for feature in required
+            for feature in self.required_features()
             if not context.has_feature(feature)
         ]
         if missing:
@@ -365,86 +607,116 @@ class BaseStrategy(
 
     def should_evaluate(self, context: StrategyContext) -> bool:
         """
-        Lightweight applicability check.
+        Fast applicability check.
 
-        Не кидає exception для нормальних випадків, коли стратегія просто
-        не підходить під поточний context.
+        Не кидає exception для normal negative cases.
         """
         if not self.is_enabled():
             return False
 
-        runtime = self.config.get_strategy_runtime(self.strategy_name)
-
-        if not runtime.allows_symbol(context.symbol):
+        try:
+            self.validate_context_requirements(context)
+        except StrategyEvaluationError:
             return False
-
-        if not runtime.allows_timeframe(context.timeframe):
-            return False
-
-        if not runtime.allows_regime(context.current_regime):
-            return False
-
-        required = self.required_features()
-        if required and not required.issubset(set(context.feature_map.keys())):
-            if not self.config.routing.allow_partial_context:
-                return False
 
         return True
 
     async def evaluate(self, context: StrategyContext) -> StrategyEvaluation:
         """
-        Єдиний зовнішній entrypoint для оцінки стратегії.
+        Evaluate one StrategyContext and return StrategyEvaluation.
 
-        Concrete strategies мають реалізовувати generate_signal(),
-        а не дублювати evaluate().
+        Concrete strategy implements only generate_signal().
+        BaseStrategy handles:
+        - context validation;
+        - enabled/symbol/timeframe/regime/feature checks;
+        - confidence/score thresholds;
+        - signal enrichment;
+        - consistent StrategyEvaluation construction.
         """
-        self.validate_context(context)
-
-        if not self.should_evaluate(context):
-            return StrategyEvaluation(
-                strategy_name=self.strategy_name,
-                symbol=context.symbol,
-                timestamp=context.timestamp,
-                passed=False,
-                reasons=["strategy_not_applicable"],
-            )
+        timestamp = getattr(context, "timestamp", None) or utcnow()
+        timestamp = ensure_aware_utc(timestamp)
 
         try:
-            signal = await self.generate_signal(context)
-        except StrategyEvaluationError:
-            raise
+            self.validate_context(context)
+
+            if not self.should_evaluate(context):
+                return self._build_evaluation(
+                    context=context,
+                    timestamp=timestamp,
+                    passed=False,
+                    signal=None,
+                    reasons=["strategy_not_applicable"],
+                )
+
+            signal = await self._call_generate_signal(context)
+
+            if signal is None:
+                return self._build_evaluation(
+                    context=context,
+                    timestamp=timestamp,
+                    passed=False,
+                    signal=None,
+                    reasons=["no_signal_generated"],
+                )
+
+            self._prepare_signal(signal, context=context)
+            signal.validate()
+
+            reasons = list(signal.reasons)
+            passed = True
+
+            if not self._signal_is_directional(signal):
+                passed = False
+                reasons.append("signal_side_is_not_directional")
+
+            if signal.confidence < self.min_confidence():
+                passed = False
+                reasons.append("confidence_below_strategy_minimum")
+
+            if signal.score < self.min_score():
+                passed = False
+                reasons.append("score_below_strategy_minimum")
+
+            if not passed:
+                signal.to_rejected()
+                for reason in reasons:
+                    self._add_signal_reason(signal, reason)
+
+            return self._build_evaluation(
+                context=context,
+                timestamp=timestamp,
+                passed=passed,
+                signal=signal,
+                score=signal.score,
+                confidence=signal.confidence,
+                reasons=reasons,
+                metadata={
+                    "strategy_category": self.category.value,
+                    "strategy_priority": self.priority,
+                    "strategy_weight": self.weight,
+                    "required_features": sorted(self.required_features()),
+                },
+            )
+
         except Exception as exc:
             self.log_exception(
                 "Strategy evaluation failed",
-                strategy=self.strategy_name,
-                symbol=context.symbol,
+                strategy_name=self.strategy_name,
+                symbol=getattr(context, "symbol", None),
+                error=str(exc),
             )
-            raise StrategyEvaluationError(
-                f"{self.strategy_name}: evaluation failed: {exc}"
-            ) from exc
 
-        if signal is None:
-            return self.build_no_signal_evaluation(context)
-
-        signal.validate()
-
-        passed = (
-            signal.is_directional
-            and signal.confidence >= self.min_confidence()
-            and signal.score >= self.min_score()
-            and signal.passed_filters
-        )
-
-        return StrategyEvaluation(
-            strategy_name=self.strategy_name,
-            symbol=context.symbol,
-            timestamp=context.timestamp,
-            signal=signal,
-            passed=passed,
-            score=signal.score,
-            confidence=signal.confidence,
-            reasons=list(signal.reasons),
-        )
+            return self._build_evaluation(
+                context=context,
+                timestamp=timestamp,
+                passed=False,
+                signal=None,
+                reasons=[f"evaluation_error:{exc}"],
+                metadata={
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
 
     @abstractmethod
     async def generate_signal(
@@ -452,7 +724,16 @@ class BaseStrategy(
         context: StrategyContext,
     ) -> StrategySignal | None:
         """
-        Concrete strategy must implement signal generation logic.
+        Generate internal StrategySignal from StrategyContext.
+
+        Concrete strategies implement only this method.
+
+        Заборонено:
+        - публікувати signal.generated;
+        - викликати RiskManager;
+        - викликати Execution;
+        - рахувати final position size;
+        - читати analytics/data напряму.
         """
 
     def build_signal(
@@ -462,90 +743,162 @@ class BaseStrategy(
         side: SignalSide,
         confidence: float,
         score: float,
+        setup_type: SetupType | None = None,
         reasons: list[str] | None = None,
         confirmations: list[str] | None = None,
         source_features: list[str] | None = None,
-        combined_from: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
-        setup_type: SetupType | None = None,
-        trigger_type: TriggerType = TriggerType.PRIMARY,
+        trigger_type: TriggerType | None = None,
         origin: SignalOrigin = SignalOrigin.SINGLE_STRATEGY,
         priority: SignalPriority = SignalPriority.MEDIUM,
         status: SignalStatus = SignalStatus.NEW,
     ) -> StrategySignal:
-        confidence = self._clamp(confidence, 0.0, 1.0)
+        """
+        Convenience helper for concrete strategies.
 
-        return StrategySignal(
+        Стратегія може створювати signal через цей метод, а SignalProcessor
+        пізніше добудує entry/exit/execution plan і risk-ready payload.
+        """
+        self.validate_context_requirements(context)
+
+        signal = StrategySignal(
             symbol=context.symbol,
             side=side,
             strategy_name=self.strategy_name,
             category=self.category,
             timeframe=context.timeframe,
             setup_type=setup_type or self.default_setup_type,
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=confidence_to_strength(confidence),
-            confidence_grade=confidence_to_grade(confidence),
+            timestamp=ensure_aware_utc(context.timestamp),
+            confidence=float(confidence),
+            score=float(score),
+            confidence_grade=confidence_to_grade(float(confidence)),
+            strength=confidence_to_strength(float(confidence)),
             status=status,
-            trigger_type=trigger_type,
+            trigger_type=trigger_type or self.default_trigger_type,
             origin=origin,
             priority=priority,
-            reasons=reasons or [],
-            confirmations=confirmations or [],
-            source_features=source_features or [],
-            combined_from=combined_from or [],
-            regime=context.current_regime,
-            metadata=metadata or {},
+            reasons=list(reasons or []),
+            confirmations=list(confirmations or []),
+            source_features=list(source_features or []),
+            regime=self._context_regime(context),
+            metadata=dict(metadata or {}),
         )
 
-    def build_no_signal_evaluation(
+        self._prepare_signal(signal, context=context)
+        signal.validate()
+        return signal
+
+    async def _call_generate_signal(
         self,
         context: StrategyContext,
-        reason: str = "no_signal_generated",
+    ) -> StrategySignal | None:
+        result = self.generate_signal(context)
+
+        if inspect.isawaitable(result):
+            return await result
+
+        return result
+
+    def _prepare_signal(
+        self,
+        signal: StrategySignal,
+        *,
+        context: StrategyContext,
+    ) -> None:
+        """
+        Normalize/enrich StrategySignal before returning StrategyEvaluation.
+        """
+        if not signal.symbol:
+            signal.symbol = context.symbol
+
+        if not signal.strategy_name:
+            signal.strategy_name = self.strategy_name
+
+        signal.category = signal.category or self.category
+        signal.timeframe = signal.timeframe or context.timeframe
+        signal.setup_type = signal.setup_type or self.default_setup_type
+        signal.timestamp = ensure_aware_utc(signal.timestamp or context.timestamp or utcnow())
+
+        if signal.confidence_grade is None:
+            signal.confidence_grade = confidence_to_grade(signal.confidence)
+
+        if signal.strength is None:
+            signal.strength = confidence_to_strength(signal.confidence)
+
+        if signal.regime is None or signal.regime is MarketRegime.UNKNOWN:
+            signal.regime = self._context_regime(context)
+
+        signal.metadata.setdefault("strategy_name", self.strategy_name)
+        signal.metadata.setdefault("category", self.category.value)
+        signal.metadata.setdefault("timeframe", context.timeframe.value)
+        signal.metadata.setdefault("setup_type", signal.setup_type.value)
+        signal.metadata.setdefault("source", "strategy")
+        signal.metadata.setdefault("signal_id", signal.signal_id)
+
+    def _build_evaluation(
+        self,
+        *,
+        context: StrategyContext,
+        timestamp: datetime,
+        passed: bool,
+        signal: StrategySignal | None,
+        score: float = 0.0,
+        confidence: float = 0.0,
+        reasons: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> StrategyEvaluation:
         return StrategyEvaluation(
             strategy_name=self.strategy_name,
             symbol=context.symbol,
-            timestamp=context.timestamp,
-            passed=False,
-            reasons=[reason],
+            timestamp=ensure_aware_utc(timestamp),
+            signal=signal,
+            passed=passed,
+            score=float(score),
+            confidence=float(confidence),
+            reasons=list(reasons or []),
+            metadata=dict(metadata or {}),
         )
 
-    def add_reason_if(
-        self,
-        reasons: list[str],
-        condition: bool,
-        reason: str,
-    ) -> None:
-        if condition and reason not in reasons:
-            reasons.append(reason)
+    @staticmethod
+    def _signal_is_directional(signal: StrategySignal) -> bool:
+        side = signal.side
 
-    def get_feature(
-        self,
-        context: StrategyContext,
-        name: str,
-        default: Any = None,
-    ) -> Any:
-        return context.get_feature(name, default)
+        if isinstance(side, SignalSide):
+            return side.is_directional
 
-    def get_normalized_feature(
-        self,
-        context: StrategyContext,
-        name: str,
-        default: float | None = None,
-    ) -> float | None:
-        return context.get_normalized_feature(name, default)
-
-    def has_feature(self, context: StrategyContext, name: str) -> bool:
-        return context.has_feature(name)
-
-    def get_mid_price(self, context: StrategyContext) -> float | None:
-        return context.mid_price
-
-    def now(self) -> datetime:
-        return utcnow()
+        return str(side) in {SignalSide.LONG.value, SignalSide.SHORT.value}
 
     @staticmethod
-    def _clamp(value: float, min_value: float, max_value: float) -> float:
-        return max(min_value, min(value, max_value))
+    def _add_signal_reason(signal: StrategySignal, reason: str) -> None:
+        if not reason:
+            return
+
+        add_reason = getattr(signal, "add_reason", None)
+        if callable(add_reason):
+            add_reason(reason)
+            return
+
+        if reason not in signal.reasons:
+            signal.reasons.append(reason)
+
+    @staticmethod
+    def _context_regime(context: StrategyContext) -> MarketRegime:
+        current_regime = getattr(context, "current_regime", None)
+        if isinstance(current_regime, MarketRegime):
+            return current_regime
+
+        regime = getattr(context, "regime", None)
+        if regime is None:
+            return MarketRegime.UNKNOWN
+
+        value = getattr(regime, "regime", None)
+        if isinstance(value, MarketRegime):
+            return value
+
+        if isinstance(value, str):
+            try:
+                return MarketRegime(value)
+            except ValueError:
+                return MarketRegime.UNKNOWN
+
+        return MarketRegime.UNKNOWN
