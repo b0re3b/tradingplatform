@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from logging import Logger
 from typing import Any, Mapping, Protocol, TypeVar, cast
@@ -49,6 +50,50 @@ class PriceActionStrategyParamsProtocol(Protocol):
 
 
 ParamsT = TypeVar("ParamsT", bound=PriceActionStrategyParamsProtocol)
+
+
+PRICE_ACTION_COMPOSITE_FEATURE_NAMES: tuple[str, ...] = (
+    "analytics.price_action",
+    "price_action",
+    "price_action.composite",
+    "analytics.price_action.composite",
+)
+
+PRICE_ACTION_MODULE_ALIASES: dict[str, tuple[str, ...]] = {
+    "market_structure": (
+        "market_structure",
+        "structure",
+        "price_action.market_structure",
+        "analytics.price_action.market_structure",
+    ),
+    "support_resistance": (
+        "support_resistance",
+        "sr",
+        "price_action.support_resistance",
+        "analytics.price_action.support_resistance",
+    ),
+    "fair_value_gap": (
+        "fair_value_gap",
+        "fvg",
+        "price_action.fair_value_gap",
+        "price_action.fvg",
+        "analytics.price_action.fair_value_gap",
+        "analytics.price_action.fvg",
+    ),
+    "liquidity_levels": (
+        "liquidity_levels",
+        "liquidity",
+        "price_action.liquidity_levels",
+        "price_action.liquidity",
+        "analytics.price_action.liquidity_levels",
+        "analytics.price_action.liquidity",
+    ),
+    "trend": (
+        "trend",
+        "price_action.trend",
+        "analytics.price_action.trend",
+    ),
+}
 
 
 def utcnow() -> datetime:
@@ -134,6 +179,24 @@ def first_non_empty(*values: Any) -> Any:
     return None
 
 
+def _normalize_scope_value(value: Any, *, uppercase: bool = False) -> str | None:
+    if value is None:
+        return None
+
+    raw = str(getattr(value, "value", value)).strip()
+    if not raw:
+        return None
+
+    return raw.upper() if uppercase else raw.lower()
+
+
+def _timeframe_raw(value: Any) -> str | None:
+    if value is None:
+        return None
+    raw = str(getattr(value, "value", value)).strip()
+    return raw or None
+
+
 def apply_definition_metadata(
     *,
     params: Any,
@@ -141,12 +204,10 @@ def apply_definition_metadata(
     skip_fields: set[str] | None = None,
 ) -> Any:
     """
-    Універсальне застосування StrategyDefinitionConfig.metadata до params dataclass.
+    Застосовує StrategyDefinitionConfig.metadata до params dataclass.
 
-    Це дозволяє прибрати дублювання з:
-    - MarketStructureStrategyParams.from_definition()
-    - TrendContinuationStrategyParams.from_definition()
-    - FVGReactionStrategyParams.from_definition()
+    Runtime-gating залишається в StrategyConfig / StrategyDefinitionConfig.runtime.
+    Metadata використовується тільки для локальних параметрів конкретної strategy.
     """
     skip_fields = skip_fields or {"strategy_name"}
 
@@ -178,23 +239,31 @@ class PriceActionStrategyBase(
     PrioritizedMixin,
 ):
     """
-    Базовий клас для strategy/strategies/price_action.
+    Базовий adapter layer для strategy/strategies/price_action.
 
-    Дає спільну інфраструктуру для:
-    - MarketStructureStrategy
-    - TrendContinuationStrategy
-    - FVGReactionStrategy
-    - майбутніх SupportResistanceStrategy / LiquidityLevelsStrategy тощо
+    Цей клас не містить доменної торгової логіки. Його задача — вирівняти
+    конкретні стратегії з актуальним analytics.price_action contract:
 
-    Не містить конкретної торгової логіки.
-    Конкретні стратегії мають реалізовувати:
-    - evaluate()
-    - extraction/normalization
-    - score/confidence/reasons/build_signal
+        analytics.price_action.updated
+            -> PriceActionCompositeState
+            -> {market_structure, support_resistance, fair_value_gap,
+                liquidity_levels/liquidity, trend}
+            -> конкретна strategy
+
+    Важливо:
+    - не прив'язується до старих окремих strategy helper-файлів;
+    - не дублює StrategyEngine / SignalProcessor;
+    - не читає exchange/data напряму;
+    - дає backward-compatible aliases, щоб старі strategy-класи можна було
+      переписувати поступово.
     """
 
     category: StrategyCategory = StrategyCategory.PRICE_ACTION
     default_priority: int = 100
+
+    canonical_price_action_feature: str = "analytics.price_action"
+    composite_feature_names: tuple[str, ...] = PRICE_ACTION_COMPOSITE_FEATURE_NAMES
+    module_aliases: dict[str, tuple[str, ...]] = PRICE_ACTION_MODULE_ALIASES
 
     def __init__(
         self,
@@ -223,9 +292,6 @@ class PriceActionStrategyBase(
         self.validate_config()
 
         self.definition = self._resolve_definition(strategy_name)
-        # FIX: використовуємо cast щоб зберегти точну типізацію ParamsT
-        # від_definition є classmethod протоколу; виклик через cast є безпечним,
-        # оскільки всі конкретні реалізації ParamsT гарантують його наявність.
         self.params: ParamsT = cast(
             ParamsT,
             params_cls.from_definition(self.definition),  # type: ignore[attr-defined]
@@ -294,15 +360,6 @@ class PriceActionStrategyBase(
         return True
 
     def _basic_runtime_gate(self, context: SignalContext) -> StrategyEvaluation | None:
-        """
-        Спільний pre-check для evaluate().
-
-        Використання в дочірньому класі:
-
-            blocked = self._basic_runtime_gate(context)
-            if blocked is not None:
-                return blocked
-        """
         self.validate_context(context)
 
         if not self._is_strategy_enabled():
@@ -326,6 +383,429 @@ class PriceActionStrategyBase(
         return None
 
     # ------------------------------------------------------------------
+    # Price action analytics extraction
+    # ------------------------------------------------------------------
+
+    def _extract_price_action_state(self, context: SignalContext) -> dict[str, Any]:
+        """
+        Повертає normalized PriceActionCompositeState як dict.
+
+        Підтримує новий contract:
+        - context.price_action = composite state;
+        - feature analytics.price_action = {state: composite state};
+        - feature price_action / price_action.composite = legacy composite.
+        """
+        candidates: list[tuple[str, Any]] = []
+
+        price_action_attr = getattr(context, "price_action", None)
+        if price_action_attr is not None:
+            candidates.append(("context.price_action", price_action_attr))
+
+        for feature_name in self.composite_feature_names:
+            feature = self._get_context_feature(context, feature_name)
+            if feature is not None:
+                candidates.append((feature_name, feature))
+
+        for source_name, candidate in candidates:
+            state = self._normalize_state_payload(candidate)
+            if not state:
+                continue
+
+            if self._looks_like_price_action_composite(state):
+                result = dict(state)
+                result.setdefault("_source_feature", source_name)
+                return result
+
+        return {}
+
+    def _extract_price_action_module(
+        self,
+        context: SignalContext,
+        module_name: str,
+        *,
+        aliases: tuple[str, ...] = (),
+        require_scope_match: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Повертає normalized state конкретного analytics.price_action модуля.
+
+        Порядок пошуку:
+        1. PriceActionCompositeState у context.price_action / analytics.price_action;
+        2. module-specific feature analytics.price_action.<module>;
+        3. legacy aliases, які залишені тільки для поетапного переписування.
+
+        Якщо payload має scope і він не збігається з SignalContext, payload
+        ігнорується. Якщо частини scope у context немає, вона не блокує payload.
+        """
+        canonical = self._canonical_module_name(module_name)
+        candidates = self._module_candidate_names(canonical, aliases=aliases)
+
+        composite = self._extract_price_action_state(context)
+        module_payload = self._extract_module_from_composite(composite, canonical)
+        if module_payload:
+            normalized = self._normalize_state_payload(module_payload)
+            if normalized and (
+                not require_scope_match
+                or self._analytics_scope_matches_context(context, normalized)
+            ):
+                normalized = dict(normalized)
+                normalized.setdefault("_source_feature", composite.get("_source_feature", "analytics.price_action"))
+                normalized.setdefault("_source_module", canonical)
+                return normalized
+
+        # Direct access in context.price_action for legacy shapes:
+        # context.price_action["trend"], context.price_action["fvg"], etc.
+        price_action_mapping = self._mapping_or_empty(getattr(context, "price_action", None))
+        for candidate_name in candidates:
+            payload = price_action_mapping.get(candidate_name)
+            normalized = self._normalize_state_payload(payload)
+            if normalized and (
+                not require_scope_match
+                or self._analytics_scope_matches_context(context, normalized)
+            ):
+                normalized = dict(normalized)
+                normalized.setdefault("_source_feature", f"context.price_action.{candidate_name}")
+                normalized.setdefault("_source_module", canonical)
+                return normalized
+
+        # Feature map direct module payloads.
+        for candidate_name in candidates:
+            payload = self._get_context_feature(context, candidate_name)
+            normalized = self._normalize_state_payload(payload)
+            if normalized and (
+                not require_scope_match
+                or self._analytics_scope_matches_context(context, normalized)
+            ):
+                normalized = dict(normalized)
+                normalized.setdefault("_source_feature", candidate_name)
+                normalized.setdefault("_source_module", canonical)
+                return normalized
+
+        return {}
+
+    def _extract_module_from_composite(
+        self,
+        composite_payload: Mapping[str, Any],
+        module_name: str,
+    ) -> Mapping[str, Any]:
+        if not composite_payload:
+            return {}
+
+        state = self._normalize_state_payload(composite_payload)
+        if not state:
+            return {}
+
+        aliases = self._module_candidate_names(module_name)
+        for alias in aliases:
+            candidate = state.get(alias)
+            candidate_mapping = self._mapping_or_empty(candidate)
+            if candidate_mapping:
+                return candidate_mapping
+
+        # Some EventBus payloads may be shaped as:
+        # {"updated_module": "trend", "state": <module_state>}.
+        updated_module = str(state.get("updated_module") or "").strip().lower()
+        if updated_module in aliases:
+            module_state = self._mapping_or_empty(state.get("state"))
+            if module_state:
+                return module_state
+
+        return {}
+
+    def _normalize_state_payload(self, payload: Any) -> dict[str, Any]:
+        """
+        Нормалізує dataclass / dict / EventBus payload у plain dict state.
+
+        Підтримувані форми:
+        - dataclass state;
+        - {state: dataclass_or_dict};
+        - {payload: {state: ...}};
+        - {data: {state: ...}};
+        - direct state dict.
+        """
+        mapping = self._mapping_or_empty(payload)
+        if not mapping:
+            return {}
+
+        for wrapper_key in ("payload", "data"):
+            wrapped = mapping.get(wrapper_key)
+            wrapped_mapping = self._mapping_or_empty(wrapped)
+            if wrapped_mapping:
+                mapping = wrapped_mapping
+                break
+
+        state = mapping.get("state")
+        state_mapping = self._mapping_or_empty(state)
+        if state_mapping:
+            return dict(state_mapping)
+
+        return dict(mapping)
+
+    def _looks_like_price_action_composite(self, payload: Mapping[str, Any]) -> bool:
+        if not payload:
+            return False
+
+        module_keys = {
+            "market_structure",
+            "support_resistance",
+            "fair_value_gap",
+            "fvg",
+            "liquidity_levels",
+            "liquidity",
+            "trend",
+        }
+        if any(key in payload for key in module_keys):
+            return True
+
+        # A composite may be empty at startup but still scoped as analytics.price_action.
+        metadata = self._mapping_or_empty(payload.get("metadata"))
+        source = str(
+            first_non_empty(
+                payload.get("source"),
+                payload.get("event_namespace"),
+                metadata.get("source"),
+                metadata.get("event_namespace"),
+            )
+            or ""
+        ).strip()
+        return source == self.canonical_price_action_feature
+
+    def _module_candidate_names(
+        self,
+        module_name: str,
+        *,
+        aliases: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        canonical = self._canonical_module_name(module_name)
+        values: list[str] = [canonical]
+        values.extend(self.module_aliases.get(canonical, ()))
+        values.extend(aliases)
+
+        deduped: list[str] = []
+        for value in values:
+            normalized = str(value or "").strip()
+            if normalized and normalized not in deduped:
+                deduped.append(normalized)
+        return tuple(deduped)
+
+    @staticmethod
+    def _canonical_module_name(module_name: str) -> str:
+        normalized = str(module_name or "").strip().lower()
+        mapping = {
+            "fvg": "fair_value_gap",
+            "liquidity": "liquidity_levels",
+            "sr": "support_resistance",
+            "structure": "market_structure",
+        }
+        return mapping.get(normalized, normalized)
+
+    def _get_context_feature(self, context: SignalContext, feature_name: str) -> Any:
+        get_feature = getattr(context, "get_feature", None)
+        if callable(get_feature):
+            try:
+                return get_feature(feature_name)
+            except KeyError:
+                return None
+
+        features = getattr(context, "features", None)
+        features_mapping = self._mapping_or_empty(features)
+        if features_mapping:
+            return features_mapping.get(feature_name)
+
+        feature_map = getattr(context, "feature_map", None)
+        feature_map_mapping = self._mapping_or_empty(feature_map)
+        if feature_map_mapping:
+            return feature_map_mapping.get(feature_name)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Analytics scope helpers
+    # ------------------------------------------------------------------
+
+    def _analytics_scope_matches_context(
+        self,
+        context: SignalContext,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        mismatch = self._analytics_scope_mismatch(context, payload)
+        if mismatch:
+            self._logger.debug(
+                "Price action analytics payload skipped because scope does not match | strategy=%s mismatch=%s",
+                self.name,
+                mismatch,
+            )
+            return False
+        return True
+
+    def _analytics_scope_mismatch(
+        self,
+        context: SignalContext,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        scope = self._extract_analytics_scope(payload)
+        context_scope = self._extract_context_scope(context)
+
+        mismatches: dict[str, Any] = {}
+        for field_name in ("exchange", "market_type", "symbol", "timeframe"):
+            payload_value = scope.get(field_name)
+            context_value = context_scope.get(field_name)
+
+            # symbol/timeframe should usually exist in context. exchange/market_type
+            # may not exist yet in older SignalContext versions, so missing values
+            # do not block the payload.
+            if payload_value is None or context_value is None:
+                continue
+
+            if payload_value != context_value:
+                mismatches[field_name] = {
+                    "payload": payload_value,
+                    "context": context_value,
+                }
+
+        return mismatches
+
+    def _extract_context_scope(self, context: SignalContext) -> dict[str, Any]:
+        metadata = self._mapping_or_empty(getattr(context, "metadata", None))
+        market = self._mapping_or_empty(getattr(context, "market", None))
+
+        exchange = first_non_empty(
+            getattr(context, "exchange", None),
+            metadata.get("exchange"),
+            market.get("exchange"),
+        )
+        market_type = first_non_empty(
+            getattr(context, "market_type", None),
+            metadata.get("market_type"),
+            market.get("market_type"),
+        )
+        symbol = first_non_empty(
+            getattr(context, "symbol", None),
+            metadata.get("symbol"),
+            market.get("symbol"),
+        )
+        timeframe = first_non_empty(
+            getattr(context, "timeframe", None),
+            metadata.get("timeframe"),
+            market.get("timeframe"),
+        )
+
+        return {
+            "exchange": _normalize_scope_value(exchange),
+            "market_type": _normalize_scope_value(market_type),
+            "symbol": _normalize_scope_value(symbol, uppercase=True),
+            "timeframe": _timeframe_raw(timeframe),
+        }
+
+    def _extract_analytics_scope(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        state = self._normalize_state_payload(payload)
+        metadata = self._mapping_or_empty(state.get("metadata"))
+
+        key = first_non_empty(state.get("key"), metadata.get("key"))
+        key_values = list(key) if isinstance(key, (list, tuple)) else []
+
+        exchange = first_non_empty(
+            state.get("exchange"),
+            metadata.get("exchange"),
+            key_values[0] if len(key_values) > 0 else None,
+        )
+        market_type = first_non_empty(
+            state.get("market_type"),
+            metadata.get("market_type"),
+            key_values[1] if len(key_values) > 1 else None,
+        )
+        symbol = first_non_empty(
+            state.get("symbol"),
+            metadata.get("symbol"),
+            key_values[2] if len(key_values) > 2 else None,
+        )
+        timeframe = first_non_empty(
+            state.get("timeframe"),
+            metadata.get("timeframe"),
+            key_values[3] if len(key_values) > 3 else None,
+        )
+
+        return {
+            "exchange": _normalize_scope_value(exchange),
+            "market_type": _normalize_scope_value(market_type),
+            "symbol": _normalize_scope_value(symbol, uppercase=True),
+            "timeframe": _timeframe_raw(timeframe),
+            "exchange_symbol": first_non_empty(
+                state.get("exchange_symbol"),
+                metadata.get("exchange_symbol"),
+            ),
+            "key": key_values,
+        }
+
+    def _build_analytics_source_metadata(
+        self,
+        *,
+        module_name: str,
+        payload: Mapping[str, Any],
+        selected_entity: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Єдина metadata-структура для StrategySignal.metadata.
+
+        Конкретні стратегії мають додавати сюди selected gap/swing/level/signal id,
+        layer, source topic і state scope, щоб downstream Risk/Execution/Dashboard
+        бачили, на якому analytics state було побудовано сигнал.
+        """
+        state = self._normalize_state_payload(payload)
+        source_metadata = self._mapping_or_empty(state.get("metadata"))
+        entity = self._mapping_or_empty(selected_entity)
+
+        result: dict[str, Any] = {
+            "analytics_namespace": self.canonical_price_action_feature,
+            "analytics_module": self._canonical_module_name(module_name),
+            "analytics_source_feature": state.get("_source_feature"),
+            "analytics_scope": self._extract_analytics_scope(state),
+            "analytics_last_update": first_non_empty(
+                state.get("last_update"),
+                state.get("updated_at"),
+                source_metadata.get("last_update"),
+                source_metadata.get("updated_at"),
+            ),
+        }
+
+        state_version = first_non_empty(
+            state.get("state_version"),
+            source_metadata.get("state_version"),
+            source_metadata.get("version"),
+        )
+        if state_version is not None:
+            result["analytics_state_version"] = state_version
+
+        event_topic = first_non_empty(
+            state.get("topic"),
+            source_metadata.get("topic"),
+            source_metadata.get("event_topic"),
+        )
+        if event_topic is not None:
+            result["analytics_event_topic"] = event_topic
+
+        if entity:
+            for key in (
+                "layer",
+                "event_id",
+                "gap_id",
+                "level_id",
+                "swing_id",
+                "signal_id",
+                "event_type",
+                "status",
+                "direction",
+            ):
+                if key in entity and entity[key] is not None:
+                    result[f"selected_{key}"] = getattr(entity[key], "value", entity[key])
+
+        if extra:
+            result.update(dict(extra))
+
+        return result
+
+    # ------------------------------------------------------------------
     # Filters
     # ------------------------------------------------------------------
 
@@ -334,31 +814,69 @@ class PriceActionStrategyBase(
         context: SignalContext,
         *,
         filter_name: str | None = None,
+        module_name: str | None = None,
+        analytics_payload: Mapping[str, Any] | None = None,
     ) -> FilterResult | None:
         """
-        FIX: Перевіряємо ВСІ freshness_feature_names.
+        Freshness filter із підтримкою нового analytics.price_action contract.
 
-        Попередня реалізація повертала результат першої знайденої фічі та
-        ігнорувала решту, що могло пропустити stale-фічі.
-
-        Поточна логіка:
-        - якщо хоча б одна з фіч є stale → BLOCK (з ім'ям першої stale-фічі)
-        - якщо всі знайдені фічі fresh → PASS (з ім'ям першої знайденої)
-        - якщо жодна фіча не знайдена в контексті → None
+        Спочатку перевіряє explicit freshness_feature_names з params, щоб не
+        ламати існуючі StrategyContextBuilder реалізації. Далі додає canonical
+        analytics feature names для модуля / composite.
         """
+        candidate_features: list[str] = list(self.params.freshness_feature_names)
+
+        if module_name:
+            canonical = self._canonical_module_name(module_name)
+            candidate_features.append(self.canonical_price_action_feature)
+            candidate_features.append(f"{self.canonical_price_action_feature}.{canonical}")
+            candidate_features.extend(self.module_aliases.get(canonical, ()))
+
         first_found: str | None = None
         stale_feature: str | None = None
 
-        for feature_name in self.params.freshness_feature_names:
-            if not context.has_feature(feature_name):
+        seen: set[str] = set()
+        for feature_name in candidate_features:
+            if feature_name in seen:
+                continue
+            seen.add(feature_name)
+
+            has_feature = getattr(context, "has_feature", None)
+            if callable(has_feature):
+                try:
+                    exists = bool(has_feature(feature_name))
+                except KeyError:
+                    exists = False
+            else:
+                exists = self._get_context_feature(context, feature_name) is not None
+
+            if not exists:
                 continue
 
             if first_found is None:
                 first_found = feature_name
 
-            if context.feature_is_stale(feature_name):
-                stale_feature = feature_name
-                break  # достатньо однієї stale-фічі щоб заблокувати
+            feature_is_stale = getattr(context, "feature_is_stale", None)
+            if callable(feature_is_stale):
+                try:
+                    if bool(feature_is_stale(feature_name)):
+                        stale_feature = feature_name
+                        break
+                except KeyError:
+                    continue
+
+        # Fallback для нового flow: якщо StrategyContextBuilder уже поклав
+        # analytics payload, але ще не додав freshness metadata у feature registry.
+        if first_found is None and analytics_payload:
+            last_update = parse_datetime(
+                first_non_empty(
+                    analytics_payload.get("last_update"),
+                    analytics_payload.get("updated_at"),
+                    self._mapping_or_empty(analytics_payload.get("metadata")).get("last_update"),
+                )
+            )
+            if last_update is not None:
+                first_found = module_name or self.canonical_price_action_feature
 
         if first_found is None:
             return None
@@ -374,6 +892,7 @@ class PriceActionStrategyBase(
             metadata={
                 "feature_name": feature_name_for_result,
                 "strategy_name": self.name,
+                "analytics_module": self._canonical_module_name(module_name) if module_name else None,
             },
         )
 
@@ -512,12 +1031,6 @@ class PriceActionStrategyBase(
     # ------------------------------------------------------------------
 
     async def maybe_emit_signal(self, signal: StrategySignal) -> None:
-        """
-        Безпечна публікація StrategySignal у EventBus.
-
-        Якщо EventBus не запущений або emit падає, стратегія не повинна ламати
-        evaluation-flow. Це telemetry/event side effect, а не основна логіка.
-        """
         if not self.params.emit_signal_events:
             return
 
@@ -598,9 +1111,6 @@ class PriceActionStrategyBase(
     # ------------------------------------------------------------------
 
     def _resolve_market_regime(self, context: SignalContext) -> MarketRegime:
-        # Явна анотація Any дозволяє лінтеру коректно аналізувати гілки нижче.
-        # context.regime.regime може бути MarketRegime, str або іншим raw-значенням
-        # залежно від джерела даних, тому isinstance-перевірка є необхідною.
         regime: Any = (
             context.regime.regime
             if context.regime is not None
@@ -633,19 +1143,6 @@ class PriceActionStrategyBase(
         context: SignalContext,
         side: SignalSide,
     ) -> float:
-        """
-        FIX: BREAKOUT і SQUEEZE були одночасно в bullish_regimes і bearish_regimes,
-        що робило їх нейтральними до сторони (завжди 1.0) — помилкова поведінка.
-
-        Виправлена логіка:
-        - TRENDING_UP  → сильне підтвердження для LONG
-        - TRENDING_DOWN → сильне підтвердження для SHORT
-        - BREAKOUT/SQUEEZE → помірне підтвердження для обох сторін (momentum-neutral)
-        - RANGING → слабке підтвердження (контр-трендові умови)
-        - HIGH_VOLATILITY/NEWS_DRIVEN → знижений score (ризик хибних сигналів)
-        - UNKNOWN → нейтральний score
-        - Все інше (ILLIQUID, RISK_OFF, LOW_VOLATILITY) → мінімальний score
-        """
         regime = self._resolve_market_regime(context)
 
         if regime == MarketRegime.UNKNOWN:
@@ -657,8 +1154,6 @@ class PriceActionStrategyBase(
         if regime in {MarketRegime.HIGH_VOLATILITY, MarketRegime.NEWS_DRIVEN}:
             return 0.40
 
-        # FIX: BREAKOUT/SQUEEZE є momentum-режимами без чіткої directional bias —
-        # дають помірний score незалежно від side, а не максимальний.
         if regime in {MarketRegime.BREAKOUT, MarketRegime.SQUEEZE}:
             return 0.65
 
@@ -668,10 +1163,8 @@ class PriceActionStrategyBase(
         if side == SignalSide.SHORT and regime == MarketRegime.TRENDING_DOWN:
             return 1.0
 
-        # Протилежний напрямок тренду або інші режими (ILLIQUID, RISK_OFF, тощо)
         return 0.20
 
-    # Backward-compatible alias для класів, де вже використовується _resolve_regime()
     def _resolve_regime(self, context: SignalContext) -> MarketRegime:
         return self._resolve_market_regime(context)
 
@@ -697,6 +1190,9 @@ class PriceActionStrategyBase(
         if payload is None:
             return {}
 
+        if is_dataclass(payload) and not isinstance(payload, type):
+            return asdict(payload)
+
         if hasattr(payload, "__dict__") and not isinstance(payload, Mapping):
             payload = vars(payload)
 
@@ -706,13 +1202,7 @@ class PriceActionStrategyBase(
         return {}
 
     def _state_mapping_or_empty(self, payload: Any) -> Mapping[str, Any]:
-        payload_mapping = self._mapping_or_empty(payload)
-
-        state = payload_mapping.get("state")
-        if isinstance(state, Mapping):
-            return state
-
-        return payload_mapping
+        return self._normalize_state_payload(payload)
 
     # ------------------------------------------------------------------
     # Validation helpers
