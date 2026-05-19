@@ -1,1190 +1,912 @@
+# trading_system/strategy/strategies/spoofing/spoofing_reversal_strategy.py
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
+from analytics.spoofing.enums import (
+    SpoofingComponent,
+    SpoofingPattern,
+    SpoofingType,
+)
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
 
-from analytics.spoofing import (
-    SpoofingComponent,
-    SpoofingPattern,
-    SpoofingSeverity,
-    SpoofingSide,
-    SpoofingSignal,
-    SpoofingType,
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+    Timeframe,
 )
-
-from .base_spoofing_strategy import (
-    BaseSpoofingStrategy,
-    BaseSpoofingStrategyConfig,
-    SetupStatus,
-    SpoofingTradeSetup,
-    StrategyDirection,
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
+from .base import (
+    SPOOFING_FEATURES,
+    SpoofingCompositeSnapshot,
+    SpoofingStrategyConfig,
+    SpoofingTradingStrategy,
+)
+from .utils import (
+    ScoreBreakdown,
+    average_score,
+    base_spoofing_source_features,
+    confidence_from_components,
+    composite_spoofing_source_features,
+    detector_agreement_ratio,
+    detector_average_confidence,
+    detector_count,
+    detector_confidence,
+    detector_passed,
+    detector_score,
+    extract_cancel_to_fill_ratio,
+    extract_event_time,
+    extract_fill_ratio,
+    extract_layer_count,
+    extract_layer_price_span_bps,
+    extract_lifetime_ms,
+    extract_price_reaction_bps,
+    extract_pressure_flip_strength,
+    extract_pull_ratio,
+    extract_pulled_notional,
+    extract_score,
+    extract_spoofing_pattern,
+    extract_spoofing_type,
+    extract_wall_notional,
+    freshness_score,
+    is_composite_signal,
+    is_directional_side,
+    is_layering_signal,
+    is_order_pull_signal,
+    is_pressure_bluff_signal,
+    is_stale,
+    layering_source_features,
+    normalize_label,
+    order_pull_source_features,
+    pressure_bluff_source_features,
+    quality_filter_reason,
+    reaction_aligns_with_side,
+    serialize_for_metadata,
+    spoofing_side_to_signal_side,
+    unit_score,
+    weighted_score,
 )
 
 
 @dataclass(slots=True)
-class SpoofingReversalStrategyConfig(BaseSpoofingStrategyConfig):
+class SpoofingReversalPayload:
     """
-    Конфіг для reversal-стратегії поверх analytics.spoofing.
+    Normalized strategy-level payload для spoofing reversal.
 
-    Ідея:
-    - торгуємо directional reversal / continuation після зняття spoofing-тиску;
-    - використовуємо не тільки merged SpoofingFeatures, а й:
-      detector_results, score_breakdown, analytics metadata.
+    Strategy idea:
+    - fake ASK pressure / pulled ask wall -> fake resistance removed -> LONG;
+    - fake BID pressure / pulled bid wall -> fake support removed -> SHORT.
     """
 
-    # ---------------------------------------------------------------------
-    # Accepted analytics patterns / types
-    # ---------------------------------------------------------------------
+    snapshot: SpoofingCompositeSnapshot
+    side: SignalSide
 
-    allow_pull_and_reversal: bool = True
+    event_time: datetime | None = None
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def pull_ratio(self) -> float:
+        return extract_pull_ratio(self.snapshot.raw_signal)
+
+    @property
+    def fill_ratio(self) -> float:
+        return extract_fill_ratio(self.snapshot.raw_signal)
+
+    @property
+    def price_reaction_bps(self) -> float:
+        return extract_price_reaction_bps(self.snapshot.raw_signal)
+
+    @property
+    def wall_notional(self) -> float:
+        return extract_wall_notional(self.snapshot.raw_signal)
+
+    @property
+    def pulled_notional(self) -> float:
+        return extract_pulled_notional(self.snapshot.raw_signal)
+
+    @property
+    def cancel_to_fill_ratio(self) -> float:
+        return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
+
+
+@dataclass(slots=True)
+class SpoofingReversalStrategyConfig(SpoofingStrategyConfig):
+    """
+    Unified spoofing reversal config.
+
+    This is an umbrella/fallback reversal strategy for analytics-level spoofing
+    signals. Narrower strategies can still handle order-pull, pressure-bluff,
+    layering and fake-liquidity cases separately.
+    """
+
+    allow_order_pull: bool = True
     allow_pressure_bluff: bool = True
-    allow_multi_level_layering: bool = True
+    allow_layering: bool = True
     allow_composite: bool = True
-
-    # ---------------------------------------------------------------------
-    # Base reversal filters
-    # ---------------------------------------------------------------------
 
     min_reversal_score: float = 0.68
     min_reversal_confidence: float = 0.58
-    min_price_reaction_bps: float = 1.5
+
     min_pull_ratio: float = 0.55
     max_fill_ratio: float = 0.35
+    min_price_reaction_bps: float = 1.5
 
-    # Якщо signal прийшов як COMPOSITE, хочемо бачити не менше N detector-ів.
-    min_composite_detector_count: int = 2
-    min_composite_agreement_ratio: float = 0.50
-
-    # Optional feature-based filters.
-    require_fast_pull_or_reaction: bool = False
-    require_directional_reaction_alignment: bool = False
-
-    # ---------------------------------------------------------------------
-    # ORDER_PULL / PULL_AND_REVERSAL-specific filters
-    # ---------------------------------------------------------------------
-
-    require_order_pull_detector_for_pull_pattern: bool = False
-    min_order_pull_detector_score: float = 0.0
-    min_order_pull_detector_confidence: float = 0.0
-
-    # ---------------------------------------------------------------------
-    # FLIP_PRESSURE / PRESSURE_BLUFF-specific filters
-    # ---------------------------------------------------------------------
-
-    require_flip_pressure_detector_for_pressure_bluff: bool = False
-    require_reaction_for_pressure_bluff: bool = True
-    require_has_reversal_for_pressure_bluff: bool = False
+    min_wall_notional: float = 0.0
+    min_pulled_notional: float = 0.0
+    min_cancel_to_fill_ratio: float = 0.0
+    max_lifetime_ms: float | None = None
 
     min_pressure_flip_strength: float = 0.0
-    min_flip_pressure_detector_score: float = 0.0
-    min_flip_pressure_detector_confidence: float = 0.0
-    max_distance_from_mid_bps_for_flip: float = 0.0
-    # 0.0 = disabled
+    min_layer_count: int = 0
+    max_layer_price_span_bps: float | None = None
 
-    # ---------------------------------------------------------------------
-    # LAYERING-specific filters
-    # ---------------------------------------------------------------------
+    min_composite_detector_count: int = 2
+    min_composite_agreement_ratio: float = 0.50
+    min_composite_average_confidence: float = 0.50
 
-    require_layering_detector_for_layering_pattern: bool = False
-    min_layering_score: float = 0.0
-    min_layering_detector_score: float = 0.0
-    min_layering_detector_confidence: float = 0.0
+    require_fast_pull_or_reaction: bool = False
+    require_directional_reaction_alignment: bool = False
+    require_detector_passed_for_known_type: bool = False
 
-    min_layers: int = 0
-    min_layer_total_notional: float = 0.0
-    min_synchronized_pull_ratio: float = 0.0
-    max_layer_price_span_bps: float = 0.0
-    # 0.0 = disabled
+    score_base_weight: float = 0.30
+    score_pull_weight: float = 0.18
+    score_fill_weight: float = 0.14
+    score_reaction_weight: float = 0.16
+    score_detector_weight: float = 0.12
+    score_context_weight: float = 0.06
+    score_freshness_weight: float = 0.04
 
-    # ---------------------------------------------------------------------
-    # Analytics score metadata filters
-    # ---------------------------------------------------------------------
+    confidence_primary_weight: float = 0.55
+    confidence_context_weight: float = 0.25
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
 
-    min_reversal_detector_count: int = 1
-    min_reversal_agreement_ratio: float = 0.0
-    min_reversal_average_confidence: float = 0.0
-    require_analytics_score_passed: bool = False
+    order_pull_bonus: float = 0.04
+    pressure_bluff_bonus: float = 0.04
+    layering_bonus: float = 0.04
+    composite_bonus: float = 0.05
+    directional_reaction_bonus: float = 0.04
+    high_pull_bonus: float = 0.03
 
-    # ---------------------------------------------------------------------
-    # Confirmation
-    # ---------------------------------------------------------------------
+    execution_entry_offset_bps_hint: float | None = None
+    execution_stop_buffer_bps_hint: float | None = None
+    execution_take_profit_bps_hint: float | None = None
+    reaction_tp_multiplier_hint: float | None = None
 
-    confirmation_move_bps: float = 1.2
-    confirmation_move_bps_high_severity: float = 0.8
-    confirmation_move_bps_composite: float = 0.8
-    require_price_beyond_reference: bool = True
-    require_confirmation_analytics_still_valid: bool = True
+    tag_spoofing_reversal: str = "spoofing_reversal"
+    tag_order_pull_reversal: str = "order_pull_reversal"
+    tag_pressure_bluff_reversal: str = "pressure_bluff_reversal"
+    tag_layering_reversal: str = "layering_reversal"
+    tag_composite_reversal: str = "composite_reversal"
 
-    # ---------------------------------------------------------------------
-    # Invalidation
-    # ---------------------------------------------------------------------
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.REVERSAL
 
-    max_adverse_move_bps_reversal: float = 2.2
-    invalidate_on_signal_confidence_drop_below: float = 0.45
-    invalidate_on_signal_score_drop_below: float = 0.50
-    invalidate_if_pull_ratio_drops_below_factor: float = 0.75
-    invalidate_if_reaction_drops_below_factor: float = 0.60
+    required_spoofing_features: tuple[str, ...] = (
+        SPOOFING_FEATURES.SIGNAL,
+    )
 
-    # ---------------------------------------------------------------------
-    # Pricing
-    # ---------------------------------------------------------------------
+    def validate(self) -> None:
+        SpoofingStrategyConfig.validate(self)
 
-    entry_offset_bps_reversal: float = 0.15
-    stop_buffer_bps_reversal: float = 2.8
-    take_profit_bps_reversal: float = 7.0
+        unit_fields = {
+            "min_reversal_score": self.min_reversal_score,
+            "min_reversal_confidence": self.min_reversal_confidence,
+            "min_pull_ratio": self.min_pull_ratio,
+            "max_fill_ratio": self.max_fill_ratio,
+            "min_cancel_to_fill_ratio": self.min_cancel_to_fill_ratio,
+            "min_pressure_flip_strength": self.min_pressure_flip_strength,
+            "min_composite_agreement_ratio": self.min_composite_agreement_ratio,
+            "min_composite_average_confidence": self.min_composite_average_confidence,
+            "order_pull_bonus": self.order_pull_bonus,
+            "pressure_bluff_bonus": self.pressure_bluff_bonus,
+            "layering_bonus": self.layering_bonus,
+            "composite_bonus": self.composite_bonus,
+            "directional_reaction_bonus": self.directional_reaction_bonus,
+            "high_pull_bonus": self.high_pull_bonus,
+        }
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
 
-    # Target shaping.
-    use_reaction_scaled_take_profit: bool = True
-    reaction_tp_multiplier: float = 1.35
-    composite_tp_multiplier: float = 1.50
-    min_take_profit_bps: float = 4.0
-    max_take_profit_bps: float = 18.0
+        non_negative = {
+            "min_price_reaction_bps": self.min_price_reaction_bps,
+            "min_wall_notional": self.min_wall_notional,
+            "min_pulled_notional": self.min_pulled_notional,
+        }
+        for field_name, value in non_negative.items():
+            if float(value) < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
 
-    # Metadata / state.
-    keep_reference_to_source_wall: bool = True
-    store_detector_metadata: bool = True
+        if self.min_layer_count < 0:
+            raise StrategyConfigError("min_layer_count must be >= 0")
+
+        if self.min_composite_detector_count < 0:
+            raise StrategyConfigError("min_composite_detector_count must be >= 0")
+
+        if self.max_lifetime_ms is not None and self.max_lifetime_ms <= 0:
+            raise StrategyConfigError("max_lifetime_ms must be > 0")
+
+        if self.max_layer_price_span_bps is not None and self.max_layer_price_span_bps < 0:
+            raise StrategyConfigError("max_layer_price_span_bps must be >= 0")
+
+        hint_fields = {
+            "execution_entry_offset_bps_hint": self.execution_entry_offset_bps_hint,
+            "execution_stop_buffer_bps_hint": self.execution_stop_buffer_bps_hint,
+            "execution_take_profit_bps_hint": self.execution_take_profit_bps_hint,
+            "reaction_tp_multiplier_hint": self.reaction_tp_multiplier_hint,
+        }
+        for field_name, value in hint_fields.items():
+            if value is not None and value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        score_weights = {
+            "score_base_weight": self.score_base_weight,
+            "score_pull_weight": self.score_pull_weight,
+            "score_fill_weight": self.score_fill_weight,
+            "score_reaction_weight": self.score_reaction_weight,
+            "score_detector_weight": self.score_detector_weight,
+            "score_context_weight": self.score_context_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+        confidence_weights = {
+            "confidence_primary_weight": self.confidence_primary_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if float(value) < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_spoofing_reversal",
+            "tag_order_pull_reversal",
+            "tag_pressure_bluff_reversal",
+            "tag_layering_reversal",
+            "tag_composite_reversal",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_spoofing_features:
+            raise StrategyConfigError("required_spoofing_features cannot be empty")
 
 
-class SpoofingReversalStrategy(BaseSpoofingStrategy):
+class SpoofingReversalStrategy(SpoofingTradingStrategy):
     """
-    Strategy: reversal / pressure-release trade після spoofing-сигналів.
+    Unified spoofing reversal strategy.
 
-    Підтримувані analytics sources:
-    - ORDER_PULL / PULL_AND_REVERSAL;
-    - FLIP_PRESSURE / PRESSURE_BLUFF;
-    - LAYERING / MULTI_LEVEL_LAYERING;
-    - COMPOSITE spoofing signals.
+    Input:
+        StrategyContext with FeatureSource.SPOOFING domain data / features.
 
-    Важливо:
-    - detection не робиться тут;
-    - strategy працює поверх готового SpoofingSignal;
-    - максимально використовує detector_results / score_breakdown / metadata.
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    strategy_name = "spoofing_reversal_strategy"
+    component_namespace = "strategy.spoofing.reversal"
+    category: StrategyCategory = StrategyCategory.SPOOFING
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     def __init__(
         self,
-        *,
-        event_bus: EventBus,
+        config: StrategyConfig,
+        event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
-        config: SpoofingReversalStrategyConfig | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        spoofing_config: SpoofingReversalStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        resolved_spoofing_config = spoofing_config or SpoofingReversalStrategyConfig()
+        resolved_spoofing_config.validate()
+
         super().__init__(
+            config=config,
             event_bus=event_bus,
             scheduler=scheduler,
-            config=config or SpoofingReversalStrategyConfig(),
+            definition=definition,
+            spoofing_config=resolved_spoofing_config,
+            service_name=service_name,
         )
-        self.config: SpoofingReversalStrategyConfig
 
-    # -------------------------------------------------------------------------
-    # Pattern support
-    # -------------------------------------------------------------------------
+        self.reversal_config: SpoofingReversalStrategyConfig = resolved_spoofing_config
 
-    def supports_pattern(self, signal: SpoofingSignal) -> bool:
-        """
-        Перевіряє, чи сигнал релевантний саме для reversal-ідеї.
+    @property
+    def strategy_name(self) -> str:
+        return "spoofing_reversal"
 
-        Тут враховуємо і high-level pattern/type, і фактичну наявність
-        detector_results, якщо сигнал прийшов як COMPOSITE.
-        """
-        pattern = signal.pattern
-        spoofing_type = signal.spoofing_type
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            strategy_name=self.strategy_name,
+            category=StrategyCategory.SPOOFING,
+            timeframe=Timeframe.M1,
+            tags=[
+                self.reversal_config.tag_spoofing,
+                self.reversal_config.tag_reversal,
+                self.reversal_config.tag_spoofing_reversal,
+                self.reversal_config.tag_order_pull,
+                self.reversal_config.tag_pressure_bluff,
+                self.reversal_config.tag_layering,
+                self.reversal_config.tag_composite,
+                "analytics_spoofing",
+            ],
+            version="2.0.0",
+            description=(
+                "Interprets analytics-level spoofing reversal signals from "
+                "normalized StrategyContext and returns internal StrategySignal."
+            ),
+            required_features=set(self.required_features()),
+            supported_regimes={
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.BREAKOUT,
+                MarketRegime.SQUEEZE,
+                MarketRegime.RANGING,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.UNKNOWN,
+            },
+            metadata={
+                "source": "analytics.spoofing",
+                "strategy_type": "spoofing_reversal",
+                "base_class": "SpoofingTradingStrategy",
+                "canonical_payload": "SpoofingCompositeSnapshot",
+                "uses_order_pull": True,
+                "uses_pressure_bluff": True,
+                "uses_layering": True,
+                "uses_composite": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
+            },
+        )
 
-        if (
-            self.config.allow_pull_and_reversal
-            and (
-                pattern == SpoofingPattern.PULL_AND_REVERSAL
-                or spoofing_type == SpoofingType.ORDER_PULL
-                or self.has_detector(signal, SpoofingComponent.ORDER_PULL_DETECTOR)
-            )
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(self.reversal_config.required_spoofing_features)
+
+    async def generate_signal(
+        self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_spoofing_data(
+            context,
+            tuple(self.reversal_config.required_spoofing_features),
         ):
-            return True
-
-        if (
-            self.config.allow_pressure_bluff
-            and (
-                pattern == SpoofingPattern.PRESSURE_BLUFF
-                or spoofing_type == SpoofingType.FLIP_PRESSURE
-                or self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR)
-            )
-        ):
-            return True
-
-        if (
-            self.config.allow_multi_level_layering
-            and (
-                pattern == SpoofingPattern.MULTI_LEVEL_LAYERING
-                or spoofing_type == SpoofingType.LAYERING
-                or self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR)
-            )
-        ):
-            return True
-
-        if self.config.allow_composite and spoofing_type == SpoofingType.COMPOSITE:
-            return self._has_reversal_relevant_composite(signal)
-
-        return False
-
-    def accepts_signal(self, signal: SpoofingSignal) -> bool:
-        """
-        Reversal-specific acceptance filter.
-
-        На відміну від старої версії, цей фільтр використовує:
-        - SpoofingSignal fields;
-        - SpoofingFeatures;
-        - detector_results;
-        - score_breakdown;
-        - analytics metadata.
-        """
-        if not super().accepts_signal(signal):
-            return False
-
-        if signal.score < self.config.min_reversal_score:
-            return False
-
-        if signal.confidence < self.config.min_reversal_confidence:
-            return False
-
-        if signal.features is None:
-            return False
-
-        if not self._passes_reversal_analytics_contract(signal):
-            return False
-
-        if not self._passes_common_feature_filters(signal):
-            return False
-
-        if self._is_pull_reversal_signal(signal):
-            if not self._passes_pull_reversal_filters(signal):
-                return False
-
-        if self._is_pressure_bluff_signal(signal):
-            if not self._passes_pressure_bluff_filters(signal):
-                return False
-
-        if self._is_layering_signal(signal):
-            if not self._passes_layering_filters(signal):
-                return False
-
-        if signal.spoofing_type == SpoofingType.COMPOSITE:
-            if not self._passes_composite_filters(signal):
-                return False
-
-        return True
-
-    # -------------------------------------------------------------------------
-    # Setup building
-    # -------------------------------------------------------------------------
-
-    def build_setup(self, signal: SpoofingSignal) -> SpoofingTradeSetup | None:
-        """
-        Створює reversal setup на базі актуального analytics.spoofing signal.
-        """
-        setup = super().build_setup(signal)
-        if setup is None:
             return None
 
-        direction = setup.direction
-        reference_price = setup.reference_price
+        if self.has_stale_spoofing_features(
+            context,
+            tuple(self.reversal_config.required_spoofing_features),
+        ):
+            return None
 
-        setup.entry_price = self.compute_entry_price(signal, direction, reference_price)
-        setup.stop_price = self.compute_stop_price(signal, direction, reference_price)
-        setup.take_profit_price = self.compute_take_profit_price(
-            signal=signal,
-            direction=direction,
-            entry_price=setup.entry_price,
-            stop_price=setup.stop_price,
-            reference_price=reference_price,
+        payload = self._extract_payload(context)
+        if payload is None:
+            return None
+
+        if is_stale(
+            event_time=payload.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.reversal_config.stale_feature_max_age_seconds,
+        ):
+            return None
+
+        rejection = quality_filter_reason(
+            payload.snapshot.raw_signal,
+            min_score=max(self.reversal_config.min_score, self.reversal_config.min_reversal_score),
+            min_confidence=max(
+                self.reversal_config.min_confidence,
+                self.reversal_config.min_reversal_confidence,
+            ),
+            allowed_severities=self.reversal_config.allowed_severities,
+            min_detector_count=self.reversal_config.min_detector_count,
+            min_agreement_ratio=self.reversal_config.min_agreement_ratio,
+            min_average_confidence=self.reversal_config.min_average_confidence,
+            require_score_passed=self.reversal_config.require_score_passed,
+            stale_after_seconds=self.reversal_config.stale_feature_max_age_seconds,
+            now=context.timestamp,
+        )
+        if rejection is not None:
+            return None
+
+        if not self.accepts_spoofing_snapshot(payload.snapshot):
+            return None
+
+        if not self._supports_snapshot(payload.snapshot):
+            return None
+
+        if not self._passes_reversal_filters(payload):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            payload=payload,
         )
 
-        setup.metadata["reversal_reason"] = self._build_reversal_reason(signal)
-        setup.metadata["reversal_mode"] = self._resolve_reversal_mode(signal)
-        setup.metadata["expected_reversal_direction"] = direction.value
+        if breakdown.score < self.reversal_config.min_reversal_score:
+            return None
 
-        setup.metadata.update(self._build_reversal_feature_metadata(signal))
-        setup.metadata.update(self._build_reversal_analytics_metadata(signal))
+        if breakdown.confidence < self.reversal_config.min_reversal_confidence:
+            return None
 
-        if self.config.store_detector_metadata:
-            setup.metadata["detectors"] = self._build_detector_metadata(signal)
+        source_features = self._source_features(payload)
+        tags = self._tags(payload)
 
-        if self.config.keep_reference_to_source_wall:
-            setup.metadata["wall_id"] = signal.wall_id
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "spoofing_reversal_signal",
+                    f"side:{payload.side.value}",
+                    *payload.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
 
-        return setup
-
-    def enrich_setup(self, setup: SpoofingTradeSetup, signal: SpoofingSignal) -> None:
-        """
-        Додає reversal-specific metadata без втрати analytics scope.
-        """
-        setup.metadata["signal_side"] = signal.side.value
-        setup.metadata["spoofing_type"] = signal.spoofing_type.value
-        setup.metadata["pattern"] = signal.pattern.value
-        setup.metadata["severity"] = signal.severity.value
-
-        setup.metadata["scope"] = {
-            "exchange": setup.exchange,
-            "market_type": setup.market_type,
-            "symbol": setup.symbol,
-            "timeframe": setup.timeframe,
-            "exchange_symbol": setup.exchange_symbol,
+        metadata = {
+            "spoofing_setup_family": "spoofing_reversal",
+            "spoofing_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "snapshot": serialize_for_metadata(payload.snapshot.to_dict()),
+            "raw": serialize_for_metadata(payload.raw),
+            "event_time": payload.event_time.isoformat() if payload.event_time else None,
+            "spoofing_type": normalize_label(payload.snapshot.spoofing_type),
+            "pattern": normalize_label(payload.snapshot.pattern),
+            "spoofing_side": normalize_label(payload.snapshot.side),
+            "mapped_side": payload.side.value,
+            "score": payload.snapshot.score,
+            "confidence": payload.snapshot.confidence,
+            "pull_ratio": payload.pull_ratio,
+            "fill_ratio": payload.fill_ratio,
+            "price_reaction_bps": payload.price_reaction_bps,
+            "signed_price_reaction_bps": payload.snapshot.signed_price_reaction_bps,
+            "wall_notional": payload.wall_notional,
+            "pulled_notional": payload.pulled_notional,
+            "cancel_to_fill_ratio": payload.cancel_to_fill_ratio,
+            "detector_count": detector_count(payload.snapshot.raw_signal),
+            "detector_agreement_ratio": detector_agreement_ratio(payload.snapshot.raw_signal),
+            "detector_average_confidence": detector_average_confidence(payload.snapshot.raw_signal),
+            "execution_hints": self._execution_hints(),
         }
 
-    # -------------------------------------------------------------------------
-    # Pricing
-    # -------------------------------------------------------------------------
-
-    def compute_entry_price(
-        self,
-        signal: SpoofingSignal,
-        direction: StrategyDirection,
-        reference_price: float,
-    ) -> float:
-        """
-        Entry трохи за reference level у бік очікуваного reversal move.
-        """
-        offset_ratio = self.config.entry_offset_bps_reversal / 10_000.0
-
-        if direction == StrategyDirection.LONG:
-            return reference_price * (1.0 + offset_ratio)
-
-        if direction == StrategyDirection.SHORT:
-            return reference_price * (1.0 - offset_ratio)
-
-        return reference_price
-
-    def compute_stop_price(
-        self,
-        signal: SpoofingSignal,
-        direction: StrategyDirection,
-        reference_price: float,
-    ) -> float:
-        """
-        Stop за spoof reference zone.
-        """
-        buffer_ratio = self.config.stop_buffer_bps_reversal / 10_000.0
-
-        if direction == StrategyDirection.LONG:
-            return reference_price * (1.0 - buffer_ratio)
-
-        if direction == StrategyDirection.SHORT:
-            return reference_price * (1.0 + buffer_ratio)
-
-        return reference_price
-
-    def compute_take_profit_price(
-        self,
-        *,
-        signal: SpoofingSignal,
-        direction: StrategyDirection,
-        entry_price: float,
-        stop_price: float,
-        reference_price: float,
-    ) -> float:
-        """
-        TP:
-        1. базово через RR;
-        2. optional reaction scaling;
-        3. composite signals можуть отримати трохи ширшу ціль.
-        """
-        base_tp = super().compute_take_profit_price(
-            signal=signal,
-            direction=direction,
-            entry_price=entry_price,
-            stop_price=stop_price,
-            reference_price=reference_price,
+        return self.build_spoofing_signal(
+            context=context,
+            side=payload.side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=self.reversal_config.default_setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.reversal_config.default_priority,
         )
 
-        fallback_ratio = self.config.take_profit_bps_reversal / 10_000.0
-        if direction == StrategyDirection.LONG:
-            fallback_tp = entry_price * (1.0 + fallback_ratio)
-            base_tp = max(base_tp, fallback_tp)
-        elif direction == StrategyDirection.SHORT:
-            fallback_tp = entry_price * (1.0 - fallback_ratio)
-            base_tp = min(base_tp, fallback_tp)
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
 
-        if not self.config.use_reaction_scaled_take_profit:
-            return base_tp
+    def _extract_payload(
+        self,
+        context: StrategyContext,
+    ) -> SpoofingReversalPayload | None:
+        snapshot = self.resolve_spoofing_snapshot(context)
+        if snapshot is None or not snapshot.has_minimum_data():
+            return None
 
-        reaction_bps = abs(self._feature_float(signal.features, "price_reaction_bps"))
-        if reaction_bps <= 0:
-            reaction_bps = abs(
-                self.first_detector_metadata_float(
-                    signal,
-                    names=("price_reaction_bps", "reaction_bps"),
-                    default=0.0,
-                )
+        side = spoofing_side_to_signal_side(snapshot.side)
+        if not is_directional_side(side):
+            return None
+
+        event_time = extract_event_time(snapshot.raw_signal) or snapshot.timestamp or context.timestamp
+
+        reasons = [
+            f"spoofing_type:{normalize_label(snapshot.spoofing_type)}",
+            f"pattern:{normalize_label(snapshot.pattern)}",
+            f"spoofing_side:{normalize_label(snapshot.side)}",
+            f"score:{snapshot.score:.4f}",
+            f"confidence:{snapshot.confidence:.4f}",
+        ]
+
+        if is_order_pull_signal(snapshot.raw_signal):
+            reasons.append("order_pull_reversal_context")
+
+        if is_pressure_bluff_signal(snapshot.raw_signal):
+            reasons.append("pressure_bluff_reversal_context")
+
+        if is_layering_signal(snapshot.raw_signal):
+            reasons.append("layering_reversal_context")
+
+        if is_composite_signal(snapshot.raw_signal):
+            reasons.append("composite_spoofing_reversal_context")
+
+        return SpoofingReversalPayload(
+            snapshot=snapshot,
+            side=side,
+            event_time=event_time,
+            reasons=list(dict.fromkeys(reasons)),
+            raw=snapshot.raw_signal,
+        )
+
+    # ------------------------------------------------------------------
+    # Support / filters
+    # ------------------------------------------------------------------
+
+    def _supports_snapshot(
+        self,
+        snapshot: SpoofingCompositeSnapshot,
+    ) -> bool:
+        if self.reversal_config.allow_order_pull and is_order_pull_signal(snapshot.raw_signal):
+            return True
+
+        if self.reversal_config.allow_pressure_bluff and is_pressure_bluff_signal(snapshot.raw_signal):
+            return True
+
+        if self.reversal_config.allow_layering and is_layering_signal(snapshot.raw_signal):
+            return True
+
+        if self.reversal_config.allow_composite and is_composite_signal(snapshot.raw_signal):
+            return True
+
+        return False
+
+    def _passes_reversal_filters(
+        self,
+        payload: SpoofingReversalPayload,
+    ) -> bool:
+        snapshot = payload.snapshot
+
+        if payload.pull_ratio < self.reversal_config.min_pull_ratio:
+            return False
+
+        if payload.fill_ratio > self.reversal_config.max_fill_ratio:
+            return False
+
+        if payload.price_reaction_bps < self.reversal_config.min_price_reaction_bps:
+            if self.reversal_config.require_fast_pull_or_reaction:
+                return False
+
+        if payload.wall_notional < self.reversal_config.min_wall_notional:
+            return False
+
+        if payload.pulled_notional < self.reversal_config.min_pulled_notional:
+            return False
+
+        if payload.cancel_to_fill_ratio < self.reversal_config.min_cancel_to_fill_ratio:
+            return False
+
+        if self.reversal_config.max_lifetime_ms is not None:
+            if snapshot.lifetime_ms > self.reversal_config.max_lifetime_ms:
+                return False
+
+        if self.reversal_config.require_directional_reaction_alignment:
+            if not reaction_aligns_with_side(
+                signed_reaction_bps=snapshot.signed_price_reaction_bps,
+                side=payload.side,
+                min_reaction_bps=self.reversal_config.min_price_reaction_bps,
+            ):
+                return False
+
+        if is_pressure_bluff_signal(snapshot.raw_signal):
+            if snapshot.pressure_flip_strength < self.reversal_config.min_pressure_flip_strength:
+                return False
+
+        if is_layering_signal(snapshot.raw_signal):
+            if snapshot.layer_count < self.reversal_config.min_layer_count:
+                return False
+
+            if self.reversal_config.max_layer_price_span_bps is not None:
+                if snapshot.layer_price_span_bps > self.reversal_config.max_layer_price_span_bps:
+                    return False
+
+        if is_composite_signal(snapshot.raw_signal):
+            if detector_count(snapshot.raw_signal) < self.reversal_config.min_composite_detector_count:
+                return False
+
+            if detector_agreement_ratio(snapshot.raw_signal) < self.reversal_config.min_composite_agreement_ratio:
+                return False
+
+            if detector_average_confidence(snapshot.raw_signal) < self.reversal_config.min_composite_average_confidence:
+                return False
+
+        if self.reversal_config.require_detector_passed_for_known_type:
+            component = self._primary_detector_component(snapshot)
+            if component is not None and not detector_passed(snapshot.raw_signal, component):
+                return False
+
+        return True
+
+    def _primary_detector_component(
+        self,
+        snapshot: SpoofingCompositeSnapshot,
+    ) -> SpoofingComponent | None:
+        if is_order_pull_signal(snapshot.raw_signal):
+            return SpoofingComponent.ORDER_PULL_DETECTOR
+
+        if is_pressure_bluff_signal(snapshot.raw_signal):
+            return SpoofingComponent.FLIP_PRESSURE_DETECTOR
+
+        if is_layering_signal(snapshot.raw_signal):
+            return SpoofingComponent.LAYERING_DETECTOR
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def _build_score_breakdown(
+        self,
+        *,
+        context: StrategyContext,
+        payload: SpoofingReversalPayload,
+    ) -> ScoreBreakdown:
+        snapshot = payload.snapshot
+
+        base_component = average_score(
+            extract_score(snapshot.raw_signal),
+            snapshot.score,
+            snapshot.confidence,
+        )
+        pull_component = payload.pull_ratio
+        fill_component = unit_score(1.0 - payload.fill_ratio)
+        reaction_component = unit_score(
+            payload.price_reaction_bps
+            / max(self.reversal_config.min_price_reaction_bps * 4.0, 0.01)
+        )
+        detector_component = average_score(
+            detector_agreement_ratio(snapshot.raw_signal),
+            detector_average_confidence(snapshot.raw_signal),
+            detector_score(snapshot.raw_signal, self._primary_detector_component(snapshot))
+            if self._primary_detector_component(snapshot) is not None
+            else snapshot.detector_average_confidence,
+        )
+        context_component = self._context_component(snapshot)
+        fresh_component = freshness_score(
+            event_time=payload.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.reversal_config.stale_feature_max_age_seconds,
+        )
+
+        components = {
+            "base": base_component,
+            "pull": pull_component,
+            "fill": fill_component,
+            "reaction": reaction_component,
+            "detector": detector_component,
+            "context": context_component,
+            "freshness": fresh_component,
+        }
+        weights = {
+            "base": self.reversal_config.score_base_weight,
+            "pull": self.reversal_config.score_pull_weight,
+            "fill": self.reversal_config.score_fill_weight,
+            "reaction": self.reversal_config.score_reaction_weight,
+            "detector": self.reversal_config.score_detector_weight,
+            "context": self.reversal_config.score_context_weight,
+            "freshness": self.reversal_config.score_freshness_weight,
+        }
+
+        score = weighted_score(components, weights, default=base_component)
+        confidence = confidence_from_components(
+            primary=base_component,
+            context=context_component,
+            confirmation=average_score(pull_component, fill_component, reaction_component),
+            freshness=fresh_component,
+            primary_weight=self.reversal_config.confidence_primary_weight,
+            context_weight=self.reversal_config.confidence_context_weight,
+            confirmation_weight=self.reversal_config.confidence_confirmation_weight,
+            freshness_weight=self.reversal_config.confidence_freshness_weight,
+        )
+
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            "spoofing_reversal_context",
+            f"side:{payload.side.value}",
+            f"pull_ratio:{payload.pull_ratio:.4f}",
+            f"fill_ratio:{payload.fill_ratio:.4f}",
+            f"price_reaction_bps:{payload.price_reaction_bps:.4f}",
+        ]
+
+        if is_order_pull_signal(snapshot.raw_signal):
+            score += self.reversal_config.order_pull_bonus
+            confirmations.append("order_pull_detector_context")
+
+        if is_pressure_bluff_signal(snapshot.raw_signal):
+            score += self.reversal_config.pressure_bluff_bonus
+            confirmations.append("pressure_bluff_detector_context")
+
+        if is_layering_signal(snapshot.raw_signal):
+            score += self.reversal_config.layering_bonus
+            confirmations.append("layering_detector_context")
+
+        if is_composite_signal(snapshot.raw_signal):
+            score += self.reversal_config.composite_bonus
+            confirmations.append("composite_spoofing_context")
+
+        if payload.pull_ratio >= max(self.reversal_config.min_pull_ratio * 1.25, self.reversal_config.min_pull_ratio):
+            score += self.reversal_config.high_pull_bonus
+            confirmations.append("strong_pull_ratio")
+
+        if reaction_aligns_with_side(
+            signed_reaction_bps=snapshot.signed_price_reaction_bps,
+            side=payload.side,
+            min_reaction_bps=self.reversal_config.min_price_reaction_bps,
+        ):
+            score += self.reversal_config.directional_reaction_bonus
+            confidence += min(0.03, self.reversal_config.directional_reaction_bonus)
+            confirmations.append("directional_reaction_alignment")
+
+        if snapshot.lifetime_ms > 0:
+            reasons.append(f"lifetime_ms:{snapshot.lifetime_ms:.2f}")
+
+        if snapshot.distance_from_mid_bps > 0:
+            reasons.append(f"distance_from_mid_bps:{snapshot.distance_from_mid_bps:.4f}")
+
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
+
+    def _context_component(
+        self,
+        snapshot: SpoofingCompositeSnapshot,
+    ) -> float:
+        components = {
+            "notional": unit_score(
+                snapshot.pulled_notional / max(snapshot.wall_notional, 1.0)
             )
+            if snapshot.wall_notional > 0
+            else 0.0,
+            "cancel_to_fill": snapshot.cancel_to_fill_ratio,
+            "detectors": average_score(
+                snapshot.detector_agreement_ratio,
+                snapshot.detector_average_confidence,
+            ),
+            "pressure": snapshot.pressure_flip_strength,
+            "layers": unit_score(snapshot.layer_count / 5.0),
+        }
 
-        if reaction_bps <= 0:
-            return base_tp
-
-        multiplier = self.config.reaction_tp_multiplier
-        if signal.spoofing_type == SpoofingType.COMPOSITE:
-            multiplier = max(multiplier, self.config.composite_tp_multiplier)
-
-        target_bps = reaction_bps * multiplier
-        target_bps = max(self.config.min_take_profit_bps, target_bps)
-        target_bps = min(self.config.max_take_profit_bps, target_bps)
-
-        target_ratio = target_bps / 10_000.0
-
-        if direction == StrategyDirection.LONG:
-            reaction_tp = entry_price * (1.0 + target_ratio)
-            return max(base_tp, reaction_tp)
-
-        if direction == StrategyDirection.SHORT:
-            reaction_tp = entry_price * (1.0 - target_ratio)
-            return min(base_tp, reaction_tp)
-
-        return base_tp
-
-    # -------------------------------------------------------------------------
-    # Signal update handling
-    # -------------------------------------------------------------------------
-
-    def apply_signal_update(self, *, setup: SpoofingTradeSetup, signal: SpoofingSignal) -> None:
-        """
-        Оновлюємо setup сильнішим / свіжішим spoofing update.
-        """
-        super().apply_signal_update(setup=setup, signal=signal)
-
-        if setup.status in {SetupStatus.PENDING, SetupStatus.CONFIRMED}:
-            setup.take_profit_price = self.compute_take_profit_price(
-                signal=signal,
-                direction=setup.direction,
-                entry_price=setup.entry_price,
-                stop_price=setup.stop_price,
-                reference_price=setup.reference_price,
-            )
-
-        setup.metadata["reversal_reason"] = self._build_reversal_reason(signal)
-        setup.metadata["reversal_mode"] = self._resolve_reversal_mode(signal)
-        setup.metadata.update(
+        return weighted_score(
+            components,
             {
-                f"updated_{key}": value
-                for key, value in self._build_reversal_feature_metadata(signal).items()
-            }
+                "notional": 0.25,
+                "cancel_to_fill": 0.20,
+                "detectors": 0.30,
+                "pressure": 0.15,
+                "layers": 0.10,
+            },
         )
-        setup.metadata["updated_analytics"] = self._build_reversal_analytics_metadata(signal)
 
-        if self.config.store_detector_metadata:
-            setup.metadata["updated_detectors"] = self._build_detector_metadata(signal)
+    # ------------------------------------------------------------------
+    # Source features / tags / metadata hints
+    # ------------------------------------------------------------------
 
-    def should_invalidate_from_signal_update(
+    def _source_features(
         self,
-        *,
-        setup: SpoofingTradeSetup,
-        signal: SpoofingSignal,
-    ) -> bool:
-        """
-        Invalidate setup, якщо analytics update ослабив reversal hypothesis.
-        """
-        if signal.confidence < self.config.invalidate_on_signal_confidence_drop_below:
-            return True
+        payload: SpoofingReversalPayload,
+    ) -> list[str]:
+        features = [
+            *base_spoofing_source_features(),
+            SPOOFING_FEATURES.SIGNAL,
+            SPOOFING_FEATURES.SPOOFING_TYPE,
+            SPOOFING_FEATURES.PATTERN,
+            SPOOFING_FEATURES.SIDE,
+            SPOOFING_FEATURES.SCORE,
+            SPOOFING_FEATURES.CONFIDENCE,
+            SPOOFING_FEATURES.PULL_RATIO,
+            SPOOFING_FEATURES.FILL_RATIO,
+            SPOOFING_FEATURES.PRICE_REACTION_BPS,
+            SPOOFING_FEATURES.WALL_NOTIONAL,
+            SPOOFING_FEATURES.PULLED_NOTIONAL,
+            SPOOFING_FEATURES.DETECTOR_RESULTS,
+            SPOOFING_FEATURES.SCORE_BREAKDOWN,
+        ]
 
-        if signal.score < self.config.invalidate_on_signal_score_drop_below:
-            return True
+        if is_order_pull_signal(payload.snapshot.raw_signal):
+            features.extend(order_pull_source_features())
 
-        if signal.features is None:
-            return False
+        if is_pressure_bluff_signal(payload.snapshot.raw_signal):
+            features.extend(pressure_bluff_source_features())
 
-        fill_ratio = self._feature_float(signal.features, "fill_ratio")
-        if fill_ratio > max(self.config.max_fill_ratio, 0.45):
-            return True
+        if is_layering_signal(payload.snapshot.raw_signal):
+            features.extend(layering_source_features())
 
-        pull_ratio = self._feature_float(signal.features, "pull_ratio")
-        if pull_ratio > 0:
-            threshold = self.config.min_pull_ratio * self.config.invalidate_if_pull_ratio_drops_below_factor
-            if pull_ratio < threshold and not self._has_strong_flip_or_layering(signal):
-                return True
+        if is_composite_signal(payload.snapshot.raw_signal):
+            features.extend(composite_spoofing_source_features())
 
-        reaction_bps = abs(self._feature_float(signal.features, "price_reaction_bps"))
-        if reaction_bps > 0:
-            threshold = (
-                self.config.min_price_reaction_bps
-                * self.config.invalidate_if_reaction_drops_below_factor
-            )
-            if reaction_bps < threshold and self._requires_reaction(signal):
-                return True
+        return list(dict.fromkeys(features))
 
-        if self._is_pressure_bluff_signal(signal):
-            if self.config.require_reaction_for_pressure_bluff:
-                if reaction_bps < self.config.min_price_reaction_bps * 0.75:
-                    return True
-
-        if self.config.require_analytics_score_passed:
-            if not self.analytics_bool(signal, "passed", default=True):
-                return True
-
-        return False
-
-    # -------------------------------------------------------------------------
-    # Confirmation / trigger / invalidation
-    # -------------------------------------------------------------------------
-
-    def confirm_setup(
+    def _tags(
         self,
-        *,
-        setup: SpoofingTradeSetup,
-        current_price: float,
-        signal: SpoofingSignal,
-    ) -> bool:
-        """
-        Reversal confirmation.
-
-        Ціна має зміститись у напрямку reversal. Для HIGH/CRITICAL або
-        COMPOSITE можна дозволити нижчий confirmation threshold.
-        """
-        if setup.status != SetupStatus.PENDING:
-            return False
-
-        if current_price <= 0 or setup.reference_price <= 0:
-            return False
-
-        if self.config.require_confirmation_analytics_still_valid:
-            if not self.accepts_signal(signal):
-                return False
-
-        required_bps = self._resolve_confirmation_bps(signal=signal, setup=setup)
-
-        move_bps = self.signed_bps_move(
-            current_price=current_price,
-            reference_price=setup.reference_price,
-        )
-
-        if setup.direction == StrategyDirection.LONG:
-            if self.config.require_price_beyond_reference and current_price <= setup.entry_price:
-                return False
-            passed = move_bps >= required_bps
-
-        elif setup.direction == StrategyDirection.SHORT:
-            if self.config.require_price_beyond_reference and current_price >= setup.entry_price:
-                return False
-            passed = move_bps <= -required_bps
-
-        else:
-            passed = False
-
-        if not passed:
-            return False
-
-        if not self._has_minimum_confirmation_evidence(signal):
-            return False
-
-        setup.status = SetupStatus.CONFIRMED
-        setup.confirmed_at = self.now()
-        setup.confirmation_price = current_price
-        setup.metadata["confirmation_move_bps"] = move_bps
-        setup.metadata["confirmation_required_bps"] = required_bps
-        setup.metadata["confirmation_analytics"] = self._build_reversal_analytics_metadata(signal)
-
-        self._stats["setups_confirmed"] += 1
-
-        self.log_info(
-            "Reversal setup confirmed",
-            setup_id=setup.setup_id,
-            exchange=setup.exchange,
-            market_type=setup.market_type,
-            symbol=setup.symbol,
-            timeframe=setup.timeframe,
-            direction=setup.direction.value,
-            current_price=current_price,
-            move_bps=move_bps,
-            required_bps=required_bps,
-        )
-        return True
-
-    def should_trigger_entry(
-        self,
-        *,
-        setup: SpoofingTradeSetup,
-        current_price: float,
-    ) -> bool:
-        """
-        Для reversal-стратегії confirmed setup trigger-иться, якщо ціна
-        не відкотилась назад за entry zone.
-        """
-        if setup.status != SetupStatus.CONFIRMED:
-            return False
-
-        if setup.direction == StrategyDirection.LONG:
-            return current_price >= setup.entry_price
-
-        if setup.direction == StrategyDirection.SHORT:
-            return current_price <= setup.entry_price
-
-        return False
-
-    def should_invalidate_on_price(
-        self,
-        *,
-        setup: SpoofingTradeSetup,
-        current_price: float,
-    ) -> bool:
-        """
-        Invalidation якщо ринок рухається проти reversal hypothesis.
-        """
-        adverse_bps = self._compute_adverse_move_bps(
-            setup=setup,
-            current_price=current_price,
-        )
-        if adverse_bps >= self.config.max_adverse_move_bps_reversal:
-            return True
-
-        return False
-
-    # -------------------------------------------------------------------------
-    # Signal classification helpers
-    # -------------------------------------------------------------------------
-
-    def _is_pull_reversal_signal(self, signal: SpoofingSignal) -> bool:
-        return (
-            signal.pattern == SpoofingPattern.PULL_AND_REVERSAL
-            or signal.spoofing_type == SpoofingType.ORDER_PULL
-            or self.has_detector(signal, SpoofingComponent.ORDER_PULL_DETECTOR)
-        )
-
-    def _is_pressure_bluff_signal(self, signal: SpoofingSignal) -> bool:
-        return (
-            signal.pattern == SpoofingPattern.PRESSURE_BLUFF
-            or signal.spoofing_type == SpoofingType.FLIP_PRESSURE
-            or self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR)
-        )
-
-    def _is_layering_signal(self, signal: SpoofingSignal) -> bool:
-        return (
-            signal.pattern == SpoofingPattern.MULTI_LEVEL_LAYERING
-            or signal.spoofing_type == SpoofingType.LAYERING
-            or self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR)
-        )
-
-    def _has_reversal_relevant_composite(self, signal: SpoofingSignal) -> bool:
-        relevant_detectors = 0
-
-        if self.has_detector(signal, SpoofingComponent.ORDER_PULL_DETECTOR):
-            relevant_detectors += 1
-
-        if self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR):
-            relevant_detectors += 1
-
-        if self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR):
-            relevant_detectors += 1
-
-        if relevant_detectors > 0:
-            return True
-
-        pattern = signal.pattern
-        return pattern in {
-            SpoofingPattern.PULL_AND_REVERSAL,
-            SpoofingPattern.PRESSURE_BLUFF,
-            SpoofingPattern.MULTI_LEVEL_LAYERING,
-        }
-
-    def _resolve_reversal_mode(self, signal: SpoofingSignal) -> str:
-        if self._is_pressure_bluff_signal(signal):
-            return "pressure_bluff_reversal"
-
-        if self._is_layering_signal(signal):
-            return "layering_unwind_reversal"
-
-        if self._is_pull_reversal_signal(signal):
-            return "order_pull_reversal"
-
-        if signal.spoofing_type == SpoofingType.COMPOSITE:
-            return "composite_spoofing_reversal"
-
-        return "post_spoof_reversal"
-
-    # -------------------------------------------------------------------------
-    # Acceptance filter helpers
-    # -------------------------------------------------------------------------
-
-    def _passes_reversal_analytics_contract(self, signal: SpoofingSignal) -> bool:
-        detector_count = self.analytics_int(
-            signal,
-            "detector_count",
-            default=len(signal.detector_results or []),
-        )
-        if detector_count < self.config.min_reversal_detector_count:
-            return False
-
-        agreement_ratio = self.analytics_float(signal, "agreement_ratio", default=0.0)
-        if agreement_ratio < self.config.min_reversal_agreement_ratio:
-            return False
-
-        average_confidence = self.analytics_float(signal, "average_confidence", default=0.0)
-        if average_confidence < self.config.min_reversal_average_confidence:
-            return False
-
-        if self.config.require_analytics_score_passed:
-            if not self.analytics_bool(signal, "passed", default=False):
-                return False
-
-        return True
-
-    def _passes_common_feature_filters(self, signal: SpoofingSignal) -> bool:
-        features = signal.features
-        if features is None:
-            return False
-
-        reaction_bps = abs(self._feature_float(features, "price_reaction_bps"))
-        signed_reaction_bps = self._feature_float(features, "price_reaction_bps")
-        pull_ratio = self._feature_float(features, "pull_ratio")
-        fill_ratio = self._feature_float(features, "fill_ratio")
-        is_fast_pull = self._feature_bool(features, "is_fast_pull")
-        pressure_flip_strength = self._feature_float(features, "pressure_flip_strength")
-        layering_score = self._feature_float(features, "layering_score")
-
-        if fill_ratio > self.config.max_fill_ratio:
-            return False
-
-        if self.config.require_directional_reaction_alignment:
-            direction = self.resolve_direction(signal)
-            if direction == StrategyDirection.LONG and signed_reaction_bps < 0:
-                return False
-            if direction == StrategyDirection.SHORT and signed_reaction_bps > 0:
-                return False
-
-        if reaction_bps < self.config.min_price_reaction_bps:
-            has_alternative_strength = (
-                pull_ratio >= self.config.min_pull_ratio
-                or pressure_flip_strength >= self.config.min_pressure_flip_strength > 0
-                or layering_score >= self.config.min_layering_score > 0
-                or self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR)
-                or self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR)
-            )
-            if not has_alternative_strength:
-                return False
-
-        if pull_ratio > 0 and pull_ratio < self.config.min_pull_ratio:
-            if not self._has_strong_flip_or_layering(signal):
-                return False
-
-        if self.config.require_fast_pull_or_reaction:
-            if not is_fast_pull and reaction_bps < self.config.min_price_reaction_bps:
-                return False
-
-        return True
-
-    def _passes_pull_reversal_filters(self, signal: SpoofingSignal) -> bool:
-        if self.config.require_order_pull_detector_for_pull_pattern:
-            if not self.has_detector(signal, SpoofingComponent.ORDER_PULL_DETECTOR):
-                return False
-
-        detector_score = self.detector_score(
-            signal,
-            SpoofingComponent.ORDER_PULL_DETECTOR,
-            default=0.0,
-        )
-        if detector_score < self.config.min_order_pull_detector_score:
-            return False
-
-        detector_confidence = self.detector_confidence(
-            signal,
-            SpoofingComponent.ORDER_PULL_DETECTOR,
-            default=0.0,
-        )
-        if detector_confidence < self.config.min_order_pull_detector_confidence:
-            return False
-
-        pull_ratio = self._feature_float(signal.features, "pull_ratio")
-        if pull_ratio > 0 and pull_ratio < self.config.min_pull_ratio:
-            return False
-
-        return True
-
-    def _passes_pressure_bluff_filters(self, signal: SpoofingSignal) -> bool:
-        if self.config.require_flip_pressure_detector_for_pressure_bluff:
-            if not self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR):
-                return False
-
-        detector_score = self.detector_score(
-            signal,
-            SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-            default=0.0,
-        )
-        if detector_score < self.config.min_flip_pressure_detector_score:
-            return False
-
-        detector_confidence = self.detector_confidence(
-            signal,
-            SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-            default=0.0,
-        )
-        if detector_confidence < self.config.min_flip_pressure_detector_confidence:
-            return False
-
-        reaction_bps = abs(self._feature_float(signal.features, "price_reaction_bps"))
-        pressure_flip_strength = self._feature_float(signal.features, "pressure_flip_strength")
-
-        if pressure_flip_strength < self.config.min_pressure_flip_strength:
-            if self.config.min_pressure_flip_strength > 0:
-                return False
-
-        if self.config.require_reaction_for_pressure_bluff:
-            if reaction_bps < self.config.min_price_reaction_bps:
-                return False
-
-        flip_metadata = self.detector_metadata(
-            signal,
-            SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-        )
-
-        if self.config.require_has_reversal_for_pressure_bluff:
-            has_reversal = self._metadata_bool(flip_metadata, "has_reversal", default=False)
-            if not has_reversal:
-                return False
-
-        if self.config.max_distance_from_mid_bps_for_flip > 0:
-            distance = self._feature_float(signal.features, "distance_from_mid_bps")
-            if distance <= 0:
-                distance = self._metadata_float(flip_metadata, "distance_from_mid_bps", default=0.0)
-            if distance > self.config.max_distance_from_mid_bps_for_flip:
-                return False
-
-        return True
-
-    def _passes_layering_filters(self, signal: SpoofingSignal) -> bool:
-        if self.config.require_layering_detector_for_layering_pattern:
-            if not self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR):
-                return False
-
-        detector_score = self.detector_score(
-            signal,
-            SpoofingComponent.LAYERING_DETECTOR,
-            default=0.0,
-        )
-        if detector_score < self.config.min_layering_detector_score:
-            return False
-
-        detector_confidence = self.detector_confidence(
-            signal,
-            SpoofingComponent.LAYERING_DETECTOR,
-            default=0.0,
-        )
-        if detector_confidence < self.config.min_layering_detector_confidence:
-            return False
-
-        layering_score = self._feature_float(signal.features, "layering_score")
-        if layering_score < self.config.min_layering_score:
-            if self.config.min_layering_score > 0:
-                return False
-
-        metadata = self.detector_metadata(signal, SpoofingComponent.LAYERING_DETECTOR)
-
-        if self.config.min_layers > 0:
-            layers = int(self._metadata_float(metadata, "layers", default=0.0))
-            if layers < self.config.min_layers:
-                return False
-
-        if self.config.min_layer_total_notional > 0:
-            total_notional = self._first_metadata_float(
-                metadata,
-                names=("total_notional", "total_layer_notional", "layer_notional"),
-                default=0.0,
-            )
-            if total_notional < self.config.min_layer_total_notional:
-                return False
-
-        if self.config.min_synchronized_pull_ratio > 0:
-            sync_pull = self._metadata_float(
-                metadata,
-                "synchronized_pull_ratio",
-                default=0.0,
-            )
-            if sync_pull < self.config.min_synchronized_pull_ratio:
-                return False
-
-        if self.config.max_layer_price_span_bps > 0:
-            price_span = self._metadata_float(metadata, "price_span_bps", default=0.0)
-            if price_span > self.config.max_layer_price_span_bps:
-                return False
-
-        return True
-
-    def _passes_composite_filters(self, signal: SpoofingSignal) -> bool:
-        detector_count = self.analytics_int(
-            signal,
-            "detector_count",
-            default=len(signal.detector_results or []),
-        )
-        if detector_count < self.config.min_composite_detector_count:
-            return False
-
-        agreement_ratio = self.analytics_float(signal, "agreement_ratio", default=0.0)
-        if agreement_ratio < self.config.min_composite_agreement_ratio:
-            return False
-
-        return self._has_reversal_relevant_composite(signal)
-
-    def _has_strong_flip_or_layering(self, signal: SpoofingSignal) -> bool:
-        pressure_flip_strength = self._feature_float(signal.features, "pressure_flip_strength")
-        layering_score = self._feature_float(signal.features, "layering_score")
-
-        if self.config.min_pressure_flip_strength > 0:
-            if pressure_flip_strength >= self.config.min_pressure_flip_strength:
-                return True
-        elif pressure_flip_strength > 0:
-            return True
-
-        if self.config.min_layering_score > 0:
-            if layering_score >= self.config.min_layering_score:
-                return True
-        elif layering_score > 0:
-            return True
-
-        if self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR):
-            return True
-
-        if self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR):
-            return True
-
-        return False
-
-    def _requires_reaction(self, signal: SpoofingSignal) -> bool:
-        if self._is_pressure_bluff_signal(signal):
-            return self.config.require_reaction_for_pressure_bluff
-        return True
-
-    def _has_minimum_confirmation_evidence(self, signal: SpoofingSignal) -> bool:
-        reaction_bps = abs(self._feature_float(signal.features, "price_reaction_bps"))
-        pull_ratio = self._feature_float(signal.features, "pull_ratio")
-        pressure_flip_strength = self._feature_float(signal.features, "pressure_flip_strength")
-        layering_score = self._feature_float(signal.features, "layering_score")
-
-        if reaction_bps >= self.config.min_price_reaction_bps:
-            return True
-
-        if pull_ratio >= self.config.min_pull_ratio:
-            return True
-
-        if pressure_flip_strength > 0:
-            return True
-
-        if layering_score > 0:
-            return True
-
-        if self.has_detector(signal, SpoofingComponent.FLIP_PRESSURE_DETECTOR):
-            return True
-
-        if self.has_detector(signal, SpoofingComponent.LAYERING_DETECTOR):
-            return True
-
-        return False
-
-    def _resolve_confirmation_bps(
-        self,
-        *,
-        signal: SpoofingSignal,
-        setup: SpoofingTradeSetup,
-    ) -> float:
-        required_bps = self.config.confirmation_move_bps
-
-        if setup.severity in {SpoofingSeverity.HIGH, SpoofingSeverity.CRITICAL}:
-            required_bps = min(
-                required_bps,
-                self.config.confirmation_move_bps_high_severity,
+        payload: SpoofingReversalPayload,
+    ) -> list[str]:
+        tags = [
+            self.reversal_config.tag_spoofing,
+            self.reversal_config.tag_reversal,
+            self.reversal_config.tag_spoofing_reversal,
+        ]
+
+        if is_order_pull_signal(payload.snapshot.raw_signal):
+            tags.extend(
+                [
+                    self.reversal_config.tag_order_pull,
+                    self.reversal_config.tag_order_pull_reversal,
+                ]
             )
 
-        if signal.spoofing_type == SpoofingType.COMPOSITE:
-            required_bps = min(
-                required_bps,
-                self.config.confirmation_move_bps_composite,
+        if is_pressure_bluff_signal(payload.snapshot.raw_signal):
+            tags.extend(
+                [
+                    self.reversal_config.tag_pressure_bluff,
+                    self.reversal_config.tag_pressure_bluff_reversal,
+                ]
             )
 
-        return required_bps
+        if is_layering_signal(payload.snapshot.raw_signal):
+            tags.extend(
+                [
+                    self.reversal_config.tag_layering,
+                    self.reversal_config.tag_layering_reversal,
+                ]
+            )
 
-    # -------------------------------------------------------------------------
-    # Metadata builders
-    # -------------------------------------------------------------------------
+        if is_composite_signal(payload.snapshot.raw_signal):
+            tags.extend(
+                [
+                    self.reversal_config.tag_composite,
+                    self.reversal_config.tag_composite_reversal,
+                ]
+            )
 
-    def _build_reversal_feature_metadata(self, signal: SpoofingSignal) -> dict[str, Any]:
-        features = signal.features
+        tags.append(f"side:{payload.side.value}")
 
+        if payload.snapshot.spoofing_type is not None:
+            tags.append(f"type:{normalize_label(payload.snapshot.spoofing_type)}")
+
+        if payload.snapshot.pattern is not None:
+            tags.append(f"pattern:{normalize_label(payload.snapshot.pattern)}")
+
+        return list(dict.fromkeys(tags))
+
+    def _execution_hints(self) -> dict[str, Any]:
+        """
+        Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
+        is owned by SignalProcessor / SignalBuilder.
+        """
         return {
-            "price_reaction_bps": self._feature_float(features, "price_reaction_bps"),
-            "abs_price_reaction_bps": abs(self._feature_float(features, "price_reaction_bps")),
-            "pull_ratio": self._feature_float(features, "pull_ratio"),
-            "fill_ratio": self._feature_float(features, "fill_ratio"),
-            "lifetime_ms": self._feature_float(features, "lifetime_ms"),
-            "pressure_flip_strength": self._feature_float(features, "pressure_flip_strength"),
-            "layering_score": self._feature_float(features, "layering_score"),
-            "distance_from_mid_bps": self._feature_float(features, "distance_from_mid_bps"),
-            "wall_size": self._feature_float(features, "wall_size"),
-            "wall_size_ratio": self._feature_float(features, "wall_size_ratio"),
-            "is_fast_pull": self._feature_bool(features, "is_fast_pull"),
-            "is_fake_liquidity": self._feature_bool(features, "is_fake_liquidity"),
-            "is_layering": self._feature_bool(features, "is_layering"),
-            "is_near_best_quote": self._feature_bool(features, "is_near_best_quote"),
-            "repetition_count": self._feature_float(features, "repetition_count"),
+            "entry_offset_bps": self.reversal_config.execution_entry_offset_bps_hint,
+            "stop_buffer_bps": self.reversal_config.execution_stop_buffer_bps_hint,
+            "take_profit_bps": self.reversal_config.execution_take_profit_bps_hint,
+            "reaction_tp_multiplier": self.reversal_config.reaction_tp_multiplier_hint,
         }
-
-    def _build_reversal_analytics_metadata(self, signal: SpoofingSignal) -> dict[str, Any]:
-        return {
-            "detector_count": self.analytics_int(
-                signal,
-                "detector_count",
-                default=len(signal.detector_results or []),
-            ),
-            "agreement_ratio": self.analytics_float(signal, "agreement_ratio", default=0.0),
-            "average_confidence": self.analytics_float(signal, "average_confidence", default=0.0),
-            "threshold": self.analytics_float(signal, "threshold", default=0.0),
-            "passed": self.analytics_bool(signal, "passed", default=False),
-            "order_pull_detector_score": self.detector_score(
-                signal,
-                SpoofingComponent.ORDER_PULL_DETECTOR,
-                default=0.0,
-            ),
-            "order_pull_detector_confidence": self.detector_confidence(
-                signal,
-                SpoofingComponent.ORDER_PULL_DETECTOR,
-                default=0.0,
-            ),
-            "flip_pressure_detector_score": self.detector_score(
-                signal,
-                SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-                default=0.0,
-            ),
-            "flip_pressure_detector_confidence": self.detector_confidence(
-                signal,
-                SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-                default=0.0,
-            ),
-            "layering_detector_score": self.detector_score(
-                signal,
-                SpoofingComponent.LAYERING_DETECTOR,
-                default=0.0,
-            ),
-            "layering_detector_confidence": self.detector_confidence(
-                signal,
-                SpoofingComponent.LAYERING_DETECTOR,
-                default=0.0,
-            ),
-            "has_order_pull_detector": self.has_detector(
-                signal,
-                SpoofingComponent.ORDER_PULL_DETECTOR,
-            ),
-            "has_flip_pressure_detector": self.has_detector(
-                signal,
-                SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-            ),
-            "has_layering_detector": self.has_detector(
-                signal,
-                SpoofingComponent.LAYERING_DETECTOR,
-            ),
-        }
-
-    def _build_detector_metadata(self, signal: SpoofingSignal) -> dict[str, Any]:
-        return {
-            "order_pull": self.detector_metadata(
-                signal,
-                SpoofingComponent.ORDER_PULL_DETECTOR,
-            ),
-            "flip_pressure": self.detector_metadata(
-                signal,
-                SpoofingComponent.FLIP_PRESSURE_DETECTOR,
-            ),
-            "layering": self.detector_metadata(
-                signal,
-                SpoofingComponent.LAYERING_DETECTOR,
-            ),
-        }
-
-    def _build_reversal_reason(self, signal: SpoofingSignal) -> str:
-        parts: list[str] = []
-
-        if self._is_pull_reversal_signal(signal):
-            pull_ratio = self._feature_float(signal.features, "pull_ratio")
-            parts.append(f"order_pull:pull_ratio={pull_ratio:.3f}")
-
-        if self._is_pressure_bluff_signal(signal):
-            strength = self._feature_float(signal.features, "pressure_flip_strength")
-            reaction = self._feature_float(signal.features, "price_reaction_bps")
-            parts.append(
-                f"pressure_bluff:strength={strength:.3f},reaction_bps={reaction:.2f}"
-            )
-
-        if self._is_layering_signal(signal):
-            layering_score = self._feature_float(signal.features, "layering_score")
-            metadata = self.detector_metadata(signal, SpoofingComponent.LAYERING_DETECTOR)
-            layers = int(self._metadata_float(metadata, "layers", default=0.0))
-            parts.append(f"layering:score={layering_score:.3f},layers={layers}")
-
-        if signal.spoofing_type == SpoofingType.COMPOSITE:
-            detector_count = self.analytics_int(
-                signal,
-                "detector_count",
-                default=len(signal.detector_results or []),
-            )
-            agreement_ratio = self.analytics_float(signal, "agreement_ratio", default=0.0)
-            parts.append(
-                f"composite:detectors={detector_count},agreement={agreement_ratio:.3f}"
-            )
-
-        if not parts:
-            parts.append(
-                f"{signal.spoofing_type.value}:{signal.pattern.value}:score={signal.score:.3f}"
-            )
-
-        return " | ".join(parts)
-
-    # -------------------------------------------------------------------------
-    # Metadata small helpers
-    # -------------------------------------------------------------------------
-
-    def _metadata_float(
-        self,
-        metadata: dict[str, Any] | None,
-        name: str,
-        *,
-        default: float = 0.0,
-    ) -> float:
-        if not metadata:
-            return default
-        return self._safe_float(metadata.get(name), default)
-
-    def _metadata_bool(
-        self,
-        metadata: dict[str, Any] | None,
-        name: str,
-        *,
-        default: bool = False,
-    ) -> bool:
-        if not metadata:
-            return default
-
-        value = metadata.get(name)
-        if value is None:
-            return default
-
-        if isinstance(value, bool):
-            return value
-
-        if isinstance(value, (int, float)):
-            return bool(value)
-
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-        return default
-
-    def _first_metadata_float(
-        self,
-        metadata: dict[str, Any] | None,
-        names: tuple[str, ...],
-        *,
-        default: float = 0.0,
-    ) -> float:
-        if not metadata:
-            return default
-
-        for name in names:
-            value = self._safe_float(metadata.get(name), default)
-            if value != default:
-                return value
-
-        return default

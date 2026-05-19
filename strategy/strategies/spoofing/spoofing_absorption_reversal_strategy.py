@@ -1,4 +1,4 @@
-# trading_system/strategy/strategies/spoofing/fake_liquidity_trap_strategy.py
+# trading_system/strategy/strategies/spoofing/spoofing_absorption_reversal_strategy.py
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from .base import (
 from .utils import (
     ScoreBreakdown,
     average_score,
+    base_spoofing_source_features,
     confidence_from_components,
     detector_agreement_ratio,
     detector_average_confidence,
@@ -38,10 +39,8 @@ from .utils import (
     detector_passed,
     detector_score,
     extract_cancel_to_fill_ratio,
-    extract_distance_from_mid_bps,
     extract_event_time,
     extract_fill_ratio,
-    extract_lifetime_ms,
     extract_price_reaction_bps,
     extract_pull_ratio,
     extract_pulled_notional,
@@ -49,7 +48,6 @@ from .utils import (
     extract_wall_notional,
     fake_liquidity_source_features,
     freshness_score,
-    is_composite_signal,
     is_directional_side,
     is_fake_liquidity_signal,
     is_stale,
@@ -64,13 +62,13 @@ from .utils import (
 
 
 @dataclass(slots=True)
-class FakeLiquidityTrapPayload:
+class SpoofingAbsorptionReversalPayload:
     """
-    Normalized strategy-level payload для fake liquidity trap.
+    Normalized strategy-level payload для fake absorption reversal.
 
     Direction convention:
-    - fake ASK liquidity removed -> fake resistance disappears -> LONG;
-    - fake BID liquidity removed -> fake support disappears -> SHORT.
+    - fake BID absorption/support -> buyers were not real -> SHORT;
+    - fake ASK absorption/resistance -> sellers were not real -> LONG.
     """
 
     snapshot: SpoofingCompositeSnapshot
@@ -89,12 +87,12 @@ class FakeLiquidityTrapPayload:
         return extract_fill_ratio(self.snapshot.raw_signal)
 
     @property
-    def price_reaction_bps(self) -> float:
-        return extract_price_reaction_bps(self.snapshot.raw_signal)
+    def cancel_to_fill_ratio(self) -> float:
+        return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
 
     @property
-    def lifetime_ms(self) -> float:
-        return extract_lifetime_ms(self.snapshot.raw_signal)
+    def price_reaction_bps(self) -> float:
+        return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def wall_notional(self) -> float:
@@ -104,72 +102,44 @@ class FakeLiquidityTrapPayload:
     def pulled_notional(self) -> float:
         return extract_pulled_notional(self.snapshot.raw_signal)
 
-    @property
-    def cancel_to_fill_ratio(self) -> float:
-        return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
-
-    @property
-    def distance_from_mid_bps(self) -> float:
-        return extract_distance_from_mid_bps(self.snapshot.raw_signal)
-
 
 @dataclass(slots=True)
-class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
+class SpoofingAbsorptionReversalStrategyConfig(SpoofingStrategyConfig):
     """
-    Unified fake-liquidity trap strategy config.
+    Unified fake-absorption reversal strategy config.
 
     Strategy idea:
-    - fake wall / fake absorption is detected by analytics.spoofing;
-    - wall is mostly pulled, barely filled, often short-lived;
-    - market reacts in unwind direction;
-    - strategy returns internal StrategySignal only;
-    - SignalProcessor owns routing, filters, confluence and risk-ready payload.
+    - analytics.spoofing detects fake absorption / fake liquidity wall;
+    - wall looked like support/resistance but had high cancel-to-fill and low fill;
+    - pulled liquidity invalidates absorption narrative;
+    - strategy returns internal StrategySignal only.
     """
 
-    allow_fake_liquidity_type: bool = True
-    allow_fake_absorption_pattern: bool = True
-    allow_composite_if_fake_liquidity_flag: bool = True
-    allow_composite_if_fake_liquidity_detector: bool = True
+    min_absorption_score: float = 0.70
+    min_absorption_confidence: float = 0.60
 
-    min_trap_score: float = 0.72
-    min_trap_confidence: float = 0.62
-
-    min_pull_ratio: float = 0.70
-    max_fill_ratio: float = 0.20
-    min_price_reaction_bps: float = 2.0
-    max_lifetime_ms: float = 4500.0
-
+    min_pull_ratio: float = 0.55
+    max_fill_ratio: float = 0.25
     min_cancel_to_fill_ratio: float = 0.65
     min_wall_notional: float = 0.0
     min_pulled_notional: float = 0.0
-    max_distance_from_mid_bps: float | None = None
 
-    require_fake_liquidity_flag: bool = False
+    require_fake_absorption_pattern: bool = True
     require_fake_liquidity_detector: bool = False
-    require_short_lived_wall: bool = True
-    require_market_reaction: bool = True
+    require_fake_liquidity_detector_passed: bool = False
+    require_market_reaction: bool = False
     require_directional_reaction_alignment: bool = False
-    require_detector_passed: bool = False
 
+    min_price_reaction_bps: float = 1.0
     min_fake_liquidity_detector_score: float = 0.0
     min_fake_liquidity_detector_confidence: float = 0.0
 
-    allow_retest_entry_hint: bool = True
-    max_retest_distance_bps_hint: float | None = None
-    entry_offset_bps_hint: float | None = None
-    stop_buffer_bps_hint: float | None = None
-    take_profit_bps_hint: float | None = None
-    trap_tp_multiplier_hint: float | None = None
-    composite_tp_multiplier_hint: float | None = None
-    repeated_trap_tp_multiplier_hint: float | None = None
-
     score_base_weight: float = 0.24
-    score_pull_weight: float = 0.20
-    score_fill_weight: float = 0.16
-    score_reaction_weight: float = 0.16
-    score_lifetime_weight: float = 0.08
+    score_absorption_weight: float = 0.22
+    score_cancel_fill_weight: float = 0.18
+    score_fill_weight: float = 0.14
+    score_reaction_weight: float = 0.10
     score_detector_weight: float = 0.08
-    score_notional_weight: float = 0.04
     score_freshness_weight: float = 0.04
 
     confidence_primary_weight: float = 0.55
@@ -177,26 +147,32 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
     confidence_confirmation_weight: float = 0.15
     confidence_freshness_weight: float = 0.05
 
-    high_pull_bonus: float = 0.04
+    strong_cancel_to_fill_bonus: float = 0.04
     low_fill_bonus: float = 0.04
-    short_lifetime_bonus: float = 0.03
+    strong_pull_bonus: float = 0.04
     detector_bonus: float = 0.04
-    composite_bonus: float = 0.04
+    reaction_bonus: float = 0.03
     directional_reaction_bonus: float = 0.04
-    cancel_to_fill_bonus: float = 0.03
+    notional_bonus: float = 0.03
 
-    strong_pull_ratio_threshold: float = 0.85
-    very_low_fill_ratio_threshold: float = 0.10
     strong_cancel_to_fill_threshold: float = 0.85
+    very_low_fill_ratio_threshold: float = 0.10
+    strong_pull_ratio_threshold: float = 0.75
 
-    tag_fake_liquidity_trap: str = "fake_liquidity_trap"
+    entry_offset_bps_hint: float | None = None
+    stop_buffer_bps_hint: float | None = None
+    take_profit_bps_hint: float | None = None
+    absorption_tp_multiplier_hint: float | None = None
+
+    tag_spoofing_absorption_reversal: str = "spoofing_absorption_reversal"
     tag_fake_absorption: str = "fake_absorption"
+    tag_absorption_failed: str = "absorption_failed"
+    tag_cancel_to_fill: str = "cancel_to_fill"
+    tag_low_fill: str = "low_fill"
     tag_unwind: str = "unwind"
-    tag_short_lived_wall: str = "short_lived_wall"
-    tag_market_reaction: str = "market_reaction"
 
     default_priority: SignalPriority = SignalPriority.HIGH
-    default_setup_type: SetupType = SetupType.CONTINUATION
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     required_spoofing_features: tuple[str, ...] = (
         SPOOFING_FEATURES.SIGNAL,
@@ -206,49 +182,42 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
-            "min_trap_score": self.min_trap_score,
-            "min_trap_confidence": self.min_trap_confidence,
+            "min_absorption_score": self.min_absorption_score,
+            "min_absorption_confidence": self.min_absorption_confidence,
             "min_pull_ratio": self.min_pull_ratio,
             "max_fill_ratio": self.max_fill_ratio,
             "min_cancel_to_fill_ratio": self.min_cancel_to_fill_ratio,
             "min_fake_liquidity_detector_score": self.min_fake_liquidity_detector_score,
             "min_fake_liquidity_detector_confidence": self.min_fake_liquidity_detector_confidence,
-            "high_pull_bonus": self.high_pull_bonus,
+            "strong_cancel_to_fill_bonus": self.strong_cancel_to_fill_bonus,
             "low_fill_bonus": self.low_fill_bonus,
-            "short_lifetime_bonus": self.short_lifetime_bonus,
+            "strong_pull_bonus": self.strong_pull_bonus,
             "detector_bonus": self.detector_bonus,
-            "composite_bonus": self.composite_bonus,
+            "reaction_bonus": self.reaction_bonus,
             "directional_reaction_bonus": self.directional_reaction_bonus,
-            "cancel_to_fill_bonus": self.cancel_to_fill_bonus,
-            "strong_pull_ratio_threshold": self.strong_pull_ratio_threshold,
-            "very_low_fill_ratio_threshold": self.very_low_fill_ratio_threshold,
+            "notional_bonus": self.notional_bonus,
             "strong_cancel_to_fill_threshold": self.strong_cancel_to_fill_threshold,
+            "very_low_fill_ratio_threshold": self.very_low_fill_ratio_threshold,
+            "strong_pull_ratio_threshold": self.strong_pull_ratio_threshold,
         }
         for field_name, value in unit_fields.items():
             if not 0.0 <= float(value) <= 1.0:
                 raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
 
         non_negative_fields = {
-            "min_price_reaction_bps": self.min_price_reaction_bps,
-            "max_lifetime_ms": self.max_lifetime_ms,
             "min_wall_notional": self.min_wall_notional,
             "min_pulled_notional": self.min_pulled_notional,
+            "min_price_reaction_bps": self.min_price_reaction_bps,
         }
         for field_name, value in non_negative_fields.items():
             if float(value) < 0.0:
                 raise StrategyConfigError(f"{field_name} must be >= 0")
 
-        if self.max_distance_from_mid_bps is not None and self.max_distance_from_mid_bps < 0:
-            raise StrategyConfigError("max_distance_from_mid_bps must be >= 0")
-
         hint_fields = {
-            "max_retest_distance_bps_hint": self.max_retest_distance_bps_hint,
             "entry_offset_bps_hint": self.entry_offset_bps_hint,
             "stop_buffer_bps_hint": self.stop_buffer_bps_hint,
             "take_profit_bps_hint": self.take_profit_bps_hint,
-            "trap_tp_multiplier_hint": self.trap_tp_multiplier_hint,
-            "composite_tp_multiplier_hint": self.composite_tp_multiplier_hint,
-            "repeated_trap_tp_multiplier_hint": self.repeated_trap_tp_multiplier_hint,
+            "absorption_tp_multiplier_hint": self.absorption_tp_multiplier_hint,
         }
         for field_name, value in hint_fields.items():
             if value is not None and value < 0:
@@ -256,12 +225,11 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
 
         score_weights = {
             "score_base_weight": self.score_base_weight,
-            "score_pull_weight": self.score_pull_weight,
+            "score_absorption_weight": self.score_absorption_weight,
+            "score_cancel_fill_weight": self.score_cancel_fill_weight,
             "score_fill_weight": self.score_fill_weight,
             "score_reaction_weight": self.score_reaction_weight,
-            "score_lifetime_weight": self.score_lifetime_weight,
             "score_detector_weight": self.score_detector_weight,
-            "score_notional_weight": self.score_notional_weight,
             "score_freshness_weight": self.score_freshness_weight,
         }
         confidence_weights = {
@@ -282,11 +250,12 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
             raise StrategyConfigError("confidence weights sum must be > 0")
 
         for attr in (
-            "tag_fake_liquidity_trap",
+            "tag_spoofing_absorption_reversal",
             "tag_fake_absorption",
+            "tag_absorption_failed",
+            "tag_cancel_to_fill",
+            "tag_low_fill",
             "tag_unwind",
-            "tag_short_lived_wall",
-            "tag_market_reaction",
         ):
             value = getattr(self, attr)
             if not isinstance(value, str) or not value.strip():
@@ -296,9 +265,9 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
             raise StrategyConfigError("required_spoofing_features cannot be empty")
 
 
-class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
+class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
     """
-    Unified fake-liquidity trap strategy.
+    Unified fake-absorption reversal strategy.
 
     Input:
         StrategyContext with FeatureSource.SPOOFING domain data / features.
@@ -310,9 +279,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    component_namespace = "strategy.spoofing.fake_liquidity_trap"
+    component_namespace = "strategy.spoofing.absorption_reversal"
     category: StrategyCategory = StrategyCategory.SPOOFING
-    default_setup_type: SetupType = SetupType.CONTINUATION
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     def __init__(
         self,
@@ -321,11 +290,11 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         scheduler: Scheduler | None = None,
         *,
         definition: StrategyDefinitionConfig | None = None,
-        spoofing_config: FakeLiquidityTrapStrategyConfig | None = None,
+        spoofing_config: SpoofingAbsorptionReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
         resolved_spoofing_config = (
-            spoofing_config or FakeLiquidityTrapStrategyConfig()
+            spoofing_config or SpoofingAbsorptionReversalStrategyConfig()
         )
         resolved_spoofing_config.validate()
 
@@ -338,11 +307,13 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             service_name=service_name,
         )
 
-        self.trap_config: FakeLiquidityTrapStrategyConfig = resolved_spoofing_config
+        self.absorption_config: SpoofingAbsorptionReversalStrategyConfig = (
+            resolved_spoofing_config
+        )
 
     @property
     def strategy_name(self) -> str:
-        return "fake_liquidity_trap"
+        return "spoofing_absorption_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
@@ -351,18 +322,17 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             category=StrategyCategory.SPOOFING,
             timeframe=Timeframe.M1,
             tags=[
-                self.trap_config.tag_spoofing,
-                self.trap_config.tag_fake_liquidity,
-                self.trap_config.tag_liquidity_trap,
-                self.trap_config.tag_fake_liquidity_trap,
-                self.trap_config.tag_continuation,
-                self.trap_config.tag_unwind,
+                self.absorption_config.tag_spoofing,
+                self.absorption_config.tag_absorption,
+                self.absorption_config.tag_fake_absorption,
+                self.absorption_config.tag_reversal,
+                self.absorption_config.tag_spoofing_absorption_reversal,
                 "analytics_spoofing",
             ],
             version="2.0.0",
             description=(
-                "Interprets fake-liquidity / fake-absorption spoofing traps "
-                "from normalized StrategyContext and returns internal StrategySignal."
+                "Interprets fake absorption / fake liquidity wall failure from "
+                "normalized StrategyContext and returns internal StrategySignal."
             ),
             required_features=set(self.required_features()),
             supported_regimes={
@@ -376,12 +346,11 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             },
             metadata={
                 "source": "analytics.spoofing",
-                "strategy_type": "fake_liquidity_trap",
+                "strategy_type": "spoofing_absorption_reversal",
                 "base_class": "SpoofingTradingStrategy",
                 "canonical_payload": "SpoofingCompositeSnapshot",
-                "uses_fake_liquidity": True,
                 "uses_fake_absorption": True,
-                "uses_detector_results": True,
+                "uses_fake_liquidity_detector": True,
                 "emits_signal_generated": False,
                 "risk_ready_payload_owner": "SignalProcessor",
             },
@@ -389,7 +358,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
     def required_features(self) -> set[str]:
         base_required = super().required_features()
-        return set(base_required).union(self.trap_config.required_spoofing_features)
+        return set(base_required).union(
+            self.absorption_config.required_spoofing_features
+        )
 
     async def generate_signal(
         self,
@@ -399,13 +370,13 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
         if not self.has_any_spoofing_data(
             context,
-            tuple(self.trap_config.required_spoofing_features),
+            tuple(self.absorption_config.required_spoofing_features),
         ):
             return None
 
         if self.has_stale_spoofing_features(
             context,
-            tuple(self.trap_config.required_spoofing_features),
+            tuple(self.absorption_config.required_spoofing_features),
         ):
             return None
 
@@ -416,23 +387,26 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         if is_stale(
             event_time=payload.event_time,
             now=context.timestamp,
-            stale_after_seconds=self.trap_config.stale_feature_max_age_seconds,
+            stale_after_seconds=self.absorption_config.stale_feature_max_age_seconds,
         ):
             return None
 
         rejection = quality_filter_reason(
             payload.snapshot.raw_signal,
-            min_score=max(self.trap_config.min_score, self.trap_config.min_trap_score),
-            min_confidence=max(
-                self.trap_config.min_confidence,
-                self.trap_config.min_trap_confidence,
+            min_score=max(
+                self.absorption_config.min_score,
+                self.absorption_config.min_absorption_score,
             ),
-            allowed_severities=self.trap_config.allowed_severities,
-            min_detector_count=self.trap_config.min_detector_count,
-            min_agreement_ratio=self.trap_config.min_agreement_ratio,
-            min_average_confidence=self.trap_config.min_average_confidence,
-            require_score_passed=self.trap_config.require_score_passed,
-            stale_after_seconds=self.trap_config.stale_feature_max_age_seconds,
+            min_confidence=max(
+                self.absorption_config.min_confidence,
+                self.absorption_config.min_absorption_confidence,
+            ),
+            allowed_severities=self.absorption_config.allowed_severities,
+            min_detector_count=self.absorption_config.min_detector_count,
+            min_agreement_ratio=self.absorption_config.min_agreement_ratio,
+            min_average_confidence=self.absorption_config.min_average_confidence,
+            require_score_passed=self.absorption_config.require_score_passed,
+            stale_after_seconds=self.absorption_config.stale_feature_max_age_seconds,
             now=context.timestamp,
         )
         if rejection is not None:
@@ -444,7 +418,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         if not self._supports_snapshot(payload.snapshot):
             return None
 
-        if not self._passes_trap_filters(payload):
+        if not self._passes_absorption_filters(payload):
             return None
 
         breakdown = self._build_score_breakdown(
@@ -452,10 +426,10 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             payload=payload,
         )
 
-        if breakdown.score < self.trap_config.min_trap_score:
+        if breakdown.score < self.absorption_config.min_absorption_score:
             return None
 
-        if breakdown.confidence < self.trap_config.min_trap_confidence:
+        if breakdown.confidence < self.absorption_config.min_absorption_confidence:
             return None
 
         source_features = self._source_features(payload)
@@ -464,7 +438,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         reasons = list(
             dict.fromkeys(
                 [
-                    "fake_liquidity_trap_signal",
+                    "spoofing_absorption_reversal_signal",
                     f"side:{payload.side.value}",
                     *payload.reasons,
                     *breakdown.reasons,
@@ -474,7 +448,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         confirmations = list(dict.fromkeys(breakdown.confirmations))
 
         metadata = {
-            "spoofing_setup_family": "fake_liquidity_trap",
+            "spoofing_setup_family": "spoofing_absorption_reversal",
             "spoofing_strategy_version": "2.0.0",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,
@@ -489,17 +463,15 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             "confidence": payload.snapshot.confidence,
             "pull_ratio": payload.pull_ratio,
             "fill_ratio": payload.fill_ratio,
+            "cancel_to_fill_ratio": payload.cancel_to_fill_ratio,
             "price_reaction_bps": payload.price_reaction_bps,
             "signed_price_reaction_bps": payload.snapshot.signed_price_reaction_bps,
-            "lifetime_ms": payload.lifetime_ms,
             "wall_notional": payload.wall_notional,
             "pulled_notional": payload.pulled_notional,
-            "cancel_to_fill_ratio": payload.cancel_to_fill_ratio,
-            "distance_from_mid_bps": payload.distance_from_mid_bps,
             "detector_count": detector_count(payload.snapshot.raw_signal),
             "detector_agreement_ratio": detector_agreement_ratio(payload.snapshot.raw_signal),
             "detector_average_confidence": detector_average_confidence(payload.snapshot.raw_signal),
-            "trap_execution_hints": self._trap_execution_hints(),
+            "execution_hints": self._execution_hints(),
         }
 
         return self.build_spoofing_signal(
@@ -507,12 +479,12 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             side=payload.side,
             confidence=breakdown.confidence,
             score=breakdown.score,
-            setup_type=self.trap_config.default_setup_type,
+            setup_type=self.absorption_config.default_setup_type,
             reasons=reasons,
             confirmations=confirmations,
             source_features=source_features,
             metadata=metadata,
-            priority=self.trap_config.default_priority,
+            priority=self.absorption_config.default_priority,
         )
 
     # ------------------------------------------------------------------
@@ -522,7 +494,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
     def _extract_payload(
         self,
         context: StrategyContext,
-    ) -> FakeLiquidityTrapPayload | None:
+    ) -> SpoofingAbsorptionReversalPayload | None:
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -538,7 +510,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         )
 
         reasons = [
-            "fake_liquidity_trap_context",
+            "spoofing_absorption_context",
             f"spoofing_type:{normalize_label(snapshot.spoofing_type)}",
             f"pattern:{normalize_label(snapshot.pattern)}",
             f"spoofing_side:{normalize_label(snapshot.side)}",
@@ -546,13 +518,13 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             f"confidence:{snapshot.confidence:.4f}",
         ]
 
+        if snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
+            reasons.append("fake_absorption_pattern_detected")
+
         if is_fake_liquidity_signal(snapshot.raw_signal):
-            reasons.append("fake_liquidity_signal_detected")
+            reasons.append("fake_liquidity_context")
 
-        if is_composite_signal(snapshot.raw_signal):
-            reasons.append("composite_spoofing_context")
-
-        return FakeLiquidityTrapPayload(
+        return SpoofingAbsorptionReversalPayload(
             snapshot=snapshot,
             side=side,
             event_time=event_time,
@@ -568,94 +540,77 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
-        if self.trap_config.allow_fake_liquidity_type:
-            if snapshot.spoofing_type is SpoofingType.FAKE_LIQUIDITY:
-                return True
+        if snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
+            return True
 
-        if self.trap_config.allow_fake_absorption_pattern:
-            if snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
-                return True
+        if snapshot.spoofing_type is SpoofingType.FAKE_LIQUIDITY:
+            return True
 
-        if self.trap_config.allow_composite_if_fake_liquidity_flag:
-            if is_composite_signal(snapshot.raw_signal) and is_fake_liquidity_signal(snapshot.raw_signal):
-                return True
-
-        if self.trap_config.allow_composite_if_fake_liquidity_detector:
-            if is_composite_signal(snapshot.raw_signal) and snapshot.has_detector(
-                SpoofingComponent.FAKE_LIQUIDITY_DETECTOR
-            ):
-                return True
+        if snapshot.has_detector(SpoofingComponent.FAKE_LIQUIDITY_DETECTOR):
+            return True
 
         return is_fake_liquidity_signal(snapshot.raw_signal)
 
-    def _passes_trap_filters(
+    def _passes_absorption_filters(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: SpoofingAbsorptionReversalPayload,
     ) -> bool:
         snapshot = payload.snapshot
 
-        if self.trap_config.require_fake_liquidity_flag:
-            if not is_fake_liquidity_signal(snapshot.raw_signal):
+        if self.absorption_config.require_fake_absorption_pattern:
+            if snapshot.pattern is not SpoofingPattern.FAKE_ABSORPTION:
                 return False
 
-        if self.trap_config.require_fake_liquidity_detector:
+        if self.absorption_config.require_fake_liquidity_detector:
             if not snapshot.has_detector(SpoofingComponent.FAKE_LIQUIDITY_DETECTOR):
                 return False
 
-        if self.trap_config.require_detector_passed:
+        if self.absorption_config.require_fake_liquidity_detector_passed:
             if not detector_passed(
                 snapshot.raw_signal,
                 SpoofingComponent.FAKE_LIQUIDITY_DETECTOR,
             ):
                 return False
 
-        if payload.pull_ratio < self.trap_config.min_pull_ratio:
+        if payload.pull_ratio < self.absorption_config.min_pull_ratio:
             return False
 
-        if payload.fill_ratio > self.trap_config.max_fill_ratio:
+        if payload.fill_ratio > self.absorption_config.max_fill_ratio:
             return False
 
-        if self.trap_config.require_market_reaction:
-            if payload.price_reaction_bps < self.trap_config.min_price_reaction_bps:
+        if payload.cancel_to_fill_ratio < self.absorption_config.min_cancel_to_fill_ratio:
+            return False
+
+        if payload.wall_notional < self.absorption_config.min_wall_notional:
+            return False
+
+        if payload.pulled_notional < self.absorption_config.min_pulled_notional:
+            return False
+
+        if self.absorption_config.require_market_reaction:
+            if payload.price_reaction_bps < self.absorption_config.min_price_reaction_bps:
                 return False
 
-        if self.trap_config.require_short_lived_wall:
-            if payload.lifetime_ms > self.trap_config.max_lifetime_ms:
-                return False
-
-        if payload.cancel_to_fill_ratio < self.trap_config.min_cancel_to_fill_ratio:
-            return False
-
-        if payload.wall_notional < self.trap_config.min_wall_notional:
-            return False
-
-        if payload.pulled_notional < self.trap_config.min_pulled_notional:
-            return False
-
-        if self.trap_config.max_distance_from_mid_bps is not None:
-            if payload.distance_from_mid_bps > self.trap_config.max_distance_from_mid_bps:
-                return False
-
-        if self.trap_config.require_directional_reaction_alignment:
+        if self.absorption_config.require_directional_reaction_alignment:
             if not reaction_aligns_with_side(
                 signed_reaction_bps=snapshot.signed_price_reaction_bps,
                 side=payload.side,
-                min_reaction_bps=self.trap_config.min_price_reaction_bps,
+                min_reaction_bps=self.absorption_config.min_price_reaction_bps,
             ):
                 return False
 
         if detector_score(
             snapshot.raw_signal,
             SpoofingComponent.FAKE_LIQUIDITY_DETECTOR,
-        ) < self.trap_config.min_fake_liquidity_detector_score:
-            if self.trap_config.require_fake_liquidity_detector:
+        ) < self.absorption_config.min_fake_liquidity_detector_score:
+            if self.absorption_config.require_fake_liquidity_detector:
                 return False
 
         if detector_confidence(
             snapshot.raw_signal,
             SpoofingComponent.FAKE_LIQUIDITY_DETECTOR,
-        ) < self.trap_config.min_fake_liquidity_detector_confidence:
-            if self.trap_config.require_fake_liquidity_detector:
+        ) < self.absorption_config.min_fake_liquidity_detector_confidence:
+            if self.absorption_config.require_fake_liquidity_detector:
                 return False
 
         return True
@@ -668,7 +623,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         *,
         context: StrategyContext,
-        payload: FakeLiquidityTrapPayload,
+        payload: SpoofingAbsorptionReversalPayload,
     ) -> ScoreBreakdown:
         snapshot = payload.snapshot
 
@@ -677,108 +632,103 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             snapshot.score,
             snapshot.confidence,
         )
-        pull_component = payload.pull_ratio
+        absorption_component = average_score(
+            payload.pull_ratio,
+            payload.cancel_to_fill_ratio,
+            payload.pulled_notional / max(payload.wall_notional, 1.0)
+            if payload.wall_notional > 0
+            else 0.0,
+        )
+        cancel_fill_component = payload.cancel_to_fill_ratio
         fill_component = unit_score(1.0 - payload.fill_ratio)
         reaction_component = unit_score(
             payload.price_reaction_bps
-            / max(self.trap_config.min_price_reaction_bps * 4.0, 0.01)
+            / max(self.absorption_config.min_price_reaction_bps * 4.0, 0.01)
         )
-        lifetime_component = self._lifetime_component(payload)
         detector_component = average_score(
             detector_score(snapshot.raw_signal, SpoofingComponent.FAKE_LIQUIDITY_DETECTOR),
             detector_confidence(snapshot.raw_signal, SpoofingComponent.FAKE_LIQUIDITY_DETECTOR),
             detector_agreement_ratio(snapshot.raw_signal),
             detector_average_confidence(snapshot.raw_signal),
         )
-        notional_component = self._notional_component(payload)
         fresh_component = freshness_score(
             event_time=payload.event_time,
             now=context.timestamp,
-            stale_after_seconds=self.trap_config.stale_feature_max_age_seconds,
+            stale_after_seconds=self.absorption_config.stale_feature_max_age_seconds,
         )
 
         components = {
             "base": base_component,
-            "pull": pull_component,
+            "absorption": absorption_component,
+            "cancel_fill": cancel_fill_component,
             "fill": fill_component,
             "reaction": reaction_component,
-            "lifetime": lifetime_component,
             "detector": detector_component,
-            "notional": notional_component,
             "freshness": fresh_component,
         }
         weights = {
-            "base": self.trap_config.score_base_weight,
-            "pull": self.trap_config.score_pull_weight,
-            "fill": self.trap_config.score_fill_weight,
-            "reaction": self.trap_config.score_reaction_weight,
-            "lifetime": self.trap_config.score_lifetime_weight,
-            "detector": self.trap_config.score_detector_weight,
-            "notional": self.trap_config.score_notional_weight,
-            "freshness": self.trap_config.score_freshness_weight,
+            "base": self.absorption_config.score_base_weight,
+            "absorption": self.absorption_config.score_absorption_weight,
+            "cancel_fill": self.absorption_config.score_cancel_fill_weight,
+            "fill": self.absorption_config.score_fill_weight,
+            "reaction": self.absorption_config.score_reaction_weight,
+            "detector": self.absorption_config.score_detector_weight,
+            "freshness": self.absorption_config.score_freshness_weight,
         }
 
         score = weighted_score(components, weights, default=base_component)
         confidence = confidence_from_components(
             primary=base_component,
-            context=average_score(detector_component, notional_component),
-            confirmation=average_score(
-                pull_component,
-                fill_component,
-                reaction_component,
-                lifetime_component,
-            ),
+            context=average_score(absorption_component, detector_component),
+            confirmation=average_score(cancel_fill_component, fill_component, reaction_component),
             freshness=fresh_component,
-            primary_weight=self.trap_config.confidence_primary_weight,
-            context_weight=self.trap_config.confidence_context_weight,
-            confirmation_weight=self.trap_config.confidence_confirmation_weight,
-            freshness_weight=self.trap_config.confidence_freshness_weight,
+            primary_weight=self.absorption_config.confidence_primary_weight,
+            context_weight=self.absorption_config.confidence_context_weight,
+            confirmation_weight=self.absorption_config.confidence_confirmation_weight,
+            freshness_weight=self.absorption_config.confidence_freshness_weight,
         )
 
         reasons: list[str] = []
         confirmations: list[str] = [
-            "fake_liquidity_trap_context",
+            "fake_absorption_reversal_context",
             f"side:{payload.side.value}",
             f"pull_ratio:{payload.pull_ratio:.4f}",
             f"fill_ratio:{payload.fill_ratio:.4f}",
-            f"price_reaction_bps:{payload.price_reaction_bps:.4f}",
+            f"cancel_to_fill_ratio:{payload.cancel_to_fill_ratio:.4f}",
         ]
 
-        if payload.pull_ratio >= self.trap_config.strong_pull_ratio_threshold:
-            score += self.trap_config.high_pull_bonus
-            confirmations.append("strong_pull_ratio")
-
-        if payload.fill_ratio <= self.trap_config.very_low_fill_ratio_threshold:
-            score += self.trap_config.low_fill_bonus
-            confirmations.append("very_low_fill_ratio")
-
-        if payload.lifetime_ms <= self.trap_config.max_lifetime_ms:
-            score += self.trap_config.short_lifetime_bonus
-            confirmations.append("short_lived_fake_wall")
-
-        if payload.cancel_to_fill_ratio >= self.trap_config.strong_cancel_to_fill_threshold:
-            score += self.trap_config.cancel_to_fill_bonus
+        if payload.cancel_to_fill_ratio >= self.absorption_config.strong_cancel_to_fill_threshold:
+            score += self.absorption_config.strong_cancel_to_fill_bonus
             confirmations.append("strong_cancel_to_fill_ratio")
 
+        if payload.fill_ratio <= self.absorption_config.very_low_fill_ratio_threshold:
+            score += self.absorption_config.low_fill_bonus
+            confirmations.append("very_low_fill_ratio")
+
+        if payload.pull_ratio >= self.absorption_config.strong_pull_ratio_threshold:
+            score += self.absorption_config.strong_pull_bonus
+            confirmations.append("strong_pull_ratio")
+
         if snapshot.has_detector(SpoofingComponent.FAKE_LIQUIDITY_DETECTOR):
-            score += self.trap_config.detector_bonus
+            score += self.absorption_config.detector_bonus
             confirmations.append("fake_liquidity_detector_context")
 
-        if is_composite_signal(snapshot.raw_signal):
-            score += self.trap_config.composite_bonus
-            confirmations.append("composite_spoofing_context")
+        if payload.price_reaction_bps >= self.absorption_config.min_price_reaction_bps:
+            score += self.absorption_config.reaction_bonus
+            confirmations.append("market_reaction_context")
 
         if reaction_aligns_with_side(
             signed_reaction_bps=snapshot.signed_price_reaction_bps,
             side=payload.side,
-            min_reaction_bps=self.trap_config.min_price_reaction_bps,
+            min_reaction_bps=self.absorption_config.min_price_reaction_bps,
         ):
-            score += self.trap_config.directional_reaction_bonus
-            confidence += min(0.03, self.trap_config.directional_reaction_bonus)
-            confirmations.append("directional_unwind_reaction")
+            score += self.absorption_config.directional_reaction_bonus
+            confidence += min(0.03, self.absorption_config.directional_reaction_bonus)
+            confirmations.append("directional_absorption_failure_reaction")
 
-        if payload.distance_from_mid_bps > 0:
-            reasons.append(f"distance_from_mid_bps:{payload.distance_from_mid_bps:.4f}")
+        if payload.pulled_notional > 0:
+            score += self.absorption_config.notional_bonus
+            confirmations.append("pulled_notional_confirmed")
 
         if payload.wall_notional > 0:
             reasons.append(f"wall_notional:{payload.wall_notional:.4f}")
@@ -795,33 +745,16 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             confirmations=list(dict.fromkeys(confirmations)),
         ).normalize()
 
-    def _lifetime_component(
-        self,
-        payload: FakeLiquidityTrapPayload,
-    ) -> float:
-        if payload.lifetime_ms <= 0:
-            return 0.0
-
-        return unit_score(1.0 - (payload.lifetime_ms / max(self.trap_config.max_lifetime_ms, 1.0)))
-
-    def _notional_component(
-        self,
-        payload: FakeLiquidityTrapPayload,
-    ) -> float:
-        if payload.wall_notional <= 0:
-            return 0.0
-
-        return unit_score(payload.pulled_notional / max(payload.wall_notional, 1.0))
-
     # ------------------------------------------------------------------
     # Source features / tags / execution hints
     # ------------------------------------------------------------------
 
     def _source_features(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: SpoofingAbsorptionReversalPayload,
     ) -> list[str]:
         features = [
+            *base_spoofing_source_features(),
             *fake_liquidity_source_features(),
             SPOOFING_FEATURES.SIGNAL,
             SPOOFING_FEATURES.SPOOFING_TYPE,
@@ -831,12 +764,10 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             SPOOFING_FEATURES.CONFIDENCE,
             SPOOFING_FEATURES.PULL_RATIO,
             SPOOFING_FEATURES.FILL_RATIO,
-            SPOOFING_FEATURES.PRICE_REACTION_BPS,
-            SPOOFING_FEATURES.LIFETIME_MS,
             SPOOFING_FEATURES.CANCEL_TO_FILL_RATIO,
+            SPOOFING_FEATURES.PRICE_REACTION_BPS,
             SPOOFING_FEATURES.WALL_NOTIONAL,
             SPOOFING_FEATURES.PULLED_NOTIONAL,
-            SPOOFING_FEATURES.DISTANCE_FROM_MID_BPS,
             SPOOFING_FEATURES.DETECTOR_RESULTS,
             SPOOFING_FEATURES.SCORE_BREAKDOWN,
         ]
@@ -845,26 +776,24 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
     def _tags(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: SpoofingAbsorptionReversalPayload,
     ) -> list[str]:
         tags = [
-            self.trap_config.tag_spoofing,
-            self.trap_config.tag_fake_liquidity,
-            self.trap_config.tag_liquidity_trap,
-            self.trap_config.tag_fake_liquidity_trap,
-            self.trap_config.tag_continuation,
-            self.trap_config.tag_unwind,
+            self.absorption_config.tag_spoofing,
+            self.absorption_config.tag_absorption,
+            self.absorption_config.tag_fake_absorption,
+            self.absorption_config.tag_reversal,
+            self.absorption_config.tag_spoofing_absorption_reversal,
+            self.absorption_config.tag_absorption_failed,
+            self.absorption_config.tag_unwind,
             f"side:{payload.side.value}",
         ]
 
-        if payload.snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
-            tags.append(self.trap_config.tag_fake_absorption)
+        if payload.cancel_to_fill_ratio >= self.absorption_config.min_cancel_to_fill_ratio:
+            tags.append(self.absorption_config.tag_cancel_to_fill)
 
-        if payload.lifetime_ms <= self.trap_config.max_lifetime_ms:
-            tags.append(self.trap_config.tag_short_lived_wall)
-
-        if payload.price_reaction_bps >= self.trap_config.min_price_reaction_bps:
-            tags.append(self.trap_config.tag_market_reaction)
+        if payload.fill_ratio <= self.absorption_config.very_low_fill_ratio_threshold:
+            tags.append(self.absorption_config.tag_low_fill)
 
         if payload.snapshot.spoofing_type is not None:
             tags.append(f"type:{normalize_label(payload.snapshot.spoofing_type)}")
@@ -874,20 +803,16 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
         return list(dict.fromkeys(tags))
 
-    def _trap_execution_hints(self) -> dict[str, Any]:
+    def _execution_hints(self) -> dict[str, Any]:
         """
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
         return {
-            "allow_retest_entry": self.trap_config.allow_retest_entry_hint,
-            "max_retest_distance_bps": self.trap_config.max_retest_distance_bps_hint,
-            "entry_offset_bps": self.trap_config.entry_offset_bps_hint,
-            "stop_buffer_bps": self.trap_config.stop_buffer_bps_hint,
-            "take_profit_bps": self.trap_config.take_profit_bps_hint,
-            "trap_tp_multiplier": self.trap_config.trap_tp_multiplier_hint,
-            "composite_tp_multiplier": self.trap_config.composite_tp_multiplier_hint,
-            "repeated_trap_tp_multiplier": (
-                self.trap_config.repeated_trap_tp_multiplier_hint
+            "entry_offset_bps": self.absorption_config.entry_offset_bps_hint,
+            "stop_buffer_bps": self.absorption_config.stop_buffer_bps_hint,
+            "take_profit_bps": self.absorption_config.take_profit_bps_hint,
+            "absorption_tp_multiplier": (
+                self.absorption_config.absorption_tp_multiplier_hint
             ),
         }

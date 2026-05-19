@@ -1,4 +1,4 @@
-# trading_system/strategy/strategies/spoofing/fake_liquidity_trap_strategy.py
+# trading_system/strategy/strategies/spoofing/layering_trap_strategy.py
 
 from __future__ import annotations
 
@@ -37,22 +37,20 @@ from .utils import (
     detector_count,
     detector_passed,
     detector_score,
-    extract_cancel_to_fill_ratio,
-    extract_distance_from_mid_bps,
     extract_event_time,
     extract_fill_ratio,
-    extract_lifetime_ms,
+    extract_layer_count,
+    extract_layer_price_span_bps,
     extract_price_reaction_bps,
     extract_pull_ratio,
     extract_pulled_notional,
     extract_score,
     extract_wall_notional,
-    fake_liquidity_source_features,
     freshness_score,
-    is_composite_signal,
     is_directional_side,
-    is_fake_liquidity_signal,
+    is_layering_signal,
     is_stale,
+    layering_source_features,
     normalize_label,
     quality_filter_reason,
     reaction_aligns_with_side,
@@ -64,13 +62,13 @@ from .utils import (
 
 
 @dataclass(slots=True)
-class FakeLiquidityTrapPayload:
+class LayeringTrapPayload:
     """
-    Normalized strategy-level payload для fake liquidity trap.
+    Normalized strategy-level payload для layering trap.
 
     Direction convention:
-    - fake ASK liquidity removed -> fake resistance disappears -> LONG;
-    - fake BID liquidity removed -> fake support disappears -> SHORT.
+    - multi-level fake ASK supply removed -> fake resistance disappears -> LONG;
+    - multi-level fake BID demand removed -> fake support disappears -> SHORT.
     """
 
     snapshot: SpoofingCompositeSnapshot
@@ -79,6 +77,14 @@ class FakeLiquidityTrapPayload:
     event_time: datetime | None = None
     reasons: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def layer_count(self) -> int:
+        return extract_layer_count(self.snapshot.raw_signal)
+
+    @property
+    def layer_price_span_bps(self) -> float:
+        return extract_layer_price_span_bps(self.snapshot.raw_signal)
 
     @property
     def pull_ratio(self) -> float:
@@ -93,10 +99,6 @@ class FakeLiquidityTrapPayload:
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
-    def lifetime_ms(self) -> float:
-        return extract_lifetime_ms(self.snapshot.raw_signal)
-
-    @property
     def wall_notional(self) -> float:
         return extract_wall_notional(self.snapshot.raw_signal)
 
@@ -104,99 +106,80 @@ class FakeLiquidityTrapPayload:
     def pulled_notional(self) -> float:
         return extract_pulled_notional(self.snapshot.raw_signal)
 
-    @property
-    def cancel_to_fill_ratio(self) -> float:
-        return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
-
-    @property
-    def distance_from_mid_bps(self) -> float:
-        return extract_distance_from_mid_bps(self.snapshot.raw_signal)
-
 
 @dataclass(slots=True)
-class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
+class LayeringTrapStrategyConfig(SpoofingStrategyConfig):
     """
-    Unified fake-liquidity trap strategy config.
+    Unified layering trap strategy config.
 
     Strategy idea:
-    - fake wall / fake absorption is detected by analytics.spoofing;
-    - wall is mostly pulled, barely filled, often short-lived;
-    - market reacts in unwind direction;
-    - strategy returns internal StrategySignal only;
-    - SignalProcessor owns routing, filters, confluence and risk-ready payload.
+    - analytics.spoofing detects multi-level layering;
+    - layers are mostly pulled / low-filled;
+    - layer span is compact enough to be one fake liquidity zone;
+    - optional reaction confirms unwind direction;
+    - strategy returns internal StrategySignal only.
     """
 
-    allow_fake_liquidity_type: bool = True
-    allow_fake_absorption_pattern: bool = True
-    allow_composite_if_fake_liquidity_flag: bool = True
-    allow_composite_if_fake_liquidity_detector: bool = True
+    min_layering_score: float = 0.70
+    min_layering_confidence: float = 0.60
 
-    min_trap_score: float = 0.72
-    min_trap_confidence: float = 0.62
-
-    min_pull_ratio: float = 0.70
-    max_fill_ratio: float = 0.20
-    min_price_reaction_bps: float = 2.0
-    max_lifetime_ms: float = 4500.0
-
-    min_cancel_to_fill_ratio: float = 0.65
-    min_wall_notional: float = 0.0
+    min_layers: int = 2
+    min_layer_total_notional: float = 0.0
     min_pulled_notional: float = 0.0
-    max_distance_from_mid_bps: float | None = None
+    min_synchronized_pull_ratio: float = 0.50
+    max_fill_ratio: float = 0.40
+    max_layer_price_span_bps: float = 8.0
+    min_price_reaction_bps: float = 1.0
 
-    require_fake_liquidity_flag: bool = False
-    require_fake_liquidity_detector: bool = False
-    require_short_lived_wall: bool = True
-    require_market_reaction: bool = True
+    require_layering_detector: bool = False
+    require_layering_detector_passed: bool = False
+    require_compact_layer_span: bool = True
+    require_market_reaction: bool = False
     require_directional_reaction_alignment: bool = False
-    require_detector_passed: bool = False
 
-    min_fake_liquidity_detector_score: float = 0.0
-    min_fake_liquidity_detector_confidence: float = 0.0
-
-    allow_retest_entry_hint: bool = True
-    max_retest_distance_bps_hint: float | None = None
-    entry_offset_bps_hint: float | None = None
-    stop_buffer_bps_hint: float | None = None
-    take_profit_bps_hint: float | None = None
-    trap_tp_multiplier_hint: float | None = None
-    composite_tp_multiplier_hint: float | None = None
-    repeated_trap_tp_multiplier_hint: float | None = None
+    min_layering_detector_score: float = 0.0
+    min_layering_detector_confidence: float = 0.0
 
     score_base_weight: float = 0.24
-    score_pull_weight: float = 0.20
-    score_fill_weight: float = 0.16
-    score_reaction_weight: float = 0.16
-    score_lifetime_weight: float = 0.08
-    score_detector_weight: float = 0.08
-    score_notional_weight: float = 0.04
-    score_freshness_weight: float = 0.04
+    score_layers_weight: float = 0.20
+    score_pull_weight: float = 0.18
+    score_span_weight: float = 0.14
+    score_detector_weight: float = 0.10
+    score_reaction_weight: float = 0.08
+    score_notional_weight: float = 0.03
+    score_freshness_weight: float = 0.03
 
     confidence_primary_weight: float = 0.55
     confidence_context_weight: float = 0.25
     confidence_confirmation_weight: float = 0.15
     confidence_freshness_weight: float = 0.05
 
-    high_pull_bonus: float = 0.04
-    low_fill_bonus: float = 0.04
-    short_lifetime_bonus: float = 0.03
+    layer_count_bonus: float = 0.04
+    synchronized_pull_bonus: float = 0.04
+    compact_span_bonus: float = 0.03
     detector_bonus: float = 0.04
-    composite_bonus: float = 0.04
-    directional_reaction_bonus: float = 0.04
-    cancel_to_fill_bonus: float = 0.03
+    reaction_bonus: float = 0.03
+    notional_bonus: float = 0.03
+    low_fill_bonus: float = 0.03
 
-    strong_pull_ratio_threshold: float = 0.85
-    very_low_fill_ratio_threshold: float = 0.10
-    strong_cancel_to_fill_threshold: float = 0.85
+    strong_layer_count_threshold: int = 4
+    strong_pull_ratio_threshold: float = 0.70
+    low_fill_ratio_threshold: float = 0.25
+    compact_span_threshold_bps: float = 4.0
 
-    tag_fake_liquidity_trap: str = "fake_liquidity_trap"
-    tag_fake_absorption: str = "fake_absorption"
+    entry_offset_bps_hint: float | None = None
+    stop_buffer_bps_hint: float | None = None
+    take_profit_bps_hint: float | None = None
+    trap_tp_multiplier_hint: float | None = None
+
+    tag_layering_trap: str = "layering_trap"
+    tag_multi_level_layering: str = "multi_level_layering"
+    tag_synchronized_pull: str = "synchronized_pull"
+    tag_compact_layers: str = "compact_layers"
     tag_unwind: str = "unwind"
-    tag_short_lived_wall: str = "short_lived_wall"
-    tag_market_reaction: str = "market_reaction"
 
     default_priority: SignalPriority = SignalPriority.HIGH
-    default_setup_type: SetupType = SetupType.CONTINUATION
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     required_spoofing_features: tuple[str, ...] = (
         SPOOFING_FEATURES.SIGNAL,
@@ -206,49 +189,48 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
-            "min_trap_score": self.min_trap_score,
-            "min_trap_confidence": self.min_trap_confidence,
-            "min_pull_ratio": self.min_pull_ratio,
+            "min_layering_score": self.min_layering_score,
+            "min_layering_confidence": self.min_layering_confidence,
+            "min_synchronized_pull_ratio": self.min_synchronized_pull_ratio,
             "max_fill_ratio": self.max_fill_ratio,
-            "min_cancel_to_fill_ratio": self.min_cancel_to_fill_ratio,
-            "min_fake_liquidity_detector_score": self.min_fake_liquidity_detector_score,
-            "min_fake_liquidity_detector_confidence": self.min_fake_liquidity_detector_confidence,
-            "high_pull_bonus": self.high_pull_bonus,
-            "low_fill_bonus": self.low_fill_bonus,
-            "short_lifetime_bonus": self.short_lifetime_bonus,
+            "min_layering_detector_score": self.min_layering_detector_score,
+            "min_layering_detector_confidence": self.min_layering_detector_confidence,
+            "layer_count_bonus": self.layer_count_bonus,
+            "synchronized_pull_bonus": self.synchronized_pull_bonus,
+            "compact_span_bonus": self.compact_span_bonus,
             "detector_bonus": self.detector_bonus,
-            "composite_bonus": self.composite_bonus,
-            "directional_reaction_bonus": self.directional_reaction_bonus,
-            "cancel_to_fill_bonus": self.cancel_to_fill_bonus,
+            "reaction_bonus": self.reaction_bonus,
+            "notional_bonus": self.notional_bonus,
+            "low_fill_bonus": self.low_fill_bonus,
             "strong_pull_ratio_threshold": self.strong_pull_ratio_threshold,
-            "very_low_fill_ratio_threshold": self.very_low_fill_ratio_threshold,
-            "strong_cancel_to_fill_threshold": self.strong_cancel_to_fill_threshold,
+            "low_fill_ratio_threshold": self.low_fill_ratio_threshold,
         }
         for field_name, value in unit_fields.items():
             if not 0.0 <= float(value) <= 1.0:
                 raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
 
         non_negative_fields = {
-            "min_price_reaction_bps": self.min_price_reaction_bps,
-            "max_lifetime_ms": self.max_lifetime_ms,
-            "min_wall_notional": self.min_wall_notional,
+            "min_layer_total_notional": self.min_layer_total_notional,
             "min_pulled_notional": self.min_pulled_notional,
+            "max_layer_price_span_bps": self.max_layer_price_span_bps,
+            "min_price_reaction_bps": self.min_price_reaction_bps,
+            "compact_span_threshold_bps": self.compact_span_threshold_bps,
         }
         for field_name, value in non_negative_fields.items():
             if float(value) < 0.0:
                 raise StrategyConfigError(f"{field_name} must be >= 0")
 
-        if self.max_distance_from_mid_bps is not None and self.max_distance_from_mid_bps < 0:
-            raise StrategyConfigError("max_distance_from_mid_bps must be >= 0")
+        if self.min_layers < 1:
+            raise StrategyConfigError("min_layers must be >= 1")
+
+        if self.strong_layer_count_threshold < 1:
+            raise StrategyConfigError("strong_layer_count_threshold must be >= 1")
 
         hint_fields = {
-            "max_retest_distance_bps_hint": self.max_retest_distance_bps_hint,
             "entry_offset_bps_hint": self.entry_offset_bps_hint,
             "stop_buffer_bps_hint": self.stop_buffer_bps_hint,
             "take_profit_bps_hint": self.take_profit_bps_hint,
             "trap_tp_multiplier_hint": self.trap_tp_multiplier_hint,
-            "composite_tp_multiplier_hint": self.composite_tp_multiplier_hint,
-            "repeated_trap_tp_multiplier_hint": self.repeated_trap_tp_multiplier_hint,
         }
         for field_name, value in hint_fields.items():
             if value is not None and value < 0:
@@ -256,11 +238,11 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
 
         score_weights = {
             "score_base_weight": self.score_base_weight,
+            "score_layers_weight": self.score_layers_weight,
             "score_pull_weight": self.score_pull_weight,
-            "score_fill_weight": self.score_fill_weight,
-            "score_reaction_weight": self.score_reaction_weight,
-            "score_lifetime_weight": self.score_lifetime_weight,
+            "score_span_weight": self.score_span_weight,
             "score_detector_weight": self.score_detector_weight,
+            "score_reaction_weight": self.score_reaction_weight,
             "score_notional_weight": self.score_notional_weight,
             "score_freshness_weight": self.score_freshness_weight,
         }
@@ -282,11 +264,11 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
             raise StrategyConfigError("confidence weights sum must be > 0")
 
         for attr in (
-            "tag_fake_liquidity_trap",
-            "tag_fake_absorption",
+            "tag_layering_trap",
+            "tag_multi_level_layering",
+            "tag_synchronized_pull",
+            "tag_compact_layers",
             "tag_unwind",
-            "tag_short_lived_wall",
-            "tag_market_reaction",
         ):
             value = getattr(self, attr)
             if not isinstance(value, str) or not value.strip():
@@ -296,9 +278,9 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
             raise StrategyConfigError("required_spoofing_features cannot be empty")
 
 
-class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
+class LayeringTrapStrategy(SpoofingTradingStrategy):
     """
-    Unified fake-liquidity trap strategy.
+    Unified layering trap strategy.
 
     Input:
         StrategyContext with FeatureSource.SPOOFING domain data / features.
@@ -310,9 +292,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    component_namespace = "strategy.spoofing.fake_liquidity_trap"
+    component_namespace = "strategy.spoofing.layering_trap"
     category: StrategyCategory = StrategyCategory.SPOOFING
-    default_setup_type: SetupType = SetupType.CONTINUATION
+    default_setup_type: SetupType = SetupType.REVERSAL
 
     def __init__(
         self,
@@ -321,12 +303,10 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         scheduler: Scheduler | None = None,
         *,
         definition: StrategyDefinitionConfig | None = None,
-        spoofing_config: FakeLiquidityTrapStrategyConfig | None = None,
+        spoofing_config: LayeringTrapStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
-        resolved_spoofing_config = (
-            spoofing_config or FakeLiquidityTrapStrategyConfig()
-        )
+        resolved_spoofing_config = spoofing_config or LayeringTrapStrategyConfig()
         resolved_spoofing_config.validate()
 
         super().__init__(
@@ -338,11 +318,11 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             service_name=service_name,
         )
 
-        self.trap_config: FakeLiquidityTrapStrategyConfig = resolved_spoofing_config
+        self.layering_config: LayeringTrapStrategyConfig = resolved_spoofing_config
 
     @property
     def strategy_name(self) -> str:
-        return "fake_liquidity_trap"
+        return "layering_trap"
 
     @property
     def metadata(self) -> StrategyMetadata:
@@ -351,18 +331,17 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             category=StrategyCategory.SPOOFING,
             timeframe=Timeframe.M1,
             tags=[
-                self.trap_config.tag_spoofing,
-                self.trap_config.tag_fake_liquidity,
-                self.trap_config.tag_liquidity_trap,
-                self.trap_config.tag_fake_liquidity_trap,
-                self.trap_config.tag_continuation,
-                self.trap_config.tag_unwind,
+                self.layering_config.tag_spoofing,
+                self.layering_config.tag_layering,
+                self.layering_config.tag_layering_trap,
+                self.layering_config.tag_multi_level_layering,
+                self.layering_config.tag_reversal,
                 "analytics_spoofing",
             ],
             version="2.0.0",
             description=(
-                "Interprets fake-liquidity / fake-absorption spoofing traps "
-                "from normalized StrategyContext and returns internal StrategySignal."
+                "Interprets multi-level layering spoofing traps from normalized "
+                "StrategyContext and returns internal StrategySignal."
             ),
             required_features=set(self.required_features()),
             supported_regimes={
@@ -376,12 +355,10 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             },
             metadata={
                 "source": "analytics.spoofing",
-                "strategy_type": "fake_liquidity_trap",
+                "strategy_type": "layering_trap",
                 "base_class": "SpoofingTradingStrategy",
                 "canonical_payload": "SpoofingCompositeSnapshot",
-                "uses_fake_liquidity": True,
-                "uses_fake_absorption": True,
-                "uses_detector_results": True,
+                "uses_layering_detector": True,
                 "emits_signal_generated": False,
                 "risk_ready_payload_owner": "SignalProcessor",
             },
@@ -389,7 +366,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
     def required_features(self) -> set[str]:
         base_required = super().required_features()
-        return set(base_required).union(self.trap_config.required_spoofing_features)
+        return set(base_required).union(
+            self.layering_config.required_spoofing_features
+        )
 
     async def generate_signal(
         self,
@@ -399,13 +378,13 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
         if not self.has_any_spoofing_data(
             context,
-            tuple(self.trap_config.required_spoofing_features),
+            tuple(self.layering_config.required_spoofing_features),
         ):
             return None
 
         if self.has_stale_spoofing_features(
             context,
-            tuple(self.trap_config.required_spoofing_features),
+            tuple(self.layering_config.required_spoofing_features),
         ):
             return None
 
@@ -416,23 +395,26 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         if is_stale(
             event_time=payload.event_time,
             now=context.timestamp,
-            stale_after_seconds=self.trap_config.stale_feature_max_age_seconds,
+            stale_after_seconds=self.layering_config.stale_feature_max_age_seconds,
         ):
             return None
 
         rejection = quality_filter_reason(
             payload.snapshot.raw_signal,
-            min_score=max(self.trap_config.min_score, self.trap_config.min_trap_score),
-            min_confidence=max(
-                self.trap_config.min_confidence,
-                self.trap_config.min_trap_confidence,
+            min_score=max(
+                self.layering_config.min_score,
+                self.layering_config.min_layering_score,
             ),
-            allowed_severities=self.trap_config.allowed_severities,
-            min_detector_count=self.trap_config.min_detector_count,
-            min_agreement_ratio=self.trap_config.min_agreement_ratio,
-            min_average_confidence=self.trap_config.min_average_confidence,
-            require_score_passed=self.trap_config.require_score_passed,
-            stale_after_seconds=self.trap_config.stale_feature_max_age_seconds,
+            min_confidence=max(
+                self.layering_config.min_confidence,
+                self.layering_config.min_layering_confidence,
+            ),
+            allowed_severities=self.layering_config.allowed_severities,
+            min_detector_count=self.layering_config.min_detector_count,
+            min_agreement_ratio=self.layering_config.min_agreement_ratio,
+            min_average_confidence=self.layering_config.min_average_confidence,
+            require_score_passed=self.layering_config.require_score_passed,
+            stale_after_seconds=self.layering_config.stale_feature_max_age_seconds,
             now=context.timestamp,
         )
         if rejection is not None:
@@ -444,7 +426,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         if not self._supports_snapshot(payload.snapshot):
             return None
 
-        if not self._passes_trap_filters(payload):
+        if not self._passes_layering_filters(payload):
             return None
 
         breakdown = self._build_score_breakdown(
@@ -452,10 +434,10 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             payload=payload,
         )
 
-        if breakdown.score < self.trap_config.min_trap_score:
+        if breakdown.score < self.layering_config.min_layering_score:
             return None
 
-        if breakdown.confidence < self.trap_config.min_trap_confidence:
+        if breakdown.confidence < self.layering_config.min_layering_confidence:
             return None
 
         source_features = self._source_features(payload)
@@ -464,7 +446,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         reasons = list(
             dict.fromkeys(
                 [
-                    "fake_liquidity_trap_signal",
+                    "layering_trap_signal",
                     f"side:{payload.side.value}",
                     *payload.reasons,
                     *breakdown.reasons,
@@ -474,7 +456,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         confirmations = list(dict.fromkeys(breakdown.confirmations))
 
         metadata = {
-            "spoofing_setup_family": "fake_liquidity_trap",
+            "spoofing_setup_family": "layering_trap",
             "spoofing_strategy_version": "2.0.0",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,
@@ -487,19 +469,18 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             "mapped_side": payload.side.value,
             "score": payload.snapshot.score,
             "confidence": payload.snapshot.confidence,
+            "layer_count": payload.layer_count,
+            "layer_price_span_bps": payload.layer_price_span_bps,
             "pull_ratio": payload.pull_ratio,
             "fill_ratio": payload.fill_ratio,
             "price_reaction_bps": payload.price_reaction_bps,
             "signed_price_reaction_bps": payload.snapshot.signed_price_reaction_bps,
-            "lifetime_ms": payload.lifetime_ms,
             "wall_notional": payload.wall_notional,
             "pulled_notional": payload.pulled_notional,
-            "cancel_to_fill_ratio": payload.cancel_to_fill_ratio,
-            "distance_from_mid_bps": payload.distance_from_mid_bps,
             "detector_count": detector_count(payload.snapshot.raw_signal),
             "detector_agreement_ratio": detector_agreement_ratio(payload.snapshot.raw_signal),
             "detector_average_confidence": detector_average_confidence(payload.snapshot.raw_signal),
-            "trap_execution_hints": self._trap_execution_hints(),
+            "execution_hints": self._execution_hints(),
         }
 
         return self.build_spoofing_signal(
@@ -507,12 +488,12 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             side=payload.side,
             confidence=breakdown.confidence,
             score=breakdown.score,
-            setup_type=self.trap_config.default_setup_type,
+            setup_type=self.layering_config.default_setup_type,
             reasons=reasons,
             confirmations=confirmations,
             source_features=source_features,
             metadata=metadata,
-            priority=self.trap_config.default_priority,
+            priority=self.layering_config.default_priority,
         )
 
     # ------------------------------------------------------------------
@@ -522,7 +503,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
     def _extract_payload(
         self,
         context: StrategyContext,
-    ) -> FakeLiquidityTrapPayload | None:
+    ) -> LayeringTrapPayload | None:
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -538,7 +519,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         )
 
         reasons = [
-            "fake_liquidity_trap_context",
+            "layering_trap_context",
             f"spoofing_type:{normalize_label(snapshot.spoofing_type)}",
             f"pattern:{normalize_label(snapshot.pattern)}",
             f"spoofing_side:{normalize_label(snapshot.side)}",
@@ -546,13 +527,10 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             f"confidence:{snapshot.confidence:.4f}",
         ]
 
-        if is_fake_liquidity_signal(snapshot.raw_signal):
-            reasons.append("fake_liquidity_signal_detected")
+        if is_layering_signal(snapshot.raw_signal):
+            reasons.append("layering_signal_detected")
 
-        if is_composite_signal(snapshot.raw_signal):
-            reasons.append("composite_spoofing_context")
-
-        return FakeLiquidityTrapPayload(
+        return LayeringTrapPayload(
             snapshot=snapshot,
             side=side,
             event_time=event_time,
@@ -568,94 +546,70 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
-        if self.trap_config.allow_fake_liquidity_type:
-            if snapshot.spoofing_type is SpoofingType.FAKE_LIQUIDITY:
-                return True
+        return (
+            snapshot.spoofing_type is SpoofingType.LAYERING
+            or snapshot.pattern is SpoofingPattern.MULTI_LEVEL_LAYERING
+            or snapshot.has_detector(SpoofingComponent.LAYERING_DETECTOR)
+            or is_layering_signal(snapshot.raw_signal)
+        )
 
-        if self.trap_config.allow_fake_absorption_pattern:
-            if snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
-                return True
-
-        if self.trap_config.allow_composite_if_fake_liquidity_flag:
-            if is_composite_signal(snapshot.raw_signal) and is_fake_liquidity_signal(snapshot.raw_signal):
-                return True
-
-        if self.trap_config.allow_composite_if_fake_liquidity_detector:
-            if is_composite_signal(snapshot.raw_signal) and snapshot.has_detector(
-                SpoofingComponent.FAKE_LIQUIDITY_DETECTOR
-            ):
-                return True
-
-        return is_fake_liquidity_signal(snapshot.raw_signal)
-
-    def _passes_trap_filters(
+    def _passes_layering_filters(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: LayeringTrapPayload,
     ) -> bool:
         snapshot = payload.snapshot
 
-        if self.trap_config.require_fake_liquidity_flag:
-            if not is_fake_liquidity_signal(snapshot.raw_signal):
+        if self.layering_config.require_layering_detector:
+            if not snapshot.has_detector(SpoofingComponent.LAYERING_DETECTOR):
                 return False
 
-        if self.trap_config.require_fake_liquidity_detector:
-            if not snapshot.has_detector(SpoofingComponent.FAKE_LIQUIDITY_DETECTOR):
+        if self.layering_config.require_layering_detector_passed:
+            if not detector_passed(snapshot.raw_signal, SpoofingComponent.LAYERING_DETECTOR):
                 return False
 
-        if self.trap_config.require_detector_passed:
-            if not detector_passed(
-                snapshot.raw_signal,
-                SpoofingComponent.FAKE_LIQUIDITY_DETECTOR,
-            ):
-                return False
-
-        if payload.pull_ratio < self.trap_config.min_pull_ratio:
+        if payload.layer_count < self.layering_config.min_layers:
             return False
 
-        if payload.fill_ratio > self.trap_config.max_fill_ratio:
+        if payload.wall_notional < self.layering_config.min_layer_total_notional:
             return False
 
-        if self.trap_config.require_market_reaction:
-            if payload.price_reaction_bps < self.trap_config.min_price_reaction_bps:
+        if payload.pulled_notional < self.layering_config.min_pulled_notional:
+            return False
+
+        if payload.pull_ratio < self.layering_config.min_synchronized_pull_ratio:
+            return False
+
+        if payload.fill_ratio > self.layering_config.max_fill_ratio:
+            return False
+
+        if self.layering_config.require_compact_layer_span:
+            if payload.layer_price_span_bps > self.layering_config.max_layer_price_span_bps:
                 return False
 
-        if self.trap_config.require_short_lived_wall:
-            if payload.lifetime_ms > self.trap_config.max_lifetime_ms:
+        if self.layering_config.require_market_reaction:
+            if payload.price_reaction_bps < self.layering_config.min_price_reaction_bps:
                 return False
 
-        if payload.cancel_to_fill_ratio < self.trap_config.min_cancel_to_fill_ratio:
-            return False
-
-        if payload.wall_notional < self.trap_config.min_wall_notional:
-            return False
-
-        if payload.pulled_notional < self.trap_config.min_pulled_notional:
-            return False
-
-        if self.trap_config.max_distance_from_mid_bps is not None:
-            if payload.distance_from_mid_bps > self.trap_config.max_distance_from_mid_bps:
-                return False
-
-        if self.trap_config.require_directional_reaction_alignment:
+        if self.layering_config.require_directional_reaction_alignment:
             if not reaction_aligns_with_side(
                 signed_reaction_bps=snapshot.signed_price_reaction_bps,
                 side=payload.side,
-                min_reaction_bps=self.trap_config.min_price_reaction_bps,
+                min_reaction_bps=self.layering_config.min_price_reaction_bps,
             ):
                 return False
 
         if detector_score(
             snapshot.raw_signal,
-            SpoofingComponent.FAKE_LIQUIDITY_DETECTOR,
-        ) < self.trap_config.min_fake_liquidity_detector_score:
-            if self.trap_config.require_fake_liquidity_detector:
+            SpoofingComponent.LAYERING_DETECTOR,
+        ) < self.layering_config.min_layering_detector_score:
+            if self.layering_config.require_layering_detector:
                 return False
 
         if detector_confidence(
             snapshot.raw_signal,
-            SpoofingComponent.FAKE_LIQUIDITY_DETECTOR,
-        ) < self.trap_config.min_fake_liquidity_detector_confidence:
-            if self.trap_config.require_fake_liquidity_detector:
+            SpoofingComponent.LAYERING_DETECTOR,
+        ) < self.layering_config.min_layering_detector_confidence:
+            if self.layering_config.require_layering_detector:
                 return False
 
         return True
@@ -668,7 +622,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         *,
         context: StrategyContext,
-        payload: FakeLiquidityTrapPayload,
+        payload: LayeringTrapPayload,
     ) -> ScoreBreakdown:
         snapshot = payload.snapshot
 
@@ -677,108 +631,105 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             snapshot.score,
             snapshot.confidence,
         )
-        pull_component = payload.pull_ratio
-        fill_component = unit_score(1.0 - payload.fill_ratio)
-        reaction_component = unit_score(
-            payload.price_reaction_bps
-            / max(self.trap_config.min_price_reaction_bps * 4.0, 0.01)
+        layers_component = unit_score(
+            payload.layer_count / max(self.layering_config.min_layers * 3, 1)
         )
-        lifetime_component = self._lifetime_component(payload)
+        pull_component = payload.pull_ratio
+        span_component = self._span_component(payload)
         detector_component = average_score(
-            detector_score(snapshot.raw_signal, SpoofingComponent.FAKE_LIQUIDITY_DETECTOR),
-            detector_confidence(snapshot.raw_signal, SpoofingComponent.FAKE_LIQUIDITY_DETECTOR),
+            detector_score(snapshot.raw_signal, SpoofingComponent.LAYERING_DETECTOR),
+            detector_confidence(snapshot.raw_signal, SpoofingComponent.LAYERING_DETECTOR),
             detector_agreement_ratio(snapshot.raw_signal),
             detector_average_confidence(snapshot.raw_signal),
+        )
+        reaction_component = unit_score(
+            payload.price_reaction_bps
+            / max(self.layering_config.min_price_reaction_bps * 4.0, 0.01)
         )
         notional_component = self._notional_component(payload)
         fresh_component = freshness_score(
             event_time=payload.event_time,
             now=context.timestamp,
-            stale_after_seconds=self.trap_config.stale_feature_max_age_seconds,
+            stale_after_seconds=self.layering_config.stale_feature_max_age_seconds,
         )
 
         components = {
             "base": base_component,
+            "layers": layers_component,
             "pull": pull_component,
-            "fill": fill_component,
-            "reaction": reaction_component,
-            "lifetime": lifetime_component,
+            "span": span_component,
             "detector": detector_component,
+            "reaction": reaction_component,
             "notional": notional_component,
             "freshness": fresh_component,
         }
         weights = {
-            "base": self.trap_config.score_base_weight,
-            "pull": self.trap_config.score_pull_weight,
-            "fill": self.trap_config.score_fill_weight,
-            "reaction": self.trap_config.score_reaction_weight,
-            "lifetime": self.trap_config.score_lifetime_weight,
-            "detector": self.trap_config.score_detector_weight,
-            "notional": self.trap_config.score_notional_weight,
-            "freshness": self.trap_config.score_freshness_weight,
+            "base": self.layering_config.score_base_weight,
+            "layers": self.layering_config.score_layers_weight,
+            "pull": self.layering_config.score_pull_weight,
+            "span": self.layering_config.score_span_weight,
+            "detector": self.layering_config.score_detector_weight,
+            "reaction": self.layering_config.score_reaction_weight,
+            "notional": self.layering_config.score_notional_weight,
+            "freshness": self.layering_config.score_freshness_weight,
         }
 
         score = weighted_score(components, weights, default=base_component)
         confidence = confidence_from_components(
             primary=base_component,
-            context=average_score(detector_component, notional_component),
-            confirmation=average_score(
-                pull_component,
-                fill_component,
-                reaction_component,
-                lifetime_component,
-            ),
+            context=average_score(layers_component, span_component, detector_component),
+            confirmation=average_score(pull_component, reaction_component, notional_component),
             freshness=fresh_component,
-            primary_weight=self.trap_config.confidence_primary_weight,
-            context_weight=self.trap_config.confidence_context_weight,
-            confirmation_weight=self.trap_config.confidence_confirmation_weight,
-            freshness_weight=self.trap_config.confidence_freshness_weight,
+            primary_weight=self.layering_config.confidence_primary_weight,
+            context_weight=self.layering_config.confidence_context_weight,
+            confirmation_weight=self.layering_config.confidence_confirmation_weight,
+            freshness_weight=self.layering_config.confidence_freshness_weight,
         )
 
         reasons: list[str] = []
         confirmations: list[str] = [
-            "fake_liquidity_trap_context",
+            "layering_trap_context",
             f"side:{payload.side.value}",
+            f"layer_count:{payload.layer_count}",
+            f"layer_price_span_bps:{payload.layer_price_span_bps:.4f}",
             f"pull_ratio:{payload.pull_ratio:.4f}",
             f"fill_ratio:{payload.fill_ratio:.4f}",
-            f"price_reaction_bps:{payload.price_reaction_bps:.4f}",
         ]
 
-        if payload.pull_ratio >= self.trap_config.strong_pull_ratio_threshold:
-            score += self.trap_config.high_pull_bonus
-            confirmations.append("strong_pull_ratio")
+        if payload.layer_count >= self.layering_config.strong_layer_count_threshold:
+            score += self.layering_config.layer_count_bonus
+            confirmations.append("strong_layer_count")
 
-        if payload.fill_ratio <= self.trap_config.very_low_fill_ratio_threshold:
-            score += self.trap_config.low_fill_bonus
-            confirmations.append("very_low_fill_ratio")
+        if payload.pull_ratio >= self.layering_config.strong_pull_ratio_threshold:
+            score += self.layering_config.synchronized_pull_bonus
+            confirmations.append("synchronized_layer_pull")
 
-        if payload.lifetime_ms <= self.trap_config.max_lifetime_ms:
-            score += self.trap_config.short_lifetime_bonus
-            confirmations.append("short_lived_fake_wall")
+        if payload.layer_price_span_bps <= self.layering_config.compact_span_threshold_bps:
+            score += self.layering_config.compact_span_bonus
+            confirmations.append("compact_layering_zone")
 
-        if payload.cancel_to_fill_ratio >= self.trap_config.strong_cancel_to_fill_threshold:
-            score += self.trap_config.cancel_to_fill_bonus
-            confirmations.append("strong_cancel_to_fill_ratio")
+        if payload.fill_ratio <= self.layering_config.low_fill_ratio_threshold:
+            score += self.layering_config.low_fill_bonus
+            confirmations.append("low_fill_layering")
 
-        if snapshot.has_detector(SpoofingComponent.FAKE_LIQUIDITY_DETECTOR):
-            score += self.trap_config.detector_bonus
-            confirmations.append("fake_liquidity_detector_context")
+        if snapshot.has_detector(SpoofingComponent.LAYERING_DETECTOR):
+            score += self.layering_config.detector_bonus
+            confirmations.append("layering_detector_context")
 
-        if is_composite_signal(snapshot.raw_signal):
-            score += self.trap_config.composite_bonus
-            confirmations.append("composite_spoofing_context")
+        if payload.price_reaction_bps >= self.layering_config.min_price_reaction_bps:
+            score += self.layering_config.reaction_bonus
+            confirmations.append("layering_reaction_context")
+
+        if payload.pulled_notional > 0:
+            score += self.layering_config.notional_bonus
+            confirmations.append("layering_pulled_notional_confirmed")
 
         if reaction_aligns_with_side(
             signed_reaction_bps=snapshot.signed_price_reaction_bps,
             side=payload.side,
-            min_reaction_bps=self.trap_config.min_price_reaction_bps,
+            min_reaction_bps=self.layering_config.min_price_reaction_bps,
         ):
-            score += self.trap_config.directional_reaction_bonus
-            confidence += min(0.03, self.trap_config.directional_reaction_bonus)
-            confirmations.append("directional_unwind_reaction")
-
-        if payload.distance_from_mid_bps > 0:
-            reasons.append(f"distance_from_mid_bps:{payload.distance_from_mid_bps:.4f}")
+            confirmations.append("directional_layering_unwind")
 
         if payload.wall_notional > 0:
             reasons.append(f"wall_notional:{payload.wall_notional:.4f}")
@@ -795,18 +746,16 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
             confirmations=list(dict.fromkeys(confirmations)),
         ).normalize()
 
-    def _lifetime_component(
+    def _span_component(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: LayeringTrapPayload,
     ) -> float:
-        if payload.lifetime_ms <= 0:
-            return 0.0
-
-        return unit_score(1.0 - (payload.lifetime_ms / max(self.trap_config.max_lifetime_ms, 1.0)))
+        max_span = max(self.layering_config.max_layer_price_span_bps, 0.0001)
+        return unit_score(1.0 - (payload.layer_price_span_bps / max_span))
 
     def _notional_component(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: LayeringTrapPayload,
     ) -> float:
         if payload.wall_notional <= 0:
             return 0.0
@@ -819,24 +768,23 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
     def _source_features(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: LayeringTrapPayload,
     ) -> list[str]:
         features = [
-            *fake_liquidity_source_features(),
+            *layering_source_features(),
             SPOOFING_FEATURES.SIGNAL,
             SPOOFING_FEATURES.SPOOFING_TYPE,
             SPOOFING_FEATURES.PATTERN,
             SPOOFING_FEATURES.SIDE,
             SPOOFING_FEATURES.SCORE,
             SPOOFING_FEATURES.CONFIDENCE,
+            SPOOFING_FEATURES.LAYER_COUNT,
+            SPOOFING_FEATURES.LAYER_PRICE_SPAN_BPS,
             SPOOFING_FEATURES.PULL_RATIO,
             SPOOFING_FEATURES.FILL_RATIO,
             SPOOFING_FEATURES.PRICE_REACTION_BPS,
-            SPOOFING_FEATURES.LIFETIME_MS,
-            SPOOFING_FEATURES.CANCEL_TO_FILL_RATIO,
             SPOOFING_FEATURES.WALL_NOTIONAL,
             SPOOFING_FEATURES.PULLED_NOTIONAL,
-            SPOOFING_FEATURES.DISTANCE_FROM_MID_BPS,
             SPOOFING_FEATURES.DETECTOR_RESULTS,
             SPOOFING_FEATURES.SCORE_BREAKDOWN,
         ]
@@ -845,26 +793,23 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
     def _tags(
         self,
-        payload: FakeLiquidityTrapPayload,
+        payload: LayeringTrapPayload,
     ) -> list[str]:
         tags = [
-            self.trap_config.tag_spoofing,
-            self.trap_config.tag_fake_liquidity,
-            self.trap_config.tag_liquidity_trap,
-            self.trap_config.tag_fake_liquidity_trap,
-            self.trap_config.tag_continuation,
-            self.trap_config.tag_unwind,
+            self.layering_config.tag_spoofing,
+            self.layering_config.tag_layering,
+            self.layering_config.tag_layering_trap,
+            self.layering_config.tag_multi_level_layering,
+            self.layering_config.tag_reversal,
+            self.layering_config.tag_unwind,
             f"side:{payload.side.value}",
         ]
 
-        if payload.snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
-            tags.append(self.trap_config.tag_fake_absorption)
+        if payload.pull_ratio >= self.layering_config.strong_pull_ratio_threshold:
+            tags.append(self.layering_config.tag_synchronized_pull)
 
-        if payload.lifetime_ms <= self.trap_config.max_lifetime_ms:
-            tags.append(self.trap_config.tag_short_lived_wall)
-
-        if payload.price_reaction_bps >= self.trap_config.min_price_reaction_bps:
-            tags.append(self.trap_config.tag_market_reaction)
+        if payload.layer_price_span_bps <= self.layering_config.compact_span_threshold_bps:
+            tags.append(self.layering_config.tag_compact_layers)
 
         if payload.snapshot.spoofing_type is not None:
             tags.append(f"type:{normalize_label(payload.snapshot.spoofing_type)}")
@@ -874,20 +819,14 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
         return list(dict.fromkeys(tags))
 
-    def _trap_execution_hints(self) -> dict[str, Any]:
+    def _execution_hints(self) -> dict[str, Any]:
         """
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
         return {
-            "allow_retest_entry": self.trap_config.allow_retest_entry_hint,
-            "max_retest_distance_bps": self.trap_config.max_retest_distance_bps_hint,
-            "entry_offset_bps": self.trap_config.entry_offset_bps_hint,
-            "stop_buffer_bps": self.trap_config.stop_buffer_bps_hint,
-            "take_profit_bps": self.trap_config.take_profit_bps_hint,
-            "trap_tp_multiplier": self.trap_config.trap_tp_multiplier_hint,
-            "composite_tp_multiplier": self.trap_config.composite_tp_multiplier_hint,
-            "repeated_trap_tp_multiplier": (
-                self.trap_config.repeated_trap_tp_multiplier_hint
-            ),
+            "entry_offset_bps": self.layering_config.entry_offset_bps_hint,
+            "stop_buffer_bps": self.layering_config.stop_buffer_bps_hint,
+            "take_profit_bps": self.layering_config.take_profit_bps_hint,
+            "trap_tp_multiplier": self.layering_config.trap_tp_multiplier_hint,
         }

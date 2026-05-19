@@ -1,4 +1,4 @@
-from .base_spoofing_strategy import (
+from .base import (
     BaseSpoofingStrategy,
     BaseSpoofingStrategyConfig,
     SetupStatus,
