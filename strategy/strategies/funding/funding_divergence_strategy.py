@@ -157,7 +157,7 @@ class FundingDivergenceStrategyConfig(FundingStrategyConfig):
     )
 
     def validate(self) -> None:
-        super().validate()
+        FundingStrategyConfig.validate(self)
 
         bounded_fields = {
             "min_divergence_confidence": self.min_divergence_confidence,

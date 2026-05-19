@@ -24,7 +24,7 @@ from analytics.liquidity.models import (
     StopCluster,
 )
 from strategy.enums import FilterDecision, SignalPriority, SignalSide, SignalStatus
-from strategy.strategies.liquidity.base_liquidity_strategy import BaseLiquidityStrategy
+from strategy.strategies.liquidity.base import BaseLiquidityStrategy
 
 
 DEFAULT_EXCHANGE = "binance"

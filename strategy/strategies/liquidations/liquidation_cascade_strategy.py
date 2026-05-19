@@ -1,106 +1,84 @@
+# trading_system/strategy/strategies/liquidations/liquidation_cascade_strategy.py
+
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from core.event_bus import Event, EventBus, EventPriority
+from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from analytics.liquidations.enums import CascadeDirection, CascadeSeverity, LiquidationStatus
-from analytics.liquidations.models import (
-    DEFAULT_MARKET_TYPE,
-    DEFAULT_TIMEFRAME,
-    CascadeDetectionResult,
-    LiquidationKey,
-    liquidation_key_to_dict,
+from .base import (
+    LIQUIDATIONS_FEATURES,
+    LiquidationsStrategyConfig,
+    LiquidationsTradingStrategy,
 )
-
-from strategy.strategies.liquidations.base import (
-    BaseAnalyticsStrategy,
-    BaseStrategyStats,
-    BaseSymbolStrategyState,
-    FilterResult,
-    StrategyRejection,
-    clamp_float,
-    ensure_utc,
-    make_strategy_scope_key,
-    normalize_exchange,
-    normalize_exchange_symbol,
-    normalize_market_type,
-    normalize_symbol,
-    normalize_timeframe,
-    scoped_key_to_string,
-    serialize_value,
-    utc_now,
+from .utils import (
+    ScoreBreakdown,
+    confidence_from_components,
+    continuation_side_from_direction,
+    extract_acceleration_ratio,
+    extract_bias_delta,
+    extract_cluster_avg_notional_per_event,
+    extract_cluster_duration_seconds,
+    extract_confidence,
+    extract_continuation_bias,
+    extract_direction,
+    extract_event_count,
+    extract_event_imbalance_ratio,
+    extract_event_time,
+    extract_exhaustion_bias,
+    extract_intensity_score,
+    extract_notional_usd,
+    extract_price_range_pct,
+    extract_score,
+    extract_severity_label,
+    extract_side_imbalance_ratio,
+    freshness_score,
+    is_directional_side,
+    is_stale,
+    liquidations_item,
+    quality_filter_reason,
+    serialize_for_metadata,
+    severity_score,
+    unit_score,
+    weighted_score,
 )
-
-
-# ============================================================================
-# Config
-# ============================================================================
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategySignal
 
 
 @dataclass(slots=True)
-class LiquidationCascadeStrategyConfig:
+class LiquidationCascadeStrategyConfig(LiquidationsStrategyConfig):
     """
-    Continuation strategy поверх analytics.liquidations.cascade_detected.
+    Unified liquidation cascade continuation strategy config.
 
-    Strategy:
-    - слухає analytics.liquidations.cascade_detected;
-    - приймає CascadeDetectionResult;
-    - працює тільки з повним futures/liquidation scope:
-        exchange + market_type + symbol + timeframe;
-    - фільтрує слабкі / шумні cascade results;
-    - генерує continuation signal у напрямку каскаду;
-    - не викликає risk/execution напряму.
-
-    Continuation direction:
-    - CascadeDirection.DOWN -> SHORT
-    - CascadeDirection.UP   -> LONG
+    Strategy idea:
+    - read normalized liquidation cascade context from StrategyContext;
+    - accept strong cascade / forced liquidation flow;
+    - generate continuation signal in cascade direction:
+        cascade UP   -> LONG
+        cascade DOWN -> SHORT;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
     """
 
-    enabled: bool = True
-
-    # Важливо: plural namespace, як у новому CascadeDetector.
-    subscribe_topic: str = "analytics.liquidations.cascade_detected"
-    publish_topic_signal_generated: str = "signal.generated"
-    publish_topic_signal_rejected: str = "signal.rejected"
-
-    publish_rejected_events: bool = False
-    publish_diagnostics_snapshots: bool = False
-
-    diagnostics_topic: str = "strategy.liquidations.cascade.snapshot"
-    diagnostics_interval_seconds: float = 30.0
-
-    strategy_name: str = "liquidation_cascade_strategy"
-    signal_type: str = "continuation"
-    service_name: str = "liquidation_cascade_strategy"
-
-    signal_priority: EventPriority = EventPriority.HIGH
-    rejection_priority: EventPriority = EventPriority.LOW
-    diagnostics_priority: EventPriority = EventPriority.LOW
-
-    # Full-scope filters.
-    allowed_exchanges: tuple[str, ...] = ()
-    allowed_market_types: tuple[str, ...] = ()
-    allowed_symbols: tuple[str, ...] = ()
-    allowed_timeframes: tuple[str, ...] = ()
-
-    blocked_market_types: tuple[str, ...] = ()
-    blocked_symbols: tuple[str, ...] = ()
-    blocked_timeframes: tuple[str, ...] = ()
-
-    allowed_severities: tuple[CascadeSeverity, ...] = (
-        CascadeSeverity.MEDIUM,
-        CascadeSeverity.HIGH,
-        CascadeSeverity.EXTREME,
-    )
-
-    # Common quality filters.
     require_confirmed_result: bool = True
     require_actionable_direction: bool = True
+    require_fresh_cascade: bool = True
+
+    allowed_severities: tuple[str, ...] = (
+        "medium",
+        "high",
+        "extreme",
+    )
 
     min_confidence: float = 0.60
     min_intensity_score: float = 0.55
@@ -108,17 +86,11 @@ class LiquidationCascadeStrategyConfig:
     min_event_count: int = 5
     max_price_range_pct: float | None = None
 
-    max_future_detected_at_seconds: float = 5.0
-    max_result_age_seconds: float | None = 30.0
-
     require_favors_continuation: bool = True
-    require_high_confidence_only: bool = False
-
     min_continuation_bias: float = 0.60
     max_exhaustion_bias_for_continuation: float | None = None
     min_bias_delta: float | None = None
 
-    # Analytics metadata / cluster-quality filters.
     min_side_imbalance_ratio: float | None = None
     min_event_imbalance_ratio: float | None = None
     min_acceleration_ratio: float | None = None
@@ -126,21 +98,6 @@ class LiquidationCascadeStrategyConfig:
     max_cluster_duration_seconds: float | None = None
     min_avg_notional_per_event: Decimal | None = None
 
-    symbol_cooldown_seconds: int = 20
-    min_seconds_between_same_side_signals: int = 10
-
-    max_signals_per_symbol_window: int = 2
-    signal_window_seconds: int = 60
-
-    deduplicate_by_detected_at: bool = True
-    deduplicate_same_cluster_signature: bool = True
-
-    recent_signals_limit: int = 200
-    recent_rejections_limit: int = 200
-
-    hot_symbols_window_seconds: int | None = 300
-
-    # Scoring.
     score_confidence_weight: float = 0.30
     score_continuation_bias_weight: float = 0.30
     score_intensity_weight: float = 0.18
@@ -148,125 +105,79 @@ class LiquidationCascadeStrategyConfig:
     score_imbalance_weight: float = 0.07
     score_acceleration_weight: float = 0.05
 
+    tag_cascade_continuation: str = "liquidation_cascade_continuation"
+    tag_forced_flow: str = "forced_liquidation_flow"
+    tag_continuation: str = "continuation"
+    tag_high_intensity: str = "high_intensity"
+    tag_large_notional: str = "large_notional"
+    tag_imbalanced_cluster: str = "imbalanced_cluster"
+    tag_acceleration: str = "liquidation_acceleration"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.CONTINUATION
+
+    required_liquidations_features: tuple[str, ...] = (
+        LIQUIDATIONS_FEATURES.CASCADE,
+    )
+
     def validate(self) -> None:
-        if not self.subscribe_topic:
-            raise ValueError("subscribe_topic must not be empty")
+        LiquidationsStrategyConfig.validate(self)
 
-        if not self.publish_topic_signal_generated:
-            raise ValueError("publish_topic_signal_generated must not be empty")
-
-        if not self.publish_topic_signal_rejected:
-            raise ValueError("publish_topic_signal_rejected must not be empty")
-
-        if not self.diagnostics_topic:
-            raise ValueError("diagnostics_topic must not be empty")
-
-        bounded = {
+        bounded_fields = {
             "min_confidence": self.min_confidence,
             "min_intensity_score": self.min_intensity_score,
             "min_continuation_bias": self.min_continuation_bias,
         }
 
-        for name, value in bounded.items():
-            if not (0.0 <= value <= 1.0):
-                raise ValueError(f"{name} must be between 0 and 1")
+        for field_name, value in bounded_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
 
         if self.max_exhaustion_bias_for_continuation is not None:
-            if not (0.0 <= self.max_exhaustion_bias_for_continuation <= 1.0):
-                raise ValueError("max_exhaustion_bias_for_continuation must be between 0 and 1 or None")
+            if not 0.0 <= self.max_exhaustion_bias_for_continuation <= 1.0:
+                raise StrategyConfigError(
+                    "max_exhaustion_bias_for_continuation must be between 0.0 and 1.0"
+                )
 
-        if self.min_bias_delta is not None and not (0.0 <= self.min_bias_delta <= 1.0):
-            raise ValueError("min_bias_delta must be between 0 and 1 or None")
+        if self.min_bias_delta is not None:
+            if not 0.0 <= self.min_bias_delta <= 1.0:
+                raise StrategyConfigError("min_bias_delta must be between 0.0 and 1.0")
 
         if self.min_total_notional_usd < 0:
-            raise ValueError("min_total_notional_usd must be >= 0")
+            raise StrategyConfigError("min_total_notional_usd must be >= 0")
 
         if self.min_event_count < 0:
-            raise ValueError("min_event_count must be >= 0")
+            raise StrategyConfigError("min_event_count must be >= 0")
 
         if self.max_price_range_pct is not None and self.max_price_range_pct < 0:
-            raise ValueError("max_price_range_pct must be >= 0 or None")
+            raise StrategyConfigError("max_price_range_pct must be >= 0")
 
-        if self.max_future_detected_at_seconds < 0:
-            raise ValueError("max_future_detected_at_seconds must be >= 0")
+        if self.min_side_imbalance_ratio is not None:
+            if not 0.0 <= self.min_side_imbalance_ratio <= 1.0:
+                raise StrategyConfigError(
+                    "min_side_imbalance_ratio must be between 0.0 and 1.0"
+                )
 
-        if self.max_result_age_seconds is not None and self.max_result_age_seconds <= 0:
-            raise ValueError("max_result_age_seconds must be > 0 or None")
-
-        if self.min_side_imbalance_ratio is not None and not (0.0 <= self.min_side_imbalance_ratio <= 1.0):
-            raise ValueError("min_side_imbalance_ratio must be between 0 and 1 or None")
-
-        if self.min_event_imbalance_ratio is not None and not (0.0 <= self.min_event_imbalance_ratio <= 1.0):
-            raise ValueError("min_event_imbalance_ratio must be between 0 and 1 or None")
+        if self.min_event_imbalance_ratio is not None:
+            if not 0.0 <= self.min_event_imbalance_ratio <= 1.0:
+                raise StrategyConfigError(
+                    "min_event_imbalance_ratio must be between 0.0 and 1.0"
+                )
 
         if self.min_acceleration_ratio is not None and self.min_acceleration_ratio < 0:
-            raise ValueError("min_acceleration_ratio must be >= 0 or None")
+            raise StrategyConfigError("min_acceleration_ratio must be >= 0")
 
-        if self.max_cluster_duration_seconds is not None and self.max_cluster_duration_seconds <= 0:
-            raise ValueError("max_cluster_duration_seconds must be > 0 or None")
+        if (
+            self.max_cluster_duration_seconds is not None
+            and self.max_cluster_duration_seconds <= 0
+        ):
+            raise StrategyConfigError("max_cluster_duration_seconds must be > 0")
 
-        if self.min_avg_notional_per_event is not None and self.min_avg_notional_per_event < 0:
-            raise ValueError("min_avg_notional_per_event must be >= 0 or None")
-
-        if self.symbol_cooldown_seconds < 0:
-            raise ValueError("symbol_cooldown_seconds must be >= 0")
-
-        if self.min_seconds_between_same_side_signals < 0:
-            raise ValueError("min_seconds_between_same_side_signals must be >= 0")
-
-        if self.max_signals_per_symbol_window < 0:
-            raise ValueError("max_signals_per_symbol_window must be >= 0")
-
-        if self.signal_window_seconds <= 0:
-            raise ValueError("signal_window_seconds must be > 0")
-
-        if self.diagnostics_interval_seconds <= 0:
-            raise ValueError("diagnostics_interval_seconds must be > 0")
-
-        if self.hot_symbols_window_seconds is not None and self.hot_symbols_window_seconds <= 0:
-            raise ValueError("hot_symbols_window_seconds must be > 0 or None")
-
-        normalized_allowed_market_types = {
-            normalize_market_type(item)
-            for item in self.allowed_market_types
-            if str(item).strip()
-        }
-        normalized_blocked_market_types = {
-            normalize_market_type(item)
-            for item in self.blocked_market_types
-            if str(item).strip()
-        }
-        overlap_market_types = normalized_allowed_market_types & normalized_blocked_market_types
-        if overlap_market_types:
-            raise ValueError(f"allowed_market_types and blocked_market_types overlap: {sorted(overlap_market_types)}")
-
-        normalized_allowed_timeframes = {
-            normalize_timeframe(item)
-            for item in self.allowed_timeframes
-            if str(item).strip()
-        }
-        normalized_blocked_timeframes = {
-            normalize_timeframe(item)
-            for item in self.blocked_timeframes
-            if str(item).strip()
-        }
-        overlap_timeframes = normalized_allowed_timeframes & normalized_blocked_timeframes
-        if overlap_timeframes:
-            raise ValueError(f"allowed_timeframes and blocked_timeframes overlap: {sorted(overlap_timeframes)}")
-
-        normalized_allowed_symbols = {
-            normalize_symbol(item)
-            for item in self.allowed_symbols
-            if str(item).strip()
-        }
-        normalized_blocked_symbols = {
-            normalize_symbol(item)
-            for item in self.blocked_symbols
-            if str(item).strip()
-        }
-        overlap_symbols = normalized_allowed_symbols & normalized_blocked_symbols
-        if overlap_symbols:
-            raise ValueError(f"allowed_symbols and blocked_symbols overlap: {sorted(overlap_symbols)}")
+        if (
+            self.min_avg_notional_per_event is not None
+            and self.min_avg_notional_per_event < 0
+        ):
+            raise StrategyConfigError("min_avg_notional_per_event must be >= 0")
 
         score_weights = {
             "score_confidence_weight": self.score_confidence_weight,
@@ -277,751 +188,485 @@ class LiquidationCascadeStrategyConfig:
             "score_acceleration_weight": self.score_acceleration_weight,
         }
 
-        for name, weight in score_weights.items():
-            if weight < 0:
-                raise ValueError(f"{name} must be >= 0")
+        for field_name, value in score_weights.items():
+            if value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
 
         if sum(score_weights.values()) <= 0:
-            raise ValueError("strategy score weights sum must be > 0")
+            raise StrategyConfigError("strategy score weights sum must be > 0")
+
+        for attr in (
+            "tag_cascade_continuation",
+            "tag_forced_flow",
+            "tag_continuation",
+            "tag_high_intensity",
+            "tag_large_notional",
+            "tag_imbalanced_cluster",
+            "tag_acceleration",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.allowed_severities:
+            raise StrategyConfigError("allowed_severities cannot be empty")
+
+        for severity in self.allowed_severities:
+            if not isinstance(severity, str) or not severity.strip():
+                raise StrategyConfigError(
+                    "allowed_severities cannot contain empty values"
+                )
+
+        if not self.required_liquidations_features:
+            raise StrategyConfigError("required_liquidations_features cannot be empty")
+
+        for feature in self.required_liquidations_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_liquidations_features cannot contain empty feature names"
+                )
 
 
-# ============================================================================
-# Models
-# ============================================================================
-
-
-@dataclass(slots=True)
-class LiquidationCascadeSignal:
-    strategy_name: str
-    signal_type: str
-
-    exchange: str
-    symbol: str
-    side: str
-
-    confidence: float
-    score: float
-
-    generated_at: datetime
-    detected_at: datetime
-
-    reason: str
-    source_topic: str
-
-    severity: str
-    cascade_direction: str
-    liquidation_side: str
-
-    event_count: int
-    total_notional_usd: Decimal
-    intensity_score: float
-    continuation_bias: float
-    exhaustion_bias: float
-    price_range_pct: float
-
-    market_type: str = DEFAULT_MARKET_TYPE
-    timeframe: str = DEFAULT_TIMEFRAME
-    exchange_symbol: str | None = None
-
-    event_type: str | None = None
-    status: str | None = None
-    window_seconds: int | None = None
-
-    bias_delta: float | None = None
-    side_imbalance_ratio: float | None = None
-    event_imbalance_ratio: float | None = None
-    acceleration_ratio: float | None = None
-
-    cluster_duration_seconds: float | None = None
-    cluster_avg_notional_per_event: Decimal | None = None
-
-    correlation_id: str | None = None
-    source_event_id: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.exchange = normalize_exchange(self.exchange)
-        self.symbol = normalize_symbol(self.symbol)
-        self.market_type = normalize_market_type(self.market_type)
-        self.timeframe = normalize_timeframe(self.timeframe)
-        self.exchange_symbol = normalize_exchange_symbol(
-            self.exchange_symbol,
-            fallback_symbol=self.symbol,
-        )
-        self.side = self.side.upper()
-        self.confidence = clamp_float(self.confidence)
-        self.score = clamp_float(self.score)
-        self.intensity_score = clamp_float(self.intensity_score)
-        self.continuation_bias = clamp_float(self.continuation_bias)
-        self.exhaustion_bias = clamp_float(self.exhaustion_bias)
-        self.generated_at = ensure_utc(self.generated_at)
-        self.detected_at = ensure_utc(self.detected_at)
-
-        if self.bias_delta is not None:
-            self.bias_delta = clamp_float(self.bias_delta)
-
-    @property
-    def key(self) -> LiquidationKey:
-        return make_strategy_scope_key(
-            exchange=self.exchange,
-            market_type=self.market_type,
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-        )
-
-    @property
-    def scope(self) -> dict[str, str]:
-        scope = liquidation_key_to_dict(self.key)
-        scope["exchange_symbol"] = self.exchange_symbol or self.symbol
-        return scope
-
-    @property
-    def scope_key(self) -> str:
-        return scoped_key_to_string(self.key)
-
-    @property
-    def is_long(self) -> bool:
-        return self.side == "LONG"
-
-    @property
-    def is_short(self) -> bool:
-        return self.side == "SHORT"
-
-    def to_dict(self, *, serialize: bool = True) -> dict[str, Any]:
-        data = {
-            "strategy_name": self.strategy_name,
-            "signal_type": self.signal_type,
-            "exchange": self.exchange,
-            "market_type": self.market_type,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "exchange_symbol": self.exchange_symbol,
-            "scope": self.scope,
-            "scope_key": self.scope_key,
-            "side": self.side,
-            "is_long": self.is_long,
-            "is_short": self.is_short,
-            "confidence": self.confidence,
-            "score": self.score,
-            "generated_at": self.generated_at,
-            "detected_at": self.detected_at,
-            "reason": self.reason,
-            "source_topic": self.source_topic,
-            "severity": self.severity,
-            "cascade_direction": self.cascade_direction,
-            "liquidation_side": self.liquidation_side,
-            "event_type": self.event_type,
-            "status": self.status,
-            "event_count": self.event_count,
-            "total_notional_usd": self.total_notional_usd,
-            "window_seconds": self.window_seconds,
-            "intensity_score": self.intensity_score,
-            "continuation_bias": self.continuation_bias,
-            "exhaustion_bias": self.exhaustion_bias,
-            "bias_delta": self.bias_delta,
-            "price_range_pct": self.price_range_pct,
-            "side_imbalance_ratio": self.side_imbalance_ratio,
-            "event_imbalance_ratio": self.event_imbalance_ratio,
-            "acceleration_ratio": self.acceleration_ratio,
-            "cluster_duration_seconds": self.cluster_duration_seconds,
-            "cluster_avg_notional_per_event": self.cluster_avg_notional_per_event,
-            "correlation_id": self.correlation_id,
-            "source_event_id": self.source_event_id,
-            "metadata": self.metadata,
-        }
-
-        return serialize_value(data) if serialize else data
-
-
-@dataclass(slots=True)
-class SymbolCascadeStrategyState(BaseSymbolStrategyState):
+class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
     """
-    Full-scope state для liquidation continuation strategy.
+    Unified liquidation cascade continuation strategy.
 
-    Scope:
-        exchange + market_type + symbol + timeframe
+    Input:
+        StrategyContext with FeatureSource.LIQUIDATIONS domain data / features.
+
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    pass
-
-
-# Backward-compatible alias для імпортів із __init__.py
-LiquidationCascadeStrategyStats = BaseStrategyStats
-
-
-# ============================================================================
-# Main strategy
-# ============================================================================
-
-
-class LiquidationCascadeStrategy(
-    BaseAnalyticsStrategy[
-        CascadeDetectionResult,
-        LiquidationCascadeSignal,
-        SymbolCascadeStrategyState,
-        LiquidationCascadeStrategyConfig,
-    ]
-):
-    """
-    Continuation strategy поверх analytics.liquidations.cascade_detected.
-
-    Pipeline:
-        analytics.liquidations.cascade_detected
-            -> common full-scope filters from BaseAnalyticsStrategy
-            -> liquidation continuation-specific filters
-            -> LiquidationCascadeSignal
-            -> signal.generated
-
-    Цей клас НЕ:
-    - не читає raw market data;
-    - не викликає CascadeDetector напряму;
-    - не викликає risk/execution напряму;
-    - не дублює EventBus/Scheduler/logger lifecycle.
-    """
+    component_namespace = "strategy.liquidations.cascade"
+    category: StrategyCategory = StrategyCategory.LIQUIDATIONS
+    default_setup_type: SetupType = SetupType.CONTINUATION
 
     def __init__(
         self,
-        *,
-        event_bus: EventBus,
-        config: LiquidationCascadeStrategyConfig | None = None,
+        config: StrategyConfig,
+        event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        liquidations_config: LiquidationCascadeStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        resolved_liquidations_config = (
+            liquidations_config or LiquidationCascadeStrategyConfig()
+        )
+        resolved_liquidations_config.validate()
+
         super().__init__(
+            config=config,
             event_bus=event_bus,
             scheduler=scheduler,
-            config=config or LiquidationCascadeStrategyConfig(),
+            definition=definition,
+            liquidations_config=resolved_liquidations_config,
             service_name=service_name,
-            component="strategy.liquidations.cascade_strategy",
-            payload_type=CascadeDetectionResult,
         )
 
-    # ------------------------------------------------------------------
-    # Base hooks
-    # ------------------------------------------------------------------
+        self.cascade_config: LiquidationCascadeStrategyConfig = (
+            resolved_liquidations_config
+        )
 
-    def create_symbol_state(
+    @property
+    def strategy_name(self) -> str:
+        return "liquidation_cascade"
+
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.cascade_config.required_liquidations_features
+        )
+
+    async def generate_signal(
         self,
-        *,
-        exchange: str,
-        symbol: str,
-        market_type: str = DEFAULT_MARKET_TYPE,
-        timeframe: str = DEFAULT_TIMEFRAME,
-        exchange_symbol: str | None = None,
-    ) -> SymbolCascadeStrategyState:
-        return SymbolCascadeStrategyState(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
-            exchange_symbol=exchange_symbol,
-        )
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
 
-    async def process_result(
-        self,
-        result: CascadeDetectionResult,
-        *,
-        bus_event: Event,
-    ) -> None:
-        state = self.get_or_create_state_for_result(result)
-        now = utc_now()
+        cascade = liquidations_item(context, "cascade")
+        if cascade is None:
+            return None
 
-        filter_result = self.evaluate_filters(
-            result=result,
-            state=state,
-            now=now,
-        )
-
-        if filter_result.rejection_reason is not None:
-            await self.reject_result(
-                result=result,
-                bus_event=bus_event,
-                reason=filter_result.rejection_reason,
+        event_time = extract_event_time(cascade)
+        if (
+            self.cascade_config.require_fresh_cascade
+            and is_stale(
+                event_time=event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.cascade_config.stale_feature_max_age_seconds,
             )
-            return
+        ):
+            return None
 
-        signal = self.build_signal(result=result, bus_event=bus_event)
-
-        emitted = await self.emit_signal(
-            signal,
-            bus_event=bus_event,
-            headers={
-                "analytics_event_type": result.event_type.value,
-                "analytics_status": result.status.value,
-                "analytics_scope": scoped_key_to_string(result.key),
-            },
+        common_rejection = quality_filter_reason(
+            cascade,
+            min_confidence=self.cascade_config.min_confidence,
+            min_intensity_score=self.cascade_config.min_intensity_score,
+            min_total_notional_usd=self.cascade_config.min_total_notional_usd,
+            min_event_count=self.cascade_config.min_event_count,
+            max_price_range_pct=self.cascade_config.max_price_range_pct,
+            require_confirmed=self.cascade_config.require_confirmed_result,
+            require_actionable_direction=self.cascade_config.require_actionable_direction,
         )
-        if not emitted:
-            return
+        if common_rejection is not None:
+            return None
 
-        self.remember_emitted_signal(
-            signal=signal,
-            state=state,
-            result=result,
-            signal_side=signal.side,
-            score=signal.score,
-            cluster_signature=filter_result.cluster_signature,
-        )
+        if not self._passes_cascade_filters(cascade):
+            return None
 
-        self.logger.info(
-            "Liquidation cascade continuation signal emitted",
-            extra={
-                "strategy": self.config.strategy_name,
-                "exchange": signal.exchange,
-                "market_type": signal.market_type,
-                "symbol": signal.symbol,
-                "timeframe": signal.timeframe,
-                "exchange_symbol": signal.exchange_symbol,
-                "scope": signal.scope,
-                "side": signal.side,
-                "score": signal.score,
-                "confidence": signal.confidence,
-                "severity": signal.severity,
-                "intensity_score": signal.intensity_score,
-                "continuation_bias": signal.continuation_bias,
-                "event_count": signal.event_count,
-                "total_notional_usd": str(signal.total_notional_usd),
-                "event_id": bus_event.event_id,
-                "correlation_id": signal.correlation_id,
-            },
+        side = self._derive_continuation_side(cascade)
+        if not is_directional_side(side):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            cascade=cascade,
         )
 
-    def direction_to_trade_side(self, result: CascadeDetectionResult) -> str:
-        """
-        Continuation логіка:
-        - CascadeDirection.DOWN -> SHORT
-        - CascadeDirection.UP   -> LONG
-        """
-        if result.direction is CascadeDirection.DOWN:
-            return "SHORT"
+        if breakdown.score < self.cascade_config.min_signal_score:
+            return None
 
-        if result.direction is CascadeDirection.UP:
-            return "LONG"
+        if breakdown.confidence < self.cascade_config.min_signal_confidence:
+            return None
 
-        return "FLAT"
+        source_features = self._source_features(cascade)
+        tags = self._tags(cascade)
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "liquidation_cascade_continuation",
+                    f"side:{side.value}",
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "liquidations_setup_family": "liquidation_cascade_continuation",
+            "liquidations_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "cascade": serialize_for_metadata(cascade),
+            "event_time": event_time.isoformat() if event_time else None,
+            "tags": tags,
+            "continuation_side": side.value,
+            "cascade_direction": serialize_for_metadata(extract_direction(cascade)),
+            "severity": self._severity(cascade),
+            "event_count": extract_event_count(cascade),
+            "total_notional_usd": str(extract_notional_usd(cascade)),
+            "intensity_score": extract_intensity_score(cascade),
+            "continuation_bias": extract_continuation_bias(cascade),
+            "exhaustion_bias": extract_exhaustion_bias(cascade),
+            "bias_delta": extract_bias_delta(cascade),
+            "price_range_pct": extract_price_range_pct(cascade),
+            "side_imbalance_ratio": extract_side_imbalance_ratio(cascade),
+            "event_imbalance_ratio": extract_event_imbalance_ratio(cascade),
+            "acceleration_ratio": extract_acceleration_ratio(cascade),
+            "cluster_duration_seconds": extract_cluster_duration_seconds(cascade),
+            "cluster_avg_notional_per_event": str(
+                extract_cluster_avg_notional_per_event(cascade)
+            ),
+        }
+
+        return self.build_liquidations_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=self.cascade_config.default_setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.cascade_config.default_priority,
+        )
 
     # ------------------------------------------------------------------
     # Filters
     # ------------------------------------------------------------------
 
-    def evaluate_filters(
-        self,
-        *,
-        result: CascadeDetectionResult,
-        state: SymbolCascadeStrategyState,
-        now: datetime,
-    ) -> FilterResult:
-        """
-        Об'єднує:
-        - common full-scope filters з BaseAnalyticsStrategy;
-        - liquidation continuation-specific filters.
-        """
-        common_result = self.evaluate_common_filters(
-            result=result,
-            state=state,
-            now=now,
-        )
+    def _passes_cascade_filters(self, cascade: Any) -> bool:
+        if not self._severity_allowed(cascade):
+            return False
 
-        if common_result.rejection_reason is not None:
-            return common_result
+        if self.cascade_config.require_favors_continuation:
+            continuation_bias = extract_continuation_bias(cascade)
+            if continuation_bias < self.cascade_config.min_continuation_bias:
+                return False
 
-        custom_rejection = self.get_liquidation_rejection_reason(
-            result=result,
-            now=now,
-        )
+        if self.cascade_config.max_exhaustion_bias_for_continuation is not None:
+            exhaustion_bias = extract_exhaustion_bias(cascade)
+            if exhaustion_bias > self.cascade_config.max_exhaustion_bias_for_continuation:
+                return False
 
-        if custom_rejection is not None:
-            return FilterResult(
-                rejection_reason=custom_rejection,
-                cluster_signature=None,
-            )
+        if self.cascade_config.min_bias_delta is not None:
+            bias_delta = extract_bias_delta(cascade)
+            if bias_delta < self.cascade_config.min_bias_delta:
+                return False
 
-        return common_result
+        if self.cascade_config.min_side_imbalance_ratio is not None:
+            imbalance = extract_side_imbalance_ratio(cascade)
+            if imbalance < self.cascade_config.min_side_imbalance_ratio:
+                return False
 
-    def get_liquidation_rejection_reason(
-        self,
-        *,
-        result: CascadeDetectionResult,
-        now: datetime,
-    ) -> str | None:
-        if self.config.require_confirmed_result and not result.is_confirmed:
-            self._stats.filter_skips += 1
-            return "result_not_confirmed"
+        if self.cascade_config.min_event_imbalance_ratio is not None:
+            imbalance = extract_event_imbalance_ratio(cascade)
+            if imbalance < self.cascade_config.min_event_imbalance_ratio:
+                return False
 
-        if self.config.require_actionable_direction and not result.direction.is_known:
-            self._stats.filter_skips += 1
-            return "direction_not_actionable"
+        if self.cascade_config.min_acceleration_ratio is not None:
+            acceleration = extract_acceleration_ratio(cascade)
+            if acceleration < self.cascade_config.min_acceleration_ratio:
+                return False
 
-        if result.status is not LiquidationStatus.CONFIRMED and self.config.require_confirmed_result:
-            self._stats.filter_skips += 1
-            return "status_not_confirmed"
+        if self.cascade_config.max_cluster_duration_seconds is not None:
+            duration = extract_cluster_duration_seconds(cascade)
+            if duration > self.cascade_config.max_cluster_duration_seconds:
+                return False
 
-        if self.config.require_favors_continuation and not result.favors_continuation:
-            self._stats.filter_skips += 1
-            return "continuation_not_favored"
+        if self.cascade_config.min_avg_notional_per_event is not None:
+            avg_notional = extract_cluster_avg_notional_per_event(cascade)
+            if avg_notional < self.cascade_config.min_avg_notional_per_event:
+                return False
 
-        if result.continuation_bias < self.config.min_continuation_bias:
-            self._stats.filter_skips += 1
-            return "continuation_bias_below_threshold"
+        return True
 
-        if (
-            self.config.max_exhaustion_bias_for_continuation is not None
-            and result.exhaustion_bias > self.config.max_exhaustion_bias_for_continuation
-        ):
-            self._stats.filter_skips += 1
-            return "exhaustion_bias_too_high_for_continuation"
-
-        if self.config.min_bias_delta is not None and result.bias_delta < self.config.min_bias_delta:
-            self._stats.filter_skips += 1
-            return "bias_delta_below_threshold"
-
-        max_future = timedelta(seconds=self.config.max_future_detected_at_seconds)
-        if ensure_utc(result.detected_at) > ensure_utc(now) + max_future:
-            self._stats.filter_skips += 1
-            return "detected_at_in_future"
-
-        if self.config.max_result_age_seconds is not None:
-            age_seconds = (ensure_utc(now) - ensure_utc(result.detected_at)).total_seconds()
-            if age_seconds > self.config.max_result_age_seconds:
-                self._stats.filter_skips += 1
-                return "result_too_old"
-
-        analytics_meta = self.extract_analytics_metadata(result)
-
-        if self.config.min_side_imbalance_ratio is not None:
-            value = self.optional_float(analytics_meta.get("side_imbalance_ratio"))
-            if value is None or value < self.config.min_side_imbalance_ratio:
-                self._stats.filter_skips += 1
-                return "side_imbalance_below_threshold"
-
-        if self.config.min_event_imbalance_ratio is not None:
-            value = self.optional_float(analytics_meta.get("event_imbalance_ratio"))
-            if value is None or value < self.config.min_event_imbalance_ratio:
-                self._stats.filter_skips += 1
-                return "event_imbalance_below_threshold"
-
-        if self.config.min_acceleration_ratio is not None:
-            value = self.optional_float(analytics_meta.get("acceleration_ratio"))
-            if value is None or value < self.config.min_acceleration_ratio:
-                self._stats.filter_skips += 1
-                return "acceleration_below_threshold"
-
-        cluster = result.cluster
-
-        if cluster is not None:
-            if self.config.max_cluster_duration_seconds is not None:
-                if cluster.duration_seconds > self.config.max_cluster_duration_seconds:
-                    self._stats.filter_skips += 1
-                    return "cluster_duration_too_long"
-
-            if self.config.min_avg_notional_per_event is not None:
-                if cluster.avg_notional_per_event < self.config.min_avg_notional_per_event:
-                    self._stats.filter_skips += 1
-                    return "avg_notional_per_event_below_threshold"
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Signal building
-    # ------------------------------------------------------------------
-
-    def build_signal(
-        self,
-        *,
-        result: CascadeDetectionResult,
-        bus_event: Event,
-    ) -> LiquidationCascadeSignal:
-        trade_side = self.direction_to_trade_side(result)
-        generated_at = utc_now()
-        score = self.compute_strategy_score(result)
-        analytics_meta = self.extract_analytics_metadata(result)
-
-        reason = (
-            "liquidation cascade continuation: "
-            f"scope={scoped_key_to_string(result.key)}, "
-            f"direction={result.direction.value}, "
-            f"side={result.side.value}, "
-            f"severity={result.severity.value}, "
-            f"status={result.status.value}, "
-            f"continuation_bias={result.continuation_bias:.3f}, "
-            f"exhaustion_bias={result.exhaustion_bias:.3f}, "
-            f"confidence={result.confidence:.3f}, "
-            f"intensity={result.intensity_score:.3f}"
-        )
-
-        metadata = self.build_common_signal_metadata(
-            result=result,
-            bus_event=bus_event,
-        )
-
-        metadata["liquidation_cascade_strategy"] = {
-            "strategy_model": "continuation",
-            "trade_side_mapping": {
-                "cascade_down": "SHORT",
-                "cascade_up": "LONG",
-            },
-            "require_confirmed_result": self.config.require_confirmed_result,
-            "require_favors_continuation": self.config.require_favors_continuation,
-            "min_continuation_bias": self.config.min_continuation_bias,
-            "max_exhaustion_bias_for_continuation": self.config.max_exhaustion_bias_for_continuation,
-            "min_bias_delta": self.config.min_bias_delta,
-            "max_future_detected_at_seconds": self.config.max_future_detected_at_seconds,
-            "max_result_age_seconds": self.config.max_result_age_seconds,
-            "min_side_imbalance_ratio": self.config.min_side_imbalance_ratio,
-            "min_event_imbalance_ratio": self.config.min_event_imbalance_ratio,
-            "min_acceleration_ratio": self.config.min_acceleration_ratio,
-            "max_cluster_duration_seconds": self.config.max_cluster_duration_seconds,
-            "min_avg_notional_per_event": str(self.config.min_avg_notional_per_event)
-            if self.config.min_avg_notional_per_event is not None
-            else None,
-            "analytics_metadata": serialize_value(analytics_meta),
+    def _severity_allowed(self, cascade: Any) -> bool:
+        severity = self._severity(cascade)
+        allowed = {
+            item.strip().lower()
+            for item in self.cascade_config.allowed_severities
+            if item.strip()
         }
 
-        cluster = result.cluster
-
-        return LiquidationCascadeSignal(
-            strategy_name=self.config.strategy_name,
-            signal_type=self.config.signal_type,
-            exchange=result.exchange,
-            market_type=result.market_type,
-            symbol=result.symbol,
-            timeframe=result.timeframe,
-            exchange_symbol=result.exchange_symbol,
-            side=trade_side,
-            confidence=clamp_float(result.confidence),
-            score=score,
-            generated_at=generated_at,
-            detected_at=ensure_utc(result.detected_at),
-            reason=reason,
-            source_topic=bus_event.topic,
-            severity=result.severity.value,
-            cascade_direction=result.direction.value,
-            liquidation_side=result.side.value,
-            event_type=result.event_type.value,
-            status=result.status.value,
-            event_count=result.event_count,
-            total_notional_usd=result.total_notional_usd,
-            window_seconds=result.window_seconds,
-            intensity_score=clamp_float(result.intensity_score),
-            continuation_bias=clamp_float(result.continuation_bias),
-            exhaustion_bias=clamp_float(result.exhaustion_bias),
-            bias_delta=clamp_float(result.bias_delta),
-            price_range_pct=result.price_range_pct,
-            side_imbalance_ratio=self.optional_float(analytics_meta.get("side_imbalance_ratio")),
-            event_imbalance_ratio=self.optional_float(analytics_meta.get("event_imbalance_ratio")),
-            acceleration_ratio=self.optional_float(analytics_meta.get("acceleration_ratio")),
-            cluster_duration_seconds=cluster.duration_seconds if cluster is not None else None,
-            cluster_avg_notional_per_event=cluster.avg_notional_per_event if cluster is not None else None,
-            correlation_id=bus_event.correlation_id or result.correlation_id,
-            source_event_id=bus_event.event_id,
-            metadata=metadata,
-        )
+        return severity in allowed
 
     # ------------------------------------------------------------------
-    # Scoring
+    # Direction
     # ------------------------------------------------------------------
 
-    def compute_strategy_score(self, result: CascadeDetectionResult) -> float:
-        total_weight = (
-            self.config.score_confidence_weight
-            + self.config.score_continuation_bias_weight
-            + self.config.score_intensity_weight
-            + self.config.score_severity_weight
-            + self.config.score_imbalance_weight
-            + self.config.score_acceleration_weight
-        )
-
-        if total_weight <= 0:
-            return 0.0
-
-        analytics_meta = self.extract_analytics_metadata(result)
-
-        imbalance_score = self.optional_float(analytics_meta.get("side_imbalance_ratio"))
-        if imbalance_score is None:
-            imbalance_score = self.optional_float(analytics_meta.get("event_imbalance_ratio"))
-        if imbalance_score is None:
-            imbalance_score = 0.5
-
-        acceleration_score = self.acceleration_to_score(
-            self.optional_float(analytics_meta.get("acceleration_ratio"))
-        )
-
-        weighted_score = (
-            clamp_float(result.confidence) * self.config.score_confidence_weight
-            + clamp_float(result.continuation_bias) * self.config.score_continuation_bias_weight
-            + clamp_float(result.intensity_score) * self.config.score_intensity_weight
-            + self.severity_to_score(result.severity) * self.config.score_severity_weight
-            + clamp_float(imbalance_score) * self.config.score_imbalance_weight
-            + acceleration_score * self.config.score_acceleration_weight
-        ) / total_weight
-
-        return clamp_float(weighted_score)
-
-    @staticmethod
-    def optional_float(value: Any) -> float | None:
-        if value is None:
-            return None
-
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def acceleration_to_score(value: float | None) -> float:
-        if value is None:
-            return 0.5
-
-        if value <= 0:
-            return 0.0
-
-        # 1.0 = neutral, 2.0+ = strong acceleration.
-        return clamp_float((value - 1.0) / 1.0)
+    def _derive_continuation_side(self, cascade: Any) -> SignalSide:
+        return continuation_side_from_direction(extract_direction(cascade))
 
     # ------------------------------------------------------------------
-    # Public diagnostics overrides
+    # Score
     # ------------------------------------------------------------------
 
-    def get_hot_symbols(
+    def _build_score_breakdown(
         self,
         *,
-        exchange: str | None = None,
-        market_type: str | None = None,
-        timeframe: str | None = None,
-        limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        """
-        Override base implementation, бо continuation strategy додає
-        continuation_bias / exhaustion_bias / cascade_direction.
-        """
-        if limit <= 0:
-            return []
+        context: StrategyContext,
+        cascade: Any,
+    ) -> ScoreBreakdown:
+        confidence_component = extract_confidence(cascade)
+        continuation_bias = extract_continuation_bias(cascade)
+        intensity_score = extract_intensity_score(cascade)
+        severity_component = severity_score(cascade)
+        imbalance_component = self._imbalance_score(cascade)
+        acceleration_component = self._acceleration_score(cascade)
 
-        now = utc_now()
-        min_ts = None
-
-        if self.config.hot_symbols_window_seconds is not None:
-            min_ts = now - timedelta(seconds=self.config.hot_symbols_window_seconds)
-
-        target_exchange = normalize_exchange(exchange) if exchange else None
-        target_market_type = normalize_market_type(market_type) if market_type else None
-        target_timeframe = normalize_timeframe(timeframe) if timeframe else None
-
-        latest_by_key: dict[LiquidationKey, LiquidationCascadeSignal] = {}
-
-        for signal in self._recent_signals:
-            if min_ts is not None and ensure_utc(signal.generated_at) < min_ts:
-                continue
-
-            if target_exchange is not None and signal.exchange != target_exchange:
-                continue
-
-            if target_market_type is not None and signal.market_type != target_market_type:
-                continue
-
-            if target_timeframe is not None and signal.timeframe != target_timeframe:
-                continue
-
-            previous = latest_by_key.get(signal.key)
-
-            if previous is None or ensure_utc(signal.generated_at) > ensure_utc(previous.generated_at):
-                latest_by_key[signal.key] = signal
-
-        rows = [
+        score = weighted_score(
             {
-                "exchange": signal.exchange,
-                "market_type": signal.market_type,
-                "symbol": signal.symbol,
-                "timeframe": signal.timeframe,
-                "exchange_symbol": signal.exchange_symbol,
-                "scope": liquidation_key_to_dict(signal.key),
-                "scope_key": signal.scope_key,
-                "side": signal.side,
-                "score": signal.score,
-                "confidence": signal.confidence,
-                "severity": signal.severity,
-                "cascade_direction": signal.cascade_direction,
-                "liquidation_side": signal.liquidation_side,
-                "intensity_score": signal.intensity_score,
-                "continuation_bias": signal.continuation_bias,
-                "exhaustion_bias": signal.exhaustion_bias,
-                "bias_delta": signal.bias_delta,
-                "side_imbalance_ratio": signal.side_imbalance_ratio,
-                "event_imbalance_ratio": signal.event_imbalance_ratio,
-                "acceleration_ratio": signal.acceleration_ratio,
-                "generated_at": signal.generated_at.isoformat(),
-                "detected_at": signal.detected_at.isoformat(),
-                "total_notional_usd": str(signal.total_notional_usd),
-            }
-            for signal in latest_by_key.values()
+                "confidence": confidence_component,
+                "continuation_bias": continuation_bias,
+                "intensity": intensity_score,
+                "severity": severity_component,
+                "imbalance": imbalance_component,
+                "acceleration": acceleration_component,
+            },
+            {
+                "confidence": self.cascade_config.score_confidence_weight,
+                "continuation_bias": (
+                    self.cascade_config.score_continuation_bias_weight
+                ),
+                "intensity": self.cascade_config.score_intensity_weight,
+                "severity": self.cascade_config.score_severity_weight,
+                "imbalance": self.cascade_config.score_imbalance_weight,
+                "acceleration": self.cascade_config.score_acceleration_weight,
+            },
+            default=extract_score(cascade),
+        )
+
+        event_time = extract_event_time(cascade)
+        fresh_score = freshness_score(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.cascade_config.stale_feature_max_age_seconds,
+        )
+
+        context_score = weighted_score(
+            {
+                "continuation_bias": continuation_bias,
+                "intensity": intensity_score,
+                "severity": severity_component,
+                "imbalance": imbalance_component,
+                "acceleration": acceleration_component,
+            },
+            {
+                "continuation_bias": 0.30,
+                "intensity": 0.25,
+                "severity": 0.15,
+                "imbalance": 0.15,
+                "acceleration": 0.15,
+            },
+            default=0.0,
+        )
+
+        confidence = confidence_from_components(
+            primary=confidence_component,
+            context=context_score,
+            confirmation=continuation_bias,
+            freshness=fresh_score,
+        )
+
+        reasons = [
+            f"confidence:{confidence_component:.3f}",
+            f"continuation_bias:{continuation_bias:.3f}",
+            f"intensity_score:{intensity_score:.3f}",
+            f"severity_score:{severity_component:.3f}",
         ]
 
-        rows.sort(
-            key=lambda row: (
-                float(row["score"]),
-                float(row["confidence"]),
-                float(row["intensity_score"]),
-                float(row["continuation_bias"]),
-            ),
-            reverse=True,
-        )
+        confirmations: list[str] = []
 
-        return rows[:limit]
+        if continuation_bias >= self.cascade_config.min_continuation_bias:
+            confirmations.append("continuation_bias_confirmed")
 
-    def get_symbol_state(
-        self,
-        exchange: str,
-        symbol: str,
-        *,
-        market_type: str | None = None,
-        timeframe: str | None = None,
-    ) -> dict[str, Any]:
-        key = self.state_key(
-            exchange=exchange,
-            market_type=market_type,
-            symbol=symbol,
-            timeframe=timeframe,
-        )
-        state = self._states.get(key)
+        if intensity_score >= self.cascade_config.min_intensity_score:
+            confirmations.append("intensity_confirmed")
 
-        normalized_exchange = normalize_exchange(exchange)
-        normalized_symbol = normalize_symbol(symbol)
-        normalized_market_type = normalize_market_type(market_type)
-        normalized_timeframe = normalize_timeframe(timeframe)
+        if extract_notional_usd(cascade) >= self.cascade_config.min_total_notional_usd:
+            confirmations.append("notional_confirmed")
 
-        if state is None:
-            return {
-                "exchange": normalized_exchange,
-                "market_type": normalized_market_type,
-                "symbol": normalized_symbol,
-                "timeframe": normalized_timeframe,
-                "scope": liquidation_key_to_dict(key),
-                "scope_key": scoped_key_to_string(key),
-                "exists": False,
-            }
+        if imbalance_component >= 0.60:
+            confirmations.append("imbalance_confirmed")
 
-        now = utc_now()
-        state.prune_old_signal_timestamps(now, self.config.signal_window_seconds)
+        if acceleration_component >= 0.60:
+            confirmations.append("acceleration_confirmed")
 
-        return {
-            "exchange": state.exchange,
-            "market_type": state.market_type,
-            "symbol": state.symbol,
-            "timeframe": state.timeframe,
-            "exchange_symbol": state.exchange_symbol,
-            "scope": state.scope,
-            "scope_key": state.scope_key,
-            "exists": True,
-            "last_signal_at": state.last_signal_at.isoformat() if state.last_signal_at else None,
-            "cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None,
-            "in_cooldown": state.is_in_cooldown(now),
-            "last_signal_side": state.last_signal_side,
-            "last_detected_at": state.last_detected_at.isoformat() if state.last_detected_at else None,
-            "last_cluster_signature": state.last_cluster_signature,
-            "last_signal_score": state.last_signal_score,
-            "total_signals_emitted": state.total_signals_emitted,
-            "signals_in_window": state.signals_in_window(
-                now=now,
-                window_seconds=self.config.signal_window_seconds,
-            ),
-        }
+        return ScoreBreakdown(
+            score=score,
+            confidence=confidence,
+            components={
+                "confidence": confidence_component,
+                "continuation_bias": continuation_bias,
+                "intensity_score": intensity_score,
+                "severity_score": severity_component,
+                "imbalance_score": imbalance_component,
+                "acceleration_score": acceleration_component,
+                "context_score": context_score,
+                "freshness_score": fresh_score,
+            },
+            weights={
+                "score_confidence_weight": self.cascade_config.score_confidence_weight,
+                "score_continuation_bias_weight": (
+                    self.cascade_config.score_continuation_bias_weight
+                ),
+                "score_intensity_weight": self.cascade_config.score_intensity_weight,
+                "score_severity_weight": self.cascade_config.score_severity_weight,
+                "score_imbalance_weight": self.cascade_config.score_imbalance_weight,
+                "score_acceleration_weight": self.cascade_config.score_acceleration_weight,
+            },
+            reasons=reasons,
+            confirmations=confirmations,
+        ).normalize()
+
+    @staticmethod
+    def _imbalance_score(cascade: Any) -> float:
+        side_imbalance = extract_side_imbalance_ratio(cascade)
+        event_imbalance = extract_event_imbalance_ratio(cascade)
+
+        if side_imbalance > 0:
+            return side_imbalance
+
+        if event_imbalance > 0:
+            return event_imbalance
+
+        return 0.50
+
+    @staticmethod
+    def _acceleration_score(cascade: Any) -> float:
+        acceleration = extract_acceleration_ratio(cascade)
+
+        if acceleration <= 0:
+            return 0.50
+
+        # 1.0 = neutral, 2.0+ = strong acceleration.
+        return unit_score((acceleration - 1.0) / 1.0)
+
+    # ------------------------------------------------------------------
+    # Metadata helpers
+    # ------------------------------------------------------------------
+
+    def _severity(self, cascade: Any) -> str:
+        return extract_severity_label(cascade, default="unknown")
+
+    def _source_features(self, cascade: Any) -> list[str]:
+        features = [
+            LIQUIDATIONS_FEATURES.CASCADE,
+            LIQUIDATIONS_FEATURES.CASCADE_CONFIDENCE,
+            LIQUIDATIONS_FEATURES.CASCADE_INTENSITY,
+            LIQUIDATIONS_FEATURES.CASCADE_DIRECTION,
+            LIQUIDATIONS_FEATURES.CASCADE_SEVERITY,
+            LIQUIDATIONS_FEATURES.CASCADE_CONTINUATION_BIAS,
+            LIQUIDATIONS_FEATURES.CASCADE_EXHAUSTION_BIAS,
+            LIQUIDATIONS_FEATURES.CASCADE_NOTIONAL_USD,
+            LIQUIDATIONS_FEATURES.CASCADE_EVENT_COUNT,
+        ]
+
+        if extract_side_imbalance_ratio(cascade) > 0:
+            features.append(LIQUIDATIONS_FEATURES.CLUSTER_SIDE_IMBALANCE_RATIO)
+
+        if extract_event_imbalance_ratio(cascade) > 0:
+            features.append(LIQUIDATIONS_FEATURES.CLUSTER_EVENT_IMBALANCE_RATIO)
+
+        if extract_acceleration_ratio(cascade) > 0:
+            features.append(LIQUIDATIONS_FEATURES.CLUSTER_ACCELERATION_RATIO)
+
+        if extract_cluster_duration_seconds(cascade) > 0:
+            features.append(LIQUIDATIONS_FEATURES.CLUSTER_DURATION_SECONDS)
+
+        if extract_cluster_avg_notional_per_event(cascade) > Decimal("0"):
+            features.append(LIQUIDATIONS_FEATURES.CLUSTER_AVG_NOTIONAL_PER_EVENT)
+
+        return list(dict.fromkeys(features))
+
+    def _tags(self, cascade: Any) -> list[str]:
+        tags = [
+            self.cascade_config.tag_liquidations,
+            self.cascade_config.tag_cascade,
+            self.cascade_config.tag_cascade_continuation,
+            self.cascade_config.tag_continuation,
+            self.cascade_config.tag_forced_flow,
+        ]
+
+        if extract_intensity_score(cascade) >= 0.75:
+            tags.append(self.cascade_config.tag_high_intensity)
+
+        if extract_notional_usd(cascade) >= self.cascade_config.min_total_notional_usd:
+            tags.append(self.cascade_config.tag_large_notional)
+
+        if (
+            extract_side_imbalance_ratio(cascade) >= 0.60
+            or extract_event_imbalance_ratio(cascade) >= 0.60
+        ):
+            tags.append(self.cascade_config.tag_imbalanced_cluster)
+
+        if extract_acceleration_ratio(cascade) >= 1.50:
+            tags.append(self.cascade_config.tag_acceleration)
+
+        tags.append(f"severity:{self._severity(cascade)}")
+
+        return list(dict.fromkeys(tags))
+
+
+__all__ = [
+    "LiquidationCascadeStrategy",
+    "LiquidationCascadeStrategyConfig",
+]

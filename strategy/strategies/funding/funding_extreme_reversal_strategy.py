@@ -162,7 +162,7 @@ class FundingExtremeReversalStrategyConfig(FundingStrategyConfig):
     )
 
     def validate(self) -> None:
-        super().validate()
+        FundingStrategyConfig.validate(self)
 
         bounded_fields = {
             "min_extreme_severity": self.min_extreme_severity,

@@ -1,15 +1,16 @@
+# trading_system/strategy/strategies/funding/__init__.py
+
 from __future__ import annotations
 
 from .base import (
-    BaseFundingStrategy,
-    BaseFundingStrategyConfig,
-    FundingSetupStatus,
-    FundingStrategyDirection,
+    FUNDING_FEATURES,
+    FundingFeatureNames,
+    FundingStrategyConfig,
     FundingStrategyScope,
-    FundingStrategyState,
+    FundingTradingStrategy,
     ensure_utc,
     parse_datetime,
-    serialize_for_event,
+    serialize_for_metadata,
     unwrap_analytics_payload,
     utc_now,
 )
@@ -24,12 +25,11 @@ from .funding_extreme_reversal_strategy import (
 
 __all__ = [
     # Base
-    "BaseFundingStrategy",
-    "BaseFundingStrategyConfig",
-    "FundingSetupStatus",
-    "FundingStrategyDirection",
+    "FUNDING_FEATURES",
+    "FundingFeatureNames",
+    "FundingStrategyConfig",
     "FundingStrategyScope",
-    "FundingStrategyState",
+    "FundingTradingStrategy",
     # Strategies
     "FundingDivergenceStrategy",
     "FundingDivergenceStrategyConfig",
@@ -38,7 +38,7 @@ __all__ = [
     # Helpers
     "ensure_utc",
     "parse_datetime",
-    "serialize_for_event",
+    "serialize_for_metadata",
     "unwrap_analytics_payload",
     "utc_now",
 ]
