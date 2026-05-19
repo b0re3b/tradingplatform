@@ -21,11 +21,19 @@ from .models import (
 # ============================================================
 
 # Production input topics.
-# Важливо: це саме data-layer updated events, а не raw exchange adapter events.
-DEFAULT_QUOTE_EVENT_TOPIC = "market.quote.updated"
+# Важливо: price/quote source для spreads тепер іде з OrderBookCache,
+# тобто з data-layer updated event, а не з окремого QuoteCache.
+DEFAULT_ORDERBOOK_EVENT_TOPIC = "market.orderbook.updated"
 DEFAULT_FUNDING_EVENT_TOPIC = "market.funding.updated"
 
-# Legacy/raw topics. Не використовувати в production analyzer subscriptions.
+# Backward-compatible alias для старого коду, який ще імпортує
+# DEFAULT_QUOTE_EVENT_TOPIC або читає quote_event_topic.
+# Значення навмисно вказує на production orderbook topic.
+DEFAULT_QUOTE_EVENT_TOPIC = DEFAULT_ORDERBOOK_EVENT_TOPIC
+
+# Legacy topics. Не використовувати в production analyzer subscriptions.
+DEFAULT_LEGACY_QUOTE_EVENT_TOPIC = "market.quote.updated"
+DEFAULT_RAW_ORDERBOOK_EVENT_TOPIC = "market.orderbook"
 DEFAULT_RAW_QUOTE_EVENT_TOPIC = "market.quote"
 DEFAULT_RAW_FUNDING_EVENT_TOPIC = "market.funding"
 
@@ -203,31 +211,15 @@ class BaseSpreadConfig:
     """
     Базовий config-контракт для analytics.spreads.
 
-    Відповідальність:
-    - runtime enable/disable;
-    - data-layer EventBus topic names;
-    - quote freshness / alignment rules;
-    - rolling statistics parameters;
-    - throttling / cooldown;
-    - Scheduler intervals;
-    - cache cleanup limits;
-    - signal thresholds;
-    - scoped market filters;
-    - metadata для розширення без зміни контракту.
-
-    Не відповідає за:
-    - створення EventBus;
-    - створення Scheduler;
-    - читання .env напряму;
-    - logging;
-    - бізнес-логіку analyzer-ів.
-
     Production input flow:
         exchange adapters
-            -> market.quote / market.funding
-            -> QuoteCache / FundingCache
-            -> market.quote.updated / market.funding.updated
+            -> market.orderbook / market.funding
+            -> OrderBookCache / FundingCache
+            -> market.orderbook.updated / market.funding.updated
             -> analytics.spreads.*
+
+    QuoteSnapshot у spreads залишається внутрішньою normalized top-of-book
+    моделлю, але окремий QuoteCache не потрібен.
     """
 
     # Runtime
@@ -235,15 +227,23 @@ class BaseSpreadConfig:
     service_name: str = "spread_analyzer"
 
     # Production input EventBus topics: data-layer updated events.
-    quote_event_topic: str = DEFAULT_QUOTE_EVENT_TOPIC
+    orderbook_event_topic: str = DEFAULT_ORDERBOOK_EVENT_TOPIC
     funding_event_topic: str = DEFAULT_FUNDING_EVENT_TOPIC
 
-    quote_event_topic_patterns: tuple[str, ...] = (DEFAULT_QUOTE_EVENT_TOPIC,)
+    orderbook_event_topic_patterns: tuple[str, ...] = (DEFAULT_ORDERBOOK_EVENT_TOPIC,)
     funding_event_topic_patterns: tuple[str, ...] = (DEFAULT_FUNDING_EVENT_TOPIC,)
 
+    # Backward-compatible aliases for old analyzer/base code.
+    # До переписування base.py вони вже будуть вести на market.orderbook.updated.
+    quote_event_topic: str = DEFAULT_ORDERBOOK_EVENT_TOPIC
+    quote_event_topic_patterns: tuple[str, ...] = (DEFAULT_ORDERBOOK_EVENT_TOPIC,)
+
     # Legacy/raw topics. Вимкнені за замовчуванням.
+    legacy_quote_event_topic: str = DEFAULT_LEGACY_QUOTE_EVENT_TOPIC
+    raw_orderbook_event_topic: str = DEFAULT_RAW_ORDERBOOK_EVENT_TOPIC
     raw_quote_event_topic: str = DEFAULT_RAW_QUOTE_EVENT_TOPIC
     raw_funding_event_topic: str = DEFAULT_RAW_FUNDING_EVENT_TOPIC
+    allow_legacy_quote_topics: bool = False
     allow_legacy_raw_topics: bool = False
 
     # Common output EventBus topics
@@ -260,7 +260,7 @@ class BaseSpreadConfig:
     allowed_timeframes: set[str] = field(default_factory=set)
     allowed_market_types: set[str] = field(default_factory=set)
 
-    # Quote freshness / alignment
+    # Top-of-book freshness / alignment
     max_quote_age_ms: int = 2_000
     max_quote_skew_ms: int = 1_000
 
@@ -296,17 +296,29 @@ class BaseSpreadConfig:
         self.allowed_timeframes = _normalize_timeframe_set(self.allowed_timeframes)
         self.allowed_market_types = _normalize_market_type_set(self.allowed_market_types)
 
-        self.quote_event_topic_patterns = _normalize_topic_patterns(
-            self.quote_event_topic_patterns,
-            fallback=(self.quote_event_topic,),
+        self.orderbook_event_topic_patterns = _normalize_topic_patterns(
+            self.orderbook_event_topic_patterns,
+            fallback=(self.orderbook_event_topic,),
         )
         self.funding_event_topic_patterns = _normalize_topic_patterns(
             self.funding_event_topic_patterns,
             fallback=(self.funding_event_topic,),
         )
 
-        self.quote_event_topic = self.quote_event_topic_patterns[0]
+        self.orderbook_event_topic = self.orderbook_event_topic_patterns[0]
         self.funding_event_topic = self.funding_event_topic_patterns[0]
+
+        # Синхронізуємо старі quote-поля з production orderbook input.
+        # Це дає можливість міняти base.py/analyzer-и поступово.
+        if not self.allow_legacy_quote_topics:
+            self.quote_event_topic = self.orderbook_event_topic
+            self.quote_event_topic_patterns = self.orderbook_event_topic_patterns
+        else:
+            self.quote_event_topic_patterns = _normalize_topic_patterns(
+                self.quote_event_topic_patterns,
+                fallback=(self.quote_event_topic,),
+            )
+            self.quote_event_topic = self.quote_event_topic_patterns[0]
 
         self.metadata = dict(self.metadata or {})
 
@@ -334,27 +346,31 @@ class BaseSpreadConfig:
         _validate_positive_decimal("anomaly_zscore_threshold", self.anomaly_zscore_threshold)
         _validate_positive_decimal("widening_bps_threshold", self.widening_bps_threshold)
 
-        self._validate_topic("quote_event_topic", self.quote_event_topic)
+        self._validate_topic("orderbook_event_topic", self.orderbook_event_topic)
         self._validate_topic("funding_event_topic", self.funding_event_topic)
+        self._validate_topic("quote_event_topic", self.quote_event_topic)
+        self._validate_topic("legacy_quote_event_topic", self.legacy_quote_event_topic)
         self._validate_topic("signal_event_topic", self.signal_event_topic)
         self._validate_topic("analyzer_started_event_topic", self.analyzer_started_event_topic)
         self._validate_topic("analyzer_stopped_event_topic", self.analyzer_stopped_event_topic)
         self._validate_topic("analyzer_heartbeat_event_topic", self.analyzer_heartbeat_event_topic)
+        self._validate_topic("raw_orderbook_event_topic", self.raw_orderbook_event_topic)
         self._validate_topic("raw_quote_event_topic", self.raw_quote_event_topic)
         self._validate_topic("raw_funding_event_topic", self.raw_funding_event_topic)
 
-        for topic in self.quote_event_topic_patterns:
-            self._validate_topic("quote_event_topic_patterns item", topic)
+        for topic in self.orderbook_event_topic_patterns:
+            self._validate_topic("orderbook_event_topic_patterns item", topic)
 
         for topic in self.funding_event_topic_patterns:
             self._validate_topic("funding_event_topic_patterns item", topic)
 
+        for topic in self.quote_event_topic_patterns:
+            self._validate_topic("quote_event_topic_patterns item", topic)
+
         if not self.allow_legacy_raw_topics:
-            production_topics = {
-                *self.quote_event_topic_patterns,
-                *self.funding_event_topic_patterns,
-            }
+            production_topics = set(self.production_input_topics)
             raw_topics = {
+                self.raw_orderbook_event_topic,
                 self.raw_quote_event_topic,
                 self.raw_funding_event_topic,
             }
@@ -366,6 +382,21 @@ class BaseSpreadConfig:
                     f"updated topics, not raw topics: {sorted(used_raw_topics)}"
                 )
 
+        if not self.allow_legacy_quote_topics:
+            production_topics = set(self.production_price_input_topics)
+            legacy_quote_topics = {
+                self.legacy_quote_event_topic,
+                DEFAULT_LEGACY_QUOTE_EVENT_TOPIC,
+            }
+            used_legacy_quote_topics = production_topics.intersection(legacy_quote_topics)
+
+            if used_legacy_quote_topics:
+                raise ValueError(
+                    "Spread analyzer production price input must use "
+                    "market.orderbook.updated from OrderBookCache, not legacy "
+                    f"quote topics: {sorted(used_legacy_quote_topics)}"
+                )
+
         _validate_non_empty_str("default_timeframe", self.default_timeframe)
 
     @staticmethod
@@ -374,18 +405,27 @@ class BaseSpreadConfig:
             raise ValueError(f"{field_name} must not be empty")
 
     @property
+    def production_price_input_topics(self) -> tuple[str, ...]:
+        return self.orderbook_event_topic_patterns
+
+    @property
     def production_input_topics(self) -> tuple[str, ...]:
         return (
-            *self.quote_event_topic_patterns,
+            *self.orderbook_event_topic_patterns,
             *self.funding_event_topic_patterns,
         )
 
     @property
     def legacy_raw_input_topics(self) -> tuple[str, ...]:
         return (
+            self.raw_orderbook_event_topic,
             self.raw_quote_event_topic,
             self.raw_funding_event_topic,
         )
+
+    @property
+    def legacy_quote_input_topics(self) -> tuple[str, ...]:
+        return (self.legacy_quote_event_topic,)
 
     def should_process_scope(
         self,
@@ -438,9 +478,6 @@ class BaseSpreadConfig:
     def with_metadata(self, **metadata: Any) -> BaseSpreadConfig:
         """
         Повертає копію config з оновленим metadata.
-
-        Корисно, коли bootstrap/container хоче додати runtime context,
-        не мутуючи оригінальний config.
         """
         return replace(
             self,
@@ -460,13 +497,15 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
     """
     Config для SpotFuturesSpreadAnalyzer.
 
-    Цей analyzer є дозволеним spot+futures компонентом:
+    Цей analyzer залишається production-компонентом:
     - spot leg: InstrumentType.SPOT / market_type="spot";
     - futures leg: InstrumentType.PERPETUAL або InstrumentType.FUTURES;
     - funding leg: зазвичай futures/perpetual market_type.
 
-    Він все одно має отримувати quote/funding дані тільки через data-layer
-    updated topics: market.quote.updated / market.funding.updated.
+    Price/top-of-book дані мають приходити тільки через:
+        market.orderbook.updated
+    Funding context має приходити через:
+        market.funding.updated
     """
 
     service_name: str = "spot_futures_spread_analyzer"
@@ -517,24 +556,8 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
     )
 
     def __post_init__(self) -> None:
-        self.allowed_spot_exchanges = _normalize_exchange_set(
-            self.allowed_spot_exchanges
-        )
-        self.allowed_futures_exchanges = _normalize_exchange_set(
-            self.allowed_futures_exchanges
-        )
-
-        self.default_spot_exchange = _normalize_exchange(self.default_spot_exchange)
-        self.default_futures_exchange = _normalize_exchange(self.default_futures_exchange)
-
-        self.default_spot_market_type = _normalize_market_type(
-            self.default_spot_market_type,
-            fallback=DEFAULT_SPOT_MARKET_TYPE,
-        )
-        self.default_futures_market_type = _normalize_market_type(
-            self.default_futures_market_type,
-            fallback=DEFAULT_PERPETUAL_MARKET_TYPE,
-        )
+        self.allowed_spot_exchanges = _normalize_exchange_set(self.allowed_spot_exchanges)
+        self.allowed_futures_exchanges = _normalize_exchange_set(self.allowed_futures_exchanges)
 
         self.allowed_spot_market_types = _normalize_market_type_set(
             self.allowed_spot_market_types
@@ -550,18 +573,35 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
             self.allowed_futures_instrument_types
         )
 
+        self.default_spot_exchange = _normalize_exchange(self.default_spot_exchange)
+        self.default_futures_exchange = _normalize_exchange(self.default_futures_exchange)
+        self.default_spot_market_type = _normalize_market_type(
+            self.default_spot_market_type,
+            fallback=DEFAULT_SPOT_MARKET_TYPE,
+        )
+        self.default_futures_market_type = _normalize_market_type(
+            self.default_futures_market_type,
+            fallback=DEFAULT_PERPETUAL_MARKET_TYPE,
+        )
+
+        if not self.allowed_spot_market_types:
+            raise ValueError("allowed_spot_market_types must not be empty")
+        if not self.allowed_futures_market_types:
+            raise ValueError("allowed_futures_market_types must not be empty")
         if not self.allowed_spot_instrument_types:
             raise ValueError("allowed_spot_instrument_types must not be empty")
         if not self.allowed_futures_instrument_types:
             raise ValueError("allowed_futures_instrument_types must not be empty")
 
-        if InstrumentType.SPOT not in self.allowed_spot_instrument_types:
-            raise ValueError("SpotFuturesSpreadConfig must allow InstrumentType.SPOT for spot leg")
-
-        if any(item is InstrumentType.UNKNOWN for item in self.allowed_spot_instrument_types):
+        if InstrumentType.UNKNOWN in self.allowed_spot_instrument_types:
             raise ValueError("allowed_spot_instrument_types must not include UNKNOWN")
-        if any(item is InstrumentType.UNKNOWN for item in self.allowed_futures_instrument_types):
+        if InstrumentType.UNKNOWN in self.allowed_futures_instrument_types:
             raise ValueError("allowed_futures_instrument_types must not include UNKNOWN")
+
+        if any(item is not InstrumentType.SPOT for item in self.allowed_spot_instrument_types):
+            raise ValueError(
+                "allowed_spot_instrument_types must include only InstrumentType.SPOT"
+            )
 
         if any(not item.is_derivative for item in self.allowed_futures_instrument_types):
             raise ValueError(
@@ -687,10 +727,9 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
     """
     Config для CrossExchangeSpreadAnalyzer.
 
-    За замовчуванням дозволяє spot, perpetual і futures, бо cross-exchange
-    spread/arbitrage може існувати як для spot, так і для derivative venues.
-    Якщо потрібен futures-only режим, передай:
-        allowed_instrument_types={InstrumentType.PERPETUAL, InstrumentType.FUTURES}
+    Cross-exchange spread/arbitrage може працювати як зі spot, так і з
+    perpetual/futures venues. Price source так само має бути top-of-book
+    із OrderBookCache через market.orderbook.updated.
     """
 
     service_name: str = "cross_exchange_spread_analyzer"
@@ -846,8 +885,11 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
 
 
 __all__ = [
+    "DEFAULT_ORDERBOOK_EVENT_TOPIC",
     "DEFAULT_QUOTE_EVENT_TOPIC",
     "DEFAULT_FUNDING_EVENT_TOPIC",
+    "DEFAULT_LEGACY_QUOTE_EVENT_TOPIC",
+    "DEFAULT_RAW_ORDERBOOK_EVENT_TOPIC",
     "DEFAULT_RAW_QUOTE_EVENT_TOPIC",
     "DEFAULT_RAW_FUNDING_EVENT_TOPIC",
     "DEFAULT_SPOT_FUTURES_SNAPSHOT_TOPIC",

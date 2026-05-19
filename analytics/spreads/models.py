@@ -151,9 +151,32 @@ def _datetime_from_payload(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value
 
-    if isinstance(value, str):
+    if isinstance(value, (int, float)):
         try:
-            return datetime.fromisoformat(value)
+            # Most market-data payloads use milliseconds. Keep seconds support
+            # for already-normalized payloads and tests.
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return datetime.utcfromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        try:
+            numeric = float(raw)
+            if numeric > 10_000_000_000:
+                numeric /= 1000
+            return datetime.utcfromtimestamp(numeric)
+        except (OverflowError, OSError, ValueError):
+            pass
+
+        try:
+            return datetime.fromisoformat(raw)
         except ValueError:
             return None
 
@@ -255,6 +278,223 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
+
+# ============================================================
+# Orderbook -> QuoteSnapshot normalization helpers
+# ============================================================
+
+def _first_present(payload: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload and payload.get(key) is not None:
+            return payload.get(key)
+    return None
+
+
+def _to_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _level_value(level: Any, *keys: str) -> Any:
+    """
+    Підтримує різні формати orderbook level:
+    - {"price": "100", "quantity": "1.2"}
+    - {"p": "100", "q": "1.2"}
+    - ["100", "1.2"] / ("100", "1.2")
+    """
+    if level is None:
+        return None
+
+    if isinstance(level, Mapping):
+        for key in keys:
+            if key in level and level.get(key) is not None:
+                return level.get(key)
+        return None
+
+    if isinstance(level, (list, tuple)):
+        if any(key in {"price", "p", "px", "rate"} for key in keys):
+            return level[0] if len(level) > 0 else None
+        if any(key in {"quantity", "qty", "size", "amount", "volume", "q"} for key in keys):
+            return level[1] if len(level) > 1 else None
+
+    return None
+
+
+def _best_level(payload: Mapping[str, Any], side: str) -> Any:
+    levels = payload.get(side)
+    if isinstance(levels, (list, tuple)) and levels:
+        return levels[0]
+    return None
+
+
+def _extract_best_bid(payload: Mapping[str, Any]) -> tuple[Decimal | None, Decimal | None]:
+    best_bid_level = _best_level(payload, "bids")
+
+    price = _to_decimal(
+        _first_present(
+            payload,
+            "best_bid",
+            "best_bid_price",
+            "bid",
+            "bid_price",
+        )
+    )
+    if price is None:
+        price = _to_decimal(_level_value(best_bid_level, "price", "p", "px", "rate"))
+
+    size = _to_decimal(
+        _first_present(
+            payload,
+            "best_bid_size",
+            "bid_size",
+            "bid_qty",
+            "bid_quantity",
+        )
+    )
+    if size is None:
+        size = _to_decimal(
+            _level_value(best_bid_level, "quantity", "qty", "size", "amount", "volume", "q")
+        )
+
+    return price, size
+
+
+def _extract_best_ask(payload: Mapping[str, Any]) -> tuple[Decimal | None, Decimal | None]:
+    best_ask_level = _best_level(payload, "asks")
+
+    price = _to_decimal(
+        _first_present(
+            payload,
+            "best_ask",
+            "best_ask_price",
+            "ask",
+            "ask_price",
+        )
+    )
+    if price is None:
+        price = _to_decimal(_level_value(best_ask_level, "price", "p", "px", "rate"))
+
+    size = _to_decimal(
+        _first_present(
+            payload,
+            "best_ask_size",
+            "ask_size",
+            "ask_qty",
+            "ask_quantity",
+        )
+    )
+    if size is None:
+        size = _to_decimal(
+            _level_value(best_ask_level, "quantity", "qty", "size", "amount", "volume", "q")
+        )
+
+    return price, size
+
+
+def _payload_timestamp(
+    payload: Mapping[str, Any],
+    *keys: str,
+    default: datetime | None = None,
+) -> datetime:
+    for key in keys:
+        value = payload.get(key)
+        parsed = _datetime_from_payload(value)
+        if parsed is not None:
+            return parsed
+
+    return default or _utcnow()
+
+
+def _payload_metadata(payload: Mapping[str, Any], *, source: str) -> dict[str, Any]:
+    metadata = _metadata_copy(payload.get("metadata"))
+    metadata.setdefault("source", source)
+
+    for key in (
+        "depth",
+        "checksum",
+        "sequence_id",
+        "first_update_id",
+        "last_update_id",
+        "update_id",
+        "is_snapshot",
+        "is_resync_required",
+        "validity",
+    ):
+        if key in payload and payload.get(key) is not None:
+            metadata.setdefault(key, payload.get(key))
+
+    return metadata
+
+
+def quote_snapshot_from_orderbook_payload(
+    payload: Mapping[str, Any],
+) -> "QuoteSnapshot":
+    """
+    Нормалізує payload з data/orderbook_cache.py у внутрішній QuoteSnapshot.
+
+    Production flow без QuoteCache:
+        exchange adapter -> market.orderbook
+        -> OrderBookCache -> market.orderbook.updated
+        -> analytics.spreads -> QuoteSnapshot
+
+    Підтримує payload-и з явними best_bid/best_ask полями або з bids/asks
+    рівнями, де перший level є top-of-book.
+    """
+    bid, bid_size = _extract_best_bid(payload)
+    ask, ask_size = _extract_best_ask(payload)
+
+    instrument_type = _parse_instrument_type(
+        _first_present(payload, "instrument_type", "instrument", "type")
+    )
+
+    return QuoteSnapshot(
+        exchange=str(payload["exchange"]),
+        symbol=str(payload["symbol"]),
+        instrument_type=instrument_type,
+        market_type=_first_present(payload, "market_type", "market", "contract_type"),
+        timeframe=str(_first_present(payload, "timeframe", "interval") or DEFAULT_TIMEFRAME),
+        exchange_symbol=_first_present(payload, "exchange_symbol", "raw_symbol"),
+        bid=bid,
+        ask=ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        last_price=_to_decimal(_first_present(payload, "last_price", "last", "price")),
+        mark_price=_to_decimal(_first_present(payload, "mark_price", "mark")),
+        index_price=_to_decimal(_first_present(payload, "index_price", "index")),
+        timestamp=_payload_timestamp(
+            payload,
+            "timestamp",
+            "timestamp_ms",
+            "updated_at",
+            "updated_at_ms",
+            "event_time",
+            "event_time_ms",
+        ),
+        received_at=_payload_timestamp(
+            payload,
+            "received_at",
+            "received_at_ms",
+            "ingested_at",
+            "ingested_at_ms",
+            default=_utcnow(),
+        ),
+        sequence_id=_to_optional_int(
+            _first_present(
+                payload,
+                "sequence_id",
+                "last_update_id",
+                "update_id",
+                "seq",
+            )
+        ),
+        metadata=_payload_metadata(payload, source="market.orderbook.updated"),
+    )
+
 # ============================================================
 # Market Data Models
 # ============================================================
@@ -262,18 +502,20 @@ def _serialize_value(value: Any) -> Any:
 @dataclass(slots=True)
 class QuoteSnapshot:
     """
-    Normalized quote snapshot для spread analytics.
+    Normalized top-of-book snapshot для spread analytics.
 
-    Використовується як payload для data-layer події market.quote.updated
-    або як внутрішній state analyzer-ів.
+    У production ця модель будується всередині analytics.spreads із payload-у
+    data-layer події market.orderbook.updated. Окремий QuoteCache не потрібен:
+    OrderBookCache є джерелом bid/ask/top-of-book, а QuoteSnapshot лишається
+    внутрішнім контрактом analyzer-ів.
 
     Correct input flow:
-        exchange adapter -> market.quote / market.orderbook
-        -> QuoteCache / OrderBookCache
-        -> market.quote.updated
-        -> analytics.spreads.*
+        exchange adapter -> market.orderbook
+        -> OrderBookCache -> market.orderbook.updated
+        -> analytics.spreads -> QuoteSnapshot -> SpreadSnapshot/Signal
 
-    Ця модель не залежить від EventBus напряму.
+    Для backward compatibility from_payload() також підтримує старий dict-формат
+    із bid/ask полями.
     """
 
     exchange: str
@@ -384,6 +626,26 @@ class QuoteSnapshot:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> QuoteSnapshot:
+        """
+        Backward-compatible constructor для вже нормалізованого quote payload.
+
+        Якщо payload схожий на market.orderbook.updated — містить bids/asks або
+        best_bid/best_ask — делегує нормалізацію в
+        quote_snapshot_from_orderbook_payload().
+        """
+        if any(
+            key in payload
+            for key in (
+                "bids",
+                "asks",
+                "best_bid",
+                "best_ask",
+                "best_bid_price",
+                "best_ask_price",
+            )
+        ):
+            return quote_snapshot_from_orderbook_payload(payload)
+
         instrument_type = _parse_instrument_type(payload.get("instrument_type"))
 
         return cls(
@@ -400,11 +662,18 @@ class QuoteSnapshot:
             last_price=_to_decimal(payload.get("last_price")),
             mark_price=_to_decimal(payload.get("mark_price")),
             index_price=_to_decimal(payload.get("index_price")),
-            timestamp=_datetime_from_payload(payload.get("timestamp")) or _utcnow(),
-            received_at=_datetime_from_payload(payload.get("received_at")) or _utcnow(),
-            sequence_id=payload.get("sequence_id"),
+            timestamp=_payload_timestamp(payload, "timestamp", "timestamp_ms"),
+            received_at=_payload_timestamp(payload, "received_at", "received_at_ms"),
+            sequence_id=_to_optional_int(payload.get("sequence_id")),
             metadata=_metadata_copy(payload.get("metadata")),
         )
+
+    @classmethod
+    def from_orderbook_payload(cls, payload: Mapping[str, Any]) -> QuoteSnapshot:
+        """
+        Явний constructor для market.orderbook.updated payload.
+        """
+        return quote_snapshot_from_orderbook_payload(payload)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -1159,6 +1428,7 @@ __all__ = [
     "make_spread_key",
     "spread_key_to_dict",
     "scoped_metadata",
+    "quote_snapshot_from_orderbook_payload",
     "QuoteSnapshot",
     "FundingSnapshot",
     "RollingStats",

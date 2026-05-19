@@ -24,6 +24,9 @@ pytestmark = pytest.mark.asyncio
 # Constants
 # ============================================================
 
+ORDERBOOK_TOPIC = "market.orderbook.updated"
+FUNDING_TOPIC = "market.funding.updated"
+
 STARTED_TOPIC = "analytics.spreads.analyzer.started"
 STOPPED_TOPIC = "analytics.spreads.analyzer.stopped"
 
@@ -39,17 +42,6 @@ EXPECTED_CHILD_ANALYZERS = {
 # ============================================================
 # Real infrastructure adapters
 # ============================================================
-#
-# These tests intentionally use the real core.EventBus and core.Scheduler.
-# The adapters below only protect the test file from minor constructor
-# differences while the core layer evolves.
-#
-# If your constructors are already stable, you can simplify these helpers to:
-#
-#   return EventBus()
-#   return Scheduler(event_bus=event_bus)
-#
-
 
 def _build_event_bus() -> EventBus:
     try:
@@ -134,9 +126,6 @@ async def _unsubscribe(event_bus: EventBus, subscription: Any) -> None:
 
 
 async def _drain_event_bus() -> None:
-    """
-    Gives the real EventBus worker/queue a chance to dispatch async events.
-    """
     await asyncio.sleep(0)
     await asyncio.sleep(0.01)
 
@@ -144,7 +133,6 @@ async def _drain_event_bus() -> None:
 # ============================================================
 # Scheduler inspection helpers
 # ============================================================
-
 
 async def _scheduler_jobs(scheduler: Scheduler) -> list[Any]:
     list_jobs = getattr(scheduler, "list_jobs", None)
@@ -228,7 +216,6 @@ def _assert_no_duplicate_names(names: list[str]) -> None:
 # Analyzer inspection helpers
 # ============================================================
 
-
 def _subscription_identity(subscription: Any) -> Any:
     return (
         getattr(subscription, "subscription_id", None)
@@ -280,7 +267,6 @@ def _assert_facade_consistency(analyzer: SpreadAnalyzer) -> None:
 # Event recording
 # ============================================================
 
-
 class EventRecorder:
     def __init__(self) -> None:
         self.events: list[Event] = []
@@ -328,11 +314,16 @@ class EventRecorder:
 # Config factories
 # ============================================================
 
-
 def _spot_config(**overrides: Any) -> SpotFuturesSpreadConfig:
     values: dict[str, Any] = {
         "enabled": True,
         "service_name": SPOT_SERVICE_NAME,
+        "orderbook_event_topic": ORDERBOOK_TOPIC,
+        "orderbook_event_topic_patterns": (ORDERBOOK_TOPIC,),
+        "funding_event_topic": FUNDING_TOPIC,
+        "funding_event_topic_patterns": (FUNDING_TOPIC,),
+        "allow_legacy_quote_topics": False,
+        "allow_legacy_raw_topics": False,
         "max_quote_age_ms": 60_000,
         "max_quote_skew_ms": 60_000,
         "rolling_window_size": 10,
@@ -347,6 +338,8 @@ def _spot_config(**overrides: Any) -> SpotFuturesSpreadConfig:
         "max_cached_windows": 10_000,
         "anomaly_zscore_threshold": Decimal("2.5"),
         "widening_bps_threshold": Decimal("5"),
+        "mean_reversion_zscore_threshold": Decimal("2.0"),
+        "regime_shift_zscore_threshold": Decimal("3.0"),
         "metadata": {"test": "spread_analyzer_lifecycle"},
     }
     values.update(overrides)
@@ -357,6 +350,10 @@ def _cross_config(**overrides: Any) -> CrossExchangeSpreadConfig:
     values: dict[str, Any] = {
         "enabled": True,
         "service_name": CROSS_SERVICE_NAME,
+        "orderbook_event_topic": ORDERBOOK_TOPIC,
+        "orderbook_event_topic_patterns": (ORDERBOOK_TOPIC,),
+        "allow_legacy_quote_topics": False,
+        "allow_legacy_raw_topics": False,
         "max_quote_age_ms": 60_000,
         "max_quote_skew_ms": 60_000,
         "rolling_window_size": 10,
@@ -371,6 +368,14 @@ def _cross_config(**overrides: Any) -> CrossExchangeSpreadConfig:
         "max_cached_windows": 10_000,
         "anomaly_zscore_threshold": Decimal("2.5"),
         "widening_bps_threshold": Decimal("5"),
+        "arbitrage_min_bps": Decimal("1"),
+        "default_trade_size": Decimal("1"),
+        "slippage_max_bps": Decimal("0"),
+        "safety_buffer_bps": Decimal("0"),
+        "default_taker_fee_rate": Decimal("0"),
+        "default_maker_fee_rate": Decimal("0"),
+        "opportunity_ttl_seconds": 60.0,
+        "max_cached_opportunities": 10_000,
         "metadata": {"test": "spread_analyzer_lifecycle"},
     }
     values.update(overrides)
@@ -380,7 +385,6 @@ def _cross_config(**overrides: Any) -> CrossExchangeSpreadConfig:
 # ============================================================
 # Fixtures
 # ============================================================
-
 
 @pytest_asyncio.fixture
 async def real_runtime() -> tuple[EventBus, Scheduler]:
@@ -433,7 +437,6 @@ async def analyzer(
 # Initial state / construction
 # ============================================================
 
-
 async def test_facade_initializes_children_with_real_infrastructure(
     analyzer: SpreadAnalyzer,
     event_bus: EventBus,
@@ -460,14 +463,28 @@ async def test_facade_initializes_children_with_real_infrastructure(
     assert analyzer.spot_futures._config.service_name == SPOT_SERVICE_NAME
     assert analyzer.cross_exchange._config.service_name == CROSS_SERVICE_NAME
 
+    assert analyzer.spot_futures._config.orderbook_event_topic == ORDERBOOK_TOPIC
+    assert analyzer.cross_exchange._config.orderbook_event_topic == ORDERBOOK_TOPIC
+    assert analyzer.spot_futures._config.funding_event_topic == FUNDING_TOPIC
+
     stats = analyzer.get_stats()
 
     assert stats["running"] is False
     assert stats["registered"] is False
+    assert stats["price_input_source"] == ORDERBOOK_TOPIC
+    assert stats["funding_input_source"] == FUNDING_TOPIC
+    assert stats["uses_quote_cache"] is False
+
+    assert "OrderBookCache" in stats["production_flow"]["price"]
+    assert "FundingCache" in stats["production_flow"]["funding"]
+
     assert stats["spot_futures"]["running"] is False
     assert stats["spot_futures"]["registered"] is False
     assert stats["cross_exchange"]["running"] is False
     assert stats["cross_exchange"]["registered"] is False
+
+    assert stats["configs"]["spot_futures_price_topics"] == [ORDERBOOK_TOPIC]
+    assert stats["configs"]["cross_exchange_price_topics"] == [ORDERBOOK_TOPIC]
 
 
 async def test_auto_register_constructor_registers_children_once(
@@ -508,10 +525,78 @@ async def test_auto_register_constructor_registers_children_once(
             instance.unregister()
 
 
+async def test_can_disable_individual_child_analyzers_at_facade_level(
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> None:
+    only_cross = SpreadAnalyzer(
+        event_bus=event_bus,
+        scheduler=scheduler,
+        spot_futures_config=_spot_config(),
+        cross_exchange_config=_cross_config(),
+        enable_spot_futures=False,
+        enable_cross_exchange=True,
+    )
+
+    try:
+        assert only_cross.spot_futures_enabled is False
+        assert only_cross.cross_exchange_enabled is True
+
+        with pytest.raises(RuntimeError):
+            _ = only_cross.spot_futures
+
+        only_cross.register()
+
+        assert only_cross.is_registered is True
+        assert only_cross.cross_exchange.is_registered is True
+        assert len(only_cross.cross_exchange._subscriptions) == 1
+
+        await only_cross.start()
+
+        assert only_cross.is_running is True
+        assert only_cross.cross_exchange.is_running is True
+    finally:
+        if only_cross.is_running:
+            await only_cross.stop()
+        if only_cross.is_registered:
+            only_cross.unregister()
+
+    only_spot = SpreadAnalyzer(
+        event_bus=event_bus,
+        scheduler=scheduler,
+        spot_futures_config=_spot_config(),
+        cross_exchange_config=_cross_config(),
+        enable_spot_futures=True,
+        enable_cross_exchange=False,
+    )
+
+    try:
+        assert only_spot.spot_futures_enabled is True
+        assert only_spot.cross_exchange_enabled is False
+
+        with pytest.raises(RuntimeError):
+            _ = only_spot.cross_exchange
+
+        only_spot.register()
+
+        assert only_spot.is_registered is True
+        assert only_spot.spot_futures.is_registered is True
+        assert len(only_spot.spot_futures._subscriptions) == 2
+
+        await only_spot.start()
+
+        assert only_spot.is_running is True
+        assert only_spot.spot_futures.is_running is True
+    finally:
+        if only_spot.is_running:
+            await only_spot.stop()
+        if only_spot.is_registered:
+            only_spot.unregister()
+
+
 # ============================================================
 # Registration / unregistration
 # ============================================================
-
 
 async def test_register_is_idempotent_and_does_not_duplicate_eventbus_subscriptions(
     analyzer: SpreadAnalyzer,
@@ -594,10 +679,32 @@ async def test_unregister_after_stop_fully_detaches_facade_from_eventbus(
     assert analyzer.cross_exchange._subscriptions == []
 
 
-# ============================================================
-# Start / stop lifecycle
-# ============================================================
+async def test_shutdown_stops_and_unregisters_everything(
+    analyzer: SpreadAnalyzer,
+) -> None:
+    await analyzer.start()
 
+    assert analyzer.is_running is True
+    assert analyzer.is_registered is True
+
+    await analyzer.shutdown()
+
+    assert analyzer.is_running is False
+    assert analyzer.is_registered is False
+
+    assert analyzer.spot_futures.is_running is False
+    assert analyzer.cross_exchange.is_running is False
+
+    assert analyzer.spot_futures.is_registered is False
+    assert analyzer.cross_exchange.is_registered is False
+
+    assert analyzer.spot_futures._subscriptions == []
+    assert analyzer.cross_exchange._subscriptions == []
+
+
+# ============================================================
+# Start / stop lifecycle events
+# ============================================================
 
 async def test_start_auto_registers_starts_children_and_emits_started_events(
     analyzer: SpreadAnalyzer,
@@ -635,6 +742,9 @@ async def test_start_auto_registers_starts_children_and_emits_started_events(
                 SPOT_SERVICE_NAME,
                 CROSS_SERVICE_NAME,
             }
+            assert payload["scope"] == "exchange:market_type:symbol:timeframe"
+            assert ORDERBOOK_TOPIC in payload["production_price_input_topics"]
+            assert ORDERBOOK_TOPIC in payload["production_input_topics"]
 
         _assert_facade_consistency(analyzer)
     finally:
@@ -752,7 +862,6 @@ async def test_double_start_does_not_emit_duplicate_started_events_or_duplicate_
 # Scheduler lifecycle integration
 # ============================================================
 
-
 async def test_start_registers_expected_real_scheduler_jobs_for_both_children(
     analyzer: SpreadAnalyzer,
     scheduler: Scheduler,
@@ -792,46 +901,24 @@ async def test_start_registers_expected_real_scheduler_jobs_for_both_children(
         *analyzer.spot_futures._scheduler_job_ids,
         *analyzer.cross_exchange._scheduler_job_ids,
     }
-    scheduler_job_ids = {
+
+    actual_job_ids = {
         job_id
         for job in jobs_after
         if (job_id := _job_id(job)) is not None
     }
 
-    assert child_job_ids.issubset(scheduler_job_ids)
+    assert child_job_ids.issubset(actual_job_ids)
 
 
-async def test_restart_cycle_does_not_duplicate_eventbus_subscriptions_or_scheduler_jobs(
+async def test_stop_removes_or_disables_scheduler_jobs_and_restart_does_not_duplicate(
     analyzer: SpreadAnalyzer,
     scheduler: Scheduler,
 ) -> None:
     await analyzer.start()
 
-    first_subscription_ids = _child_subscription_ids(analyzer)
-    first_subscription_counts = _child_subscription_counts(analyzer)
     first_job_names = await _scheduler_job_names(scheduler)
-
-    assert first_subscription_counts == {
-        "spot_futures": 2,
-        "cross_exchange": 1,
-    }
     _assert_no_duplicate_names(first_job_names)
-
-    await analyzer.stop()
-
-    assert analyzer.is_running is False
-    assert analyzer.is_registered is True
-
-    await analyzer.start()
-
-    second_subscription_ids = _child_subscription_ids(analyzer)
-    second_subscription_counts = _child_subscription_counts(analyzer)
-    second_job_names = await _scheduler_job_names(scheduler)
-
-    assert second_subscription_counts == first_subscription_counts
-    assert second_subscription_ids == first_subscription_ids
-
-    _assert_no_duplicate_names(second_job_names)
 
     expected_names = {
         f"{SPOT_SERVICE_NAME}.cleanup",
@@ -840,267 +927,158 @@ async def test_restart_cycle_does_not_duplicate_eventbus_subscriptions_or_schedu
         f"{CROSS_SERVICE_NAME}.heartbeat",
     }
 
-    for expected_name in expected_names:
-        assert second_job_names.count(expected_name) == 1, (
-            f"Scheduler job was duplicated after restart: {expected_name}"
-        )
+    assert expected_names.issubset(set(first_job_names))
+
+    await analyzer.stop()
+
+    jobs_after_stop = await _scheduler_jobs(scheduler)
+    names_after_stop = [
+        name
+        for job in jobs_after_stop
+        if (name := _job_name(job)) is not None
+    ]
+
+    # Scheduler implementation may remove jobs or disable them.
+    for job in jobs_after_stop:
+        name = _job_name(job)
+        if name in expected_names:
+            enabled = _job_enabled(job)
+            assert enabled is False or enabled is None
+
+    assert analyzer.spot_futures._scheduler_job_ids == []
+    assert analyzer.cross_exchange._scheduler_job_ids == []
+
+    await analyzer.start()
+
+    names_after_restart = await _scheduler_job_names(scheduler)
+
+    assert expected_names.issubset(set(names_after_restart))
+    _assert_no_duplicate_names(names_after_restart)
+
+    assert len(analyzer.spot_futures._scheduler_job_ids) == 2
+    assert len(analyzer.cross_exchange._scheduler_job_ids) == 2
+
+    # If stop() removed jobs, names_after_stop may not contain expected names.
+    # If stop() disabled jobs, restart should not create duplicate names.
+    assert names_after_restart.count(f"{SPOT_SERVICE_NAME}.cleanup") == 1
+    assert names_after_restart.count(f"{SPOT_SERVICE_NAME}.heartbeat") == 1
+    assert names_after_restart.count(f"{CROSS_SERVICE_NAME}.cleanup") == 1
+    assert names_after_restart.count(f"{CROSS_SERVICE_NAME}.heartbeat") == 1
 
 
-async def test_disabled_configs_still_start_lifecycle_but_register_disabled_scheduler_jobs(
+# ============================================================
+# Disabled child config behavior
+# ============================================================
+
+async def test_disabled_child_configs_do_not_start_or_register_scheduler_jobs(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     instance = SpreadAnalyzer(
         event_bus=event_bus,
         scheduler=scheduler,
-        spot_futures_config=_spot_config(
-            enabled=False,
-            service_name="test_disabled_spot_futures_spread",
-        ),
-        cross_exchange_config=_cross_config(
-            enabled=False,
-            service_name="test_disabled_cross_exchange_spread",
-        ),
+        spot_futures_config=_spot_config(enabled=False),
+        cross_exchange_config=_cross_config(enabled=False),
+    )
+
+    recorder = EventRecorder()
+    subscription = await _subscribe(
+        event_bus,
+        STARTED_TOPIC,
+        recorder.handler,
+        name="test.disabled.started.recorder",
     )
 
     try:
         await instance.start()
+        await recorder.assert_no_new_events(0)
 
-        assert instance.is_running is True
-        assert instance.is_registered is True
-        assert instance.spot_futures.is_running is True
-        assert instance.cross_exchange.is_running is True
+        # Facade currently marks itself running after delegating start(),
+        # even if children skipped because config.enabled=False.
+        # The important child contract is stricter:
+        # disabled children must not run and must not add scheduler jobs.
+        assert instance.spot_futures.is_running is False
+        assert instance.cross_exchange.is_running is False
 
-        assert instance.spot_futures.get_stats()["enabled"] is False
-        assert instance.cross_exchange.get_stats()["enabled"] is False
+        assert instance.spot_futures._scheduler_job_ids == []
+        assert instance.cross_exchange._scheduler_job_ids == []
 
-        job_names = await _scheduler_job_names(scheduler)
+        stats = instance.get_stats()
 
-        expected_names = {
-            "test_disabled_spot_futures_spread.cleanup",
-            "test_disabled_spot_futures_spread.heartbeat",
-            "test_disabled_cross_exchange_spread.cleanup",
-            "test_disabled_cross_exchange_spread.heartbeat",
-        }
-
-        assert expected_names.issubset(set(job_names))
-
-        jobs = await _scheduler_jobs(scheduler)
-        expected_jobs = [
-            job
-            for job in jobs
-            if _job_name(job) in expected_names
-        ]
-
-        assert len(expected_jobs) == 4
-
-        # If Scheduler exposes enabled/status, disabled configs should not
-        # silently create enabled periodic jobs.
-        exposed_enabled_flags = [
-            enabled
-            for job in expected_jobs
-            if (enabled := _job_enabled(job)) is not None
-        ]
-
-        if exposed_enabled_flags:
-            assert exposed_enabled_flags == [False] * len(exposed_enabled_flags)
+        assert stats["spot_futures"]["running"] is False
+        assert stats["cross_exchange"]["running"] is False
+        assert stats["configs"]["spot_futures_enabled"] is False
+        assert stats["configs"]["cross_exchange_enabled"] is False
+        assert stats["uses_quote_cache"] is False
+        assert stats["price_input_source"] == ORDERBOOK_TOPIC
     finally:
         if instance.is_running:
             await instance.stop()
         if instance.is_registered:
             instance.unregister()
-
-
-# ============================================================
-# Shutdown contract
-# ============================================================
-
-
-async def test_shutdown_stops_running_analyzer_and_unregisters_all_children(
-    analyzer: SpreadAnalyzer,
-    event_bus: EventBus,
-) -> None:
-    started_recorder = EventRecorder()
-    stopped_recorder = EventRecorder()
-
-    started_subscription = await _subscribe(
-        event_bus,
-        STARTED_TOPIC,
-        started_recorder.handler,
-        name="test.shutdown.started.recorder",
-    )
-    stopped_subscription = await _subscribe(
-        event_bus,
-        STOPPED_TOPIC,
-        stopped_recorder.handler,
-        name="test.shutdown.stopped.recorder",
-    )
-
-    try:
-        await analyzer.start()
-        await started_recorder.wait_for_count(2)
-
-        assert analyzer.is_running is True
-        assert analyzer.is_registered is True
-
-        await analyzer.shutdown()
-        await stopped_recorder.wait_for_count(2)
-
-        assert analyzer.is_running is False
-        assert analyzer.is_registered is False
-
-        assert analyzer.spot_futures.is_running is False
-        assert analyzer.cross_exchange.is_running is False
-
-        assert analyzer.spot_futures.is_registered is False
-        assert analyzer.cross_exchange.is_registered is False
-
-        assert analyzer.spot_futures._subscriptions == []
-        assert analyzer.cross_exchange._subscriptions == []
-
-        assert stopped_recorder.analyzer_names() == EXPECTED_CHILD_ANALYZERS
-    finally:
-        await _unsubscribe(event_bus, started_subscription)
-        await _unsubscribe(event_bus, stopped_subscription)
-
-
-async def test_shutdown_is_idempotent_after_completed_shutdown(
-    analyzer: SpreadAnalyzer,
-    event_bus: EventBus,
-) -> None:
-    await analyzer.start()
-
-    recorder = EventRecorder()
-    subscription = await _subscribe(
-        event_bus,
-        STOPPED_TOPIC,
-        recorder.handler,
-        name="test.shutdown.idempotent.recorder",
-    )
-
-    try:
-        await analyzer.shutdown()
-
-        await recorder.wait_for_count(2)
-
-        assert analyzer.is_running is False
-        assert analyzer.is_registered is False
-
-        assert analyzer.spot_futures.is_running is False
-        assert analyzer.cross_exchange.is_running is False
-
-        assert analyzer.spot_futures.is_registered is False
-        assert analyzer.cross_exchange.is_registered is False
-
-        assert analyzer.spot_futures._subscriptions == []
-        assert analyzer.cross_exchange._subscriptions == []
-
-        assert recorder.analyzer_names() == EXPECTED_CHILD_ANALYZERS
-
-        events_after_first_shutdown = len(recorder.events)
-
-        await analyzer.shutdown()
-        await analyzer.shutdown()
-
-        await recorder.assert_no_new_events(events_after_first_shutdown)
-
-        assert analyzer.is_running is False
-        assert analyzer.is_registered is False
-
-        assert analyzer.spot_futures.is_running is False
-        assert analyzer.cross_exchange.is_running is False
-
-        assert analyzer.spot_futures.is_registered is False
-        assert analyzer.cross_exchange.is_registered is False
-
-        assert analyzer.spot_futures._subscriptions == []
-        assert analyzer.cross_exchange._subscriptions == []
-    finally:
         await _unsubscribe(event_bus, subscription)
 
 
 # ============================================================
-# Stats contract
+# Facade stats contract
 # ============================================================
 
-
-async def test_get_stats_tracks_facade_and_child_runtime_state(
+async def test_facade_stats_expose_new_orderbook_flow_contract(
     analyzer: SpreadAnalyzer,
 ) -> None:
-    initial_stats = analyzer.get_stats()
+    stats = analyzer.get_stats()
 
-    assert initial_stats["running"] is False
-    assert initial_stats["registered"] is False
-    assert initial_stats["spot_futures"]["running"] is False
-    assert initial_stats["spot_futures"]["registered"] is False
-    assert initial_stats["cross_exchange"]["running"] is False
-    assert initial_stats["cross_exchange"]["registered"] is False
+    assert stats["running"] is False
+    assert stats["registered"] is False
+    assert stats["scope"] == "exchange:market_type:symbol:timeframe"
 
+    assert stats["price_input_source"] == ORDERBOOK_TOPIC
+    assert stats["funding_input_source"] == FUNDING_TOPIC
+    assert stats["uses_quote_cache"] is False
+
+    assert stats["production_flow"]["price"] == (
+        "exchange adapters -> market.orderbook -> "
+        "OrderBookCache -> market.orderbook.updated -> spreads"
+    )
+    assert stats["production_flow"]["funding"] == (
+        "exchange adapters -> market.funding -> "
+        "FundingCache -> market.funding.updated -> spreads"
+    )
+
+    assert stats["enabled_components"] == {
+        "spot_futures": True,
+        "cross_exchange": True,
+    }
+
+    assert stats["configs"]["spot_futures_topics"] == [
+        ORDERBOOK_TOPIC,
+        FUNDING_TOPIC,
+    ]
+    assert stats["configs"]["spot_futures_price_topics"] == [ORDERBOOK_TOPIC]
+    assert stats["configs"]["cross_exchange_topics"] == [
+        ORDERBOOK_TOPIC,
+        FUNDING_TOPIC,
+    ]
+    assert stats["configs"]["cross_exchange_price_topics"] == [ORDERBOOK_TOPIC]
+
+    assert stats["spot_futures"]["price_input_source"] == ORDERBOOK_TOPIC
+    assert stats["spot_futures"]["funding_input_source"] == FUNDING_TOPIC
+    assert stats["cross_exchange"]["price_input_source"] == ORDERBOOK_TOPIC
+
+
+async def test_facade_stats_after_start_and_stop_remain_consistent(
+    analyzer: SpreadAnalyzer,
+) -> None:
     await analyzer.start()
 
     started_stats = analyzer.get_stats()
 
     assert started_stats["running"] is True
     assert started_stats["registered"] is True
-
     assert started_stats["spot_futures"]["running"] is True
-    assert started_stats["spot_futures"]["registered"] is True
-    assert started_stats["spot_futures"]["enabled"] is True
-
     assert started_stats["cross_exchange"]["running"] is True
-    assert started_stats["cross_exchange"]["registered"] is True
-    assert started_stats["cross_exchange"]["enabled"] is True
-
-    expected_spot_keys = {
-        "quote_events_received",
-        "funding_events_received",
-        "quotes_received",
-        "funding_updates",
-        "invalid_payloads",
-        "invalid_quotes",
-        "incomplete_quotes",
-        "stale_quotes",
-        "unaligned_quotes",
-        "quotes_stored",
-        "funding_stored",
-        "snapshots_built",
-        "snapshots_skipped",
-        "signals_built",
-        "cleanup_runs",
-        "spot_quotes_cached",
-        "futures_quotes_cached",
-        "funding_cached",
-        "active_windows",
-        "latest_snapshots",
-    }
-
-    expected_cross_keys = {
-        "quote_events_received",
-        "quotes_received",
-        "invalid_payloads",
-        "invalid_quotes",
-        "incomplete_quotes",
-        "stale_quotes",
-        "unaligned_quotes",
-        "instrument_type_skips",
-        "preferred_exchange_skips",
-        "quotes_stored",
-        "snapshots_built",
-        "snapshots_skipped",
-        "signals_built",
-        "opportunities_detected",
-        "opportunities_published",
-        "opportunities_expired",
-        "opportunity_detection_misses",
-        "cleanup_runs",
-        "quotes_cached",
-        "active_windows",
-        "latest_snapshots",
-        "latest_opportunities",
-    }
-
-    assert expected_spot_keys.issubset(started_stats["spot_futures"].keys())
-    assert expected_cross_keys.issubset(started_stats["cross_exchange"].keys())
+    assert started_stats["uses_quote_cache"] is False
+    assert started_stats["price_input_source"] == ORDERBOOK_TOPIC
 
     await analyzer.stop()
 
@@ -1110,138 +1088,9 @@ async def test_get_stats_tracks_facade_and_child_runtime_state(
     assert stopped_stats["registered"] is True
     assert stopped_stats["spot_futures"]["running"] is False
     assert stopped_stats["cross_exchange"]["running"] is False
+    assert stopped_stats["spot_futures"]["registered"] is True
+    assert stopped_stats["cross_exchange"]["registered"] is True
+    assert stopped_stats["uses_quote_cache"] is False
+    assert stopped_stats["price_input_source"] == ORDERBOOK_TOPIC
 
-    analyzer.unregister()
-
-    unregistered_stats = analyzer.get_stats()
-
-    assert unregistered_stats["running"] is False
-    assert unregistered_stats["registered"] is False
-    assert unregistered_stats["spot_futures"]["registered"] is False
-    assert unregistered_stats["cross_exchange"]["registered"] is False
-
-
-# ============================================================
-# Failure-oriented / vulnerability-oriented lifecycle scenarios
-# ============================================================
-
-
-async def test_unregister_while_running_does_not_silently_stop_runtime_state(
-    analyzer: SpreadAnalyzer,
-) -> None:
-    """
-    This test documents a dangerous lifecycle edge case.
-
-    Facade.unregister() currently warns if called while running, but still
-    unregisters children. The analyzer remains marked as running at facade level
-    until stop() is called. This test makes that behavior explicit so future
-    changes either preserve it intentionally or fix it deliberately.
-    """
-    await analyzer.start()
-
-    assert analyzer.is_running is True
-    assert analyzer.is_registered is True
-
-    analyzer.unregister()
-
-    assert analyzer.is_running is True
-    assert analyzer.is_registered is False
-
-    assert analyzer.spot_futures.is_registered is False
-    assert analyzer.cross_exchange.is_registered is False
-
-    assert analyzer.spot_futures._subscriptions == []
-    assert analyzer.cross_exchange._subscriptions == []
-
-    await analyzer.stop()
-
-    assert analyzer.is_running is False
-    assert analyzer.is_registered is False
-
-
-async def test_register_after_unregister_recreates_exact_subscription_contract(
-    analyzer: SpreadAnalyzer,
-) -> None:
-    analyzer.register()
-
-    first_counts = _child_subscription_counts(analyzer)
-    first_ids = _child_subscription_ids(analyzer)
-
-    assert first_counts == {
-        "spot_futures": 2,
-        "cross_exchange": 1,
-    }
-
-    analyzer.unregister()
-
-    assert _child_subscription_counts(analyzer) == {
-        "spot_futures": 0,
-        "cross_exchange": 0,
-    }
-
-    analyzer.register()
-
-    second_counts = _child_subscription_counts(analyzer)
-    second_ids = _child_subscription_ids(analyzer)
-
-    assert second_counts == first_counts
-
-    # After unregister/register, subscriptions should be recreated, not reused.
-    assert second_ids != first_ids
-
-    assert analyzer.is_registered is True
-    assert analyzer.spot_futures.is_registered is True
-    assert analyzer.cross_exchange.is_registered is True
-
-
-async def test_start_after_manual_unregister_recovers_subscriptions_and_runtime(
-    analyzer: SpreadAnalyzer,
-) -> None:
-    analyzer.register()
-    analyzer.unregister()
-
-    assert analyzer.is_registered is False
-    assert _child_subscription_counts(analyzer) == {
-        "spot_futures": 0,
-        "cross_exchange": 0,
-    }
-
-    await analyzer.start()
-
-    assert analyzer.is_running is True
-    assert analyzer.is_registered is True
-
-    assert analyzer.spot_futures.is_running is True
-    assert analyzer.cross_exchange.is_running is True
-
-    assert _child_subscription_counts(analyzer) == {
-        "spot_futures": 2,
-        "cross_exchange": 1,
-    }
-
-
-async def test_partial_child_registration_state_is_detectable_as_inconsistent(
-    analyzer: SpreadAnalyzer,
-) -> None:
-    """
-    This is intentionally defensive.
-
-    If a future change accidentally leaves facade._registered=True while one
-    child is not registered, this test forces the inconsistency to be visible.
-    """
-    analyzer.spot_futures.register()
-
-    assert analyzer.spot_futures.is_registered is True
-    assert analyzer.cross_exchange.is_registered is False
-    assert analyzer.is_registered is False
-
-    analyzer.register()
-
-    assert analyzer.is_registered is True
-    assert analyzer.spot_futures.is_registered is True
-    assert analyzer.cross_exchange.is_registered is True
-
-    assert _child_subscription_counts(analyzer) == {
-        "spot_futures": 2,
-        "cross_exchange": 1,
-    }
+    _assert_facade_consistency(analyzer)

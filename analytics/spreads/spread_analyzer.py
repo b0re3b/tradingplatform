@@ -10,7 +10,6 @@ from .config import CrossExchangeSpreadConfig, SpotFuturesSpreadConfig
 from .cross_exchange_analyzer import CrossExchangeSpreadAnalyzer
 from .enums import InstrumentType
 from .models import (
-    DEFAULT_TIMEFRAME,
     ArbitrageOpportunity,
     SpreadKey,
     SpreadSnapshot,
@@ -31,21 +30,34 @@ class SpreadAnalyzer:
 
     Correct production input flow:
         exchange adapters
-            -> market.quote / market.funding
-            -> QuoteCache / FundingCache
-            -> market.quote.updated / market.funding.updated
+            -> market.orderbook / market.funding
+            -> OrderBookCache / FundingCache
+            -> market.orderbook.updated / market.funding.updated
             -> analytics.spreads analyzers
             -> analytics.spreads.*
 
+    Price data:
+        market.orderbook.updated
+            -> QuoteSnapshot як внутрішня normalized top-of-book модель
+            -> SpotFuturesSpreadAnalyzer / CrossExchangeSpreadAnalyzer
+
+    Funding data:
+        market.funding.updated
+            -> FundingSnapshot
+            -> SpotFuturesSpreadAnalyzer
+
     Важливо:
     - facade не отримує market data напряму;
-    - не створює exchange adapters;
-    - не містить spread business logic;
-    - не викликає strategy/risk/execution напряму;
-    - SpotFuturesSpreadAnalyzer є дозволеним spot+futures компонентом;
-    - CrossExchangeSpreadAnalyzer працює за своїм config, зокрема може бути
-      spot/perp/futures або futures-only залежно від allowed_instrument_types.
+    - facade не створює exchange adapters;
+    - facade не містить spread business logic;
+    - facade не викликає strategy/risk/execution напряму;
+    - QuoteCache не використовується і не потрібен;
+    - SpotFuturesSpreadAnalyzer залишається production-компонентом;
+    - CrossExchangeSpreadAnalyzer залишається production-компонентом.
     """
+
+    PRICE_INPUT_SOURCE = "market.orderbook.updated"
+    FUNDING_INPUT_SOURCE = "market.funding.updated"
 
     def __init__(
         self,
@@ -137,8 +149,10 @@ class SpreadAnalyzer:
         Реєструє enabled analyzer-и в EventBus.
 
         Production subscriptions створюються всередині analyzer-ів:
-        - SpotFuturesSpreadAnalyzer -> market.quote.updated / market.funding.updated
-        - CrossExchangeSpreadAnalyzer -> market.quote.updated
+        - SpotFuturesSpreadAnalyzer:
+            market.orderbook.updated / market.funding.updated
+        - CrossExchangeSpreadAnalyzer:
+            market.orderbook.updated
         """
         if self._registered:
             self._logger.warning("SpreadAnalyzer already registered")
@@ -157,7 +171,8 @@ class SpreadAnalyzer:
         self._registered = True
 
         self._logger.info(
-            "SpreadAnalyzer registered | components=%s spot_futures_registered=%s cross_exchange_registered=%s",
+            "SpreadAnalyzer registered | components=%s "
+            "spot_futures_registered=%s cross_exchange_registered=%s",
             registered_components,
             (
                 self._spot_futures_analyzer.is_registered
@@ -174,6 +189,9 @@ class SpreadAnalyzer:
                 "scope": "exchange:market_type:symbol:timeframe",
                 "spot_futures_enabled": self._spot_futures_analyzer is not None,
                 "cross_exchange_enabled": self._cross_exchange_analyzer is not None,
+                "price_input_source": self.PRICE_INPUT_SOURCE,
+                "funding_input_source": self.FUNDING_INPUT_SOURCE,
+                "uses_quote_cache": False,
             },
         )
 
@@ -187,7 +205,8 @@ class SpreadAnalyzer:
         """
         if self._running:
             self._logger.warning(
-                "SpreadAnalyzer unregister requested while running; stop() should be called first"
+                "SpreadAnalyzer unregister requested while running; "
+                "stop() should be called first"
             )
 
         if not self._registered:
@@ -202,7 +221,14 @@ class SpreadAnalyzer:
 
         self._registered = False
 
-        self._logger.info("SpreadAnalyzer unregistered")
+        self._logger.info(
+            "SpreadAnalyzer unregistered",
+            extra={
+                "price_input_source": self.PRICE_INPUT_SOURCE,
+                "funding_input_source": self.FUNDING_INPUT_SOURCE,
+                "uses_quote_cache": False,
+            },
+        )
 
     async def start(self) -> None:
         """
@@ -230,13 +256,30 @@ class SpreadAnalyzer:
         self._running = True
 
         self._logger.info(
-            "SpreadAnalyzer started | components=%s spot_futures_enabled=%s cross_exchange_enabled=%s",
+            "SpreadAnalyzer started | components=%s "
+            "spot_futures_enabled=%s cross_exchange_enabled=%s",
             started_components,
-            self._spot_futures_config.enabled if self._spot_futures_analyzer is not None else False,
-            self._cross_exchange_config.enabled if self._cross_exchange_analyzer is not None else False,
+            (
+                self._spot_futures_config.enabled
+                if self._spot_futures_analyzer is not None
+                else False
+            ),
+            (
+                self._cross_exchange_config.enabled
+                if self._cross_exchange_analyzer is not None
+                else False
+            ),
             extra={
                 "components": started_components,
                 "scope": "exchange:market_type:symbol:timeframe",
+                "price_input_source": self.PRICE_INPUT_SOURCE,
+                "funding_input_source": self.FUNDING_INPUT_SOURCE,
+                "uses_quote_cache": False,
+                "production_flow": (
+                    "OrderBookCache/FundingCache -> "
+                    "market.orderbook.updated/market.funding.updated -> "
+                    "analytics.spreads"
+                ),
             },
         )
 
@@ -258,7 +301,14 @@ class SpreadAnalyzer:
 
         self._running = False
 
-        self._logger.info("SpreadAnalyzer stopped")
+        self._logger.info(
+            "SpreadAnalyzer stopped",
+            extra={
+                "price_input_source": self.PRICE_INPUT_SOURCE,
+                "funding_input_source": self.FUNDING_INPUT_SOURCE,
+                "uses_quote_cache": False,
+            },
+        )
 
     async def shutdown(self) -> None:
         """
@@ -272,7 +322,14 @@ class SpreadAnalyzer:
         if self._registered:
             self.unregister()
 
-        self._logger.info("SpreadAnalyzer shutdown completed")
+        self._logger.info(
+            "SpreadAnalyzer shutdown completed",
+            extra={
+                "price_input_source": self.PRICE_INPUT_SOURCE,
+                "funding_input_source": self.FUNDING_INPUT_SOURCE,
+                "uses_quote_cache": False,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Stats
@@ -283,6 +340,19 @@ class SpreadAnalyzer:
             "running": self._running,
             "registered": self._registered,
             "scope": "exchange:market_type:symbol:timeframe",
+            "price_input_source": self.PRICE_INPUT_SOURCE,
+            "funding_input_source": self.FUNDING_INPUT_SOURCE,
+            "uses_quote_cache": False,
+            "production_flow": {
+                "price": (
+                    "exchange adapters -> market.orderbook -> "
+                    "OrderBookCache -> market.orderbook.updated -> spreads"
+                ),
+                "funding": (
+                    "exchange adapters -> market.funding -> "
+                    "FundingCache -> market.funding.updated -> spreads"
+                ),
+            },
             "enabled_components": {
                 "spot_futures": self._spot_futures_analyzer is not None,
                 "cross_exchange": self._cross_exchange_analyzer is not None,
@@ -303,8 +373,18 @@ class SpreadAnalyzer:
                     if self._spot_futures_analyzer is not None
                     else []
                 ),
+                "spot_futures_price_topics": (
+                    list(self._spot_futures_config.production_price_input_topics)
+                    if self._spot_futures_analyzer is not None
+                    else []
+                ),
                 "cross_exchange_topics": (
                     list(self._cross_exchange_config.production_input_topics)
+                    if self._cross_exchange_analyzer is not None
+                    else []
+                ),
+                "cross_exchange_price_topics": (
+                    list(self._cross_exchange_config.production_price_input_topics)
                     if self._cross_exchange_analyzer is not None
                     else []
                 ),

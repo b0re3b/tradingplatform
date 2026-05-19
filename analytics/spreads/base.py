@@ -20,6 +20,7 @@ from .models import (
     SpreadSnapshot,
     make_spread_key,
     model_to_payload,
+    quote_snapshot_from_orderbook_payload,
     spread_key_to_dict,
 )
 from .spread_regime_detector import SpreadRegimeDetector
@@ -43,17 +44,20 @@ class BaseSpreadAnalyzer(ABC):
     - production-grade logging через core.logger.get_logger;
     - shared SpreadRegimeDetector / SpreadSignalEngine.
 
-    Correct input flow:
+    Correct production input flow:
         exchange adapters
-            -> market.quote / market.funding
-            -> QuoteCache / FundingCache
-            -> market.quote.updated / market.funding.updated
+            -> market.orderbook / market.funding
+            -> OrderBookCache / FundingCache
+            -> market.orderbook.updated / market.funding.updated
             -> analytics.spreads.*
 
     Важливо:
-    - analyzer-и не мають напряму читати біржові WS/REST adapters;
-    - production subscriptions мають слухати data-layer updated topics;
-    - raw market.quote / market.funding дозволені тільки якщо config.allow_legacy_raw_topics=True;
+    - analyzer-и не читають біржові WS/REST adapters напряму;
+    - production price input іде з OrderBookCache через market.orderbook.updated;
+    - QuoteSnapshot залишається внутрішньою normalized top-of-book моделлю;
+    - raw market.orderbook / market.quote / market.funding дозволені тільки
+      якщо config.allow_legacy_raw_topics=True;
+    - market.quote.updated можна лишити тільки як legacy-сумісність;
     - цей base class не містить spread business logic.
     """
 
@@ -107,10 +111,14 @@ class BaseSpreadAnalyzer(ABC):
         Конкретний analyzer має підписатись на потрібні EventBus topics.
 
         Production subscriptions мають використовувати:
-            self._subscribe_quote_updates(...)
+            self._subscribe_orderbook_updates(...)
             self._subscribe_funding_updates(...)
 
-        або self._subscribe(...) тільки для topics із config.production_input_topics.
+        Backward-compatible:
+            self._subscribe_quote_updates(...)
+
+        `_subscribe_quote_updates(...)` лишається alias і теж підписує
+        analyzer на market.orderbook.updated, якщо config уже оновлений.
         """
         raise NotImplementedError
 
@@ -165,7 +173,8 @@ class BaseSpreadAnalyzer(ABC):
             {
                 "analyzer": self.__class__.__name__,
                 "service_name": self._service_name,
-                "production_input_topics": list(self._config.production_input_topics),
+                "production_input_topics": list(self._production_input_topics()),
+                "production_price_input_topics": list(self._production_price_input_topics()),
                 "scope": "exchange:market_type:symbol:timeframe",
             },
         )
@@ -176,6 +185,9 @@ class BaseSpreadAnalyzer(ABC):
 
         За замовчуванням stop() не видаляє EventBus subscriptions, а лише
         переводить analyzer у неактивний стан. Для повної відписки викликати unregister().
+
+        Scheduler jobs прибираються/disable-яться best-effort, щоб повторний
+        start() не створював дублікати cleanup/heartbeat jobs.
         """
         if not self._running:
             self._logger.warning(
@@ -186,6 +198,7 @@ class BaseSpreadAnalyzer(ABC):
 
         self._running = False
         self._clear_runtime_state_on_stop()
+        self._remove_scheduler_jobs()
 
         self._logger.info(
             "Analyzer stopped | analyzer=%s",
@@ -364,27 +377,68 @@ class BaseSpreadAnalyzer(ABC):
     # Payload normalization helpers
     # ------------------------------------------------------------------
 
-    def normalize_quote_payload(
+    def normalize_orderbook_payload(
         self,
         payload: QuoteSnapshot | Mapping[str, Any],
     ) -> QuoteSnapshot | None:
         """
-        Підтримує обидва production-compatible payload styles:
+        Нормалізує production price payload у QuoteSnapshot.
+
+        Production-compatible payload styles:
         - QuoteSnapshot;
-        - dict payload від QuoteCache / data-layer.
+        - dict payload від OrderBookCache / market.orderbook.updated.
+
+        QuoteSnapshot тут є внутрішньою normalized top-of-book моделлю.
         """
         try:
             if isinstance(payload, QuoteSnapshot):
                 return payload
 
             if isinstance(payload, Mapping):
-                return QuoteSnapshot.from_payload(payload)
+                return quote_snapshot_from_orderbook_payload(payload)
 
             return None
 
         except Exception as exc:
             self._mark_exception(
-                "Failed to normalize quote payload",
+                "Failed to normalize orderbook payload to quote snapshot",
+                exc,
+                payload_type=type(payload).__name__,
+            )
+            return None
+
+    def normalize_quote_payload(
+        self,
+        payload: QuoteSnapshot | Mapping[str, Any],
+    ) -> QuoteSnapshot | None:
+        """
+        Backward-compatible alias.
+
+        Старі analyzer-и ще можуть викликати normalize_quote_payload(),
+        але production input уже приходить із OrderBookCache як
+        market.orderbook.updated.
+
+        Підтримує:
+        - QuoteSnapshot;
+        - dict payload із top-of-book orderbook полями;
+        - legacy quote-like dict payload, якщо QuoteSnapshot.from_payload()
+          ще використовується у тестах або старих інтеграціях.
+        """
+        try:
+            if isinstance(payload, QuoteSnapshot):
+                return payload
+
+            if not isinstance(payload, Mapping):
+                return None
+
+            if self._looks_like_orderbook_payload(payload):
+                return quote_snapshot_from_orderbook_payload(payload)
+
+            return QuoteSnapshot.from_payload(payload)
+
+        except Exception as exc:
+            self._mark_exception(
+                "Failed to normalize quote/orderbook payload",
                 exc,
                 payload_type=type(payload).__name__,
             )
@@ -416,15 +470,72 @@ class BaseSpreadAnalyzer(ABC):
             )
             return None
 
+    def normalize_orderbook_event(self, event: Event) -> QuoteSnapshot | None:
+        return self.normalize_orderbook_payload(getattr(event, "payload", None))
+
     def normalize_quote_event(self, event: Event) -> QuoteSnapshot | None:
+        """
+        Backward-compatible event normalizer.
+
+        Поточні analyzer-и ще можуть мати handler-и on_quote_update(),
+        але якщо вони підписані через _subscribe_quote_updates(), фактично
+        отримуватимуть market.orderbook.updated і будуть нормалізовані тут.
+        """
         return self.normalize_quote_payload(getattr(event, "payload", None))
 
     def normalize_funding_event(self, event: Event) -> FundingSnapshot | None:
         return self.normalize_funding_payload(getattr(event, "payload", None))
 
+    @staticmethod
+    def _looks_like_orderbook_payload(payload: Mapping[str, Any]) -> bool:
+        """
+        Визначає, чи dict схожий на payload від OrderBookCache.
+
+        Підтримує різні top-of-book формати:
+        - bids/asks;
+        - best_bid/best_ask;
+        - best_bid_price/best_ask_price;
+        - bid_price/ask_price;
+        - bid/ask.
+        """
+        orderbook_keys = {
+            "bids",
+            "asks",
+            "best_bid",
+            "best_ask",
+            "best_bid_price",
+            "best_ask_price",
+            "bid_price",
+            "ask_price",
+            "bid_size",
+            "ask_size",
+        }
+        return any(key in payload for key in orderbook_keys)
+
     # ------------------------------------------------------------------
     # EventBus helpers
     # ------------------------------------------------------------------
+
+    def _subscribe_orderbook_updates(
+        self,
+        handler: Any,
+        *,
+        name: str | None = None,
+    ) -> list[Subscription]:
+        """
+        Підписка на production top-of-book/orderbook updates із data-layer.
+
+        Production topic:
+            market.orderbook.updated
+        """
+        return [
+            self._subscribe(
+                topic,
+                handler,
+                name=name or f"{self.__class__.__name__}.on_orderbook_update",
+            )
+            for topic in self._orderbook_event_topic_patterns()
+        ]
 
     def _subscribe_quote_updates(
         self,
@@ -433,7 +544,14 @@ class BaseSpreadAnalyzer(ABC):
         name: str | None = None,
     ) -> list[Subscription]:
         """
-        Підписка на production quote updates із data-layer.
+        Backward-compatible alias для старих analyzer-ів.
+
+        Раніше цей метод підписував на market.quote.updated.
+        Тепер, після оновлення config.py, quote_event_topic_patterns мають
+        вказувати на market.orderbook.updated.
+
+        Це дозволяє поточним on_quote_update handler-ам працювати з
+        orderbook payload без негайного перейменування методів у дочірніх класах.
         """
         return [
             self._subscribe(
@@ -441,7 +559,7 @@ class BaseSpreadAnalyzer(ABC):
                 handler,
                 name=name or f"{self.__class__.__name__}.on_quote_update",
             )
-            for topic in self._config.quote_event_topic_patterns
+            for topic in self._quote_event_topic_patterns()
         ]
 
     def _subscribe_funding_updates(
@@ -452,6 +570,9 @@ class BaseSpreadAnalyzer(ABC):
     ) -> list[Subscription]:
         """
         Підписка на production funding updates із data-layer.
+
+        Production topic:
+            market.funding.updated
         """
         return [
             self._subscribe(
@@ -459,11 +580,12 @@ class BaseSpreadAnalyzer(ABC):
                 handler,
                 name=name or f"{self.__class__.__name__}.on_funding_update",
             )
-            for topic in self._config.funding_event_topic_patterns
+            for topic in self._funding_event_topic_patterns()
         ]
 
     def _subscribe_legacy_raw_inputs(
         self,
+        orderbook_handler: Any | None = None,
         quote_handler: Any | None = None,
         funding_handler: Any | None = None,
     ) -> list[Subscription]:
@@ -471,8 +593,13 @@ class BaseSpreadAnalyzer(ABC):
         Legacy/raw subscriptions.
 
         Не використовувати в production, якщо allow_legacy_raw_topics=False.
+
+        Підтримується для dev/testing:
+        - raw market.orderbook;
+        - raw market.quote;
+        - raw market.funding.
         """
-        if not self._config.allow_legacy_raw_topics:
+        if not getattr(self._config, "allow_legacy_raw_topics", False):
             self._logger.warning(
                 "Legacy raw input subscription skipped because allow_legacy_raw_topics=False | analyzer=%s",
                 self.__class__.__name__,
@@ -481,10 +608,20 @@ class BaseSpreadAnalyzer(ABC):
 
         subscriptions: list[Subscription] = []
 
+        if orderbook_handler is not None:
+            subscriptions.append(
+                self._subscribe(
+                    getattr(self._config, "raw_orderbook_event_topic", "market.orderbook"),
+                    orderbook_handler,
+                    name=f"{self.__class__.__name__}.on_raw_orderbook",
+                    allow_raw=True,
+                )
+            )
+
         if quote_handler is not None:
             subscriptions.append(
                 self._subscribe(
-                    self._config.raw_quote_event_topic,
+                    getattr(self._config, "raw_quote_event_topic", "market.quote"),
                     quote_handler,
                     name=f"{self.__class__.__name__}.on_raw_quote",
                     allow_raw=True,
@@ -494,7 +631,7 @@ class BaseSpreadAnalyzer(ABC):
         if funding_handler is not None:
             subscriptions.append(
                 self._subscribe(
-                    self._config.raw_funding_event_topic,
+                    getattr(self._config, "raw_funding_event_topic", "market.funding"),
                     funding_handler,
                     name=f"{self.__class__.__name__}.on_raw_funding",
                     allow_raw=True,
@@ -515,11 +652,12 @@ class BaseSpreadAnalyzer(ABC):
         Реєструє EventBus subscription і зберігає Subscription для unregister().
 
         За замовчуванням блокує raw topics:
+            market.orderbook
             market.quote
             market.funding
 
-        Production topics мають бути:
-            market.quote.updated
+        Production topics:
+            market.orderbook.updated
             market.funding.updated
         """
         self._validate_subscription_topic(topic_pattern, allow_raw=allow_raw)
@@ -546,7 +684,7 @@ class BaseSpreadAnalyzer(ABC):
         *,
         allow_raw: bool = False,
     ) -> None:
-        raw_topics = set(self._config.legacy_raw_input_topics)
+        raw_topics = set(self._legacy_raw_input_topics())
 
         if topic_pattern in raw_topics and not allow_raw:
             raise ValueError(
@@ -554,10 +692,23 @@ class BaseSpreadAnalyzer(ABC):
                 f"{topic_pattern!r}. Use data-layer updated topics instead."
             )
 
-        if topic_pattern in raw_topics and allow_raw and not self._config.allow_legacy_raw_topics:
+        if topic_pattern in raw_topics and allow_raw and not getattr(
+            self._config,
+            "allow_legacy_raw_topics",
+            False,
+        ):
             raise ValueError(
                 f"{self.__class__.__name__} tried to subscribe to raw topic "
                 f"{topic_pattern!r}, but config.allow_legacy_raw_topics=False."
+            )
+
+        legacy_quote_topics = set(self._legacy_quote_input_topics())
+        allow_legacy_quote = getattr(self._config, "allow_legacy_quote_topics", False)
+
+        if topic_pattern in legacy_quote_topics and not allow_legacy_quote:
+            raise ValueError(
+                f"{self.__class__.__name__} tried to subscribe to legacy quote topic "
+                f"{topic_pattern!r}. Use market.orderbook.updated from OrderBookCache instead."
             )
 
     async def _emit(
@@ -730,6 +881,46 @@ class BaseSpreadAnalyzer(ABC):
                 analyzer=self.__class__.__name__,
             )
             return None
+
+    def _remove_scheduler_jobs(self) -> None:
+        """
+        Best-effort cleanup для Scheduler jobs, створених analyzer-ом.
+
+        Потрібно для безпечного stop/start без дублікатів cleanup/heartbeat jobs.
+        Підтримує Scheduler API:
+        - remove_job(job_id)
+        - disable_job(job_id)
+        """
+        if self._scheduler is None or not self._scheduler_job_ids:
+            return
+
+        for job_id in list(self._scheduler_job_ids):
+            try:
+                remove_job = getattr(self._scheduler, "remove_job", None)
+                if callable(remove_job):
+                    remove_job(job_id)
+                    continue
+
+                disable_job = getattr(self._scheduler, "disable_job", None)
+                if callable(disable_job):
+                    disable_job(job_id)
+                    continue
+
+                self._logger.debug(
+                    "Scheduler has no remove_job/disable_job method | analyzer=%s job_id=%s",
+                    self.__class__.__name__,
+                    job_id,
+                )
+
+            except Exception as exc:
+                self._mark_exception(
+                    "Failed to remove scheduler job",
+                    exc,
+                    job_id=job_id,
+                    analyzer=self.__class__.__name__,
+                )
+
+        self._scheduler_job_ids.clear()
 
     # ------------------------------------------------------------------
     # Publish helpers
@@ -937,6 +1128,102 @@ class BaseSpreadAnalyzer(ABC):
         )
 
     # ------------------------------------------------------------------
+    # Config compatibility helpers
+    # ------------------------------------------------------------------
+
+    def _orderbook_event_topic_patterns(self) -> tuple[str, ...]:
+        value = getattr(self._config, "orderbook_event_topic_patterns", None)
+        if value:
+            return tuple(value)
+
+        value = getattr(self._config, "quote_event_topic_patterns", None)
+        if value:
+            return tuple(value)
+
+        topic = getattr(self._config, "orderbook_event_topic", None)
+        if topic:
+            return (topic,)
+
+        topic = getattr(self._config, "quote_event_topic", None)
+        if topic:
+            return (topic,)
+
+        return ("market.orderbook.updated",)
+
+    def _quote_event_topic_patterns(self) -> tuple[str, ...]:
+        """
+        Backward-compatible topic resolver.
+
+        Після оновлення config.py quote_event_topic_patterns уже має вказувати
+        на market.orderbook.updated. Якщо в config є окремі orderbook patterns,
+        вони мають пріоритет.
+        """
+        value = getattr(self._config, "orderbook_event_topic_patterns", None)
+        if value:
+            return tuple(value)
+
+        value = getattr(self._config, "quote_event_topic_patterns", None)
+        if value:
+            return tuple(value)
+
+        topic = getattr(self._config, "orderbook_event_topic", None)
+        if topic:
+            return (topic,)
+
+        topic = getattr(self._config, "quote_event_topic", None)
+        if topic:
+            return (topic,)
+
+        return ("market.orderbook.updated",)
+
+    def _funding_event_topic_patterns(self) -> tuple[str, ...]:
+        value = getattr(self._config, "funding_event_topic_patterns", None)
+        if value:
+            return tuple(value)
+
+        topic = getattr(self._config, "funding_event_topic", None)
+        if topic:
+            return (topic,)
+
+        return ("market.funding.updated",)
+
+    def _production_price_input_topics(self) -> tuple[str, ...]:
+        value = getattr(self._config, "production_price_input_topics", None)
+        if value:
+            return tuple(value)
+
+        return self._orderbook_event_topic_patterns()
+
+    def _production_input_topics(self) -> tuple[str, ...]:
+        value = getattr(self._config, "production_input_topics", None)
+        if value:
+            return tuple(value)
+
+        return (
+            *self._orderbook_event_topic_patterns(),
+            *self._funding_event_topic_patterns(),
+        )
+
+    def _legacy_raw_input_topics(self) -> tuple[str, ...]:
+        value = getattr(self._config, "legacy_raw_input_topics", None)
+        if value:
+            return tuple(value)
+
+        return (
+            getattr(self._config, "raw_orderbook_event_topic", "market.orderbook"),
+            getattr(self._config, "raw_quote_event_topic", "market.quote"),
+            getattr(self._config, "raw_funding_event_topic", "market.funding"),
+        )
+
+    def _legacy_quote_input_topics(self) -> tuple[str, ...]:
+        value = getattr(self._config, "legacy_quote_input_topics", None)
+        if value:
+            return tuple(value)
+
+        topic = getattr(self._config, "legacy_quote_event_topic", "market.quote.updated")
+        return (topic,)
+
+    # ------------------------------------------------------------------
     # Stats / logging helpers
     # ------------------------------------------------------------------
 
@@ -966,8 +1253,10 @@ class BaseSpreadAnalyzer(ABC):
             "cooldown_seconds": self._config.cooldown_seconds,
             "subscriptions": len(self._subscriptions),
             "scheduler_jobs": len(self._scheduler_job_ids),
-            "production_input_topics": list(self._config.production_input_topics),
-            "allow_legacy_raw_topics": self._config.allow_legacy_raw_topics,
+            "production_input_topics": list(self._production_input_topics()),
+            "production_price_input_topics": list(self._production_price_input_topics()),
+            "allow_legacy_raw_topics": getattr(self._config, "allow_legacy_raw_topics", False),
+            "allow_legacy_quote_topics": getattr(self._config, "allow_legacy_quote_topics", False),
             "scope": "exchange:market_type:symbol:timeframe",
         }
 

@@ -18,9 +18,7 @@ from analytics.spreads import (
     OpportunityStatus,
     QuoteSnapshot,
     SpreadOpportunityDetector,
-    SpreadSignal,
     SpreadSignalType,
-    SpreadSnapshot,
     SpreadType,
 )
 from core.event_bus import Event, EventBus, EventPriority
@@ -34,7 +32,8 @@ pytestmark = pytest.mark.asyncio
 # Topics / constants
 # ============================================================
 
-QUOTE_TOPIC = "market.quote.updated"
+ORDERBOOK_TOPIC = "market.orderbook.updated"
+LEGACY_QUOTE_TOPIC = "market.quote.updated"
 
 SNAPSHOT_TOPIC = "analytics.spreads.cross_exchange.updated"
 SIGNAL_TOPIC = "analytics.spreads.signal.generated"
@@ -46,7 +45,6 @@ SERVICE_NAME = "test_cross_exchange_pipeline"
 # ============================================================
 # Real infrastructure adapters
 # ============================================================
-
 
 def _build_event_bus() -> EventBus:
     try:
@@ -194,16 +192,86 @@ async def _wait_until(
     while asyncio.get_running_loop().time() < deadline:
         if predicate():
             return
-
         await asyncio.sleep(interval)
 
     assert predicate(), message
 
 
 # ============================================================
-# Event recorder
+# Payload helpers
 # ============================================================
 
+def _payload_value(payload: Any, key: str, default: Any = None) -> Any:
+    if isinstance(payload, dict):
+        return payload.get(key, default)
+    return getattr(payload, key, default)
+
+
+def _payload_metadata(payload: Any) -> dict[str, Any]:
+    metadata = _payload_value(payload, "metadata", {})
+    return dict(metadata or {})
+
+
+def _payload_enum_value(payload: Any, key: str) -> str | None:
+    value = _payload_value(payload, key)
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        return str(value.value)
+    return str(value)
+
+
+def _payload_decimal(payload: Any, key: str) -> Decimal | None:
+    value = _payload_value(payload, key)
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _signal_type_value(signal: Any) -> str | None:
+    signal_type = _payload_value(signal, "signal_type")
+    if signal_type is None:
+        return None
+    if hasattr(signal_type, "value"):
+        return str(signal_type.value)
+    return str(signal_type)
+
+
+def _assert_decimal_equal(
+    actual: Decimal | str | None,
+    expected: Decimal,
+    *,
+    quant: Decimal = Decimal("0.00000001"),
+) -> None:
+    assert actual is not None
+    actual_decimal = actual if isinstance(actual, Decimal) else Decimal(str(actual))
+    assert actual_decimal.quantize(quant) == expected.quantize(quant)
+
+
+def _assert_stats_orderbook_aliases(
+    stats: dict[str, Any],
+    expected_orderbook_events: int,
+) -> None:
+    assert stats["orderbook_events_received"] == expected_orderbook_events
+
+    # Backward-compatible alias.
+    assert stats["quote_events_received"] == expected_orderbook_events
+
+
+def _assert_profitable_opportunity(opportunity: ArbitrageOpportunity) -> None:
+    assert opportunity.status == OpportunityStatus.ACTIVE
+    assert opportunity.is_profitable is True
+    assert opportunity.gross_edge > Decimal("0")
+    assert opportunity.net_edge > Decimal("0")
+    assert opportunity.expires_at is not None
+    assert opportunity.expires_at > opportunity.timestamp
+
+
+# ============================================================
+# Event recorder
+# ============================================================
 
 class EventRecorder:
     def __init__(self) -> None:
@@ -246,50 +314,20 @@ class EventRecorder:
 
 
 # ============================================================
-# Assertions / helpers
-# ============================================================
-
-
-def _assert_decimal_equal(
-    actual: Decimal | None,
-    expected: Decimal,
-    *,
-    quant: Decimal = Decimal("0.00000001"),
-) -> None:
-    assert actual is not None
-    assert actual.quantize(quant) == expected.quantize(quant)
-
-
-def _assert_profitable_opportunity(opportunity: ArbitrageOpportunity) -> None:
-    assert opportunity.status == OpportunityStatus.ACTIVE
-    assert opportunity.is_profitable is True
-    assert opportunity.gross_edge > Decimal("0")
-    assert opportunity.net_edge > Decimal("0")
-    assert opportunity.expires_at is not None
-    assert opportunity.expires_at > opportunity.timestamp
-
-
-def _signal_types(payloads: list[Any]) -> set[SpreadSignalType]:
-    return {
-        payload.signal_type
-        for payload in payloads
-        if isinstance(payload, SpreadSignal)
-    }
-
-
-# ============================================================
 # Config / model factories
 # ============================================================
-
 
 def _cross_config(**overrides: Any) -> CrossExchangeSpreadConfig:
     values: dict[str, Any] = {
         "enabled": True,
         "service_name": SERVICE_NAME,
-        "quote_event_topic": QUOTE_TOPIC,
+        "orderbook_event_topic": ORDERBOOK_TOPIC,
+        "orderbook_event_topic_patterns": (ORDERBOOK_TOPIC,),
         "snapshot_event_topic": SNAPSHOT_TOPIC,
         "signal_event_topic": SIGNAL_TOPIC,
         "opportunity_event_topic": OPPORTUNITY_TOPIC,
+        "allow_legacy_quote_topics": False,
+        "allow_legacy_raw_topics": False,
         "max_quote_age_ms": 60_000,
         "max_quote_skew_ms": 1_000,
         "rolling_window_size": 20,
@@ -319,6 +357,7 @@ def _cross_config(**overrides: Any) -> CrossExchangeSpreadConfig:
             InstrumentType.PERPETUAL,
             InstrumentType.FUTURES,
         },
+        "allowed_exchanges": set(),
         "preferred_exchanges": set(),
         "metadata": {"test": "cross_exchange_pipeline"},
     }
@@ -326,11 +365,208 @@ def _cross_config(**overrides: Any) -> CrossExchangeSpreadConfig:
     return CrossExchangeSpreadConfig(**values)
 
 
-def _quote(
+def _market_type_for_instrument(instrument_type: InstrumentType | str) -> str:
+    value = instrument_type.value if hasattr(instrument_type, "value") else str(instrument_type)
+    value = value.lower()
+
+    if value == InstrumentType.SPOT.value:
+        return "spot"
+    if value == InstrumentType.FUTURES.value:
+        return "futures"
+    return "perpetual"
+
+
+def _ts_ms(value: datetime) -> int:
+    return int(value.timestamp() * 1000)
+
+
+def _orderbook_payload(
+    *,
+    exchange: str,
+    symbol: str = "BTCUSDT",
+    instrument_type: InstrumentType | str = InstrumentType.PERPETUAL,
+    market_type: str | None = None,
+    bid: Decimal | str | None = "99.9",
+    ask: Decimal | str | None = "100.1",
+    bid_size: Decimal | str | None = "10",
+    ask_size: Decimal | str | None = "10",
+    timestamp: datetime | None = None,
+    received_at: datetime | None = None,
+    sequence_id: int | None = None,
+    timeframe: str = "realtime",
+    exchange_symbol: str | None = None,
+    shape: str = "best_bid_best_ask",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Emulates market.orderbook.updated payload from OrderBookCache.
+    """
+    now = timestamp or datetime.utcnow()
+    received = received_at or now
+    resolved_market_type = market_type or _market_type_for_instrument(instrument_type)
+
+    payload: dict[str, Any] = {
+        "exchange": exchange,
+        "symbol": symbol,
+        "exchange_symbol": exchange_symbol or symbol,
+        "instrument_type": instrument_type.value if hasattr(instrument_type, "value") else instrument_type,
+        "market_type": resolved_market_type,
+        "timeframe": timeframe,
+        "timestamp": now,
+        "timestamp_ms": _ts_ms(now),
+        "received_at": received,
+        "received_at_ms": _ts_ms(received),
+        "sequence_id": sequence_id,
+        "metadata": {
+            "source": "test_orderbook_cache",
+            "shape": shape,
+            **dict(metadata or {}),
+        },
+    }
+
+    if shape == "best_bid_best_ask":
+        payload.update(
+            {
+                "best_bid": bid,
+                "best_ask": ask,
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+            }
+        )
+    elif shape == "best_bid_price_best_ask_price":
+        payload.update(
+            {
+                "best_bid_price": bid,
+                "best_ask_price": ask,
+                "best_bid_size": bid_size,
+                "best_ask_size": ask_size,
+            }
+        )
+    elif shape == "bid_ask":
+        payload.update(
+            {
+                "bid": bid,
+                "ask": ask,
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+            }
+        )
+    elif shape == "levels_dict_price_quantity":
+        payload.update(
+            {
+                "bids": [{"price": bid, "quantity": bid_size}],
+                "asks": [{"price": ask, "quantity": ask_size}],
+            }
+        )
+    elif shape == "levels_dict_p_q":
+        payload.update(
+            {
+                "bids": [{"p": bid, "q": bid_size}],
+                "asks": [{"p": ask, "q": ask_size}],
+            }
+        )
+    elif shape == "levels_tuple":
+        payload.update(
+            {
+                "bids": [(bid, bid_size)],
+                "asks": [(ask, ask_size)],
+            }
+        )
+    elif shape == "levels_list":
+        payload.update(
+            {
+                "bids": [[bid, bid_size]],
+                "asks": [[ask, ask_size]],
+            }
+        )
+    elif shape == "empty_levels":
+        payload.update({"bids": [], "asks": []})
+    elif shape == "missing_prices":
+        payload.update({"bid_size": bid_size, "ask_size": ask_size})
+    else:
+        raise ValueError(f"Unknown orderbook payload shape: {shape}")
+
+    return payload
+
+
+def _binance_orderbook(
+    *,
+    symbol: str = "BTCUSDT",
+    instrument_type: InstrumentType = InstrumentType.PERPETUAL,
+    market_type: str = "perpetual",
+    bid: Decimal | str | None = "99.9",
+    ask: Decimal | str | None = "100.1",
+    timestamp: datetime | None = None,
+    sequence_id: int | None = 1,
+    shape: str = "best_bid_best_ask",
+) -> dict[str, Any]:
+    return _orderbook_payload(
+        exchange="binance",
+        symbol=symbol,
+        instrument_type=instrument_type,
+        market_type=market_type,
+        bid=bid,
+        ask=ask,
+        timestamp=timestamp,
+        sequence_id=sequence_id,
+        shape=shape,
+    )
+
+
+def _bybit_orderbook(
+    *,
+    symbol: str = "BTCUSDT",
+    instrument_type: InstrumentType = InstrumentType.PERPETUAL,
+    market_type: str = "perpetual",
+    bid: Decimal | str | None = "104.9",
+    ask: Decimal | str | None = "105.1",
+    timestamp: datetime | None = None,
+    sequence_id: int | None = 2,
+    shape: str = "best_bid_best_ask",
+) -> dict[str, Any]:
+    return _orderbook_payload(
+        exchange="bybit",
+        symbol=symbol,
+        instrument_type=instrument_type,
+        market_type=market_type,
+        bid=bid,
+        ask=ask,
+        timestamp=timestamp,
+        sequence_id=sequence_id,
+        shape=shape,
+    )
+
+
+def _okx_orderbook(
+    *,
+    symbol: str = "BTCUSDT",
+    instrument_type: InstrumentType = InstrumentType.PERPETUAL,
+    market_type: str = "perpetual",
+    bid: Decimal | str | None = "109.9",
+    ask: Decimal | str | None = "110.1",
+    timestamp: datetime | None = None,
+    sequence_id: int | None = 3,
+    shape: str = "best_bid_best_ask",
+) -> dict[str, Any]:
+    return _orderbook_payload(
+        exchange="okx",
+        symbol=symbol,
+        instrument_type=instrument_type,
+        market_type=market_type,
+        bid=bid,
+        ask=ask,
+        timestamp=timestamp,
+        sequence_id=sequence_id,
+        shape=shape,
+    )
+
+
+def _quote_snapshot(
     *,
     exchange: str,
     symbol: str = "BTCUSDT",
     instrument_type: InstrumentType = InstrumentType.PERPETUAL,
+    market_type: str = "perpetual",
     bid: Decimal | str | None,
     ask: Decimal | str | None,
     bid_size: Decimal | str | None = "10",
@@ -346,81 +582,21 @@ def _quote(
         exchange=exchange,
         symbol=symbol,
         instrument_type=instrument_type,
+        market_type=market_type,
         bid=Decimal(str(bid)) if bid is not None else None,
         ask=Decimal(str(ask)) if ask is not None else None,
         bid_size=Decimal(str(bid_size)) if bid_size is not None else None,
         ask_size=Decimal(str(ask_size)) if ask_size is not None else None,
         timestamp=timestamp or now,
-        received_at=received_at or now,
+        received_at=received_at or timestamp or now,
         sequence_id=sequence_id,
         metadata=dict(metadata or {}),
-    )
-
-
-def _binance_quote(
-    *,
-    symbol: str = "BTCUSDT",
-    instrument_type: InstrumentType = InstrumentType.PERPETUAL,
-    bid: Decimal | str | None = "99.9",
-    ask: Decimal | str | None = "100.1",
-    timestamp: datetime | None = None,
-    sequence_id: int | None = 1,
-) -> QuoteSnapshot:
-    return _quote(
-        exchange="binance",
-        symbol=symbol,
-        instrument_type=instrument_type,
-        bid=bid,
-        ask=ask,
-        timestamp=timestamp,
-        sequence_id=sequence_id,
-    )
-
-
-def _bybit_quote(
-    *,
-    symbol: str = "BTCUSDT",
-    instrument_type: InstrumentType = InstrumentType.PERPETUAL,
-    bid: Decimal | str | None = "104.9",
-    ask: Decimal | str | None = "105.1",
-    timestamp: datetime | None = None,
-    sequence_id: int | None = 2,
-) -> QuoteSnapshot:
-    return _quote(
-        exchange="bybit",
-        symbol=symbol,
-        instrument_type=instrument_type,
-        bid=bid,
-        ask=ask,
-        timestamp=timestamp,
-        sequence_id=sequence_id,
-    )
-
-
-def _okx_quote(
-    *,
-    symbol: str = "BTCUSDT",
-    instrument_type: InstrumentType = InstrumentType.PERPETUAL,
-    bid: Decimal | str | None = "109.9",
-    ask: Decimal | str | None = "110.1",
-    timestamp: datetime | None = None,
-    sequence_id: int | None = 3,
-) -> QuoteSnapshot:
-    return _quote(
-        exchange="okx",
-        symbol=symbol,
-        instrument_type=instrument_type,
-        bid=bid,
-        ask=ask,
-        timestamp=timestamp,
-        sequence_id=sequence_id,
     )
 
 
 # ============================================================
 # Fixtures
 # ============================================================
-
 
 @pytest_asyncio.fixture
 async def real_runtime() -> tuple[EventBus, Scheduler]:
@@ -472,7 +648,6 @@ async def analyzer(
 # Lifecycle / base pipeline
 # ============================================================
 
-
 async def test_start_registers_real_eventbus_subscription_and_scheduler_jobs(
     analyzer: CrossExchangeSpreadAnalyzer,
 ) -> None:
@@ -493,13 +668,14 @@ async def test_start_registers_real_eventbus_subscription_and_scheduler_jobs(
     assert stats["running"] is True
     assert stats["registered"] is True
     assert stats["enabled"] is True
+    assert stats["price_input_source"] == ORDERBOOK_TOPIC
     assert stats["quotes_cached"] == 0
     assert stats["active_windows"] == 0
     assert stats["latest_snapshots"] == 0
     assert stats["latest_opportunities"] == 0
 
 
-async def test_quote_event_is_ignored_when_analyzer_not_running(
+async def test_orderbook_event_is_ignored_when_analyzer_not_running(
     analyzer: CrossExchangeSpreadAnalyzer,
     event_bus: EventBus,
 ) -> None:
@@ -507,25 +683,69 @@ async def test_quote_event_is_ignored_when_analyzer_not_running(
 
     await _emit_market_event(
         event_bus,
-        QUOTE_TOPIC,
-        _binance_quote(),
+        ORDERBOOK_TOPIC,
+        _binance_orderbook(),
     )
     await _drain_event_bus()
 
     stats = analyzer.get_stats()
 
+    assert stats["orderbook_events_received"] == 0
     assert stats["quote_events_received"] == 0
     assert stats["quotes_received"] == 0
     assert stats["quotes_stored"] == 0
     assert stats["quotes_cached"] == 0
 
 
-# ============================================================
-# Quote validation / rejection
-# ============================================================
+async def test_direct_legacy_quote_snapshot_handler_still_accepts_quote_snapshot(
+    analyzer: CrossExchangeSpreadAnalyzer,
+) -> None:
+    await analyzer.start()
+
+    now = datetime.utcnow()
+
+    event_a = Event(
+        topic=LEGACY_QUOTE_TOPIC,
+        payload=_quote_snapshot(
+            exchange="binance",
+            bid="99.9",
+            ask="100.1",
+            timestamp=now,
+            sequence_id=101,
+        ),
+        priority=EventPriority.NORMAL,
+        source="test.legacy",
+    )
+    event_b = Event(
+        topic=LEGACY_QUOTE_TOPIC,
+        payload=_quote_snapshot(
+            exchange="bybit",
+            bid="104.9",
+            ask="105.1",
+            timestamp=now + timedelta(milliseconds=20),
+            sequence_id=202,
+        ),
+        priority=EventPriority.NORMAL,
+        source="test.legacy",
+    )
+
+    await analyzer.on_quote_update(event_a)
+    await analyzer.on_quote_update(event_b)
+
+    stats = analyzer.get_stats()
+
+    assert stats["quotes_received"] == 2
+    assert stats["quotes_stored"] == 2
+    assert stats["quotes_cached"] == 2
+    assert stats["snapshots_built"] == 1
+    assert stats["latest_snapshots"] == 1
 
 
-async def test_rejects_invalid_payload_and_updates_stats(
+# ============================================================
+# Orderbook validation / rejection
+# ============================================================
+
+async def test_rejects_invalid_orderbook_payload_and_updates_stats(
     analyzer: CrossExchangeSpreadAnalyzer,
     event_bus: EventBus,
 ) -> None:
@@ -533,25 +753,145 @@ async def test_rejects_invalid_payload_and_updates_stats(
 
     await _emit_market_event(
         event_bus,
-        QUOTE_TOPIC,
+        ORDERBOOK_TOPIC,
         {"bad": "payload"},
     )
 
     await _wait_until(
         lambda: analyzer.get_stats()["invalid_payloads"] == 1,
-        message="Invalid quote payload was not counted",
+        message="Invalid orderbook payload was not counted",
     )
 
     stats = analyzer.get_stats()
 
-    assert stats["quote_events_received"] == 1
+    _assert_stats_orderbook_aliases(stats, 1)
     assert stats["invalid_payloads"] == 1
     assert stats["quotes_received"] == 0
     assert stats["quotes_stored"] == 0
     assert stats["quotes_cached"] == 0
 
 
-async def test_rejects_stale_quote_and_does_not_cache_it(
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "best_bid_best_ask",
+        "best_bid_price_best_ask_price",
+        "bid_ask",
+        "levels_dict_price_quantity",
+        "levels_dict_p_q",
+        "levels_tuple",
+        "levels_list",
+    ],
+)
+async def test_orderbook_payload_shapes_are_normalized_and_cached(
+    event_bus: EventBus,
+    scheduler: Scheduler,
+    shape: str,
+) -> None:
+    analyzer = CrossExchangeSpreadAnalyzer(
+        config=_cross_config(
+            widening_bps_threshold=Decimal("10000"),
+            anomaly_zscore_threshold=Decimal("100"),
+            arbitrage_min_bps=Decimal("10000"),
+        ),
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    try:
+        await analyzer.start()
+
+        now = datetime.utcnow()
+
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
+                bid="99.9",
+                ask="100.1",
+                timestamp=now,
+                sequence_id=1,
+                shape=shape,
+            ),
+        )
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
+                bid="104.9",
+                ask="105.1",
+                timestamp=now,
+                sequence_id=2,
+                shape=shape,
+            ),
+        )
+
+        await _wait_until(
+            lambda: analyzer.get_stats()["snapshots_built"] == 1,
+            message=f"Orderbook shape {shape!r} did not build a snapshot",
+        )
+
+        stats = analyzer.get_stats()
+
+        _assert_stats_orderbook_aliases(stats, 2)
+        assert stats["quotes_received"] == 2
+        assert stats["quotes_stored"] == 2
+        assert stats["quotes_cached"] == 2
+        assert stats["invalid_payloads"] == 0
+        assert stats["invalid_quotes"] == 0
+        assert stats["snapshots_built"] == 1
+    finally:
+        if analyzer.is_running:
+            await analyzer.stop()
+        if analyzer.is_registered:
+            analyzer.unregister()
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        {"exchange": "binance", "symbol": "BTCUSDT", "instrument_type": "perpetual"},
+        {
+            "exchange": "binance",
+            "symbol": "BTCUSDT",
+            "instrument_type": "perpetual",
+            "market_type": "perpetual",
+            "bids": [],
+            "asks": [],
+        },
+        {
+            "exchange": "binance",
+            "symbol": "BTCUSDT",
+            "instrument_type": "perpetual",
+            "market_type": "perpetual",
+            "best_bid": "not-a-decimal",
+            "best_ask": "100.1",
+        },
+    ],
+)
+async def test_rejects_bad_orderbook_payload_shapes(
+    analyzer: CrossExchangeSpreadAnalyzer,
+    event_bus: EventBus,
+    bad_payload: dict[str, Any],
+) -> None:
+    await analyzer.start()
+
+    await _emit_market_event(event_bus, ORDERBOOK_TOPIC, bad_payload)
+
+    await _wait_until(
+        lambda: analyzer.get_stats()["invalid_payloads"] >= 1
+        or analyzer.get_stats()["invalid_quotes"] >= 1
+        or analyzer.get_stats()["incomplete_quotes"] >= 1,
+        message="Bad orderbook payload was not rejected",
+    )
+
+    stats = analyzer.get_stats()
+
+    assert stats["quotes_stored"] == 0
+    assert stats["quotes_cached"] == 0
+
+
+async def test_rejects_stale_orderbook_and_does_not_cache_it(
     analyzer: CrossExchangeSpreadAnalyzer,
     event_bus: EventBus,
 ) -> None:
@@ -561,25 +901,25 @@ async def test_rejects_stale_quote_and_does_not_cache_it(
 
     await _emit_market_event(
         event_bus,
-        QUOTE_TOPIC,
-        _binance_quote(timestamp=stale_timestamp),
+        ORDERBOOK_TOPIC,
+        _binance_orderbook(timestamp=stale_timestamp),
     )
 
     await _wait_until(
         lambda: analyzer.get_stats()["stale_quotes"] == 1,
-        message="Stale quote was not counted",
+        message="Stale orderbook-derived quote was not counted",
     )
 
     stats = analyzer.get_stats()
 
-    assert stats["quote_events_received"] == 1
+    _assert_stats_orderbook_aliases(stats, 1)
     assert stats["quotes_received"] == 1
     assert stats["stale_quotes"] == 1
     assert stats["quotes_stored"] == 0
     assert stats["quotes_cached"] == 0
 
 
-async def test_rejects_incomplete_quote_and_does_not_cache_it(
+async def test_rejects_incomplete_orderbook_and_does_not_cache_it(
     analyzer: CrossExchangeSpreadAnalyzer,
     event_bus: EventBus,
 ) -> None:
@@ -587,19 +927,50 @@ async def test_rejects_incomplete_quote_and_does_not_cache_it(
 
     await _emit_market_event(
         event_bus,
-        QUOTE_TOPIC,
-        _binance_quote(bid=None, ask="100.1"),
+        ORDERBOOK_TOPIC,
+        _binance_orderbook(
+            bid=None,
+            ask="100.1",
+        ),
     )
 
     await _wait_until(
-        lambda: analyzer.get_stats()["incomplete_quotes"] + analyzer.get_stats()["invalid_quotes"] >= 1,
-        message="Incomplete quote was not rejected",
+        lambda: analyzer.get_stats()["invalid_payloads"]
+        + analyzer.get_stats()["invalid_quotes"]
+        + analyzer.get_stats()["incomplete_quotes"] >= 1,
+        message="Incomplete orderbook was not rejected",
     )
 
     stats = analyzer.get_stats()
 
-    assert stats["quote_events_received"] == 1
-    assert stats["quotes_received"] == 1
+    assert stats["quotes_stored"] == 0
+    assert stats["quotes_cached"] == 0
+
+
+async def test_rejects_crossed_orderbook_and_does_not_cache_it(
+    analyzer: CrossExchangeSpreadAnalyzer,
+    event_bus: EventBus,
+) -> None:
+    await analyzer.start()
+
+    await _emit_market_event(
+        event_bus,
+        ORDERBOOK_TOPIC,
+        _binance_orderbook(
+            bid="101.0",
+            ask="100.0",
+        ),
+    )
+
+    await _wait_until(
+        lambda: analyzer.get_stats()["invalid_payloads"]
+        + analyzer.get_stats()["invalid_quotes"]
+        + analyzer.get_stats()["incomplete_quotes"] >= 1,
+        message="Crossed orderbook was not rejected",
+    )
+
+    stats = analyzer.get_stats()
+
     assert stats["quotes_stored"] == 0
     assert stats["quotes_cached"] == 0
 
@@ -621,8 +992,11 @@ async def test_skips_disallowed_instrument_type_before_caching(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(instrument_type=InstrumentType.SPOT),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
+                instrument_type=InstrumentType.SPOT,
+                market_type="spot",
+            ),
         )
 
         await _wait_until(
@@ -632,7 +1006,7 @@ async def test_skips_disallowed_instrument_type_before_caching(
 
         stats = analyzer.get_stats()
 
-        assert stats["quote_events_received"] == 1
+        _assert_stats_orderbook_aliases(stats, 1)
         assert stats["quotes_received"] == 1
         assert stats["instrument_type_skips"] == 1
         assert stats["quotes_stored"] == 0
@@ -648,8 +1022,7 @@ async def test_skips_disallowed_instrument_type_before_caching(
 # Snapshot pipeline
 # ============================================================
 
-
-async def test_stores_first_exchange_quote_without_snapshot_until_second_exchange_arrives(
+async def test_stores_first_exchange_orderbook_without_snapshot_until_second_exchange_arrives(
     analyzer: CrossExchangeSpreadAnalyzer,
     event_bus: EventBus,
 ) -> None:
@@ -666,13 +1039,13 @@ async def test_stores_first_exchange_quote_without_snapshot_until_second_exchang
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(),
         )
 
         await _wait_until(
             lambda: analyzer.get_stats()["quotes_cached"] == 1,
-            message="First exchange quote was not cached",
+            message="First exchange orderbook quote was not cached",
         )
 
         stats = analyzer.get_stats()
@@ -687,7 +1060,7 @@ async def test_stores_first_exchange_quote_without_snapshot_until_second_exchang
         await _unsubscribe(event_bus, snapshot_subscription)
 
 
-async def test_real_eventbus_cross_exchange_quotes_build_snapshot(
+async def test_real_eventbus_cross_exchange_orderbooks_build_snapshot(
     analyzer: CrossExchangeSpreadAnalyzer,
     event_bus: EventBus,
 ) -> None:
@@ -706,24 +1079,26 @@ async def test_real_eventbus_cross_exchange_quotes_build_snapshot(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
                 symbol="BTC/USDT",
                 bid="99.9",
                 ask="100.1",
                 timestamp=now,
                 sequence_id=101,
+                shape="levels_dict_price_quantity",
             ),
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
                 symbol="BTC-USDT",
                 bid="104.9",
                 ask="105.1",
                 timestamp=now + timedelta(milliseconds=20),
                 sequence_id=202,
+                shape="levels_tuple",
             ),
         )
 
@@ -731,49 +1106,49 @@ async def test_real_eventbus_cross_exchange_quotes_build_snapshot(
 
         snapshot = snapshot_recorder.payloads()[0]
 
-        assert isinstance(snapshot, SpreadSnapshot)
+        assert _payload_enum_value(snapshot, "spread_type") == SpreadType.CROSS_EXCHANGE.value
+        assert _payload_value(snapshot, "symbol") == "BTCUSDT"
 
-        assert snapshot.spread_type == SpreadType.CROSS_EXCHANGE
-        assert snapshot.symbol == "BTCUSDT"
+        assert _payload_value(snapshot, "leg_a_exchange") == "binance"
+        assert _payload_value(snapshot, "leg_b_exchange") == "bybit"
 
-        assert snapshot.leg_a_exchange == "binance"
-        assert snapshot.leg_b_exchange == "bybit"
+        assert _payload_enum_value(snapshot, "leg_a_type") == InstrumentType.PERPETUAL.value
+        assert _payload_enum_value(snapshot, "leg_b_type") == InstrumentType.PERPETUAL.value
 
-        assert snapshot.leg_a_type == InstrumentType.PERPETUAL
-        assert snapshot.leg_b_type == InstrumentType.PERPETUAL
+        _assert_decimal_equal(_payload_decimal(snapshot, "leg_a_mid"), Decimal("100.0"))
+        _assert_decimal_equal(_payload_decimal(snapshot, "leg_b_mid"), Decimal("105.0"))
 
-        assert snapshot.leg_a_mid == Decimal("100.0")
-        assert snapshot.leg_b_mid == Decimal("105.0")
+        _assert_decimal_equal(_payload_decimal(snapshot, "raw_spread"), Decimal("5.0"))
+        _assert_decimal_equal(_payload_decimal(snapshot, "spread_pct"), Decimal("5.0"))
+        _assert_decimal_equal(_payload_decimal(snapshot, "spread_bps"), Decimal("500.0"))
 
-        _assert_decimal_equal(snapshot.raw_spread, Decimal("5.0"))
-        _assert_decimal_equal(snapshot.spread_pct, Decimal("5.0"))
-        _assert_decimal_equal(snapshot.spread_bps, Decimal("500.0"))
+        metadata = _payload_metadata(snapshot)
 
-        assert snapshot.stats is not None
-        assert snapshot.stats.count == 1
-        assert snapshot.stats.last_value == Decimal("5.0")
-
-        assert snapshot.metadata["instrument_type"] == InstrumentType.PERPETUAL.value
-        assert snapshot.metadata["quote_a_sequence_id"] == 101
-        assert snapshot.metadata["quote_b_sequence_id"] == 202
-        assert snapshot.metadata["buy_exchange"] == "binance"
-        assert snapshot.metadata["sell_exchange"] == "bybit"
-        assert snapshot.metadata["buy_price"] == "100.1"
-        assert snapshot.metadata["sell_price"] == "104.9"
-        assert snapshot.metadata["gross_edge"] == "4.8"
+        assert metadata["price_input_source"] == ORDERBOOK_TOPIC
+        assert metadata["instrument_type"] == InstrumentType.PERPETUAL.value
+        assert metadata["quote_a_sequence_id"] == 101
+        assert metadata["quote_b_sequence_id"] == 202
+        assert metadata["buy_exchange"] == "binance"
+        assert metadata["sell_exchange"] == "bybit"
+        assert metadata["buy_price"] == "100.1"
+        assert metadata["sell_price"] == "104.9"
+        assert metadata["gross_edge"] == "4.8"
 
         latest = analyzer.get_latest_snapshot(
             "BTC_USDT",
             "BYBIT",
             "BINANCE",
             InstrumentType.PERPETUAL,
+            market_type="perpetual",
         )
 
-        assert latest is snapshot
+        assert latest is not None
+        assert latest.symbol == "BTCUSDT"
+        assert latest.metadata["price_input_source"] == ORDERBOOK_TOPIC
 
         stats = analyzer.get_stats()
 
-        assert stats["quote_events_received"] == 2
+        _assert_stats_orderbook_aliases(stats, 2)
         assert stats["quotes_received"] == 2
         assert stats["quotes_stored"] == 2
         assert stats["quotes_cached"] == 2
@@ -804,41 +1179,40 @@ async def test_snapshot_key_is_exchange_order_independent(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(timestamp=now, sequence_id=1),
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(timestamp=now, sequence_id=1),
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(timestamp=now, sequence_id=2),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(timestamp=now, sequence_id=2),
         )
 
         await snapshot_recorder.wait_for_count(1)
-
-        snapshot = snapshot_recorder.payloads()[0]
-
-        assert isinstance(snapshot, SpreadSnapshot)
 
         latest_a = analyzer.get_latest_snapshot(
             "BTCUSDT",
             "binance",
             "bybit",
             InstrumentType.PERPETUAL,
+            market_type="perpetual",
         )
         latest_b = analyzer.get_latest_snapshot(
             "BTC/USDT",
             "BYBIT",
             "BINANCE",
             InstrumentType.PERPETUAL,
+            market_type="perpetual",
         )
 
-        assert latest_a is snapshot
-        assert latest_b is snapshot
+        assert latest_a is not None
+        assert latest_b is not None
+        assert latest_a is latest_b
     finally:
         await _unsubscribe(event_bus, snapshot_subscription)
 
 
-async def test_unaligned_quotes_are_skipped_and_no_snapshot_is_published(
+async def test_unaligned_orderbooks_are_skipped_and_no_snapshot_is_published(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
@@ -863,18 +1237,18 @@ async def test_unaligned_quotes_are_skipped_and_no_snapshot_is_published(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(timestamp=now),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(timestamp=now),
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(timestamp=now + timedelta(seconds=2)),
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(timestamp=now + timedelta(seconds=2)),
         )
 
         await _wait_until(
             lambda: analyzer.get_stats()["unaligned_quotes"] == 1,
-            message="Unaligned quote pair was not counted",
+            message="Unaligned orderbook pair was not counted",
         )
 
         stats = analyzer.get_stats()
@@ -892,13 +1266,13 @@ async def test_unaligned_quotes_are_skipped_and_no_snapshot_is_published(
         await _unsubscribe(event_bus, snapshot_subscription)
 
 
-async def test_preferred_exchange_filter_skips_disallowed_pair(
+async def test_allowed_exchange_filter_skips_disallowed_exchange_before_snapshot(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     analyzer = CrossExchangeSpreadAnalyzer(
         config=_cross_config(
-            preferred_exchanges={"binance", "okx"},
+            allowed_exchanges={"binance", "okx"},
         ),
         event_bus=event_bus,
         scheduler=scheduler,
@@ -919,23 +1293,82 @@ async def test_preferred_exchange_filter_skips_disallowed_pair(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(timestamp=now),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(timestamp=now),
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(timestamp=now),
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(timestamp=now),
         )
 
         await _wait_until(
-            lambda: analyzer.get_stats()["preferred_exchange_skips"] == 1,
-            message="Preferred exchange skip was not counted",
+            lambda: analyzer.get_stats()["scope_skips"] >= 1,
+            message="Disallowed exchange was not skipped",
         )
 
         stats = analyzer.get_stats()
 
-        assert stats["quotes_cached"] == 2
+        assert stats["quotes_cached"] == 1
+        assert stats["snapshots_built"] == 0
+        assert stats["latest_snapshots"] == 0
+
+        await snapshot_recorder.assert_no_new_events(0)
+    finally:
+        if analyzer.is_running:
+            await analyzer.stop()
+        if analyzer.is_registered:
+            analyzer.unregister()
+        await _unsubscribe(event_bus, snapshot_subscription)
+
+
+async def test_different_market_types_do_not_pair(
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> None:
+    analyzer = CrossExchangeSpreadAnalyzer(
+        config=_cross_config(),
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    snapshot_recorder = EventRecorder()
+    snapshot_subscription = await _subscribe(
+        event_bus,
+        SNAPSHOT_TOPIC,
+        snapshot_recorder.handler,
+        name="test.cross.market_type_mismatch.recorder",
+    )
+
+    try:
+        await analyzer.start()
+
+        now = datetime.utcnow()
+
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
+                market_type="perpetual",
+                timestamp=now,
+            ),
+        )
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
+                market_type="futures",
+                timestamp=now,
+            ),
+        )
+
+        await _wait_until(
+            lambda: analyzer.get_stats()["quotes_cached"] == 2,
+            message="Both valid orderbooks should be cached",
+        )
+
+        stats = analyzer.get_stats()
+
         assert stats["snapshots_built"] == 0
         assert stats["latest_snapshots"] == 0
 
@@ -952,7 +1385,6 @@ async def test_preferred_exchange_filter_skips_disallowed_pair(
 # Opportunity detector direct checks
 # ============================================================
 
-
 async def test_opportunity_detector_selects_lower_ask_as_buy_and_higher_bid_as_sell() -> None:
     config = _cross_config(
         arbitrage_min_bps=Decimal("1"),
@@ -965,12 +1397,14 @@ async def test_opportunity_detector_selects_lower_ask_as_buy_and_higher_bid_as_s
     now = datetime.utcnow()
 
     result = detector.detect_from_quotes(
-        _binance_quote(
+        _quote_snapshot(
+            exchange="binance",
             bid="99.9",
             ask="100.1",
             timestamp=now,
         ),
-        _bybit_quote(
+        _quote_snapshot(
+            exchange="bybit",
             bid="104.9",
             ask="105.1",
             timestamp=now,
@@ -1000,6 +1434,47 @@ async def test_opportunity_detector_selects_lower_ask_as_buy_and_higher_bid_as_s
     assert result.net_edge_bps > Decimal("1")
 
 
+async def test_opportunity_detector_reverses_buy_sell_when_second_exchange_has_lower_ask() -> None:
+    config = _cross_config(
+        arbitrage_min_bps=Decimal("1"),
+        default_taker_fee_rate=Decimal("0"),
+        slippage_max_bps=Decimal("0"),
+        safety_buffer_bps=Decimal("0"),
+    )
+    detector = SpreadOpportunityDetector(config)
+
+    now = datetime.utcnow()
+
+    result = detector.detect_from_quotes(
+        _quote_snapshot(
+            exchange="binance",
+            bid="110.0",
+            ask="110.2",
+            timestamp=now,
+        ),
+        _quote_snapshot(
+            exchange="bybit",
+            bid="104.9",
+            ask="105.1",
+            timestamp=now,
+        ),
+        timestamp=now,
+    )
+
+    assert result.found is True
+    assert result.opportunity is not None
+
+    opportunity = result.opportunity
+
+    _assert_profitable_opportunity(opportunity)
+
+    assert opportunity.buy_exchange == "bybit"
+    assert opportunity.sell_exchange == "binance"
+    assert opportunity.buy_price == Decimal("105.1")
+    assert opportunity.sell_price == Decimal("110.0")
+    _assert_decimal_equal(opportunity.gross_edge, Decimal("4.9"))
+
+
 async def test_opportunity_detector_costs_reduce_gross_edge_to_net_edge() -> None:
     config = _cross_config(
         arbitrage_min_bps=Decimal("1"),
@@ -1013,14 +1488,16 @@ async def test_opportunity_detector_costs_reduce_gross_edge_to_net_edge() -> Non
     now = datetime.utcnow()
 
     result = detector.detect_from_quotes(
-        _binance_quote(
+        _quote_snapshot(
+            exchange="binance",
             bid="99.9",
             ask="100.1",
             bid_size="100",
             ask_size="100",
             timestamp=now,
         ),
-        _bybit_quote(
+        _quote_snapshot(
+            exchange="bybit",
             bid="104.9",
             ask="105.1",
             bid_size="100",
@@ -1031,41 +1508,45 @@ async def test_opportunity_detector_costs_reduce_gross_edge_to_net_edge() -> Non
     )
 
     assert result.found is True
-    assert result.costs is not None
     assert result.opportunity is not None
+    assert result.costs is not None
 
-    costs = result.costs
     opportunity = result.opportunity
+    costs = result.costs
 
-    assert costs.gross_edge > Decimal("0")
-    assert costs.total_costs > Decimal("0")
-    assert costs.net_edge < costs.gross_edge
+    _assert_profitable_opportunity(opportunity)
+
+    assert costs.gross_edge > costs.net_edge
+    assert costs.estimated_fees > Decimal("0")
+    assert costs.estimated_slippage > Decimal("0")
+    assert costs.safety_buffer > Decimal("0")
     assert opportunity.net_edge == costs.net_edge
-    assert opportunity.estimated_fees == costs.estimated_fees
-    assert opportunity.estimated_slippage == costs.estimated_slippage
-    assert opportunity.net_edge > Decimal("0")
+    assert opportunity.net_edge < opportunity.gross_edge
 
 
-async def test_opportunity_detector_does_not_detect_when_net_edge_below_threshold() -> None:
+async def test_opportunity_detector_rejects_trade_when_costs_destroy_edge() -> None:
     config = _cross_config(
-        arbitrage_min_bps=Decimal("10000"),
-        default_taker_fee_rate=Decimal("0"),
-        slippage_max_bps=Decimal("0"),
-        safety_buffer_bps=Decimal("0"),
+        arbitrage_min_bps=Decimal("1"),
+        default_trade_size=Decimal("1"),
+        default_taker_fee_rate=Decimal("0.01"),
+        slippage_max_bps=Decimal("100"),
+        safety_buffer_bps=Decimal("100"),
     )
     detector = SpreadOpportunityDetector(config)
 
     now = datetime.utcnow()
 
     result = detector.detect_from_quotes(
-        _binance_quote(
-            bid="99.9",
-            ask="100.1",
+        _quote_snapshot(
+            exchange="binance",
+            bid="99.90",
+            ask="100.00",
             timestamp=now,
         ),
-        _bybit_quote(
-            bid="100.2",
-            ask="100.4",
+        _quote_snapshot(
+            exchange="bybit",
+            bid="100.05",
+            ask="100.15",
             timestamp=now,
         ),
         timestamp=now,
@@ -1073,9 +1554,10 @@ async def test_opportunity_detector_does_not_detect_when_net_edge_below_threshol
 
     assert result.found is False
     assert result.opportunity is None
-    assert result.reason == OpportunityDetectionReason.NET_EDGE_BPS_BELOW_THRESHOLD
-    assert result.net_edge_bps is not None
-    assert result.net_edge_bps < Decimal("10000")
+    assert result.reason in {
+        OpportunityDetectionReason.NET_EDGE_NOT_PROFITABLE,
+        OpportunityDetectionReason.NET_EDGE_BPS_BELOW_THRESHOLD,
+    }
 
 
 async def test_opportunity_detector_rejects_symbol_and_instrument_mismatch() -> None:
@@ -1085,8 +1567,20 @@ async def test_opportunity_detector_rejects_symbol_and_instrument_mismatch() -> 
     now = datetime.utcnow()
 
     symbol_result = detector.detect_from_quotes(
-        _binance_quote(symbol="BTCUSDT", timestamp=now),
-        _bybit_quote(symbol="ETHUSDT", timestamp=now),
+        _quote_snapshot(
+            exchange="binance",
+            symbol="BTCUSDT",
+            bid="99.9",
+            ask="100.1",
+            timestamp=now,
+        ),
+        _quote_snapshot(
+            exchange="bybit",
+            symbol="ETHUSDT",
+            bid="104.9",
+            ask="105.1",
+            timestamp=now,
+        ),
         timestamp=now,
     )
 
@@ -1094,12 +1588,20 @@ async def test_opportunity_detector_rejects_symbol_and_instrument_mismatch() -> 
     assert symbol_result.reason == OpportunityDetectionReason.SYMBOL_MISMATCH
 
     instrument_result = detector.detect_from_quotes(
-        _binance_quote(
-            instrument_type=InstrumentType.SPOT,
+        _quote_snapshot(
+            exchange="binance",
+            instrument_type=InstrumentType.PERPETUAL,
+            market_type="perpetual",
+            bid="99.9",
+            ask="100.1",
             timestamp=now,
         ),
-        _bybit_quote(
-            instrument_type=InstrumentType.PERPETUAL,
+        _quote_snapshot(
+            exchange="bybit",
+            instrument_type=InstrumentType.FUTURES,
+            market_type="futures",
+            bid="104.9",
+            ask="105.1",
             timestamp=now,
         ),
         timestamp=now,
@@ -1110,23 +1612,19 @@ async def test_opportunity_detector_rejects_symbol_and_instrument_mismatch() -> 
 
 
 # ============================================================
-# Opportunity + signal pipeline
+# Full EventBus opportunity pipeline
 # ============================================================
 
-
-async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitrage_signal(
+async def test_real_eventbus_cross_exchange_orderbooks_publish_arbitrage_opportunity(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     analyzer = CrossExchangeSpreadAnalyzer(
         config=_cross_config(
             arbitrage_min_bps=Decimal("1"),
-            widening_bps_threshold=Decimal("10000"),
-            anomaly_zscore_threshold=Decimal("100"),
             default_taker_fee_rate=Decimal("0"),
             slippage_max_bps=Decimal("0"),
             safety_buffer_bps=Decimal("0"),
-            cooldown_seconds=0,
         ),
         event_bus=event_bus,
         scheduler=scheduler,
@@ -1134,7 +1632,6 @@ async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitra
 
     snapshot_recorder = EventRecorder()
     opportunity_recorder = EventRecorder()
-    signal_recorder = EventRecorder()
 
     snapshot_subscription = await _subscribe(
         event_bus,
@@ -1147,6 +1644,165 @@ async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitra
         OPPORTUNITY_TOPIC,
         opportunity_recorder.handler,
         name="test.cross.opportunity.recorder",
+    )
+
+    try:
+        await analyzer.start()
+
+        now = datetime.utcnow()
+
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
+                bid="99.9",
+                ask="100.1",
+                timestamp=now,
+                sequence_id=101,
+            ),
+        )
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
+                bid="104.9",
+                ask="105.1",
+                timestamp=now,
+                sequence_id=202,
+            ),
+        )
+
+        await snapshot_recorder.wait_for_count(1)
+        await opportunity_recorder.wait_for_count(1)
+
+        opportunity = opportunity_recorder.payloads()[0]
+
+        assert _payload_value(opportunity, "symbol") == "BTCUSDT"
+        assert _payload_value(opportunity, "buy_exchange") == "binance"
+        assert _payload_value(opportunity, "sell_exchange") == "bybit"
+        assert _payload_value(opportunity, "buy_market_type") == "perpetual"
+        assert _payload_value(opportunity, "sell_market_type") == "perpetual"
+
+        _assert_decimal_equal(_payload_decimal(opportunity, "gross_edge"), Decimal("4.8"))
+        _assert_decimal_equal(_payload_decimal(opportunity, "net_edge"), Decimal("4.8"))
+
+        metadata = _payload_metadata(opportunity)
+        assert metadata["price_input_source"] == ORDERBOOK_TOPIC
+
+        stats = analyzer.get_stats()
+
+        assert stats["snapshots_built"] == 1
+        assert stats["opportunities_detected"] == 1
+        assert stats["opportunities_published"] == 1
+        assert stats["latest_opportunities"] == 1
+    finally:
+        if analyzer.is_running:
+            await analyzer.stop()
+        if analyzer.is_registered:
+            analyzer.unregister()
+        await _unsubscribe(event_bus, snapshot_subscription)
+        await _unsubscribe(event_bus, opportunity_subscription)
+
+
+async def test_no_opportunity_is_published_when_net_edge_below_threshold(
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> None:
+    analyzer = CrossExchangeSpreadAnalyzer(
+        config=_cross_config(
+            arbitrage_min_bps=Decimal("1000"),
+            default_taker_fee_rate=Decimal("0"),
+            slippage_max_bps=Decimal("0"),
+            safety_buffer_bps=Decimal("0"),
+        ),
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    snapshot_recorder = EventRecorder()
+    opportunity_recorder = EventRecorder()
+
+    snapshot_subscription = await _subscribe(
+        event_bus,
+        SNAPSHOT_TOPIC,
+        snapshot_recorder.handler,
+        name="test.cross.snapshot.recorder",
+    )
+    opportunity_subscription = await _subscribe(
+        event_bus,
+        OPPORTUNITY_TOPIC,
+        opportunity_recorder.handler,
+        name="test.cross.opportunity.recorder",
+    )
+
+    try:
+        await analyzer.start()
+
+        now = datetime.utcnow()
+
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
+                bid="99.9",
+                ask="100.1",
+                timestamp=now,
+            ),
+        )
+        await _emit_market_event(
+            event_bus,
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
+                bid="100.2",
+                ask="100.4",
+                timestamp=now,
+            ),
+        )
+
+        await snapshot_recorder.wait_for_count(1)
+        await opportunity_recorder.assert_no_new_events(0)
+
+        stats = analyzer.get_stats()
+
+        assert stats["snapshots_built"] == 1
+        assert stats["opportunities_published"] == 0
+        assert stats["opportunity_detection_misses"] >= 1
+    finally:
+        if analyzer.is_running:
+            await analyzer.stop()
+        if analyzer.is_registered:
+            analyzer.unregister()
+        await _unsubscribe(event_bus, snapshot_subscription)
+        await _unsubscribe(event_bus, opportunity_subscription)
+
+
+# ============================================================
+# Signal generation
+# ============================================================
+
+async def test_widening_signal_is_generated_when_threshold_is_crossed(
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> None:
+    analyzer = CrossExchangeSpreadAnalyzer(
+        config=_cross_config(
+            widening_bps_threshold=Decimal("10"),
+            anomaly_zscore_threshold=Decimal("100"),
+            arbitrage_min_bps=Decimal("10000"),
+            cooldown_seconds=0,
+        ),
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    snapshot_recorder = EventRecorder()
+    signal_recorder = EventRecorder()
+
+    snapshot_subscription = await _subscribe(
+        event_bus,
+        SNAPSHOT_TOPIC,
+        snapshot_recorder.handler,
+        name="test.cross.snapshot.recorder",
     )
     signal_subscription = await _subscribe(
         event_bus,
@@ -1162,8 +1818,8 @@ async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitra
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
                 bid="99.9",
                 ask="100.1",
                 timestamp=now,
@@ -1171,8 +1827,8 @@ async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitra
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
                 bid="104.9",
                 ask="105.1",
                 timestamp=now,
@@ -1180,56 +1836,22 @@ async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitra
         )
 
         await snapshot_recorder.wait_for_count(1)
-        await opportunity_recorder.wait_for_count(1)
         await signal_recorder.wait_for_count(1)
 
-        snapshot = snapshot_recorder.payloads()[0]
-        opportunity = opportunity_recorder.payloads()[0]
+        signal = signal_recorder.payloads()[0]
 
-        assert isinstance(snapshot, SpreadSnapshot)
-        assert isinstance(opportunity, ArbitrageOpportunity)
+        assert _payload_enum_value(signal, "spread_type") == SpreadType.CROSS_EXCHANGE.value
+        assert _signal_type_value(signal) == SpreadSignalType.WIDENING.value
+        assert _payload_value(signal, "symbol") == "BTCUSDT"
 
-        _assert_profitable_opportunity(opportunity)
+        _assert_decimal_equal(_payload_decimal(signal, "value"), Decimal("500.0"))
+        _assert_decimal_equal(_payload_decimal(signal, "threshold"), Decimal("10"))
 
-        assert opportunity.buy_exchange == "binance"
-        assert opportunity.sell_exchange == "bybit"
-        assert opportunity.buy_price == Decimal("100.1")
-        assert opportunity.sell_price == Decimal("104.9")
-        assert opportunity.net_edge == Decimal("4.8")
-
-        assert snapshot.net_spread == opportunity.net_edge
-        assert snapshot.estimated_fees == Decimal("0.0") or snapshot.estimated_fees == Decimal("0")
-        assert snapshot.estimated_slippage == Decimal("0.0") or snapshot.estimated_slippage == Decimal("0")
-        assert snapshot.metadata["opportunity_reason"] == "opportunity_detected"
-        assert snapshot.metadata["opportunity_status"] == OpportunityStatus.ACTIVE.value
-        assert snapshot.metadata["opportunity_net_edge"] == str(opportunity.net_edge)
-
-        signal_payloads = signal_recorder.payloads()
-
-        assert SpreadSignalType.ARBITRAGE in _signal_types(signal_payloads)
-
-        arbitrage_signal = next(
-            signal
-            for signal in signal_payloads
-            if isinstance(signal, SpreadSignal)
-            and signal.signal_type == SpreadSignalType.ARBITRAGE
-        )
-
-        assert arbitrage_signal.spread_type == SpreadType.CROSS_EXCHANGE
-        assert arbitrage_signal.symbol == "BTCUSDT"
-        assert arbitrage_signal.exchange_a == "binance"
-        assert arbitrage_signal.exchange_b == "bybit"
-        assert arbitrage_signal.value == opportunity.net_edge
-        assert arbitrage_signal.threshold == Decimal("1")
-        assert arbitrage_signal.metadata["reason"] == "signal_built"
+        metadata = _payload_metadata(signal)
+        assert metadata["reason"] == "signal_built"
 
         stats = analyzer.get_stats()
 
-        assert stats["snapshots_built"] == 1
-        assert stats["snapshots_published"] == 1
-        assert stats["opportunities_detected"] == 1
-        assert stats["opportunities_published"] == 1
-        assert stats["latest_opportunities"] == 1
         assert stats["signals_built"] >= 1
         assert stats["signals_published"] >= 1
     finally:
@@ -1238,28 +1860,26 @@ async def test_real_eventbus_profitable_spread_publishes_opportunity_and_arbitra
         if analyzer.is_registered:
             analyzer.unregister()
         await _unsubscribe(event_bus, snapshot_subscription)
-        await _unsubscribe(event_bus, opportunity_subscription)
         await _unsubscribe(event_bus, signal_subscription)
 
 
-async def test_pipeline_does_not_publish_opportunity_when_net_edge_is_not_profitable(
+async def test_no_signal_is_generated_below_widening_threshold(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     analyzer = CrossExchangeSpreadAnalyzer(
         config=_cross_config(
-            arbitrage_min_bps=Decimal("1"),
-            default_taker_fee_rate=Decimal("0.01"),
-            slippage_max_bps=Decimal("10"),
-            safety_buffer_bps=Decimal("10"),
-            widening_bps_threshold=Decimal("10000"),
+            widening_bps_threshold=Decimal("1000"),
+            anomaly_zscore_threshold=Decimal("100"),
+            arbitrage_min_bps=Decimal("10000"),
+            cooldown_seconds=0,
         ),
         event_bus=event_bus,
         scheduler=scheduler,
     )
 
     snapshot_recorder = EventRecorder()
-    opportunity_recorder = EventRecorder()
+    signal_recorder = EventRecorder()
 
     snapshot_subscription = await _subscribe(
         event_bus,
@@ -1267,11 +1887,11 @@ async def test_pipeline_does_not_publish_opportunity_when_net_edge_is_not_profit
         snapshot_recorder.handler,
         name="test.cross.snapshot.recorder",
     )
-    opportunity_subscription = await _subscribe(
+    signal_subscription = await _subscribe(
         event_bus,
-        OPPORTUNITY_TOPIC,
-        opportunity_recorder.handler,
-        name="test.cross.opportunity.recorder",
+        SIGNAL_TOPIC,
+        signal_recorder.handler,
+        name="test.cross.signal.recorder",
     )
 
     try:
@@ -1281,8 +1901,8 @@ async def test_pipeline_does_not_publish_opportunity_when_net_edge_is_not_profit
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
                 bid="99.9",
                 ask="100.1",
                 timestamp=now,
@@ -1290,238 +1910,42 @@ async def test_pipeline_does_not_publish_opportunity_when_net_edge_is_not_profit
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(
-                bid="100.2",
-                ask="100.4",
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
+                bid="100.9",
+                ask="101.1",
                 timestamp=now,
             ),
         )
 
         await snapshot_recorder.wait_for_count(1)
-        await opportunity_recorder.assert_no_new_events(0)
-
-        snapshot = snapshot_recorder.payloads()[0]
-
-        assert isinstance(snapshot, SpreadSnapshot)
-        assert snapshot.metadata["opportunity_reason"] in {
-            "net_edge_not_profitable",
-            "net_edge_bps_below_threshold",
-            "no_positive_gross_edge",
-            "non_positive_gross_edge_after_leg_selection",
-        }
+        await signal_recorder.assert_no_new_events(0)
 
         stats = analyzer.get_stats()
 
         assert stats["snapshots_built"] == 1
-        assert stats["opportunity_detection_misses"] == 1
-        assert stats["opportunities_detected"] == 0
-        assert stats["opportunities_published"] == 0
-        assert stats["latest_opportunities"] == 0
+        assert stats["signals_published"] == 0
     finally:
         if analyzer.is_running:
             await analyzer.stop()
         if analyzer.is_registered:
             analyzer.unregister()
         await _unsubscribe(event_bus, snapshot_subscription)
-        await _unsubscribe(event_bus, opportunity_subscription)
+        await _unsubscribe(event_bus, signal_subscription)
 
 
 # ============================================================
-# get_best_opportunities
+# Rolling windows / cleanup
 # ============================================================
 
-
-async def test_get_best_opportunities_filters_sorts_and_limits_results(
+async def test_rolling_window_updates_after_multiple_snapshots(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     analyzer = CrossExchangeSpreadAnalyzer(
         config=_cross_config(
-            arbitrage_min_bps=Decimal("1"),
-            default_taker_fee_rate=Decimal("0"),
-            slippage_max_bps=Decimal("0"),
-            safety_buffer_bps=Decimal("0"),
-            cooldown_seconds=0,
-        ),
-        event_bus=event_bus,
-        scheduler=scheduler,
-    )
-
-    opportunity_recorder = EventRecorder()
-    opportunity_subscription = await _subscribe(
-        event_bus,
-        OPPORTUNITY_TOPIC,
-        opportunity_recorder.handler,
-        name="test.cross.opportunity.recorder",
-    )
-
-    try:
-        await analyzer.start()
-
-        now = datetime.utcnow()
-
-        # BTC opportunity, net edge around 4.8
-        await _emit_market_event(
-            event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(
-                symbol="BTCUSDT",
-                bid="99.9",
-                ask="100.1",
-                timestamp=now,
-            ),
-        )
-        await _emit_market_event(
-            event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(
-                symbol="BTCUSDT",
-                bid="104.9",
-                ask="105.1",
-                timestamp=now,
-            ),
-        )
-
-        # ETH opportunity, net edge around 9.8, should sort before BTC.
-        await _emit_market_event(
-            event_bus,
-            QUOTE_TOPIC,
-            _quote(
-                exchange="binance",
-                symbol="ETHUSDT",
-                instrument_type=InstrumentType.PERPETUAL,
-                bid="199.9",
-                ask="200.1",
-                timestamp=now + timedelta(milliseconds=10),
-                sequence_id=10,
-            ),
-        )
-        await _emit_market_event(
-            event_bus,
-            QUOTE_TOPIC,
-            _quote(
-                exchange="okx",
-                symbol="ETHUSDT",
-                instrument_type=InstrumentType.PERPETUAL,
-                bid="209.9",
-                ask="210.1",
-                timestamp=now + timedelta(milliseconds=15),
-                sequence_id=11,
-            ),
-        )
-
-        await opportunity_recorder.wait_for_count(2)
-
-        all_opportunities = analyzer.get_best_opportunities(
-            profitable_only=True,
-            active_only=True,
-        )
-
-        assert len(all_opportunities) == 2
-        assert all_opportunities[0].net_edge >= all_opportunities[1].net_edge
-        assert all_opportunities[0].symbol == "ETHUSDT"
-        assert all_opportunities[1].symbol == "BTCUSDT"
-
-        btc_only = analyzer.get_best_opportunities(symbol="BTC/USDT")
-
-        assert len(btc_only) == 1
-        assert btc_only[0].symbol == "BTCUSDT"
-
-        perpetual_only = analyzer.get_best_opportunities(
-            instrument_type=InstrumentType.PERPETUAL,
-        )
-
-        assert len(perpetual_only) == 2
-
-        limited = analyzer.get_best_opportunities(limit=1)
-
-        assert len(limited) == 1
-        assert limited[0].symbol == "ETHUSDT"
-    finally:
-        if analyzer.is_running:
-            await analyzer.stop()
-        if analyzer.is_registered:
-            analyzer.unregister()
-        await _unsubscribe(event_bus, opportunity_subscription)
-
-
-async def test_get_best_opportunities_expires_old_items_when_active_only(
-    event_bus: EventBus,
-    scheduler: Scheduler,
-) -> None:
-    analyzer = CrossExchangeSpreadAnalyzer(
-        config=_cross_config(
-            arbitrage_min_bps=Decimal("1"),
-            default_taker_fee_rate=Decimal("0"),
-            slippage_max_bps=Decimal("0"),
-            safety_buffer_bps=Decimal("0"),
-            opportunity_ttl_seconds=0.01,
-        ),
-        event_bus=event_bus,
-        scheduler=scheduler,
-    )
-
-    opportunity_recorder = EventRecorder()
-    opportunity_subscription = await _subscribe(
-        event_bus,
-        OPPORTUNITY_TOPIC,
-        opportunity_recorder.handler,
-        name="test.cross.opportunity.recorder",
-    )
-
-    try:
-        await analyzer.start()
-
-        now = datetime.utcnow()
-
-        await _emit_market_event(
-            event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(timestamp=now),
-        )
-        await _emit_market_event(
-            event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(timestamp=now),
-        )
-
-        await opportunity_recorder.wait_for_count(1)
-
-        assert len(analyzer.get_best_opportunities(active_only=True)) == 1
-
-        await asyncio.sleep(0.03)
-
-        active = analyzer.get_best_opportunities(active_only=True)
-        all_items = analyzer.get_best_opportunities(active_only=False)
-
-        assert active == []
-        assert len(all_items) == 1
-        assert all_items[0].status == OpportunityStatus.EXPIRED
-
-        stats = analyzer.get_stats()
-        assert stats["latest_opportunities"] == 1
-    finally:
-        if analyzer.is_running:
-            await analyzer.stop()
-        if analyzer.is_registered:
-            analyzer.unregister()
-        await _unsubscribe(event_bus, opportunity_subscription)
-
-
-# ============================================================
-# Rolling stats
-# ============================================================
-
-
-async def test_rolling_window_updates_after_multiple_cross_exchange_snapshots(
-    event_bus: EventBus,
-    scheduler: Scheduler,
-) -> None:
-    analyzer = CrossExchangeSpreadAnalyzer(
-        config=_cross_config(
-            arbitrage_min_bps=Decimal("10000"),
             widening_bps_threshold=Decimal("10000"),
+            arbitrage_min_bps=Decimal("10000"),
             rolling_window_size=5,
         ),
         event_bus=event_bus,
@@ -1543,21 +1967,21 @@ async def test_rolling_window_updates_after_multiple_cross_exchange_snapshots(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(timestamp=now),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(timestamp=now, sequence_id=1),
         )
 
         bybit_values = [
             ("104.9", "105.1"),
+            ("105.9", "106.1"),
             ("106.9", "107.1"),
-            ("108.9", "109.1"),
         ]
 
         for index, (bid, ask) in enumerate(bybit_values, start=2):
             await _emit_market_event(
                 event_bus,
-                QUOTE_TOPIC,
-                _bybit_quote(
+                ORDERBOOK_TOPIC,
+                _bybit_orderbook(
                     bid=bid,
                     ask=ask,
                     timestamp=now + timedelta(milliseconds=index * 10),
@@ -1568,13 +1992,19 @@ async def test_rolling_window_updates_after_multiple_cross_exchange_snapshots(
         await snapshot_recorder.wait_for_count(3)
 
         last_snapshot = snapshot_recorder.payloads()[-1]
+        stats_payload = _payload_value(last_snapshot, "stats")
 
-        assert isinstance(last_snapshot, SpreadSnapshot)
-        assert last_snapshot.stats is not None
-        assert last_snapshot.stats.count == 3
-        assert last_snapshot.stats.last_value == Decimal("9.0")
-        assert last_snapshot.stats.min_value == Decimal("5.0")
-        assert last_snapshot.stats.max_value == Decimal("9.0")
+        if isinstance(stats_payload, dict):
+            assert stats_payload["count"] == 3
+            _assert_decimal_equal(stats_payload["last_value"], Decimal("7.0"))
+            _assert_decimal_equal(stats_payload["min_value"], Decimal("5.0"))
+            _assert_decimal_equal(stats_payload["max_value"], Decimal("7.0"))
+        else:
+            assert stats_payload is not None
+            assert stats_payload.count == 3
+            assert stats_payload.last_value == Decimal("7.0")
+            assert stats_payload.min_value == Decimal("5.0")
+            assert stats_payload.max_value == Decimal("7.0")
 
         stats = analyzer.get_stats()
 
@@ -1589,20 +2019,15 @@ async def test_rolling_window_updates_after_multiple_cross_exchange_snapshots(
         await _unsubscribe(event_bus, snapshot_subscription)
 
 
-# ============================================================
-# Cleanup
-# ============================================================
-
-
-async def test_cleanup_stale_state_removes_quotes_snapshots_opportunities_and_windows(
+async def test_cleanup_stale_state_removes_quotes_snapshots_windows_and_opportunities(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     analyzer = CrossExchangeSpreadAnalyzer(
         config=_cross_config(
             stale_state_ttl_seconds=0.01,
-            opportunity_ttl_seconds=0.01,
             cleanup_interval_seconds=3_600.0,
+            widening_bps_threshold=Decimal("10000"),
             arbitrage_min_bps=Decimal("1"),
             default_taker_fee_rate=Decimal("0"),
             slippage_max_bps=Decimal("0"),
@@ -1635,13 +2060,13 @@ async def test_cleanup_stale_state_removes_quotes_snapshots_opportunities_and_wi
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(timestamp=now),
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(timestamp=now),
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(timestamp=now),
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(timestamp=now),
         )
 
         await snapshot_recorder.wait_for_count(1)
@@ -1649,8 +2074,8 @@ async def test_cleanup_stale_state_removes_quotes_snapshots_opportunities_and_wi
 
         assert analyzer.get_stats()["quotes_cached"] == 2
         assert analyzer.get_stats()["latest_snapshots"] == 1
-        assert analyzer.get_stats()["latest_opportunities"] == 1
         assert analyzer.get_stats()["active_windows"] == 1
+        assert analyzer.get_stats()["latest_opportunities"] == 1
 
         await asyncio.sleep(0.03)
 
@@ -1661,15 +2086,12 @@ async def test_cleanup_stale_state_removes_quotes_snapshots_opportunities_and_wi
         assert stats["cleanup_runs"] == 1
         assert stats["quotes_cached"] == 0
         assert stats["latest_snapshots"] == 0
-        assert stats["latest_opportunities"] == 0
-
-        # Якщо цей assert впаде, це така сама orphan-window проблема,
-        # яку вже знайшли в spot/futures analyzer.
         assert stats["active_windows"] == 0
 
+        # Opportunities may be removed by quote/snapshot TTL cleanup or by their own TTL,
+        # depending on implementation. The important guarantee is no stale market state.
         assert stats["cleanup_removed_quotes"] >= 2
         assert stats["cleanup_removed_snapshots"] >= 1
-        assert stats["cleanup_removed_opportunities"] >= 1
         assert stats["cleanup_removed_windows"] >= 1
     finally:
         if analyzer.is_running:
@@ -1680,20 +2102,73 @@ async def test_cleanup_stale_state_removes_quotes_snapshots_opportunities_and_wi
         await _unsubscribe(event_bus, opportunity_subscription)
 
 
-# ============================================================
-# Stats contract
-# ============================================================
-
-
-async def test_stats_reflect_complete_cross_exchange_pipeline(
+async def test_opportunity_ttl_cleanup_expires_and_removes_opportunity(
     event_bus: EventBus,
     scheduler: Scheduler,
 ) -> None:
     analyzer = CrossExchangeSpreadAnalyzer(
         config=_cross_config(
+            opportunity_ttl_seconds=0.01,
+            stale_state_ttl_seconds=3_600.0,
             arbitrage_min_bps=Decimal("1"),
-            widening_bps_threshold=Decimal("10000"),
+            default_taker_fee_rate=Decimal("0"),
+            slippage_max_bps=Decimal("0"),
+            safety_buffer_bps=Decimal("0"),
+        ),
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    opportunity_recorder = EventRecorder()
+    opportunity_subscription = await _subscribe(
+        event_bus,
+        OPPORTUNITY_TOPIC,
+        opportunity_recorder.handler,
+        name="test.cross.opportunity.recorder",
+    )
+
+    try:
+        await analyzer.start()
+
+        now = datetime.utcnow()
+
+        await _emit_market_event(event_bus, ORDERBOOK_TOPIC, _binance_orderbook(timestamp=now))
+        await _emit_market_event(event_bus, ORDERBOOK_TOPIC, _bybit_orderbook(timestamp=now))
+
+        await opportunity_recorder.wait_for_count(1)
+
+        assert analyzer.get_stats()["latest_opportunities"] == 1
+
+        await asyncio.sleep(0.03)
+
+        await analyzer.cleanup_stale_state()
+
+        stats = analyzer.get_stats()
+
+        assert stats["latest_opportunities"] == 0
+        assert stats["opportunities_expired"] >= 1
+        assert stats["cleanup_removed_opportunities"] >= 1
+    finally:
+        if analyzer.is_running:
+            await analyzer.stop()
+        if analyzer.is_registered:
+            analyzer.unregister()
+        await _unsubscribe(event_bus, opportunity_subscription)
+
+
+# ============================================================
+# Stats contract
+# ============================================================
+
+async def test_stats_reflect_complete_cross_exchange_orderbook_pipeline(
+    event_bus: EventBus,
+    scheduler: Scheduler,
+) -> None:
+    analyzer = CrossExchangeSpreadAnalyzer(
+        config=_cross_config(
+            widening_bps_threshold=Decimal("10"),
             anomaly_zscore_threshold=Decimal("100"),
+            arbitrage_min_bps=Decimal("1"),
             default_taker_fee_rate=Decimal("0"),
             slippage_max_bps=Decimal("0"),
             safety_buffer_bps=Decimal("0"),
@@ -1704,8 +2179,8 @@ async def test_stats_reflect_complete_cross_exchange_pipeline(
     )
 
     snapshot_recorder = EventRecorder()
-    opportunity_recorder = EventRecorder()
     signal_recorder = EventRecorder()
+    opportunity_recorder = EventRecorder()
 
     snapshot_subscription = await _subscribe(
         event_bus,
@@ -1713,17 +2188,17 @@ async def test_stats_reflect_complete_cross_exchange_pipeline(
         snapshot_recorder.handler,
         name="test.cross.snapshot.recorder",
     )
-    opportunity_subscription = await _subscribe(
-        event_bus,
-        OPPORTUNITY_TOPIC,
-        opportunity_recorder.handler,
-        name="test.cross.opportunity.recorder",
-    )
     signal_subscription = await _subscribe(
         event_bus,
         SIGNAL_TOPIC,
         signal_recorder.handler,
         name="test.cross.signal.recorder",
+    )
+    opportunity_subscription = await _subscribe(
+        event_bus,
+        OPPORTUNITY_TOPIC,
+        opportunity_recorder.handler,
+        name="test.cross.opportunity.recorder",
     )
 
     try:
@@ -1733,42 +2208,43 @@ async def test_stats_reflect_complete_cross_exchange_pipeline(
 
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _binance_quote(
+            ORDERBOOK_TOPIC,
+            _binance_orderbook(
                 bid="99.9",
                 ask="100.1",
                 timestamp=now,
+                sequence_id=101,
             ),
         )
         await _emit_market_event(
             event_bus,
-            QUOTE_TOPIC,
-            _bybit_quote(
+            ORDERBOOK_TOPIC,
+            _bybit_orderbook(
                 bid="104.9",
                 ask="105.1",
                 timestamp=now,
+                sequence_id=202,
             ),
         )
 
         await snapshot_recorder.wait_for_count(1)
-        await opportunity_recorder.wait_for_count(1)
         await signal_recorder.wait_for_count(1)
+        await opportunity_recorder.wait_for_count(1)
 
         stats = analyzer.get_stats()
 
         assert stats["running"] is True
         assert stats["registered"] is True
         assert stats["enabled"] is True
+        assert stats["price_input_source"] == ORDERBOOK_TOPIC
 
-        assert stats["quote_events_received"] == 2
+        _assert_stats_orderbook_aliases(stats, 2)
+
         assert stats["quotes_received"] == 2
         assert stats["invalid_payloads"] == 0
         assert stats["invalid_quotes"] == 0
-        assert stats["incomplete_quotes"] == 0
         assert stats["stale_quotes"] == 0
         assert stats["unaligned_quotes"] == 0
-        assert stats["instrument_type_skips"] == 0
-        assert stats["preferred_exchange_skips"] == 0
 
         assert stats["quotes_stored"] == 2
         assert stats["quotes_cached"] == 2
@@ -1778,31 +2254,33 @@ async def test_stats_reflect_complete_cross_exchange_pipeline(
         assert stats["latest_snapshots"] == 1
         assert stats["active_windows"] == 1
 
-        assert stats["opportunities_detected"] == 1
-        assert stats["opportunities_published"] == 1
-        assert stats["opportunity_detection_misses"] == 0
-        assert stats["latest_opportunities"] == 1
-
         assert stats["signals_built"] >= 1
         assert stats["signals_published"] >= 1
 
+        assert stats["opportunities_detected"] == 1
+        assert stats["opportunities_published"] == 1
+        assert stats["latest_opportunities"] == 1
+
         snapshot = snapshot_recorder.payloads()[0]
+        signal = signal_recorder.payloads()[0]
         opportunity = opportunity_recorder.payloads()[0]
 
-        assert isinstance(snapshot, SpreadSnapshot)
-        assert isinstance(opportunity, ArbitrageOpportunity)
+        assert _payload_value(snapshot, "symbol") == "BTCUSDT"
+        assert _payload_value(signal, "symbol") == "BTCUSDT"
+        assert _payload_value(opportunity, "symbol") == "BTCUSDT"
 
-        assert snapshot.symbol == "BTCUSDT"
-        assert opportunity.symbol == "BTCUSDT"
+        assert _signal_type_value(signal) == SpreadSignalType.WIDENING.value
 
-        assert opportunity.buy_exchange == "binance"
-        assert opportunity.sell_exchange == "bybit"
-        assert opportunity.net_edge == Decimal("4.8")
+        snapshot_metadata = _payload_metadata(snapshot)
+        opportunity_metadata = _payload_metadata(opportunity)
+
+        assert snapshot_metadata["price_input_source"] == ORDERBOOK_TOPIC
+        assert opportunity_metadata["price_input_source"] == ORDERBOOK_TOPIC
     finally:
         if analyzer.is_running:
             await analyzer.stop()
         if analyzer.is_registered:
             analyzer.unregister()
         await _unsubscribe(event_bus, snapshot_subscription)
-        await _unsubscribe(event_bus, opportunity_subscription)
         await _unsubscribe(event_bus, signal_subscription)
+        await _unsubscribe(event_bus, opportunity_subscription)

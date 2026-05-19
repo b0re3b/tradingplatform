@@ -42,8 +42,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
     Production-grade analyzer для cross-exchange spread analytics.
 
     Відповідальність:
-    - слухати data-layer market.quote.updated;
-    - приймати QuoteSnapshot або dict payload від QuoteCache;
+    - слухати data-layer market.orderbook.updated;
+    - приймати QuoteSnapshot або dict payload від OrderBookCache;
+    - нормалізувати top-of-book у внутрішній QuoteSnapshot;
     - кешувати quotes з різних бірж;
     - порівнювати один symbol/instrument_type/market_type/timeframe між біржами;
     - будувати SpreadSnapshot;
@@ -58,21 +59,24 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
     Correct production input flow:
         exchange adapters
-            -> market.quote / market.orderbook
-            -> QuoteCache / OrderBookCache
-            -> market.quote.updated
+            -> market.orderbook
+            -> OrderBookCache
+            -> market.orderbook.updated
             -> CrossExchangeSpreadAnalyzer
             -> analytics.spreads.*
 
     Важливо:
     - не отримує raw market-data з бірж напряму;
-    - не слухає raw market.quote у production;
+    - не слухає raw market.orderbook / market.quote у production;
+    - не потребує QuoteCache;
+    - QuoteSnapshot є внутрішньою normalized top-of-book моделлю;
     - не викликає strategy/risk/execution напряму;
     - state ізольований через SpreadKey:
       exchange + market_type + symbol + timeframe.
     """
 
-    DEFAULT_QUOTE_TOPIC = "market.quote.updated"
+    DEFAULT_ORDERBOOK_TOPIC = "market.orderbook.updated"
+    DEFAULT_QUOTE_TOPIC = DEFAULT_ORDERBOOK_TOPIC  # backward-compatible alias
     DEFAULT_SNAPSHOT_TOPIC = "analytics.spreads.cross_exchange.updated"
     DEFAULT_SIGNAL_TOPIC = "analytics.spreads.signal.generated"
     DEFAULT_OPPORTUNITY_TOPIC = "analytics.spreads.arbitrage.opportunity"
@@ -100,9 +104,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
         self._stats.update(
             {
-                "quote_events_received": 0,
+                "orderbook_events_received": 0,
+                "quote_events_received": 0,  # backward-compatible metric alias
                 "quotes_received": 0,
-                "invalid_payloads": 0,
                 "invalid_quotes": 0,
                 "incomplete_quotes": 0,
                 "stale_quotes": 0,
@@ -136,19 +140,17 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         Реєструє EventBus subscriptions.
 
         Production topic:
-            market.quote.updated
+            market.orderbook.updated
 
-        Raw topic:
-            market.quote
-
-        не використовується, якщо config.allow_legacy_raw_topics=False.
+        Raw topics market.orderbook / market.quote не використовуються,
+        якщо config.allow_legacy_raw_topics=False.
         """
         if self._registered:
             return
 
-        self._subscribe_quote_updates(
-            self.on_quote_update,
-            name=f"{self._service_name}.on_quote_update",
+        self._subscribe_orderbook_updates(
+            self.on_orderbook_update,
+            name=f"{self._service_name}.on_orderbook_update",
         )
 
         self._registered = True
@@ -312,31 +314,35 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             "latest_snapshots": len(self._latest_snapshots),
             "latest_opportunities": len(self._latest_opportunities),
             "scope": "exchange:market_type:symbol:timeframe",
+            "price_input_source": "market.orderbook.updated",
         }
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def on_quote_update(self, event: Event) -> None:
+    async def on_orderbook_update(self, event: Event) -> None:
         """
-        Handler для market.quote.updated.
+        Handler для market.orderbook.updated.
 
         Payload може бути:
         - QuoteSnapshot;
-        - dict payload від QuoteCache/data-layer.
+        - dict payload від OrderBookCache/data-layer.
+
+        OrderBookCache payload нормалізується в QuoteSnapshot через
+        BaseSpreadAnalyzer.normalize_orderbook_event().
         """
         if not self.is_running or not self._config.enabled:
             self._stats["events_skipped_not_running"] += 1
             return
 
+        self._stats["orderbook_events_received"] += 1
         self._stats["quote_events_received"] += 1
 
-        quote = self.normalize_quote_event(event)
+        quote = self.normalize_orderbook_event(event)
         if quote is None:
-            self._stats["invalid_payloads"] += 1
             self._mark_invalid_payload(
-                "expected QuoteSnapshot or quote dict payload",
+                "expected QuoteSnapshot or orderbook top-of-book dict payload",
                 payload_type=type(getattr(event, "payload", None)).__name__,
                 topic=getattr(event, "topic", None),
             )
@@ -379,7 +385,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
             except Exception as exc:
                 self._mark_exception(
-                    "Failed to process cross-exchange quote update",
+                    "Failed to process cross-exchange orderbook update",
                     exc,
                     exchange=getattr(quote, "exchange", None),
                     market_type=getattr(quote, "market_type", None),
@@ -388,6 +394,15 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                     event_id=getattr(event, "event_id", None),
                     correlation_id=getattr(event, "correlation_id", None),
                 )
+
+    async def on_quote_update(self, event: Event) -> None:
+        """
+        Backward-compatible alias.
+
+        Старий handler лишений для тестів/legacy wiring, але production
+        subscription має йти через on_orderbook_update() і market.orderbook.updated.
+        """
+        await self.on_orderbook_update(event)
 
     # ------------------------------------------------------------------
     # Scheduler jobs
@@ -449,6 +464,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "service_name": self._service_name,
                 "stats": self.get_stats(),
                 "scope": "exchange:market_type:symbol:timeframe",
+                "price_input_source": "market.orderbook.updated",
             },
             priority=EventPriority.LOW,
         )
@@ -461,6 +477,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         """
         Rebuild через QuoteSnapshot, щоб гарантувати __post_init__
         normalization і зберегти market_type/timeframe/exchange_symbol.
+
+        QuoteSnapshot тут є внутрішньою normalized top-of-book моделлю,
+        яку analyzer отримує з market.orderbook.updated.
         """
         return QuoteSnapshot(
             exchange=quote.exchange,
@@ -479,7 +498,13 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             timestamp=quote.timestamp,
             received_at=quote.received_at,
             sequence_id=quote.sequence_id,
-            metadata=dict(quote.metadata),
+            metadata={
+                **dict(quote.metadata),
+                "price_input_source": quote.metadata.get(
+                    "price_input_source",
+                    "market.orderbook.updated",
+                ),
+            },
         )
 
     def _store_quote(self, quote: QuoteSnapshot) -> None:
@@ -585,6 +610,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
+                "price_input_source": "market.orderbook.updated",
                 "leg_a_key": str(spread_key_to_dict(snapshot.leg_a_key)),
                 "leg_b_key": str(spread_key_to_dict(snapshot.leg_b_key)),
             },
@@ -605,6 +631,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
+                "price_input_source": "market.orderbook.updated",
                 "leg_a_key": str(spread_key_to_dict(snapshot.leg_a_key)),
                 "leg_b_key": str(spread_key_to_dict(snapshot.leg_b_key)),
             },
@@ -688,6 +715,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             quote_validity=QuoteValidity.VALID,
             timestamp=max(quote_a.timestamp, quote_b.timestamp),
             metadata={
+                "price_input_source": "market.orderbook.updated",
                 "instrument_type": instrument_type.value,
                 "quote_a_age_ms": quote_age_ms(quote_a),
                 "quote_b_age_ms": quote_age_ms(quote_b),
@@ -782,6 +810,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
+                "price_input_source": "market.orderbook.updated",
                 "symbol": opportunity.symbol,
                 "buy_exchange": opportunity.buy_exchange,
                 "sell_exchange": opportunity.sell_exchange,
@@ -807,6 +836,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                     "opportunity_event_topic",
                     self.DEFAULT_OPPORTUNITY_TOPIC,
                 ),
+                "price_input_source": "market.orderbook.updated",
                 "buy_exchange": opportunity.buy_exchange,
                 "sell_exchange": opportunity.sell_exchange,
                 "buy_market_type": opportunity.buy_market_type,
@@ -863,6 +893,10 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         opportunity.metadata.setdefault(
             "sell_scope",
             spread_key_to_dict(opportunity.sell_key),
+        )
+        opportunity.metadata.setdefault(
+            "price_input_source",
+            "market.orderbook.updated",
         )
 
     # ------------------------------------------------------------------

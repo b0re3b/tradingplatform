@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Iterable
+from typing import Any
 
 from core.event_bus import Event, EventBus, EventPriority
 from core.scheduler import Scheduler
@@ -42,22 +42,25 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
     Correct production input flow:
         exchange adapters
-            -> market.quote / market.funding
-            -> QuoteCache / FundingCache
-            -> market.quote.updated / market.funding.updated
+            -> market.orderbook / market.funding
+            -> OrderBookCache / FundingCache
+            -> market.orderbook.updated / market.funding.updated
             -> SpotFuturesSpreadAnalyzer
             -> analytics.spreads.spot_futures.updated
             -> analytics.spreads.signal.generated
 
     Важливо:
     - не читає біржові WS/REST adapters напряму;
-    - не слухає raw market.quote / market.funding у production;
-    - підтримує payload як dataclass або dict від data-cache layer;
+    - не слухає raw market.orderbook / market.quote / market.funding у production;
+    - price/top-of-book input отримує з OrderBookCache;
+    - QuoteSnapshot є внутрішньою normalized top-of-book моделлю;
+    - funding context отримує з FundingCache;
     - state ізольований через SpreadKey:
       exchange + market_type + symbol + timeframe.
     """
 
-    DEFAULT_QUOTE_TOPIC = "market.quote.updated"
+    DEFAULT_ORDERBOOK_TOPIC = "market.orderbook.updated"
+    DEFAULT_QUOTE_TOPIC = DEFAULT_ORDERBOOK_TOPIC  # backward-compatible alias
     DEFAULT_FUNDING_TOPIC = "market.funding.updated"
     DEFAULT_SNAPSHOT_TOPIC = "analytics.spreads.spot_futures.updated"
     DEFAULT_SIGNAL_TOPIC = "analytics.spreads.signal.generated"
@@ -83,16 +86,22 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         self._futures_quotes: dict[SpreadKey, QuoteSnapshot] = {}
         self._funding: dict[SpreadKey, FundingSnapshot] = {}
 
-        self._spread_windows: dict[SpotFuturesSpreadAnalyzer.SnapshotKey, RollingDecimalWindow] = {}
-        self._latest_snapshots: dict[SpotFuturesSpreadAnalyzer.SnapshotKey, SpreadSnapshot] = {}
+        self._spread_windows: dict[
+            SpotFuturesSpreadAnalyzer.SnapshotKey,
+            RollingDecimalWindow,
+        ] = {}
+        self._latest_snapshots: dict[
+            SpotFuturesSpreadAnalyzer.SnapshotKey,
+            SpreadSnapshot,
+        ] = {}
 
         self._stats.update(
             {
-                "quote_events_received": 0,
+                "orderbook_events_received": 0,
+                "quote_events_received": 0,  # backward-compatible metric alias
                 "funding_events_received": 0,
                 "quotes_received": 0,
                 "funding_updates": 0,
-                "invalid_payloads": 0,
                 "invalid_quotes": 0,
                 "incomplete_quotes": 0,
                 "stale_quotes": 0,
@@ -121,18 +130,18 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         Реєструє EventBus subscriptions.
 
         Production subscriptions:
-            market.quote.updated
+            market.orderbook.updated
             market.funding.updated
 
-        Raw topics market.quote / market.funding не використовуються, якщо
-        config.allow_legacy_raw_topics=False.
+        Raw topics market.orderbook / market.quote / market.funding не
+        використовуються, якщо config.allow_legacy_raw_topics=False.
         """
         if self._registered:
             return
 
-        self._subscribe_quote_updates(
-            self.on_quote_update,
-            name=f"{self._service_name}.on_quote_update",
+        self._subscribe_orderbook_updates(
+            self.on_orderbook_update,
+            name=f"{self._service_name}.on_orderbook_update",
         )
         self._subscribe_funding_updates(
             self.on_funding_update,
@@ -221,31 +230,36 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             "active_windows": len(self._spread_windows),
             "latest_snapshots": len(self._latest_snapshots),
             "scope": "exchange:market_type:symbol:timeframe",
+            "price_input_source": "market.orderbook.updated",
+            "funding_input_source": "market.funding.updated",
         }
 
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
 
-    async def on_quote_update(self, event: Event) -> None:
+    async def on_orderbook_update(self, event: Event) -> None:
         """
-        Handler для market.quote.updated.
+        Handler для market.orderbook.updated.
 
         Payload може бути:
         - QuoteSnapshot;
-        - dict payload від QuoteCache/data-layer.
+        - dict payload від OrderBookCache/data-layer.
+
+        OrderBookCache payload нормалізується в QuoteSnapshot через
+        BaseSpreadAnalyzer.normalize_orderbook_event().
         """
         if not self.is_running or not self._config.enabled:
             self._stats["events_skipped_not_running"] += 1
             return
 
+        self._stats["orderbook_events_received"] += 1
         self._stats["quote_events_received"] += 1
 
-        quote = self.normalize_quote_event(event)
+        quote = self.normalize_orderbook_event(event)
         if quote is None:
-            self._stats["invalid_payloads"] += 1
             self._mark_invalid_payload(
-                "expected QuoteSnapshot or quote dict payload",
+                "expected QuoteSnapshot or orderbook top-of-book dict payload",
                 payload_type=type(getattr(event, "payload", None)).__name__,
                 topic=getattr(event, "topic", None),
             )
@@ -269,7 +283,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                 if validity == QuoteValidity.INVALID:
                     self._stats["invalid_quotes"] += 1
                     self._logger.debug(
-                        "Rejected invalid quote | exchange=%s market_type=%s symbol=%s instrument_type=%s",
+                        "Rejected invalid top-of-book quote | exchange=%s market_type=%s symbol=%s instrument_type=%s",
                         normalized_quote.exchange,
                         normalized_quote.market_type,
                         normalized_quote.symbol,
@@ -280,6 +294,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                             "symbol": normalized_quote.symbol,
                             "timeframe": normalized_quote.timeframe,
                             "event_type": "analytics.spreads.invalid_quote",
+                            "price_input_source": "market.orderbook.updated",
                         },
                     )
                     return
@@ -305,7 +320,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
             except Exception as exc:
                 self._mark_exception(
-                    "Failed to process spot/futures quote update",
+                    "Failed to process spot/futures orderbook update",
                     exc,
                     exchange=getattr(quote, "exchange", None),
                     market_type=getattr(quote, "market_type", None),
@@ -314,6 +329,15 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                     event_id=getattr(event, "event_id", None),
                     correlation_id=getattr(event, "correlation_id", None),
                 )
+
+    async def on_quote_update(self, event: Event) -> None:
+        """
+        Backward-compatible alias.
+
+        Старий handler лишений для тестів/legacy wiring, але production
+        subscription має йти через on_orderbook_update() і market.orderbook.updated.
+        """
+        await self.on_orderbook_update(event)
 
     async def on_funding_update(self, event: Event) -> None:
         """
@@ -331,7 +355,6 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
         funding = self.normalize_funding_event(event)
         if funding is None:
-            self._stats["invalid_payloads"] += 1
             self._mark_invalid_payload(
                 "expected FundingSnapshot or funding dict payload",
                 payload_type=type(getattr(event, "payload", None)).__name__,
@@ -433,6 +456,8 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
                 "service_name": self._service_name,
                 "stats": self.get_stats(),
                 "scope": "exchange:market_type:symbol:timeframe",
+                "price_input_source": "market.orderbook.updated",
+                "funding_input_source": "market.funding.updated",
             },
             priority=EventPriority.LOW,
         )
@@ -445,6 +470,9 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         """
         Rebuild через QuoteSnapshot, щоб гарантувати __post_init__
         normalization і зберегти market_type/timeframe/exchange_symbol.
+
+        QuoteSnapshot тут є внутрішньою normalized top-of-book моделлю,
+        яку analyzer отримує з market.orderbook.updated.
         """
         return QuoteSnapshot(
             exchange=quote.exchange,
@@ -463,7 +491,13 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             timestamp=quote.timestamp,
             received_at=quote.received_at,
             sequence_id=quote.sequence_id,
-            metadata=dict(quote.metadata),
+            metadata={
+                **dict(quote.metadata),
+                "price_input_source": quote.metadata.get(
+                    "price_input_source",
+                    "market.orderbook.updated",
+                ),
+            },
         )
 
     def _normalize_funding(self, funding: FundingSnapshot) -> FundingSnapshot:
@@ -641,6 +675,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.SPOT_FUTURES.value,
+                "price_input_source": "market.orderbook.updated",
                 "spot_key": str(spread_key_to_dict(spot_quote.key)),
                 "futures_key": str(spread_key_to_dict(futures_quote.key)),
             },
@@ -660,6 +695,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.SPOT_FUTURES.value,
+                "price_input_source": "market.orderbook.updated",
                 "spot_key": str(spread_key_to_dict(spot_quote.key)),
                 "futures_key": str(spread_key_to_dict(futures_quote.key)),
             },
@@ -740,6 +776,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             quote_validity=QuoteValidity.VALID,
             timestamp=snapshot_timestamp,
             metadata={
+                "price_input_source": "market.orderbook.updated",
                 "spot_age_ms": quote_age_ms(spot_quote),
                 "futures_age_ms": quote_age_ms(futures_quote),
                 "funding_rate": str(funding_rate) if funding_rate is not None else None,
