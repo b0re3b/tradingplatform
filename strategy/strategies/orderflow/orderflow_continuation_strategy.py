@@ -30,15 +30,19 @@ from ...models import (
     TargetPlan,
 )
 
-from .base_orderflow_strategy import OrderflowStrategyBase
+from .base_orderflow_strategy import (
+    OrderflowCompositeSnapshot,
+    OrderflowStrategyBase,
+)
 
 
 @dataclass(slots=True)
 class OrderflowContinuationThresholds:
     """
-    Пороги continuation-логіки на strategy layer.
+    Strategy-level thresholds for orderflow continuation.
 
-    Це не дублювання analytics-конфігів, а саме правила прийняття рішення.
+    Analytics calculates facts. This strategy decides whether those facts show
+    tradable continuation in the same direction as price movement.
     """
 
     min_trades_count: int = 10
@@ -84,10 +88,18 @@ class OrderflowContinuationThresholds:
             raise ValueError("min_cvd_slope must be >= 0")
         if self.min_volume_delta_ratio < 0:
             raise ValueError("min_volume_delta_ratio must be >= 0")
-        if self.min_aggressive_buy_ratio < 0 or self.min_aggressive_buy_ratio > 1:
+        if self.min_volume_delta_abs < 0:
+            raise ValueError("min_volume_delta_abs must be >= 0")
+        if self.min_cumulative_volume_delta_abs < 0:
+            raise ValueError("min_cumulative_volume_delta_abs must be >= 0")
+        if not 0 <= self.min_aggressive_buy_ratio <= 1:
             raise ValueError("min_aggressive_buy_ratio must be between 0 and 1")
-        if self.min_aggressive_sell_ratio < 0 or self.min_aggressive_sell_ratio > 1:
+        if not 0 <= self.min_aggressive_sell_ratio <= 1:
             raise ValueError("min_aggressive_sell_ratio must be between 0 and 1")
+        if self.min_aggressive_burst_score < 0:
+            raise ValueError("min_aggressive_burst_score must be >= 0")
+        if self.min_large_aggressive_trades < 0:
+            raise ValueError("min_large_aggressive_trades must be >= 0")
         if self.min_orderbook_imbalance_ratio < 0:
             raise ValueError("min_orderbook_imbalance_ratio must be >= 0")
         if self.min_score_for_signal < 0:
@@ -104,52 +116,23 @@ class OrderflowContinuationThresholds:
             raise ValueError("max_expected_holding_seconds must be > 0")
 
 
-@dataclass(slots=True)
-class OrderflowContinuationSnapshot:
-    symbol: str
-
-    last_price: float | None = None
-    price_change_pct: float = 0.0
-
-    trades_count: int = 0
-    total_volume: float = 0.0
-
-    cvd_change_pct: float = 0.0
-    cvd_slope: float = 0.0
-    cvd_delta_ratio: float = 0.0
-
-    volume_delta: float = 0.0
-    volume_delta_ratio: float = 0.0
-    cumulative_volume_delta: float = 0.0
-
-    aggressive_buy_ratio: float = 0.0
-    aggressive_sell_ratio: float = 0.0
-    aggressive_burst_score: float = 0.0
-    aggressive_large_trade_count: int = 0
-
-    orderbook_imbalance_ratio: float = 0.0
-
-    def has_minimum_data(self) -> bool:
-        return self.trades_count > 0
-
-
 class OrderflowContinuationStrategy(OrderflowStrategyBase):
     """
-    Strategy continuation по order flow.
+    Orderflow continuation strategy.
 
     LONG continuation:
-    - price already moving up
-    - CVD confirms the move
-    - volume delta confirms the move
-    - aggressive buyers dominate
-    - optional orderbook imbalance supports continuation
+    - price already moves up;
+    - CVD confirms upward flow;
+    - volume delta confirms upward flow;
+    - aggressive buyers dominate;
+    - orderbook imbalance does not contradict / ideally supports continuation.
 
     SHORT continuation:
-    - price already moving down
-    - CVD confirms the move
-    - volume delta confirms the move
-    - aggressive sellers dominate
-    - optional orderbook imbalance supports continuation
+    - price already moves down;
+    - CVD confirms downward flow;
+    - volume delta confirms downward flow;
+    - aggressive sellers dominate;
+    - orderbook imbalance does not contradict / ideally supports continuation.
     """
 
     STRATEGY_NAME = "orderflow_continuation_strategy"
@@ -251,7 +234,10 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         evaluation.reasons.extend(reasons)
 
         min_score = max(self._get_min_score(), self.thresholds.min_score_for_signal)
-        min_confidence = max(self._get_min_confidence(), self.thresholds.min_confidence_for_signal)
+        min_confidence = max(
+            self._get_min_confidence(),
+            self.thresholds.min_confidence_for_signal,
+        )
 
         if score < min_score:
             evaluation.reasons.append("score_below_threshold")
@@ -283,271 +269,35 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
     # Snapshot resolution
     # ------------------------------------------------------------------
 
-    def _resolve_snapshot(self, context: SignalContext) -> OrderflowContinuationSnapshot | None:
-        snapshot = self._build_snapshot_from_context(context)
-        if snapshot is not None:
-            return snapshot
-
-        facade = self.orderflow_analyzer
-        if facade is None:
-            return None
-
-        try:
-            return self._build_snapshot_from_facade(context.symbol)
-        except Exception:
-            self.log_warning(
-                "Failed to build continuation snapshot from orderflow facade",
-                symbol=context.symbol,
-                strategy=self.STRATEGY_NAME,
-            )
-            return None
-
-    def _build_snapshot_from_context(self, context: SignalContext) -> OrderflowContinuationSnapshot | None:
-        symbol = context.symbol
-
-        orderflow = context.orderflow if isinstance(context.orderflow, dict) else {}
-
-        cvd = orderflow.get("cvd", {}) if isinstance(orderflow.get("cvd"), dict) else {}
-        volume_delta = (
-            orderflow.get("volume_delta", {})
-            if isinstance(orderflow.get("volume_delta"), dict)
-            else {}
-        )
-        aggressive = (
-            orderflow.get("aggressive_trades", {})
-            if isinstance(orderflow.get("aggressive_trades"), dict)
-            else {}
-        )
-        imbalance = (
-            orderflow.get("orderbook_imbalance", {})
-            if isinstance(orderflow.get("orderbook_imbalance"), dict)
-            else {}
-        )
-
-        snapshot = OrderflowContinuationSnapshot(
-            symbol=symbol,
-            last_price=self._coalesce_float(
-                self._feature_value(context, "orderflow.last_price"),
-                self._feature_value(context, "price.last"),
-                cvd.get("last_price"),
-                volume_delta.get("last_price"),
-                context.price.last_price if context.price is not None else None,
-                context.price.mid_price if context.price is not None else None,
-            ),
-            price_change_pct=self._coalesce_float(
-                self._feature_value(context, "orderflow.price_change_pct"),
-                self._feature_value(context, "orderflow.cvd.price_change_pct"),
-                self._feature_value(context, "price.change_pct"),
-                cvd.get("price_change_pct"),
-                0.0,
-            ) or 0.0,
-            trades_count=int(
-                self._coalesce_int(
-                    self._feature_value(context, "orderflow.trades_count"),
-                    self._feature_value(context, "orderflow.cvd.trades_count"),
-                    self._feature_value(context, "orderflow.volume_delta.trades_count"),
-                    cvd.get("trades_count"),
-                    volume_delta.get("trades_count"),
-                    aggressive.get("trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            total_volume=self._coalesce_float(
-                self._feature_value(context, "orderflow.total_volume"),
-                self._feature_value(context, "orderflow.cvd.total_volume"),
-                self._feature_value(context, "orderflow.volume_delta.total_volume"),
-                cvd.get("total_volume"),
-                volume_delta.get("total_volume"),
-                aggressive.get("total_volume"),
-                0.0,
-            ) or 0.0,
-            cvd_change_pct=self._coalesce_float(
-                self._feature_value(context, "orderflow.cvd.change_pct"),
-                self._feature_value(context, "orderflow.cvd.cvd_change_pct"),
-                cvd.get("cvd_change_pct"),
-                cvd.get("change_pct"),
-                0.0,
-            ) or 0.0,
-            cvd_slope=self._coalesce_float(
-                self._feature_value(context, "orderflow.cvd.slope"),
-                self._feature_value(context, "orderflow.cvd.cvd_slope"),
-                cvd.get("cvd_slope"),
-                cvd.get("slope"),
-                0.0,
-            ) or 0.0,
-            cvd_delta_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.cvd.delta_ratio"),
-                cvd.get("delta_ratio"),
-                0.0,
-            ) or 0.0,
-            volume_delta=self._coalesce_float(
-                self._feature_value(context, "orderflow.volume_delta.value"),
-                self._feature_value(context, "orderflow.volume_delta.volume_delta"),
-                volume_delta.get("volume_delta"),
-                volume_delta.get("value"),
-                0.0,
-            ) or 0.0,
-            volume_delta_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.volume_delta.delta_ratio"),
-                volume_delta.get("delta_ratio"),
-                0.0,
-            ) or 0.0,
-            cumulative_volume_delta=self._coalesce_float(
-                self._feature_value(context, "orderflow.volume_delta.cumulative_delta"),
-                self._feature_value(context, "orderflow.volume_delta.cumulative_volume_delta"),
-                volume_delta.get("cumulative_volume_delta"),
-                volume_delta.get("cumulative_delta"),
-                0.0,
-            ) or 0.0,
-            aggressive_buy_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.aggressive_trades.buy_ratio"),
-                aggressive.get("buy_ratio"),
-                aggressive.get("aggressive_buy_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_sell_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.aggressive_trades.sell_ratio"),
-                aggressive.get("sell_ratio"),
-                aggressive.get("aggressive_sell_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_burst_score=self._coalesce_float(
-                self._feature_value(context, "orderflow.aggressive_trades.burst_score"),
-                aggressive.get("burst_score"),
-                0.0,
-            ) or 0.0,
-            aggressive_large_trade_count=int(
-                self._coalesce_int(
-                    self._feature_value(context, "orderflow.aggressive_trades.large_trade_count"),
-                    self._feature_value(context, "orderflow.aggressive_trades.large_trades_count"),
-                    aggressive.get("large_trade_count"),
-                    aggressive.get("large_trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            orderbook_imbalance_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.orderbook_imbalance.ratio"),
-                self._feature_value(context, "orderflow.orderbook_imbalance.imbalance_ratio"),
-                imbalance.get("imbalance_ratio"),
-                imbalance.get("ratio"),
-                0.0,
-            ) or 0.0,
-        )
-
-        if snapshot.has_minimum_data():
-            return snapshot
-
-        return None
-
-    def _build_snapshot_from_facade(self, symbol: str) -> OrderflowContinuationSnapshot:
-        facade = self.orderflow_analyzer
-        if facade is None:
-            raise ValueError("orderflow_analyzer is not configured")
-
-        cvd_stats = self._safe_get_latest_stats(facade, "cvd", symbol)
-        vd_stats = self._safe_get_latest_stats(facade, "volume_delta", symbol)
-        aggressive_stats = self._safe_get_latest_stats(facade, "aggressive_trades", symbol)
-        imbalance_stats = self._safe_get_latest_stats(facade, "orderbook_imbalance", symbol)
-
-        return OrderflowContinuationSnapshot(
-            symbol=symbol,
-            last_price=self._coalesce_float(
-                self._read(cvd_stats, "last_price"),
-                self._read(vd_stats, "last_price"),
-                self._read(aggressive_stats, "last_price"),
-                self._read(imbalance_stats, "mid_price"),
-            ),
-            price_change_pct=self._coalesce_float(
-                self._read(cvd_stats, "price_change_pct"),
-                self._read(vd_stats, "price_change_pct"),
-                0.0,
-            ) or 0.0,
-            trades_count=int(
-                self._coalesce_int(
-                    self._read(cvd_stats, "trades_count"),
-                    self._read(vd_stats, "trades_count"),
-                    self._read(aggressive_stats, "trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            total_volume=self._coalesce_float(
-                self._read(cvd_stats, "total_volume"),
-                self._read(vd_stats, "total_volume"),
-                self._read(aggressive_stats, "total_volume"),
-                0.0,
-            ) or 0.0,
-            cvd_change_pct=self._coalesce_float(
-                self._read(cvd_stats, "cvd_change_pct"),
-                0.0,
-            ) or 0.0,
-            cvd_slope=self._coalesce_float(
-                self._read(cvd_stats, "cvd_slope"),
-                0.0,
-            ) or 0.0,
-            cvd_delta_ratio=self._coalesce_float(
-                self._read(cvd_stats, "delta_ratio"),
-                0.0,
-            ) or 0.0,
-            volume_delta=self._coalesce_float(
-                self._read(vd_stats, "volume_delta"),
-                0.0,
-            ) or 0.0,
-            volume_delta_ratio=self._coalesce_float(
-                self._read(vd_stats, "delta_ratio"),
-                0.0,
-            ) or 0.0,
-            cumulative_volume_delta=self._coalesce_float(
-                self._read(vd_stats, "cumulative_volume_delta"),
-                self._read(vd_stats, "cumulative_delta"),
-                0.0,
-            ) or 0.0,
-            aggressive_buy_ratio=self._coalesce_float(
-                self._read(aggressive_stats, "buy_ratio"),
-                self._read(aggressive_stats, "aggressive_buy_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_sell_ratio=self._coalesce_float(
-                self._read(aggressive_stats, "sell_ratio"),
-                self._read(aggressive_stats, "aggressive_sell_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_burst_score=self._coalesce_float(
-                self._read(aggressive_stats, "burst_score"),
-                0.0,
-            ) or 0.0,
-            aggressive_large_trade_count=int(
-                self._coalesce_int(
-                    self._read(aggressive_stats, "large_trade_count"),
-                    self._read(aggressive_stats, "large_trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            orderbook_imbalance_ratio=self._coalesce_float(
-                self._read(imbalance_stats, "imbalance_ratio"),
-                self._read(imbalance_stats, "ratio"),
-                0.0,
-            ) or 0.0,
-        )
+    def _resolve_snapshot(
+        self,
+        context: SignalContext,
+    ) -> OrderflowCompositeSnapshot | None:
+        return self._resolve_orderflow_composite_snapshot(context)
 
     # ------------------------------------------------------------------
-    # Continuation logic
+    # Continuation detection
     # ------------------------------------------------------------------
 
-    def _detect_continuation_side(self, snapshot: OrderflowContinuationSnapshot) -> SignalSide:
+    def _detect_continuation_side(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> SignalSide:
         long_ok = self._is_long_continuation(snapshot)
         short_ok = self._is_short_continuation(snapshot)
 
         if long_ok and not short_ok:
             return SignalSide.LONG
+
         if short_ok and not long_ok:
             return SignalSide.SHORT
+
         return SignalSide.UNKNOWN
 
-    def _is_long_continuation(self, snapshot: OrderflowContinuationSnapshot) -> bool:
+    def _is_long_continuation(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> bool:
         return (
             snapshot.price_change_pct >= self.thresholds.min_abs_price_change_pct
             and snapshot.cvd_delta_ratio >= self.thresholds.min_cvd_delta_ratio
@@ -555,15 +305,21 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             and snapshot.cvd_slope >= self.thresholds.min_cvd_slope
             and snapshot.volume_delta_ratio >= self.thresholds.min_volume_delta_ratio
             and snapshot.volume_delta >= self.thresholds.min_volume_delta_abs
-            and snapshot.cumulative_volume_delta >= self.thresholds.min_cumulative_volume_delta_abs
+            and snapshot.cumulative_volume_delta
+            >= self.thresholds.min_cumulative_volume_delta_abs
             and snapshot.aggressive_buy_ratio >= self.thresholds.min_aggressive_buy_ratio
             and snapshot.aggressive_buy_ratio > snapshot.aggressive_sell_ratio
-            and snapshot.orderbook_imbalance_ratio >= -self.thresholds.min_orderbook_imbalance_ratio
-            and snapshot.aggressive_burst_score >= self.thresholds.min_aggressive_burst_score
-            and snapshot.aggressive_large_trade_count >= self.thresholds.min_large_aggressive_trades
+            and snapshot.aggressive_burst_score
+            >= self.thresholds.min_aggressive_burst_score
+            and snapshot.large_buy_trades >= self.thresholds.min_large_aggressive_trades
+            and snapshot.signed_orderbook_imbalance
+            >= -self.thresholds.min_orderbook_imbalance_ratio
         )
 
-    def _is_short_continuation(self, snapshot: OrderflowContinuationSnapshot) -> bool:
+    def _is_short_continuation(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> bool:
         return (
             snapshot.price_change_pct <= -self.thresholds.min_abs_price_change_pct
             and snapshot.cvd_delta_ratio <= -self.thresholds.min_cvd_delta_ratio
@@ -571,43 +327,84 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             and snapshot.cvd_slope <= -self.thresholds.min_cvd_slope
             and snapshot.volume_delta_ratio <= -self.thresholds.min_volume_delta_ratio
             and snapshot.volume_delta <= -self.thresholds.min_volume_delta_abs
-            and snapshot.cumulative_volume_delta <= -self.thresholds.min_cumulative_volume_delta_abs
+            and snapshot.cumulative_volume_delta
+            <= -self.thresholds.min_cumulative_volume_delta_abs
             and snapshot.aggressive_sell_ratio >= self.thresholds.min_aggressive_sell_ratio
             and snapshot.aggressive_sell_ratio > snapshot.aggressive_buy_ratio
-            and snapshot.orderbook_imbalance_ratio <= self.thresholds.min_orderbook_imbalance_ratio
-            and snapshot.aggressive_burst_score >= self.thresholds.min_aggressive_burst_score
-            and snapshot.aggressive_large_trade_count >= self.thresholds.min_large_aggressive_trades
+            and snapshot.aggressive_burst_score
+            >= self.thresholds.min_aggressive_burst_score
+            and snapshot.large_sell_trades >= self.thresholds.min_large_aggressive_trades
+            and snapshot.signed_orderbook_imbalance
+            <= self.thresholds.min_orderbook_imbalance_ratio
         )
+
+    # ------------------------------------------------------------------
+    # Scoring / confidence
+    # ------------------------------------------------------------------
 
     def _calculate_score(
         self,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         context: SignalContext,
     ) -> float:
-        price_component = self._normalize_percent(abs(snapshot.price_change_pct), scale=1.5)
-        cvd_component = self._normalize_percent(abs(snapshot.cvd_change_pct), scale=1.5)
-        cvd_ratio_component = self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.40)
-        volume_ratio_component = self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.45)
+        price_component = self._normalize_percent(
+            abs(snapshot.price_change_pct),
+            scale=1.5,
+        )
+        cvd_component = self._normalize_ratio(
+            abs(snapshot.cvd_delta_ratio),
+            scale=0.45,
+        )
+        cvd_change_component = self._normalize_percent(
+            abs(snapshot.cvd_change_pct),
+            scale=1.5,
+        )
+        volume_delta_component = self._normalize_ratio(
+            abs(snapshot.volume_delta_ratio),
+            scale=0.45,
+        )
+        cumulative_component = self._normalize_magnitude(
+            abs(snapshot.cumulative_volume_delta),
+            scale=max(abs(snapshot.total_volume), 1.0),
+        )
+        notional_component = self._normalize_ratio(
+            abs(self._notional_delta_ratio(snapshot)),
+            scale=0.45,
+        )
+        cumulative_notional_component = self._normalize_magnitude(
+            abs(snapshot.cumulative_notional_delta),
+            scale=max(abs(snapshot.total_notional), 1.0),
+        )
         aggression_component = (
             snapshot.aggressive_buy_ratio
             if side == SignalSide.LONG
             else snapshot.aggressive_sell_ratio
         )
-        imbalance_component = self._normalize_ratio(abs(snapshot.orderbook_imbalance_ratio), scale=0.25)
-        trades_component = min(
-            snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1),
-            1.0,
+        aggressive_net_component = self._normalize_ratio(
+            abs(self._directional_aggressive_notional_ratio(snapshot, side)),
+            scale=0.45,
+        )
+        large_trade_component = self._large_trade_component(snapshot, side)
+        orderbook_component = self._orderbook_component(snapshot, side)
+        burst_component = self._normalize_ratio(
+            snapshot.aggressive_burst_score,
+            scale=1.0,
         )
 
         raw_score = (
-            (price_component * 0.16)
-            + (cvd_component * 0.18)
-            + (cvd_ratio_component * 0.18)
-            + (volume_ratio_component * 0.18)
-            + (aggression_component * 0.16)
-            + (imbalance_component * 0.06)
-            + (trades_component * 0.08)
+            (price_component * 0.11)
+            + (cvd_component * 0.14)
+            + (cvd_change_component * 0.09)
+            + (volume_delta_component * 0.13)
+            + (cumulative_component * 0.07)
+            + (notional_component * 0.10)
+            + (cumulative_notional_component * 0.05)
+            + (aggression_component * 0.12)
+            + (aggressive_net_component * 0.08)
+            + (large_trade_component * 0.04)
+            + (orderbook_component * 0.04)
+            + (burst_component * 0.03)
         )
 
         weighted_score = raw_score
@@ -619,16 +416,22 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
 
     def _calculate_confidence(
         self,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         context: SignalContext,
     ) -> float:
         components: list[float] = [
-            self._normalize_percent(abs(snapshot.price_change_pct), scale=1.25),
-            self._normalize_percent(abs(snapshot.cvd_change_pct), scale=1.25),
+            self._normalize_percent(abs(snapshot.price_change_pct), scale=1.5),
             self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.35),
+            self._normalize_percent(abs(snapshot.cvd_change_pct), scale=1.25),
             self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.35),
-            self._normalize_ratio(abs(snapshot.orderbook_imbalance_ratio), scale=0.20),
+            self._normalize_ratio(abs(self._notional_delta_ratio(snapshot)), scale=0.35),
+            self._normalize_ratio(
+                abs(self._directional_aggressive_notional_ratio(snapshot, side)),
+                scale=0.35,
+            ),
+            self._large_trade_component(snapshot, side),
+            self._orderbook_component(snapshot, side),
             min(
                 snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1),
                 1.0,
@@ -637,22 +440,42 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
 
         if side == SignalSide.LONG:
             components.append(snapshot.aggressive_buy_ratio)
+            components.append(1.0 if snapshot.large_buy_trades >= snapshot.large_sell_trades else 0.45)
+            components.append(1.0 if snapshot.notional_delta >= 0 else 0.35)
+            components.append(1.0 if snapshot.aggressive_net_notional_delta >= 0 else 0.35)
+
         elif side == SignalSide.SHORT:
             components.append(snapshot.aggressive_sell_ratio)
+            components.append(1.0 if snapshot.large_sell_trades >= snapshot.large_buy_trades else 0.45)
+            components.append(1.0 if snapshot.notional_delta <= 0 else 0.35)
+            components.append(1.0 if snapshot.aggressive_net_notional_delta <= 0 else 0.35)
 
-        if context.regime is not None and context.regime.regime in self.supported_regimes:
+        if snapshot.has_orderbook:
             components.append(0.75)
+            if snapshot.depth_levels_used > 0:
+                components.append(0.75)
+
+        if snapshot.spread is not None and snapshot.mid_price:
+            spread_ratio = snapshot.spread / max(snapshot.mid_price, 1e-12)
+            components.append(1.0 if spread_ratio <= 0.001 else 0.55)
 
         if context.price is not None and context.price.spread_bps is not None:
             spread_ok = context.price.spread_bps <= self.config.filters.max_spread_bps
-            components.append(1.0 if spread_ok else 0.30)
+            components.append(1.0 if spread_ok else 0.35)
+
+        if context.regime is not None and context.regime.regime in self.supported_regimes:
+            components.append(0.80)
 
         confidence = sum(components) / len(components) if components else 0.0
         return max(0.0, min(confidence, 1.0))
 
+    # ------------------------------------------------------------------
+    # Reasons / confirmations
+    # ------------------------------------------------------------------
+
     def _build_reasons(
         self,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> list[str]:
         reasons: list[str] = []
@@ -660,28 +483,44 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         if side == SignalSide.LONG:
             reasons.extend(
                 [
-                    "uptrend_price_action_confirmed",
-                    "cvd_confirms_bullish_continuation",
-                    "volume_delta_confirms_buy_pressure",
+                    "price_continuation_up",
+                    "cvd_confirms_long_continuation",
+                    "volume_delta_confirms_long_continuation",
                     "aggressive_buyers_dominate",
                 ]
             )
 
-            if snapshot.orderbook_imbalance_ratio > 0:
-                reasons.append("orderbook_supports_bid_pressure")
+            if snapshot.notional_delta > 0:
+                reasons.append("positive_notional_delta_confirmation")
+            if snapshot.cumulative_notional_delta > 0:
+                reasons.append("positive_cumulative_notional_delta")
+            if snapshot.aggressive_net_notional_delta > 0:
+                reasons.append("aggressive_buy_notional_dominance")
+            if snapshot.large_buy_trades >= self.thresholds.min_large_aggressive_trades:
+                reasons.append("large_buy_trades_support_continuation")
+            if snapshot.signed_orderbook_imbalance > 0:
+                reasons.append("bid_side_orderbook_support")
 
         elif side == SignalSide.SHORT:
             reasons.extend(
                 [
-                    "downtrend_price_action_confirmed",
-                    "cvd_confirms_bearish_continuation",
-                    "volume_delta_confirms_sell_pressure",
+                    "price_continuation_down",
+                    "cvd_confirms_short_continuation",
+                    "volume_delta_confirms_short_continuation",
                     "aggressive_sellers_dominate",
                 ]
             )
 
-            if snapshot.orderbook_imbalance_ratio < 0:
-                reasons.append("orderbook_supports_ask_pressure")
+            if snapshot.notional_delta < 0:
+                reasons.append("negative_notional_delta_confirmation")
+            if snapshot.cumulative_notional_delta < 0:
+                reasons.append("negative_cumulative_notional_delta")
+            if snapshot.aggressive_net_notional_delta < 0:
+                reasons.append("aggressive_sell_notional_dominance")
+            if snapshot.large_sell_trades >= self.thresholds.min_large_aggressive_trades:
+                reasons.append("large_sell_trades_support_continuation")
+            if snapshot.signed_orderbook_imbalance < 0:
+                reasons.append("ask_side_orderbook_support")
 
         if snapshot.aggressive_burst_score > 0:
             reasons.append("aggressive_flow_burst_present")
@@ -689,31 +528,55 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         if snapshot.trades_count >= self.thresholds.min_trades_count:
             reasons.append("sufficient_trade_sample")
 
+        if snapshot.total_notional > 0:
+            reasons.append("notional_data_available")
+
+        if snapshot.has_orderbook:
+            reasons.append("orderbook_context_available")
+
         return reasons
 
     def _build_confirmations(
         self,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         context: SignalContext,
     ) -> list[str]:
         confirmations: list[str] = []
 
         if side == SignalSide.LONG:
-            if snapshot.cvd_slope > 0:
+            if snapshot.cvd_slope >= 0:
                 confirmations.append("positive_cvd_slope")
             if snapshot.volume_delta > 0:
                 confirmations.append("positive_volume_delta")
-            if snapshot.orderbook_imbalance_ratio > 0:
-                confirmations.append("positive_orderbook_imbalance")
+            if snapshot.notional_delta > 0:
+                confirmations.append("positive_notional_delta")
+            if snapshot.aggressive_buy_ratio > snapshot.aggressive_sell_ratio:
+                confirmations.append("buy_aggression_dominance")
+            if snapshot.large_buy_trades >= snapshot.large_sell_trades:
+                confirmations.append("large_buy_trades_dominate")
+            if snapshot.signed_orderbook_imbalance >= 0:
+                confirmations.append("non_bearish_orderbook_imbalance")
 
         elif side == SignalSide.SHORT:
-            if snapshot.cvd_slope < 0:
+            if snapshot.cvd_slope <= 0:
                 confirmations.append("negative_cvd_slope")
             if snapshot.volume_delta < 0:
                 confirmations.append("negative_volume_delta")
-            if snapshot.orderbook_imbalance_ratio < 0:
-                confirmations.append("negative_orderbook_imbalance")
+            if snapshot.notional_delta < 0:
+                confirmations.append("negative_notional_delta")
+            if snapshot.aggressive_sell_ratio > snapshot.aggressive_buy_ratio:
+                confirmations.append("sell_aggression_dominance")
+            if snapshot.large_sell_trades >= snapshot.large_buy_trades:
+                confirmations.append("large_sell_trades_dominate")
+            if snapshot.signed_orderbook_imbalance <= 0:
+                confirmations.append("non_bullish_orderbook_imbalance")
+
+        if snapshot.depth_levels_used > 0:
+            confirmations.append("orderbook_depth_available")
+
+        if snapshot.spread is not None:
+            confirmations.append("orderbook_spread_available")
 
         if context.price is not None and context.price.spread_bps is not None:
             if context.price.spread_bps <= self.config.filters.max_spread_bps:
@@ -732,7 +595,7 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         self,
         *,
         context: SignalContext,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         score: float,
         confidence: float,
@@ -741,9 +604,15 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
     ) -> StrategySignal:
         entry_plan = self._build_entry_plan(context, snapshot, side)
         exit_plan = self._build_exit_plan(context, snapshot, side, entry_plan)
-        invalidation_plan = self._build_invalidation_plan(context, snapshot, side, entry_plan)
+        invalidation_plan = self._build_invalidation_plan(
+            context,
+            snapshot,
+            side,
+            entry_plan,
+        )
         execution_plan = self._build_execution_plan(
             context=context,
+            snapshot=snapshot,
             side=side,
             entry_plan=entry_plan,
             exit_plan=exit_plan,
@@ -751,7 +620,7 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         )
 
         signal = StrategySignal(
-            symbol=context.symbol,
+            symbol=snapshot.symbol,
             side=side,
             strategy_name=self.STRATEGY_NAME,
             category=self.CATEGORY,
@@ -766,7 +635,11 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             trigger_type=TriggerType.PRIMARY,
             origin=SignalOrigin.SINGLE_STRATEGY,
             priority=self._resolve_priority(confidence),
-            regime=context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN,
+            regime=(
+                context.regime.regime
+                if context.regime is not None
+                else MarketRegime.UNKNOWN
+            ),
             entry_plan=entry_plan,
             exit_plan=exit_plan,
             invalidation_plan=invalidation_plan,
@@ -774,23 +647,16 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             metadata={
                 "source": self.STRATEGY_NAME,
                 "analytics_fallback_enabled": self.orderflow_analyzer is not None,
-                "orderflow_snapshot": {
-                    "price_change_pct": snapshot.price_change_pct,
-                    "trades_count": snapshot.trades_count,
-                    "total_volume": snapshot.total_volume,
-                    "cvd_change_pct": snapshot.cvd_change_pct,
-                    "cvd_slope": snapshot.cvd_slope,
-                    "cvd_delta_ratio": snapshot.cvd_delta_ratio,
-                    "volume_delta": snapshot.volume_delta,
-                    "volume_delta_ratio": snapshot.volume_delta_ratio,
-                    "cumulative_volume_delta": snapshot.cumulative_volume_delta,
-                    "aggressive_buy_ratio": snapshot.aggressive_buy_ratio,
-                    "aggressive_sell_ratio": snapshot.aggressive_sell_ratio,
-                    "aggressive_burst_score": snapshot.aggressive_burst_score,
-                    "aggressive_large_trade_count": snapshot.aggressive_large_trade_count,
-                    "orderbook_imbalance_ratio": snapshot.orderbook_imbalance_ratio,
-                    "last_price": snapshot.last_price,
-                },
+                "analytics_metrics": [
+                    "cvd",
+                    "volume_delta",
+                    "aggressive_trades",
+                    "orderbook_imbalance",
+                ],
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
+                "key": list(snapshot.key),
+                "orderflow_snapshot": snapshot.to_dict(),
             },
         )
 
@@ -817,7 +683,7 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
     def _build_entry_plan(
         self,
         context: SignalContext,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> EntryPlan:
         ref_price = self._resolve_reference_price(context, snapshot)
@@ -832,7 +698,11 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
                 entry_price = ref_price - offset
 
         return EntryPlan(
-            entry_type=getattr(self.config.builders, "default_entry_type", EntryType.MARKET),
+            entry_type=getattr(
+                self.config.builders,
+                "default_entry_type",
+                EntryType.MARKET,
+            ),
             price=entry_price,
             confirmation_required=False,
             notes=[
@@ -842,13 +712,15 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             metadata={
                 "reference_price": ref_price,
                 "entry_offset_pct": self.thresholds.preferred_entry_offset_pct,
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
 
     def _build_exit_plan(
         self,
         context: SignalContext,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         entry_plan: EntryPlan,
     ) -> ExitPlan:
@@ -857,14 +729,15 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         stop_loss = None
         tp_levels: list[TargetPlan] = []
 
+        rr_ratio = getattr(
+            self.config.builders,
+            "default_rr_ratio",
+            self.thresholds.fallback_rr_ratio,
+        )
+        rr_ratio = rr_ratio if rr_ratio and rr_ratio > 0 else self.thresholds.fallback_rr_ratio
+
         if ref_price is not None:
             stop_buffer = ref_price * self.thresholds.stop_buffer_pct
-            rr_ratio = getattr(
-                self.config.builders,
-                "default_rr_ratio",
-                self.thresholds.fallback_rr_ratio,
-            )
-            rr_ratio = rr_ratio if rr_ratio and rr_ratio > 0 else self.thresholds.fallback_rr_ratio
 
             if side == SignalSide.LONG:
                 stop_loss = ref_price - stop_buffer
@@ -900,18 +773,16 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             ),
             metadata={
                 "strategy": self.STRATEGY_NAME,
-                "rr_ratio": getattr(
-                    self.config.builders,
-                    "default_rr_ratio",
-                    self.thresholds.fallback_rr_ratio,
-                ),
+                "rr_ratio": rr_ratio,
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
 
     def _build_invalidation_plan(
         self,
         context: SignalContext,
-        snapshot: OrderflowContinuationSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         entry_plan: EntryPlan,
     ) -> InvalidationPlan:
@@ -930,12 +801,16 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             price=invalidation_price,
             reason="orderflow_continuation_failed",
             conditions=[
-                "cvd_reverses_against_signal",
-                "volume_delta_flips_against_signal",
-                "aggressive_flow_loses_dominance",
+                "cvd_delta_ratio_reverses",
+                "volume_delta_ratio_reverses",
+                "aggressive_flow_loses_directional_dominance",
+                "notional_delta_reverses",
+                "orderbook_imbalance_flips_against_continuation",
             ],
             metadata={
                 "strategy": self.STRATEGY_NAME,
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
 
@@ -943,13 +818,14 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
         self,
         *,
         context: SignalContext,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         entry_plan: EntryPlan,
         exit_plan: ExitPlan,
         invalidation_plan: InvalidationPlan,
     ) -> ExecutionPlanDraft:
         return ExecutionPlanDraft(
-            symbol=context.symbol,
+            symbol=snapshot.symbol,
             side=side,
             entry=entry_plan,
             exit=exit_plan,
@@ -961,5 +837,77 @@ class OrderflowContinuationStrategy(OrderflowStrategyBase):
             metadata={
                 "strategy_name": self.STRATEGY_NAME,
                 "timeframe": str(context.timeframe),
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Derived analytics helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _notional_delta_ratio(snapshot: OrderflowCompositeSnapshot) -> float:
+        if snapshot.total_notional <= 0:
+            return 0.0
+        return snapshot.notional_delta / snapshot.total_notional
+
+    @staticmethod
+    def _directional_aggressive_notional_ratio(
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        total = snapshot.aggressive_buy_notional + snapshot.aggressive_sell_notional
+        if total <= 0:
+            return 0.0
+
+        if side == SignalSide.LONG:
+            return snapshot.aggressive_net_notional_delta / total
+
+        if side == SignalSide.SHORT:
+            return -snapshot.aggressive_net_notional_delta / total
+
+        return 0.0
+
+    def _large_trade_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        required = max(self.thresholds.min_large_aggressive_trades, 1)
+
+        if side == SignalSide.LONG:
+            directional = snapshot.large_buy_trades
+            opposite = snapshot.large_sell_trades
+        elif side == SignalSide.SHORT:
+            directional = snapshot.large_sell_trades
+            opposite = snapshot.large_buy_trades
+        else:
+            return 0.0
+
+        base = min(directional / required, 1.0)
+        dominance = 1.0 if directional >= opposite else 0.5
+        return max(0.0, min(base * dominance, 1.0))
+
+    def _orderbook_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        if not snapshot.has_orderbook:
+            return 0.5
+
+        signed = snapshot.signed_orderbook_imbalance
+        scale = max(self.thresholds.min_orderbook_imbalance_ratio, 0.01)
+
+        if side == SignalSide.LONG:
+            if signed < -scale:
+                return 0.0
+            return 0.5 + (0.5 * self._normalize_ratio(max(signed, 0.0), scale=scale))
+
+        if side == SignalSide.SHORT:
+            if signed > scale:
+                return 0.0
+            return 0.5 + (0.5 * self._normalize_ratio(abs(min(signed, 0.0)), scale=scale))
+
+        return 0.0

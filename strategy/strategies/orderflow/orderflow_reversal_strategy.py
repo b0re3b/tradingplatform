@@ -30,23 +30,26 @@ from ...models import (
     TargetPlan,
 )
 
-from .base_orderflow_strategy import OrderflowStrategyBase
+from .base_orderflow_strategy import (
+    OrderflowCompositeSnapshot,
+    OrderflowStrategyBase,
+)
 
 
 @dataclass(slots=True)
 class OrderflowReversalThresholds:
     """
-    Пороги reversal-логіки на рівні strategy layer.
+    Strategy-level thresholds for orderflow reversal.
 
     LONG reversal:
-    - price still weak / negative
-    - but sell-side flow is exhausting
-    - buyers start absorbing / taking control
+    - price is still weak / moving down;
+    - CVD and volume delta start turning up;
+    - aggressive buyers start absorbing / taking control.
 
     SHORT reversal:
-    - price still strong / positive
-    - but buy-side flow is exhausting
-    - sellers start absorbing / taking control
+    - price is still strong / moving up;
+    - CVD and volume delta start turning down;
+    - aggressive sellers start absorbing / taking control.
     """
 
     min_trades_count: int = 10
@@ -110,66 +113,21 @@ class OrderflowReversalThresholds:
             raise ValueError("max_expected_holding_seconds must be > 0")
 
 
-@dataclass(slots=True)
-class OrderflowReversalSnapshot:
-    symbol: str
-
-    last_price: float | None = None
-    price_change_pct: float = 0.0
-
-    trades_count: int = 0
-    total_volume: float = 0.0
-
-    cvd_change_pct: float = 0.0
-    cvd_slope: float = 0.0
-    cvd_delta_ratio: float = 0.0
-
-    volume_delta: float = 0.0
-    volume_delta_ratio: float = 0.0
-    cumulative_volume_delta: float = 0.0
-
-    aggressive_buy_ratio: float = 0.0
-    aggressive_sell_ratio: float = 0.0
-    aggressive_burst_score: float = 0.0
-    aggressive_large_trade_count: int = 0
-
-    orderbook_imbalance_ratio: float = 0.0
-
-    def has_minimum_data(self) -> bool:
-        return self.trades_count > 0
-
-    @property
-    def buy_absorption_hint(self) -> bool:
-        return (
-            self.price_change_pct < 0
-            and self.cvd_delta_ratio > 0
-            and self.volume_delta_ratio > 0
-        )
-
-    @property
-    def sell_absorption_hint(self) -> bool:
-        return (
-            self.price_change_pct > 0
-            and self.cvd_delta_ratio < 0
-            and self.volume_delta_ratio < 0
-        )
-
-
 class OrderflowReversalStrategy(OrderflowStrategyBase):
     """
-    Strategy reversal по order flow.
+    Orderflow reversal strategy.
 
     LONG reversal:
-    - ціна ще тиснеться вниз або залишається слабкою
-    - але CVD / volume delta вже розвертаються вгору
-    - агресивні покупці починають домінувати
-    - optional orderbook imbalance переходить на bid-side
+    - price still moves down / remains weak;
+    - CVD and volume delta already turn positive;
+    - aggressive buy notional confirms absorption;
+    - optional orderbook imbalance flips bid-side.
 
     SHORT reversal:
-    - ціна ще росте або залишається сильною
-    - але CVD / volume delta вже розвертаються вниз
-    - агресивні продавці починають домінувати
-    - optional orderbook imbalance переходить на ask-side
+    - price still moves up / remains strong;
+    - CVD and volume delta already turn negative;
+    - aggressive sell notional confirms absorption;
+    - optional orderbook imbalance flips ask-side.
     """
 
     STRATEGY_NAME = "orderflow_reversal_strategy"
@@ -272,7 +230,10 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         evaluation.reasons.extend(reasons)
 
         min_score = max(self._get_min_score(), self.thresholds.min_score_for_signal)
-        min_confidence = max(self._get_min_confidence(), self.thresholds.min_confidence_for_signal)
+        min_confidence = max(
+            self._get_min_confidence(),
+            self.thresholds.min_confidence_for_signal,
+        )
 
         if score < min_score:
             evaluation.reasons.append("score_below_threshold")
@@ -304,271 +265,35 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
     # Snapshot resolution
     # ------------------------------------------------------------------
 
-    def _resolve_snapshot(self, context: SignalContext) -> OrderflowReversalSnapshot | None:
-        snapshot = self._build_snapshot_from_context(context)
-        if snapshot is not None:
-            return snapshot
-
-        facade = self.orderflow_analyzer
-        if facade is None:
-            return None
-
-        try:
-            return self._build_snapshot_from_facade(context.symbol)
-        except Exception:
-            self.log_warning(
-                "Failed to build reversal snapshot from orderflow facade",
-                symbol=context.symbol,
-                strategy=self.STRATEGY_NAME,
-            )
-            return None
-
-    def _build_snapshot_from_context(self, context: SignalContext) -> OrderflowReversalSnapshot | None:
-        symbol = context.symbol
-
-        orderflow = context.orderflow if isinstance(context.orderflow, dict) else {}
-
-        cvd = orderflow.get("cvd", {}) if isinstance(orderflow.get("cvd"), dict) else {}
-        volume_delta = (
-            orderflow.get("volume_delta", {})
-            if isinstance(orderflow.get("volume_delta"), dict)
-            else {}
-        )
-        aggressive = (
-            orderflow.get("aggressive_trades", {})
-            if isinstance(orderflow.get("aggressive_trades"), dict)
-            else {}
-        )
-        imbalance = (
-            orderflow.get("orderbook_imbalance", {})
-            if isinstance(orderflow.get("orderbook_imbalance"), dict)
-            else {}
-        )
-
-        snapshot = OrderflowReversalSnapshot(
-            symbol=symbol,
-            last_price=self._coalesce_float(
-                self._feature_value(context, "orderflow.last_price"),
-                self._feature_value(context, "price.last"),
-                cvd.get("last_price"),
-                volume_delta.get("last_price"),
-                context.price.last_price if context.price is not None else None,
-                context.price.mid_price if context.price is not None else None,
-            ),
-            price_change_pct=self._coalesce_float(
-                self._feature_value(context, "orderflow.price_change_pct"),
-                self._feature_value(context, "orderflow.cvd.price_change_pct"),
-                self._feature_value(context, "price.change_pct"),
-                cvd.get("price_change_pct"),
-                0.0,
-            ) or 0.0,
-            trades_count=int(
-                self._coalesce_int(
-                    self._feature_value(context, "orderflow.trades_count"),
-                    self._feature_value(context, "orderflow.cvd.trades_count"),
-                    self._feature_value(context, "orderflow.volume_delta.trades_count"),
-                    cvd.get("trades_count"),
-                    volume_delta.get("trades_count"),
-                    aggressive.get("trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            total_volume=self._coalesce_float(
-                self._feature_value(context, "orderflow.total_volume"),
-                self._feature_value(context, "orderflow.cvd.total_volume"),
-                self._feature_value(context, "orderflow.volume_delta.total_volume"),
-                cvd.get("total_volume"),
-                volume_delta.get("total_volume"),
-                aggressive.get("total_volume"),
-                0.0,
-            ) or 0.0,
-            cvd_change_pct=self._coalesce_float(
-                self._feature_value(context, "orderflow.cvd.change_pct"),
-                self._feature_value(context, "orderflow.cvd.cvd_change_pct"),
-                cvd.get("cvd_change_pct"),
-                cvd.get("change_pct"),
-                0.0,
-            ) or 0.0,
-            cvd_slope=self._coalesce_float(
-                self._feature_value(context, "orderflow.cvd.slope"),
-                self._feature_value(context, "orderflow.cvd.cvd_slope"),
-                cvd.get("cvd_slope"),
-                cvd.get("slope"),
-                0.0,
-            ) or 0.0,
-            cvd_delta_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.cvd.delta_ratio"),
-                cvd.get("delta_ratio"),
-                0.0,
-            ) or 0.0,
-            volume_delta=self._coalesce_float(
-                self._feature_value(context, "orderflow.volume_delta.value"),
-                self._feature_value(context, "orderflow.volume_delta.volume_delta"),
-                volume_delta.get("volume_delta"),
-                volume_delta.get("value"),
-                0.0,
-            ) or 0.0,
-            volume_delta_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.volume_delta.delta_ratio"),
-                volume_delta.get("delta_ratio"),
-                0.0,
-            ) or 0.0,
-            cumulative_volume_delta=self._coalesce_float(
-                self._feature_value(context, "orderflow.volume_delta.cumulative_delta"),
-                self._feature_value(context, "orderflow.volume_delta.cumulative_volume_delta"),
-                volume_delta.get("cumulative_volume_delta"),
-                volume_delta.get("cumulative_delta"),
-                0.0,
-            ) or 0.0,
-            aggressive_buy_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.aggressive_trades.buy_ratio"),
-                aggressive.get("buy_ratio"),
-                aggressive.get("aggressive_buy_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_sell_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.aggressive_trades.sell_ratio"),
-                aggressive.get("sell_ratio"),
-                aggressive.get("aggressive_sell_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_burst_score=self._coalesce_float(
-                self._feature_value(context, "orderflow.aggressive_trades.burst_score"),
-                aggressive.get("burst_score"),
-                0.0,
-            ) or 0.0,
-            aggressive_large_trade_count=int(
-                self._coalesce_int(
-                    self._feature_value(context, "orderflow.aggressive_trades.large_trade_count"),
-                    self._feature_value(context, "orderflow.aggressive_trades.large_trades_count"),
-                    aggressive.get("large_trade_count"),
-                    aggressive.get("large_trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            orderbook_imbalance_ratio=self._coalesce_float(
-                self._feature_value(context, "orderflow.orderbook_imbalance.ratio"),
-                self._feature_value(context, "orderflow.orderbook_imbalance.imbalance_ratio"),
-                imbalance.get("imbalance_ratio"),
-                imbalance.get("ratio"),
-                0.0,
-            ) or 0.0,
-        )
-
-        if snapshot.has_minimum_data():
-            return snapshot
-
-        return None
-
-    def _build_snapshot_from_facade(self, symbol: str) -> OrderflowReversalSnapshot:
-        facade = self.orderflow_analyzer
-        if facade is None:
-            raise ValueError("orderflow_analyzer is not configured")
-
-        cvd_stats = self._safe_get_latest_stats(facade, "cvd", symbol)
-        vd_stats = self._safe_get_latest_stats(facade, "volume_delta", symbol)
-        aggressive_stats = self._safe_get_latest_stats(facade, "aggressive_trades", symbol)
-        imbalance_stats = self._safe_get_latest_stats(facade, "orderbook_imbalance", symbol)
-
-        return OrderflowReversalSnapshot(
-            symbol=symbol,
-            last_price=self._coalesce_float(
-                self._read(cvd_stats, "last_price"),
-                self._read(vd_stats, "last_price"),
-                self._read(aggressive_stats, "last_price"),
-                self._read(imbalance_stats, "mid_price"),
-            ),
-            price_change_pct=self._coalesce_float(
-                self._read(cvd_stats, "price_change_pct"),
-                self._read(vd_stats, "price_change_pct"),
-                0.0,
-            ) or 0.0,
-            trades_count=int(
-                self._coalesce_int(
-                    self._read(cvd_stats, "trades_count"),
-                    self._read(vd_stats, "trades_count"),
-                    self._read(aggressive_stats, "trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            total_volume=self._coalesce_float(
-                self._read(cvd_stats, "total_volume"),
-                self._read(vd_stats, "total_volume"),
-                self._read(aggressive_stats, "total_volume"),
-                0.0,
-            ) or 0.0,
-            cvd_change_pct=self._coalesce_float(
-                self._read(cvd_stats, "cvd_change_pct"),
-                0.0,
-            ) or 0.0,
-            cvd_slope=self._coalesce_float(
-                self._read(cvd_stats, "cvd_slope"),
-                0.0,
-            ) or 0.0,
-            cvd_delta_ratio=self._coalesce_float(
-                self._read(cvd_stats, "delta_ratio"),
-                0.0,
-            ) or 0.0,
-            volume_delta=self._coalesce_float(
-                self._read(vd_stats, "volume_delta"),
-                0.0,
-            ) or 0.0,
-            volume_delta_ratio=self._coalesce_float(
-                self._read(vd_stats, "delta_ratio"),
-                0.0,
-            ) or 0.0,
-            cumulative_volume_delta=self._coalesce_float(
-                self._read(vd_stats, "cumulative_volume_delta"),
-                self._read(vd_stats, "cumulative_delta"),
-                0.0,
-            ) or 0.0,
-            aggressive_buy_ratio=self._coalesce_float(
-                self._read(aggressive_stats, "buy_ratio"),
-                self._read(aggressive_stats, "aggressive_buy_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_sell_ratio=self._coalesce_float(
-                self._read(aggressive_stats, "sell_ratio"),
-                self._read(aggressive_stats, "aggressive_sell_ratio"),
-                0.0,
-            ) or 0.0,
-            aggressive_burst_score=self._coalesce_float(
-                self._read(aggressive_stats, "burst_score"),
-                0.0,
-            ) or 0.0,
-            aggressive_large_trade_count=int(
-                self._coalesce_int(
-                    self._read(aggressive_stats, "large_trade_count"),
-                    self._read(aggressive_stats, "large_trades_count"),
-                    0,
-                )
-                or 0
-            ),
-            orderbook_imbalance_ratio=self._coalesce_float(
-                self._read(imbalance_stats, "imbalance_ratio"),
-                self._read(imbalance_stats, "ratio"),
-                0.0,
-            ) or 0.0,
-        )
+    def _resolve_snapshot(
+        self,
+        context: SignalContext,
+    ) -> OrderflowCompositeSnapshot | None:
+        return self._resolve_orderflow_composite_snapshot(context)
 
     # ------------------------------------------------------------------
-    # Reversal logic
+    # Reversal detection
     # ------------------------------------------------------------------
 
-    def _detect_reversal_side(self, snapshot: OrderflowReversalSnapshot) -> SignalSide:
+    def _detect_reversal_side(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> SignalSide:
         long_ok = self._is_long_reversal(snapshot)
         short_ok = self._is_short_reversal(snapshot)
 
         if long_ok and not short_ok:
             return SignalSide.LONG
+
         if short_ok and not long_ok:
             return SignalSide.SHORT
+
         return SignalSide.UNKNOWN
 
-    def _is_long_reversal(self, snapshot: OrderflowReversalSnapshot) -> bool:
+    def _is_long_reversal(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> bool:
         if snapshot.price_change_pct > -self.thresholds.min_abs_price_change_pct:
             return False
 
@@ -581,19 +306,30 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         if snapshot.cvd_change_pct < self.thresholds.min_abs_cvd_change_pct:
             return False
 
+        if snapshot.notional_delta < 0:
+            return False
+
+        if snapshot.aggressive_net_notional_delta < 0:
+            return False
+
         if self.thresholds.require_aggressive_confirmation:
             if snapshot.aggressive_buy_ratio < self.thresholds.min_aggressive_buy_ratio_for_long:
                 return False
             if snapshot.aggressive_buy_ratio <= snapshot.aggressive_sell_ratio:
                 return False
+            if snapshot.large_buy_trades < snapshot.large_sell_trades:
+                return False
 
         if self.thresholds.require_orderbook_confirmation:
-            if snapshot.orderbook_imbalance_ratio < self.thresholds.min_bullish_imbalance_for_long:
+            if snapshot.signed_orderbook_imbalance < self.thresholds.min_bullish_imbalance_for_long:
                 return False
 
         return True
 
-    def _is_short_reversal(self, snapshot: OrderflowReversalSnapshot) -> bool:
+    def _is_short_reversal(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+    ) -> bool:
         if snapshot.price_change_pct < self.thresholds.min_abs_price_change_pct:
             return False
 
@@ -606,54 +342,90 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         if snapshot.cvd_change_pct > -self.thresholds.min_abs_cvd_change_pct:
             return False
 
+        if snapshot.notional_delta > 0:
+            return False
+
+        if snapshot.aggressive_net_notional_delta > 0:
+            return False
+
         if self.thresholds.require_aggressive_confirmation:
             if snapshot.aggressive_sell_ratio < self.thresholds.min_aggressive_sell_ratio_for_short:
                 return False
             if snapshot.aggressive_sell_ratio <= snapshot.aggressive_buy_ratio:
                 return False
+            if snapshot.large_sell_trades < snapshot.large_buy_trades:
+                return False
 
         if self.thresholds.require_orderbook_confirmation:
-            if snapshot.orderbook_imbalance_ratio > -self.thresholds.min_bearish_imbalance_for_short:
+            if snapshot.signed_orderbook_imbalance > -self.thresholds.min_bearish_imbalance_for_short:
                 return False
 
         return True
 
+    # ------------------------------------------------------------------
+    # Scoring / confidence
+    # ------------------------------------------------------------------
+
     def _calculate_score(
         self,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         context: SignalContext,
     ) -> float:
-        price_component = self._normalize_percent(abs(snapshot.price_change_pct), scale=1.25)
-        cvd_component = self._normalize_percent(abs(snapshot.cvd_change_pct), scale=1.25)
-        cvd_ratio_component = self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.35)
-        volume_ratio_component = self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.35)
-
+        price_component = self._normalize_percent(
+            abs(snapshot.price_change_pct),
+            scale=1.25,
+        )
+        cvd_ratio_component = self._normalize_ratio(
+            abs(snapshot.cvd_delta_ratio),
+            scale=0.40,
+        )
+        volume_ratio_component = self._normalize_ratio(
+            abs(snapshot.volume_delta_ratio),
+            scale=0.40,
+        )
+        cvd_change_component = self._normalize_percent(
+            abs(snapshot.cvd_change_pct),
+            scale=1.25,
+        )
+        cvd_slope_component = self._normalize_magnitude(
+            abs(snapshot.cvd_slope),
+            scale=10.0,
+        )
+        notional_component = self._normalize_ratio(
+            abs(self._notional_delta_ratio(snapshot)),
+            scale=0.40,
+        )
+        aggressive_notional_component = self._normalize_ratio(
+            abs(self._directional_aggressive_notional_ratio(snapshot, side)),
+            scale=0.40,
+        )
+        absorption_component = self._absorption_component(snapshot, side)
         aggression_component = (
             snapshot.aggressive_buy_ratio
             if side == SignalSide.LONG
             else snapshot.aggressive_sell_ratio
         )
-        imbalance_component = self._normalize_ratio(abs(snapshot.orderbook_imbalance_ratio), scale=0.20)
-        absorption_component = 1.0 if (
-            snapshot.buy_absorption_hint
-            if side == SignalSide.LONG
-            else snapshot.sell_absorption_hint
-        ) else 0.0
-        trades_component = min(
-            snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1),
-            1.0,
+        large_trade_component = self._large_trade_component(snapshot, side)
+        orderbook_component = self._orderbook_component(snapshot, side)
+        burst_component = self._normalize_ratio(
+            snapshot.aggressive_burst_score,
+            scale=1.0,
         )
 
         raw_score = (
-            (price_component * 0.14)
-            + (cvd_component * 0.17)
-            + (cvd_ratio_component * 0.18)
-            + (volume_ratio_component * 0.18)
-            + (aggression_component * 0.14)
-            + (imbalance_component * 0.06)
-            + (absorption_component * 0.09)
-            + (trades_component * 0.04)
+            (price_component * 0.10)
+            + (cvd_ratio_component * 0.14)
+            + (volume_ratio_component * 0.13)
+            + (cvd_change_component * 0.10)
+            + (cvd_slope_component * 0.07)
+            + (notional_component * 0.10)
+            + (aggressive_notional_component * 0.11)
+            + (absorption_component * 0.10)
+            + (aggression_component * 0.07)
+            + (large_trade_component * 0.04)
+            + (orderbook_component * 0.03)
+            + (burst_component * 0.01)
         )
 
         weighted_score = raw_score
@@ -665,15 +437,23 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
 
     def _calculate_confidence(
         self,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         context: SignalContext,
     ) -> float:
         components: list[float] = [
-            self._normalize_percent(abs(snapshot.price_change_pct), scale=1.10),
-            self._normalize_percent(abs(snapshot.cvd_change_pct), scale=1.10),
-            self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.30),
-            self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.30),
+            self._normalize_percent(abs(snapshot.price_change_pct), scale=1.25),
+            self._normalize_ratio(abs(snapshot.cvd_delta_ratio), scale=0.35),
+            self._normalize_ratio(abs(snapshot.volume_delta_ratio), scale=0.35),
+            self._normalize_percent(abs(snapshot.cvd_change_pct), scale=1.25),
+            self._normalize_ratio(abs(self._notional_delta_ratio(snapshot)), scale=0.35),
+            self._normalize_ratio(
+                abs(self._directional_aggressive_notional_ratio(snapshot, side)),
+                scale=0.35,
+            ),
+            self._absorption_component(snapshot, side),
+            self._large_trade_component(snapshot, side),
+            self._orderbook_component(snapshot, side),
             min(
                 snapshot.trades_count / max(self.thresholds.min_trades_count * 2, 1),
                 1.0,
@@ -682,31 +462,42 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
 
         if side == SignalSide.LONG:
             components.append(snapshot.aggressive_buy_ratio)
-            components.append(1.0 if snapshot.buy_absorption_hint else 0.35)
+            components.append(1.0 if snapshot.notional_delta >= 0 else 0.25)
+            components.append(1.0 if snapshot.aggressive_net_notional_delta >= 0 else 0.25)
+            components.append(1.0 if snapshot.large_buy_trades >= snapshot.large_sell_trades else 0.45)
+
         elif side == SignalSide.SHORT:
             components.append(snapshot.aggressive_sell_ratio)
-            components.append(1.0 if snapshot.sell_absorption_hint else 0.35)
+            components.append(1.0 if snapshot.notional_delta <= 0 else 0.25)
+            components.append(1.0 if snapshot.aggressive_net_notional_delta <= 0 else 0.25)
+            components.append(1.0 if snapshot.large_sell_trades >= snapshot.large_buy_trades else 0.45)
 
-        if self.thresholds.require_orderbook_confirmation:
-            components.append(1.0 if abs(snapshot.orderbook_imbalance_ratio) > 0 else 0.25)
-        else:
-            components.append(
-                self._normalize_ratio(abs(snapshot.orderbook_imbalance_ratio), scale=0.20)
-            )
-
-        if context.regime is not None and context.regime.regime in self.supported_regimes:
+        if snapshot.has_orderbook:
             components.append(0.75)
+            if snapshot.depth_levels_used > 0:
+                components.append(0.75)
+
+        if snapshot.spread is not None and snapshot.mid_price:
+            spread_ratio = snapshot.spread / max(snapshot.mid_price, 1e-12)
+            components.append(1.0 if spread_ratio <= 0.001 else 0.55)
 
         if context.price is not None and context.price.spread_bps is not None:
             spread_ok = context.price.spread_bps <= self.config.filters.max_spread_bps
-            components.append(1.0 if spread_ok else 0.30)
+            components.append(1.0 if spread_ok else 0.35)
+
+        if context.regime is not None and context.regime.regime in self.supported_regimes:
+            components.append(0.80)
 
         confidence = sum(components) / len(components) if components else 0.0
         return max(0.0, min(confidence, 1.0))
 
+    # ------------------------------------------------------------------
+    # Reasons / confirmations
+    # ------------------------------------------------------------------
+
     def _build_reasons(
         self,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> list[str]:
         reasons: list[str] = []
@@ -714,36 +505,44 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         if side == SignalSide.LONG:
             reasons.extend(
                 [
-                    "down_move_shows_orderflow_exhaustion",
-                    "bullish_reversal_pressure_detected",
-                    "cvd_turns_positive_against_price_weakness",
-                    "volume_delta_turns_positive_against_price_weakness",
+                    "price_declining_while_orderflow_turns_up",
+                    "bullish_orderflow_reversal_detected",
+                    "cvd_absorption_supports_long_reversal",
+                    "volume_delta_absorption_supports_long_reversal",
                 ]
             )
 
-            if snapshot.buy_absorption_hint:
-                reasons.append("buy_absorption_detected")
-            if snapshot.aggressive_buy_ratio > snapshot.aggressive_sell_ratio:
-                reasons.append("aggressive_buyers_take_control")
-            if snapshot.orderbook_imbalance_ratio > 0:
-                reasons.append("orderbook_shifts_to_bid_support")
+            if snapshot.notional_delta > 0:
+                reasons.append("positive_notional_delta_absorption")
+            if snapshot.cumulative_notional_delta > 0:
+                reasons.append("positive_cumulative_notional_reversal")
+            if snapshot.aggressive_net_notional_delta > 0:
+                reasons.append("aggressive_buy_notional_absorption")
+            if snapshot.large_buy_trades >= snapshot.large_sell_trades:
+                reasons.append("large_buy_trades_absorb_selling")
+            if snapshot.signed_orderbook_imbalance > 0:
+                reasons.append("bid_side_orderbook_reversal_support")
 
         elif side == SignalSide.SHORT:
             reasons.extend(
                 [
-                    "up_move_shows_orderflow_exhaustion",
-                    "bearish_reversal_pressure_detected",
-                    "cvd_turns_negative_against_price_strength",
-                    "volume_delta_turns_negative_against_price_strength",
+                    "price_rising_while_orderflow_turns_down",
+                    "bearish_orderflow_reversal_detected",
+                    "cvd_absorption_supports_short_reversal",
+                    "volume_delta_absorption_supports_short_reversal",
                 ]
             )
 
-            if snapshot.sell_absorption_hint:
-                reasons.append("sell_absorption_detected")
-            if snapshot.aggressive_sell_ratio > snapshot.aggressive_buy_ratio:
-                reasons.append("aggressive_sellers_take_control")
-            if snapshot.orderbook_imbalance_ratio < 0:
-                reasons.append("orderbook_shifts_to_ask_pressure")
+            if snapshot.notional_delta < 0:
+                reasons.append("negative_notional_delta_absorption")
+            if snapshot.cumulative_notional_delta < 0:
+                reasons.append("negative_cumulative_notional_reversal")
+            if snapshot.aggressive_net_notional_delta < 0:
+                reasons.append("aggressive_sell_notional_absorption")
+            if snapshot.large_sell_trades >= snapshot.large_buy_trades:
+                reasons.append("large_sell_trades_absorb_buying")
+            if snapshot.signed_orderbook_imbalance < 0:
+                reasons.append("ask_side_orderbook_reversal_support")
 
         if snapshot.aggressive_burst_score > 0:
             reasons.append("aggressive_flow_burst_present")
@@ -751,35 +550,63 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         if snapshot.trades_count >= self.thresholds.min_trades_count:
             reasons.append("sufficient_trade_sample")
 
+        if snapshot.total_notional > 0:
+            reasons.append("notional_data_available")
+
+        if snapshot.has_orderbook:
+            reasons.append("orderbook_context_available")
+
         return reasons
 
     def _build_confirmations(
         self,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         context: SignalContext,
     ) -> list[str]:
         confirmations: list[str] = []
 
         if side == SignalSide.LONG:
-            if snapshot.cvd_slope > 0:
-                confirmations.append("positive_cvd_slope")
-            if snapshot.volume_delta > 0:
-                confirmations.append("positive_volume_delta")
-            if snapshot.orderbook_imbalance_ratio > 0:
-                confirmations.append("positive_orderbook_imbalance")
-            if snapshot.buy_absorption_hint:
-                confirmations.append("buy_absorption_confirmation")
+            if snapshot.price_change_pct < 0:
+                confirmations.append("price_still_weak_for_long_reversal")
+            if snapshot.cvd_delta_ratio > 0:
+                confirmations.append("positive_cvd_delta_ratio")
+            if snapshot.volume_delta_ratio > 0:
+                confirmations.append("positive_volume_delta_ratio")
+            if snapshot.cvd_change_pct > 0:
+                confirmations.append("positive_cvd_change")
+            if snapshot.notional_delta > 0:
+                confirmations.append("positive_notional_delta")
+            if snapshot.aggressive_net_notional_delta > 0:
+                confirmations.append("aggressive_buy_notional_delta")
+            if snapshot.large_buy_trades >= snapshot.large_sell_trades:
+                confirmations.append("large_buy_trade_absorption")
+            if snapshot.signed_orderbook_imbalance >= 0:
+                confirmations.append("non_bearish_orderbook_imbalance")
 
         elif side == SignalSide.SHORT:
-            if snapshot.cvd_slope < 0:
-                confirmations.append("negative_cvd_slope")
-            if snapshot.volume_delta < 0:
-                confirmations.append("negative_volume_delta")
-            if snapshot.orderbook_imbalance_ratio < 0:
-                confirmations.append("negative_orderbook_imbalance")
-            if snapshot.sell_absorption_hint:
-                confirmations.append("sell_absorption_confirmation")
+            if snapshot.price_change_pct > 0:
+                confirmations.append("price_still_strong_for_short_reversal")
+            if snapshot.cvd_delta_ratio < 0:
+                confirmations.append("negative_cvd_delta_ratio")
+            if snapshot.volume_delta_ratio < 0:
+                confirmations.append("negative_volume_delta_ratio")
+            if snapshot.cvd_change_pct < 0:
+                confirmations.append("negative_cvd_change")
+            if snapshot.notional_delta < 0:
+                confirmations.append("negative_notional_delta")
+            if snapshot.aggressive_net_notional_delta < 0:
+                confirmations.append("aggressive_sell_notional_delta")
+            if snapshot.large_sell_trades >= snapshot.large_buy_trades:
+                confirmations.append("large_sell_trade_absorption")
+            if snapshot.signed_orderbook_imbalance <= 0:
+                confirmations.append("non_bullish_orderbook_imbalance")
+
+        if snapshot.depth_levels_used > 0:
+            confirmations.append("orderbook_depth_available")
+
+        if snapshot.spread is not None:
+            confirmations.append("orderbook_spread_available")
 
         if context.price is not None and context.price.spread_bps is not None:
             if context.price.spread_bps <= self.config.filters.max_spread_bps:
@@ -798,7 +625,7 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         self,
         *,
         context: SignalContext,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         score: float,
         confidence: float,
@@ -807,9 +634,15 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
     ) -> StrategySignal:
         entry_plan = self._build_entry_plan(context, snapshot, side)
         exit_plan = self._build_exit_plan(context, snapshot, side, entry_plan)
-        invalidation_plan = self._build_invalidation_plan(context, snapshot, side, entry_plan)
+        invalidation_plan = self._build_invalidation_plan(
+            context,
+            snapshot,
+            side,
+            entry_plan,
+        )
         execution_plan = self._build_execution_plan(
             context=context,
+            snapshot=snapshot,
             side=side,
             entry_plan=entry_plan,
             exit_plan=exit_plan,
@@ -817,7 +650,7 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         )
 
         signal = StrategySignal(
-            symbol=context.symbol,
+            symbol=snapshot.symbol,
             side=side,
             strategy_name=self.STRATEGY_NAME,
             category=self.CATEGORY,
@@ -832,7 +665,11 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
             trigger_type=TriggerType.PRIMARY,
             origin=SignalOrigin.SINGLE_STRATEGY,
             priority=self._resolve_priority(confidence),
-            regime=context.regime.regime if context.regime is not None else MarketRegime.UNKNOWN,
+            regime=(
+                context.regime.regime
+                if context.regime is not None
+                else MarketRegime.UNKNOWN
+            ),
             entry_plan=entry_plan,
             exit_plan=exit_plan,
             invalidation_plan=invalidation_plan,
@@ -840,25 +677,16 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
             metadata={
                 "source": self.STRATEGY_NAME,
                 "analytics_fallback_enabled": self.orderflow_analyzer is not None,
-                "orderflow_snapshot": {
-                    "price_change_pct": snapshot.price_change_pct,
-                    "trades_count": snapshot.trades_count,
-                    "total_volume": snapshot.total_volume,
-                    "cvd_change_pct": snapshot.cvd_change_pct,
-                    "cvd_slope": snapshot.cvd_slope,
-                    "cvd_delta_ratio": snapshot.cvd_delta_ratio,
-                    "volume_delta": snapshot.volume_delta,
-                    "volume_delta_ratio": snapshot.volume_delta_ratio,
-                    "cumulative_volume_delta": snapshot.cumulative_volume_delta,
-                    "aggressive_buy_ratio": snapshot.aggressive_buy_ratio,
-                    "aggressive_sell_ratio": snapshot.aggressive_sell_ratio,
-                    "aggressive_burst_score": snapshot.aggressive_burst_score,
-                    "aggressive_large_trade_count": snapshot.aggressive_large_trade_count,
-                    "orderbook_imbalance_ratio": snapshot.orderbook_imbalance_ratio,
-                    "buy_absorption_hint": snapshot.buy_absorption_hint,
-                    "sell_absorption_hint": snapshot.sell_absorption_hint,
-                    "last_price": snapshot.last_price,
-                },
+                "analytics_metrics": [
+                    "cvd",
+                    "volume_delta",
+                    "aggressive_trades",
+                    "orderbook_imbalance",
+                ],
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
+                "key": list(snapshot.key),
+                "orderflow_snapshot": snapshot.to_dict(),
             },
         )
 
@@ -885,7 +713,7 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
     def _build_entry_plan(
         self,
         context: SignalContext,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> EntryPlan:
         ref_price = self._resolve_reference_price(context, snapshot)
@@ -900,7 +728,11 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
                 entry_price = ref_price - offset
 
         return EntryPlan(
-            entry_type=getattr(self.config.builders, "default_entry_type", EntryType.MARKET),
+            entry_type=getattr(
+                self.config.builders,
+                "default_entry_type",
+                EntryType.MARKET,
+            ),
             price=entry_price,
             confirmation_required=False,
             notes=[
@@ -910,13 +742,15 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
             metadata={
                 "reference_price": ref_price,
                 "entry_offset_pct": self.thresholds.preferred_entry_offset_pct,
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
 
     def _build_exit_plan(
         self,
         context: SignalContext,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         entry_plan: EntryPlan,
     ) -> ExitPlan:
@@ -925,14 +759,15 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         stop_loss = None
         tp_levels: list[TargetPlan] = []
 
+        rr_ratio = getattr(
+            self.config.builders,
+            "default_rr_ratio",
+            self.thresholds.fallback_rr_ratio,
+        )
+        rr_ratio = rr_ratio if rr_ratio and rr_ratio > 0 else self.thresholds.fallback_rr_ratio
+
         if ref_price is not None:
             stop_buffer = ref_price * self.thresholds.stop_buffer_pct
-            rr_ratio = getattr(
-                self.config.builders,
-                "default_rr_ratio",
-                self.thresholds.fallback_rr_ratio,
-            )
-            rr_ratio = rr_ratio if rr_ratio and rr_ratio > 0 else self.thresholds.fallback_rr_ratio
 
             if side == SignalSide.LONG:
                 stop_loss = ref_price - stop_buffer
@@ -968,18 +803,16 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
             ),
             metadata={
                 "strategy": self.STRATEGY_NAME,
-                "rr_ratio": getattr(
-                    self.config.builders,
-                    "default_rr_ratio",
-                    self.thresholds.fallback_rr_ratio,
-                ),
+                "rr_ratio": rr_ratio,
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
 
     def _build_invalidation_plan(
         self,
         context: SignalContext,
-        snapshot: OrderflowReversalSnapshot,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         entry_plan: EntryPlan,
     ) -> InvalidationPlan:
@@ -998,12 +831,16 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
             price=invalidation_price,
             reason="orderflow_reversal_failed",
             conditions=[
-                "cvd_realigns_with_previous_trend",
-                "volume_delta_realigns_with_previous_trend",
-                "aggressive_flow_returns_to_previous_side",
+                "cvd_delta_ratio_returns_to_original_trend",
+                "volume_delta_ratio_returns_to_original_trend",
+                "aggressive_absorption_disappears",
+                "notional_delta_confirms_failed_reversal",
+                "orderbook_imbalance_flips_against_reversal",
             ],
             metadata={
                 "strategy": self.STRATEGY_NAME,
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
 
@@ -1011,13 +848,14 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
         self,
         *,
         context: SignalContext,
+        snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
         entry_plan: EntryPlan,
         exit_plan: ExitPlan,
         invalidation_plan: InvalidationPlan,
     ) -> ExecutionPlanDraft:
         return ExecutionPlanDraft(
-            symbol=context.symbol,
+            symbol=snapshot.symbol,
             side=side,
             entry=entry_plan,
             exit=exit_plan,
@@ -1029,5 +867,111 @@ class OrderflowReversalStrategy(OrderflowStrategyBase):
             metadata={
                 "strategy_name": self.STRATEGY_NAME,
                 "timeframe": str(context.timeframe),
+                "scope": snapshot.scope,
+                "scope_key": snapshot.scope_key,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Derived analytics helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _notional_delta_ratio(snapshot: OrderflowCompositeSnapshot) -> float:
+        if snapshot.total_notional <= 0:
+            return 0.0
+        return snapshot.notional_delta / snapshot.total_notional
+
+    @staticmethod
+    def _directional_aggressive_notional_ratio(
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        total = snapshot.aggressive_buy_notional + snapshot.aggressive_sell_notional
+        if total <= 0:
+            return 0.0
+
+        if side == SignalSide.LONG:
+            return snapshot.aggressive_net_notional_delta / total
+
+        if side == SignalSide.SHORT:
+            return -snapshot.aggressive_net_notional_delta / total
+
+        return 0.0
+
+    def _absorption_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        if side == SignalSide.LONG:
+            components = [
+                1.0 if snapshot.price_change_pct < 0 else 0.0,
+                self._normalize_ratio(max(snapshot.cvd_delta_ratio, 0.0), scale=0.35),
+                self._normalize_ratio(max(snapshot.volume_delta_ratio, 0.0), scale=0.35),
+                self._normalize_ratio(max(self._notional_delta_ratio(snapshot), 0.0), scale=0.35),
+                self._normalize_ratio(
+                    max(self._directional_aggressive_notional_ratio(snapshot, side), 0.0),
+                    scale=0.35,
+                ),
+            ]
+        elif side == SignalSide.SHORT:
+            components = [
+                1.0 if snapshot.price_change_pct > 0 else 0.0,
+                self._normalize_ratio(abs(min(snapshot.cvd_delta_ratio, 0.0)), scale=0.35),
+                self._normalize_ratio(abs(min(snapshot.volume_delta_ratio, 0.0)), scale=0.35),
+                self._normalize_ratio(abs(min(self._notional_delta_ratio(snapshot), 0.0)), scale=0.35),
+                self._normalize_ratio(
+                    max(self._directional_aggressive_notional_ratio(snapshot, side), 0.0),
+                    scale=0.35,
+                ),
+            ]
+        else:
+            return 0.0
+
+        return max(0.0, min(sum(components) / len(components), 1.0))
+
+    def _large_trade_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        if side == SignalSide.LONG:
+            directional = snapshot.large_buy_trades
+            opposite = snapshot.large_sell_trades
+        elif side == SignalSide.SHORT:
+            directional = snapshot.large_sell_trades
+            opposite = snapshot.large_buy_trades
+        else:
+            return 0.0
+
+        total = directional + opposite
+        if total <= 0:
+            return 0.5
+
+        dominance = directional / total
+        return max(0.0, min(dominance, 1.0))
+
+    def _orderbook_component(
+        self,
+        snapshot: OrderflowCompositeSnapshot,
+        side: SignalSide,
+    ) -> float:
+        if not snapshot.has_orderbook:
+            return 0.5
+
+        signed = snapshot.signed_orderbook_imbalance
+
+        if side == SignalSide.LONG:
+            scale = max(self.thresholds.min_bullish_imbalance_for_long, 0.01)
+            if signed < -scale:
+                return 0.0
+            return 0.5 + (0.5 * self._normalize_ratio(max(signed, 0.0), scale=scale))
+
+        if side == SignalSide.SHORT:
+            scale = max(self.thresholds.min_bearish_imbalance_for_short, 0.01)
+            if signed > scale:
+                return 0.0
+            return 0.5 + (0.5 * self._normalize_ratio(abs(min(signed, 0.0)), scale=scale))
+
+        return 0.0
