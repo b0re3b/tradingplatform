@@ -126,6 +126,7 @@ class SetupType(StrEnum):
     BASIS_DISLOCATION = "basis_dislocation"
     HYBRID = "hybrid"
     UNKNOWN = "unknown"
+    RETEST = "retest"
 
 
 class EntryType(StrEnum):

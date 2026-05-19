@@ -1,10 +1,10 @@
+# trading_system/strategy/strategies/price_action/market_structure_strategy.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from logging import Logger
-from typing import Any, Mapping, cast
-from uuid import uuid4
+from datetime import datetime
+from typing import Any
 
 from analytics.price_action.enums import (
     MarketBias,
@@ -13,54 +13,296 @@ from analytics.price_action.enums import (
     SwingType,
 )
 from core.event_bus import EventBus
-from core.logger import TradingLoggerAdapter
-from strategy.config import StrategyConfig, StrategyDefinitionConfig
-from strategy.enums import (
+from core.scheduler import Scheduler
+from .base import (
+    PRICE_ACTION_FEATURES,
+    PriceActionStrategyConfig,
+    PriceActionTradingStrategy,
+)
+from .utils import (
+    ScoreBreakdown,
+    average_score,
+    confidence_from_components,
+    extract_last_event,
+    extract_last_update,
+    get_path,
+    is_directional_side,
+    is_stale,
+    layer_confidence,
+    layer_strength,
+    market_bias_to_side,
+    market_structure_source_features,
+    normalize_label,
+    parse_datetime,
+    parse_market_bias,
+    parse_structure_event_type,
+    parse_structure_layer,
+    parse_swing_type,
+    quality_filter_reason,
+    select_primary_layer,
+    select_secondary_layer,
+    serialize_for_metadata,
+    structure_event_to_side,
+    to_bool,
+    to_float,
+    unit_score,
+    weighted_score,
+    freshness_score,
+)
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
     SetupType,
-    SignalOrigin,
     SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
-    TriggerType,
+    Timeframe,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    FilterResult,
-    SignalContext,
-    StrategyEvaluation,
-    StrategySignal,
-    confidence_to_grade,
-    confidence_to_strength,
-)
-from strategy.strategies.price_action.base import (
-    PriceActionStrategyBase,
-    apply_definition_metadata,
-    clamp,
-    enum_value,
-    first_non_empty,
-    parse_datetime,
-    safe_bool,
-    safe_float,
-)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)
-class MarketStructureStrategyParams:
+class SwingContext:
     """
-    Local params for MarketStructureStrategy.
+    Normalized swing context for market-structure strategy.
 
-    Runtime gates such as enabled/symbols/timeframes/min_score/min_confidence
-    stay in StrategyConfig / StrategyDefinitionConfig.runtime. These params
-    only define how this strategy consumes analytics.price_action.market_structure.
+    This is strategy-layer DTO only. Analytics models remain in
+    analytics.price_action.
     """
 
-    strategy_name: str = "market_structure_strategy"
+    swing_type: SwingType | None = None
+    price: float | None = None
+    timestamp: datetime | None = None
+    strength: float = 0.0
+    distance_pct: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> SwingContext | None:
+        if payload is None:
+            return None
+
+        swing_type = parse_swing_type(
+            get_path(payload, "swing_type")
+            or get_path(payload, "type")
+            or get_path(payload, "kind")
+        )
+        price = to_float(
+            get_path(payload, "price")
+            or get_path(payload, "level")
+            or get_path(payload, "value")
+        )
+
+        if swing_type is None and price is None:
+            return None
+
+        return cls(
+            swing_type=swing_type,
+            price=price,
+            timestamp=parse_datetime(
+                get_path(payload, "timestamp")
+                or get_path(payload, "time")
+                or get_path(payload, "created_at")
+            ),
+            strength=unit_score(
+                get_path(payload, "strength")
+                or get_path(payload, "score")
+                or get_path(payload, "confidence")
+            ),
+            distance_pct=abs(
+                to_float(
+                    get_path(payload, "distance_pct")
+                    or get_path(payload, "distance_to_price_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            metadata=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class StructureEventContext:
+    """
+    Normalized BOS/CHOCH/MSS event context.
+    """
+
+    event_type: StructureEventType | None = None
+    side: SignalSide = SignalSide.UNKNOWN
+    layer: StructureLayer | None = None
+
+    confidence: float = 0.0
+    score: float = 0.0
+    break_distance_pct: float = 0.0
+    price: float | None = None
+    level: float | None = None
+    timestamp: datetime | None = None
+
+    is_confirmed: bool = False
+    is_liquidity_sweep: bool = False
+
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+        reverse_on_choch: bool = True,
+        reverse_on_mss: bool = True,
+    ) -> StructureEventContext | None:
+        if payload is None:
+            return None
+
+        event_type = parse_structure_event_type(
+            get_path(payload, "event_type")
+            or get_path(payload, "type")
+            or get_path(payload, "kind")
+        )
+        side = structure_event_to_side(
+            payload,
+            reverse_on_choch=reverse_on_choch,
+            reverse_on_mss=reverse_on_mss,
+        )
+
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        if event_type is None and not is_directional_side(side):
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "event_confidence")
+            or get_path(payload, "break_confidence")
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "event_score")
+            or confidence
+        )
+
+        reasons_raw = (
+            get_path(payload, "reasons")
+            or get_path(payload, "reason")
+            or get_path(payload, "confirmations")
+            or []
+        )
+        reasons: list[str] = []
+        if isinstance(reasons_raw, str):
+            reasons = [reasons_raw] if reasons_raw.strip() else []
+        elif isinstance(reasons_raw, (list, tuple, set)):
+            reasons = [str(item).strip() for item in reasons_raw if str(item).strip()]
+
+        return cls(
+            event_type=event_type,
+            side=side,
+            layer=layer,
+            confidence=confidence,
+            score=score,
+            break_distance_pct=abs(
+                to_float(
+                    get_path(payload, "break_distance_pct")
+                    or get_path(payload, "distance_pct")
+                    or get_path(payload, "distance_to_level_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            price=to_float(
+                get_path(payload, "price")
+                or get_path(payload, "break_price")
+                or get_path(payload, "close")
+            ),
+            level=to_float(
+                get_path(payload, "level")
+                or get_path(payload, "broken_level")
+                or get_path(payload, "swing_level")
+            ),
+            timestamp=parse_datetime(
+                get_path(payload, "timestamp")
+                or get_path(payload, "event_time")
+                or get_path(payload, "created_at")
+                or get_path(payload, "time")
+            ),
+            is_confirmed=to_bool(
+                get_path(payload, "confirmed")
+                or get_path(payload, "is_confirmed")
+                or get_path(payload, "valid"),
+                default=confidence > 0.0,
+            ),
+            is_liquidity_sweep=to_bool(
+                get_path(payload, "is_liquidity_sweep")
+                or get_path(payload, "liquidity_sweep")
+                or get_path(payload, "sweep"),
+                default=False,
+            ),
+            reasons=list(dict.fromkeys(reasons)),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class MarketStructureContextView:
+    """
+    Normalized view consumed by MarketStructureStrategy.
+    """
+
+    module: dict[str, Any]
+    primary_layer: dict[str, Any]
+    secondary_layer: dict[str, Any]
+
+    primary_layer_name: StructureLayer | None = None
+    secondary_layer_name: StructureLayer | None = None
+
+    bias: MarketBias = MarketBias.UNKNOWN
+    secondary_bias: MarketBias = MarketBias.UNKNOWN
+
+    last_event: StructureEventContext | None = None
+    last_swing_high: SwingContext | None = None
+    last_swing_low: SwingContext | None = None
+
+    mtf_alignment_score: float = 0.0
+    swing_progression_score: float = 0.0
+    trend_strength: float = 0.0
+    layer_confidence: float = 0.0
+    layer_strength: float = 0.0
+
+    event_time: datetime | None = None
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MarketStructureStrategyConfig(PriceActionStrategyConfig):
+    """
+    Unified market-structure strategy config.
+
+    Strategy idea:
+    - read normalized market_structure context from StrategyContext;
+    - react to BOS / CHOCH / MSS;
+    - optionally use market-bias continuation fallback;
+    - build internal StrategySignal only;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
+    """
 
     prefer_external_layer: bool = True
-    require_alignment: bool = False
-    require_break_event: bool = True
+
+    require_fresh_structure: bool = True
     require_primary_layer_eligible: bool = True
+    require_break_event: bool = True
+    require_alignment: bool = False
 
     allow_bos_entries: bool = True
     allow_choch_reversals: bool = True
@@ -70,1448 +312,821 @@ class MarketStructureStrategyParams:
     reverse_on_choch: bool = True
     reverse_on_mss: bool = True
 
-    require_recent_swing_context: bool = False
-    require_reference_swing_for_break: bool = False
-    allow_breakout_state_without_break_event: bool = False
-
     min_layer_confidence: float = 0.45
+    min_layer_strength: float = 0.25
     min_alignment_score: float = 0.30
     min_break_confidence: float = 0.45
+    min_break_score: float = 0.35
     min_trend_strength: float = 0.20
     min_swing_strength: float = 0.25
     min_swing_progression_score: float = 0.20
     min_break_distance_pct: float = 0.0002
 
-    primary_bias_weight: float = 0.22
-    secondary_bias_weight: float = 0.12
-    break_event_weight: float = 0.24
-    alignment_weight: float = 0.14
-    trend_strength_weight: float = 0.10
-    swing_context_weight: float = 0.10
-    breakout_state_weight: float = 0.04
-    regime_alignment_weight: float = 0.04
+    bos_score_bonus: float = 0.05
+    choch_score_bonus: float = 0.06
+    mss_score_bonus: float = 0.07
+    alignment_score_bonus: float = 0.04
+    liquidity_sweep_bonus: float = 0.03
+    swing_strength_bonus: float = 0.03
 
-    emit_signal_events: bool = False
-    signal_event_name: str = "strategy.price_action.market_structure.signal"
+    score_event_weight: float = 0.34
+    score_layer_weight: float = 0.20
+    score_alignment_weight: float = 0.16
+    score_trend_weight: float = 0.12
+    score_swing_weight: float = 0.10
+    score_freshness_weight: float = 0.08
 
-    freshness_feature_names: tuple[str, ...] = (
-        "analytics.price_action",
-        "analytics.price_action.market_structure",
-        "price_action.market_structure",
-        "market_structure",
+    confidence_event_weight: float = 0.52
+    confidence_context_weight: float = 0.28
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    tag_market_structure_bos: str = "bos"
+    tag_market_structure_choch: str = "choch"
+    tag_market_structure_mss: str = "mss"
+    tag_structure_break: str = "structure_break"
+    tag_bias_continuation: str = "bias_continuation"
+    tag_liquidity_sweep: str = "liquidity_sweep"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.BREAKOUT
+
+    required_price_action_features: tuple[str, ...] = (
+        PRICE_ACTION_FEATURES.MARKET_STRUCTURE,
     )
 
     def validate(self) -> None:
-        PriceActionStrategyBase.validate_bounded_fields(
-            instance=self,
-            field_names=(
-                "min_layer_confidence",
-                "min_alignment_score",
-                "min_break_confidence",
-                "min_trend_strength",
-                "min_swing_strength",
-                "min_swing_progression_score",
-                "primary_bias_weight",
-                "secondary_bias_weight",
-                "break_event_weight",
-                "alignment_weight",
-                "trend_strength_weight",
-                "swing_context_weight",
-                "breakout_state_weight",
-                "regime_alignment_weight",
-            ),
-            minimum=0.0,
-            maximum=1.0,
-        )
+        PriceActionStrategyConfig.validate(self)
 
-        if self.min_break_distance_pct < 0:
-            raise ValueError("min_break_distance_pct must be >= 0")
-
-    @classmethod
-    def from_definition(
-        cls,
-        definition: StrategyDefinitionConfig | None,
-    ) -> "MarketStructureStrategyParams":
-        return apply_definition_metadata(
-            params=cls(),
-            definition=definition,
-        )
-
-
-@dataclass(slots=True)
-class SwingContext:
-    swing_id: str | None = None
-    swing_type: SwingType | None = None
-    timestamp: datetime | None = None
-    price: float | None = None
-    layer: StructureLayer | None = None
-    index: int | None = None
-    candle_open: float | None = None
-    candle_high: float | None = None
-    candle_low: float | None = None
-    candle_close: float | None = None
-    strength: float = 0.0
-    is_confirmed: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def valid(self) -> bool:
-        return bool(
-            self.swing_id
-            and self.swing_type is not None
-            and self.price is not None
-        )
-
-
-@dataclass(slots=True)
-class StructureEventContext:
-    event_id: str | None = None
-    event_type: StructureEventType | None = None
-    timestamp: datetime | None = None
-    price: float | None = None
-    layer: StructureLayer | None = None
-    direction: MarketBias = MarketBias.UNKNOWN
-    swing_id: str | None = None
-    reference_price: float | None = None
-    reference_swing_id: str | None = None
-    confidence: float = 0.0
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def is_break(self) -> bool:
-        return self.event_type in {
-            StructureEventType.BOS,
-            StructureEventType.CHOCH,
-            StructureEventType.MSS,
+        unit_fields = {
+            "min_layer_confidence": self.min_layer_confidence,
+            "min_layer_strength": self.min_layer_strength,
+            "min_alignment_score": self.min_alignment_score,
+            "min_break_confidence": self.min_break_confidence,
+            "min_break_score": self.min_break_score,
+            "min_trend_strength": self.min_trend_strength,
+            "min_swing_strength": self.min_swing_strength,
+            "min_swing_progression_score": self.min_swing_progression_score,
+            "bos_score_bonus": self.bos_score_bonus,
+            "choch_score_bonus": self.choch_score_bonus,
+            "mss_score_bonus": self.mss_score_bonus,
+            "alignment_score_bonus": self.alignment_score_bonus,
+            "liquidity_sweep_bonus": self.liquidity_sweep_bonus,
+            "swing_strength_bonus": self.swing_strength_bonus,
         }
 
-    @property
-    def valid(self) -> bool:
-        return self.event_type is not None and self.price is not None
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
+        if self.min_break_distance_pct < 0:
+            raise StrategyConfigError("min_break_distance_pct must be >= 0")
+
+        score_weights = {
+            "score_event_weight": self.score_event_weight,
+            "score_layer_weight": self.score_layer_weight,
+            "score_alignment_weight": self.score_alignment_weight,
+            "score_trend_weight": self.score_trend_weight,
+            "score_swing_weight": self.score_swing_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+        confidence_weights = {
+            "confidence_event_weight": self.confidence_event_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_market_structure_bos",
+            "tag_market_structure_choch",
+            "tag_market_structure_mss",
+            "tag_structure_break",
+            "tag_bias_continuation",
+            "tag_liquidity_sweep",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_price_action_features:
+            raise StrategyConfigError("required_price_action_features cannot be empty")
+
+        for feature in self.required_price_action_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_price_action_features cannot contain empty feature names"
+                )
 
 
-@dataclass(slots=True)
-class MarketStructureContextView:
+class MarketStructureStrategy(PriceActionTradingStrategy):
     """
-    Normalized view of analytics.price_action.market_structure.MarketStructureState.
+    Unified market-structure strategy.
+
+    Input:
+        StrategyContext with FeatureSource.PRICE_ACTION domain data / features.
+
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    exchange: str | None = None
-    market_type: str | None = None
-    symbol: str | None = None
-    exchange_symbol: str | None = None
-    timeframe: str | None = None
-    key: tuple[str, str, str, str] | None = None
-
-    last_price: float | None = None
-    last_update: datetime | None = None
-
-    internal: dict[str, Any] = field(default_factory=dict)
-    external: dict[str, Any] = field(default_factory=dict)
-    mtf_alignment: dict[str, Any] = field(default_factory=dict)
-
-    last_break_event: StructureEventContext = field(default_factory=StructureEventContext)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    source_feature: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-class MarketStructureStrategy(PriceActionStrategyBase):
-    """
-    Strategy wrapper around analytics.price_action.market_structure.
-
-    Aligned with the current MarketStructureAnalyzer / MarketStructureState contract:
-    - consumes MarketStructureState from PriceActionCompositeState or direct module feature;
-    - validates futures scope through PriceActionStrategyBase;
-    - uses internal/external StructureLayerState;
-    - uses last_swing_high / previous_swing_high / last_swing_low / previous_swing_low;
-    - uses HH/HL/LH/LL sequence context and BOS/CHOCH/MSS break context;
-    - uses MultiTimeframeAlignment;
-    - preserves analytics source metadata in StrategySignal.metadata.
-    """
-
-    analytics_module_name = "market_structure"
+    component_namespace = "strategy.price_action.market_structure"
+    category: StrategyCategory = StrategyCategory.PRICE_ACTION
+    default_setup_type: SetupType = SetupType.BREAKOUT
 
     def __init__(
         self,
         config: StrategyConfig,
         event_bus: EventBus | None = None,
-        logger: Logger | TradingLoggerAdapter | None = None,
-        strategy_name: str = "market_structure_strategy",
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        price_action_config: MarketStructureStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        resolved_price_action_config = (
+            price_action_config or MarketStructureStrategyConfig()
+        )
+        resolved_price_action_config.validate()
+
         super().__init__(
             config=config,
-            strategy_name=strategy_name,
-            params_cls=MarketStructureStrategyParams,
             event_bus=event_bus,
-            logger=logger,
+            scheduler=scheduler,
+            definition=definition,
+            price_action_config=resolved_price_action_config,
+            service_name=service_name,
+        )
+
+        self.structure_config: MarketStructureStrategyConfig = (
+            resolved_price_action_config
         )
 
     @property
-    def _p(self) -> MarketStructureStrategyParams:
-        return cast(MarketStructureStrategyParams, self.params)
+    def strategy_name(self) -> str:
+        return "market_structure"
 
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        try:
-            blocked = self._basic_runtime_gate(context)
-            if blocked is not None:
-                return blocked
-
-            structure = self._extract_market_structure_snapshot(context)
-            if structure.symbol is None and not structure.external and not structure.internal:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="market_structure_snapshot_missing",
-                )
-
-            freshness_filter = self._build_freshness_filter(
-                context=context,
-                filter_name="market_structure_freshness",
-                module_name=self.analytics_module_name,
-                analytics_payload=structure.raw,
-            )
-            if freshness_filter is not None and freshness_filter.blocked:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="stale_market_structure_feature",
-                )
-
-            side = self._resolve_side(context=context, structure=structure)
-            if side == SignalSide.UNKNOWN:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="no_directional_market_structure_signal",
-                    metadata={
-                        "analytics_module": self.analytics_module_name,
-                        "analytics_source_feature": structure.source_feature,
-                        "alignment_score": structure.mtf_alignment.get("alignment_score"),
-                        "last_break_event_type": enum_value(
-                            structure.last_break_event.event_type
-                        ),
-                        "last_break_direction": enum_value(
-                            structure.last_break_event.direction
-                        ),
-                    },
-                )
-
-            primary_layer = self._select_primary_layer(structure)
-            secondary_layer = self._select_secondary_layer(structure)
-
-            score = self._compute_score(
-                context=context,
-                structure=structure,
-                side=side,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-            confidence = self._compute_confidence(
-                context=context,
-                structure=structure,
-                side=side,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-            reasons = self._build_reasons(
-                structure=structure,
-                side=side,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-
-            signal = self._build_signal(
-                context=context,
-                structure=structure,
-                side=side,
-                score=score,
-                confidence=confidence,
-                reasons=reasons,
-                freshness_filter=freshness_filter,
-            )
-
-            return self._finalize_signal_evaluation(
-                context=context,
-                signal=signal,
-                confidence=confidence,
-                score=score,
-                reasons=reasons,
-                metadata={
-                    "analytics_module": self.analytics_module_name,
-                    "analytics_source_feature": structure.source_feature,
-                },
-            )
-
-        except StrategyEvaluationError:
-            raise
-        except Exception as exc:
-            self._logger.exception(
-                "Failed to evaluate market structure strategy | strategy=%s symbol=%s",
-                self.name,
-                getattr(context, "symbol", None),
-            )
-            raise StrategyEvaluationError(
-                f"{self.name}: failed to evaluate market structure context for {context.symbol}"
-            ) from exc
-
-    # ------------------------------------------------------------------
-    # Extraction / normalization
-    # ------------------------------------------------------------------
-
-    def _extract_market_structure_snapshot(
-        self,
-        context: SignalContext,
-    ) -> MarketStructureContextView:
-        payload = self._extract_price_action_module(
-            context,
-            self.analytics_module_name,
-            aliases=(
-                "market_structure",
-                "structure",
-                "price_action.market_structure",
-                "analytics.price_action.market_structure",
-            ),
-            require_scope_match=True,
-        )
-        if payload:
-            return self._normalize_structure_snapshot(payload)
-
-        candidates: list[Any] = [
-            self._mapping_or_empty(getattr(context, "price_action", None)).get(
-                "market_structure"
-            ),
-            self._mapping_or_empty(getattr(context, "price_action", None)).get(
-                "structure"
-            ),
-            self._get_context_feature(context, "price_action.market_structure"),
-            self._get_context_feature(context, "market_structure"),
-            self._get_context_feature(context, "analytics.price_action.market_structure"),
-        ]
-        for candidate in candidates:
-            normalized = self._normalize_structure_snapshot(candidate)
-            if normalized.symbol is not None or normalized.external or normalized.internal:
-                return normalized
-
-        return MarketStructureContextView()
-
-    def _normalize_structure_snapshot(self, payload: Any) -> MarketStructureContextView:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return MarketStructureContextView()
-
-        state = self._normalize_state_payload(payload_mapping)
-        if not state:
-            return MarketStructureContextView()
-
-        internal = self._normalize_layer(state.get("internal"), StructureLayer.INTERNAL)
-        external = self._normalize_layer(state.get("external"), StructureLayer.EXTERNAL)
-        mtf_alignment = self._normalize_alignment(state.get("mtf_alignment"))
-        metadata = dict(self._mapping_or_empty(state.get("metadata")))
-        scope = self._extract_analytics_scope(state)
-
-        key_values = scope.get("key") if isinstance(scope.get("key"), list) else []
-        key_tuple: tuple[str, str, str, str] | None = None
-        if len(key_values) == 4:
-            key_tuple = (
-                str(key_values[0]),
-                str(key_values[1]),
-                str(key_values[2]),
-                str(key_values[3]),
-            )
-
-        return MarketStructureContextView(
-            exchange=scope.get("exchange"),
-            market_type=scope.get("market_type"),
-            symbol=first_non_empty(state.get("symbol"), scope.get("symbol")),
-            exchange_symbol=first_non_empty(
-                state.get("exchange_symbol"),
-                scope.get("exchange_symbol"),
-            ),
-            timeframe=first_non_empty(state.get("timeframe"), scope.get("timeframe")),
-            key=key_tuple,
-            last_price=(
-                safe_float(
-                    first_non_empty(
-                        state.get("last_price"),
-                        payload_mapping.get("last_price"),
-                    ),
-                    0.0,
-                )
-                or None
-            ),
-            last_update=parse_datetime(
-                first_non_empty(
-                    state.get("last_update"),
-                    state.get("updated_at"),
-                    payload_mapping.get("last_update"),
-                    metadata.get("last_update"),
-                    metadata.get("updated_at"),
-                )
-            ),
-            internal=internal,
-            external=external,
-            mtf_alignment=mtf_alignment,
-            last_break_event=self._extract_last_break_event(
-                internal=internal,
-                external=external,
-            ),
-            metadata=metadata,
-            source_feature=state.get("_source_feature"),
-            raw=dict(state),
-        )
-
-    def _normalize_layer(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any]:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return {}
-
-        return {
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "bias": self._parse_market_bias(payload_mapping.get("bias")),
-            "confidence": clamp(
-                safe_float(payload_mapping.get("confidence"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "trend_strength": clamp(
-                safe_float(payload_mapping.get("trend_strength"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "in_breakout": safe_bool(payload_mapping.get("in_breakout"), False),
-            "last_swing_high": self._normalize_swing(
-                payload_mapping.get("last_swing_high"),
-                default_layer,
-                SwingType.HIGH,
-            ),
-            "previous_swing_high": self._normalize_swing(
-                payload_mapping.get("previous_swing_high"),
-                default_layer,
-                SwingType.HIGH,
-            ),
-            "last_swing_low": self._normalize_swing(
-                payload_mapping.get("last_swing_low"),
-                default_layer,
-                SwingType.LOW,
-            ),
-            "previous_swing_low": self._normalize_swing(
-                payload_mapping.get("previous_swing_low"),
-                default_layer,
-                SwingType.LOW,
-            ),
-            "last_hh": self._normalize_structure_event(
-                payload_mapping.get("last_hh"),
-                default_layer,
-            ),
-            "last_hl": self._normalize_structure_event(
-                payload_mapping.get("last_hl"),
-                default_layer,
-            ),
-            "last_lh": self._normalize_structure_event(
-                payload_mapping.get("last_lh"),
-                default_layer,
-            ),
-            "last_ll": self._normalize_structure_event(
-                payload_mapping.get("last_ll"),
-                default_layer,
-            ),
-            "last_bos": self._normalize_structure_event(
-                payload_mapping.get("last_bos"),
-                default_layer,
-            ),
-            "last_choch": self._normalize_structure_event(
-                payload_mapping.get("last_choch"),
-                default_layer,
-            ),
-            "last_mss": self._normalize_structure_event(
-                payload_mapping.get("last_mss"),
-                default_layer,
-            ),
-            "swing_count": int(safe_float(payload_mapping.get("swing_count"), 0.0)),
-            "event_count": int(safe_float(payload_mapping.get("event_count"), 0.0)),
-            "sequence": [
-                str(item)
-                for item in list(payload_mapping.get("sequence", []) or [])
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            strategy_name=self.strategy_name,
+            category=StrategyCategory.PRICE_ACTION,
+            timeframe=Timeframe.M1,
+            tags=[
+                self.structure_config.tag_price_action,
+                self.structure_config.tag_market_structure,
+                self.structure_config.tag_structure_break,
+                self.structure_config.tag_breakout,
+                self.structure_config.tag_reversal,
+                "analytics_price_action",
             ],
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _normalize_swing(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-        default_swing_type: SwingType,
-    ) -> SwingContext | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return None
-
-        price = (
-            safe_float(payload_mapping.get("price"), 0.0)
-            if payload_mapping.get("price") is not None
-            else None
-        )
-        index = (
-            int(safe_float(payload_mapping.get("index"), 0.0))
-            if payload_mapping.get("index") is not None
-            else None
-        )
-
-        return SwingContext(
-            swing_id=payload_mapping.get("swing_id"),
-            swing_type=self._parse_swing_type(payload_mapping.get("swing_type"))
-            or default_swing_type,
-            timestamp=parse_datetime(payload_mapping.get("timestamp")),
-            price=price,
-            layer=self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            index=index,
-            candle_open=(
-                safe_float(payload_mapping.get("candle_open"), 0.0)
-                if payload_mapping.get("candle_open") is not None
-                else None
+            version="2.0.0",
+            description=(
+                "Interprets BOS/CHOCH/MSS and market-bias context from "
+                "normalized price-action StrategyContext and returns internal "
+                "StrategySignal."
             ),
-            candle_high=(
-                safe_float(payload_mapping.get("candle_high"), 0.0)
-                if payload_mapping.get("candle_high") is not None
-                else None
-            ),
-            candle_low=(
-                safe_float(payload_mapping.get("candle_low"), 0.0)
-                if payload_mapping.get("candle_low") is not None
-                else None
-            ),
-            candle_close=(
-                safe_float(payload_mapping.get("candle_close"), 0.0)
-                if payload_mapping.get("candle_close") is not None
-                else None
-            ),
-            strength=clamp(
-                safe_float(payload_mapping.get("strength"), 0.0),
-                0.0,
-                1.0,
-            ),
-            is_confirmed=safe_bool(payload_mapping.get("is_confirmed"), False),
-            metadata=dict(payload_mapping.get("metadata", {}) or {}),
-        )
-
-    def _normalize_structure_event(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> StructureEventContext | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return None
-
-        return StructureEventContext(
-            event_id=payload_mapping.get("event_id"),
-            event_type=self._parse_structure_event_type(
-                payload_mapping.get("event_type")
-            ),
-            timestamp=parse_datetime(payload_mapping.get("timestamp")),
-            price=(
-                safe_float(payload_mapping.get("price"), 0.0)
-                if payload_mapping.get("price") is not None
-                else None
-            ),
-            layer=self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            direction=self._parse_market_bias(payload_mapping.get("direction")),
-            swing_id=payload_mapping.get("swing_id"),
-            reference_price=(
-                safe_float(payload_mapping.get("reference_price"), 0.0)
-                if payload_mapping.get("reference_price") is not None
-                else None
-            ),
-            reference_swing_id=payload_mapping.get("reference_swing_id"),
-            confidence=clamp(
-                safe_float(payload_mapping.get("confidence"), 0.0),
-                0.0,
-                1.0,
-            ),
-            metadata=dict(payload_mapping.get("metadata", {}) or {}),
-        )
-
-    def _normalize_alignment(self, payload: Any) -> dict[str, Any]:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return {}
-
-        return {
-            "higher_timeframe": payload_mapping.get("higher_timeframe"),
-            "higher_timeframe_bias": self._parse_market_bias(
-                payload_mapping.get("higher_timeframe_bias")
-            ),
-            "higher_timeframe_confidence": clamp(
-                safe_float(payload_mapping.get("higher_timeframe_confidence"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "internal_bias_aligned": safe_bool(
-                payload_mapping.get("internal_bias_aligned"),
-                False,
-            ),
-            "external_bias_aligned": safe_bool(
-                payload_mapping.get("external_bias_aligned"),
-                False,
-            ),
-            "internal_with_external_aligned": safe_bool(
-                payload_mapping.get("internal_with_external_aligned"),
-                False,
-            ),
-            "alignment_score": clamp(
-                safe_float(payload_mapping.get("alignment_score"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "last_updated": parse_datetime(payload_mapping.get("last_updated")),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _extract_last_break_event(
-        self,
-        *,
-        internal: Mapping[str, Any],
-        external: Mapping[str, Any],
-    ) -> StructureEventContext:
-        epoch = datetime.min.replace(tzinfo=timezone.utc)
-        candidates: list[StructureEventContext] = []
-
-        for layer in (external, internal):
-            for key in ("last_bos", "last_choch", "last_mss"):
-                event = layer.get(key)
-                if isinstance(event, StructureEventContext) and event.is_break:
-                    candidates.append(event)
-
-        if not candidates:
-            return StructureEventContext()
-
-        def _sort_key(event: StructureEventContext) -> datetime:
-            ts = event.timestamp
-            if ts is None:
-                return epoch
-            if ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            return ts.astimezone(timezone.utc)
-
-        candidates.sort(key=_sort_key, reverse=True)
-        return candidates[0]
-
-    # ------------------------------------------------------------------
-    # Direction / eligibility
-    # ------------------------------------------------------------------
-
-    def _select_primary_layer(
-        self,
-        structure: MarketStructureContextView,
-    ) -> dict[str, Any]:
-        return structure.external if self._p.prefer_external_layer else structure.internal
-
-    def _select_secondary_layer(
-        self,
-        structure: MarketStructureContextView,
-    ) -> dict[str, Any]:
-        return structure.internal if self._p.prefer_external_layer else structure.external
-
-    def _resolve_side(
-        self,
-        context: SignalContext,
-        structure: MarketStructureContextView,
-    ) -> SignalSide:
-        primary_layer = self._select_primary_layer(structure)
-        secondary_layer = self._select_secondary_layer(structure)
-        last_break = structure.last_break_event
-
-        if self._p.require_alignment and not self._alignment_eligible(structure):
-            return SignalSide.UNKNOWN
-
-        if last_break.is_break:
-            if not self._break_event_eligible(last_break, structure=structure):
-                return SignalSide.UNKNOWN
-
-            side = self._side_from_break_event(last_break)
-            if side == SignalSide.UNKNOWN:
-                return SignalSide.UNKNOWN
-
-            if self._p.require_primary_layer_eligible and not self._layer_eligible(
-                primary_layer
-            ):
-                return SignalSide.UNKNOWN
-
-            if not self._side_consistent_with_structure(
-                side,
-                primary_layer,
-                secondary_layer,
-                structure,
-            ):
-                return SignalSide.UNKNOWN
-
-            return side
-
-        if self._p.require_break_event and not self._p.allow_breakout_state_without_break_event:
-            return SignalSide.UNKNOWN
-
-        if self._p.allow_breakout_state_without_break_event:
-            if safe_bool(primary_layer.get("in_breakout"), False) and self._layer_eligible(
-                primary_layer
-            ):
-                return self._bias_to_side(primary_layer.get("bias", MarketBias.UNKNOWN))
-
-        if not self._p.allow_bias_continuation_fallback:
-            return SignalSide.UNKNOWN
-
-        if not self._layer_eligible(primary_layer):
-            return SignalSide.UNKNOWN
-
-        primary_side = self._bias_to_side(primary_layer.get("bias", MarketBias.UNKNOWN))
-        if primary_side == SignalSide.UNKNOWN:
-            return SignalSide.UNKNOWN
-
-        if not self._side_consistent_with_structure(
-            primary_side,
-            primary_layer,
-            secondary_layer,
-            structure,
-        ):
-            return SignalSide.UNKNOWN
-
-        return primary_side
-
-    def _break_event_eligible(
-        self,
-        event: StructureEventContext,
-        *,
-        structure: MarketStructureContextView,
-    ) -> bool:
-        if not event.is_break:
-            return False
-
-        if event.confidence < self._p.min_break_confidence:
-            return False
-
-        if event.event_type == StructureEventType.BOS and not self._p.allow_bos_entries:
-            return False
-
-        if (
-            event.event_type == StructureEventType.CHOCH
-            and not self._p.allow_choch_reversals
-        ):
-            return False
-
-        if event.event_type == StructureEventType.MSS and not self._p.allow_mss_reversals:
-            return False
-
-        if self._p.require_reference_swing_for_break and not event.reference_swing_id:
-            return False
-
-        if self._p.min_break_distance_pct > 0 and event.reference_price and event.price:
-            distance_pct = abs(event.price - event.reference_price) / event.reference_price
-            if distance_pct < self._p.min_break_distance_pct:
-                return False
-
-        if self._p.require_recent_swing_context:
-            event_layer = (
-                structure.external
-                if event.layer == StructureLayer.EXTERNAL
-                else structure.internal
-            )
-            if not self._layer_has_recent_swings(event_layer):
-                return False
-
-        return True
-
-    def _side_from_break_event(self, event: StructureEventContext) -> SignalSide:
-        if event.event_type == StructureEventType.BOS:
-            return self._bias_to_side(event.direction)
-
-        if event.event_type == StructureEventType.CHOCH:
-            if not self._p.reverse_on_choch:
-                return SignalSide.UNKNOWN
-            return self._bias_to_side(event.direction)
-
-        if event.event_type == StructureEventType.MSS:
-            if not self._p.reverse_on_mss:
-                return SignalSide.UNKNOWN
-            return self._bias_to_side(event.direction)
-
-        return SignalSide.UNKNOWN
-
-    def _alignment_eligible(self, structure: MarketStructureContextView) -> bool:
-        mtf = structure.mtf_alignment
-        if not mtf:
-            return False
-
-        if (
-            clamp(safe_float(mtf.get("alignment_score"), 0.0), 0.0, 1.0)
-            < self._p.min_alignment_score
-        ):
-            return False
-
-        return safe_bool(mtf.get("internal_with_external_aligned"), False) or safe_bool(
-            mtf.get("external_bias_aligned"),
-            False,
-        )
-
-    def _layer_eligible(self, layer: Mapping[str, Any]) -> bool:
-        if not layer:
-            return False
-
-        confidence = clamp(safe_float(layer.get("confidence"), 0.0), 0.0, 1.0)
-        trend_strength = clamp(
-            safe_float(layer.get("trend_strength"), 0.0),
-            0.0,
-            1.0,
-        )
-
-        if confidence < self._p.min_layer_confidence:
-            return False
-
-        if trend_strength < self._p.min_trend_strength:
-            return False
-
-        if self._p.require_recent_swing_context and not self._layer_has_recent_swings(
-            layer
-        ):
-            return False
-
-        return True
-
-    def _layer_has_recent_swings(self, layer: Mapping[str, Any]) -> bool:
-        last_high = layer.get("last_swing_high")
-        last_low = layer.get("last_swing_low")
-        return (
-            isinstance(last_high, SwingContext)
-            and last_high.valid
-            and isinstance(last_low, SwingContext)
-            and last_low.valid
-        )
-
-    def _side_consistent_with_structure(
-        self,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        structure: MarketStructureContextView,
-    ) -> bool:
-        primary_bias = primary_layer.get("bias", MarketBias.UNKNOWN)
-        primary_side = self._bias_to_side(primary_bias)
-
-        if primary_side not in {SignalSide.UNKNOWN, side}:
-            return False
-
-        if self._p.require_alignment:
-            mtf = structure.mtf_alignment
-            if side == SignalSide.LONG and mtf.get("higher_timeframe_bias") == MarketBias.BEARISH:
-                return False
-            if side == SignalSide.SHORT and mtf.get("higher_timeframe_bias") == MarketBias.BULLISH:
-                return False
-
-        secondary_bias = secondary_layer.get("bias", MarketBias.UNKNOWN)
-        secondary_side = self._bias_to_side(secondary_bias)
-
-        if secondary_side not in {SignalSide.UNKNOWN, side}:
-            alignment_score = clamp(
-                safe_float(structure.mtf_alignment.get("alignment_score"), 0.0),
-                0.0,
-                1.0,
-            )
-            if alignment_score < self._p.min_alignment_score:
-                return False
-
-        return True
-
-    # ------------------------------------------------------------------
-    # Score / confidence
-    # ------------------------------------------------------------------
-
-    def _compute_score(
-        self,
-        context: SignalContext,
-        structure: MarketStructureContextView,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> float:
-        score = 0.0
-
-        score += self._p.primary_bias_weight * self._bias_alignment_score(
-            primary_layer,
-            side,
-        )
-        score += self._p.secondary_bias_weight * self._bias_alignment_score(
-            secondary_layer,
-            side,
-        )
-        score += self._p.break_event_weight * self._break_event_score(
-            structure.last_break_event,
-            side,
-        )
-        score += self._p.alignment_weight * self._mtf_alignment_score(structure, side)
-        score += self._p.trend_strength_weight * clamp(
-            safe_float(primary_layer.get("trend_strength"), 0.0),
-            0.0,
-            1.0,
-        )
-        score += self._p.swing_context_weight * self._swing_context_score(
-            primary_layer,
-            side,
-        )
-
-        if safe_bool(primary_layer.get("in_breakout"), False):
-            score += self._p.breakout_state_weight
-
-        score += self._p.regime_alignment_weight * self._regime_alignment_score(
-            context=context,
-            side=side,
-        )
-
-        return clamp(score, 0.0, 1.0)
-
-    def _compute_confidence(
-        self,
-        context: SignalContext,
-        structure: MarketStructureContextView,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> float:
-        components: list[float] = [
-            clamp(safe_float(primary_layer.get("confidence"), 0.0), 0.0, 1.0),
-            clamp(safe_float(primary_layer.get("trend_strength"), 0.0), 0.0, 1.0),
-            self._bias_alignment_score(primary_layer, side),
-            self._swing_context_score(primary_layer, side),
-        ]
-
-        if secondary_layer:
-            components.append(self._bias_alignment_score(secondary_layer, side))
-
-        if structure.last_break_event.is_break:
-            components.append(self._break_event_score(structure.last_break_event, side))
-
-        alignment_score = self._mtf_alignment_score(structure, side)
-        if alignment_score > 0:
-            components.append(alignment_score)
-
-        components.append(self._regime_alignment_score(context=context, side=side))
-
-        return clamp(sum(components) / len(components), 0.0, 1.0)
-
-    def _bias_alignment_score(self, layer: Mapping[str, Any], side: SignalSide) -> float:
-        if not layer:
-            return 0.0
-
-        layer_side = self._bias_to_side(layer.get("bias", MarketBias.UNKNOWN))
-        confidence = clamp(safe_float(layer.get("confidence"), 0.0), 0.0, 1.0)
-        trend_strength = clamp(
-            safe_float(layer.get("trend_strength"), 0.0),
-            0.0,
-            1.0,
-        )
-
-        if layer_side == side:
-            return clamp((confidence * 0.60) + (trend_strength * 0.40), 0.0, 1.0)
-
-        if layer_side == SignalSide.UNKNOWN:
-            return 0.25 * confidence
-
-        return 0.0
-
-    def _break_event_score(self, event: StructureEventContext, side: SignalSide) -> float:
-        if not event.is_break:
-            return 0.0
-
-        if self._side_from_break_event(event) != side:
-            return 0.0
-
-        base = event.confidence
-
-        if event.event_type == StructureEventType.BOS:
-            base += 0.08
-        elif event.event_type == StructureEventType.CHOCH:
-            base += 0.10
-        elif event.event_type == StructureEventType.MSS:
-            base += 0.12
-
-        if event.reference_swing_id:
-            base += 0.04
-
-        if event.swing_id:
-            base += 0.03
-
-        if event.reference_price and event.price:
-            distance_pct = abs(event.price - event.reference_price) / event.reference_price
-            base += min(0.08, distance_pct * 10.0)
-
-        return clamp(base, 0.0, 1.0)
-
-    def _mtf_alignment_score(
-        self,
-        structure: MarketStructureContextView,
-        side: SignalSide,
-    ) -> float:
-        mtf = structure.mtf_alignment
-        if not mtf:
-            return 0.0
-
-        score = clamp(safe_float(mtf.get("alignment_score"), 0.0), 0.0, 1.0)
-        htf_bias = mtf.get("higher_timeframe_bias", MarketBias.UNKNOWN)
-        htf_confidence = clamp(
-            safe_float(mtf.get("higher_timeframe_confidence"), 0.0),
-            0.0,
-            1.0,
-        )
-
-        if self._bias_to_side(htf_bias) == side:
-            score = max(score, htf_confidence)
-        elif self._bias_to_side(htf_bias) not in {SignalSide.UNKNOWN, side}:
-            score *= 0.50
-
-        if safe_bool(mtf.get("internal_with_external_aligned"), False):
-            score = max(score, self._p.min_alignment_score)
-
-        return clamp(score, 0.0, 1.0)
-
-    def _swing_context_score(self, layer: Mapping[str, Any], side: SignalSide) -> float:
-        if not layer:
-            return 0.0
-
-        last_high = layer.get("last_swing_high")
-        previous_high = layer.get("previous_swing_high")
-        last_low = layer.get("last_swing_low")
-        previous_low = layer.get("previous_swing_low")
-
-        score = 0.0
-
-        swing_strengths = [
-            swing.strength
-            for swing in (last_high, previous_high, last_low, previous_low)
-            if isinstance(swing, SwingContext) and swing.valid
-        ]
-        if swing_strengths:
-            score += min(0.45, sum(swing_strengths) / len(swing_strengths) * 0.45)
-
-        progression = self._swing_progression_score(
-            last_high=last_high,
-            previous_high=previous_high,
-            last_low=last_low,
-            previous_low=previous_low,
-            side=side,
-        )
-        score += 0.40 * progression
-
-        sequence = [
-            str(item).lower()
-            for item in list(layer.get("sequence", []) or [])
-        ]
-
-        if side == SignalSide.LONG and any(
-            item in {"hh", "hl", "bos"} for item in sequence[-4:]
-        ):
-            score += 0.15
-
-        if side == SignalSide.SHORT and any(
-            item in {"lh", "ll", "bos"} for item in sequence[-4:]
-        ):
-            score += 0.15
-
-        return clamp(score, 0.0, 1.0)
-
-    def _swing_progression_score(
-        self,
-        *,
-        last_high: Any,
-        previous_high: Any,
-        last_low: Any,
-        previous_low: Any,
-        side: SignalSide,
-    ) -> float:
-        if side == SignalSide.LONG:
-            higher_high = self._swing_price_gt(last_high, previous_high)
-            higher_low = self._swing_price_gt(last_low, previous_low)
-
-            if higher_high and higher_low:
-                return 1.0
-            if higher_high or higher_low:
-                return 0.55
-            return 0.0
-
-        if side == SignalSide.SHORT:
-            lower_high = self._swing_price_lt(last_high, previous_high)
-            lower_low = self._swing_price_lt(last_low, previous_low)
-
-            if lower_high and lower_low:
-                return 1.0
-            if lower_high or lower_low:
-                return 0.55
-            return 0.0
-
-        return 0.0
-
-    def _swing_price_gt(self, current: Any, previous: Any) -> bool:
-        return (
-            isinstance(current, SwingContext)
-            and isinstance(previous, SwingContext)
-            and current.price is not None
-            and previous.price is not None
-            and current.price > previous.price
-        )
-
-    def _swing_price_lt(self, current: Any, previous: Any) -> bool:
-        return (
-            isinstance(current, SwingContext)
-            and isinstance(previous, SwingContext)
-            and current.price is not None
-            and previous.price is not None
-            and current.price < previous.price
-        )
-
-    # ------------------------------------------------------------------
-    # Reasons / signal build
-    # ------------------------------------------------------------------
-
-    def _build_reasons(
-        self,
-        structure: MarketStructureContextView,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> list[str]:
-        reasons: list[str] = []
-
-        if side == SignalSide.LONG:
-            reasons.append("market_structure_bullish")
-        elif side == SignalSide.SHORT:
-            reasons.append("market_structure_bearish")
-
-        primary_name = "external" if self._p.prefer_external_layer else "internal"
-        secondary_name = "internal" if self._p.prefer_external_layer else "external"
-
-        reasons.append(f"primary_layer_{primary_name}")
-        reasons.append(f"{primary_name}_bias_{enum_value(primary_layer.get('bias'))}")
-
-        secondary_side = self._bias_to_side(
-            secondary_layer.get("bias", MarketBias.UNKNOWN)
-        )
-        if secondary_side == side:
-            reasons.append(f"{secondary_name}_bias_confirmation")
-
-        last_break = structure.last_break_event
-        if last_break.is_break:
-            reasons.append(f"last_break_{enum_value(last_break.event_type)}")
-            reasons.append(f"break_layer_{enum_value(last_break.layer)}")
-            if last_break.reference_swing_id:
-                reasons.append("break_has_reference_swing")
-
-        if safe_bool(primary_layer.get("in_breakout"), False):
-            reasons.append("primary_layer_in_breakout")
-
-        swing_score = self._swing_context_score(primary_layer, side)
-        if swing_score >= self._p.min_swing_progression_score:
-            reasons.append("swing_progression_supports_side")
-
-        mtf_score = self._mtf_alignment_score(structure, side)
-        if mtf_score >= self._p.min_alignment_score:
-            reasons.append("mtf_alignment_supports_side")
-
-        return reasons
-
-    def _build_signal(
-        self,
-        context: SignalContext,
-        structure: MarketStructureContextView,
-        side: SignalSide,
-        score: float,
-        confidence: float,
-        reasons: list[str],
-        freshness_filter: FilterResult | None,
-    ) -> StrategySignal:
-        primary_layer = self._select_primary_layer(structure)
-        secondary_layer = self._select_secondary_layer(structure)
-        last_break = structure.last_break_event
-
-        selected_entity = (
-            self._event_context_to_metadata(last_break)
-            if last_break.is_break
-            else None
-        )
-        if selected_entity is None:
-            selected_entity = self._layer_selected_entity(primary_layer, side)
-
-        analytics_metadata = self._build_analytics_source_metadata(
-            module_name=self.analytics_module_name,
-            payload=structure.raw,
-            selected_entity=selected_entity,
-            extra={
-                "signal_id": uuid4().hex,
-                "module": self.name,
-                "source": "analytics.price_action.market_structure",
-                "market_structure_timeframe": structure.timeframe,
-                "market_structure_last_update": (
-                    structure.last_update.isoformat()
-                    if structure.last_update
-                    else None
-                ),
-                "market_structure_last_price": structure.last_price,
-                "primary_layer": enum_value(primary_layer.get("layer")),
-                "primary_bias": enum_value(primary_layer.get("bias")),
-                "primary_confidence": safe_float(primary_layer.get("confidence"), 0.0),
-                "primary_trend_strength": safe_float(
-                    primary_layer.get("trend_strength"),
-                    0.0,
-                ),
-                "primary_in_breakout": safe_bool(
-                    primary_layer.get("in_breakout"),
-                    False,
-                ),
-                "secondary_layer": enum_value(secondary_layer.get("layer")),
-                "secondary_bias": enum_value(secondary_layer.get("bias")),
-                "secondary_confidence": safe_float(
-                    secondary_layer.get("confidence"),
-                    0.0,
-                ),
-                "alignment_score": safe_float(
-                    structure.mtf_alignment.get("alignment_score"),
-                    0.0,
-                ),
-                "higher_timeframe": structure.mtf_alignment.get("higher_timeframe"),
-                "higher_timeframe_bias": enum_value(
-                    structure.mtf_alignment.get("higher_timeframe_bias")
-                ),
-                "higher_timeframe_confidence": safe_float(
-                    structure.mtf_alignment.get("higher_timeframe_confidence"),
-                    0.0,
-                ),
-                "last_break_type": enum_value(last_break.event_type),
-                "last_break_direction": enum_value(last_break.direction),
-                "last_break_confidence": last_break.confidence,
-                "last_break_layer": enum_value(last_break.layer),
-                "last_break_event_id": last_break.event_id,
-                "last_break_swing_id": last_break.swing_id,
-                "last_break_reference_swing_id": last_break.reference_swing_id,
-                "swing_context_score": self._swing_context_score(
-                    primary_layer,
-                    side,
-                ),
+            required_features=set(self.required_features()),
+            supported_regimes={
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.BREAKOUT,
+                MarketRegime.SQUEEZE,
+                MarketRegime.RANGING,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.UNKNOWN,
+            },
+            metadata={
+                "source": "analytics.price_action",
+                "strategy_type": "market_structure",
+                "base_class": "PriceActionTradingStrategy",
+                "canonical_payload": "PriceActionCompositeSnapshot",
+                "uses_market_structure": True,
+                "uses_bos": True,
+                "uses_choch": True,
+                "uses_mss": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
             },
         )
 
-        signal = StrategySignal(
-            symbol=context.symbol,
-            side=side,
-            strategy_name=self.name,
-            category=StrategyCategory.PRICE_ACTION,
-            timeframe=context.timeframe,
-            setup_type=self._resolve_setup_type(last_break),
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=confidence_to_strength(confidence),
-            confidence_grade=confidence_to_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=self._resolve_trigger_type(last_break),
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self._resolve_priority(
-                last_break=last_break,
-                confidence=confidence,
-                score=score,
-                structure=structure,
-            ),
-            regime=self._resolve_market_regime(context),
-            metadata=analytics_metadata,
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.structure_config.required_price_action_features
         )
 
-        for reason in reasons:
-            signal.add_reason(reason)
-
-        signal.add_source_feature("analytics.price_action")
-        signal.add_source_feature("analytics.price_action.market_structure")
-        signal.add_source_feature("price_action.market_structure")
-
-        if freshness_filter is not None:
-            signal.add_filter_result(freshness_filter)
-
-        regime_filter = self._build_regime_filter(context=context, side=side)
-        if regime_filter is not None:
-            signal.add_filter_result(regime_filter)
-
-        signal.validate()
-        return signal
-
-    def _resolve_setup_type(self, last_break: StructureEventContext) -> SetupType:
-        if last_break.event_type == StructureEventType.BOS:
-            return SetupType.BREAKOUT
-
-        if last_break.event_type in {StructureEventType.CHOCH, StructureEventType.MSS}:
-            return SetupType.REVERSAL
-
-        return SetupType.CONTINUATION
-
-    def _resolve_trigger_type(self, last_break: StructureEventContext) -> TriggerType:
-        if last_break.is_break:
-            return TriggerType.PRIMARY
-        return TriggerType.DERIVED
-
-    def _resolve_priority(
+    async def generate_signal(
         self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_price_action_data(
+            context,
+            tuple(self.structure_config.required_price_action_features),
+        ):
+            return None
+
+        if self.has_stale_price_action_features(
+            context,
+            tuple(self.structure_config.required_price_action_features),
+        ):
+            return None
+
+        view = self._extract_view(context)
+        if view is None:
+            return None
+
+        if (
+            self.structure_config.require_fresh_structure
+            and is_stale(
+                event_time=view.event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.structure_config.stale_feature_max_age_seconds,
+            )
+        ):
+            return None
+
+        common_rejection = quality_filter_reason(
+            view.primary_layer,
+            min_confidence=self.structure_config.min_layer_confidence,
+            min_score=self.structure_config.min_layer_strength,
+            stale_after_seconds=self.structure_config.stale_feature_max_age_seconds,
+            now=context.timestamp,
+        )
+        if common_rejection is not None and self.structure_config.require_primary_layer_eligible:
+            return None
+
+        side = self._infer_side(view)
+        if not is_directional_side(side):
+            return None
+
+        setup_type = self._infer_setup_type(view)
+
+        if not self._passes_filters(view=view, side=side, setup_type=setup_type):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            view=view,
+            side=side,
+            setup_type=setup_type,
+        )
+
+        if breakdown.score < self.structure_config.min_signal_score:
+            return None
+
+        if breakdown.confidence < self.structure_config.min_signal_confidence:
+            return None
+
+        source_features = self._source_features(view)
+        tags = self._tags(view=view, setup_type=setup_type)
+
+        event_label = (
+            normalize_label(view.last_event.event_type)
+            if view.last_event is not None
+            else "bias_continuation"
+        )
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "market_structure_signal",
+                    f"side:{side.value}",
+                    f"setup_type:{setup_type.value}",
+                    f"event:{event_label}",
+                    *view.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "price_action_setup_family": "market_structure",
+            "price_action_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "event_time": view.event_time.isoformat() if view.event_time else None,
+            "primary_layer_name": normalize_label(view.primary_layer_name),
+            "secondary_layer_name": normalize_label(view.secondary_layer_name),
+            "bias": normalize_label(view.bias),
+            "secondary_bias": normalize_label(view.secondary_bias),
+            "last_event": serialize_for_metadata(view.last_event),
+            "last_swing_high": serialize_for_metadata(view.last_swing_high),
+            "last_swing_low": serialize_for_metadata(view.last_swing_low),
+            "primary_layer": serialize_for_metadata(view.primary_layer),
+            "secondary_layer": serialize_for_metadata(view.secondary_layer),
+            "mtf_alignment_score": view.mtf_alignment_score,
+            "swing_progression_score": view.swing_progression_score,
+            "trend_strength": view.trend_strength,
+            "layer_confidence": view.layer_confidence,
+            "layer_strength": view.layer_strength,
+            "mapped_side": side.value,
+            "setup_type": setup_type.value,
+            "raw": serialize_for_metadata(view.raw),
+        }
+
+        return self.build_price_action_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.structure_config.default_priority,
+        )
+
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
+
+    def _extract_view(
+        self,
+        context: StrategyContext,
+    ) -> MarketStructureContextView | None:
+        module = self.resolve_price_action_module(
+            context,
+            "market_structure",
+            aliases=("structure",),
+        )
+        if not module:
+            return None
+
+        primary = select_primary_layer(
+            module,
+            prefer_external_layer=self.structure_config.prefer_external_layer,
+        )
+        secondary = select_secondary_layer(
+            module,
+            prefer_external_layer=self.structure_config.prefer_external_layer,
+        )
+
+        if not primary:
+            return None
+
+        primary_layer_name = self._extract_layer_name(
+            primary,
+            fallback=StructureLayer.EXTERNAL
+            if self.structure_config.prefer_external_layer
+            else StructureLayer.INTERNAL,
+        )
+        secondary_layer_name = self._extract_layer_name(
+            secondary,
+            fallback=StructureLayer.INTERNAL
+            if self.structure_config.prefer_external_layer
+            else StructureLayer.EXTERNAL,
+        )
+
+        bias = parse_market_bias(
+            get_path(primary, "bias")
+            or get_path(primary, "market_bias")
+            or get_path(module, "bias")
+        )
+        secondary_bias = parse_market_bias(
+            get_path(secondary, "bias")
+            or get_path(secondary, "market_bias")
+        )
+
+        last_event_payload = (
+            get_path(primary, "last_break_event")
+            or get_path(primary, "last_event")
+            or get_path(module, "last_break_event")
+            or get_path(module, "last_event")
+            or extract_last_event(module)
+        )
+        last_event = StructureEventContext.from_payload(
+            last_event_payload,
+            fallback_layer=primary_layer_name,
+            reverse_on_choch=self.structure_config.reverse_on_choch,
+            reverse_on_mss=self.structure_config.reverse_on_mss,
+        )
+
+        last_swing_high = SwingContext.from_payload(
+            get_path(primary, "last_swing_high")
+            or get_path(primary, "swing_high")
+            or get_path(module, "last_swing_high")
+        )
+        last_swing_low = SwingContext.from_payload(
+            get_path(primary, "last_swing_low")
+            or get_path(primary, "swing_low")
+            or get_path(module, "last_swing_low")
+        )
+
+        mtf_alignment_score = unit_score(
+            get_path(module, "mtf_alignment_score")
+            or get_path(module, "mtf_alignment.score")
+            or get_path(module, "alignment_score")
+            or get_path(primary, "alignment_score")
+        )
+        swing_progression_score = unit_score(
+            get_path(primary, "swing_progression_score")
+            or get_path(module, "swing_progression_score")
+            or get_path(module, "swing_progression.score")
+        )
+        trend_strength = unit_score(
+            get_path(primary, "trend_strength")
+            or get_path(module, "trend_strength")
+            or get_path(module, "trend.strength")
+        )
+
+        event_time = (
+            last_event.timestamp if last_event is not None else None
+        ) or extract_last_update(primary) or extract_last_update(module)
+
+        reasons = self._extract_reasons(module, primary, last_event)
+
+        return MarketStructureContextView(
+            module=module,
+            primary_layer=primary,
+            secondary_layer=secondary,
+            primary_layer_name=primary_layer_name,
+            secondary_layer_name=secondary_layer_name,
+            bias=bias,
+            secondary_bias=secondary_bias,
+            last_event=last_event,
+            last_swing_high=last_swing_high,
+            last_swing_low=last_swing_low,
+            mtf_alignment_score=mtf_alignment_score,
+            swing_progression_score=swing_progression_score,
+            trend_strength=trend_strength,
+            layer_confidence=layer_confidence(primary),
+            layer_strength=layer_strength(primary),
+            event_time=event_time,
+            reasons=reasons,
+            raw=module,
+        )
+
+    @staticmethod
+    def _extract_layer_name(
+        layer: dict[str, Any],
         *,
-        last_break: StructureEventContext,
-        confidence: float,
-        score: float,
-        structure: MarketStructureContextView,
-    ) -> SignalPriority:
-        if (
-            last_break.event_type in {StructureEventType.CHOCH, StructureEventType.MSS}
-            and confidence >= 0.70
+        fallback: StructureLayer,
+    ) -> StructureLayer:
+        return (
+            parse_structure_layer(
+                get_path(layer, "layer")
+                or get_path(layer, "structure_layer")
+                or get_path(layer, "name"),
+                default=fallback,
+            )
+            or fallback
+        )
+
+    @staticmethod
+    def _extract_reasons(
+        module: dict[str, Any],
+        primary: dict[str, Any],
+        event: StructureEventContext | None,
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        for value in (
+            get_path(module, "reasons"),
+            get_path(primary, "reasons"),
+            get_path(module, "confirmations"),
+            get_path(primary, "confirmations"),
         ):
-            return SignalPriority.HIGH
+            if isinstance(value, str) and value.strip():
+                reasons.append(value.strip())
+            elif isinstance(value, (list, tuple, set)):
+                reasons.extend(str(item).strip() for item in value if str(item).strip())
 
-        if last_break.event_type == StructureEventType.BOS and confidence >= 0.75:
-            return SignalPriority.HIGH
+        if event is not None:
+            reasons.extend(event.reasons)
 
-        if confidence >= 0.85 and score >= 0.75:
-            return SignalPriority.HIGH
-
-        if (
-            self._mtf_alignment_score(structure, self._side_from_break_event(last_break))
-            >= 0.75
-            and confidence >= 0.72
-        ):
-            return SignalPriority.HIGH
-
-        return SignalPriority.MEDIUM
-
-    def _layer_selected_entity(
-        self,
-        layer: Mapping[str, Any],
-        side: SignalSide,
-    ) -> dict[str, Any] | None:
-        if side == SignalSide.LONG:
-            preferred = layer.get("last_swing_low") or layer.get("last_swing_high")
-        elif side == SignalSide.SHORT:
-            preferred = layer.get("last_swing_high") or layer.get("last_swing_low")
-        else:
-            preferred = None
-
-        if isinstance(preferred, SwingContext):
-            return self._swing_context_to_metadata(preferred)
-
-        return None
-
-    def _swing_context_to_metadata(self, swing: SwingContext) -> dict[str, Any]:
-        return {
-            "swing_id": swing.swing_id,
-            "swing_type": enum_value(swing.swing_type),
-            "timestamp": swing.timestamp.isoformat() if swing.timestamp else None,
-            "price": swing.price,
-            "layer": enum_value(swing.layer),
-            "index": swing.index,
-            "strength": swing.strength,
-            "is_confirmed": swing.is_confirmed,
-            "metadata": dict(swing.metadata),
-        }
-
-    def _event_context_to_metadata(
-        self,
-        event: StructureEventContext,
-    ) -> dict[str, Any]:
-        return {
-            "event_id": event.event_id,
-            "event_type": enum_value(event.event_type),
-            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
-            "price": event.price,
-            "layer": enum_value(event.layer),
-            "direction": enum_value(event.direction),
-            "swing_id": event.swing_id,
-            "reference_price": event.reference_price,
-            "reference_swing_id": event.reference_swing_id,
-            "confidence": event.confidence,
-            "metadata": dict(event.metadata),
-        }
+        return list(dict.fromkeys(reasons))
 
     # ------------------------------------------------------------------
-    # Enum parsing helpers
+    # Mapping / filters
     # ------------------------------------------------------------------
 
-    def _bias_to_side(self, bias: Any) -> SignalSide:
-        parsed = self._parse_market_bias(bias)
+    def _infer_side(self, view: MarketStructureContextView) -> SignalSide:
+        event = view.last_event
 
-        if parsed == MarketBias.BULLISH:
-            return SignalSide.LONG
+        if event is not None:
+            event_type = normalize_label(event.event_type)
 
-        if parsed == MarketBias.BEARISH:
-            return SignalSide.SHORT
+            if event_type == "bos" and self.structure_config.allow_bos_entries:
+                if is_directional_side(event.side):
+                    return event.side
+
+            if event_type == "choch" and self.structure_config.allow_choch_reversals:
+                if is_directional_side(event.side):
+                    return event.side
+
+            if event_type == "mss" and self.structure_config.allow_mss_reversals:
+                if is_directional_side(event.side):
+                    return event.side
+
+        if self.structure_config.allow_bias_continuation_fallback:
+            return market_bias_to_side(view.bias)
 
         return SignalSide.UNKNOWN
 
-    def _parse_market_bias(self, value: Any) -> MarketBias:
-        raw = enum_value(value)
-        mapping = {
-            "bullish": MarketBias.BULLISH,
-            "bearish": MarketBias.BEARISH,
-            "ranging": MarketBias.RANGING,
-            "range": MarketBias.RANGING,
-            "neutral": MarketBias.RANGING,
-            "unknown": MarketBias.UNKNOWN,
+    def _infer_setup_type(
+        self,
+        view: MarketStructureContextView,
+    ) -> SetupType:
+        event = view.last_event
+        if event is None or event.event_type is None:
+            return SetupType.CONTINUATION
+
+        event_type = normalize_label(event.event_type)
+
+        if event_type == "bos":
+            return SetupType.BREAKOUT
+
+        if event_type in {"choch", "mss"}:
+            return SetupType.REVERSAL
+
+        return self.structure_config.default_setup_type
+
+    def _passes_filters(
+        self,
+        *,
+        view: MarketStructureContextView,
+        side: SignalSide,
+        setup_type: SetupType,
+    ) -> bool:
+        if self.structure_config.require_break_event and view.last_event is None:
+            if not self.structure_config.allow_bias_continuation_fallback:
+                return False
+
+        if view.layer_confidence < self.structure_config.min_layer_confidence:
+            return False
+
+        if view.layer_strength < self.structure_config.min_layer_strength:
+            return False
+
+        if self.structure_config.require_alignment:
+            if view.mtf_alignment_score < self.structure_config.min_alignment_score:
+                return False
+
+        if view.trend_strength < self.structure_config.min_trend_strength:
+            return False
+
+        if view.swing_progression_score < self.structure_config.min_swing_progression_score:
+            if setup_type is SetupType.CONTINUATION:
+                return False
+
+        event = view.last_event
+        if event is not None:
+            if event.confidence < self.structure_config.min_break_confidence:
+                return False
+
+            if event.score < self.structure_config.min_break_score:
+                return False
+
+            if event.break_distance_pct < self.structure_config.min_break_distance_pct:
+                return False
+
+            event_type = normalize_label(event.event_type)
+            if event_type == "bos" and not self.structure_config.allow_bos_entries:
+                return False
+
+            if event_type == "choch" and not self.structure_config.allow_choch_reversals:
+                return False
+
+            if event_type == "mss" and not self.structure_config.allow_mss_reversals:
+                return False
+
+        if not is_directional_side(side):
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def _build_score_breakdown(
+        self,
+        *,
+        context: StrategyContext,
+        view: MarketStructureContextView,
+        side: SignalSide,
+        setup_type: SetupType,
+    ) -> ScoreBreakdown:
+        event_component = self._event_component(view)
+        layer_component = average_score(view.layer_confidence, view.layer_strength)
+        alignment_component = view.mtf_alignment_score
+        trend_component = view.trend_strength
+        swing_component = self._swing_component(view)
+        fresh_component = freshness_score(
+            event_time=view.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.structure_config.stale_feature_max_age_seconds,
+        )
+
+        components = {
+            "event": event_component,
+            "layer": layer_component,
+            "alignment": alignment_component,
+            "trend": trend_component,
+            "swing": swing_component,
+            "freshness": fresh_component,
+        }
+        weights = {
+            "event": self.structure_config.score_event_weight,
+            "layer": self.structure_config.score_layer_weight,
+            "alignment": self.structure_config.score_alignment_weight,
+            "trend": self.structure_config.score_trend_weight,
+            "swing": self.structure_config.score_swing_weight,
+            "freshness": self.structure_config.score_freshness_weight,
         }
 
-        if raw in mapping:
-            return mapping[raw]
+        score = weighted_score(components, weights, default=event_component)
+        confidence = confidence_from_components(
+            primary=max(event_component, view.layer_confidence),
+            context=weighted_score(
+                {
+                    "layer": layer_component,
+                    "trend": trend_component,
+                    "alignment": alignment_component,
+                },
+                {
+                    "layer": 0.40,
+                    "trend": 0.30,
+                    "alignment": 0.30,
+                },
+            ),
+            confirmation=swing_component,
+            freshness=fresh_component,
+            primary_weight=self.structure_config.confidence_event_weight,
+            context_weight=self.structure_config.confidence_context_weight,
+            confirmation_weight=self.structure_config.confidence_confirmation_weight,
+            freshness_weight=self.structure_config.confidence_freshness_weight,
+        )
 
-        try:
-            return MarketBias(raw)
-        except Exception:
-            return MarketBias.UNKNOWN
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            f"side:{side.value}",
+            f"setup_type:{setup_type.value}",
+        ]
 
-    def _parse_structure_layer(self, value: Any) -> StructureLayer | None:
-        raw = enum_value(value)
+        event = view.last_event
+        if event is not None and event.event_type is not None:
+            event_type = normalize_label(event.event_type)
+            confirmations.append(f"structure_event:{event_type}")
 
-        if raw == "internal":
-            return StructureLayer.INTERNAL
+            if event_type == "bos":
+                score += self.structure_config.bos_score_bonus
+                confirmations.append("bos_confirms_breakout")
 
-        if raw == "external":
-            return StructureLayer.EXTERNAL
+            elif event_type == "choch":
+                score += self.structure_config.choch_score_bonus
+                confirmations.append("choch_confirms_reversal")
 
-        return None
+            elif event_type == "mss":
+                score += self.structure_config.mss_score_bonus
+                confirmations.append("mss_confirms_reversal")
 
-    def _parse_swing_type(self, value: Any) -> SwingType | None:
-        raw = enum_value(value)
+            if event.is_liquidity_sweep:
+                score += self.structure_config.liquidity_sweep_bonus
+                confirmations.append("liquidity_sweep_context")
 
-        if raw == "high":
-            return SwingType.HIGH
+        else:
+            confirmations.append("bias_continuation_fallback")
+            reasons.append("no_recent_structure_break_event")
 
-        if raw == "low":
-            return SwingType.LOW
+        if view.mtf_alignment_score >= self.structure_config.min_alignment_score:
+            score += self.structure_config.alignment_score_bonus
+            confirmations.append("mtf_alignment_confirmed")
 
-        try:
-            return SwingType(raw)
-        except Exception:
-            return None
+        swing_bonus = self._swing_bonus(view)
+        if swing_bonus > 0:
+            score += swing_bonus
+            confirmations.append("swing_context_confirmed")
 
-    def _parse_structure_event_type(self, value: Any) -> StructureEventType | None:
-        raw = enum_value(value)
-        mapping = {
-            "swing_high": StructureEventType.SWING_HIGH,
-            "swing_low": StructureEventType.SWING_LOW,
-            "hh": StructureEventType.HH,
-            "hl": StructureEventType.HL,
-            "lh": StructureEventType.LH,
-            "ll": StructureEventType.LL,
-            "bos": StructureEventType.BOS,
-            "break_of_structure": StructureEventType.BOS,
-            "choch": StructureEventType.CHOCH,
-            "change_of_character": StructureEventType.CHOCH,
-            "mss": StructureEventType.MSS,
-            "market_structure_shift": StructureEventType.MSS,
-        }
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
 
-        if raw in mapping:
-            return mapping[raw]
+    def _event_component(self, view: MarketStructureContextView) -> float:
+        event = view.last_event
+        if event is None:
+            return average_score(view.layer_confidence, view.layer_strength)
 
-        try:
-            return StructureEventType(raw)
-        except Exception:
-            return None
+        distance_component = unit_score(
+            event.break_distance_pct
+            / max(self.structure_config.min_break_distance_pct * 5.0, 0.0001)
+        )
+
+        return weighted_score(
+            {
+                "confidence": event.confidence,
+                "score": event.score,
+                "distance": distance_component,
+            },
+            {
+                "confidence": 0.45,
+                "score": 0.40,
+                "distance": 0.15,
+            },
+        )
+
+    def _swing_component(self, view: MarketStructureContextView) -> float:
+        swing_scores = []
+
+        if view.last_swing_high is not None:
+            swing_scores.append(view.last_swing_high.strength)
+
+        if view.last_swing_low is not None:
+            swing_scores.append(view.last_swing_low.strength)
+
+        swing_scores.append(view.swing_progression_score)
+
+        return average_score(*swing_scores)
+
+    def _swing_bonus(self, view: MarketStructureContextView) -> float:
+        if self._swing_component(view) >= self.structure_config.min_swing_strength:
+            return self.structure_config.swing_strength_bonus
+
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Source features / tags
+    # ------------------------------------------------------------------
+
+    def _source_features(self, view: MarketStructureContextView) -> list[str]:
+        features = [
+            *market_structure_source_features(),
+            PRICE_ACTION_FEATURES.MARKET_STRUCTURE,
+            PRICE_ACTION_FEATURES.MARKET_STRUCTURE_INTERNAL,
+            PRICE_ACTION_FEATURES.MARKET_STRUCTURE_EXTERNAL,
+            PRICE_ACTION_FEATURES.MARKET_STRUCTURE_LAST_BREAK_EVENT,
+            PRICE_ACTION_FEATURES.MARKET_STRUCTURE_MTF_ALIGNMENT,
+        ]
+
+        return list(dict.fromkeys(features))
+
+    def _tags(
+        self,
+        *,
+        view: MarketStructureContextView,
+        setup_type: SetupType,
+    ) -> list[str]:
+        tags = [
+            self.structure_config.tag_price_action,
+            self.structure_config.tag_market_structure,
+            setup_type.value,
+        ]
+
+        event = view.last_event
+        if event is not None and event.event_type is not None:
+            event_type = normalize_label(event.event_type)
+
+            if event_type == "bos":
+                tags.append(self.structure_config.tag_market_structure_bos)
+                tags.append(self.structure_config.tag_structure_break)
+
+            elif event_type == "choch":
+                tags.append(self.structure_config.tag_market_structure_choch)
+                tags.append(self.structure_config.tag_reversal)
+
+            elif event_type == "mss":
+                tags.append(self.structure_config.tag_market_structure_mss)
+                tags.append(self.structure_config.tag_reversal)
+
+            if event.is_liquidity_sweep:
+                tags.append(self.structure_config.tag_liquidity_sweep)
+
+        else:
+            tags.append(self.structure_config.tag_bias_continuation)
+
+        if setup_type is SetupType.BREAKOUT:
+            tags.append(self.structure_config.tag_breakout)
+
+        if setup_type is SetupType.REVERSAL:
+            tags.append(self.structure_config.tag_reversal)
+
+        if setup_type is SetupType.CONTINUATION:
+            tags.append(self.structure_config.tag_continuation)
+
+        if view.primary_layer_name is not None:
+            tags.append(f"layer:{normalize_label(view.primary_layer_name)}")
+
+        return list(dict.fromkeys(tags))

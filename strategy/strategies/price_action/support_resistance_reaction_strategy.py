@@ -1,10 +1,10 @@
+# trading_system/strategy/strategies/price_action/support_resistance_reaction_strategy.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from logging import Logger
-from typing import Any, Mapping, cast
-from uuid import uuid4
+from datetime import datetime
+from typing import Any
 
 from analytics.price_action.enums import (
     LevelStatus,
@@ -13,52 +13,381 @@ from analytics.price_action.enums import (
     StructureLayer,
 )
 from core.event_bus import EventBus
-from core.logger import TradingLoggerAdapter
-from strategy.config import StrategyConfig, StrategyDefinitionConfig
-from strategy.enums import (
+from core.scheduler import Scheduler
+from .base import (
+    PRICE_ACTION_FEATURES,
+    PriceActionStrategyConfig,
+    PriceActionTradingStrategy,
+)
+from .utils import (
+    ScoreBreakdown,
+    average_score,
+    confidence_from_components,
+    distance_score,
+    extract_last_event,
+    extract_last_update,
+    get_path,
+    is_directional_side,
+    is_stale,
+    layer_confidence,
+    layer_strength,
+    level_reaction_to_side,
+    normalize_label,
+    parse_datetime,
+    parse_level_status,
+    parse_level_type,
+    parse_sr_event_type,
+    parse_structure_layer,
+    quality_filter_reason,
+    select_primary_layer,
+    select_secondary_layer,
+    serialize_for_metadata,
+    support_resistance_source_features,
+    to_bool,
+    to_float,
+    unit_score,
+    weighted_score,
+    freshness_score,
+)
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
     SetupType,
-    SignalOrigin,
     SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
-    TriggerType,
+    Timeframe,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    FilterResult,
-    SignalContext,
-    StrategyEvaluation,
-    StrategySignal,
-    confidence_to_grade,
-    confidence_to_strength,
-)
-from strategy.strategies.price_action.base import (
-    PriceActionStrategyBase,
-    apply_definition_metadata,
-    clamp,
-    enum_value,
-    first_non_empty,
-    parse_datetime,
-    safe_float,
-)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)
-class SupportResistanceReactionStrategyParams:
+class SupportResistanceLevelContext:
     """
-    Local params for SupportResistanceReactionStrategy.
+    Normalized support/resistance level context.
 
-    Runtime gates such as enabled/symbols/timeframes/min_score/min_confidence
-    stay in StrategyConfig / StrategyDefinitionConfig.runtime. These params
-    define how this strategy consumes analytics.price_action.support_resistance.
+    This DTO belongs to strategy layer only. Analytics models remain in
+    analytics.price_action.
     """
 
-    strategy_name: str = "support_resistance_reaction_strategy"
+    level_type: LevelType | None = None
+    status: LevelStatus | None = None
+    layer: StructureLayer | None = None
+
+    price: float | None = None
+    current_price: float | None = None
+    distance_pct: float = 0.0
+
+    strength: float = 0.0
+    confidence: float = 0.0
+    score: float = 0.0
+    touch_count: int = 0
+    reaction_count: int = 0
+    break_count: int = 0
+
+    is_active: bool = True
+    is_broken: bool = False
+    is_flipped: bool = False
+    is_retested: bool = False
+
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+    ) -> SupportResistanceLevelContext | None:
+        if payload is None:
+            return None
+
+        level_type = parse_level_type(
+            get_path(payload, "level_type")
+            or get_path(payload, "type")
+            or get_path(payload, "kind")
+        )
+        status = parse_level_status(
+            get_path(payload, "status")
+            or get_path(payload, "level_status")
+            or get_path(payload, "state")
+        )
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        price = to_float(
+            get_path(payload, "price")
+            or get_path(payload, "level")
+            or get_path(payload, "value")
+        )
+
+        if level_type is None and price is None:
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "level_confidence")
+        )
+        strength = unit_score(
+            get_path(payload, "strength")
+            or get_path(payload, "level_strength")
+            or get_path(payload, "quality")
+            or confidence
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "level_score")
+            or strength
+            or confidence
+        )
+
+        return cls(
+            level_type=level_type,
+            status=status,
+            layer=layer,
+            price=price,
+            current_price=to_float(
+                get_path(payload, "current_price")
+                or get_path(payload, "last_price")
+                or get_path(payload, "close")
+            ),
+            distance_pct=abs(
+                to_float(
+                    get_path(payload, "distance_pct")
+                    or get_path(payload, "distance_to_price_pct")
+                    or get_path(payload, "distance_to_level_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            strength=strength,
+            confidence=confidence,
+            score=score,
+            touch_count=to_int_safe(
+                get_path(payload, "touch_count")
+                or get_path(payload, "touches")
+            ),
+            reaction_count=to_int_safe(
+                get_path(payload, "reaction_count")
+                or get_path(payload, "reactions")
+            ),
+            break_count=to_int_safe(
+                get_path(payload, "break_count")
+                or get_path(payload, "breaks")
+            ),
+            is_active=to_bool(
+                get_path(payload, "is_active")
+                or get_path(payload, "active"),
+                default=True,
+            ),
+            is_broken=to_bool(
+                get_path(payload, "is_broken")
+                or get_path(payload, "broken"),
+                default=False,
+            ),
+            is_flipped=to_bool(
+                get_path(payload, "is_flipped")
+                or get_path(payload, "flipped"),
+                default=False,
+            ),
+            is_retested=to_bool(
+                get_path(payload, "is_retested")
+                or get_path(payload, "retested"),
+                default=False,
+            ),
+            created_at=parse_datetime(
+                get_path(payload, "created_at")
+                or get_path(payload, "timestamp")
+                or get_path(payload, "time")
+            ),
+            updated_at=parse_datetime(
+                get_path(payload, "updated_at")
+                or get_path(payload, "last_update")
+                or get_path(payload, "event_time")
+            ),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class SupportResistanceEventContext:
+    """
+    Normalized support/resistance lifecycle event.
+    """
+
+    event_type: SREventType | None = None
+    level_type: LevelType | None = None
+    status: LevelStatus | None = None
+    layer: StructureLayer | None = None
+
+    confidence: float = 0.0
+    score: float = 0.0
+    distance_pct: float = 0.0
+    price: float | None = None
+    level_price: float | None = None
+
+    timestamp: datetime | None = None
+    is_confirmed: bool = False
+
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+    ) -> SupportResistanceEventContext | None:
+        if payload is None:
+            return None
+
+        event_type = parse_sr_event_type(
+            get_path(payload, "event_type")
+            or get_path(payload, "type")
+            or get_path(payload, "kind")
+        )
+        level_type = parse_level_type(
+            get_path(payload, "level_type")
+            or get_path(payload, "type")
+            or get_path(payload, "level.kind")
+        )
+        status = parse_level_status(
+            get_path(payload, "status")
+            or get_path(payload, "level_status")
+            or get_path(payload, "state")
+        )
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        if event_type is None and level_type is None and status is None:
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "event_confidence")
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "event_score")
+            or confidence
+        )
+
+        reasons_raw = (
+            get_path(payload, "reasons")
+            or get_path(payload, "reason")
+            or get_path(payload, "confirmations")
+            or []
+        )
+        reasons: list[str] = []
+        if isinstance(reasons_raw, str):
+            reasons = [reasons_raw] if reasons_raw.strip() else []
+        elif isinstance(reasons_raw, (list, tuple, set)):
+            reasons = [str(item).strip() for item in reasons_raw if str(item).strip()]
+
+        return cls(
+            event_type=event_type,
+            level_type=level_type,
+            status=status,
+            layer=layer,
+            confidence=confidence,
+            score=score,
+            distance_pct=abs(
+                to_float(
+                    get_path(payload, "distance_pct")
+                    or get_path(payload, "distance_to_level_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            price=to_float(
+                get_path(payload, "price")
+                or get_path(payload, "current_price")
+                or get_path(payload, "last_price")
+            ),
+            level_price=to_float(
+                get_path(payload, "level_price")
+                or get_path(payload, "level")
+                or get_path(payload, "level.price")
+            ),
+            timestamp=parse_datetime(
+                get_path(payload, "timestamp")
+                or get_path(payload, "event_time")
+                or get_path(payload, "created_at")
+                or get_path(payload, "time")
+            ),
+            is_confirmed=to_bool(
+                get_path(payload, "confirmed")
+                or get_path(payload, "is_confirmed")
+                or get_path(payload, "valid"),
+                default=confidence > 0.0,
+            ),
+            reasons=list(dict.fromkeys(reasons)),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class SupportResistanceReactionContext:
+    """
+    Normalized SR reaction view consumed by SupportResistanceReactionStrategy.
+    """
+
+    module: dict[str, Any]
+    primary_layer: dict[str, Any]
+    secondary_layer: dict[str, Any]
+
+    primary_layer_name: StructureLayer | None = None
+    secondary_layer_name: StructureLayer | None = None
+
+    reaction_level: SupportResistanceLevelContext | None = None
+    last_event: SupportResistanceEventContext | None = None
+
+    layer_confidence: float = 0.0
+    layer_strength: float = 0.0
+    layer_alignment_score: float = 0.0
+    proximity_score: float = 0.0
+    level_quality_score: float = 0.0
+
+    event_time: datetime | None = None
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class SupportResistanceReactionStrategyConfig(PriceActionStrategyConfig):
+    """
+    Unified support/resistance reaction strategy config.
+
+    Strategy idea:
+    - read normalized support_resistance context from StrategyContext;
+    - select support/resistance reaction level;
+    - interpret rejection / break / flip / retest;
+    - return internal StrategySignal only;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
+    """
 
     prefer_external_layer: bool = True
+
+    require_fresh_sr: bool = True
     require_recent_event: bool = True
     require_level_strength: bool = True
+    require_primary_layer_eligible: bool = True
 
     allow_support_rejection_long: bool = True
     allow_resistance_rejection_short: bool = True
@@ -67,1522 +396,1001 @@ class SupportResistanceReactionStrategyParams:
     allow_flip_support_long: bool = True
     allow_flip_resistance_short: bool = True
     allow_retest_entries: bool = True
-    allow_touch_entries: bool = False
-    allow_created_level_entries: bool = False
-    allow_merged_level_entries: bool = False
     allow_nearest_level_fallback: bool = True
 
     block_inactive_levels: bool = True
     block_broken_non_flip_levels: bool = True
-    block_counter_regime: bool = False
 
+    min_layer_confidence: float = 0.40
     min_level_strength: float = 0.45
     min_event_confidence: float = 0.45
     min_touch_count: int = 1
-    min_rejection_count_for_reaction: int = 1
-    min_retest_count_for_retest_entry: int = 1
-
     max_distance_to_level_pct: float = 0.0035
-    max_zone_width_pct: float = 0.0060
 
-    primary_level_weight: float = 0.24
-    event_confidence_weight: float = 0.20
-    status_quality_weight: float = 0.12
-    proximity_weight: float = 0.14
-    interaction_quality_weight: float = 0.12
-    secondary_layer_alignment_weight: float = 0.08
-    regime_alignment_weight: float = 0.05
-    retest_bonus_weight: float = 0.03
-    flip_bonus_weight: float = 0.02
+    rejection_bonus: float = 0.05
+    break_bonus: float = 0.05
+    flip_bonus: float = 0.06
+    retest_bonus: float = 0.06
+    proximity_bonus: float = 0.04
+    touch_count_bonus: float = 0.03
+    layer_alignment_bonus: float = 0.03
 
-    emit_signal_events: bool = False
-    signal_event_name: str = "strategy.price_action.support_resistance_reaction.signal"
+    score_level_weight: float = 0.30
+    score_event_weight: float = 0.24
+    score_proximity_weight: float = 0.16
+    score_reaction_weight: float = 0.14
+    score_layer_weight: float = 0.10
+    score_freshness_weight: float = 0.06
 
-    freshness_feature_names: tuple[str, ...] = (
-        "analytics.price_action",
-        "analytics.price_action.support_resistance",
-        "price_action.support_resistance",
-        "support_resistance",
-        "sr",
+    confidence_level_weight: float = 0.52
+    confidence_context_weight: float = 0.28
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    tag_sr_reaction: str = "support_resistance_reaction"
+    tag_support_rejection: str = "support_rejection"
+    tag_resistance_rejection: str = "resistance_rejection"
+    tag_support_break: str = "support_break"
+    tag_resistance_break: str = "resistance_break"
+    tag_flip: str = "flip"
+    tag_level_retest: str = "level_retest"
+    tag_level_proximity: str = "level_proximity"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.RETEST
+
+    required_price_action_features: tuple[str, ...] = (
+        PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE,
     )
 
     def validate(self) -> None:
-        PriceActionStrategyBase.validate_bounded_fields(
-            instance=self,
-            field_names=(
-                "min_level_strength",
-                "min_event_confidence",
-                "max_distance_to_level_pct",
-                "max_zone_width_pct",
-                "primary_level_weight",
-                "event_confidence_weight",
-                "status_quality_weight",
-                "proximity_weight",
-                "interaction_quality_weight",
-                "secondary_layer_alignment_weight",
-                "regime_alignment_weight",
-                "retest_bonus_weight",
-                "flip_bonus_weight",
-            ),
-            minimum=0.0,
-            maximum=1.0,
-        )
+        PriceActionStrategyConfig.validate(self)
 
-        for field_name in (
-            "min_touch_count",
-            "min_rejection_count_for_reaction",
-            "min_retest_count_for_retest_entry",
-        ):
-            value = int(getattr(self, field_name))
+        unit_fields = {
+            "min_layer_confidence": self.min_layer_confidence,
+            "min_level_strength": self.min_level_strength,
+            "min_event_confidence": self.min_event_confidence,
+            "rejection_bonus": self.rejection_bonus,
+            "break_bonus": self.break_bonus,
+            "flip_bonus": self.flip_bonus,
+            "retest_bonus": self.retest_bonus,
+            "proximity_bonus": self.proximity_bonus,
+            "touch_count_bonus": self.touch_count_bonus,
+            "layer_alignment_bonus": self.layer_alignment_bonus,
+        }
+
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
+        if self.min_touch_count < 0:
+            raise StrategyConfigError("min_touch_count must be >= 0")
+
+        if self.max_distance_to_level_pct < 0:
+            raise StrategyConfigError("max_distance_to_level_pct must be >= 0")
+
+        score_weights = {
+            "score_level_weight": self.score_level_weight,
+            "score_event_weight": self.score_event_weight,
+            "score_proximity_weight": self.score_proximity_weight,
+            "score_reaction_weight": self.score_reaction_weight,
+            "score_layer_weight": self.score_layer_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+        confidence_weights = {
+            "confidence_level_weight": self.confidence_level_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
             if value < 0:
-                raise ValueError(f"{field_name} must be >= 0")
-            setattr(self, field_name, value)
+                raise StrategyConfigError(f"{field_name} must be >= 0")
 
-    @classmethod
-    def from_definition(
-        cls,
-        definition: StrategyDefinitionConfig | None,
-    ) -> "SupportResistanceReactionStrategyParams":
-        return apply_definition_metadata(
-            params=cls(),
-            definition=definition,
-        )
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_sr_reaction",
+            "tag_support_rejection",
+            "tag_resistance_rejection",
+            "tag_support_break",
+            "tag_resistance_break",
+            "tag_flip",
+            "tag_level_retest",
+            "tag_level_proximity",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_price_action_features:
+            raise StrategyConfigError("required_price_action_features cannot be empty")
+
+        for feature in self.required_price_action_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_price_action_features cannot contain empty feature names"
+                )
 
 
-@dataclass(slots=True)
-class SupportResistanceContext:
+class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
     """
-    Normalized view of analytics.price_action.support_resistance.SupportResistanceState.
-    """
+    Unified support/resistance reaction strategy.
 
-    exchange: str | None = None
-    market_type: str | None = None
-    symbol: str | None = None
-    exchange_symbol: str | None = None
-    timeframe: str | None = None
-    key: tuple[str, str, str, str] | None = None
+    Input:
+        StrategyContext with FeatureSource.PRICE_ACTION domain data / features.
 
-    last_price: float | None = None
-    last_update: datetime | None = None
+    Output:
+        StrategySignal | None.
 
-    internal: dict[str, Any] = field(default_factory=dict)
-    external: dict[str, Any] = field(default_factory=dict)
-
-    last_event: dict[str, Any] | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    source_feature: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-class SupportResistanceReactionStrategy(PriceActionStrategyBase):
-    """
-    Strategy wrapper around analytics.price_action.support_resistance.
-
-    Main setups:
-    - support rejection -> LONG;
-    - resistance rejection -> SHORT;
-    - resistance break / flip support / retest -> LONG;
-    - support break / flip resistance / retest -> SHORT;
-    - optional nearest-level fallback when no fresh event exists.
-
-    This class is intentionally aligned only with analytics.price_action
-    contracts. Broader alignment with the final strategy base hierarchy can be
-    done later.
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    analytics_module_name = "support_resistance"
+    component_namespace = "strategy.price_action.support_resistance_reaction"
+    category: StrategyCategory = StrategyCategory.PRICE_ACTION
+    default_setup_type: SetupType = SetupType.RETEST
 
     def __init__(
         self,
         config: StrategyConfig,
         event_bus: EventBus | None = None,
-        logger: Logger | TradingLoggerAdapter | None = None,
-        strategy_name: str = "support_resistance_reaction_strategy",
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        price_action_config: SupportResistanceReactionStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        resolved_price_action_config = (
+            price_action_config or SupportResistanceReactionStrategyConfig()
+        )
+        resolved_price_action_config.validate()
+
         super().__init__(
             config=config,
-            strategy_name=strategy_name,
-            params_cls=SupportResistanceReactionStrategyParams,
             event_bus=event_bus,
-            logger=logger,
+            scheduler=scheduler,
+            definition=definition,
+            price_action_config=resolved_price_action_config,
+            service_name=service_name,
+        )
+
+        self.sr_config: SupportResistanceReactionStrategyConfig = (
+            resolved_price_action_config
         )
 
     @property
-    def _p(self) -> SupportResistanceReactionStrategyParams:
-        return cast(SupportResistanceReactionStrategyParams, self.params)
+    def strategy_name(self) -> str:
+        return "support_resistance_reaction"
 
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        try:
-            blocked = self._basic_runtime_gate(context)
-            if blocked is not None:
-                return blocked
-
-            sr = self._extract_support_resistance_snapshot(context)
-            if sr.symbol is None and not sr.external and not sr.internal:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="support_resistance_snapshot_missing",
-                )
-
-            freshness_filter = self._build_freshness_filter(
-                context=context,
-                filter_name="support_resistance_freshness",
-                module_name=self.analytics_module_name,
-                analytics_payload=sr.raw,
-            )
-            if freshness_filter is not None and freshness_filter.blocked:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="stale_support_resistance_feature",
-                )
-
-            primary_layer = self._select_primary_layer(sr)
-            secondary_layer = self._select_secondary_layer(sr)
-
-            selected_level = self._select_reaction_level(
-                context=context,
-                sr=sr,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-            if selected_level is None:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="no_reactable_support_resistance_level_found",
-                    metadata={
-                        "analytics_module": self.analytics_module_name,
-                        "analytics_source_feature": sr.source_feature,
-                        "last_sr_event_type": (
-                            enum_value(sr.last_event.get("event_type"))
-                            if sr.last_event is not None
-                            else None
-                        ),
-                    },
-                )
-
-            side = self._resolve_side(
-                level=selected_level,
-                last_event=sr.last_event,
-            )
-            if side == SignalSide.UNKNOWN:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="support_resistance_level_not_directional",
-                    metadata={
-                        "level_id": selected_level.get("level_id"),
-                        "level_type": enum_value(selected_level.get("level_type")),
-                        "level_status": enum_value(selected_level.get("status")),
-                    },
-                )
-
-            if not self._level_is_tradeable(selected_level):
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="selected_support_resistance_level_not_tradeable",
-                    metadata={
-                        "level_id": selected_level.get("level_id"),
-                        "level_type": enum_value(selected_level.get("level_type")),
-                        "level_status": enum_value(selected_level.get("status")),
-                        "level_strength": selected_level.get("strength"),
-                    },
-                )
-
-            score = self._compute_score(
-                context=context,
-                sr=sr,
-                selected_level=selected_level,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                last_event=sr.last_event,
-                side=side,
-            )
-            confidence = self._compute_confidence(
-                context=context,
-                sr=sr,
-                selected_level=selected_level,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                last_event=sr.last_event,
-                side=side,
-            )
-            reasons = self._build_reasons(
-                sr=sr,
-                selected_level=selected_level,
-                side=side,
-            )
-
-            signal = self._build_signal(
-                context=context,
-                sr=sr,
-                selected_level=selected_level,
-                score=score,
-                confidence=confidence,
-                reasons=reasons,
-                freshness_filter=freshness_filter,
-            )
-
-            return self._finalize_signal_evaluation(
-                context=context,
-                signal=signal,
-                confidence=confidence,
-                score=score,
-                reasons=reasons,
-                metadata={
-                    "analytics_module": self.analytics_module_name,
-                    "analytics_source_feature": sr.source_feature,
-                },
-            )
-
-        except StrategyEvaluationError:
-            raise
-        except Exception as exc:
-            self._logger.exception(
-                "Failed to evaluate support/resistance reaction strategy | strategy=%s symbol=%s",
-                self.name,
-                getattr(context, "symbol", None),
-            )
-            raise StrategyEvaluationError(
-                f"{self.name}: failed to evaluate support/resistance reaction for {context.symbol}"
-            ) from exc
-
-    # ------------------------------------------------------------------
-    # Extraction / normalization
-    # ------------------------------------------------------------------
-
-    def _extract_support_resistance_snapshot(
-        self,
-        context: SignalContext,
-    ) -> SupportResistanceContext:
-        payload = self._extract_price_action_module(
-            context,
-            self.analytics_module_name,
-            aliases=(
-                "support_resistance",
-                "sr",
-                "price_action.support_resistance",
-                "analytics.price_action.support_resistance",
-            ),
-            require_scope_match=True,
-        )
-        if payload:
-            return self._normalize_support_resistance_snapshot(payload)
-
-        candidates: list[Any] = [
-            self._mapping_or_empty(getattr(context, "price_action", None)).get(
-                "support_resistance"
-            ),
-            self._mapping_or_empty(getattr(context, "price_action", None)).get("sr"),
-            self._get_context_feature(context, "price_action.support_resistance"),
-            self._get_context_feature(context, "support_resistance"),
-            self._get_context_feature(context, "sr"),
-            self._get_context_feature(context, "analytics.price_action.support_resistance"),
-        ]
-
-        for candidate in candidates:
-            normalized = self._normalize_support_resistance_snapshot(candidate)
-            if normalized.symbol is not None or normalized.external or normalized.internal:
-                return normalized
-
-        return SupportResistanceContext()
-
-    def _normalize_support_resistance_snapshot(
-        self,
-        payload: Any,
-    ) -> SupportResistanceContext:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return SupportResistanceContext()
-
-        state = self._normalize_state_payload(payload_mapping)
-        if not state:
-            return SupportResistanceContext()
-
-        internal = self._normalize_sr_layer(
-            state.get("internal"),
-            StructureLayer.INTERNAL,
-        )
-        external = self._normalize_sr_layer(
-            state.get("external"),
-            StructureLayer.EXTERNAL,
-        )
-
-        metadata = dict(self._mapping_or_empty(state.get("metadata")))
-        scope = self._extract_analytics_scope(state)
-
-        key_values = scope.get("key") if isinstance(scope.get("key"), list) else []
-        key_tuple: tuple[str, str, str, str] | None = None
-        if len(key_values) == 4:
-            key_tuple = (
-                str(key_values[0]),
-                str(key_values[1]),
-                str(key_values[2]),
-                str(key_values[3]),
-            )
-
-        last_event = self._extract_last_event(internal, external)
-
-        return SupportResistanceContext(
-            exchange=scope.get("exchange"),
-            market_type=scope.get("market_type"),
-            symbol=first_non_empty(state.get("symbol"), scope.get("symbol")),
-            exchange_symbol=first_non_empty(
-                state.get("exchange_symbol"),
-                scope.get("exchange_symbol"),
-            ),
-            timeframe=first_non_empty(state.get("timeframe"), scope.get("timeframe")),
-            key=key_tuple,
-            last_price=(
-                safe_float(
-                    first_non_empty(
-                        state.get("last_price"),
-                        payload_mapping.get("last_price"),
-                    ),
-                    0.0,
-                )
-                or None
-            ),
-            last_update=parse_datetime(
-                first_non_empty(
-                    state.get("last_update"),
-                    state.get("updated_at"),
-                    payload_mapping.get("last_update"),
-                    metadata.get("last_update"),
-                    metadata.get("updated_at"),
-                )
-            ),
-            internal=internal,
-            external=external,
-            last_event=last_event,
-            metadata=metadata,
-            source_feature=state.get("_source_feature"),
-            raw=dict(state),
-        )
-
-    def _normalize_sr_layer(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any]:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return {}
-
-        return {
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "total_levels": int(safe_float(payload_mapping.get("total_levels"), 0.0)),
-            "active_supports": int(
-                safe_float(payload_mapping.get("active_supports"), 0.0)
-            ),
-            "active_resistances": int(
-                safe_float(payload_mapping.get("active_resistances"), 0.0)
-            ),
-            "active_flip_supports": int(
-                safe_float(payload_mapping.get("active_flip_supports"), 0.0)
-            ),
-            "active_flip_resistances": int(
-                safe_float(payload_mapping.get("active_flip_resistances"), 0.0)
-            ),
-            "strongest_support": self._normalize_level(
-                payload_mapping.get("strongest_support"),
-                default_layer,
-            ),
-            "strongest_resistance": self._normalize_level(
-                payload_mapping.get("strongest_resistance"),
-                default_layer,
-            ),
-            "nearest_support": self._normalize_level(
-                payload_mapping.get("nearest_support"),
-                default_layer,
-            ),
-            "nearest_resistance": self._normalize_level(
-                payload_mapping.get("nearest_resistance"),
-                default_layer,
-            ),
-            "last_event": self._normalize_sr_event(
-                payload_mapping.get("last_event"),
-                default_layer,
-            ),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _normalize_level(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any] | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return None
-
-        source_prices: list[float] = []
-        for price in list(payload_mapping.get("source_prices", []) or []):
-            value = safe_float(price, 0.0)
-            if value > 0:
-                source_prices.append(value)
-
-        return {
-            "level_id": payload_mapping.get("level_id"),
-            "exchange": payload_mapping.get("exchange"),
-            "market_type": payload_mapping.get("market_type"),
-            "symbol": payload_mapping.get("symbol"),
-            "exchange_symbol": payload_mapping.get("exchange_symbol"),
-            "timeframe": payload_mapping.get("timeframe"),
-            "key": list(payload_mapping.get("key", []) or []),
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "level_type": self._parse_level_type(payload_mapping.get("level_type")),
-            "price": safe_float(payload_mapping.get("price"), 0.0),
-            "upper_bound": safe_float(payload_mapping.get("upper_bound"), 0.0),
-            "lower_bound": safe_float(payload_mapping.get("lower_bound"), 0.0),
-            "strength": clamp(
-                safe_float(payload_mapping.get("strength"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "status": self._parse_level_status(payload_mapping.get("status")),
-            "created_at": parse_datetime(payload_mapping.get("created_at")),
-            "updated_at": parse_datetime(payload_mapping.get("updated_at")),
-            "broken_at": parse_datetime(payload_mapping.get("broken_at")),
-            "flipped_at": parse_datetime(payload_mapping.get("flipped_at")),
-            "last_tested_at": parse_datetime(payload_mapping.get("last_tested_at")),
-            "last_rejected_at": parse_datetime(payload_mapping.get("last_rejected_at")),
-            "last_broken_at": parse_datetime(payload_mapping.get("last_broken_at")),
-            "last_retested_at": parse_datetime(payload_mapping.get("last_retested_at")),
-            "touch_count": int(safe_float(payload_mapping.get("touch_count"), 0.0)),
-            "rejection_count": int(
-                safe_float(payload_mapping.get("rejection_count"), 0.0)
-            ),
-            "break_count": int(safe_float(payload_mapping.get("break_count"), 0.0)),
-            "retest_count": int(safe_float(payload_mapping.get("retest_count"), 0.0)),
-            "source_count": int(safe_float(payload_mapping.get("source_count"), 0.0)),
-            "source_swing_ids": [
-                str(item)
-                for item in list(payload_mapping.get("source_swing_ids", []) or [])
-                if item is not None
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            strategy_name=self.strategy_name,
+            category=StrategyCategory.PRICE_ACTION,
+            timeframe=Timeframe.M1,
+            tags=[
+                self.sr_config.tag_price_action,
+                self.sr_config.tag_support_resistance,
+                self.sr_config.tag_sr_reaction,
+                self.sr_config.tag_retest,
+                self.sr_config.tag_reaction,
+                "analytics_price_action",
             ],
-            "source_prices": source_prices,
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
+            version="2.0.0",
+            description=(
+                "Interprets support/resistance rejection, break, flip and retest "
+                "context from normalized price-action StrategyContext and returns "
+                "internal StrategySignal."
+            ),
+            required_features=set(self.required_features()),
+            supported_regimes={
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.BREAKOUT,
+                MarketRegime.SQUEEZE,
+                MarketRegime.RANGING,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.UNKNOWN,
+            },
+            metadata={
+                "source": "analytics.price_action",
+                "strategy_type": "support_resistance_reaction",
+                "base_class": "PriceActionTradingStrategy",
+                "canonical_payload": "PriceActionCompositeSnapshot",
+                "uses_support_resistance": True,
+                "uses_level_events": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
+            },
+        )
 
-    def _normalize_sr_event(
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.sr_config.required_price_action_features
+        )
+
+    async def generate_signal(
         self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any] | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_price_action_data(
+            context,
+            tuple(self.sr_config.required_price_action_features),
+        ):
             return None
 
-        return {
-            "event_id": payload_mapping.get("event_id"),
-            "exchange": payload_mapping.get("exchange"),
-            "market_type": payload_mapping.get("market_type"),
-            "symbol": payload_mapping.get("symbol"),
-            "exchange_symbol": payload_mapping.get("exchange_symbol"),
-            "timeframe": payload_mapping.get("timeframe"),
-            "key": list(payload_mapping.get("key", []) or []),
-            "event_type": self._parse_sr_event_type(payload_mapping.get("event_type")),
-            "timestamp": parse_datetime(payload_mapping.get("timestamp")),
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "level_id": payload_mapping.get("level_id"),
-            "level_type": self._parse_level_type(payload_mapping.get("level_type")),
-            "price": safe_float(payload_mapping.get("price"), 0.0),
-            "confidence": clamp(
-                safe_float(payload_mapping.get("confidence"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "reference_price": (
-                safe_float(payload_mapping.get("reference_price"), 0.0)
-                if payload_mapping.get("reference_price") is not None
-                else None
-            ),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
+        if self.has_stale_price_action_features(
+            context,
+            tuple(self.sr_config.required_price_action_features),
+        ):
+            return None
 
-    def _extract_last_event(
-        self,
-        internal: Mapping[str, Any],
-        external: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        epoch = datetime.min.replace(tzinfo=timezone.utc)
+        view = self._extract_view(context)
+        if view is None or view.reaction_level is None:
+            return None
 
-        candidates = [
-            event
-            for event in (
-                external.get("last_event"),
-                internal.get("last_event"),
+        if (
+            self.sr_config.require_fresh_sr
+            and is_stale(
+                event_time=view.event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.sr_config.stale_feature_max_age_seconds,
             )
-            if event is not None
-        ]
-        if not candidates:
+        ):
             return None
 
-        def _sort_key(item: Mapping[str, Any]) -> datetime:
-            ts = item.get("timestamp")
-            if ts is None:
-                return epoch
-            if isinstance(ts, datetime) and ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            if isinstance(ts, datetime):
-                return ts.astimezone(timezone.utc)
-            return epoch
+        common_rejection = quality_filter_reason(
+            view.primary_layer,
+            min_confidence=self.sr_config.min_layer_confidence,
+            min_score=self.sr_config.min_level_strength,
+            stale_after_seconds=self.sr_config.stale_feature_max_age_seconds,
+            now=context.timestamp,
+        )
+        if common_rejection is not None and self.sr_config.require_primary_layer_eligible:
+            return None
 
-        candidates.sort(key=_sort_key, reverse=True)
-        return dict(candidates[0])
+        side = self._infer_side(view)
+        if not is_directional_side(side):
+            return None
+
+        setup_type = self._infer_setup_type(view)
+
+        if not self._passes_filters(view=view, side=side, setup_type=setup_type):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            view=view,
+            side=side,
+            setup_type=setup_type,
+        )
+
+        if breakdown.score < self.sr_config.min_signal_score:
+            return None
+
+        if breakdown.confidence < self.sr_config.min_signal_confidence:
+            return None
+
+        source_features = self._source_features(view)
+        tags = self._tags(view=view, setup_type=setup_type)
+
+        event_label = (
+            normalize_label(view.last_event.event_type)
+            if view.last_event is not None
+            else "nearest_level_proximity"
+        )
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "support_resistance_reaction_signal",
+                    f"side:{side.value}",
+                    f"setup_type:{setup_type.value}",
+                    f"event:{event_label}",
+                    *view.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "price_action_setup_family": "support_resistance_reaction",
+            "price_action_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "event_time": view.event_time.isoformat() if view.event_time else None,
+            "primary_layer_name": normalize_label(view.primary_layer_name),
+            "secondary_layer_name": normalize_label(view.secondary_layer_name),
+            "reaction_level": serialize_for_metadata(view.reaction_level),
+            "last_event": serialize_for_metadata(view.last_event),
+            "primary_layer": serialize_for_metadata(view.primary_layer),
+            "secondary_layer": serialize_for_metadata(view.secondary_layer),
+            "layer_confidence": view.layer_confidence,
+            "layer_strength": view.layer_strength,
+            "layer_alignment_score": view.layer_alignment_score,
+            "proximity_score": view.proximity_score,
+            "level_quality_score": view.level_quality_score,
+            "mapped_side": side.value,
+            "setup_type": setup_type.value,
+            "raw": serialize_for_metadata(view.raw),
+        }
+
+        return self.build_price_action_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.sr_config.default_priority,
+        )
 
     # ------------------------------------------------------------------
-    # Selection / side
+    # Extraction
     # ------------------------------------------------------------------
 
-    def _select_primary_layer(self, sr: SupportResistanceContext) -> dict[str, Any]:
-        return sr.external if self._p.prefer_external_layer else sr.internal
+    def _extract_view(
+        self,
+        context: StrategyContext,
+    ) -> SupportResistanceReactionContext | None:
+        module = self.resolve_price_action_module(
+            context,
+            "support_resistance",
+            aliases=("sr",),
+        )
+        if not module:
+            return None
 
-    def _select_secondary_layer(self, sr: SupportResistanceContext) -> dict[str, Any]:
-        return sr.internal if self._p.prefer_external_layer else sr.external
+        primary = select_primary_layer(
+            module,
+            prefer_external_layer=self.sr_config.prefer_external_layer,
+        )
+        secondary = select_secondary_layer(
+            module,
+            prefer_external_layer=self.sr_config.prefer_external_layer,
+        )
+
+        if not primary:
+            return None
+
+        primary_layer_name = self._extract_layer_name(
+            primary,
+            fallback=StructureLayer.EXTERNAL
+            if self.sr_config.prefer_external_layer
+            else StructureLayer.INTERNAL,
+        )
+        secondary_layer_name = self._extract_layer_name(
+            secondary,
+            fallback=StructureLayer.INTERNAL
+            if self.sr_config.prefer_external_layer
+            else StructureLayer.EXTERNAL,
+        )
+
+        last_event_payload = (
+            get_path(primary, "last_event")
+            or get_path(module, "last_event")
+            or extract_last_event(module)
+        )
+        last_event = SupportResistanceEventContext.from_payload(
+            last_event_payload,
+            fallback_layer=primary_layer_name,
+        )
+
+        reaction_level = self._select_reaction_level(
+            module=module,
+            primary=primary,
+            last_event=last_event,
+            fallback_layer=primary_layer_name,
+        )
+        if reaction_level is None:
+            return None
+
+        layer_alignment_score = unit_score(
+            get_path(module, "layer_alignment_score")
+            or get_path(module, "internal_external_alignment")
+            or get_path(module, "alignment_score")
+            or get_path(primary, "alignment_score")
+        )
+        proximity_score = self._proximity_score(reaction_level)
+        level_quality_score = self._level_quality_score(reaction_level)
+
+        event_time = (
+            last_event.timestamp if last_event is not None else None
+        ) or reaction_level.updated_at or reaction_level.created_at or extract_last_update(primary)
+
+        reasons = self._extract_reasons(module, primary, last_event)
+
+        return SupportResistanceReactionContext(
+            module=module,
+            primary_layer=primary,
+            secondary_layer=secondary,
+            primary_layer_name=primary_layer_name,
+            secondary_layer_name=secondary_layer_name,
+            reaction_level=reaction_level,
+            last_event=last_event,
+            layer_confidence=layer_confidence(primary),
+            layer_strength=layer_strength(primary),
+            layer_alignment_score=layer_alignment_score,
+            proximity_score=proximity_score,
+            level_quality_score=level_quality_score,
+            event_time=event_time,
+            reasons=reasons,
+            raw=module,
+        )
 
     def _select_reaction_level(
         self,
         *,
-        context: SignalContext,
-        sr: SupportResistanceContext,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        last_event = sr.last_event
-        current_price = self._resolve_current_price(context=context, sr=sr)
+        module: dict[str, Any],
+        primary: dict[str, Any],
+        last_event: SupportResistanceEventContext | None,
+        fallback_layer: StructureLayer | None,
+    ) -> SupportResistanceLevelContext | None:
+        candidates: list[Any] = []
 
-        if last_event is not None and self._event_is_usable_for_entry(last_event):
-            event_level = self._level_from_event(
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                event=last_event,
+        if last_event is not None:
+            event_level = (
+                get_path(last_event.raw, "level")
+                or get_path(last_event.raw, "support_resistance_level")
+                or get_path(last_event.raw, "sr_level")
             )
-            if event_level is not None and self._level_is_tradeable(event_level):
-                return event_level
+            if event_level is not None:
+                candidates.append(event_level)
 
-        if self._p.require_recent_event:
-            return None
+        candidates.extend(
+            [
+                get_path(primary, "reaction_level"),
+                get_path(primary, "nearest_level"),
+                get_path(primary, "nearest_support"),
+                get_path(primary, "nearest_resistance"),
+                get_path(primary, "active_level"),
+                get_path(module, "reaction_level"),
+                get_path(module, "nearest_level"),
+                get_path(module, "nearest_support"),
+                get_path(module, "nearest_resistance"),
+                get_path(module, "active_level"),
+            ]
+        )
 
-        if not self._p.allow_nearest_level_fallback:
-            return None
+        levels = get_path(primary, "levels") or get_path(module, "levels")
+        if isinstance(levels, (list, tuple)):
+            candidates.extend(levels)
 
-        candidate_levels = self._candidate_levels(primary_layer)
-
-        best_level: dict[str, Any] | None = None
-        best_score = -1.0
-
-        for level in candidate_levels:
-            if not self._level_is_tradeable(level):
-                continue
-
-            local_score = self._level_selection_score(
-                level=level,
-                current_price=current_price,
+        normalized: list[SupportResistanceLevelContext] = []
+        for candidate in candidates:
+            level = SupportResistanceLevelContext.from_payload(
+                candidate,
+                fallback_layer=fallback_layer,
             )
-            if local_score > best_score:
-                best_score = local_score
-                best_level = level
+            if level is not None:
+                normalized.append(level)
 
-        return best_level
+        if not normalized:
+            return None
 
-    def _candidate_levels(self, layer: Mapping[str, Any]) -> list[dict[str, Any]]:
-        candidates = [
-            layer.get("strongest_support"),
-            layer.get("strongest_resistance"),
-            layer.get("nearest_support"),
-            layer.get("nearest_resistance"),
-        ]
-        return [dict(level) for level in candidates if isinstance(level, Mapping)]
+        return max(
+            normalized,
+            key=lambda level: (
+                level.score,
+                level.confidence,
+                level.strength,
+                self._proximity_score(level),
+                level.touch_count,
+            ),
+        )
 
-    def _level_from_event(
-        self,
+    @staticmethod
+    def _extract_layer_name(
+        layer: dict[str, Any],
         *,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        event: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        level_id = event.get("level_id")
-        if not level_id:
-            return None
+        fallback: StructureLayer,
+    ) -> StructureLayer:
+        return (
+            parse_structure_layer(
+                get_path(layer, "layer")
+                or get_path(layer, "structure_layer")
+                or get_path(layer, "name"),
+                default=fallback,
+            )
+            or fallback
+        )
 
-        for layer in (primary_layer, secondary_layer):
-            for key in (
-                "strongest_support",
-                "strongest_resistance",
-                "nearest_support",
-                "nearest_resistance",
-            ):
-                level = layer.get(key)
-                if isinstance(level, Mapping) and level.get("level_id") == level_id:
-                    return dict(level)
+    @staticmethod
+    def _extract_reasons(
+        module: dict[str, Any],
+        primary: dict[str, Any],
+        event: SupportResistanceEventContext | None,
+    ) -> list[str]:
+        reasons: list[str] = []
 
-        return self._level_stub_from_event(event)
+        for value in (
+            get_path(module, "reasons"),
+            get_path(primary, "reasons"),
+            get_path(module, "confirmations"),
+            get_path(primary, "confirmations"),
+        ):
+            if isinstance(value, str) and value.strip():
+                reasons.append(value.strip())
+            elif isinstance(value, (list, tuple, set)):
+                reasons.extend(str(item).strip() for item in value if str(item).strip())
 
-    def _level_stub_from_event(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
-        level_id = event.get("level_id")
-        level_type = self._parse_level_type(event.get("level_type"))
-        if not level_id or level_type is None:
-            return None
+        if event is not None:
+            reasons.extend(event.reasons)
 
-        price = safe_float(event.get("price"), 0.0)
-        if price <= 0:
-            return None
+        return list(dict.fromkeys(reasons))
 
-        return {
-            "level_id": level_id,
-            "layer": self._parse_structure_layer(event.get("layer"))
-            or StructureLayer.INTERNAL,
-            "level_type": level_type,
-            "price": price,
-            "upper_bound": price,
-            "lower_bound": price,
-            "strength": clamp(safe_float(event.get("confidence"), 0.0), 0.0, 1.0),
-            "status": self._status_from_event_type(event.get("event_type")),
-            "created_at": None,
-            "updated_at": event.get("timestamp"),
-            "broken_at": event.get("timestamp")
-            if event.get("event_type") == SREventType.LEVEL_BROKEN
-            else None,
-            "flipped_at": event.get("timestamp")
-            if event.get("event_type") == SREventType.LEVEL_FLIPPED
-            else None,
-            "last_tested_at": event.get("timestamp")
-            if event.get("event_type") == SREventType.LEVEL_TOUCHED
-            else None,
-            "last_rejected_at": event.get("timestamp")
-            if event.get("event_type") == SREventType.LEVEL_REJECTED
-            else None,
-            "last_broken_at": event.get("timestamp")
-            if event.get("event_type") == SREventType.LEVEL_BROKEN
-            else None,
-            "last_retested_at": event.get("timestamp")
-            if event.get("event_type") == SREventType.LEVEL_RETESTED
-            else None,
-            "touch_count": 1
-            if event.get("event_type") == SREventType.LEVEL_TOUCHED
-            else 0,
-            "rejection_count": 1
-            if event.get("event_type") == SREventType.LEVEL_REJECTED
-            else 0,
-            "break_count": 1
-            if event.get("event_type") == SREventType.LEVEL_BROKEN
-            else 0,
-            "retest_count": 1
-            if event.get("event_type") == SREventType.LEVEL_RETESTED
-            else 0,
-            "source_count": 0,
-            "source_swing_ids": [],
-            "source_prices": [],
-            "metadata": dict(event.get("metadata", {}) or {}),
-        }
+    # ------------------------------------------------------------------
+    # Mapping / filters
+    # ------------------------------------------------------------------
 
-    def _resolve_side(
+    def _infer_side(self, view: SupportResistanceReactionContext) -> SignalSide:
+        if view.reaction_level is None:
+            return SignalSide.UNKNOWN
+
+        if view.last_event is not None:
+            event_side = level_reaction_to_side(
+                view.reaction_level.raw,
+                view.last_event.raw,
+            )
+            if is_directional_side(event_side):
+                return event_side
+
+        return level_reaction_to_side(view.reaction_level.raw)
+
+    def _infer_setup_type(
         self,
-        *,
-        level: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> SignalSide:
-        event_type = last_event.get("event_type") if last_event is not None else None
-        level_type = self._parse_level_type(level.get("level_type"))
+        view: SupportResistanceReactionContext,
+    ) -> SetupType:
+        event = view.last_event
 
-        if event_type == SREventType.LEVEL_REJECTED:
-            if level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}:
-                return SignalSide.LONG
-            if level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
-                return SignalSide.SHORT
+        if event is not None and event.event_type is not None:
+            event_label = normalize_label(event.event_type)
 
-        if event_type == SREventType.LEVEL_BROKEN:
-            if level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}:
-                return SignalSide.SHORT
-            if level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
-                return SignalSide.LONG
-
-        if event_type in {SREventType.LEVEL_FLIPPED, SREventType.LEVEL_RETESTED}:
-            return self._level_type_to_reaction_side(level_type)
-
-        if event_type == SREventType.LEVEL_TOUCHED:
-            return self._level_type_to_reaction_side(level_type)
-
-        return self._level_type_to_reaction_side(level_type)
-
-    def _event_is_usable_for_entry(self, event: Mapping[str, Any]) -> bool:
-        event_type = event.get("event_type")
-        confidence = clamp(safe_float(event.get("confidence"), 0.0), 0.0, 1.0)
-
-        if confidence < self._p.min_event_confidence:
-            return False
-
-        level_type = self._parse_level_type(event.get("level_type"))
-
-        if event_type == SREventType.LEVEL_REJECTED:
-            if level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}:
-                return self._p.allow_support_rejection_long
-            if level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
-                return self._p.allow_resistance_rejection_short
-            return False
-
-        if event_type == SREventType.LEVEL_BROKEN:
-            if level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}:
-                return self._p.allow_support_break_short
-            if level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
-                return self._p.allow_resistance_break_long
-            return False
-
-        if event_type == SREventType.LEVEL_FLIPPED:
-            if level_type == LevelType.FLIP_SUPPORT:
-                return self._p.allow_flip_support_long
-            if level_type == LevelType.FLIP_RESISTANCE:
-                return self._p.allow_flip_resistance_short
-            return False
-
-        if event_type == SREventType.LEVEL_RETESTED:
-            return self._p.allow_retest_entries
-
-        if event_type == SREventType.LEVEL_TOUCHED:
-            return self._p.allow_touch_entries
-
-        if event_type == SREventType.LEVEL_CREATED:
-            return self._p.allow_created_level_entries
-
-        if event_type == SREventType.LEVEL_MERGED:
-            return self._p.allow_merged_level_entries
-
-        return False
-
-    def _level_is_tradeable(self, level: Mapping[str, Any]) -> bool:
-        if not level:
-            return False
-
-        level_type = self._parse_level_type(level.get("level_type"))
-        if level_type not in {
-            LevelType.SUPPORT,
-            LevelType.RESISTANCE,
-            LevelType.FLIP_SUPPORT,
-            LevelType.FLIP_RESISTANCE,
-        }:
-            return False
-
-        status = self._parse_level_status(level.get("status"))
-
-        if self._p.block_inactive_levels and status == LevelStatus.INACTIVE:
-            return False
-
-        if self._p.block_broken_non_flip_levels:
-            if status == LevelStatus.BROKEN and level_type in {
-                LevelType.SUPPORT,
-                LevelType.RESISTANCE,
+            if event_label in {
+                "support_break",
+                "support_breakdown",
+                "resistance_break",
+                "resistance_breakout",
+                "break",
+                "breakout",
+                "breakdown",
             }:
+                return SetupType.BREAKOUT
+
+            if event_label in {
+                "flip_support",
+                "flip_resistance",
+                "support_retest",
+                "resistance_retest",
+                "retest",
+            }:
+                return SetupType.RETEST
+
+            if event_label in {
+                "support_rejection",
+                "support_hold",
+                "resistance_rejection",
+                "resistance_hold",
+                "rejection",
+                "hold",
+            }:
+                return SetupType.REVERSAL
+
+        level = view.reaction_level
+        if level is not None:
+            if level.is_retested or level.is_flipped:
+                return SetupType.RETEST
+
+            if level.is_broken:
+                return SetupType.BREAKOUT
+
+        return self.sr_config.default_setup_type
+
+    def _passes_filters(
+        self,
+        *,
+        view: SupportResistanceReactionContext,
+        side: SignalSide,
+        setup_type: SetupType,
+    ) -> bool:
+        level = view.reaction_level
+        if level is None:
+            return False
+
+        if self.sr_config.block_inactive_levels and not level.is_active:
+            return False
+
+        if self.sr_config.block_broken_non_flip_levels:
+            if level.is_broken and not level.is_flipped and setup_type is not SetupType.BREAKOUT:
                 return False
 
-        if self._p.require_level_strength:
-            strength = clamp(safe_float(level.get("strength"), 0.0), 0.0, 1.0)
-            if strength < self._p.min_level_strength:
+        if self.sr_config.require_level_strength:
+            if level.strength < self.sr_config.min_level_strength:
                 return False
 
-        if int(safe_float(level.get("touch_count"), 0.0)) < self._p.min_touch_count:
-            if int(safe_float(level.get("source_count"), 0.0)) <= 0:
+        if level.touch_count < self.sr_config.min_touch_count:
+            return False
+
+        if view.layer_confidence < self.sr_config.min_layer_confidence:
+            return False
+
+        if level.distance_pct > self.sr_config.max_distance_to_level_pct:
+            return False
+
+        event = view.last_event
+        if self.sr_config.require_recent_event and event is None:
+            if not self.sr_config.allow_nearest_level_fallback:
                 return False
+
+        if event is not None:
+            if event.confidence < self.sr_config.min_event_confidence:
+                return False
+
+            event_label = normalize_label(event.event_type)
+
+            if event_label in {"support_rejection", "support_hold"}:
+                if side is SignalSide.LONG and not self.sr_config.allow_support_rejection_long:
+                    return False
+
+            if event_label in {"resistance_rejection", "resistance_hold"}:
+                if side is SignalSide.SHORT and not self.sr_config.allow_resistance_rejection_short:
+                    return False
+
+            if event_label in {"support_break", "support_breakdown"}:
+                if side is SignalSide.SHORT and not self.sr_config.allow_support_break_short:
+                    return False
+
+            if event_label in {"resistance_break", "resistance_breakout"}:
+                if side is SignalSide.LONG and not self.sr_config.allow_resistance_break_long:
+                    return False
+
+            if event_label == "flip_support":
+                if side is SignalSide.LONG and not self.sr_config.allow_flip_support_long:
+                    return False
+
+            if event_label == "flip_resistance":
+                if side is SignalSide.SHORT and not self.sr_config.allow_flip_resistance_short:
+                    return False
+
+            if event_label in {"support_retest", "resistance_retest", "retest"}:
+                if not self.sr_config.allow_retest_entries:
+                    return False
+
+        if not is_directional_side(side):
+            return False
 
         return True
 
     # ------------------------------------------------------------------
-    # Score / confidence
+    # Scoring
     # ------------------------------------------------------------------
 
-    def _compute_score(
+    def _build_score_breakdown(
         self,
         *,
-        context: SignalContext,
-        sr: SupportResistanceContext,
-        selected_level: Mapping[str, Any],
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
+        context: StrategyContext,
+        view: SupportResistanceReactionContext,
         side: SignalSide,
-    ) -> float:
-        current_price = self._resolve_current_price(context=context, sr=sr)
+        setup_type: SetupType,
+    ) -> ScoreBreakdown:
+        level = view.reaction_level
+        event = view.last_event
 
-        score = 0.0
-        score += self._p.primary_level_weight * clamp(
-            safe_float(selected_level.get("strength"), 0.0),
-            0.0,
-            1.0,
-        )
-        score += self._p.event_confidence_weight * self._event_score(
-            selected_level=selected_level,
-            last_event=last_event,
-        )
-        score += self._p.status_quality_weight * self._status_quality_score(
-            selected_level.get("status"),
-            selected_level.get("level_type"),
-        )
-        score += self._p.proximity_weight * self._proximity_score(
-            current_price=current_price,
-            level=selected_level,
-        )
-        score += self._p.interaction_quality_weight * self._interaction_quality_score(
-            selected_level,
-            last_event=last_event,
-        )
-        score += self._p.secondary_layer_alignment_weight * self._secondary_layer_alignment_score(
-            secondary_layer=secondary_layer,
-            selected_level=selected_level,
-        )
-        score += self._p.regime_alignment_weight * self._regime_alignment_score(
-            context=context,
-            side=side,
+        if level is None:
+            return ScoreBreakdown()
+
+        level_component = average_score(level.score, level.confidence, level.strength)
+        event_component = self._event_component(event)
+        proximity_component = view.proximity_score
+        reaction_component = self._reaction_component(view, side, setup_type)
+        layer_component = average_score(view.layer_confidence, view.layer_strength)
+        fresh_component = freshness_score(
+            event_time=view.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.sr_config.stale_feature_max_age_seconds,
         )
 
-        if int(safe_float(selected_level.get("retest_count"), 0.0)) > 0:
-            score += self._p.retest_bonus_weight
+        components = {
+            "level": level_component,
+            "event": event_component,
+            "proximity": proximity_component,
+            "reaction": reaction_component,
+            "layer": layer_component,
+            "freshness": fresh_component,
+        }
+        weights = {
+            "level": self.sr_config.score_level_weight,
+            "event": self.sr_config.score_event_weight,
+            "proximity": self.sr_config.score_proximity_weight,
+            "reaction": self.sr_config.score_reaction_weight,
+            "layer": self.sr_config.score_layer_weight,
+            "freshness": self.sr_config.score_freshness_weight,
+        }
 
-        if selected_level.get("level_type") in {
-            LevelType.FLIP_SUPPORT,
-            LevelType.FLIP_RESISTANCE,
-        }:
-            score += self._p.flip_bonus_weight
-
-        return clamp(score, 0.0, 1.0)
-
-    def _compute_confidence(
-        self,
-        *,
-        context: SignalContext,
-        sr: SupportResistanceContext,
-        selected_level: Mapping[str, Any],
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-        side: SignalSide,
-    ) -> float:
-        current_price = self._resolve_current_price(context=context, sr=sr)
-
-        components = [
-            clamp(safe_float(selected_level.get("strength"), 0.0), 0.0, 1.0),
-            self._event_score(selected_level=selected_level, last_event=last_event),
-            self._status_quality_score(
-                selected_level.get("status"),
-                selected_level.get("level_type"),
+        score = weighted_score(components, weights, default=level_component)
+        confidence = confidence_from_components(
+            primary=max(level_component, event_component),
+            context=weighted_score(
+                {
+                    "layer": layer_component,
+                    "alignment": view.layer_alignment_score,
+                    "proximity": proximity_component,
+                },
+                {
+                    "layer": 0.35,
+                    "alignment": 0.30,
+                    "proximity": 0.35,
+                },
             ),
-            self._proximity_score(current_price=current_price, level=selected_level),
-            self._interaction_quality_score(selected_level, last_event=last_event),
-            self._secondary_layer_alignment_score(
-                secondary_layer=secondary_layer,
-                selected_level=selected_level,
-            ),
-            self._regime_alignment_score(context=context, side=side),
+            confirmation=reaction_component,
+            freshness=fresh_component,
+            primary_weight=self.sr_config.confidence_level_weight,
+            context_weight=self.sr_config.confidence_context_weight,
+            confirmation_weight=self.sr_config.confidence_confirmation_weight,
+            freshness_weight=self.sr_config.confidence_freshness_weight,
+        )
+
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            f"side:{side.value}",
+            f"setup_type:{setup_type.value}",
+            f"level_type:{normalize_label(level.level_type)}",
         ]
 
-        return clamp(sum(components) / len(components), 0.0, 1.0)
+        if event is not None and event.event_type is not None:
+            event_label = normalize_label(event.event_type)
+            confirmations.append(f"sr_event:{event_label}")
 
-    def _event_score(
-        self,
-        *,
-        selected_level: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> float:
-        if last_event is None:
-            return 0.35
+            if event_label in {"support_rejection", "support_hold", "resistance_rejection", "resistance_hold"}:
+                score += self.sr_config.rejection_bonus
+                confirmations.append("sr_rejection_context")
 
-        if last_event.get("level_id") != selected_level.get("level_id"):
-            return 0.30
+            elif event_label in {"support_break", "support_breakdown", "resistance_break", "resistance_breakout"}:
+                score += self.sr_config.break_bonus
+                confirmations.append("sr_break_context")
 
-        event_type = last_event.get("event_type")
-        confidence = clamp(safe_float(last_event.get("confidence"), 0.0), 0.0, 1.0)
+            elif event_label in {"flip_support", "flip_resistance"}:
+                score += self.sr_config.flip_bonus
+                confirmations.append("sr_flip_context")
 
-        multiplier = {
-            SREventType.LEVEL_REJECTED: 1.00,
-            SREventType.LEVEL_RETESTED: 0.94,
-            SREventType.LEVEL_FLIPPED: 0.90,
-            SREventType.LEVEL_BROKEN: 0.84,
-            SREventType.LEVEL_TOUCHED: 0.62,
-            SREventType.LEVEL_CREATED: 0.45,
-            SREventType.LEVEL_MERGED: 0.42,
-        }.get(event_type, 0.35)
+            elif event_label in {"support_retest", "resistance_retest", "retest"}:
+                score += self.sr_config.retest_bonus
+                confirmations.append("sr_retest_context")
 
-        return clamp(confidence * multiplier, 0.0, 1.0)
-
-    def _status_quality_score(
-        self,
-        status: Any,
-        level_type: Any,
-    ) -> float:
-        parsed_status = self._parse_level_status(status)
-        parsed_type = self._parse_level_type(level_type)
-
-        if parsed_status == LevelStatus.INACTIVE:
-            return 0.0
-
-        if parsed_type in {LevelType.FLIP_SUPPORT, LevelType.FLIP_RESISTANCE}:
-            if parsed_status == LevelStatus.ACTIVE:
-                return 1.0
-            if parsed_status == LevelStatus.BROKEN:
-                return 0.55
-
-        if parsed_status == LevelStatus.ACTIVE:
-            return 0.78
-
-        if parsed_status == LevelStatus.BROKEN:
-            return 0.35
-
-        return 0.25
-
-    def _interaction_quality_score(
-        self,
-        level: Mapping[str, Any],
-        *,
-        last_event: Mapping[str, Any] | None,
-    ) -> float:
-        touch_count = int(safe_float(level.get("touch_count"), 0.0))
-        rejection_count = int(safe_float(level.get("rejection_count"), 0.0))
-        break_count = int(safe_float(level.get("break_count"), 0.0))
-        retest_count = int(safe_float(level.get("retest_count"), 0.0))
-        source_count = int(safe_float(level.get("source_count"), 0.0))
-
-        score = 0.0
-        score += min(0.25, touch_count / 5.0 * 0.25)
-        score += min(0.25, rejection_count / 3.0 * 0.25)
-        score += min(0.20, retest_count / 3.0 * 0.20)
-        score += min(0.15, source_count / 4.0 * 0.15)
-
-        if break_count > 0 and level.get("level_type") in {
-            LevelType.FLIP_SUPPORT,
-            LevelType.FLIP_RESISTANCE,
-        }:
-            score += 0.15
-
-        if last_event is not None and last_event.get("level_id") == level.get("level_id"):
-            if last_event.get("event_type") in {
-                SREventType.LEVEL_REJECTED,
-                SREventType.LEVEL_RETESTED,
-                SREventType.LEVEL_FLIPPED,
-            }:
-                score += 0.15
-
-        return clamp(score, 0.0, 1.0)
-
-    def _secondary_layer_alignment_score(
-        self,
-        *,
-        secondary_layer: Mapping[str, Any],
-        selected_level: Mapping[str, Any],
-    ) -> float:
-        if not secondary_layer:
-            return 0.35
-
-        level_type = self._parse_level_type(selected_level.get("level_type"))
-
-        if level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}:
-            ref_level = (
-                secondary_layer.get("nearest_support")
-                or secondary_layer.get("strongest_support")
-            )
-        elif level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
-            ref_level = (
-                secondary_layer.get("nearest_resistance")
-                or secondary_layer.get("strongest_resistance")
-            )
         else:
-            ref_level = None
+            reasons.append("no_recent_sr_event")
+            confirmations.append("nearest_level_proximity_entry")
 
-        if not isinstance(ref_level, Mapping):
-            return 0.35
+        if proximity_component >= 0.70:
+            score += self.sr_config.proximity_bonus
+            confirmations.append("price_near_sr_level")
 
-        return clamp(
-            0.55 * clamp(safe_float(ref_level.get("strength"), 0.0), 0.0, 1.0)
-            + 0.25
-            * self._status_quality_score(
-                ref_level.get("status"),
-                ref_level.get("level_type"),
-            )
-            + 0.20 * self._interaction_quality_score(ref_level, last_event=None),
-            0.0,
-            1.0,
-        )
+        if level.touch_count >= self.sr_config.min_touch_count:
+            score += self.sr_config.touch_count_bonus
+            confirmations.append("level_touch_count_confirmed")
 
-    def _proximity_score(
+        if view.layer_alignment_score > 0:
+            score += self.sr_config.layer_alignment_bonus
+            confirmations.append("sr_layer_alignment_context")
+
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
+
+    def _event_component(
         self,
-        *,
-        current_price: float | None,
-        level: Mapping[str, Any],
+        event: SupportResistanceEventContext | None,
     ) -> float:
-        if current_price is None or current_price <= 0:
-            return 0.35
-
-        level_price = safe_float(level.get("price"), 0.0)
-        if level_price <= 0:
-            return 0.35
-
-        distance_pct = abs(current_price - level_price) / level_price
-        if distance_pct >= self._p.max_distance_to_level_pct:
+        if event is None:
             return 0.0
 
-        upper_bound = safe_float(level.get("upper_bound"), 0.0)
-        lower_bound = safe_float(level.get("lower_bound"), 0.0)
-
-        zone_penalty = 0.0
-        if upper_bound > 0 and lower_bound > 0 and upper_bound >= lower_bound:
-            zone_width_pct = (upper_bound - lower_bound) / level_price
-            if zone_width_pct > self._p.max_zone_width_pct:
-                zone_penalty = min(0.30, zone_width_pct)
-
-        raw = 1.0 - (
-            distance_pct / max(self._p.max_distance_to_level_pct, 1e-9)
-        )
-        return clamp(raw - zone_penalty, 0.0, 1.0)
-
-    def _level_selection_score(
-        self,
-        *,
-        level: Mapping[str, Any],
-        current_price: float | None,
-    ) -> float:
-        score = 0.0
-        score += 0.34 * clamp(safe_float(level.get("strength"), 0.0), 0.0, 1.0)
-        score += 0.22 * self._status_quality_score(
-            level.get("status"),
-            level.get("level_type"),
-        )
-        score += 0.20 * self._interaction_quality_score(level, last_event=None)
-        score += 0.18 * self._proximity_score(current_price=current_price, level=level)
-
-        if level.get("level_type") in {
-            LevelType.FLIP_SUPPORT,
-            LevelType.FLIP_RESISTANCE,
-        }:
-            score += 0.06
-
-        return clamp(score, 0.0, 1.0)
-
-    # ------------------------------------------------------------------
-    # Reasons / signal build
-    # ------------------------------------------------------------------
-
-    def _build_reasons(
-        self,
-        *,
-        sr: SupportResistanceContext,
-        selected_level: Mapping[str, Any],
-        side: SignalSide,
-    ) -> list[str]:
-        reasons: list[str] = []
-
-        if side == SignalSide.LONG:
-            reasons.append("support_resistance_long_reaction")
-        elif side == SignalSide.SHORT:
-            reasons.append("support_resistance_short_reaction")
-
-        level_type = selected_level.get("level_type")
-        status = selected_level.get("status")
-        layer = selected_level.get("layer")
-
-        reasons.append(f"level_layer_{enum_value(layer)}")
-        reasons.append(f"level_type_{enum_value(level_type)}")
-        reasons.append(f"level_status_{enum_value(status)}")
-
-        if level_type in {LevelType.FLIP_SUPPORT, LevelType.FLIP_RESISTANCE}:
-            reasons.append("flip_level_context")
-
-        if int(safe_float(selected_level.get("touch_count"), 0.0)) > 0:
-            reasons.append("level_has_touches")
-
-        if int(safe_float(selected_level.get("rejection_count"), 0.0)) >= (
-            self._p.min_rejection_count_for_reaction
-        ):
-            reasons.append("level_has_rejections")
-
-        if int(safe_float(selected_level.get("retest_count"), 0.0)) >= (
-            self._p.min_retest_count_for_retest_entry
-        ):
-            reasons.append("level_has_retests")
-
-        if int(safe_float(selected_level.get("source_count"), 0.0)) > 0:
-            reasons.append("level_has_swing_sources")
-
-        if sr.last_event is not None:
-            event_type = sr.last_event.get("event_type")
-            if isinstance(event_type, SREventType):
-                reasons.append(f"last_sr_event_{event_type.value}")
-
-            if sr.last_event.get("level_id") == selected_level.get("level_id"):
-                reasons.append("last_event_matches_selected_level")
-
-        return reasons
-
-    def _build_signal(
-        self,
-        *,
-        context: SignalContext,
-        sr: SupportResistanceContext,
-        selected_level: Mapping[str, Any],
-        score: float,
-        confidence: float,
-        reasons: list[str],
-        freshness_filter: FilterResult | None,
-    ) -> StrategySignal:
-        side = self._resolve_side(
-            level=selected_level,
-            last_event=sr.last_event,
-        )
-        last_event = sr.last_event
-
-        level_type = selected_level.get("level_type")
-        level_status = selected_level.get("status")
-        last_event_type = last_event.get("event_type") if last_event is not None else None
-
-        analytics_metadata = self._build_analytics_source_metadata(
-            module_name=self.analytics_module_name,
-            payload=sr.raw,
-            selected_entity=selected_level,
-            extra={
-                "signal_id": uuid4().hex,
-                "module": self.name,
-                "source": "analytics.price_action.support_resistance",
-                "support_resistance_timeframe": sr.timeframe,
-                "support_resistance_last_update": (
-                    sr.last_update.isoformat() if sr.last_update else None
+        return weighted_score(
+            {
+                "confidence": event.confidence,
+                "score": event.score,
+                "distance": distance_score(
+                    event.distance_pct,
+                    max_distance_pct=max(
+                        self.sr_config.max_distance_to_level_pct,
+                        0.0001,
+                    ),
                 ),
-                "support_resistance_last_price": sr.last_price,
-                "level_id": selected_level.get("level_id"),
-                "level_layer": enum_value(selected_level.get("layer")),
-                "level_type": enum_value(level_type),
-                "level_status": enum_value(level_status),
-                "level_price": safe_float(selected_level.get("price"), 0.0),
-                "level_upper_bound": safe_float(selected_level.get("upper_bound"), 0.0),
-                "level_lower_bound": safe_float(selected_level.get("lower_bound"), 0.0),
-                "level_strength": safe_float(selected_level.get("strength"), 0.0),
-                "level_touch_count": int(
-                    safe_float(selected_level.get("touch_count"), 0.0)
-                ),
-                "level_rejection_count": int(
-                    safe_float(selected_level.get("rejection_count"), 0.0)
-                ),
-                "level_break_count": int(
-                    safe_float(selected_level.get("break_count"), 0.0)
-                ),
-                "level_retest_count": int(
-                    safe_float(selected_level.get("retest_count"), 0.0)
-                ),
-                "level_source_count": int(
-                    safe_float(selected_level.get("source_count"), 0.0)
-                ),
-                "level_source_swing_ids": list(
-                    selected_level.get("source_swing_ids", []) or []
-                ),
-                "level_source_prices": list(selected_level.get("source_prices", []) or []),
-                "level_created_at": self._datetime_to_iso(
-                    selected_level.get("created_at")
-                ),
-                "level_updated_at": self._datetime_to_iso(
-                    selected_level.get("updated_at")
-                ),
-                "level_broken_at": self._datetime_to_iso(
-                    selected_level.get("broken_at")
-                ),
-                "level_flipped_at": self._datetime_to_iso(
-                    selected_level.get("flipped_at")
-                ),
-                "level_last_tested_at": self._datetime_to_iso(
-                    selected_level.get("last_tested_at")
-                ),
-                "level_last_rejected_at": self._datetime_to_iso(
-                    selected_level.get("last_rejected_at")
-                ),
-                "level_last_broken_at": self._datetime_to_iso(
-                    selected_level.get("last_broken_at")
-                ),
-                "level_last_retested_at": self._datetime_to_iso(
-                    selected_level.get("last_retested_at")
-                ),
-                "last_sr_event_id": (
-                    last_event.get("event_id") if last_event is not None else None
-                ),
-                "last_sr_event_type": enum_value(last_event_type),
-                "last_sr_event_confidence": (
-                    safe_float(last_event.get("confidence"), 0.0)
-                    if last_event is not None
-                    else None
-                ),
-                "last_sr_event_reference_price": (
-                    last_event.get("reference_price") if last_event is not None else None
-                ),
-                "last_sr_event_matches_level": bool(
-                    last_event
-                    and last_event.get("level_id") == selected_level.get("level_id")
-                ),
-                "primary_layer": "external" if self._p.prefer_external_layer else "internal",
+            },
+            {
+                "confidence": 0.45,
+                "score": 0.40,
+                "distance": 0.15,
             },
         )
 
-        signal = StrategySignal(
-            symbol=context.symbol,
-            side=side,
-            strategy_name=self.name,
-            category=StrategyCategory.PRICE_ACTION,
-            timeframe=context.timeframe,
-            setup_type=self._resolve_setup_type(selected_level, last_event),
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=confidence_to_strength(confidence),
-            confidence_grade=confidence_to_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=self._resolve_trigger_type(selected_level, last_event),
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self._resolve_priority(
-                selected_level=selected_level,
-                last_event=last_event,
-                confidence=confidence,
-                score=score,
-            ),
-            regime=self._resolve_market_regime(context),
-            metadata=analytics_metadata,
+    def _reaction_component(
+        self,
+        view: SupportResistanceReactionContext,
+        side: SignalSide,
+        setup_type: SetupType,
+    ) -> float:
+        level = view.reaction_level
+        event = view.last_event
+
+        if level is None:
+            return 0.0
+
+        base = average_score(level.score, level.strength, view.proximity_score)
+
+        event_label = normalize_label(event.event_type) if event else ""
+        level_label = normalize_label(level.level_type)
+
+        if side is SignalSide.LONG:
+            if "support" in level_label:
+                base += 0.08
+            if event_label in {
+                "support_rejection",
+                "support_hold",
+                "support_retest",
+                "flip_support",
+                "resistance_break",
+                "resistance_breakout",
+            }:
+                base += 0.10
+
+        elif side is SignalSide.SHORT:
+            if "resistance" in level_label:
+                base += 0.08
+            if event_label in {
+                "resistance_rejection",
+                "resistance_hold",
+                "resistance_retest",
+                "flip_resistance",
+                "support_break",
+                "support_breakdown",
+            }:
+                base += 0.10
+
+        if setup_type is SetupType.RETEST and level.is_retested:
+            base += 0.05
+
+        if level.is_flipped:
+            base += 0.05
+
+        return unit_score(base)
+
+    def _proximity_score(
+        self,
+        level: SupportResistanceLevelContext,
+    ) -> float:
+        return distance_score(
+            level.distance_pct,
+            max_distance_pct=max(self.sr_config.max_distance_to_level_pct, 0.0001),
         )
 
-        for reason in reasons:
-            signal.add_reason(reason)
-
-        signal.add_source_feature("analytics.price_action")
-        signal.add_source_feature("analytics.price_action.support_resistance")
-        signal.add_source_feature("price_action.support_resistance")
-        signal.add_source_feature("support_resistance")
-
-        if freshness_filter is not None:
-            signal.add_filter_result(freshness_filter)
-
-        regime_filter = self._build_regime_filter(context=context, side=side)
-        if regime_filter is not None:
-            signal.add_filter_result(regime_filter)
-
-        signal.validate()
-        return signal
-
-    def _resolve_setup_type(
+    def _level_quality_score(
         self,
-        level: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> SetupType:
-        event_type = last_event.get("event_type") if last_event is not None else None
+        level: SupportResistanceLevelContext,
+    ) -> float:
+        touch_component = unit_score(
+            level.touch_count / max(self.sr_config.min_touch_count * 3, 1)
+        )
+        reaction_component = unit_score(level.reaction_count / 5.0)
+        break_penalty = 0.15 if level.is_broken and not level.is_flipped else 0.0
 
-        if event_type == SREventType.LEVEL_BROKEN:
-            return SetupType.BREAKOUT
-
-        if event_type in {
-            SREventType.LEVEL_REJECTED,
-            SREventType.LEVEL_RETESTED,
-        }:
-            return SetupType.REVERSAL
-
-        if event_type == SREventType.LEVEL_FLIPPED:
-            return SetupType.RETEST
-
-        level_type = self._parse_level_type(level.get("level_type"))
-        if level_type in {LevelType.FLIP_SUPPORT, LevelType.FLIP_RESISTANCE}:
-            return SetupType.RETEST
-
-        return SetupType.REVERSAL
-
-    def _resolve_trigger_type(
-        self,
-        level: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> TriggerType:
-        event_type = last_event.get("event_type") if last_event is not None else None
-
-        if event_type in {
-            SREventType.LEVEL_REJECTED,
-            SREventType.LEVEL_BROKEN,
-            SREventType.LEVEL_FLIPPED,
-            SREventType.LEVEL_RETESTED,
-        }:
-            return TriggerType.PRIMARY
-
-        if event_type == SREventType.LEVEL_TOUCHED:
-            return TriggerType.CONFIRMATION
-
-        return TriggerType.DERIVED
-
-    def _resolve_priority(
-        self,
-        *,
-        selected_level: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-        confidence: float,
-        score: float,
-    ) -> SignalPriority:
-        event_type = last_event.get("event_type") if last_event is not None else None
-        level_strength = clamp(safe_float(selected_level.get("strength"), 0.0), 0.0, 1.0)
-
-        if (
-            event_type in {
-                SREventType.LEVEL_REJECTED,
-                SREventType.LEVEL_FLIPPED,
-                SREventType.LEVEL_RETESTED,
-            }
-            and confidence >= 0.72
-            and score >= 0.65
-        ):
-            return SignalPriority.HIGH
-
-        if event_type == SREventType.LEVEL_BROKEN and confidence >= 0.75:
-            return SignalPriority.HIGH
-
-        if confidence >= 0.85 and score >= 0.78 and level_strength >= 0.70:
-            return SignalPriority.HIGH
-
-        return SignalPriority.MEDIUM
-
-    # ------------------------------------------------------------------
-    # Utility helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_current_price(
-        self,
-        *,
-        context: SignalContext,
-        sr: SupportResistanceContext,
-    ) -> float | None:
-        candidates = (
-            getattr(context, "last_price", None),
-            getattr(context, "current_price", None),
-            getattr(context, "price", None),
-            self._get_context_feature(context, "last_price"),
-            self._get_context_feature(context, "current_price"),
-            self._get_context_feature(context, "price"),
-            sr.last_price,
+        return unit_score(
+            weighted_score(
+                {
+                    "strength": level.strength,
+                    "confidence": level.confidence,
+                    "score": level.score,
+                    "touches": touch_component,
+                    "reactions": reaction_component,
+                },
+                {
+                    "strength": 0.28,
+                    "confidence": 0.24,
+                    "score": 0.24,
+                    "touches": 0.14,
+                    "reactions": 0.10,
+                },
+            )
+            - break_penalty
         )
 
-        for candidate in candidates:
-            value = safe_float(candidate, 0.0)
-            if value > 0:
-                return value
-
-        return None
-
-    def _level_type_to_reaction_side(self, level_type: LevelType | None) -> SignalSide:
-        if level_type in {LevelType.SUPPORT, LevelType.FLIP_SUPPORT}:
-            return SignalSide.LONG
-
-        if level_type in {LevelType.RESISTANCE, LevelType.FLIP_RESISTANCE}:
-            return SignalSide.SHORT
-
-        return SignalSide.UNKNOWN
-
-    def _status_from_event_type(self, event_type: Any) -> LevelStatus:
-        parsed = self._parse_sr_event_type(event_type)
-
-        if parsed in {
-            SREventType.LEVEL_CREATED,
-            SREventType.LEVEL_MERGED,
-            SREventType.LEVEL_TOUCHED,
-            SREventType.LEVEL_REJECTED,
-            SREventType.LEVEL_FLIPPED,
-            SREventType.LEVEL_RETESTED,
-        }:
-            return LevelStatus.ACTIVE
-
-        if parsed == SREventType.LEVEL_BROKEN:
-            return LevelStatus.BROKEN
-
-        return LevelStatus.ACTIVE
-
-    def _datetime_to_iso(self, value: Any) -> str | None:
-        if isinstance(value, datetime):
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            return value.astimezone(timezone.utc).isoformat()
-        return None
-
     # ------------------------------------------------------------------
-    # Enum parsing
+    # Source features / tags
     # ------------------------------------------------------------------
 
-    def _parse_structure_layer(self, value: Any) -> StructureLayer | None:
-        raw = enum_value(value)
+    def _source_features(self, view: SupportResistanceReactionContext) -> list[str]:
+        features = [
+            *support_resistance_source_features(),
+            PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE,
+            PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE_INTERNAL,
+            PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE_EXTERNAL,
+            PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE_LAST_EVENT,
+            PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE_NEAREST_SUPPORT,
+            PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE_NEAREST_RESISTANCE,
+        ]
 
-        if raw == "internal":
-            return StructureLayer.INTERNAL
+        return list(dict.fromkeys(features))
 
-        if raw == "external":
-            return StructureLayer.EXTERNAL
+    def _tags(
+        self,
+        *,
+        view: SupportResistanceReactionContext,
+        setup_type: SetupType,
+    ) -> list[str]:
+        tags = [
+            self.sr_config.tag_price_action,
+            self.sr_config.tag_support_resistance,
+            self.sr_config.tag_sr_reaction,
+            setup_type.value,
+        ]
 
-        try:
-            return StructureLayer(raw)
-        except Exception:
-            return None
+        event = view.last_event
+        if event is not None and event.event_type is not None:
+            event_label = normalize_label(event.event_type)
 
-    def _parse_level_type(self, value: Any) -> LevelType | None:
-        raw = enum_value(value)
+            if event_label in {"support_rejection", "support_hold"}:
+                tags.append(self.sr_config.tag_support_rejection)
 
-        mapping = {
-            "support": LevelType.SUPPORT,
-            "resistance": LevelType.RESISTANCE,
-            "flip_support": LevelType.FLIP_SUPPORT,
-            "flipped_support": LevelType.FLIP_SUPPORT,
-            "support_flip": LevelType.FLIP_SUPPORT,
-            "flip_resistance": LevelType.FLIP_RESISTANCE,
-            "flipped_resistance": LevelType.FLIP_RESISTANCE,
-            "resistance_flip": LevelType.FLIP_RESISTANCE,
-        }
+            if event_label in {"resistance_rejection", "resistance_hold"}:
+                tags.append(self.sr_config.tag_resistance_rejection)
 
-        if raw in mapping:
-            return mapping[raw]
+            if event_label in {"support_break", "support_breakdown"}:
+                tags.append(self.sr_config.tag_support_break)
 
-        try:
-            return LevelType(raw)
-        except Exception:
-            return None
+            if event_label in {"resistance_break", "resistance_breakout"}:
+                tags.append(self.sr_config.tag_resistance_break)
 
-    def _parse_level_status(self, value: Any) -> LevelStatus | None:
-        raw = enum_value(value)
+            if event_label in {"flip_support", "flip_resistance"}:
+                tags.append(self.sr_config.tag_flip)
 
-        mapping = {
-            "active": LevelStatus.ACTIVE,
-            "broken": LevelStatus.BROKEN,
-            "inactive": LevelStatus.INACTIVE,
-        }
+            if event_label in {"support_retest", "resistance_retest", "retest"}:
+                tags.append(self.sr_config.tag_level_retest)
 
-        if raw in mapping:
-            return mapping[raw]
+        else:
+            tags.append(self.sr_config.tag_level_proximity)
 
-        try:
-            return LevelStatus(raw)
-        except Exception:
-            return None
+        level = view.reaction_level
+        if level is not None:
+            if level.layer is not None:
+                tags.append(f"layer:{normalize_label(level.layer)}")
 
-    def _parse_sr_event_type(self, value: Any) -> SREventType | None:
-        raw = enum_value(value)
+            if level.level_type is not None:
+                tags.append(f"level:{normalize_label(level.level_type)}")
 
-        mapping = {
-            "level_created": SREventType.LEVEL_CREATED,
-            "created": SREventType.LEVEL_CREATED,
-            "level_merged": SREventType.LEVEL_MERGED,
-            "merged": SREventType.LEVEL_MERGED,
-            "level_touched": SREventType.LEVEL_TOUCHED,
-            "touched": SREventType.LEVEL_TOUCHED,
-            "touch": SREventType.LEVEL_TOUCHED,
-            "level_rejected": SREventType.LEVEL_REJECTED,
-            "rejected": SREventType.LEVEL_REJECTED,
-            "rejection": SREventType.LEVEL_REJECTED,
-            "level_broken": SREventType.LEVEL_BROKEN,
-            "broken": SREventType.LEVEL_BROKEN,
-            "break": SREventType.LEVEL_BROKEN,
-            "breakout": SREventType.LEVEL_BROKEN,
-            "level_flipped": SREventType.LEVEL_FLIPPED,
-            "flipped": SREventType.LEVEL_FLIPPED,
-            "flip": SREventType.LEVEL_FLIPPED,
-            "level_retested": SREventType.LEVEL_RETESTED,
-            "retested": SREventType.LEVEL_RETESTED,
-            "retest": SREventType.LEVEL_RETESTED,
-        }
+            if level.status is not None:
+                tags.append(f"status:{normalize_label(level.status)}")
 
-        if raw in mapping:
-            return mapping[raw]
+        if setup_type is SetupType.RETEST:
+            tags.append(self.sr_config.tag_retest)
 
-        try:
-            return SREventType(raw)
-        except Exception:
-            return None
+        if setup_type is SetupType.BREAKOUT:
+            tags.append(self.sr_config.tag_breakout)
+
+        if setup_type is SetupType.REVERSAL:
+            tags.append(self.sr_config.tag_reversal)
+
+        return list(dict.fromkeys(tags))
+
+
+def to_int_safe(value: Any, default: int = 0) -> int:
+    parsed = to_float(value, default)
+    if parsed is None:
+        return default
+    return int(parsed)

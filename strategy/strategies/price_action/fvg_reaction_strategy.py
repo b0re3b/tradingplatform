@@ -1,10 +1,10 @@
+# trading_system/strategy/strategies/price_action/fvg_reaction_strategy.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from logging import Logger
-from typing import Any, Mapping, cast
-from uuid import uuid4
+from datetime import datetime
+from typing import Any
 
 from analytics.price_action.enums import (
     FVGDirection,
@@ -13,53 +13,405 @@ from analytics.price_action.enums import (
     StructureLayer,
 )
 from core.event_bus import EventBus
-from core.logger import TradingLoggerAdapter
-from strategy.config import StrategyConfig, StrategyDefinitionConfig
-from strategy.enums import (
+from core.scheduler import Scheduler
+
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
     SetupType,
-    SignalOrigin,
     SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
-    TriggerType,
+    Timeframe,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    FilterResult,
-    SignalContext,
-    StrategyEvaluation,
-    StrategySignal,
-    confidence_to_grade,
-    confidence_to_strength,
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
+from .base import (
+    PRICE_ACTION_FEATURES,
+    PriceActionStrategyConfig,
+    PriceActionTradingStrategy,
 )
-from strategy.strategies.price_action.base import (
-    PriceActionStrategyBase,
-    apply_definition_metadata,
-    clamp,
-    enum_value,
-    first_non_empty,
+from .utils import (
+    ScoreBreakdown,
+    average_score,
+    confidence_from_components,
+    distance_score,
+    extract_last_event,
+    extract_last_update,
+    fvg_direction_to_side,
+    fvg_source_features,
+    get_path,
+    is_directional_side,
+    is_stale,
+    layer_confidence,
+    layer_strength,
+    normalize_label,
     parse_datetime,
-    safe_float,
+    parse_fvg_direction,
+    parse_fvg_event_type,
+    parse_fvg_status,
+    parse_structure_layer,
+    quality_filter_reason,
+    select_primary_layer,
+    select_secondary_layer,
+    serialize_for_metadata,
+    to_bool,
+    to_float,
+    unit_score,
+    weighted_score,
+    freshness_score,
 )
 
 
 @dataclass(slots=True)
-class FVGReactionStrategyParams:
+class FVGContext:
     """
-    Local params for FVGReactionStrategy.
+    Normalized strategy-level FVG context.
 
-    Runtime gates such as enabled/symbols/timeframes/min_score/min_confidence
-    stay in StrategyConfig / StrategyDefinitionConfig.runtime. These params
-    define how this strategy consumes analytics.price_action.fair_value_gap.
+    This DTO belongs to strategy layer only. Analytics models remain in
+    analytics.price_action.
     """
 
-    strategy_name: str = "fvg_reaction_strategy"
+    direction: FVGDirection | None = None
+    status: FVGStatus | None = None
+    layer: StructureLayer | None = None
+
+    upper_price: float | None = None
+    lower_price: float | None = None
+    mid_price: float | None = None
+    current_price: float | None = None
+
+    fill_pct: float = 0.0
+    gap_size_pct: float = 0.0
+    distance_to_mid_pct: float = 0.0
+    distance_to_nearest_edge_pct: float = 0.0
+
+    strength: float = 0.0
+    confidence: float = 0.0
+    score: float = 0.0
+    touches: int = 0
+
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    is_mitigated: bool = False
+    is_valid: bool = True
+
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+    ) -> FVGContext | None:
+        if payload is None:
+            return None
+
+        direction = parse_fvg_direction(
+            get_path(payload, "direction")
+            or get_path(payload, "fvg_direction")
+            or get_path(payload, "side")
+        )
+        status = parse_fvg_status(
+            get_path(payload, "status")
+            or get_path(payload, "fvg_status")
+            or get_path(payload, "state")
+        )
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        upper_price = to_float(
+            get_path(payload, "upper_price")
+            or get_path(payload, "upper")
+            or get_path(payload, "high")
+        )
+        lower_price = to_float(
+            get_path(payload, "lower_price")
+            or get_path(payload, "lower")
+            or get_path(payload, "low")
+        )
+        mid_price = to_float(
+            get_path(payload, "mid_price")
+            or get_path(payload, "mid")
+        )
+
+        if mid_price is None and upper_price is not None and lower_price is not None:
+            mid_price = (upper_price + lower_price) / 2.0
+
+        if direction is None and upper_price is None and lower_price is None:
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "event_confidence")
+            or get_path(payload, "gap_confidence")
+        )
+        strength = unit_score(
+            get_path(payload, "strength")
+            or get_path(payload, "gap_strength")
+            or get_path(payload, "quality")
+            or confidence
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "gap_score")
+            or strength
+            or confidence
+        )
+
+        return cls(
+            direction=direction,
+            status=status,
+            layer=layer,
+            upper_price=upper_price,
+            lower_price=lower_price,
+            mid_price=mid_price,
+            current_price=to_float(
+                get_path(payload, "current_price")
+                or get_path(payload, "price")
+                or get_path(payload, "last_price")
+            ),
+            fill_pct=unit_score(
+                get_path(payload, "fill_pct")
+                or get_path(payload, "filled_pct")
+                or get_path(payload, "mitigation_pct")
+                or get_path(payload, "fill_ratio")
+            ),
+            gap_size_pct=abs(
+                to_float(
+                    get_path(payload, "gap_size_pct")
+                    or get_path(payload, "size_pct")
+                    or get_path(payload, "width_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            distance_to_mid_pct=abs(
+                to_float(
+                    get_path(payload, "distance_to_mid_pct")
+                    or get_path(payload, "mid_distance_pct")
+                    or get_path(payload, "distance_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            distance_to_nearest_edge_pct=abs(
+                to_float(
+                    get_path(payload, "distance_to_nearest_edge_pct")
+                    or get_path(payload, "edge_distance_pct")
+                    or get_path(payload, "distance_to_gap_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            strength=strength,
+            confidence=confidence,
+            score=score,
+            touches=int(
+                to_float(
+                    get_path(payload, "touches")
+                    or get_path(payload, "touch_count"),
+                    0,
+                )
+                or 0
+            ),
+            created_at=parse_datetime(
+                get_path(payload, "created_at")
+                or get_path(payload, "timestamp")
+                or get_path(payload, "time")
+            ),
+            updated_at=parse_datetime(
+                get_path(payload, "updated_at")
+                or get_path(payload, "last_update")
+                or get_path(payload, "event_time")
+            ),
+            is_mitigated=to_bool(
+                get_path(payload, "is_mitigated")
+                or get_path(payload, "mitigated"),
+                default=False,
+            ),
+            is_valid=to_bool(
+                get_path(payload, "is_valid")
+                or get_path(payload, "valid"),
+                default=True,
+            ),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class FVGEventContext:
+    """
+    Normalized last FVG lifecycle event.
+    """
+
+    event_type: FVGEventType | None = None
+    direction: FVGDirection | None = None
+    status: FVGStatus | None = None
+    layer: StructureLayer | None = None
+
+    confidence: float = 0.0
+    score: float = 0.0
+    fill_pct: float = 0.0
+    distance_to_mid_pct: float = 0.0
+
+    timestamp: datetime | None = None
+    is_confirmed: bool = False
+
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+    ) -> FVGEventContext | None:
+        if payload is None:
+            return None
+
+        event_type = parse_fvg_event_type(
+            get_path(payload, "event_type")
+            or get_path(payload, "type")
+            or get_path(payload, "kind")
+        )
+        direction = parse_fvg_direction(
+            get_path(payload, "direction")
+            or get_path(payload, "fvg_direction")
+            or get_path(payload, "side")
+        )
+        status = parse_fvg_status(
+            get_path(payload, "status")
+            or get_path(payload, "fvg_status")
+            or get_path(payload, "state")
+        )
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        if event_type is None and direction is None and status is None:
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "event_confidence")
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "event_score")
+            or confidence
+        )
+
+        reasons_raw = (
+            get_path(payload, "reasons")
+            or get_path(payload, "reason")
+            or get_path(payload, "confirmations")
+            or []
+        )
+        reasons: list[str] = []
+        if isinstance(reasons_raw, str):
+            reasons = [reasons_raw] if reasons_raw.strip() else []
+        elif isinstance(reasons_raw, (list, tuple, set)):
+            reasons = [str(item).strip() for item in reasons_raw if str(item).strip()]
+
+        return cls(
+            event_type=event_type,
+            direction=direction,
+            status=status,
+            layer=layer,
+            confidence=confidence,
+            score=score,
+            fill_pct=unit_score(
+                get_path(payload, "fill_pct")
+                or get_path(payload, "filled_pct")
+                or get_path(payload, "mitigation_pct")
+            ),
+            distance_to_mid_pct=abs(
+                to_float(
+                    get_path(payload, "distance_to_mid_pct")
+                    or get_path(payload, "mid_distance_pct")
+                    or get_path(payload, "distance_pct"),
+                    0.0,
+                )
+                or 0.0
+            ),
+            timestamp=parse_datetime(
+                get_path(payload, "timestamp")
+                or get_path(payload, "event_time")
+                or get_path(payload, "created_at")
+                or get_path(payload, "time")
+            ),
+            is_confirmed=to_bool(
+                get_path(payload, "confirmed")
+                or get_path(payload, "is_confirmed")
+                or get_path(payload, "valid"),
+                default=confidence > 0.0,
+            ),
+            reasons=list(dict.fromkeys(reasons)),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class FVGReactionContext:
+    """
+    Normalized FVG reaction view consumed by FVGReactionStrategy.
+    """
+
+    module: dict[str, Any]
+    primary_layer: dict[str, Any]
+    secondary_layer: dict[str, Any]
+
+    primary_layer_name: StructureLayer | None = None
+    secondary_layer_name: StructureLayer | None = None
+
+    reaction_gap: FVGContext | None = None
+    last_event: FVGEventContext | None = None
+
+    layer_confidence: float = 0.0
+    layer_strength: float = 0.0
+    layer_alignment_score: float = 0.0
+    proximity_score: float = 0.0
+    fill_quality_score: float = 0.0
+
+    event_time: datetime | None = None
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class FVGReactionStrategyConfig(PriceActionStrategyConfig):
+    """
+    Unified FVG reaction strategy config.
+
+    Strategy idea:
+    - read normalized fair_value_gap context from StrategyContext;
+    - select active/respected/retested/partially filled FVG;
+    - generate reaction / continuation / retest signal;
+    - return internal StrategySignal only;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
+    """
 
     prefer_external_layer: bool = True
+
+    require_fresh_fvg: bool = True
     require_recent_event: bool = True
     require_directional_gap: bool = True
     require_respected_or_retested: bool = False
+    require_primary_layer_eligible: bool = True
 
     allow_active_gap_proximity_entry: bool = True
     allow_fill_started_reaction: bool = True
@@ -67,1412 +419,892 @@ class FVGReactionStrategyParams:
     allow_respected_reaction: bool = True
     allow_retested_reaction: bool = True
     allow_created_gap_continuation: bool = False
-    allow_merged_gap_entry: bool = False
 
     block_invalidated_gaps: bool = True
     block_filled_gaps: bool = True
-    block_counter_regime: bool = False
-    block_excessive_layer_fill_activity: bool = True
 
+    min_layer_confidence: float = 0.40
     min_gap_strength: float = 0.45
     min_event_confidence: float = 0.45
     min_gap_fill_for_reaction: float = 0.05
     max_gap_fill_for_entry: float = 0.90
     max_distance_to_mid_pct: float = 0.0035
-    max_recent_fill_activity: float = 0.95
+    max_distance_to_edge_pct: float = 0.0035
 
-    primary_gap_weight: float = 0.26
-    event_confidence_weight: float = 0.20
-    status_quality_weight: float = 0.14
-    proximity_weight: float = 0.12
-    fill_quality_weight: float = 0.10
-    secondary_layer_alignment_weight: float = 0.08
-    regime_alignment_weight: float = 0.05
-    retest_bonus_weight: float = 0.03
-    respect_bonus_weight: float = 0.02
+    respected_bonus: float = 0.05
+    retested_bonus: float = 0.06
+    partial_fill_bonus: float = 0.04
+    proximity_bonus: float = 0.04
+    layer_alignment_bonus: float = 0.03
 
-    emit_signal_events: bool = False
-    signal_event_name: str = "strategy.price_action.fvg_reaction.signal"
+    score_gap_weight: float = 0.30
+    score_event_weight: float = 0.24
+    score_proximity_weight: float = 0.16
+    score_fill_weight: float = 0.14
+    score_layer_weight: float = 0.10
+    score_freshness_weight: float = 0.06
 
-    freshness_feature_names: tuple[str, ...] = (
-        "analytics.price_action",
-        "analytics.price_action.fair_value_gap",
-        "price_action.fair_value_gap",
-        "price_action.fvg",
-        "fair_value_gap",
-        "fvg",
+    confidence_gap_weight: float = 0.52
+    confidence_context_weight: float = 0.28
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    tag_fvg_reaction: str = "fvg_reaction"
+    tag_fvg_respected: str = "fvg_respected"
+    tag_fvg_retested: str = "fvg_retested"
+    tag_fvg_partial_fill: str = "fvg_partial_fill"
+    tag_fvg_fill_started: str = "fvg_fill_started"
+    tag_fvg_proximity: str = "fvg_proximity"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.RETEST
+
+    required_price_action_features: tuple[str, ...] = (
+        PRICE_ACTION_FEATURES.FAIR_VALUE_GAP,
     )
 
     def validate(self) -> None:
-        PriceActionStrategyBase.validate_bounded_fields(
-            instance=self,
-            field_names=(
-                "min_gap_strength",
-                "min_event_confidence",
-                "min_gap_fill_for_reaction",
-                "max_gap_fill_for_entry",
-                "max_distance_to_mid_pct",
-                "max_recent_fill_activity",
-                "primary_gap_weight",
-                "event_confidence_weight",
-                "status_quality_weight",
-                "proximity_weight",
-                "fill_quality_weight",
-                "secondary_layer_alignment_weight",
-                "regime_alignment_weight",
-                "retest_bonus_weight",
-                "respect_bonus_weight",
-            ),
-            minimum=0.0,
-            maximum=1.0,
-        )
+        PriceActionStrategyConfig.validate(self)
 
-    @classmethod
-    def from_definition(
-        cls,
-        definition: StrategyDefinitionConfig | None,
-    ) -> "FVGReactionStrategyParams":
-        return apply_definition_metadata(
-            params=cls(),
-            definition=definition,
-        )
+        unit_fields = {
+            "min_layer_confidence": self.min_layer_confidence,
+            "min_gap_strength": self.min_gap_strength,
+            "min_event_confidence": self.min_event_confidence,
+            "min_gap_fill_for_reaction": self.min_gap_fill_for_reaction,
+            "max_gap_fill_for_entry": self.max_gap_fill_for_entry,
+            "respected_bonus": self.respected_bonus,
+            "retested_bonus": self.retested_bonus,
+            "partial_fill_bonus": self.partial_fill_bonus,
+            "proximity_bonus": self.proximity_bonus,
+            "layer_alignment_bonus": self.layer_alignment_bonus,
+        }
+
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
+        if self.max_distance_to_mid_pct < 0:
+            raise StrategyConfigError("max_distance_to_mid_pct must be >= 0")
+
+        if self.max_distance_to_edge_pct < 0:
+            raise StrategyConfigError("max_distance_to_edge_pct must be >= 0")
+
+        score_weights = {
+            "score_gap_weight": self.score_gap_weight,
+            "score_event_weight": self.score_event_weight,
+            "score_proximity_weight": self.score_proximity_weight,
+            "score_fill_weight": self.score_fill_weight,
+            "score_layer_weight": self.score_layer_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+        confidence_weights = {
+            "confidence_gap_weight": self.confidence_gap_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_fvg_reaction",
+            "tag_fvg_respected",
+            "tag_fvg_retested",
+            "tag_fvg_partial_fill",
+            "tag_fvg_fill_started",
+            "tag_fvg_proximity",
+        ):
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
+
+        if not self.required_price_action_features:
+            raise StrategyConfigError("required_price_action_features cannot be empty")
+
+        for feature in self.required_price_action_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_price_action_features cannot contain empty feature names"
+                )
 
 
-@dataclass(slots=True)
-class FVGReactionContext:
+class FVGReactionStrategy(PriceActionTradingStrategy):
     """
-    Normalized view of analytics.price_action.fair_value_gap.FairValueGapState.
+    Unified FVG reaction strategy.
+
+    Input:
+        StrategyContext with FeatureSource.PRICE_ACTION domain data / features.
+
+    Output:
+        StrategySignal | None.
+
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    exchange: str | None = None
-    market_type: str | None = None
-    symbol: str | None = None
-    exchange_symbol: str | None = None
-    timeframe: str | None = None
-    key: tuple[str, str, str, str] | None = None
-
-    last_price: float | None = None
-    last_update: datetime | None = None
-
-    internal: dict[str, Any] = field(default_factory=dict)
-    external: dict[str, Any] = field(default_factory=dict)
-
-    last_event: dict[str, Any] | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    source_feature: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-class FVGReactionStrategy(PriceActionStrategyBase):
-    """
-    Strategy wrapper around analytics.price_action.fair_value_gap.
-
-    Aligned with the current FairValueGapAnalyzer / FairValueGapState contract:
-    - consumes FairValueGapState from PriceActionCompositeState or direct module feature;
-    - validates futures scope through PriceActionStrategyBase;
-    - supports internal/external LayerFVGState;
-    - uses nearest/strongest bullish/bearish gaps;
-    - uses FVG lifecycle events: fill started, partially filled, respected,
-      retested, filled, invalidated, merged;
-    - preserves analytics source metadata in StrategySignal.metadata.
-    """
-
-    analytics_module_name = "fair_value_gap"
+    component_namespace = "strategy.price_action.fvg_reaction"
+    category: StrategyCategory = StrategyCategory.PRICE_ACTION
+    default_setup_type: SetupType = SetupType.RETEST
 
     def __init__(
         self,
         config: StrategyConfig,
         event_bus: EventBus | None = None,
-        logger: Logger | TradingLoggerAdapter | None = None,
-        strategy_name: str = "fvg_reaction_strategy",
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        price_action_config: FVGReactionStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        resolved_price_action_config = (
+            price_action_config or FVGReactionStrategyConfig()
+        )
+        resolved_price_action_config.validate()
+
         super().__init__(
             config=config,
-            strategy_name=strategy_name,
-            params_cls=FVGReactionStrategyParams,
             event_bus=event_bus,
-            logger=logger,
+            scheduler=scheduler,
+            definition=definition,
+            price_action_config=resolved_price_action_config,
+            service_name=service_name,
         )
+
+        self.fvg_config: FVGReactionStrategyConfig = resolved_price_action_config
 
     @property
-    def _p(self) -> FVGReactionStrategyParams:
-        return cast(FVGReactionStrategyParams, self.params)
+    def strategy_name(self) -> str:
+        return "fvg_reaction"
 
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        try:
-            blocked = self._basic_runtime_gate(context)
-            if blocked is not None:
-                return blocked
-
-            fvg = self._extract_fvg_snapshot(context)
-            if fvg.symbol is None and not fvg.external and not fvg.internal:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="fvg_snapshot_missing",
-                )
-
-            freshness_filter = self._build_freshness_filter(
-                context=context,
-                filter_name="fvg_freshness",
-                module_name=self.analytics_module_name,
-                analytics_payload=fvg.raw,
-            )
-            if freshness_filter is not None and freshness_filter.blocked:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="stale_fvg_feature",
-                )
-
-            primary_layer = self._select_primary_layer(fvg)
-            secondary_layer = self._select_secondary_layer(fvg)
-
-            selected_gap = self._select_reaction_gap(
-                context=context,
-                fvg=fvg,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-            if selected_gap is None:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="no_reactable_fvg_found",
-                    metadata={
-                        "analytics_module": self.analytics_module_name,
-                        "analytics_source_feature": fvg.source_feature,
-                        "last_fvg_event_type": (
-                            enum_value(fvg.last_event.get("event_type"))
-                            if fvg.last_event is not None
-                            else None
-                        ),
-                    },
-                )
-
-            side = self._resolve_side(selected_gap)
-            if side == SignalSide.UNKNOWN:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="fvg_direction_not_tradeable",
-                )
-
-            if not self._gap_is_tradeable(selected_gap, primary_layer):
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="selected_fvg_not_tradeable",
-                    metadata={
-                        "gap_id": selected_gap.get("gap_id"),
-                        "gap_status": enum_value(selected_gap.get("status")),
-                        "gap_fill_percentage": selected_gap.get("fill_percentage"),
-                        "gap_strength": selected_gap.get("strength"),
-                    },
-                )
-
-            score = self._compute_score(
-                context=context,
-                fvg=fvg,
-                selected_gap=selected_gap,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                last_event=fvg.last_event,
-                side=side,
-            )
-            confidence = self._compute_confidence(
-                context=context,
-                fvg=fvg,
-                selected_gap=selected_gap,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                last_event=fvg.last_event,
-                side=side,
-            )
-
-            reasons = self._build_reasons(
-                fvg=fvg,
-                selected_gap=selected_gap,
-                side=side,
-            )
-
-            signal = self._build_signal(
-                context=context,
-                fvg=fvg,
-                selected_gap=selected_gap,
-                score=score,
-                confidence=confidence,
-                reasons=reasons,
-                freshness_filter=freshness_filter,
-            )
-
-            return self._finalize_signal_evaluation(
-                context=context,
-                signal=signal,
-                confidence=confidence,
-                score=score,
-                reasons=reasons,
-                metadata={
-                    "analytics_module": self.analytics_module_name,
-                    "analytics_source_feature": fvg.source_feature,
-                },
-            )
-
-        except StrategyEvaluationError:
-            raise
-        except Exception as exc:
-            self._logger.exception(
-                "Failed to evaluate FVG reaction strategy | strategy=%s symbol=%s",
-                self.name,
-                getattr(context, "symbol", None),
-            )
-            raise StrategyEvaluationError(
-                f"{self.name}: failed to evaluate FVG reaction for {context.symbol}"
-            ) from exc
-
-    # ------------------------------------------------------------------
-    # Extraction / normalization
-    # ------------------------------------------------------------------
-
-    def _extract_fvg_snapshot(self, context: SignalContext) -> FVGReactionContext:
-        payload = self._extract_price_action_module(
-            context,
-            self.analytics_module_name,
-            aliases=(
-                "fair_value_gap",
-                "fvg",
-                "price_action.fair_value_gap",
-                "price_action.fvg",
-                "analytics.price_action.fair_value_gap",
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            strategy_name=self.strategy_name,
+            category=StrategyCategory.PRICE_ACTION,
+            timeframe=Timeframe.M1,
+            tags=[
+                self.fvg_config.tag_price_action,
+                self.fvg_config.tag_fvg,
+                self.fvg_config.tag_fvg_reaction,
+                self.fvg_config.tag_reaction,
+                self.fvg_config.tag_retest,
+                "analytics_price_action",
+            ],
+            version="2.0.0",
+            description=(
+                "Interprets Fair Value Gap lifecycle context from normalized "
+                "price-action StrategyContext and returns internal StrategySignal."
             ),
-            require_scope_match=True,
-        )
-        if payload:
-            return self._normalize_fvg_snapshot(payload)
-
-        candidates: list[Any] = [
-            self._mapping_or_empty(getattr(context, "price_action", None)).get("fair_value_gap"),
-            self._mapping_or_empty(getattr(context, "price_action", None)).get("fvg"),
-            self._get_context_feature(context, "price_action.fair_value_gap"),
-            self._get_context_feature(context, "price_action.fvg"),
-            self._get_context_feature(context, "fair_value_gap"),
-            self._get_context_feature(context, "fvg"),
-            self._get_context_feature(context, "analytics.price_action.fair_value_gap"),
-        ]
-
-        for candidate in candidates:
-            normalized = self._normalize_fvg_snapshot(candidate)
-            if normalized.symbol is not None or normalized.external or normalized.internal:
-                return normalized
-
-        return FVGReactionContext()
-
-    def _normalize_fvg_snapshot(self, payload: Any) -> FVGReactionContext:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return FVGReactionContext()
-
-        state = self._normalize_state_payload(payload_mapping)
-        if not state:
-            return FVGReactionContext()
-
-        internal = self._normalize_fvg_layer(
-            state.get("internal"),
-            StructureLayer.INTERNAL,
-        )
-        external = self._normalize_fvg_layer(
-            state.get("external"),
-            StructureLayer.EXTERNAL,
+            required_features=set(self.required_features()),
+            supported_regimes={
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.BREAKOUT,
+                MarketRegime.SQUEEZE,
+                MarketRegime.RANGING,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.UNKNOWN,
+            },
+            metadata={
+                "source": "analytics.price_action",
+                "strategy_type": "fvg_reaction",
+                "base_class": "PriceActionTradingStrategy",
+                "canonical_payload": "PriceActionCompositeSnapshot",
+                "uses_fvg": True,
+                "uses_fvg_lifecycle_events": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
+            },
         )
 
-        metadata = dict(self._mapping_or_empty(state.get("metadata")))
-        scope = self._extract_analytics_scope(state)
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.fvg_config.required_price_action_features
+        )
 
-        key_values = scope.get("key") if isinstance(scope.get("key"), list) else []
-        key_tuple: tuple[str, str, str, str] | None = None
-        if len(key_values) == 4:
-            key_tuple = (
-                str(key_values[0]),
-                str(key_values[1]),
-                str(key_values[2]),
-                str(key_values[3]),
+    async def generate_signal(
+        self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_price_action_data(
+            context,
+            tuple(self.fvg_config.required_price_action_features),
+        ):
+            return None
+
+        if self.has_stale_price_action_features(
+            context,
+            tuple(self.fvg_config.required_price_action_features),
+        ):
+            return None
+
+        view = self._extract_view(context)
+        if view is None or view.reaction_gap is None:
+            return None
+
+        if (
+            self.fvg_config.require_fresh_fvg
+            and is_stale(
+                event_time=view.event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.fvg_config.stale_feature_max_age_seconds,
             )
+        ):
+            return None
 
-        last_event = self._extract_last_event(internal, external)
+        common_rejection = quality_filter_reason(
+            view.primary_layer,
+            min_confidence=self.fvg_config.min_layer_confidence,
+            min_score=self.fvg_config.min_gap_strength,
+            stale_after_seconds=self.fvg_config.stale_feature_max_age_seconds,
+            now=context.timestamp,
+        )
+        if common_rejection is not None and self.fvg_config.require_primary_layer_eligible:
+            return None
+
+        side = self._infer_side(view)
+        if self.fvg_config.require_directional_gap and not is_directional_side(side):
+            return None
+
+        setup_type = self._infer_setup_type(view)
+
+        if not self._passes_filters(view=view, side=side, setup_type=setup_type):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            view=view,
+            side=side,
+            setup_type=setup_type,
+        )
+
+        if breakdown.score < self.fvg_config.min_signal_score:
+            return None
+
+        if breakdown.confidence < self.fvg_config.min_signal_confidence:
+            return None
+
+        source_features = self._source_features(view)
+        tags = self._tags(view=view, setup_type=setup_type)
+
+        event_label = (
+            normalize_label(view.last_event.event_type)
+            if view.last_event is not None
+            else "active_gap_proximity"
+        )
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "fvg_reaction_signal",
+                    f"side:{side.value}",
+                    f"setup_type:{setup_type.value}",
+                    f"event:{event_label}",
+                    *view.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "price_action_setup_family": "fvg_reaction",
+            "price_action_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "event_time": view.event_time.isoformat() if view.event_time else None,
+            "primary_layer_name": normalize_label(view.primary_layer_name),
+            "secondary_layer_name": normalize_label(view.secondary_layer_name),
+            "reaction_gap": serialize_for_metadata(view.reaction_gap),
+            "last_event": serialize_for_metadata(view.last_event),
+            "primary_layer": serialize_for_metadata(view.primary_layer),
+            "secondary_layer": serialize_for_metadata(view.secondary_layer),
+            "layer_confidence": view.layer_confidence,
+            "layer_strength": view.layer_strength,
+            "layer_alignment_score": view.layer_alignment_score,
+            "proximity_score": view.proximity_score,
+            "fill_quality_score": view.fill_quality_score,
+            "mapped_side": side.value,
+            "setup_type": setup_type.value,
+            "raw": serialize_for_metadata(view.raw),
+        }
+
+        return self.build_price_action_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=setup_type,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.fvg_config.default_priority,
+        )
+
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
+
+    def _extract_view(
+        self,
+        context: StrategyContext,
+    ) -> FVGReactionContext | None:
+        module = self.resolve_price_action_module(
+            context,
+            "fair_value_gap",
+            aliases=("fvg",),
+        )
+        if not module:
+            return None
+
+        primary = select_primary_layer(
+            module,
+            prefer_external_layer=self.fvg_config.prefer_external_layer,
+        )
+        secondary = select_secondary_layer(
+            module,
+            prefer_external_layer=self.fvg_config.prefer_external_layer,
+        )
+
+        if not primary:
+            return None
+
+        primary_layer_name = self._extract_layer_name(
+            primary,
+            fallback=StructureLayer.EXTERNAL
+            if self.fvg_config.prefer_external_layer
+            else StructureLayer.INTERNAL,
+        )
+        secondary_layer_name = self._extract_layer_name(
+            secondary,
+            fallback=StructureLayer.INTERNAL
+            if self.fvg_config.prefer_external_layer
+            else StructureLayer.EXTERNAL,
+        )
+
+        last_event_payload = (
+            get_path(primary, "last_event")
+            or get_path(module, "last_event")
+            or extract_last_event(module)
+        )
+        last_event = FVGEventContext.from_payload(
+            last_event_payload,
+            fallback_layer=primary_layer_name,
+        )
+
+        reaction_gap = self._select_reaction_gap(
+            module=module,
+            primary=primary,
+            last_event=last_event,
+            fallback_layer=primary_layer_name,
+        )
+        if reaction_gap is None:
+            return None
+
+        layer_alignment_score = unit_score(
+            get_path(module, "layer_alignment_score")
+            or get_path(module, "internal_external_alignment")
+            or get_path(module, "alignment_score")
+            or get_path(primary, "alignment_score")
+        )
+        proximity_score = self._proximity_score(reaction_gap)
+        fill_quality_score = self._fill_quality_score(reaction_gap)
+
+        event_time = (
+            last_event.timestamp if last_event is not None else None
+        ) or reaction_gap.updated_at or reaction_gap.created_at or extract_last_update(primary)
+
+        reasons = self._extract_reasons(module, primary, last_event)
 
         return FVGReactionContext(
-            exchange=scope.get("exchange"),
-            market_type=scope.get("market_type"),
-            symbol=first_non_empty(state.get("symbol"), scope.get("symbol")),
-            exchange_symbol=first_non_empty(
-                state.get("exchange_symbol"),
-                scope.get("exchange_symbol"),
-            ),
-            timeframe=first_non_empty(state.get("timeframe"), scope.get("timeframe")),
-            key=key_tuple,
-            last_price=(
-                safe_float(
-                    first_non_empty(
-                        state.get("last_price"),
-                        payload_mapping.get("last_price"),
-                    ),
-                    0.0,
-                )
-                or None
-            ),
-            last_update=parse_datetime(
-                first_non_empty(
-                    state.get("last_update"),
-                    state.get("updated_at"),
-                    payload_mapping.get("last_update"),
-                    metadata.get("last_update"),
-                    metadata.get("updated_at"),
-                )
-            ),
-            internal=internal,
-            external=external,
+            module=module,
+            primary_layer=primary,
+            secondary_layer=secondary,
+            primary_layer_name=primary_layer_name,
+            secondary_layer_name=secondary_layer_name,
+            reaction_gap=reaction_gap,
             last_event=last_event,
-            metadata=metadata,
-            source_feature=state.get("_source_feature"),
-            raw=dict(state),
+            layer_confidence=layer_confidence(primary),
+            layer_strength=layer_strength(primary),
+            layer_alignment_score=layer_alignment_score,
+            proximity_score=proximity_score,
+            fill_quality_score=fill_quality_score,
+            event_time=event_time,
+            reasons=reasons,
+            raw=module,
         )
-
-    def _normalize_fvg_layer(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any]:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return {}
-
-        return {
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "total_gaps": int(safe_float(payload_mapping.get("total_gaps"), 0.0)),
-            "active_gaps": int(safe_float(payload_mapping.get("active_gaps"), 0.0)),
-            "partially_filled_gaps": int(
-                safe_float(payload_mapping.get("partially_filled_gaps"), 0.0)
-            ),
-            "filled_gaps": int(safe_float(payload_mapping.get("filled_gaps"), 0.0)),
-            "respected_gaps": int(safe_float(payload_mapping.get("respected_gaps"), 0.0)),
-            "invalidated_gaps": int(
-                safe_float(payload_mapping.get("invalidated_gaps"), 0.0)
-            ),
-            "nearest_bullish_gap": self._normalize_gap(
-                payload_mapping.get("nearest_bullish_gap"),
-                default_layer,
-            ),
-            "nearest_bearish_gap": self._normalize_gap(
-                payload_mapping.get("nearest_bearish_gap"),
-                default_layer,
-            ),
-            "strongest_bullish_gap": self._normalize_gap(
-                payload_mapping.get("strongest_bullish_gap"),
-                default_layer,
-            ),
-            "strongest_bearish_gap": self._normalize_gap(
-                payload_mapping.get("strongest_bearish_gap"),
-                default_layer,
-            ),
-            "recent_fill_activity": clamp(
-                safe_float(payload_mapping.get("recent_fill_activity"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "last_event": self._normalize_fvg_event(
-                payload_mapping.get("last_event"),
-                default_layer,
-            ),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _normalize_gap(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any] | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return None
-
-        source_candle_indices = []
-        for index in list(payload_mapping.get("source_candle_indices", []) or []):
-            try:
-                source_candle_indices.append(int(index))
-            except (TypeError, ValueError):
-                continue
-
-        return {
-            "gap_id": payload_mapping.get("gap_id"),
-            "exchange": payload_mapping.get("exchange"),
-            "market_type": payload_mapping.get("market_type"),
-            "symbol": payload_mapping.get("symbol"),
-            "exchange_symbol": payload_mapping.get("exchange_symbol"),
-            "timeframe": payload_mapping.get("timeframe"),
-            "key": list(payload_mapping.get("key", []) or []),
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "direction": self._parse_fvg_direction(payload_mapping.get("direction")),
-            "upper_bound": safe_float(payload_mapping.get("upper_bound"), 0.0),
-            "lower_bound": safe_float(payload_mapping.get("lower_bound"), 0.0),
-            "mid_price": safe_float(payload_mapping.get("mid_price"), 0.0),
-            "size": safe_float(payload_mapping.get("size"), 0.0),
-            "size_pct": clamp(
-                safe_float(payload_mapping.get("size_pct"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "strength": clamp(
-                safe_float(payload_mapping.get("strength"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "status": self._parse_fvg_status(payload_mapping.get("status")),
-            "fill_percentage": clamp(
-                safe_float(payload_mapping.get("fill_percentage"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "touch_count": int(safe_float(payload_mapping.get("touch_count"), 0.0)),
-            "retest_count": int(safe_float(payload_mapping.get("retest_count"), 0.0)),
-            "created_at": parse_datetime(payload_mapping.get("created_at")),
-            "updated_at": parse_datetime(payload_mapping.get("updated_at")),
-            "first_touch_at": parse_datetime(payload_mapping.get("first_touch_at")),
-            "filled_at": parse_datetime(payload_mapping.get("filled_at")),
-            "respected_at": parse_datetime(payload_mapping.get("respected_at")),
-            "invalidated_at": parse_datetime(payload_mapping.get("invalidated_at")),
-            "created_index": self._optional_int(payload_mapping.get("created_index")),
-            "last_touch_index": self._optional_int(payload_mapping.get("last_touch_index")),
-            "last_fill_index": self._optional_int(payload_mapping.get("last_fill_index")),
-            "source_candle_indices": source_candle_indices,
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _normalize_fvg_event(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any] | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return None
-
-        return {
-            "event_id": payload_mapping.get("event_id"),
-            "exchange": payload_mapping.get("exchange"),
-            "market_type": payload_mapping.get("market_type"),
-            "symbol": payload_mapping.get("symbol"),
-            "exchange_symbol": payload_mapping.get("exchange_symbol"),
-            "timeframe": payload_mapping.get("timeframe"),
-            "key": list(payload_mapping.get("key", []) or []),
-            "event_type": self._parse_fvg_event_type(payload_mapping.get("event_type")),
-            "timestamp": parse_datetime(payload_mapping.get("timestamp")),
-            "layer": self._parse_structure_layer(payload_mapping.get("layer"))
-            or default_layer,
-            "gap_id": payload_mapping.get("gap_id"),
-            "direction": self._parse_fvg_direction(payload_mapping.get("direction")),
-            "upper_bound": safe_float(payload_mapping.get("upper_bound"), 0.0),
-            "lower_bound": safe_float(payload_mapping.get("lower_bound"), 0.0),
-            "fill_percentage": clamp(
-                safe_float(payload_mapping.get("fill_percentage"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "confidence": clamp(
-                safe_float(payload_mapping.get("confidence"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "reference_price": (
-                safe_float(payload_mapping.get("reference_price"), 0.0)
-                if payload_mapping.get("reference_price") is not None
-                else None
-            ),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _extract_last_event(
-        self,
-        internal: Mapping[str, Any],
-        external: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        epoch = datetime.min.replace(tzinfo=timezone.utc)
-
-        candidates = [
-            event
-            for event in (
-                external.get("last_event"),
-                internal.get("last_event"),
-            )
-            if event is not None
-        ]
-        if not candidates:
-            return None
-
-        def _sort_key(item: Mapping[str, Any]) -> datetime:
-            ts = item.get("timestamp")
-            if ts is None:
-                return epoch
-            if isinstance(ts, datetime) and ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            if isinstance(ts, datetime):
-                return ts.astimezone(timezone.utc)
-            return epoch
-
-        candidates.sort(key=_sort_key, reverse=True)
-        return dict(candidates[0])
-
-    # ------------------------------------------------------------------
-    # Selection / side
-    # ------------------------------------------------------------------
-
-    def _select_primary_layer(self, fvg: FVGReactionContext) -> dict[str, Any]:
-        return fvg.external if self._p.prefer_external_layer else fvg.internal
-
-    def _select_secondary_layer(self, fvg: FVGReactionContext) -> dict[str, Any]:
-        return fvg.internal if self._p.prefer_external_layer else fvg.external
 
     def _select_reaction_gap(
         self,
         *,
-        context: SignalContext,
-        fvg: FVGReactionContext,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        last_event = fvg.last_event
-        current_price = self._resolve_current_price(context=context, fvg=fvg)
+        module: dict[str, Any],
+        primary: dict[str, Any],
+        last_event: FVGEventContext | None,
+        fallback_layer: StructureLayer | None,
+    ) -> FVGContext | None:
+        candidates: list[Any] = []
 
-        if last_event is not None and self._event_is_usable_for_entry(last_event):
-            event_gap = self._gap_from_event(
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                event=last_event,
+        if last_event is not None:
+            event_gap = (
+                get_path(last_event.raw, "gap")
+                or get_path(last_event.raw, "fvg")
+                or get_path(last_event.raw, "fair_value_gap")
             )
-            if event_gap is not None and self._gap_is_tradeable(event_gap, primary_layer):
-                return event_gap
+            if event_gap is not None:
+                candidates.append(event_gap)
 
-        if self._p.require_recent_event:
+        candidates.extend(
+            [
+                get_path(primary, "reaction_gap"),
+                get_path(primary, "active_gap"),
+                get_path(primary, "nearest_gap"),
+                get_path(primary, "nearest_bullish_gap"),
+                get_path(primary, "nearest_bearish_gap"),
+                get_path(module, "reaction_gap"),
+                get_path(module, "active_gap"),
+                get_path(module, "nearest_gap"),
+                get_path(module, "nearest_bullish_gap"),
+                get_path(module, "nearest_bearish_gap"),
+            ]
+        )
+
+        gaps = get_path(primary, "active_gaps") or get_path(module, "active_gaps")
+        if isinstance(gaps, (list, tuple)):
+            candidates.extend(gaps)
+
+        normalized: list[FVGContext] = []
+        for candidate in candidates:
+            gap = FVGContext.from_payload(candidate, fallback_layer=fallback_layer)
+            if gap is not None:
+                normalized.append(gap)
+
+        if not normalized:
             return None
 
-        candidate_gaps = self._candidate_gaps(primary_layer)
+        return max(
+            normalized,
+            key=lambda gap: (
+                gap.score,
+                gap.confidence,
+                gap.strength,
+                self._proximity_score(gap),
+            ),
+        )
 
-        best_gap: dict[str, Any] | None = None
-        best_score = -1.0
-
-        for gap in candidate_gaps:
-            if gap is None:
-                continue
-
-            if not self._gap_is_tradeable(gap, primary_layer):
-                continue
-
-            if (
-                not self._p.allow_active_gap_proximity_entry
-                and gap.get("status") == FVGStatus.ACTIVE
-            ):
-                continue
-
-            local_score = self._gap_selection_score(
-                gap=gap,
-                current_price=current_price,
+    @staticmethod
+    def _extract_layer_name(
+        layer: dict[str, Any],
+        *,
+        fallback: StructureLayer,
+    ) -> StructureLayer:
+        return (
+            parse_structure_layer(
+                get_path(layer, "layer")
+                or get_path(layer, "structure_layer")
+                or get_path(layer, "name"),
+                default=fallback,
             )
-            if local_score > best_score:
-                best_score = local_score
-                best_gap = gap
+            or fallback
+        )
 
-        return best_gap
+    @staticmethod
+    def _extract_reasons(
+        module: dict[str, Any],
+        primary: dict[str, Any],
+        event: FVGEventContext | None,
+    ) -> list[str]:
+        reasons: list[str] = []
 
-    def _candidate_gaps(self, layer: Mapping[str, Any]) -> list[dict[str, Any]]:
-        candidates = [
-            layer.get("strongest_bullish_gap"),
-            layer.get("strongest_bearish_gap"),
-            layer.get("nearest_bullish_gap"),
-            layer.get("nearest_bearish_gap"),
-        ]
-        return [dict(gap) for gap in candidates if isinstance(gap, Mapping)]
+        for value in (
+            get_path(module, "reasons"),
+            get_path(primary, "reasons"),
+            get_path(module, "confirmations"),
+            get_path(primary, "confirmations"),
+        ):
+            if isinstance(value, str) and value.strip():
+                reasons.append(value.strip())
+            elif isinstance(value, (list, tuple, set)):
+                reasons.extend(str(item).strip() for item in value if str(item).strip())
 
-    def _gap_from_event(
+        if event is not None:
+            reasons.extend(event.reasons)
+
+        return list(dict.fromkeys(reasons))
+
+    # ------------------------------------------------------------------
+    # Mapping / filters
+    # ------------------------------------------------------------------
+
+    def _infer_side(self, view: FVGReactionContext) -> SignalSide:
+        gap = view.reaction_gap
+        if gap is None:
+            return SignalSide.UNKNOWN
+
+        if view.last_event is not None and view.last_event.direction is not None:
+            event_side = fvg_direction_to_side(view.last_event.direction)
+            if is_directional_side(event_side):
+                return event_side
+
+        return fvg_direction_to_side(gap.direction)
+
+    def _infer_setup_type(
+        self,
+        view: FVGReactionContext,
+    ) -> SetupType:
+        event = view.last_event
+        gap = view.reaction_gap
+
+        if event is not None and event.event_type is not None:
+            event_label = normalize_label(event.event_type)
+
+            if event_label in {"created", "gap_created", "new_gap"}:
+                return SetupType.CONTINUATION
+
+            if event_label in {"retested", "retest"}:
+                return SetupType.RETEST
+
+            if event_label in {"respected", "rejected", "reaction"}:
+                return SetupType.RETEST
+
+            if event_label in {"fill_started", "partial_fill", "mitigation_started"}:
+                return SetupType.RETEST
+
+        if gap is not None:
+            status_label = normalize_label(gap.status)
+
+            if status_label in {"active", "open"}:
+                return SetupType.RETEST
+
+            if status_label in {"respected", "retested", "partial_fill", "partially_filled"}:
+                return SetupType.RETEST
+
+        return self.fvg_config.default_setup_type
+
+    def _passes_filters(
         self,
         *,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        event: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        gap_id = event.get("gap_id")
-        if not gap_id:
-            return None
-
-        for layer in (primary_layer, secondary_layer):
-            for key in (
-                "strongest_bullish_gap",
-                "strongest_bearish_gap",
-                "nearest_bullish_gap",
-                "nearest_bearish_gap",
-            ):
-                gap = layer.get(key)
-                if isinstance(gap, Mapping) and gap.get("gap_id") == gap_id:
-                    return dict(gap)
-
-        return self._gap_stub_from_event(event)
-
-    def _gap_stub_from_event(self, event: Mapping[str, Any]) -> dict[str, Any] | None:
-        gap_id = event.get("gap_id")
-        direction = self._parse_fvg_direction(event.get("direction"))
-        if not gap_id or direction is None:
-            return None
-
-        upper_bound = safe_float(event.get("upper_bound"), 0.0)
-        lower_bound = safe_float(event.get("lower_bound"), 0.0)
-        mid_price = (upper_bound + lower_bound) / 2.0 if upper_bound and lower_bound else 0.0
-
-        return {
-            "gap_id": gap_id,
-            "layer": self._parse_structure_layer(event.get("layer")) or StructureLayer.INTERNAL,
-            "direction": direction,
-            "upper_bound": upper_bound,
-            "lower_bound": lower_bound,
-            "mid_price": mid_price,
-            "size": max(upper_bound - lower_bound, 0.0),
-            "size_pct": 0.0,
-            "strength": clamp(safe_float(event.get("confidence"), 0.0), 0.0, 1.0),
-            "status": self._status_from_event_type(event.get("event_type")),
-            "fill_percentage": clamp(safe_float(event.get("fill_percentage"), 0.0), 0.0, 1.0),
-            "touch_count": 0,
-            "retest_count": 1 if event.get("event_type") == FVGEventType.FVG_RETESTED else 0,
-            "created_at": None,
-            "updated_at": event.get("timestamp"),
-            "first_touch_at": None,
-            "filled_at": None,
-            "respected_at": event.get("timestamp")
-            if event.get("event_type") == FVGEventType.FVG_RESPECTED
-            else None,
-            "invalidated_at": None,
-            "metadata": dict(event.get("metadata", {}) or {}),
-        }
-
-    def _resolve_side(self, gap: Mapping[str, Any]) -> SignalSide:
-        direction = gap.get("direction")
-        if direction == FVGDirection.BULLISH:
-            return SignalSide.LONG
-        if direction == FVGDirection.BEARISH:
-            return SignalSide.SHORT
-        return SignalSide.UNKNOWN
-
-    def _event_is_usable_for_entry(self, event: Mapping[str, Any]) -> bool:
-        event_type = event.get("event_type")
-        confidence = clamp(safe_float(event.get("confidence"), 0.0), 0.0, 1.0)
-
-        if confidence < self._p.min_event_confidence:
-            return False
-
-        if event_type == FVGEventType.FVG_FILL_STARTED:
-            return self._p.allow_fill_started_reaction
-
-        if event_type == FVGEventType.FVG_PARTIALLY_FILLED:
-            return self._p.allow_partial_fill_reaction
-
-        if event_type == FVGEventType.FVG_RESPECTED:
-            return self._p.allow_respected_reaction
-
-        if event_type == FVGEventType.FVG_RETESTED:
-            return self._p.allow_retested_reaction
-
-        if event_type == FVGEventType.FVG_CREATED:
-            return self._p.allow_created_gap_continuation
-
-        if event_type == FVGEventType.FVG_MERGED:
-            return self._p.allow_merged_gap_entry
-
-        if event_type in {
-            FVGEventType.FVG_FILLED,
-            FVGEventType.FVG_INVALIDATED,
-        }:
-            return False
-
-        return False
-
-    def _gap_is_tradeable(
-        self,
-        gap: Mapping[str, Any],
-        layer: Mapping[str, Any],
+        view: FVGReactionContext,
+        side: SignalSide,
+        setup_type: SetupType,
     ) -> bool:
-        if not gap:
+        gap = view.reaction_gap
+        if gap is None:
             return False
 
-        if self._p.require_directional_gap and gap.get("direction") not in {
-            FVGDirection.BULLISH,
-            FVGDirection.BEARISH,
-        }:
+        if self.fvg_config.require_directional_gap and not is_directional_side(side):
             return False
 
-        if clamp(safe_float(gap.get("strength"), 0.0), 0.0, 1.0) < self._p.min_gap_strength:
+        if not gap.is_valid:
             return False
 
-        status = gap.get("status", FVGStatus.ACTIVE)
+        status_label = normalize_label(gap.status)
 
-        if self._p.block_invalidated_gaps and status == FVGStatus.INVALIDATED:
-            return False
-
-        if self._p.block_filled_gaps and status == FVGStatus.FILLED:
-            return False
-
-        fill_percentage = clamp(safe_float(gap.get("fill_percentage"), 0.0), 0.0, 1.0)
-
-        if fill_percentage > self._p.max_gap_fill_for_entry:
-            return False
-
-        if status in {FVGStatus.PARTIALLY_FILLED, FVGStatus.RESPECTED}:
-            if fill_percentage < self._p.min_gap_fill_for_reaction:
-                if int(safe_float(gap.get("retest_count"), 0.0)) <= 0:
-                    return False
-
-        if self._p.require_respected_or_retested:
-            respected = status == FVGStatus.RESPECTED
-            retested = int(safe_float(gap.get("retest_count"), 0.0)) > 0
-            if not (respected or retested):
+        if self.fvg_config.block_invalidated_gaps:
+            if status_label in {"invalidated", "expired", "broken"}:
                 return False
 
-        if self._p.block_excessive_layer_fill_activity:
-            recent_fill_activity = clamp(
-                safe_float(layer.get("recent_fill_activity"), 0.0),
-                0.0,
-                1.0,
-            )
-            if recent_fill_activity > self._p.max_recent_fill_activity:
+        if self.fvg_config.block_filled_gaps:
+            if status_label in {"filled", "fully_filled", "mitigated"} or gap.is_mitigated:
+                return False
+
+        if gap.strength < self.fvg_config.min_gap_strength:
+            return False
+
+        if view.layer_confidence < self.fvg_config.min_layer_confidence:
+            return False
+
+        if gap.fill_pct > self.fvg_config.max_gap_fill_for_entry:
+            return False
+
+        if gap.distance_to_mid_pct > self.fvg_config.max_distance_to_mid_pct:
+            if gap.distance_to_nearest_edge_pct > self.fvg_config.max_distance_to_edge_pct:
+                return False
+
+        event = view.last_event
+        if self.fvg_config.require_recent_event and event is None:
+            if not self.fvg_config.allow_active_gap_proximity_entry:
+                return False
+
+        if event is not None:
+            if event.confidence < self.fvg_config.min_event_confidence:
+                return False
+
+            event_label = normalize_label(event.event_type)
+
+            if event_label in {"created", "gap_created", "new_gap"}:
+                if not self.fvg_config.allow_created_gap_continuation:
+                    return False
+
+            if event_label in {"fill_started", "mitigation_started"}:
+                if not self.fvg_config.allow_fill_started_reaction:
+                    return False
+
+            if event_label in {"partial_fill", "partially_filled"}:
+                if not self.fvg_config.allow_partial_fill_reaction:
+                    return False
+
+            if event_label in {"respected", "rejected", "reaction"}:
+                if not self.fvg_config.allow_respected_reaction:
+                    return False
+
+            if event_label in {"retested", "retest"}:
+                if not self.fvg_config.allow_retested_reaction:
+                    return False
+
+        if self.fvg_config.require_respected_or_retested:
+            event_label = normalize_label(event.event_type) if event else ""
+            if event_label not in {"respected", "retested", "retest", "rejected", "reaction"}:
+                return False
+
+        if gap.fill_pct < self.fvg_config.min_gap_fill_for_reaction:
+            if not self.fvg_config.allow_active_gap_proximity_entry:
                 return False
 
         return True
 
     # ------------------------------------------------------------------
-    # Score / confidence
+    # Scoring
     # ------------------------------------------------------------------
 
-    def _compute_score(
+    def _build_score_breakdown(
         self,
         *,
-        context: SignalContext,
-        fvg: FVGReactionContext,
-        selected_gap: Mapping[str, Any],
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
+        context: StrategyContext,
+        view: FVGReactionContext,
         side: SignalSide,
-    ) -> float:
-        current_price = self._resolve_current_price(context=context, fvg=fvg)
+        setup_type: SetupType,
+    ) -> ScoreBreakdown:
+        gap = view.reaction_gap
+        event = view.last_event
 
-        score = 0.0
-        score += self._p.primary_gap_weight * clamp(
-            safe_float(selected_gap.get("strength"), 0.0),
-            0.0,
-            1.0,
-        )
-        score += self._p.event_confidence_weight * self._event_score(
-            selected_gap=selected_gap,
-            last_event=last_event,
-        )
-        score += self._p.status_quality_weight * self._status_quality_score(
-            selected_gap.get("status")
-        )
-        score += self._p.proximity_weight * self._proximity_score(
-            current_price=current_price,
-            gap=selected_gap,
-        )
-        score += self._p.fill_quality_weight * self._fill_quality_score(selected_gap)
-        score += self._p.secondary_layer_alignment_weight * self._secondary_layer_alignment_score(
-            secondary_layer=secondary_layer,
-            selected_gap=selected_gap,
-        )
-        score += self._p.regime_alignment_weight * self._regime_alignment_score(
-            context=context,
-            side=side,
+        if gap is None:
+            return ScoreBreakdown()
+
+        gap_component = average_score(gap.score, gap.confidence, gap.strength)
+        event_component = self._event_component(event)
+        proximity_component = view.proximity_score
+        fill_component = view.fill_quality_score
+        layer_component = average_score(view.layer_confidence, view.layer_strength)
+        fresh_component = freshness_score(
+            event_time=view.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.fvg_config.stale_feature_max_age_seconds,
         )
 
-        if int(safe_float(selected_gap.get("retest_count"), 0.0)) > 0:
-            score += self._p.retest_bonus_weight
+        components = {
+            "gap": gap_component,
+            "event": event_component,
+            "proximity": proximity_component,
+            "fill": fill_component,
+            "layer": layer_component,
+            "freshness": fresh_component,
+        }
+        weights = {
+            "gap": self.fvg_config.score_gap_weight,
+            "event": self.fvg_config.score_event_weight,
+            "proximity": self.fvg_config.score_proximity_weight,
+            "fill": self.fvg_config.score_fill_weight,
+            "layer": self.fvg_config.score_layer_weight,
+            "freshness": self.fvg_config.score_freshness_weight,
+        }
 
-        if selected_gap.get("status") == FVGStatus.RESPECTED:
-            score += self._p.respect_bonus_weight
-
-        return clamp(score, 0.0, 1.0)
-
-    def _compute_confidence(
-        self,
-        *,
-        context: SignalContext,
-        fvg: FVGReactionContext,
-        selected_gap: Mapping[str, Any],
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-        side: SignalSide,
-    ) -> float:
-        current_price = self._resolve_current_price(context=context, fvg=fvg)
-
-        components = [
-            clamp(safe_float(selected_gap.get("strength"), 0.0), 0.0, 1.0),
-            self._event_score(selected_gap=selected_gap, last_event=last_event),
-            self._status_quality_score(selected_gap.get("status")),
-            self._proximity_score(current_price=current_price, gap=selected_gap),
-            self._fill_quality_score(selected_gap),
-            self._secondary_layer_alignment_score(
-                secondary_layer=secondary_layer,
-                selected_gap=selected_gap,
+        score = weighted_score(components, weights, default=gap_component)
+        confidence = confidence_from_components(
+            primary=max(gap_component, event_component),
+            context=weighted_score(
+                {
+                    "layer": layer_component,
+                    "alignment": view.layer_alignment_score,
+                    "proximity": proximity_component,
+                },
+                {
+                    "layer": 0.35,
+                    "alignment": 0.30,
+                    "proximity": 0.35,
+                },
             ),
-            self._regime_alignment_score(context=context, side=side),
+            confirmation=fill_component,
+            freshness=fresh_component,
+            primary_weight=self.fvg_config.confidence_gap_weight,
+            context_weight=self.fvg_config.confidence_context_weight,
+            confirmation_weight=self.fvg_config.confidence_confirmation_weight,
+            freshness_weight=self.fvg_config.confidence_freshness_weight,
+        )
+
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            f"side:{side.value}",
+            f"setup_type:{setup_type.value}",
+            f"fvg_direction:{normalize_label(gap.direction)}",
         ]
 
-        layer_fill_activity = clamp(
-            safe_float(primary_layer.get("recent_fill_activity"), 0.0),
-            0.0,
-            1.0,
-        )
-        penalty = 0.20 * max(0.0, layer_fill_activity - 0.65)
+        if event is not None and event.event_type is not None:
+            event_label = normalize_label(event.event_type)
+            confirmations.append(f"fvg_event:{event_label}")
 
-        return clamp((sum(components) / len(components)) - penalty, 0.0, 1.0)
+            if event_label in {"respected", "rejected", "reaction"}:
+                score += self.fvg_config.respected_bonus
+                confirmations.append("fvg_respected")
 
-    def _event_score(
-        self,
-        *,
-        selected_gap: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> float:
-        if last_event is None:
-            return 0.35
+            elif event_label in {"retested", "retest"}:
+                score += self.fvg_config.retested_bonus
+                confirmations.append("fvg_retested")
 
-        if last_event.get("gap_id") != selected_gap.get("gap_id"):
-            return 0.30
+            elif event_label in {"partial_fill", "partially_filled"}:
+                score += self.fvg_config.partial_fill_bonus
+                confirmations.append("fvg_partial_fill")
 
-        event_type = last_event.get("event_type")
-        confidence = clamp(safe_float(last_event.get("confidence"), 0.0), 0.0, 1.0)
+            elif event_label in {"fill_started", "mitigation_started"}:
+                score += self.fvg_config.partial_fill_bonus
+                confirmations.append("fvg_fill_started")
 
-        multiplier = {
-            FVGEventType.FVG_RESPECTED: 1.00,
-            FVGEventType.FVG_RETESTED: 0.95,
-            FVGEventType.FVG_PARTIALLY_FILLED: 0.82,
-            FVGEventType.FVG_FILL_STARTED: 0.72,
-            FVGEventType.FVG_CREATED: 0.55,
-            FVGEventType.FVG_MERGED: 0.50,
-            FVGEventType.FVG_FILLED: 0.10,
-            FVGEventType.FVG_INVALIDATED: 0.0,
-        }.get(event_type, 0.35)
-
-        return clamp(confidence * multiplier, 0.0, 1.0)
-
-    def _status_quality_score(self, status: Any) -> float:
-        parsed = self._parse_fvg_status(status)
-
-        if parsed == FVGStatus.RESPECTED:
-            return 1.0
-        if parsed == FVGStatus.PARTIALLY_FILLED:
-            return 0.78
-        if parsed == FVGStatus.ACTIVE:
-            return 0.62
-        if parsed == FVGStatus.FILLED:
-            return 0.20
-        if parsed == FVGStatus.INVALIDATED:
-            return 0.0
-
-        return 0.35
-
-    def _fill_quality_score(self, gap: Mapping[str, Any]) -> float:
-        fill = clamp(safe_float(gap.get("fill_percentage"), 0.0), 0.0, 1.0)
-        status = gap.get("status")
-
-        if status == FVGStatus.RESPECTED:
-            return max(0.80, 1.0 - abs(fill - 0.50))
-
-        if status == FVGStatus.PARTIALLY_FILLED:
-            if fill < self._p.min_gap_fill_for_reaction:
-                return 0.25
-            if fill <= self._p.max_gap_fill_for_entry:
-                return clamp(1.0 - abs(fill - 0.45), 0.0, 1.0)
-
-        if status == FVGStatus.ACTIVE:
-            return 1.0 - fill
-
-        if status == FVGStatus.FILLED:
-            return 0.15
-
-        if status == FVGStatus.INVALIDATED:
-            return 0.0
-
-        return 0.35
-
-    def _proximity_score(
-        self,
-        *,
-        current_price: float | None,
-        gap: Mapping[str, Any],
-    ) -> float:
-        if current_price is None or current_price <= 0:
-            return 0.35
-
-        mid_price = safe_float(gap.get("mid_price"), 0.0)
-        if mid_price <= 0:
-            lower = safe_float(gap.get("lower_bound"), 0.0)
-            upper = safe_float(gap.get("upper_bound"), 0.0)
-            if lower > 0 and upper > 0:
-                mid_price = (lower + upper) / 2.0
-
-        if mid_price <= 0:
-            return 0.35
-
-        distance_pct = abs(current_price - mid_price) / mid_price
-        if distance_pct >= self._p.max_distance_to_mid_pct:
-            return 0.0
-
-        return clamp(
-            1.0 - (distance_pct / max(self._p.max_distance_to_mid_pct, 1e-9)),
-            0.0,
-            1.0,
-        )
-
-    def _secondary_layer_alignment_score(
-        self,
-        *,
-        secondary_layer: Mapping[str, Any],
-        selected_gap: Mapping[str, Any],
-    ) -> float:
-        if not secondary_layer:
-            return 0.35
-
-        direction = selected_gap.get("direction")
-
-        if direction == FVGDirection.BULLISH:
-            ref_gap = (
-                secondary_layer.get("nearest_bullish_gap")
-                or secondary_layer.get("strongest_bullish_gap")
-            )
-        elif direction == FVGDirection.BEARISH:
-            ref_gap = (
-                secondary_layer.get("nearest_bearish_gap")
-                or secondary_layer.get("strongest_bearish_gap")
-            )
         else:
-            ref_gap = None
+            reasons.append("no_recent_fvg_event")
+            confirmations.append("active_gap_proximity_entry")
 
-        if not isinstance(ref_gap, Mapping):
-            return 0.35
+        if proximity_component >= 0.70:
+            score += self.fvg_config.proximity_bonus
+            confirmations.append("price_near_fvg_reaction_zone")
 
-        ref_status = ref_gap.get("status")
-        return clamp(
-            0.55 * clamp(safe_float(ref_gap.get("strength"), 0.0), 0.0, 1.0)
-            + 0.30 * self._status_quality_score(ref_status)
-            + 0.15 * self._fill_quality_score(ref_gap),
-            0.0,
-            1.0,
-        )
+        if view.layer_alignment_score > 0:
+            score += self.fvg_config.layer_alignment_bonus
+            confirmations.append("fvg_layer_alignment_context")
 
-    def _gap_selection_score(
-        self,
-        *,
-        gap: Mapping[str, Any],
-        current_price: float | None,
-    ) -> float:
-        score = 0.0
-        score += 0.35 * clamp(safe_float(gap.get("strength"), 0.0), 0.0, 1.0)
-        score += 0.22 * self._status_quality_score(gap.get("status"))
-        score += 0.18 * self._fill_quality_score(gap)
-        score += 0.15 * self._proximity_score(current_price=current_price, gap=gap)
-        score += 0.10 * min(1.0, safe_float(gap.get("retest_count"), 0.0) / 3.0)
-        return clamp(score, 0.0, 1.0)
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
 
-    # ------------------------------------------------------------------
-    # Reasons / signal build
-    # ------------------------------------------------------------------
+    def _event_component(self, event: FVGEventContext | None) -> float:
+        if event is None:
+            return 0.0
 
-    def _build_reasons(
-        self,
-        *,
-        fvg: FVGReactionContext,
-        selected_gap: Mapping[str, Any],
-        side: SignalSide,
-    ) -> list[str]:
-        reasons: list[str] = []
-
-        if side == SignalSide.LONG:
-            reasons.append("bullish_fvg_reaction")
-        elif side == SignalSide.SHORT:
-            reasons.append("bearish_fvg_reaction")
-
-        layer = selected_gap.get("layer")
-        status = selected_gap.get("status")
-        direction = selected_gap.get("direction")
-
-        reasons.append(f"gap_layer_{enum_value(layer)}")
-        reasons.append(f"gap_direction_{enum_value(direction)}")
-        reasons.append(f"gap_status_{enum_value(status)}")
-
-        if status == FVGStatus.RESPECTED:
-            reasons.append("fvg_respected")
-
-        if status == FVGStatus.PARTIALLY_FILLED:
-            reasons.append("fvg_partially_filled")
-
-        if int(safe_float(selected_gap.get("retest_count"), 0.0)) > 0:
-            reasons.append("fvg_retested")
-
-        fill_pct = clamp(safe_float(selected_gap.get("fill_percentage"), 0.0), 0.0, 1.0)
-        if fill_pct >= self._p.min_gap_fill_for_reaction:
-            reasons.append("fvg_has_reaction_fill")
-
-        if fvg.last_event is not None:
-            event_type = fvg.last_event.get("event_type")
-            if isinstance(event_type, FVGEventType):
-                reasons.append(f"last_fvg_event_{event_type.value}")
-
-            if fvg.last_event.get("gap_id") == selected_gap.get("gap_id"):
-                reasons.append("last_event_matches_selected_gap")
-
-        return reasons
-
-    def _build_signal(
-        self,
-        *,
-        context: SignalContext,
-        fvg: FVGReactionContext,
-        selected_gap: Mapping[str, Any],
-        score: float,
-        confidence: float,
-        reasons: list[str],
-        freshness_filter: FilterResult | None,
-    ) -> StrategySignal:
-        side = self._resolve_side(selected_gap)
-        last_event = fvg.last_event
-
-        gap_layer = selected_gap.get("layer")
-        gap_direction = selected_gap.get("direction")
-        gap_status = selected_gap.get("status")
-        last_event_type = last_event.get("event_type") if last_event is not None else None
-
-        analytics_metadata = self._build_analytics_source_metadata(
-            module_name=self.analytics_module_name,
-            payload=fvg.raw,
-            selected_entity=selected_gap,
-            extra={
-                "signal_id": uuid4().hex,
-                "module": self.name,
-                "source": "analytics.price_action.fair_value_gap",
-                "fvg_timeframe": fvg.timeframe,
-                "fvg_last_update": fvg.last_update.isoformat() if fvg.last_update else None,
-                "fvg_last_price": fvg.last_price,
-                "gap_id": selected_gap.get("gap_id"),
-                "gap_layer": enum_value(gap_layer),
-                "gap_direction": enum_value(gap_direction),
-                "gap_status": enum_value(gap_status),
-                "gap_strength": safe_float(selected_gap.get("strength"), 0.0),
-                "gap_fill_percentage": safe_float(selected_gap.get("fill_percentage"), 0.0),
-                "gap_mid_price": safe_float(selected_gap.get("mid_price"), 0.0),
-                "gap_upper_bound": safe_float(selected_gap.get("upper_bound"), 0.0),
-                "gap_lower_bound": safe_float(selected_gap.get("lower_bound"), 0.0),
-                "gap_size": safe_float(selected_gap.get("size"), 0.0),
-                "gap_size_pct": safe_float(selected_gap.get("size_pct"), 0.0),
-                "gap_touch_count": int(safe_float(selected_gap.get("touch_count"), 0.0)),
-                "gap_retest_count": int(safe_float(selected_gap.get("retest_count"), 0.0)),
-                "gap_created_at": (
-                    selected_gap.get("created_at").isoformat()
-                    if isinstance(selected_gap.get("created_at"), datetime)
-                    else None
+        return weighted_score(
+            {
+                "confidence": event.confidence,
+                "score": event.score,
+                "fill": event.fill_pct,
+                "distance": distance_score(
+                    event.distance_to_mid_pct,
+                    max_distance_pct=max(self.fvg_config.max_distance_to_mid_pct, 0.0001),
                 ),
-                "gap_updated_at": (
-                    selected_gap.get("updated_at").isoformat()
-                    if isinstance(selected_gap.get("updated_at"), datetime)
-                    else None
-                ),
-                "gap_first_touch_at": (
-                    selected_gap.get("first_touch_at").isoformat()
-                    if isinstance(selected_gap.get("first_touch_at"), datetime)
-                    else None
-                ),
-                "gap_filled_at": (
-                    selected_gap.get("filled_at").isoformat()
-                    if isinstance(selected_gap.get("filled_at"), datetime)
-                    else None
-                ),
-                "gap_respected_at": (
-                    selected_gap.get("respected_at").isoformat()
-                    if isinstance(selected_gap.get("respected_at"), datetime)
-                    else None
-                ),
-                "gap_invalidated_at": (
-                    selected_gap.get("invalidated_at").isoformat()
-                    if isinstance(selected_gap.get("invalidated_at"), datetime)
-                    else None
-                ),
-                "gap_created_index": selected_gap.get("created_index"),
-                "gap_last_touch_index": selected_gap.get("last_touch_index"),
-                "gap_last_fill_index": selected_gap.get("last_fill_index"),
-                "gap_source_candle_indices": list(
-                    selected_gap.get("source_candle_indices", []) or []
-                ),
-                "last_fvg_event_id": (
-                    last_event.get("event_id")
-                    if last_event is not None
-                    else None
-                ),
-                "last_fvg_event_type": enum_value(last_event_type),
-                "last_fvg_event_confidence": (
-                    safe_float(last_event.get("confidence"), 0.0)
-                    if last_event is not None
-                    else None
-                ),
-                "last_fvg_event_reference_price": (
-                    last_event.get("reference_price")
-                    if last_event is not None
-                    else None
-                ),
-                "last_fvg_event_matches_gap": (
-                    bool(last_event and last_event.get("gap_id") == selected_gap.get("gap_id"))
-                ),
-                "primary_layer": "external" if self._p.prefer_external_layer else "internal",
+            },
+            {
+                "confidence": 0.40,
+                "score": 0.35,
+                "fill": 0.15,
+                "distance": 0.10,
             },
         )
 
-        signal = StrategySignal(
-            symbol=context.symbol,
-            side=side,
-            strategy_name=self.name,
-            category=StrategyCategory.PRICE_ACTION,
-            timeframe=context.timeframe,
-            setup_type=self._resolve_setup_type(selected_gap, last_event),
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=confidence_to_strength(confidence),
-            confidence_grade=confidence_to_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=self._resolve_trigger_type(selected_gap, last_event),
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=self._resolve_priority(
-                selected_gap=selected_gap,
-                last_event=last_event,
-                confidence=confidence,
-                score=score,
-            ),
-            regime=self._resolve_market_regime(context),
-            metadata=analytics_metadata,
+    def _proximity_score(self, gap: FVGContext) -> float:
+        mid_score = distance_score(
+            gap.distance_to_mid_pct,
+            max_distance_pct=max(self.fvg_config.max_distance_to_mid_pct, 0.0001),
         )
+        edge_score = distance_score(
+            gap.distance_to_nearest_edge_pct,
+            max_distance_pct=max(self.fvg_config.max_distance_to_edge_pct, 0.0001),
+        )
+        return max(mid_score, edge_score)
 
-        for reason in reasons:
-            signal.add_reason(reason)
+    def _fill_quality_score(self, gap: FVGContext) -> float:
+        if gap.fill_pct <= 0:
+            return 0.0
 
-        signal.add_source_feature("analytics.price_action")
-        signal.add_source_feature("analytics.price_action.fair_value_gap")
-        signal.add_source_feature("price_action.fair_value_gap")
-        signal.add_source_feature("price_action.fvg")
+        if gap.fill_pct < self.fvg_config.min_gap_fill_for_reaction:
+            return unit_score(gap.fill_pct / max(self.fvg_config.min_gap_fill_for_reaction, 0.0001))
 
-        if freshness_filter is not None:
-            signal.add_filter_result(freshness_filter)
+        if gap.fill_pct <= self.fvg_config.max_gap_fill_for_entry:
+            return unit_score(gap.fill_pct)
 
-        regime_filter = self._build_regime_filter(context=context, side=side)
-        if regime_filter is not None:
-            signal.add_filter_result(regime_filter)
+        return unit_score(1.0 - gap.fill_pct)
 
-        signal.validate()
-        return signal
+    # ------------------------------------------------------------------
+    # Source features / tags
+    # ------------------------------------------------------------------
 
-    def _resolve_setup_type(
-        self,
-        gap: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> SetupType:
-        event_type = last_event.get("event_type") if last_event is not None else None
+    def _source_features(self, view: FVGReactionContext) -> list[str]:
+        features = [
+            *fvg_source_features(),
+            PRICE_ACTION_FEATURES.FAIR_VALUE_GAP,
+            PRICE_ACTION_FEATURES.FVG,
+            PRICE_ACTION_FEATURES.FVG_INTERNAL,
+            PRICE_ACTION_FEATURES.FVG_EXTERNAL,
+            PRICE_ACTION_FEATURES.FVG_LAST_EVENT,
+            PRICE_ACTION_FEATURES.FVG_NEAREST_BULLISH_GAP,
+            PRICE_ACTION_FEATURES.FVG_NEAREST_BEARISH_GAP,
+        ]
 
-        if event_type in {
-            FVGEventType.FVG_RESPECTED,
-            FVGEventType.FVG_RETESTED,
-        }:
-            return SetupType.REVERSAL
+        return list(dict.fromkeys(features))
 
-        if event_type in {
-            FVGEventType.FVG_FILL_STARTED,
-            FVGEventType.FVG_PARTIALLY_FILLED,
-        }:
-            return SetupType.MEAN_REVERSION
-
-        if gap.get("status") == FVGStatus.PARTIALLY_FILLED:
-            return SetupType.MEAN_REVERSION
-
-        if gap.get("status") == FVGStatus.RESPECTED:
-            return SetupType.REVERSAL
-
-        return SetupType.CONTINUATION
-
-    def _resolve_trigger_type(
-        self,
-        gap: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-    ) -> TriggerType:
-        event_type = last_event.get("event_type") if last_event is not None else None
-
-        if event_type in {
-            FVGEventType.FVG_RESPECTED,
-            FVGEventType.FVG_RETESTED,
-        }:
-            return TriggerType.PRIMARY
-
-        if event_type in {
-            FVGEventType.FVG_FILL_STARTED,
-            FVGEventType.FVG_PARTIALLY_FILLED,
-        }:
-            return TriggerType.CONFIRMATION
-
-        if gap.get("status") == FVGStatus.ACTIVE:
-            return TriggerType.DERIVED
-
-        return TriggerType.CONFIRMATION
-
-    def _resolve_priority(
+    def _tags(
         self,
         *,
-        selected_gap: Mapping[str, Any],
-        last_event: Mapping[str, Any] | None,
-        confidence: float,
-        score: float,
-    ) -> SignalPriority:
-        event_type = last_event.get("event_type") if last_event is not None else None
-        gap_strength = clamp(safe_float(selected_gap.get("strength"), 0.0), 0.0, 1.0)
+        view: FVGReactionContext,
+        setup_type: SetupType,
+    ) -> list[str]:
+        tags = [
+            self.fvg_config.tag_price_action,
+            self.fvg_config.tag_fvg,
+            self.fvg_config.tag_fvg_reaction,
+            self.fvg_config.tag_reaction,
+            setup_type.value,
+        ]
 
-        if (
-            event_type in {FVGEventType.FVG_RESPECTED, FVGEventType.FVG_RETESTED}
-            and confidence >= 0.72
-            and score >= 0.65
-        ):
-            return SignalPriority.HIGH
+        event = view.last_event
+        if event is not None and event.event_type is not None:
+            event_label = normalize_label(event.event_type)
 
-        if (
-            selected_gap.get("status") == FVGStatus.RESPECTED
-            and confidence >= 0.70
-            and gap_strength >= 0.65
-        ):
-            return SignalPriority.HIGH
+            if event_label in {"respected", "rejected", "reaction"}:
+                tags.append(self.fvg_config.tag_fvg_respected)
 
-        if confidence >= 0.85 and score >= 0.78:
-            return SignalPriority.HIGH
+            if event_label in {"retested", "retest"}:
+                tags.append(self.fvg_config.tag_fvg_retested)
 
-        return SignalPriority.MEDIUM
+            if event_label in {"partial_fill", "partially_filled"}:
+                tags.append(self.fvg_config.tag_fvg_partial_fill)
 
-    # ------------------------------------------------------------------
-    # Utility helpers
-    # ------------------------------------------------------------------
+            if event_label in {"fill_started", "mitigation_started"}:
+                tags.append(self.fvg_config.tag_fvg_fill_started)
 
-    def _resolve_current_price(
-        self,
-        *,
-        context: SignalContext,
-        fvg: FVGReactionContext,
-    ) -> float | None:
-        candidates = (
-            getattr(context, "last_price", None),
-            getattr(context, "current_price", None),
-            getattr(context, "price", None),
-            self._get_context_feature(context, "last_price"),
-            self._get_context_feature(context, "current_price"),
-            self._get_context_feature(context, "price"),
-            fvg.last_price,
-        )
+        else:
+            tags.append(self.fvg_config.tag_fvg_proximity)
 
-        for candidate in candidates:
-            value = safe_float(candidate, 0.0)
-            if value > 0:
-                return value
+        gap = view.reaction_gap
+        if gap is not None:
+            if gap.layer is not None:
+                tags.append(f"layer:{normalize_label(gap.layer)}")
 
-        return None
+            if gap.direction is not None:
+                tags.append(f"direction:{normalize_label(gap.direction)}")
 
-    def _optional_int(self, value: Any) -> int | None:
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+            if gap.status is not None:
+                tags.append(f"status:{normalize_label(gap.status)}")
 
-    def _status_from_event_type(self, event_type: Any) -> FVGStatus:
-        parsed = self._parse_fvg_event_type(event_type)
+        if setup_type is SetupType.RETEST:
+            tags.append(self.fvg_config.tag_retest)
 
-        if parsed == FVGEventType.FVG_PARTIALLY_FILLED:
-            return FVGStatus.PARTIALLY_FILLED
-        if parsed == FVGEventType.FVG_FILLED:
-            return FVGStatus.FILLED
-        if parsed in {FVGEventType.FVG_RESPECTED, FVGEventType.FVG_RETESTED}:
-            return FVGStatus.RESPECTED
-        if parsed == FVGEventType.FVG_INVALIDATED:
-            return FVGStatus.INVALIDATED
+        if setup_type is SetupType.CONTINUATION:
+            tags.append(self.fvg_config.tag_continuation)
 
-        return FVGStatus.ACTIVE
+        if setup_type is SetupType.REVERSAL:
+            tags.append(self.fvg_config.tag_reversal)
 
-    # ------------------------------------------------------------------
-    # Enum parsing
-    # ------------------------------------------------------------------
-
-    def _parse_structure_layer(self, value: Any) -> StructureLayer | None:
-        raw = enum_value(value)
-
-        if raw == "internal":
-            return StructureLayer.INTERNAL
-
-        if raw == "external":
-            return StructureLayer.EXTERNAL
-
-        try:
-            return StructureLayer(raw)
-        except Exception:
-            return None
-
-    def _parse_fvg_direction(self, value: Any) -> FVGDirection | None:
-        raw = enum_value(value)
-
-        if raw == "bullish":
-            return FVGDirection.BULLISH
-
-        if raw == "bearish":
-            return FVGDirection.BEARISH
-
-        try:
-            return FVGDirection(raw)
-        except Exception:
-            return None
-
-    def _parse_fvg_status(self, value: Any) -> FVGStatus | None:
-        raw = enum_value(value)
-        mapping = {
-            "active": FVGStatus.ACTIVE,
-            "partially_filled": FVGStatus.PARTIALLY_FILLED,
-            "filled": FVGStatus.FILLED,
-            "respected": FVGStatus.RESPECTED,
-            "invalidated": FVGStatus.INVALIDATED,
-        }
-
-        if raw in mapping:
-            return mapping[raw]
-
-        try:
-            return FVGStatus(raw)
-        except Exception:
-            return None
-
-    def _parse_fvg_event_type(self, value: Any) -> FVGEventType | None:
-        raw = enum_value(value)
-        mapping = {
-            "fvg_created": FVGEventType.FVG_CREATED,
-            "created": FVGEventType.FVG_CREATED,
-            "fvg_fill_started": FVGEventType.FVG_FILL_STARTED,
-            "fill_started": FVGEventType.FVG_FILL_STARTED,
-            "fvg_partially_filled": FVGEventType.FVG_PARTIALLY_FILLED,
-            "partially_filled": FVGEventType.FVG_PARTIALLY_FILLED,
-            "fvg_filled": FVGEventType.FVG_FILLED,
-            "filled": FVGEventType.FVG_FILLED,
-            "fvg_respected": FVGEventType.FVG_RESPECTED,
-            "respected": FVGEventType.FVG_RESPECTED,
-            "fvg_invalidated": FVGEventType.FVG_INVALIDATED,
-            "invalidated": FVGEventType.FVG_INVALIDATED,
-            "fvg_retested": FVGEventType.FVG_RETESTED,
-            "retested": FVGEventType.FVG_RETESTED,
-            "fvg_merged": FVGEventType.FVG_MERGED,
-            "merged": FVGEventType.FVG_MERGED,
-        }
-
-        if raw in mapping:
-            return mapping[raw]
-
-        try:
-            return FVGEventType(raw)
-        except Exception:
-            return None
+        return list(dict.fromkeys(tags))

@@ -1,10 +1,10 @@
+# trading_system/strategy/strategies/price_action/trend_continuation_strategy.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from logging import Logger
-from typing import Any, Mapping, cast
-from uuid import uuid4
+from datetime import datetime
+from typing import Any
 
 from analytics.price_action.enums import (
     StructureLayer,
@@ -13,1279 +13,1142 @@ from analytics.price_action.enums import (
     TrendRegime,
 )
 from core.event_bus import EventBus
-from core.logger import TradingLoggerAdapter
-from strategy.config import StrategyConfig, StrategyDefinitionConfig
-from strategy.enums import (
+from core.scheduler import Scheduler
+from .base import (
+    PRICE_ACTION_FEATURES,
+    PriceActionStrategyConfig,
+    PriceActionTradingStrategy,
+)
+from .utils import (
+    ScoreBreakdown,
+    average_score,
+    confidence_from_components,
+    extract_last_event,
+    extract_last_update,
+    get_path,
+    is_directional_side,
+    is_stale,
+    layer_confidence,
+    layer_strength,
+    normalize_label,
+    parse_datetime,
+    parse_structure_layer,
+    parse_trend_direction,
+    parse_trend_event_type,
+    parse_trend_regime,
+    quality_filter_reason,
+    select_primary_layer,
+    select_secondary_layer,
+    serialize_for_metadata,
+    to_bool,
+    trend_direction_to_side,
+    trend_source_features,
+    unit_score,
+    weighted_score,
+    freshness_score,
+)
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
     SetupType,
-    SignalOrigin,
     SignalPriority,
     SignalSide,
-    SignalStatus,
     StrategyCategory,
-    TriggerType,
+    Timeframe,
 )
-from strategy.exceptions import StrategyEvaluationError
-from strategy.models import (
-    FilterResult,
-    SignalContext,
-    StrategyEvaluation,
-    StrategySignal,
-    confidence_to_grade,
-    confidence_to_strength,
-)
-from strategy.strategies.price_action.base import (
-    PriceActionStrategyBase,
-    apply_definition_metadata,
-    clamp,
-    enum_value,
-    first_non_empty,
-    parse_datetime,
-    safe_bool,
-    safe_float,
-)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)
-class TrendContinuationStrategyParams:
+class TrendEventContext:
     """
-    Local params for TrendContinuationStrategy.
+    Normalized trend lifecycle/signal event.
 
-    Runtime gates such as enabled/symbols/timeframes/min_score/min_confidence
-    stay in StrategyConfig / StrategyDefinitionConfig.runtime. These params
-    control only how this strategy consumes analytics.price_action.trend.
+    Strategy-layer DTO only. Analytics models remain in analytics.price_action.
     """
 
-    strategy_name: str = "trend_continuation_strategy"
+    event_type: TrendEventType | None = None
+    direction: TrendDirection | None = None
+    regime: TrendRegime | None = None
+    layer: StructureLayer | None = None
+
+    confidence: float = 0.0
+    score: float = 0.0
+    continuation_probability: float = 0.0
+    reversal_risk: float = 0.0
+    exhaustion_score: float = 0.0
+
+    timestamp: datetime | None = None
+    is_confirmed: bool = False
+
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+    ) -> TrendEventContext | None:
+        if payload is None:
+            return None
+
+        event_type = parse_trend_event_type(
+            get_path(payload, "event_type")
+            or get_path(payload, "type")
+            or get_path(payload, "kind")
+        )
+        direction = parse_trend_direction(
+            get_path(payload, "direction")
+            or get_path(payload, "trend_direction")
+            or get_path(payload, "side")
+        )
+        regime = parse_trend_regime(
+            get_path(payload, "regime")
+            or get_path(payload, "trend_regime")
+            or get_path(payload, "state")
+        )
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        if event_type is None and direction is None and regime is None:
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "event_confidence")
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "event_score")
+            or confidence
+        )
+
+        reasons_raw = (
+            get_path(payload, "reasons")
+            or get_path(payload, "reason")
+            or get_path(payload, "confirmations")
+            or []
+        )
+        reasons: list[str] = []
+        if isinstance(reasons_raw, str):
+            reasons = [reasons_raw] if reasons_raw.strip() else []
+        elif isinstance(reasons_raw, (list, tuple, set)):
+            reasons = [str(item).strip() for item in reasons_raw if str(item).strip()]
+
+        return cls(
+            event_type=event_type,
+            direction=direction,
+            regime=regime,
+            layer=layer,
+            confidence=confidence,
+            score=score,
+            continuation_probability=unit_score(
+                get_path(payload, "continuation_probability")
+                or get_path(payload, "continuation_prob")
+                or get_path(payload, "probability")
+            ),
+            reversal_risk=unit_score(
+                get_path(payload, "reversal_risk")
+                or get_path(payload, "reversal_probability")
+                or get_path(payload, "countertrend_risk")
+            ),
+            exhaustion_score=unit_score(
+                get_path(payload, "exhaustion_score")
+                or get_path(payload, "exhaustion")
+            ),
+            timestamp=parse_datetime(
+                get_path(payload, "timestamp")
+                or get_path(payload, "event_time")
+                or get_path(payload, "created_at")
+                or get_path(payload, "time")
+            ),
+            is_confirmed=to_bool(
+                get_path(payload, "confirmed")
+                or get_path(payload, "is_confirmed")
+                or get_path(payload, "valid"),
+                default=confidence > 0.0,
+            ),
+            reasons=list(dict.fromkeys(reasons)),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class TrendLayerContext:
+    """
+    Normalized trend layer view.
+    """
+
+    direction: TrendDirection | None = None
+    regime: TrendRegime | None = None
+    layer: StructureLayer | None = None
+
+    confidence: float = 0.0
+    score: float = 0.0
+    trend_strength: float = 0.0
+    momentum_score: float = 0.0
+    slope_score: float = 0.0
+    continuation_probability: float = 0.0
+    reversal_risk: float = 0.0
+    exhaustion_score: float = 0.0
+    pullback_quality: float = 0.0
+    structure_score: float = 0.0
+
+    is_exhausted: bool = False
+    is_pullback: bool = False
+    is_countertrend: bool = False
+
+    updated_at: datetime | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Any,
+        *,
+        fallback_layer: StructureLayer | None = None,
+    ) -> TrendLayerContext | None:
+        if payload is None:
+            return None
+
+        direction = parse_trend_direction(
+            get_path(payload, "direction")
+            or get_path(payload, "trend_direction")
+            or get_path(payload, "side")
+        )
+        regime = parse_trend_regime(
+            get_path(payload, "regime")
+            or get_path(payload, "trend_regime")
+            or get_path(payload, "state")
+        )
+        layer = parse_structure_layer(
+            get_path(payload, "layer")
+            or get_path(payload, "structure_layer"),
+            default=fallback_layer,
+        )
+
+        if direction is None and regime is None:
+            return None
+
+        confidence = unit_score(
+            get_path(payload, "confidence")
+            or get_path(payload, "trend_confidence")
+        )
+        trend_strength = unit_score(
+            get_path(payload, "trend_strength")
+            or get_path(payload, "strength")
+            or get_path(payload, "directional_strength")
+        )
+        score = unit_score(
+            get_path(payload, "score")
+            or get_path(payload, "trend_score")
+            or get_path(payload, "overall_score")
+            or trend_strength
+            or confidence
+        )
+
+        return cls(
+            direction=direction,
+            regime=regime,
+            layer=layer,
+            confidence=confidence,
+            score=score,
+            trend_strength=trend_strength,
+            momentum_score=unit_score(
+                get_path(payload, "momentum_score")
+                or get_path(payload, "momentum")
+                or get_path(payload, "directional_momentum")
+            ),
+            slope_score=unit_score(
+                get_path(payload, "slope_score")
+                or get_path(payload, "slope")
+                or get_path(payload, "trend_slope")
+            ),
+            continuation_probability=unit_score(
+                get_path(payload, "continuation_probability")
+                or get_path(payload, "continuation_prob")
+            ),
+            reversal_risk=unit_score(
+                get_path(payload, "reversal_risk")
+                or get_path(payload, "reversal_probability")
+                or get_path(payload, "countertrend_risk")
+            ),
+            exhaustion_score=unit_score(
+                get_path(payload, "exhaustion_score")
+                or get_path(payload, "exhaustion")
+            ),
+            pullback_quality=unit_score(
+                get_path(payload, "pullback_quality")
+                or get_path(payload, "pullback_score")
+                or get_path(payload, "retracement_quality")
+            ),
+            structure_score=unit_score(
+                get_path(payload, "structure_score")
+                or get_path(payload, "market_structure_score")
+                or get_path(payload, "structure_alignment_score")
+            ),
+            is_exhausted=to_bool(
+                get_path(payload, "is_exhausted")
+                or get_path(payload, "exhausted"),
+                default=False,
+            ),
+            is_pullback=to_bool(
+                get_path(payload, "is_pullback")
+                or get_path(payload, "pullback"),
+                default=False,
+            ),
+            is_countertrend=to_bool(
+                get_path(payload, "is_countertrend")
+                or get_path(payload, "countertrend"),
+                default=False,
+            ),
+            updated_at=parse_datetime(
+                get_path(payload, "updated_at")
+                or get_path(payload, "last_update")
+                or get_path(payload, "timestamp")
+                or get_path(payload, "time")
+            ),
+            raw=serialize_for_metadata(payload)
+            if isinstance(payload, dict)
+            else {"raw": serialize_for_metadata(payload)},
+        )
+
+
+@dataclass(slots=True)
+class TrendContinuationContextView:
+    """
+    Normalized trend-continuation view consumed by TrendContinuationStrategy.
+    """
+
+    module: dict[str, Any]
+    primary_layer: dict[str, Any]
+    secondary_layer: dict[str, Any]
+
+    primary_trend: TrendLayerContext | None = None
+    secondary_trend: TrendLayerContext | None = None
+    last_event: TrendEventContext | None = None
+
+    primary_layer_name: StructureLayer | None = None
+    secondary_layer_name: StructureLayer | None = None
+
+    internal_external_alignment: float = 0.0
+    higher_timeframe_alignment: float = 0.0
+    overall_trend_score: float = 0.0
+    layer_confidence: float = 0.0
+    layer_strength: float = 0.0
+
+    event_time: datetime | None = None
+    reasons: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class TrendContinuationStrategyConfig(PriceActionStrategyConfig):
+    """
+    Unified trend-continuation strategy config.
+
+    Strategy idea:
+    - read normalized trend context from StrategyContext;
+    - require directional trend, strength, continuation probability and alignment;
+    - optionally allow pullback continuation entries;
+    - return internal StrategySignal only;
+    - leave routing, filtering, confluence, portfolio coordination and
+      risk-ready conversion to SignalProcessor.
+    """
 
     prefer_external_layer: bool = True
+
+    require_fresh_trend: bool = True
     require_internal_confirmation: bool = True
     allow_cross_layer_fallback: bool = True
     require_direction_alignment: bool = True
 
-    # Trend quality gates.
     allow_pullback_entries: bool = True
     block_exhausted_trend: bool = True
     block_high_reversal_risk: bool = True
-    block_counter_regime: bool = False
-    require_structure_alignment: bool = False
-    require_positive_momentum: bool = True
-    require_positive_slope: bool = False
-    require_higher_timeframe_alignment: bool = False
+    block_countertrend_context: bool = True
 
     min_layer_confidence: float = 0.50
     min_trend_strength: float = 0.55
     min_continuation_probability: float = 0.55
     min_directional_momentum: float = 0.10
-    min_directional_slope: float = 0.00
-    min_structure_score: float = 0.25
-    min_internal_external_alignment: float = 0.35
-    min_higher_timeframe_alignment: float = 0.35
+    min_slope_score: float = 0.05
     min_overall_trend_score: float = 0.35
+    min_internal_external_alignment: float = 0.30
+    min_higher_timeframe_alignment: float = 0.20
 
-    max_reversal_risk: float = 0.60
-    max_exhaustion_score: float = 0.72
-    max_consolidation_score: float = 0.70
-    max_pullback_depth: float = 0.80
+    max_reversal_risk: float = 0.45
+    max_exhaustion_score: float = 0.65
 
-    # Score components. These are intentionally local weights. The final score
-    # is clamped to [0, 1], so the weights do not have to sum exactly to 1.0.
-    primary_confidence_weight: float = 0.16
-    primary_strength_weight: float = 0.15
-    continuation_probability_weight: float = 0.16
-    momentum_direction_weight: float = 0.10
-    slope_direction_weight: float = 0.07
-    structure_alignment_weight: float = 0.10
-    internal_confirmation_weight: float = 0.10
-    global_alignment_weight: float = 0.08
-    higher_timeframe_alignment_weight: float = 0.04
-    regime_alignment_weight: float = 0.04
-    pullback_bonus_weight: float = 0.04
-    acceleration_bonus_weight: float = 0.04
+    pullback_bonus: float = 0.05
+    alignment_bonus: float = 0.05
+    higher_timeframe_bonus: float = 0.04
+    strong_trend_bonus: float = 0.05
+    momentum_bonus: float = 0.04
+    event_confirmation_bonus: float = 0.03
 
-    emit_signal_events: bool = False
-    signal_event_name: str = "strategy.price_action.trend_continuation.signal"
+    strong_trend_threshold: float = 0.75
+    strong_momentum_threshold: float = 0.60
+    strong_continuation_probability_threshold: float = 0.70
 
-    freshness_feature_names: tuple[str, ...] = (
-        "analytics.price_action",
-        "analytics.price_action.trend",
-        "price_action.trend",
-        "trend",
+    score_trend_weight: float = 0.28
+    score_probability_weight: float = 0.22
+    score_momentum_weight: float = 0.16
+    score_alignment_weight: float = 0.14
+    score_structure_weight: float = 0.10
+    score_freshness_weight: float = 0.10
+
+    confidence_trend_weight: float = 0.52
+    confidence_context_weight: float = 0.28
+    confidence_confirmation_weight: float = 0.15
+    confidence_freshness_weight: float = 0.05
+
+    tag_trend_continuation: str = "trend_continuation"
+    tag_uptrend_continuation: str = "uptrend_continuation"
+    tag_downtrend_continuation: str = "downtrend_continuation"
+    tag_pullback_entry: str = "pullback_entry"
+    tag_momentum: str = "momentum"
+    tag_alignment: str = "alignment"
+    tag_higher_timeframe: str = "higher_timeframe"
+
+    default_priority: SignalPriority = SignalPriority.HIGH
+    default_setup_type: SetupType = SetupType.CONTINUATION
+
+    required_price_action_features: tuple[str, ...] = (
+        PRICE_ACTION_FEATURES.TREND,
     )
 
     def validate(self) -> None:
-        PriceActionStrategyBase.validate_bounded_fields(
-            instance=self,
-            field_names=(
-                "min_layer_confidence",
-                "min_trend_strength",
-                "min_continuation_probability",
-                "min_directional_momentum",
-                "min_directional_slope",
-                "min_structure_score",
-                "min_internal_external_alignment",
-                "min_higher_timeframe_alignment",
-                "min_overall_trend_score",
-                "max_reversal_risk",
-                "max_exhaustion_score",
-                "max_consolidation_score",
-                "max_pullback_depth",
-                "primary_confidence_weight",
-                "primary_strength_weight",
-                "continuation_probability_weight",
-                "momentum_direction_weight",
-                "slope_direction_weight",
-                "structure_alignment_weight",
-                "internal_confirmation_weight",
-                "global_alignment_weight",
-                "higher_timeframe_alignment_weight",
-                "regime_alignment_weight",
-                "pullback_bonus_weight",
-                "acceleration_bonus_weight",
-            ),
-            minimum=0.0,
-            maximum=1.0,
-        )
+        PriceActionStrategyConfig.validate(self)
 
-        if (
-            self.require_higher_timeframe_alignment
-            and self.min_higher_timeframe_alignment <= 0
+        unit_fields = {
+            "min_layer_confidence": self.min_layer_confidence,
+            "min_trend_strength": self.min_trend_strength,
+            "min_continuation_probability": self.min_continuation_probability,
+            "min_directional_momentum": self.min_directional_momentum,
+            "min_slope_score": self.min_slope_score,
+            "min_overall_trend_score": self.min_overall_trend_score,
+            "min_internal_external_alignment": self.min_internal_external_alignment,
+            "min_higher_timeframe_alignment": self.min_higher_timeframe_alignment,
+            "max_reversal_risk": self.max_reversal_risk,
+            "max_exhaustion_score": self.max_exhaustion_score,
+            "pullback_bonus": self.pullback_bonus,
+            "alignment_bonus": self.alignment_bonus,
+            "higher_timeframe_bonus": self.higher_timeframe_bonus,
+            "strong_trend_bonus": self.strong_trend_bonus,
+            "momentum_bonus": self.momentum_bonus,
+            "event_confirmation_bonus": self.event_confirmation_bonus,
+            "strong_trend_threshold": self.strong_trend_threshold,
+            "strong_momentum_threshold": self.strong_momentum_threshold,
+            "strong_continuation_probability_threshold": self.strong_continuation_probability_threshold,
+        }
+
+        for field_name, value in unit_fields.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise StrategyConfigError(f"{field_name} must be between 0.0 and 1.0")
+
+        score_weights = {
+            "score_trend_weight": self.score_trend_weight,
+            "score_probability_weight": self.score_probability_weight,
+            "score_momentum_weight": self.score_momentum_weight,
+            "score_alignment_weight": self.score_alignment_weight,
+            "score_structure_weight": self.score_structure_weight,
+            "score_freshness_weight": self.score_freshness_weight,
+        }
+        confidence_weights = {
+            "confidence_trend_weight": self.confidence_trend_weight,
+            "confidence_context_weight": self.confidence_context_weight,
+            "confidence_confirmation_weight": self.confidence_confirmation_weight,
+            "confidence_freshness_weight": self.confidence_freshness_weight,
+        }
+
+        for field_name, value in {**score_weights, **confidence_weights}.items():
+            if value < 0:
+                raise StrategyConfigError(f"{field_name} must be >= 0")
+
+        if sum(score_weights.values()) <= 0:
+            raise StrategyConfigError("score weights sum must be > 0")
+
+        if sum(confidence_weights.values()) <= 0:
+            raise StrategyConfigError("confidence weights sum must be > 0")
+
+        for attr in (
+            "tag_trend_continuation",
+            "tag_uptrend_continuation",
+            "tag_downtrend_continuation",
+            "tag_pullback_entry",
+            "tag_momentum",
+            "tag_alignment",
+            "tag_higher_timeframe",
         ):
-            raise ValueError(
-                "min_higher_timeframe_alignment must be > 0 when "
-                "require_higher_timeframe_alignment=True"
-            )
+            value = getattr(self, attr)
+            if not isinstance(value, str) or not value.strip():
+                raise StrategyConfigError(f"{attr} must be a non-empty string")
 
-    @classmethod
-    def from_definition(
-        cls,
-        definition: StrategyDefinitionConfig | None,
-    ) -> "TrendContinuationStrategyParams":
-        return apply_definition_metadata(
-            params=cls(),
-            definition=definition,
-        )
+        if not self.required_price_action_features:
+            raise StrategyConfigError("required_price_action_features cannot be empty")
+
+        for feature in self.required_price_action_features:
+            if not isinstance(feature, str) or not feature.strip():
+                raise StrategyConfigError(
+                    "required_price_action_features cannot contain empty feature names"
+                )
 
 
-@dataclass(slots=True)
-class TrendContextView:
+class TrendContinuationStrategy(PriceActionTradingStrategy):
     """
-    Normalized view of analytics.price_action.trend.TrendState.
+    Unified trend-continuation strategy.
 
-    This view mirrors the current analytics contract and keeps the strategy
-    independent from whether the input came as a dataclass, direct dict,
-    {state: ...} EventBus payload, or PriceActionCompositeState child.
-    """
+    Input:
+        StrategyContext with FeatureSource.PRICE_ACTION domain data / features.
 
-    exchange: str | None = None
-    market_type: str | None = None
-    symbol: str | None = None
-    exchange_symbol: str | None = None
-    timeframe: str | None = None
-    key: tuple[str, str, str, str] | None = None
+    Output:
+        StrategySignal | None.
 
-    last_price: float | None = None
-    last_update: datetime | None = None
-
-    internal: dict[str, Any] = field(default_factory=dict)
-    external: dict[str, Any] = field(default_factory=dict)
-
-    internal_external_alignment: float = 0.0
-    higher_timeframe_alignment: float = 0.0
-    overall_trend_score: float = 0.0
-
-    last_signal: dict[str, Any] | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    source_feature: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-class TrendContinuationStrategy(PriceActionStrategyBase):
-    """
-    Strategy wrapper around analytics.price_action.trend.
-
-    It is aligned with the current TrendAnalyzer / TrendState contract:
-    - consumes TrendState from PriceActionCompositeState or direct module feature;
-    - validates futures scope through PriceActionStrategyBase;
-    - uses internal/external layers, direction, regime, strength, confidence,
-      momentum_direction_score, slope_direction_score, structure_score,
-      continuation_probability, reversal_risk, exhaustion_score, pullback_depth,
-      consolidation_score, is_accelerating, is_exhausted, in_pullback,
-      is_aligned_with_structure and last_signal;
-    - uses global state fields internal_external_alignment,
-      higher_timeframe_alignment and overall_trend_score;
-    - emits StrategySignal metadata that preserves the analytics source contract.
+    This class does not subscribe to EventBus and does not emit signal.generated.
+    SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
 
-    analytics_module_name = "trend"
+    component_namespace = "strategy.price_action.trend_continuation"
+    category: StrategyCategory = StrategyCategory.PRICE_ACTION
+    default_setup_type: SetupType = SetupType.CONTINUATION
 
     def __init__(
         self,
         config: StrategyConfig,
         event_bus: EventBus | None = None,
-        logger: Logger | TradingLoggerAdapter | None = None,
-        strategy_name: str = "trend_continuation_strategy",
+        scheduler: Scheduler | None = None,
+        *,
+        definition: StrategyDefinitionConfig | None = None,
+        price_action_config: TrendContinuationStrategyConfig | None = None,
+        service_name: str | None = None,
     ) -> None:
+        resolved_price_action_config = (
+            price_action_config or TrendContinuationStrategyConfig()
+        )
+        resolved_price_action_config.validate()
+
         super().__init__(
             config=config,
-            strategy_name=strategy_name,
-            params_cls=TrendContinuationStrategyParams,
             event_bus=event_bus,
-            logger=logger,
+            scheduler=scheduler,
+            definition=definition,
+            price_action_config=resolved_price_action_config,
+            service_name=service_name,
+        )
+
+        self.trend_config: TrendContinuationStrategyConfig = (
+            resolved_price_action_config
         )
 
     @property
-    def _p(self) -> TrendContinuationStrategyParams:
-        return cast(TrendContinuationStrategyParams, self.params)
+    def strategy_name(self) -> str:
+        return "trend_continuation"
 
-    def evaluate(self, context: SignalContext) -> StrategyEvaluation:
-        try:
-            blocked = self._basic_runtime_gate(context)
-            if blocked is not None:
-                return blocked
-
-            trend = self._extract_trend_snapshot(context)
-            if trend.symbol is None and not trend.external and not trend.internal:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="trend_snapshot_missing",
-                )
-
-            freshness_filter = self._build_freshness_filter(
-                context=context,
-                filter_name="trend_freshness",
-                module_name=self.analytics_module_name,
-                analytics_payload=trend.raw,
-            )
-            if freshness_filter is not None and freshness_filter.blocked:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="stale_trend_feature",
-                )
-
-            side = self._resolve_side(context=context, trend=trend)
-            if side == SignalSide.UNKNOWN:
-                return self._rejected_evaluation(
-                    context=context,
-                    reason="no_valid_trend_continuation_setup",
-                    metadata={
-                        "trend_source_feature": trend.source_feature,
-                        "internal_external_alignment": trend.internal_external_alignment,
-                        "higher_timeframe_alignment": trend.higher_timeframe_alignment,
-                        "overall_trend_score": trend.overall_trend_score,
-                    },
-                )
-
-            primary_layer = self._select_primary_layer(trend)
-            primary_layer_name = (
-                "external" if self._p.prefer_external_layer else "internal"
-            )
-            secondary_layer = (
-                trend.internal if self._p.prefer_external_layer else trend.external
-            )
-            secondary_layer_name = (
-                "internal" if self._p.prefer_external_layer else "external"
-            )
-
-            score = self._compute_score(
-                context=context,
-                trend=trend,
-                side=side,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-            confidence = self._compute_confidence(
-                context=context,
-                trend=trend,
-                side=side,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-            )
-
-            reasons = self._build_reasons(
-                trend=trend,
-                side=side,
-                primary_layer=primary_layer,
-                secondary_layer=secondary_layer,
-                primary_layer_name=primary_layer_name,
-                secondary_layer_name=secondary_layer_name,
-            )
-
-            signal = self._build_signal(
-                context=context,
-                trend=trend,
-                side=side,
-                score=score,
-                confidence=confidence,
-                reasons=reasons,
-                freshness_filter=freshness_filter,
-            )
-
-            return self._finalize_signal_evaluation(
-                context=context,
-                signal=signal,
-                confidence=confidence,
-                score=score,
-                reasons=reasons,
-                metadata={
-                    "analytics_module": self.analytics_module_name,
-                    "analytics_source_feature": trend.source_feature,
-                },
-            )
-
-        except StrategyEvaluationError:
-            raise
-        except Exception as exc:
-            self._logger.exception(
-                "Failed to evaluate trend continuation strategy | strategy=%s symbol=%s",
-                self.name,
-                getattr(context, "symbol", None),
-            )
-            raise StrategyEvaluationError(
-                f"{self.name}: failed to evaluate trend continuation for {context.symbol}"
-            ) from exc
-
-    # ------------------------------------------------------------------
-    # Extraction / normalization
-    # ------------------------------------------------------------------
-
-    def _extract_trend_snapshot(self, context: SignalContext) -> TrendContextView:
-        payload = self._extract_price_action_module(
-            context,
-            self.analytics_module_name,
-            aliases=(
-                "trend",
-                "price_action.trend",
-                "analytics.price_action.trend",
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            strategy_name=self.strategy_name,
+            category=StrategyCategory.PRICE_ACTION,
+            timeframe=Timeframe.M1,
+            tags=[
+                self.trend_config.tag_price_action,
+                self.trend_config.tag_trend,
+                self.trend_config.tag_trend_continuation,
+                self.trend_config.tag_continuation,
+                self.trend_config.tag_momentum,
+                self.trend_config.tag_alignment,
+                "analytics_price_action",
+            ],
+            version="2.0.0",
+            description=(
+                "Interprets trend direction, strength, continuation probability, "
+                "momentum, slope and layer alignment from normalized price-action "
+                "StrategyContext and returns internal StrategySignal."
             ),
-            require_scope_match=True,
-        )
-        if payload:
-            return self._normalize_trend_snapshot(payload)
-
-        # Defensive fallback for deployments that still pass legacy context
-        # shapes while base.py is already updated.
-        candidates: list[Any] = [
-            self._mapping_or_empty(getattr(context, "price_action", None)).get("trend"),
-            self._get_context_feature(context, "price_action.trend"),
-            self._get_context_feature(context, "trend"),
-            self._get_context_feature(context, "analytics.price_action.trend"),
-        ]
-        for candidate in candidates:
-            normalized = self._normalize_trend_snapshot(candidate)
-            if normalized.symbol is not None or normalized.external or normalized.internal:
-                return normalized
-
-        return TrendContextView()
-
-    def _normalize_trend_snapshot(self, payload: Any) -> TrendContextView:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return TrendContextView()
-
-        state = self._normalize_state_payload(payload_mapping)
-        if not state:
-            return TrendContextView()
-
-        internal = self._normalize_trend_layer(
-            state.get("internal"),
-            StructureLayer.INTERNAL,
-        )
-        external = self._normalize_trend_layer(
-            state.get("external"),
-            StructureLayer.EXTERNAL,
-        )
-
-        metadata = dict(self._mapping_or_empty(state.get("metadata")))
-        scope = self._extract_analytics_scope(state)
-        key_values = scope.get("key") if isinstance(scope.get("key"), list) else []
-        key_tuple: tuple[str, str, str, str] | None = None
-        if len(key_values) == 4:
-            key_tuple = (
-                str(key_values[0]),
-                str(key_values[1]),
-                str(key_values[2]),
-                str(key_values[3]),
-            )
-
-        last_signal = self._extract_last_signal(internal, external)
-
-        return TrendContextView(
-            exchange=scope.get("exchange"),
-            market_type=scope.get("market_type"),
-            symbol=first_non_empty(state.get("symbol"), scope.get("symbol")),
-            exchange_symbol=first_non_empty(
-                state.get("exchange_symbol"),
-                scope.get("exchange_symbol"),
-            ),
-            timeframe=first_non_empty(state.get("timeframe"), scope.get("timeframe")),
-            key=key_tuple,
-            last_price=(
-                safe_float(
-                    first_non_empty(
-                        state.get("last_price"),
-                        payload_mapping.get("last_price"),
-                    ),
-                    0.0,
-                )
-                or None
-            ),
-            last_update=parse_datetime(
-                first_non_empty(
-                    state.get("last_update"),
-                    state.get("updated_at"),
-                    payload_mapping.get("last_update"),
-                    metadata.get("last_update"),
-                    metadata.get("updated_at"),
-                )
-            ),
-            internal=internal,
-            external=external,
-            internal_external_alignment=clamp(
-                safe_float(state.get("internal_external_alignment"), 0.0),
-                0.0,
-                1.0,
-            ),
-            higher_timeframe_alignment=clamp(
-                safe_float(state.get("higher_timeframe_alignment"), 0.0),
-                0.0,
-                1.0,
-            ),
-            overall_trend_score=clamp(
-                safe_float(state.get("overall_trend_score"), 0.0),
-                0.0,
-                1.0,
-            ),
-            last_signal=last_signal,
-            metadata=metadata,
-            source_feature=state.get("_source_feature"),
-            raw=dict(state),
-        )
-
-    def _normalize_trend_layer(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any]:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return {}
-
-        last_signal = self._mapping_or_empty(payload_mapping.get("last_signal")) or None
-
-        return {
-            "layer": self._parse_structure_layer(payload_mapping.get("layer")) or default_layer,
-            "direction": self._parse_trend_direction(payload_mapping.get("direction")),
-            "regime": self._parse_trend_regime(payload_mapping.get("regime")),
-            "strength": clamp(safe_float(payload_mapping.get("strength"), 0.0), 0.0, 1.0),
-            "confidence": clamp(safe_float(payload_mapping.get("confidence"), 0.0), 0.0, 1.0),
-            "momentum_direction_score": clamp(
-                safe_float(payload_mapping.get("momentum_direction_score"), 0.0),
-                -1.0,
-                1.0,
-            ),
-            "slope_direction_score": clamp(
-                safe_float(payload_mapping.get("slope_direction_score"), 0.0),
-                -1.0,
-                1.0,
-            ),
-            "structure_score": clamp(
-                safe_float(payload_mapping.get("structure_score"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "continuation_probability": clamp(
-                safe_float(payload_mapping.get("continuation_probability"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "reversal_risk": clamp(
-                safe_float(payload_mapping.get("reversal_risk"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "exhaustion_score": clamp(
-                safe_float(payload_mapping.get("exhaustion_score"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "pullback_depth": clamp(
-                safe_float(payload_mapping.get("pullback_depth"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "consolidation_score": clamp(
-                safe_float(payload_mapping.get("consolidation_score"), 0.0),
-                0.0,
-                1.0,
-            ),
-            "is_accelerating": safe_bool(payload_mapping.get("is_accelerating"), False),
-            "is_exhausted": safe_bool(payload_mapping.get("is_exhausted"), False),
-            "in_pullback": safe_bool(payload_mapping.get("in_pullback"), False),
-            "is_aligned_with_structure": safe_bool(
-                payload_mapping.get("is_aligned_with_structure"),
-                False,
-            ),
-            "last_signal": self._normalize_trend_signal(last_signal, default_layer),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _normalize_trend_signal(
-        self,
-        payload: Any,
-        default_layer: StructureLayer,
-    ) -> dict[str, Any] | None:
-        payload_mapping = self._mapping_or_empty(payload)
-        if not payload_mapping:
-            return None
-
-        return {
-            "signal_id": payload_mapping.get("signal_id"),
-            "timestamp": parse_datetime(payload_mapping.get("timestamp")),
-            "symbol": payload_mapping.get("symbol"),
-            "timeframe": payload_mapping.get("timeframe"),
-            "layer": self._parse_structure_layer(payload_mapping.get("layer")) or default_layer,
-            "event_type": self._parse_trend_event_type(payload_mapping.get("event_type")),
-            "direction": self._parse_trend_direction(payload_mapping.get("direction")),
-            "strength": clamp(safe_float(payload_mapping.get("strength"), 0.0), 0.0, 1.0),
-            "confidence": clamp(safe_float(payload_mapping.get("confidence"), 0.0), 0.0, 1.0),
-            "regime": self._parse_trend_regime(payload_mapping.get("regime")),
-            "price": (
-                safe_float(payload_mapping.get("price"), 0.0)
-                if payload_mapping.get("price") is not None
-                else None
-            ),
-            "metadata": dict(payload_mapping.get("metadata", {}) or {}),
-        }
-
-    def _extract_last_signal(
-        self,
-        internal: Mapping[str, Any],
-        external: Mapping[str, Any],
-    ) -> dict[str, Any] | None:
-        epoch = datetime.min.replace(tzinfo=timezone.utc)
-        candidates = [
-            signal
-            for signal in (
-                external.get("last_signal"),
-                internal.get("last_signal"),
-            )
-            if signal is not None
-        ]
-        if not candidates:
-            return None
-
-        def _sort_key(item: Mapping[str, Any]) -> datetime:
-            ts = item.get("timestamp")
-            if ts is None:
-                return epoch
-            if isinstance(ts, datetime) and ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            if isinstance(ts, datetime):
-                return ts.astimezone(timezone.utc)
-            return epoch
-
-        candidates.sort(key=_sort_key, reverse=True)
-        return dict(candidates[0])
-
-    # ------------------------------------------------------------------
-    # Direction / eligibility
-    # ------------------------------------------------------------------
-
-    def _select_primary_layer(self, trend: TrendContextView) -> dict[str, Any]:
-        return trend.external if self._p.prefer_external_layer else trend.internal
-
-    def _select_secondary_layer(self, trend: TrendContextView) -> dict[str, Any]:
-        return trend.internal if self._p.prefer_external_layer else trend.external
-
-    def _resolve_side(
-        self,
-        context: SignalContext,
-        trend: TrendContextView,
-    ) -> SignalSide:
-        primary = self._select_primary_layer(trend)
-        secondary = self._select_secondary_layer(trend)
-
-        primary_side = self._trend_direction_to_side(
-            primary.get("direction", TrendDirection.UNKNOWN)
-        )
-        secondary_side = self._trend_direction_to_side(
-            secondary.get("direction", TrendDirection.UNKNOWN)
-        )
-
-        if primary_side != SignalSide.UNKNOWN:
-            if not self._trend_state_eligible(trend):
-                return SignalSide.UNKNOWN
-            if not self._layer_eligible(primary, side=primary_side, primary=True):
-                return SignalSide.UNKNOWN
-            if not self._cross_layer_confirmation_ok(
-                primary_side=primary_side,
-                secondary_side=secondary_side,
-                secondary_layer=secondary,
-            ):
-                return SignalSide.UNKNOWN
-            if not self._side_regime_allowed(primary_side, primary):
-                return SignalSide.UNKNOWN
-            return primary_side
-
-        if not self._p.allow_cross_layer_fallback or secondary_side == SignalSide.UNKNOWN:
-            return SignalSide.UNKNOWN
-
-        if not self._trend_state_eligible(trend, allow_weak_global=True):
-            return SignalSide.UNKNOWN
-        if not self._layer_eligible(secondary, side=secondary_side, primary=False):
-            return SignalSide.UNKNOWN
-        if not self._side_regime_allowed(secondary_side, secondary):
-            return SignalSide.UNKNOWN
-        return secondary_side
-
-    def _trend_state_eligible(
-        self,
-        trend: TrendContextView,
-        *,
-        allow_weak_global: bool = False,
-    ) -> bool:
-        if trend.internal_external_alignment < self._p.min_internal_external_alignment:
-            if self._p.require_direction_alignment and not allow_weak_global:
-                return False
-
-        if trend.overall_trend_score < self._p.min_overall_trend_score:
-            if not allow_weak_global:
-                return False
-
-        if self._p.require_higher_timeframe_alignment:
-            if trend.higher_timeframe_alignment < self._p.min_higher_timeframe_alignment:
-                return False
-
-        return True
-
-    def _cross_layer_confirmation_ok(
-        self,
-        *,
-        primary_side: SignalSide,
-        secondary_side: SignalSide,
-        secondary_layer: Mapping[str, Any],
-    ) -> bool:
-        if self._p.require_direction_alignment:
-            if secondary_side not in {SignalSide.UNKNOWN, primary_side}:
-                return False
-
-        if not self._p.require_internal_confirmation:
-            return True
-
-        if secondary_side == SignalSide.UNKNOWN:
-            return False
-
-        if secondary_side != primary_side:
-            return False
-
-        return self._layer_confirmation_ok(secondary_layer, side=primary_side)
-
-    def _layer_eligible(
-        self,
-        layer: Mapping[str, Any],
-        *,
-        side: SignalSide,
-        primary: bool,
-    ) -> bool:
-        if not layer:
-            return False
-
-        confidence = clamp(safe_float(layer.get("confidence"), 0.0), 0.0, 1.0)
-        strength = clamp(safe_float(layer.get("strength"), 0.0), 0.0, 1.0)
-        continuation_probability = clamp(
-            safe_float(layer.get("continuation_probability"), 0.0),
-            0.0,
-            1.0,
-        )
-        reversal_risk = clamp(safe_float(layer.get("reversal_risk"), 0.0), 0.0, 1.0)
-        exhaustion_score = clamp(safe_float(layer.get("exhaustion_score"), 0.0), 0.0, 1.0)
-        consolidation_score = clamp(
-            safe_float(layer.get("consolidation_score"), 0.0),
-            0.0,
-            1.0,
-        )
-        pullback_depth = clamp(safe_float(layer.get("pullback_depth"), 0.0), 0.0, 1.0)
-
-        primary_multiplier = 1.0 if primary else 0.85
-        if confidence < self._p.min_layer_confidence * primary_multiplier:
-            return False
-        if strength < self._p.min_trend_strength * primary_multiplier:
-            return False
-        if continuation_probability < self._p.min_continuation_probability * primary_multiplier:
-            return False
-
-        if self._p.require_positive_momentum:
-            if (
-                self._directional_score(layer.get("momentum_direction_score"), side)
-                < self._p.min_directional_momentum
-            ):
-                return False
-
-        if self._p.require_positive_slope:
-            if (
-                self._directional_score(layer.get("slope_direction_score"), side)
-                < self._p.min_directional_slope
-            ):
-                return False
-
-        if self._p.require_structure_alignment:
-            aligned = safe_bool(layer.get("is_aligned_with_structure"), False)
-            structure_score = clamp(safe_float(layer.get("structure_score"), 0.0), 0.0, 1.0)
-            if not aligned and structure_score < self._p.min_structure_score:
-                return False
-
-        if self._p.block_high_reversal_risk and reversal_risk > self._p.max_reversal_risk:
-            return False
-
-        if self._p.block_exhausted_trend:
-            exhausted = safe_bool(layer.get("is_exhausted"), False)
-            if exhausted or exhaustion_score > self._p.max_exhaustion_score:
-                return False
-
-        if consolidation_score > self._p.max_consolidation_score:
-            return False
-
-        if safe_bool(layer.get("in_pullback"), False):
-            if not self._p.allow_pullback_entries:
-                return False
-            if pullback_depth > self._p.max_pullback_depth:
-                return False
-
-        return True
-
-    def _layer_confirmation_ok(
-        self,
-        layer: Mapping[str, Any],
-        *,
-        side: SignalSide,
-    ) -> bool:
-        if not layer:
-            return False
-
-        confidence_ok = (
-            clamp(safe_float(layer.get("confidence"), 0.0), 0.0, 1.0)
-            >= self._p.min_layer_confidence * 0.85
-        )
-        strength_ok = (
-            clamp(safe_float(layer.get("strength"), 0.0), 0.0, 1.0)
-            >= self._p.min_trend_strength * 0.85
-        )
-        continuation_ok = (
-            clamp(safe_float(layer.get("continuation_probability"), 0.0), 0.0, 1.0)
-            >= self._p.min_continuation_probability * 0.85
-        )
-        momentum_ok = (
-            self._directional_score(layer.get("momentum_direction_score"), side)
-            >= max(0.0, self._p.min_directional_momentum * 0.75)
-        )
-        return confidence_ok and strength_ok and continuation_ok and momentum_ok
-
-    def _side_regime_allowed(self, side: SignalSide, layer: Mapping[str, Any]) -> bool:
-        if not self._p.block_counter_regime:
-            return True
-
-        regime = layer.get("regime", TrendRegime.UNKNOWN)
-        continuation_regimes = {
-            TrendRegime.TRENDING,
-            TrendRegime.PULLBACK,
-        }
-        return regime in continuation_regimes
-
-    # ------------------------------------------------------------------
-    # Score / confidence
-    # ------------------------------------------------------------------
-
-    def _compute_score(
-        self,
-        context: SignalContext,
-        trend: TrendContextView,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> float:
-        score = 0.0
-
-        score += self._p.primary_confidence_weight * clamp(
-            safe_float(primary_layer.get("confidence"), 0.0),
-            0.0,
-            1.0,
-        )
-        score += self._p.primary_strength_weight * clamp(
-            safe_float(primary_layer.get("strength"), 0.0),
-            0.0,
-            1.0,
-        )
-        score += self._p.continuation_probability_weight * clamp(
-            safe_float(primary_layer.get("continuation_probability"), 0.0),
-            0.0,
-            1.0,
-        )
-
-        score += self._p.momentum_direction_weight * self._directional_score(
-            primary_layer.get("momentum_direction_score"),
-            side,
-        )
-        score += self._p.slope_direction_weight * self._directional_score(
-            primary_layer.get("slope_direction_score"),
-            side,
-        )
-        score += self._p.structure_alignment_weight * self._structure_alignment_score(
-            primary_layer,
-            side,
-        )
-
-        secondary_side = self._trend_direction_to_side(
-            secondary_layer.get("direction", TrendDirection.UNKNOWN)
-        )
-        if secondary_side == side:
-            score += self._p.internal_confirmation_weight * self._layer_confirmation_score(
-                secondary_layer,
-                side=side,
-            )
-
-        score += self._p.global_alignment_weight * self._global_alignment_score(trend)
-        score += self._p.higher_timeframe_alignment_weight * trend.higher_timeframe_alignment
-        score += self._p.regime_alignment_weight * self._regime_alignment_score(
-            context=context,
-            side=side,
-        )
-
-        if self._p.allow_pullback_entries and safe_bool(primary_layer.get("in_pullback"), False):
-            pullback_depth = clamp(safe_float(primary_layer.get("pullback_depth"), 0.0), 0.0, 1.0)
-            if pullback_depth <= self._p.max_pullback_depth:
-                score += self._p.pullback_bonus_weight * (1.0 - pullback_depth)
-
-        if safe_bool(primary_layer.get("is_accelerating"), False):
-            score += self._p.acceleration_bonus_weight
-
-        reversal_risk = clamp(safe_float(primary_layer.get("reversal_risk"), 0.0), 0.0, 1.0)
-        exhaustion_score = clamp(safe_float(primary_layer.get("exhaustion_score"), 0.0), 0.0, 1.0)
-        consolidation_score = clamp(safe_float(primary_layer.get("consolidation_score"), 0.0), 0.0, 1.0)
-
-        penalty = (reversal_risk * 0.10) + (exhaustion_score * 0.08) + (consolidation_score * 0.05)
-        return clamp(score - penalty, 0.0, 1.0)
-
-    def _compute_confidence(
-        self,
-        context: SignalContext,
-        trend: TrendContextView,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-    ) -> float:
-        components: list[float] = [
-            clamp(safe_float(primary_layer.get("confidence"), 0.0), 0.0, 1.0),
-            clamp(safe_float(primary_layer.get("strength"), 0.0), 0.0, 1.0),
-            clamp(safe_float(primary_layer.get("continuation_probability"), 0.0), 0.0, 1.0),
-            self._directional_score(primary_layer.get("momentum_direction_score"), side),
-            self._directional_score(primary_layer.get("slope_direction_score"), side),
-            self._structure_alignment_score(primary_layer, side),
-            self._global_alignment_score(trend),
-        ]
-
-        if trend.higher_timeframe_alignment > 0:
-            components.append(trend.higher_timeframe_alignment)
-
-        secondary_side = self._trend_direction_to_side(
-            secondary_layer.get("direction", TrendDirection.UNKNOWN)
-        )
-        if secondary_side == side:
-            components.append(self._layer_confirmation_score(secondary_layer, side=side))
-
-        components.append(self._regime_alignment_score(context=context, side=side))
-
-        confidence = sum(components) / len(components)
-
-        reversal_risk = clamp(safe_float(primary_layer.get("reversal_risk"), 0.0), 0.0, 1.0)
-        exhaustion_score = clamp(safe_float(primary_layer.get("exhaustion_score"), 0.0), 0.0, 1.0)
-        consolidation_score = clamp(safe_float(primary_layer.get("consolidation_score"), 0.0), 0.0, 1.0)
-
-        confidence *= 1.0 - reversal_risk * 0.30
-        confidence *= 1.0 - exhaustion_score * 0.22
-        confidence *= 1.0 - consolidation_score * 0.12
-
-        return clamp(confidence, 0.0, 1.0)
-
-    def _build_reasons(
-        self,
-        trend: TrendContextView,
-        side: SignalSide,
-        primary_layer: Mapping[str, Any],
-        secondary_layer: Mapping[str, Any],
-        primary_layer_name: str,
-        secondary_layer_name: str,
-    ) -> list[str]:
-        reasons: list[str] = []
-
-        if side == SignalSide.LONG:
-            reasons.append("trend_continuation_bullish")
-        elif side == SignalSide.SHORT:
-            reasons.append("trend_continuation_bearish")
-
-        reasons.append(f"primary_layer_{primary_layer_name}")
-        reasons.append(f"{primary_layer_name}_direction_{enum_value(primary_layer.get('direction'))}")
-        reasons.append(f"{primary_layer_name}_regime_{enum_value(primary_layer.get('regime'))}")
-
-        if (
-            self._directional_score(primary_layer.get("momentum_direction_score"), side)
-            >= self._p.min_directional_momentum
-        ):
-            reasons.append("momentum_aligned")
-
-        if (
-            self._directional_score(primary_layer.get("slope_direction_score"), side)
-            >= self._p.min_directional_slope
-        ):
-            reasons.append("slope_aligned")
-
-        if safe_bool(primary_layer.get("is_aligned_with_structure"), False):
-            reasons.append("structure_aligned")
-
-        if trend.internal_external_alignment >= self._p.min_internal_external_alignment:
-            reasons.append("internal_external_aligned")
-
-        if trend.higher_timeframe_alignment >= self._p.min_higher_timeframe_alignment:
-            reasons.append("higher_timeframe_aligned")
-
-        if trend.overall_trend_score >= self._p.min_overall_trend_score:
-            reasons.append("overall_trend_score_valid")
-
-        secondary_side = self._trend_direction_to_side(
-            secondary_layer.get("direction", TrendDirection.UNKNOWN)
-        )
-        if secondary_side == side:
-            reasons.append(f"{secondary_layer_name}_confirmation")
-
-        if safe_bool(primary_layer.get("is_accelerating"), False):
-            reasons.append("trend_accelerating")
-
-        if self._p.allow_pullback_entries and safe_bool(primary_layer.get("in_pullback"), False):
-            reasons.append("continuation_pullback_entry")
-
-        last_signal = trend.last_signal
-        if last_signal is not None and self._trend_direction_to_side(
-            last_signal.get("direction", TrendDirection.UNKNOWN)
-        ) == side:
-            event_type = last_signal.get("event_type")
-            if isinstance(event_type, TrendEventType):
-                reasons.append(f"last_trend_event_{event_type.value}")
-
-        return reasons
-
-    # ------------------------------------------------------------------
-    # Signal build
-    # ------------------------------------------------------------------
-
-    def _build_signal(
-        self,
-        context: SignalContext,
-        trend: TrendContextView,
-        side: SignalSide,
-        score: float,
-        confidence: float,
-        reasons: list[str],
-        freshness_filter: FilterResult | None,
-    ) -> StrategySignal:
-        primary_layer = self._select_primary_layer(trend)
-        secondary_layer = self._select_secondary_layer(trend)
-        last_signal = trend.last_signal
-
-        priority = self._resolve_priority(
-            confidence=confidence,
-            score=score,
-            trend=trend,
-            primary_layer=primary_layer,
-            last_signal=last_signal,
-        )
-
-        last_event_type = last_signal.get("event_type") if last_signal is not None else None
-        last_layer = last_signal.get("layer") if last_signal is not None else None
-
-        analytics_metadata = self._build_analytics_source_metadata(
-            module_name=self.analytics_module_name,
-            payload=trend.raw,
-            selected_entity=last_signal or primary_layer,
-            extra={
-                "signal_id": uuid4().hex,
-                "module": self.name,
-                "source": "analytics.price_action.trend",
-                "trend_timeframe": trend.timeframe,
-                "trend_last_update": trend.last_update.isoformat() if trend.last_update else None,
-                "trend_last_price": trend.last_price,
-                "primary_layer": enum_value(primary_layer.get("layer")),
-                "primary_direction": enum_value(primary_layer.get("direction")),
-                "primary_regime": enum_value(primary_layer.get("regime")),
-                "primary_strength": safe_float(primary_layer.get("strength"), 0.0),
-                "primary_confidence": safe_float(primary_layer.get("confidence"), 0.0),
-                "momentum_direction_score": safe_float(primary_layer.get("momentum_direction_score"), 0.0),
-                "slope_direction_score": safe_float(primary_layer.get("slope_direction_score"), 0.0),
-                "structure_score": safe_float(primary_layer.get("structure_score"), 0.0),
-                "is_aligned_with_structure": safe_bool(primary_layer.get("is_aligned_with_structure"), False),
-                "continuation_probability": safe_float(primary_layer.get("continuation_probability"), 0.0),
-                "reversal_risk": safe_float(primary_layer.get("reversal_risk"), 0.0),
-                "exhaustion_score": safe_float(primary_layer.get("exhaustion_score"), 0.0),
-                "consolidation_score": safe_float(primary_layer.get("consolidation_score"), 0.0),
-                "pullback_depth": safe_float(primary_layer.get("pullback_depth"), 0.0),
-                "in_pullback": safe_bool(primary_layer.get("in_pullback"), False),
-                "is_accelerating": safe_bool(primary_layer.get("is_accelerating"), False),
-                "is_exhausted": safe_bool(primary_layer.get("is_exhausted"), False),
-                "secondary_layer": enum_value(secondary_layer.get("layer")),
-                "secondary_direction": enum_value(secondary_layer.get("direction")),
-                "secondary_confidence": safe_float(secondary_layer.get("confidence"), 0.0),
-                "internal_external_alignment": trend.internal_external_alignment,
-                "higher_timeframe_alignment": trend.higher_timeframe_alignment,
-                "overall_trend_score": trend.overall_trend_score,
-                "last_trend_event_type": (
-                    last_event_type.value
-                    if isinstance(last_event_type, TrendEventType)
-                    else None
-                ),
-                "last_trend_event_layer": (
-                    last_layer.value
-                    if isinstance(last_layer, StructureLayer)
-                    else None
-                ),
+            required_features=set(self.required_features()),
+            supported_regimes={
+                MarketRegime.TRENDING_UP,
+                MarketRegime.TRENDING_DOWN,
+                MarketRegime.BREAKOUT,
+                MarketRegime.SQUEEZE,
+                MarketRegime.HIGH_VOLATILITY,
+                MarketRegime.UNKNOWN,
+            },
+            metadata={
+                "source": "analytics.price_action",
+                "strategy_type": "trend_continuation",
+                "base_class": "PriceActionTradingStrategy",
+                "canonical_payload": "PriceActionCompositeSnapshot",
+                "uses_trend": True,
+                "uses_alignment": True,
+                "uses_pullback_entries": True,
+                "emits_signal_generated": False,
+                "risk_ready_payload_owner": "SignalProcessor",
             },
         )
 
-        signal = StrategySignal(
-            symbol=context.symbol,
+    def required_features(self) -> set[str]:
+        base_required = super().required_features()
+        return set(base_required).union(
+            self.trend_config.required_price_action_features
+        )
+
+    async def generate_signal(
+        self,
+        context: StrategyContext,
+    ) -> StrategySignal | None:
+        self.validate_context_requirements(context)
+
+        if not self.has_any_price_action_data(
+            context,
+            tuple(self.trend_config.required_price_action_features),
+        ):
+            return None
+
+        if self.has_stale_price_action_features(
+            context,
+            tuple(self.trend_config.required_price_action_features),
+        ):
+            return None
+
+        view = self._extract_view(context)
+        if view is None or view.primary_trend is None:
+            return None
+
+        if (
+            self.trend_config.require_fresh_trend
+            and is_stale(
+                event_time=view.event_time,
+                now=context.timestamp,
+                stale_after_seconds=self.trend_config.stale_feature_max_age_seconds,
+            )
+        ):
+            return None
+
+        common_rejection = quality_filter_reason(
+            view.primary_layer,
+            min_confidence=self.trend_config.min_layer_confidence,
+            min_score=self.trend_config.min_trend_strength,
+            stale_after_seconds=self.trend_config.stale_feature_max_age_seconds,
+            now=context.timestamp,
+        )
+        if common_rejection is not None:
+            return None
+
+        side = self._infer_side(view)
+        if not is_directional_side(side):
+            return None
+
+        if not self._passes_filters(view=view, side=side):
+            return None
+
+        breakdown = self._build_score_breakdown(
+            context=context,
+            view=view,
             side=side,
-            strategy_name=self.name,
-            category=StrategyCategory.PRICE_ACTION,
-            timeframe=context.timeframe,
+        )
+
+        if breakdown.score < self.trend_config.min_signal_score:
+            return None
+
+        if breakdown.confidence < self.trend_config.min_signal_confidence:
+            return None
+
+        source_features = self._source_features(view)
+        tags = self._tags(view=view)
+
+        event_label = (
+            normalize_label(view.last_event.event_type)
+            if view.last_event is not None
+            else "trend_state"
+        )
+
+        reasons = list(
+            dict.fromkeys(
+                [
+                    "trend_continuation_signal",
+                    f"side:{side.value}",
+                    f"setup_type:{SetupType.CONTINUATION.value}",
+                    f"event:{event_label}",
+                    *view.reasons,
+                    *breakdown.reasons,
+                ]
+            )
+        )
+        confirmations = list(dict.fromkeys(breakdown.confirmations))
+
+        metadata = {
+            "price_action_setup_family": "trend_continuation",
+            "price_action_strategy_version": "2.0.0",
+            "score_breakdown": breakdown.to_dict(),
+            "tags": tags,
+            "event_time": view.event_time.isoformat() if view.event_time else None,
+            "primary_layer_name": normalize_label(view.primary_layer_name),
+            "secondary_layer_name": normalize_label(view.secondary_layer_name),
+            "primary_trend": serialize_for_metadata(view.primary_trend),
+            "secondary_trend": serialize_for_metadata(view.secondary_trend),
+            "last_event": serialize_for_metadata(view.last_event),
+            "primary_layer": serialize_for_metadata(view.primary_layer),
+            "secondary_layer": serialize_for_metadata(view.secondary_layer),
+            "internal_external_alignment": view.internal_external_alignment,
+            "higher_timeframe_alignment": view.higher_timeframe_alignment,
+            "overall_trend_score": view.overall_trend_score,
+            "layer_confidence": view.layer_confidence,
+            "layer_strength": view.layer_strength,
+            "mapped_side": side.value,
+            "setup_type": SetupType.CONTINUATION.value,
+            "raw": serialize_for_metadata(view.raw),
+        }
+
+        return self.build_price_action_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
             setup_type=SetupType.CONTINUATION,
-            timestamp=context.timestamp,
-            confidence=confidence,
-            score=score,
-            strength=confidence_to_strength(confidence),
-            confidence_grade=confidence_to_grade(confidence),
-            status=SignalStatus.NEW,
-            trigger_type=self._resolve_trigger_type(primary_layer, last_signal),
-            origin=SignalOrigin.SINGLE_STRATEGY,
-            priority=priority,
-            regime=self._resolve_market_regime(context),
-            metadata=analytics_metadata,
+            reasons=reasons,
+            confirmations=confirmations,
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.trend_config.default_priority,
         )
 
-        for reason in reasons:
-            signal.add_reason(reason)
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
 
-        signal.add_source_feature("analytics.price_action")
-        signal.add_source_feature("analytics.price_action.trend")
-        signal.add_source_feature("price_action.trend")
-
-        if freshness_filter is not None:
-            signal.add_filter_result(freshness_filter)
-
-        regime_filter = self._build_regime_filter(context=context, side=side)
-        if regime_filter is not None:
-            signal.add_filter_result(regime_filter)
-
-        signal.validate()
-        return signal
-
-    def _resolve_priority(
+    def _extract_view(
         self,
-        *,
-        confidence: float,
-        score: float,
-        trend: TrendContextView,
-        primary_layer: Mapping[str, Any],
-        last_signal: Mapping[str, Any] | None,
-    ) -> SignalPriority:
-        continuation_probability = clamp(
-            safe_float(primary_layer.get("continuation_probability"), 0.0),
-            0.0,
-            1.0,
+        context: StrategyContext,
+    ) -> TrendContinuationContextView | None:
+        module = self.resolve_price_action_module(
+            context,
+            "trend",
+        )
+        if not module:
+            return None
+
+        primary = select_primary_layer(
+            module,
+            prefer_external_layer=self.trend_config.prefer_external_layer,
+        )
+        secondary = select_secondary_layer(
+            module,
+            prefer_external_layer=self.trend_config.prefer_external_layer,
         )
 
-        if (
-            confidence >= 0.85
-            and score >= 0.80
-            and continuation_probability >= 0.80
-            and trend.overall_trend_score >= 0.70
-        ):
-            return SignalPriority.HIGH
+        if not primary:
+            return None
 
-        if (
-            last_signal is not None
-            and last_signal.get("event_type") in {
-                TrendEventType.TREND_CONTINUATION,
-                TrendEventType.TREND_ACCELERATION,
-                TrendEventType.TREND_ALIGNMENT,
-            }
-            and confidence >= 0.70
-            and score >= 0.65
-        ):
-            return SignalPriority.HIGH
+        primary_layer_name = self._extract_layer_name(
+            primary,
+            fallback=StructureLayer.EXTERNAL
+            if self.trend_config.prefer_external_layer
+            else StructureLayer.INTERNAL,
+        )
+        secondary_layer_name = self._extract_layer_name(
+            secondary,
+            fallback=StructureLayer.INTERNAL
+            if self.trend_config.prefer_external_layer
+            else StructureLayer.EXTERNAL,
+        )
 
-        return SignalPriority.MEDIUM
+        primary_trend = TrendLayerContext.from_payload(
+            primary,
+            fallback_layer=primary_layer_name,
+        )
+        secondary_trend = TrendLayerContext.from_payload(
+            secondary,
+            fallback_layer=secondary_layer_name,
+        )
 
-    def _resolve_trigger_type(
-        self,
-        primary_layer: Mapping[str, Any],
-        last_signal: Mapping[str, Any] | None,
-    ) -> TriggerType:
-        if last_signal is not None:
-            event_type = last_signal.get("event_type")
-            if event_type in {
-                TrendEventType.TREND_CONTINUATION,
-                TrendEventType.TREND_ACCELERATION,
-                TrendEventType.TREND_ALIGNMENT,
-            }:
-                return TriggerType.PRIMARY
-            if event_type in {
-                TrendEventType.PULLBACK_STARTED,
-                TrendEventType.PULLBACK_ENDED,
-                TrendEventType.TREND_WEAKENING,
-            }:
-                return TriggerType.CONFIRMATION
+        last_event_payload = (
+            get_path(primary, "last_signal")
+            or get_path(primary, "last_event")
+            or get_path(module, "last_signal")
+            or get_path(module, "last_event")
+            or extract_last_event(module)
+        )
+        last_event = TrendEventContext.from_payload(
+            last_event_payload,
+            fallback_layer=primary_layer_name,
+        )
 
-        if safe_bool(primary_layer.get("in_pullback"), False):
-            return TriggerType.CONFIRMATION
+        if primary_trend is None:
+            return None
 
-        return TriggerType.DERIVED
+        internal_external_alignment = unit_score(
+            get_path(module, "internal_external_alignment")
+            or get_path(module, "internal_external_alignment_score")
+            or get_path(module, "alignment_score")
+            or get_path(primary, "alignment_score")
+        )
+        higher_timeframe_alignment = unit_score(
+            get_path(module, "higher_timeframe_alignment")
+            or get_path(module, "higher_timeframe_alignment_score")
+            or get_path(module, "htf_alignment")
+            or get_path(primary, "higher_timeframe_alignment")
+        )
+        overall_trend_score = unit_score(
+            get_path(module, "overall_trend_score")
+            or get_path(module, "trend_score")
+            or get_path(primary, "overall_trend_score")
+            or primary_trend.score
+        )
 
-    # ------------------------------------------------------------------
-    # Scoring helpers
-    # ------------------------------------------------------------------
+        event_time = (
+            last_event.timestamp if last_event is not None else None
+        ) or primary_trend.updated_at or extract_last_update(primary) or extract_last_update(module)
 
-    def _directional_score(self, value: Any, side: SignalSide) -> float:
-        signed = clamp(safe_float(value, 0.0), -1.0, 1.0)
-        if side == SignalSide.LONG:
-            return clamp(max(0.0, signed), 0.0, 1.0)
-        if side == SignalSide.SHORT:
-            return clamp(max(0.0, -signed), 0.0, 1.0)
-        return 0.0
+        reasons = self._extract_reasons(module, primary, last_event)
 
-    def _structure_alignment_score(
-        self,
-        layer: Mapping[str, Any],
-        side: SignalSide,
-    ) -> float:
-        structure_score = clamp(safe_float(layer.get("structure_score"), 0.0), 0.0, 1.0)
-        aligned = safe_bool(layer.get("is_aligned_with_structure"), False)
-        if aligned:
-            return max(structure_score, 0.75)
-        return structure_score
+        return TrendContinuationContextView(
+            module=module,
+            primary_layer=primary,
+            secondary_layer=secondary,
+            primary_trend=primary_trend,
+            secondary_trend=secondary_trend,
+            last_event=last_event,
+            primary_layer_name=primary_layer_name,
+            secondary_layer_name=secondary_layer_name,
+            internal_external_alignment=internal_external_alignment,
+            higher_timeframe_alignment=higher_timeframe_alignment,
+            overall_trend_score=overall_trend_score,
+            layer_confidence=layer_confidence(primary),
+            layer_strength=layer_strength(primary),
+            event_time=event_time,
+            reasons=reasons,
+            raw=module,
+        )
 
-    def _layer_confirmation_score(
-        self,
-        layer: Mapping[str, Any],
+    @staticmethod
+    def _extract_layer_name(
+        layer: dict[str, Any],
         *,
-        side: SignalSide,
-    ) -> float:
-        components = [
-            clamp(safe_float(layer.get("confidence"), 0.0), 0.0, 1.0),
-            clamp(safe_float(layer.get("strength"), 0.0), 0.0, 1.0),
-            clamp(safe_float(layer.get("continuation_probability"), 0.0), 0.0, 1.0),
-            self._directional_score(layer.get("momentum_direction_score"), side),
-        ]
-        return clamp(sum(components) / len(components), 0.0, 1.0)
+        fallback: StructureLayer,
+    ) -> StructureLayer:
+        return (
+            parse_structure_layer(
+                get_path(layer, "layer")
+                or get_path(layer, "structure_layer")
+                or get_path(layer, "name"),
+                default=fallback,
+            )
+            or fallback
+        )
 
-    def _global_alignment_score(self, trend: TrendContextView) -> float:
-        components = [
-            trend.internal_external_alignment,
-            trend.overall_trend_score,
-        ]
-        if trend.higher_timeframe_alignment > 0:
-            components.append(trend.higher_timeframe_alignment)
-        return clamp(sum(components) / len(components), 0.0, 1.0)
+    @staticmethod
+    def _extract_reasons(
+        module: dict[str, Any],
+        primary: dict[str, Any],
+        event: TrendEventContext | None,
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        for value in (
+            get_path(module, "reasons"),
+            get_path(primary, "reasons"),
+            get_path(module, "confirmations"),
+            get_path(primary, "confirmations"),
+        ):
+            if isinstance(value, str) and value.strip():
+                reasons.append(value.strip())
+            elif isinstance(value, (list, tuple, set)):
+                reasons.extend(str(item).strip() for item in value if str(item).strip())
+
+        if event is not None:
+            reasons.extend(event.reasons)
+
+        return list(dict.fromkeys(reasons))
 
     # ------------------------------------------------------------------
-    # Enum parsing helpers
+    # Mapping / filters
     # ------------------------------------------------------------------
 
-    def _trend_direction_to_side(self, direction: Any) -> SignalSide:
-        parsed = self._parse_trend_direction(direction)
-        if parsed == TrendDirection.BULLISH:
-            return SignalSide.LONG
-        if parsed == TrendDirection.BEARISH:
-            return SignalSide.SHORT
+    def _infer_side(self, view: TrendContinuationContextView) -> SignalSide:
+        trend = view.primary_trend
+        if trend is None:
+            return SignalSide.UNKNOWN
+
+        side = trend_direction_to_side(trend.direction)
+        if is_directional_side(side):
+            return side
+
+        if view.last_event is not None and view.last_event.direction is not None:
+            event_side = trend_direction_to_side(view.last_event.direction)
+            if is_directional_side(event_side):
+                return event_side
+
         return SignalSide.UNKNOWN
 
-    def _parse_structure_layer(self, value: Any) -> StructureLayer | None:
-        raw = enum_value(value)
-        if raw == "internal":
-            return StructureLayer.INTERNAL
-        if raw == "external":
-            return StructureLayer.EXTERNAL
-        return None
+    def _passes_filters(
+        self,
+        *,
+        view: TrendContinuationContextView,
+        side: SignalSide,
+    ) -> bool:
+        trend = view.primary_trend
+        if trend is None:
+            return False
 
-    def _parse_trend_direction(self, value: Any) -> TrendDirection:
-        raw = enum_value(value)
-        mapping = {
-            "bullish": TrendDirection.BULLISH,
-            "bearish": TrendDirection.BEARISH,
-            "neutral": TrendDirection.NEUTRAL,
-            "unknown": TrendDirection.UNKNOWN,
+        if trend.confidence < self.trend_config.min_layer_confidence:
+            return False
+
+        if trend.trend_strength < self.trend_config.min_trend_strength:
+            return False
+
+        if trend.continuation_probability < self.trend_config.min_continuation_probability:
+            return False
+
+        if trend.momentum_score < self.trend_config.min_directional_momentum:
+            return False
+
+        if trend.slope_score < self.trend_config.min_slope_score:
+            return False
+
+        if view.overall_trend_score < self.trend_config.min_overall_trend_score:
+            return False
+
+        if self.trend_config.require_direction_alignment:
+            if not self._direction_alignment_ok(view=view, side=side):
+                return False
+
+        if self.trend_config.require_internal_confirmation:
+            if view.internal_external_alignment < self.trend_config.min_internal_external_alignment:
+                if not self.trend_config.allow_cross_layer_fallback:
+                    return False
+
+        if view.higher_timeframe_alignment < self.trend_config.min_higher_timeframe_alignment:
+            return False
+
+        if self.trend_config.block_exhausted_trend:
+            if trend.is_exhausted or trend.exhaustion_score > self.trend_config.max_exhaustion_score:
+                return False
+
+        if self.trend_config.block_high_reversal_risk:
+            if trend.reversal_risk > self.trend_config.max_reversal_risk:
+                return False
+
+        if self.trend_config.block_countertrend_context and trend.is_countertrend:
+            return False
+
+        if trend.is_pullback and not self.trend_config.allow_pullback_entries:
+            return False
+
+        if not is_directional_side(side):
+            return False
+
+        return True
+
+    def _direction_alignment_ok(
+        self,
+        *,
+        view: TrendContinuationContextView,
+        side: SignalSide,
+    ) -> bool:
+        secondary = view.secondary_trend
+        if secondary is None:
+            return True
+
+        secondary_side = trend_direction_to_side(secondary.direction)
+        if not is_directional_side(secondary_side):
+            return True
+
+        return secondary_side is side
+
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
+
+    def _build_score_breakdown(
+        self,
+        *,
+        context: StrategyContext,
+        view: TrendContinuationContextView,
+        side: SignalSide,
+    ) -> ScoreBreakdown:
+        trend = view.primary_trend
+        if trend is None:
+            return ScoreBreakdown()
+
+        trend_component = average_score(
+            trend.score,
+            trend.confidence,
+            trend.trend_strength,
+        )
+        probability_component = trend.continuation_probability
+        momentum_component = average_score(
+            trend.momentum_score,
+            trend.slope_score,
+        )
+        alignment_component = average_score(
+            view.internal_external_alignment,
+            view.higher_timeframe_alignment,
+        )
+        structure_component = average_score(
+            trend.structure_score,
+            view.overall_trend_score,
+            view.layer_strength,
+        )
+        fresh_component = freshness_score(
+            event_time=view.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.trend_config.stale_feature_max_age_seconds,
+        )
+
+        components = {
+            "trend": trend_component,
+            "probability": probability_component,
+            "momentum": momentum_component,
+            "alignment": alignment_component,
+            "structure": structure_component,
+            "freshness": fresh_component,
         }
-        if raw in mapping:
-            return mapping[raw]
-        try:
-            return TrendDirection(raw)
-        except Exception:
-            return TrendDirection.UNKNOWN
-
-    def _parse_trend_regime(self, value: Any) -> TrendRegime:
-        raw = enum_value(value)
-        mapping = {
-            "trending": TrendRegime.TRENDING,
-            "trend": TrendRegime.TRENDING,
-            "trending_up": TrendRegime.TRENDING,
-            "trending_down": TrendRegime.TRENDING,
-            "accelerating_up": TrendRegime.TRENDING,
-            "accelerating_down": TrendRegime.TRENDING,
-            "pullback": TrendRegime.PULLBACK,
-            "pullback_uptrend": TrendRegime.PULLBACK,
-            "pullback_downtrend": TrendRegime.PULLBACK,
-            "consolidating": TrendRegime.CONSOLIDATING,
-            "consolidation": TrendRegime.CONSOLIDATING,
-            "ranging": TrendRegime.CONSOLIDATING,
-            "reversing": TrendRegime.REVERSING,
-            "reversal": TrendRegime.REVERSING,
-            "exhausted": TrendRegime.EXHAUSTED,
-            "exhaustion": TrendRegime.EXHAUSTED,
-            "unknown": TrendRegime.UNKNOWN,
+        weights = {
+            "trend": self.trend_config.score_trend_weight,
+            "probability": self.trend_config.score_probability_weight,
+            "momentum": self.trend_config.score_momentum_weight,
+            "alignment": self.trend_config.score_alignment_weight,
+            "structure": self.trend_config.score_structure_weight,
+            "freshness": self.trend_config.score_freshness_weight,
         }
-        if raw in mapping:
-            return mapping[raw]
-        try:
-            return TrendRegime(raw)
-        except Exception:
-            return TrendRegime.UNKNOWN
 
-    def _parse_trend_event_type(self, value: Any) -> TrendEventType | None:
-        raw = enum_value(value)
-        if not raw:
-            return None
+        score = weighted_score(components, weights, default=trend_component)
+        confidence = confidence_from_components(
+            primary=trend_component,
+            context=weighted_score(
+                {
+                    "structure": structure_component,
+                    "alignment": alignment_component,
+                    "probability": probability_component,
+                },
+                {
+                    "structure": 0.30,
+                    "alignment": 0.35,
+                    "probability": 0.35,
+                },
+            ),
+            confirmation=momentum_component,
+            freshness=fresh_component,
+            primary_weight=self.trend_config.confidence_trend_weight,
+            context_weight=self.trend_config.confidence_context_weight,
+            confirmation_weight=self.trend_config.confidence_confirmation_weight,
+            freshness_weight=self.trend_config.confidence_freshness_weight,
+        )
 
-        mapping = {
-            "trend_started": TrendEventType.TREND_STARTED,
-            "trend_continuation": TrendEventType.TREND_CONTINUATION,
-            "continuation_confirmed": TrendEventType.TREND_CONTINUATION,
-            "continuation": TrendEventType.TREND_CONTINUATION,
-            "trend_acceleration": TrendEventType.TREND_ACCELERATION,
-            "acceleration": TrendEventType.TREND_ACCELERATION,
-            "trend_weakening": TrendEventType.TREND_WEAKENING,
-            "weakening": TrendEventType.TREND_WEAKENING,
-            "pullback_started": TrendEventType.PULLBACK_STARTED,
-            "pullback": TrendEventType.PULLBACK_STARTED,
-            "pullback_ended": TrendEventType.PULLBACK_ENDED,
-            "resumption": TrendEventType.PULLBACK_ENDED,
-            "trend_reversal": TrendEventType.TREND_REVERSAL,
-            "reversal": TrendEventType.TREND_REVERSAL,
-            "trend_exhaustion": TrendEventType.TREND_EXHAUSTION,
-            "exhaustion": TrendEventType.TREND_EXHAUSTION,
-            "trend_alignment": TrendEventType.TREND_ALIGNMENT,
-            "alignment": TrendEventType.TREND_ALIGNMENT,
-            "trend_disagreement": TrendEventType.TREND_DISAGREEMENT,
-            "disagreement": TrendEventType.TREND_DISAGREEMENT,
-        }
-        if raw in mapping:
-            return mapping[raw]
-        try:
-            return TrendEventType(raw)
-        except Exception:
-            return None
+        reasons: list[str] = []
+        confirmations: list[str] = [
+            f"side:{side.value}",
+            "trend_continuation_context",
+            f"trend_direction:{normalize_label(trend.direction)}",
+        ]
+
+        if trend.trend_strength >= self.trend_config.strong_trend_threshold:
+            score += self.trend_config.strong_trend_bonus
+            confirmations.append("strong_trend_strength")
+
+        if trend.momentum_score >= self.trend_config.strong_momentum_threshold:
+            score += self.trend_config.momentum_bonus
+            confirmations.append("strong_directional_momentum")
+
+        if trend.continuation_probability >= self.trend_config.strong_continuation_probability_threshold:
+            score += self.trend_config.strong_trend_bonus
+            confirmations.append("high_continuation_probability")
+
+        if trend.is_pullback:
+            score += self.trend_config.pullback_bonus
+            confirmations.append("pullback_continuation_entry")
+
+        if view.internal_external_alignment >= self.trend_config.min_internal_external_alignment:
+            score += self.trend_config.alignment_bonus
+            confirmations.append("internal_external_alignment_confirmed")
+
+        if view.higher_timeframe_alignment >= self.trend_config.min_higher_timeframe_alignment:
+            score += self.trend_config.higher_timeframe_bonus
+            confirmations.append("higher_timeframe_alignment_confirmed")
+
+        if view.last_event is not None:
+            score += self.trend_config.event_confirmation_bonus
+            confirmations.append(
+                f"trend_event:{normalize_label(view.last_event.event_type)}"
+            )
+
+        if trend.exhaustion_score > 0:
+            reasons.append(f"exhaustion_score:{trend.exhaustion_score:.4f}")
+
+        if trend.reversal_risk > 0:
+            reasons.append(f"reversal_risk:{trend.reversal_risk:.4f}")
+
+        return ScoreBreakdown(
+            score=unit_score(score),
+            confidence=unit_score(confidence),
+            components=components,
+            weights=weights,
+            reasons=reasons,
+            confirmations=list(dict.fromkeys(confirmations)),
+        ).normalize()
+
+    # ------------------------------------------------------------------
+    # Source features / tags
+    # ------------------------------------------------------------------
+
+    def _source_features(self, view: TrendContinuationContextView) -> list[str]:
+        features = [
+            *trend_source_features(),
+            PRICE_ACTION_FEATURES.TREND,
+            PRICE_ACTION_FEATURES.TREND_INTERNAL,
+            PRICE_ACTION_FEATURES.TREND_EXTERNAL,
+            PRICE_ACTION_FEATURES.TREND_LAST_SIGNAL,
+            PRICE_ACTION_FEATURES.TREND_INTERNAL_EXTERNAL_ALIGNMENT,
+            PRICE_ACTION_FEATURES.TREND_HIGHER_TIMEFRAME_ALIGNMENT,
+            PRICE_ACTION_FEATURES.TREND_OVERALL_SCORE,
+        ]
+
+        return list(dict.fromkeys(features))
+
+    def _tags(
+        self,
+        *,
+        view: TrendContinuationContextView,
+    ) -> list[str]:
+        tags = [
+            self.trend_config.tag_price_action,
+            self.trend_config.tag_trend,
+            self.trend_config.tag_trend_continuation,
+            self.trend_config.tag_continuation,
+            self.trend_config.tag_momentum,
+            self.trend_config.tag_alignment,
+        ]
+
+        trend = view.primary_trend
+        if trend is not None:
+            side = trend_direction_to_side(trend.direction)
+
+            if side is SignalSide.LONG:
+                tags.append(self.trend_config.tag_uptrend_continuation)
+
+            if side is SignalSide.SHORT:
+                tags.append(self.trend_config.tag_downtrend_continuation)
+
+            if trend.is_pullback:
+                tags.append(self.trend_config.tag_pullback_entry)
+
+            if trend.layer is not None:
+                tags.append(f"layer:{normalize_label(trend.layer)}")
+
+            if trend.regime is not None:
+                tags.append(f"regime:{normalize_label(trend.regime)}")
+
+        if view.higher_timeframe_alignment > 0:
+            tags.append(self.trend_config.tag_higher_timeframe)
+
+        return list(dict.fromkeys(tags))
