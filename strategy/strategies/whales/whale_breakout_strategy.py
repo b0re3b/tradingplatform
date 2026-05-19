@@ -37,37 +37,45 @@ from strategy.strategies.whales.base import (
 
 class WhaleBreakoutStrategy(WhaleStrategyBase):
     """
-    Whale breakout strategy.
+    Futures whale breakout / continuation strategy.
 
     Ідея:
-        Стратегія шукає продовження руху, коли whale-активність
-        не абсорбує протилежний потік, а штовхає ринок у напрямку
-        breakout / continuation.
+        Стратегія шукає продовження руху, коли whale-flow не абсорбує
+        протилежний тиск, а підштовхує ринок у напрямку breakout.
 
     Bullish breakout:
-        - buy whale pressure домінує;
-        - whale activity по buy-side підтверджує агресію;
-        - cluster side = buy;
+        - dominant whale pressure = buy;
+        - whale activity / large trade підтверджує buy-side aggression;
+        - cluster side = buy або cluster_update підтримує buy-side;
         - continuation_probability достатньо висока;
-        - exhaustion_probability не надто висока.
+        - exhaustion_probability не надто висока;
+        - optional liquidation context не суперечить breakout.
 
     Bearish breakout:
-        - sell whale pressure домінує;
-        - whale activity по sell-side підтверджує агресію;
-        - cluster side = sell;
+        - dominant whale pressure = sell;
+        - whale activity / large trade підтверджує sell-side aggression;
+        - cluster side = sell або cluster_update підтримує sell-side;
         - continuation_probability достатньо висока;
-        - exhaustion_probability не надто висока.
+        - exhaustion_probability не надто висока;
+        - optional liquidation context не суперечить breakout.
 
-    Джерела даних:
-        - context.whales
-        - context.feature_map
+    Основні analytics.whales inputs:
+        - large_trade;
+        - whale_activity;
+        - whale_pressure;
+        - whale_cluster;
+        - whale_cluster_update;
+        - whale_cluster_exhaustion.
 
-    Очікувані whale-сутності:
-        - whale_activity
-        - whale_pressure
-        - whale_cluster
-        - whale_cluster_update
-        - whale_cluster_exhaustion
+    Optional futures confirmation:
+        - whale_liquidation_context.
+
+    Важливо:
+        - scope/freshness/futures validation виконується в WhaleStrategyBase
+          через _resolve_payload();
+        - клас поки лишається самодостатнім evaluator-ом;
+        - пізніше filters/scoring/signal building можна буде винести в
+          SignalProcessor.
     """
 
     DEFAULT_STRATEGY_NAME = "whale_breakout_strategy"
@@ -111,12 +119,13 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
 
     def evaluate(self, context: SignalContext) -> StrategyEvaluation:
         """
-        Основний sync-вхід у breakout-стратегію.
+        Основний sync evaluation-вхід.
 
         Повертає:
-            - StrategyEvaluation з signal, якщо setup валідний;
-            - StrategyEvaluation(passed=False), якщо setup відсутній
-              або не пройшов фільтри.
+            - StrategyEvaluation(passed=True, signal=...), якщо breakout setup
+              валідний;
+            - StrategyEvaluation(passed=False), якщо setup відсутній або
+              заблокований фільтрами.
         """
         try:
             self.validate_context(context)
@@ -133,6 +142,15 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
                 return evaluation
 
             inputs = self._extract_inputs(context)
+
+            missing_required = self._missing_required_inputs(inputs)
+            if missing_required:
+                evaluation.reasons.append(
+                    "Missing required whale analytics inputs: "
+                    + ", ".join(sorted(missing_required))
+                )
+                return evaluation
+
             signal_side = self._determine_signal_side(inputs)
 
             if signal_side == SignalSide.UNKNOWN:
@@ -235,6 +253,24 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         )
 
     @property
+    def _min_large_trade_notional(self) -> float:
+        return float(
+            self._metadata.get(
+                "min_large_trade_notional",
+                250_000.0,
+            )
+        )
+
+    @property
+    def _min_large_trade_zscore(self) -> float:
+        return float(
+            self._metadata.get(
+                "min_large_trade_zscore",
+                2.0,
+            )
+        )
+
+    @property
     def _min_pressure_imbalance_ratio(self) -> float:
         return float(
             self._metadata.get(
@@ -280,6 +316,24 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         )
 
     @property
+    def _min_liquidation_context_strength(self) -> float:
+        return float(
+            self._metadata.get(
+                "min_liquidation_context_strength",
+                0.45,
+            )
+        )
+
+    @property
+    def _min_liquidation_notional(self) -> float:
+        return float(
+            self._metadata.get(
+                "min_liquidation_notional",
+                120_000.0,
+            )
+        )
+
+    @property
     def _require_activity_confirmation(self) -> bool:
         return bool(
             self._metadata.get(
@@ -294,6 +348,33 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             self._metadata.get(
                 "require_cluster_confirmation",
                 True,
+            )
+        )
+
+    @property
+    def _require_large_trade_confirmation(self) -> bool:
+        return bool(
+            self._metadata.get(
+                "require_large_trade_confirmation",
+                False,
+            )
+        )
+
+    @property
+    def _use_liquidation_context_confirmation(self) -> bool:
+        return bool(
+            self._metadata.get(
+                "use_liquidation_context_confirmation",
+                True,
+            )
+        )
+
+    @property
+    def _block_opposite_liquidation_context(self) -> bool:
+        return bool(
+            self._metadata.get(
+                "block_opposite_liquidation_context",
+                False,
             )
         )
 
@@ -323,7 +404,25 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         self,
         context: SignalContext,
     ) -> dict[str, dict[str, Any]]:
+        """
+        Дістає whale analytics inputs із context.whales / context.feature_map.
+
+        _resolve_payload() уже виконує:
+            - object -> dict conversion;
+            - scope validation;
+            - freshness validation;
+            - futures market_type validation;
+            - optional dropping invalid payloads.
+        """
         return {
+            "large_trade": self._resolve_payload(
+                context,
+                names=(
+                    "large_trade",
+                    "large_trade_signal",
+                    "analytics.whales.large_trade",
+                ),
+            ),
             "activity": self._resolve_payload(
                 context,
                 names=(
@@ -338,6 +437,14 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
                     "whale_pressure",
                     "whale_pressure_signal",
                     "analytics.whales.whale_pressure",
+                ),
+            ),
+            "liquidation_context": self._resolve_payload(
+                context,
+                names=(
+                    "whale_liquidation_context",
+                    "whale_liquidation_context_signal",
+                    "analytics.whales.whale_liquidation_context",
                 ),
             ),
             "cluster": self._resolve_payload(
@@ -366,6 +473,27 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             ),
         }
 
+    def _missing_required_inputs(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> set[str]:
+        missing: set[str] = set()
+
+        if self._require_activity_confirmation and not inputs.get("activity"):
+            missing.add("whale_activity")
+
+        if not inputs.get("pressure"):
+            missing.add("whale_pressure")
+
+        if self._require_cluster_confirmation:
+            if not inputs.get("cluster") and not inputs.get("cluster_update"):
+                missing.add("whale_cluster/whale_cluster_update")
+
+        if self._require_large_trade_confirmation and not inputs.get("large_trade"):
+            missing.add("large_trade")
+
+        return missing
+
     # =========================================================================
     # Setup detection
     # =========================================================================
@@ -376,54 +504,53 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
     ) -> SignalSide:
         activity = inputs["activity"]
         pressure = inputs["pressure"]
-        cluster = inputs["cluster"]
-        cluster_update = inputs["cluster_update"]
-        cluster_exhaustion = inputs["cluster_exhaustion"]
+        large_trade = inputs["large_trade"]
 
-        activity_side = str(
-            activity.get("side", "")
-        ).lower()
+        activity_side = self._side_value(
+            activity.get("side")
+            or activity.get("dominant_side")
+            or activity.get("whale_side")
+        )
+
+        dominant_side = self._side_value(
+            pressure.get("dominant_side")
+            or pressure.get("side")
+        )
+
+        large_trade_side = self._side_value(
+            large_trade.get("side")
+            or large_trade.get("trade_side")
+            or large_trade.get("taker_side")
+        )
+
+        cluster_side = self._resolve_cluster_side(inputs)
+        exhausted_side = self._resolve_exhausted_side(inputs)
 
         activity_trade_count = self._safe_int(
-            activity.get("trade_count"),
+            activity.get("trade_count")
+            or activity.get("large_trade_count")
+            or activity.get("count"),
             default=0,
         )
 
         activity_total_notional = self._safe_float(
-            activity.get("total_notional"),
+            activity.get("total_notional")
+            or activity.get("notional")
+            or activity.get("volume_notional"),
             default=0.0,
-        )
+        ) or 0.0
 
-        dominant_side = str(
-            pressure.get("dominant_side", "")
-        ).lower()
+        large_trade_notional = self._resolve_large_trade_notional(large_trade)
+        large_trade_zscore = self._resolve_large_trade_zscore(large_trade)
 
         imbalance_ratio = self._safe_float(
             pressure.get("imbalance_ratio")
+            or pressure.get("pressure_imbalance_ratio")
         )
 
-        cluster_side = str(
-            cluster.get("cluster_side")
-            or cluster_update.get("cluster_side")
-            or cluster_exhaustion.get("cluster_side")
-            or ""
-        ).lower()
-
-        cluster_score = self._safe_float(
-            cluster.get("cluster_score")
-            or cluster_update.get("cluster_score")
-        )
-
-        continuation_probability = self._safe_float(
-            cluster.get("continuation_probability")
-            or cluster_update.get("continuation_probability")
-        )
-
-        exhaustion_probability = self._safe_float(
-            cluster_exhaustion.get("exhaustion_probability")
-            or cluster_update.get("exhaustion_probability")
-            or cluster.get("exhaustion_probability")
-        )
+        cluster_score = self._resolve_cluster_score(inputs)
+        continuation_probability = self._resolve_continuation_probability(inputs)
+        exhaustion_probability = self._resolve_exhaustion_probability(inputs)
 
         if (
             imbalance_ratio is None
@@ -435,9 +562,16 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             if activity_trade_count < self._min_activity_trade_count:
                 return SignalSide.UNKNOWN
 
+            if activity_total_notional < self._min_activity_notional:
+                return SignalSide.UNKNOWN
+
+        if self._require_large_trade_confirmation:
+            if large_trade_notional < self._min_large_trade_notional:
+                return SignalSide.UNKNOWN
+
             if (
-                activity_total_notional is None
-                or activity_total_notional < self._min_activity_notional
+                large_trade_zscore is not None
+                and large_trade_zscore < self._min_large_trade_zscore
             ):
                 return SignalSide.UNKNOWN
 
@@ -460,16 +594,24 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         ):
             return SignalSide.UNKNOWN
 
-        bullish_breakout = (
-            dominant_side == "buy"
-            and activity_side in {"buy", ""}
-            and cluster_side in {"buy", ""}
+        if self._block_opposite_liquidation_context:
+            if self._has_opposite_liquidation_context(inputs, dominant_side):
+                return SignalSide.UNKNOWN
+
+        bullish_breakout = self._is_bullish_breakout(
+            dominant_side=dominant_side,
+            activity_side=activity_side,
+            large_trade_side=large_trade_side,
+            cluster_side=cluster_side,
+            exhausted_side=exhausted_side,
         )
 
-        bearish_breakout = (
-            dominant_side == "sell"
-            and activity_side in {"sell", ""}
-            and cluster_side in {"sell", ""}
+        bearish_breakout = self._is_bearish_breakout(
+            dominant_side=dominant_side,
+            activity_side=activity_side,
+            large_trade_side=large_trade_side,
+            cluster_side=cluster_side,
+            exhausted_side=exhausted_side,
         )
 
         if bullish_breakout:
@@ -479,6 +621,58 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             return SignalSide.SHORT
 
         return SignalSide.UNKNOWN
+
+    def _is_bullish_breakout(
+        self,
+        *,
+        dominant_side: str,
+        activity_side: str,
+        large_trade_side: str,
+        cluster_side: str,
+        exhausted_side: str,
+    ) -> bool:
+        if dominant_side != "buy":
+            return False
+
+        if self._require_activity_confirmation and activity_side not in {"buy", ""}:
+            return False
+
+        if self._require_large_trade_confirmation and large_trade_side not in {"buy", ""}:
+            return False
+
+        if cluster_side not in {"buy", "unknown", ""}:
+            return False
+
+        if exhausted_side == "buy":
+            return False
+
+        return True
+
+    def _is_bearish_breakout(
+        self,
+        *,
+        dominant_side: str,
+        activity_side: str,
+        large_trade_side: str,
+        cluster_side: str,
+        exhausted_side: str,
+    ) -> bool:
+        if dominant_side != "sell":
+            return False
+
+        if self._require_activity_confirmation and activity_side not in {"sell", ""}:
+            return False
+
+        if self._require_large_trade_confirmation and large_trade_side not in {"sell", ""}:
+            return False
+
+        if cluster_side not in {"sell", "unknown", ""}:
+            return False
+
+        if exhausted_side == "sell":
+            return False
+
+        return True
 
     # =========================================================================
     # Scoring
@@ -490,57 +684,29 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         inputs: dict[str, dict[str, Any]],
         side: SignalSide,
     ) -> float:
-        activity = inputs["activity"]
-        pressure = inputs["pressure"]
-        cluster = inputs["cluster"]
-        cluster_update = inputs["cluster_update"]
-        cluster_exhaustion = inputs["cluster_exhaustion"]
+        if side == SignalSide.UNKNOWN:
+            return 0.0
 
-        activity_total_notional = self._safe_float(
-            activity.get("total_notional"),
-            default=0.0,
-        )
-        activity_trade_count = self._safe_int(
-            activity.get("trade_count"),
-            default=0,
-        )
-
-        activity_score = self._normalize_activity(
-            total_notional=activity_total_notional or 0.0,
-            trade_count=activity_trade_count,
-        )
-
-        imbalance_ratio = self._safe_float(
-            pressure.get("imbalance_ratio"),
-            default=0.0,
-        )
-        cluster_score = self._safe_float(
-            cluster.get("cluster_score")
-            or cluster_update.get("cluster_score"),
-            default=0.0,
-        )
-        continuation_probability = self._safe_float(
-            cluster.get("continuation_probability")
-            or cluster_update.get("continuation_probability"),
-            default=0.0,
-        )
-        exhaustion_probability = self._safe_float(
-            cluster_exhaustion.get("exhaustion_probability")
-            or cluster_update.get("exhaustion_probability")
-            or cluster.get("exhaustion_probability"),
-            default=0.0,
+        activity_score = self._resolve_activity_score(inputs)
+        pressure_score = self._resolve_pressure_score(inputs)
+        cluster_score = self._resolve_cluster_score(inputs) or 0.0
+        continuation_probability = self._resolve_continuation_probability(inputs) or 0.0
+        exhaustion_probability = self._resolve_exhaustion_probability(inputs) or 0.0
+        large_trade_score = self._resolve_large_trade_score(inputs)
+        liquidation_context_score = self._resolve_liquidation_context_score(
+            inputs=inputs,
+            side=side,
         )
 
         base_score = (
-            (activity_score or 0.0) * 0.25
-            + (imbalance_ratio or 0.0) * 0.25
-            + (cluster_score or 0.0) * 0.20
-            + (continuation_probability or 0.0) * 0.25
-            + (1.0 - (exhaustion_probability or 0.0)) * 0.05
+            activity_score * 0.20
+            + pressure_score * 0.24
+            + cluster_score * 0.17
+            + continuation_probability * 0.24
+            + (1.0 - exhaustion_probability) * 0.07
+            + large_trade_score * 0.05
+            + liquidation_context_score * 0.03
         )
-
-        if side == SignalSide.UNKNOWN:
-            return 0.0
 
         return self._clamp(
             base_score,
@@ -554,57 +720,29 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         inputs: dict[str, dict[str, Any]],
         side: SignalSide,
     ) -> float:
-        activity = inputs["activity"]
-        pressure = inputs["pressure"]
-        cluster = inputs["cluster"]
-        cluster_update = inputs["cluster_update"]
-        cluster_exhaustion = inputs["cluster_exhaustion"]
+        if side == SignalSide.UNKNOWN:
+            return 0.0
 
-        activity_total_notional = self._safe_float(
-            activity.get("total_notional"),
-            default=0.0,
-        )
-        activity_trade_count = self._safe_int(
-            activity.get("trade_count"),
-            default=0,
-        )
-
-        activity_score = self._normalize_activity(
-            total_notional=activity_total_notional or 0.0,
-            trade_count=activity_trade_count,
-        )
-
-        imbalance_ratio = self._safe_float(
-            pressure.get("imbalance_ratio"),
-            default=0.0,
-        )
-        continuation_probability = self._safe_float(
-            cluster.get("continuation_probability")
-            or cluster_update.get("continuation_probability"),
-            default=0.0,
-        )
-        cluster_score = self._safe_float(
-            cluster.get("cluster_score")
-            or cluster_update.get("cluster_score"),
-            default=0.0,
-        )
-        exhaustion_probability = self._safe_float(
-            cluster_exhaustion.get("exhaustion_probability")
-            or cluster_update.get("exhaustion_probability")
-            or cluster.get("exhaustion_probability"),
-            default=0.0,
+        activity_score = self._resolve_activity_score(inputs)
+        pressure_score = self._resolve_pressure_score(inputs)
+        cluster_score = self._resolve_cluster_score(inputs) or 0.0
+        continuation_probability = self._resolve_continuation_probability(inputs) or 0.0
+        exhaustion_probability = self._resolve_exhaustion_probability(inputs) or 0.0
+        large_trade_score = self._resolve_large_trade_score(inputs)
+        liquidation_context_score = self._resolve_liquidation_context_score(
+            inputs=inputs,
+            side=side,
         )
 
         confidence = (
-            (activity_score or 0.0) * 0.25
-            + (imbalance_ratio or 0.0) * 0.25
-            + (continuation_probability or 0.0) * 0.30
-            + (cluster_score or 0.0) * 0.10
-            + (1.0 - (exhaustion_probability or 0.0)) * 0.10
+            activity_score * 0.22
+            + pressure_score * 0.23
+            + continuation_probability * 0.27
+            + cluster_score * 0.12
+            + (1.0 - exhaustion_probability) * 0.08
+            + large_trade_score * 0.05
+            + liquidation_context_score * 0.03
         )
-
-        if side == SignalSide.UNKNOWN:
-            return 0.0
 
         return self._clamp(
             confidence,
@@ -612,26 +750,153 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             1.0,
         )
 
-    def _normalize_activity(
+    def _resolve_activity_score(
         self,
-        *,
-        total_notional: float,
-        trade_count: int,
+        inputs: dict[str, dict[str, Any]],
     ) -> float:
+        activity = inputs.get("activity") or {}
+        if not activity:
+            return 0.0
+
+        total_notional = self._safe_float(
+            activity.get("total_notional")
+            or activity.get("notional")
+            or activity.get("volume_notional"),
+            default=0.0,
+        ) or 0.0
+
+        trade_count = self._safe_int(
+            activity.get("trade_count")
+            or activity.get("large_trade_count")
+            or activity.get("count"),
+            default=0,
+        )
+
         notional_part = self._clamp(
             total_notional / max(self._min_activity_notional, 1.0),
             0.0,
-            2.0,
+            1.0,
         )
 
         count_part = self._clamp(
             trade_count / max(self._min_activity_trade_count, 1),
             0.0,
-            2.0,
+            1.0,
         )
 
         return self._clamp(
-            (notional_part * 0.7 + count_part * 0.3) / 2.0,
+            notional_part * 0.75 + count_part * 0.25,
+            0.0,
+            1.0,
+        )
+
+    def _resolve_pressure_score(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> float:
+        pressure = inputs.get("pressure") or {}
+
+        imbalance_ratio = self._safe_float(
+            pressure.get("imbalance_ratio")
+            or pressure.get("pressure_imbalance_ratio"),
+            default=0.0,
+        ) or 0.0
+
+        pressure_score = self._safe_float(
+            pressure.get("pressure_score")
+            or pressure.get("score"),
+            default=None,
+        )
+
+        if pressure_score is not None:
+            return self._clamp(
+                max(imbalance_ratio, pressure_score),
+                0.0,
+                1.0,
+            )
+
+        return self._clamp(
+            imbalance_ratio,
+            0.0,
+            1.0,
+        )
+
+    def _resolve_large_trade_score(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> float:
+        large_trade = inputs.get("large_trade") or {}
+        if not large_trade:
+            return 0.0
+
+        notional = self._resolve_large_trade_notional(large_trade)
+        zscore = self._resolve_large_trade_zscore(large_trade) or 0.0
+
+        notional_score = self._clamp(
+            notional / max(self._min_large_trade_notional, 1.0),
+            0.0,
+            1.0,
+        )
+
+        zscore_score = self._clamp(
+            zscore / max(self._min_large_trade_zscore * 2.0, 1.0),
+            0.0,
+            1.0,
+        )
+
+        return self._clamp(
+            notional_score * 0.70 + zscore_score * 0.30,
+            0.0,
+            1.0,
+        )
+
+    def _resolve_liquidation_context_score(
+        self,
+        *,
+        inputs: dict[str, dict[str, Any]],
+        side: SignalSide,
+    ) -> float:
+        if not self._use_liquidation_context_confirmation:
+            return 0.0
+
+        liq_ctx = inputs.get("liquidation_context") or {}
+        if not liq_ctx:
+            return 0.0
+
+        context_strength = self._safe_float(
+            liq_ctx.get("context_strength")
+            or liq_ctx.get("liquidation_context_strength")
+            or liq_ctx.get("strength"),
+            default=0.0,
+        ) or 0.0
+
+        liquidation_notional = self._resolve_liquidation_notional(liq_ctx)
+        liquidation_score = self._clamp(
+            liquidation_notional / max(self._min_liquidation_notional, 1.0),
+            0.0,
+            1.0,
+        )
+
+        liquidation_side = self._side_value(
+            liq_ctx.get("liquidation_side")
+            or liq_ctx.get("liquidated_side")
+            or liq_ctx.get("opposite_side")
+        )
+
+        # Для breakout liquidation context корисний, якщо forced flow
+        # не суперечить напрямку breakout.
+        if side == SignalSide.LONG:
+            aligned = liquidation_side in {"buy", "unknown", ""}
+        elif side == SignalSide.SHORT:
+            aligned = liquidation_side in {"sell", "unknown", ""}
+        else:
+            aligned = False
+
+        if not aligned:
+            return 0.0
+
+        return self._clamp(
+            context_strength * 0.65 + liquidation_score * 0.35,
             0.0,
             1.0,
         )
@@ -672,9 +937,19 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             regime=self._resolve_regime(context),
             metadata={
                 "strategy_type": "whale_breakout",
+                "market_scope": self._build_market_scope_metadata(context, inputs),
                 "inputs_present": {
                     key: bool(value)
                     for key, value in inputs.items()
+                },
+                "inputs_used": {
+                    "large_trade": bool(inputs.get("large_trade")),
+                    "activity": True,
+                    "pressure": True,
+                    "liquidation_context": bool(inputs.get("liquidation_context")),
+                    "cluster": bool(inputs.get("cluster")),
+                    "cluster_update": bool(inputs.get("cluster_update")),
+                    "cluster_exhaustion": bool(inputs.get("cluster_exhaustion")),
                 },
             },
         )
@@ -696,6 +971,7 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
                 context=context,
                 side=side,
                 confidence=confidence,
+                inputs=inputs,
             )
 
             if execution_plan is not None:
@@ -715,37 +991,36 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
     ) -> None:
         activity = inputs["activity"]
         pressure = inputs["pressure"]
-        cluster = inputs["cluster"]
-        cluster_update = inputs["cluster_update"]
-        cluster_exhaustion = inputs["cluster_exhaustion"]
+        large_trade = inputs["large_trade"]
 
         trade_count = self._safe_int(
-            activity.get("trade_count"),
+            activity.get("trade_count")
+            or activity.get("large_trade_count")
+            or activity.get("count"),
             default=0,
         )
+
         total_notional = self._safe_float(
-            activity.get("total_notional"),
+            activity.get("total_notional")
+            or activity.get("notional")
+            or activity.get("volume_notional"),
             default=0.0,
-        )
+        ) or 0.0
+
         imbalance_ratio = self._safe_float(
-            pressure.get("imbalance_ratio"),
+            pressure.get("imbalance_ratio")
+            or pressure.get("pressure_imbalance_ratio"),
             default=0.0,
-        )
-        cluster_score = self._safe_float(
-            cluster.get("cluster_score")
-            or cluster_update.get("cluster_score"),
-            default=0.0,
-        )
-        continuation_probability = self._safe_float(
-            cluster.get("continuation_probability")
-            or cluster_update.get("continuation_probability"),
-            default=0.0,
-        )
-        exhaustion_probability = self._safe_float(
-            cluster_exhaustion.get("exhaustion_probability")
-            or cluster_update.get("exhaustion_probability")
-            or cluster.get("exhaustion_probability"),
-            default=0.0,
+        ) or 0.0
+
+        cluster_score = self._resolve_cluster_score(inputs) or 0.0
+        continuation_probability = self._resolve_continuation_probability(inputs) or 0.0
+        exhaustion_probability = self._resolve_exhaustion_probability(inputs) or 0.0
+        large_trade_notional = self._resolve_large_trade_notional(large_trade)
+        large_trade_zscore = self._resolve_large_trade_zscore(large_trade) or 0.0
+        liquidation_context_score = self._resolve_liquidation_context_score(
+            inputs=inputs,
+            side=side,
         )
 
         signal.add_reason(
@@ -755,21 +1030,36 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             f"Whale activity trades={trade_count}"
         )
         signal.add_reason(
-            f"Whale activity notional={(total_notional or 0.0):.2f}"
+            f"Whale activity notional={total_notional:.2f}"
         )
         signal.add_reason(
-            f"Pressure imbalance ratio={(imbalance_ratio or 0.0):.4f}"
+            f"Pressure imbalance ratio={imbalance_ratio:.4f}"
         )
         signal.add_reason(
-            f"Cluster score={(cluster_score or 0.0):.4f}"
+            f"Cluster score={cluster_score:.4f}"
         )
         signal.add_reason(
-            f"Continuation probability={(continuation_probability or 0.0):.4f}"
+            f"Continuation probability={continuation_probability:.4f}"
         )
 
-        if exhaustion_probability is not None and exhaustion_probability > 0:
+        if exhaustion_probability > 0:
             signal.add_reason(
                 f"Exhaustion probability={exhaustion_probability:.4f}"
+            )
+
+        if large_trade_notional > 0:
+            signal.add_reason(
+                f"Large trade notional={large_trade_notional:.2f}"
+            )
+
+        if large_trade_zscore > 0:
+            signal.add_reason(
+                f"Large trade zscore={large_trade_zscore:.4f}"
+            )
+
+        if liquidation_context_score > 0:
+            signal.add_reason(
+                f"Liquidation context confirmation score={liquidation_context_score:.4f}"
             )
 
     def _append_confirmations(
@@ -781,24 +1071,27 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
     ) -> None:
         activity = inputs["activity"]
         pressure = inputs["pressure"]
-        cluster = inputs["cluster"]
-        cluster_update = inputs["cluster_update"]
-        cluster_exhaustion = inputs["cluster_exhaustion"]
+        large_trade = inputs["large_trade"]
 
-        activity_side = str(
-            activity.get("side", "")
-        ).lower()
+        activity_side = self._side_value(
+            activity.get("side")
+            or activity.get("dominant_side")
+            or activity.get("whale_side")
+        )
 
-        dominant_side = str(
-            pressure.get("dominant_side", "")
-        ).lower()
+        dominant_side = self._side_value(
+            pressure.get("dominant_side")
+            or pressure.get("side")
+        )
 
-        cluster_side = str(
-            cluster.get("cluster_side")
-            or cluster_update.get("cluster_side")
-            or cluster_exhaustion.get("cluster_side")
-            or ""
-        ).lower()
+        large_trade_side = self._side_value(
+            large_trade.get("side")
+            or large_trade.get("trade_side")
+            or large_trade.get("taker_side")
+        )
+
+        cluster_side = self._resolve_cluster_side(inputs)
+        exhausted_side = self._resolve_exhausted_side(inputs)
 
         if activity_side:
             signal.add_confirmation(
@@ -810,9 +1103,19 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
                 f"Dominant whale pressure={dominant_side}"
             )
 
+        if large_trade_side:
+            signal.add_confirmation(
+                f"Large trade side={large_trade_side}"
+            )
+
         if cluster_side:
             signal.add_confirmation(
                 f"Cluster side={cluster_side}"
+            )
+
+        if exhausted_side:
+            signal.add_confirmation(
+                f"Exhausted side={exhausted_side}"
             )
 
         if side == SignalSide.LONG:
@@ -829,8 +1132,10 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         self,
         signal: StrategySignal,
     ) -> None:
+        signal.add_source_feature("large_trade")
         signal.add_source_feature("whale_activity")
         signal.add_source_feature("whale_pressure")
+        signal.add_source_feature("whale_liquidation_context")
         signal.add_source_feature("whale_cluster")
         signal.add_source_feature("whale_cluster_update")
         signal.add_source_feature("whale_cluster_exhaustion")
@@ -845,6 +1150,7 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         context: SignalContext,
         side: SignalSide,
         confidence: float,
+        inputs: dict[str, dict[str, Any]],
     ) -> ExecutionPlanDraft | None:
         price = self._resolve_reference_price(context)
         if price is None or price <= 0:
@@ -852,7 +1158,7 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
 
         entry_type = self._resolve_entry_type()
         rr_ratio = self._default_rr_ratio
-        stop_buffer_fraction = self._default_stop_buffer_bps / 10_000.0
+        stop_buffer_fraction = self._resolve_stop_buffer_fraction(inputs)
 
         entry = EntryPlan(
             entry_type=entry_type,
@@ -863,6 +1169,7 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
                     EntryType.LIMIT,
                     EntryType.STOP,
                     EntryType.PULLBACK,
+                    EntryType.BREAKOUT_CONFIRMATION,
                 }
                 else None
             ),
@@ -908,6 +1215,8 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
                 "whale_breakout_signal_flip",
                 "continuation_probability_drop",
                 "opposite_whale_pressure_confirmation",
+                "cluster_exhaustion_increase",
+                "large_trade_flow_reversal",
             ],
         )
 
@@ -919,12 +1228,15 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
             invalidation=invalidation,
             expected_holding_seconds=self._suggest_holding_seconds(context),
             notes=[
-                "Execution draft generated from whale breakout setup",
+                "Execution draft generated from futures whale breakout setup",
             ],
             metadata={
                 "strategy_name": self.strategy_name,
                 "rr_ratio": rr_ratio,
                 "reference_price": price,
+                "stop_buffer_fraction": stop_buffer_fraction,
+                "stop_buffer_bps": stop_buffer_fraction * 10_000.0,
+                "setup": "whale_breakout",
             },
         )
 
@@ -942,6 +1254,36 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
 
         return EntryType.MARKET
 
+    def _resolve_stop_buffer_fraction(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> float:
+        base_buffer_bps = self._default_stop_buffer_bps
+
+        continuation_probability = self._resolve_continuation_probability(inputs) or 0.0
+        exhaustion_probability = self._resolve_exhaustion_probability(inputs) or 0.0
+        pressure_score = self._resolve_pressure_score(inputs)
+
+        # Strong breakout can use slightly tighter stop;
+        # high exhaustion / weak pressure gets more room.
+        adjustment = (
+            1.0
+            - continuation_probability * 0.10
+            - pressure_score * 0.05
+            + exhaustion_probability * 0.15
+        )
+
+        buffer_bps = base_buffer_bps * self._clamp(
+            adjustment,
+            0.75,
+            1.25,
+        )
+
+        return max(
+            buffer_bps / 10_000.0,
+            0.0001,
+        )
+
     # =========================================================================
     # Filters
     # =========================================================================
@@ -953,7 +1295,334 @@ class WhaleBreakoutStrategy(WhaleStrategyBase):
         signal: StrategySignal,
         inputs: dict[str, dict[str, Any]],
     ) -> list[FilterResult]:
-        return self._run_common_filters(
+        results = self._run_common_filters(
             context=context,
             signal=signal,
         )
+
+        results.extend(
+            self._run_breakout_specific_filters(
+                signal=signal,
+                inputs=inputs,
+            )
+        )
+
+        return results
+
+    def _run_breakout_specific_filters(
+        self,
+        *,
+        signal: StrategySignal,
+        inputs: dict[str, dict[str, Any]],
+    ) -> list[FilterResult]:
+        results: list[FilterResult] = []
+
+        continuation_probability = self._resolve_continuation_probability(inputs)
+        if (
+            continuation_probability is None
+            or continuation_probability < self._min_continuation_probability
+        ):
+            results.append(
+                FilterResult(
+                    name="whale_breakout_continuation_filter",
+                    decision=FilterDecision.BLOCK,
+                    reason=(
+                        "Continuation probability below threshold: "
+                        f"{(continuation_probability or 0.0):.4f} "
+                        f"< {self._min_continuation_probability:.4f}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                FilterResult(
+                    name="whale_breakout_continuation_filter",
+                    decision=FilterDecision.PASS,
+                    reason=(
+                        "Continuation probability confirmed: "
+                        f"{continuation_probability:.4f}"
+                    ),
+                )
+            )
+
+        exhaustion_probability = self._resolve_exhaustion_probability(inputs)
+        if (
+            exhaustion_probability is not None
+            and exhaustion_probability > self._max_exhaustion_probability
+        ):
+            results.append(
+                FilterResult(
+                    name="whale_breakout_exhaustion_filter",
+                    decision=FilterDecision.BLOCK,
+                    reason=(
+                        "Exhaustion probability too high: "
+                        f"{exhaustion_probability:.4f} "
+                        f"> {self._max_exhaustion_probability:.4f}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                FilterResult(
+                    name="whale_breakout_exhaustion_filter",
+                    decision=FilterDecision.PASS,
+                    reason=(
+                        "Exhaustion risk acceptable: "
+                        f"{(exhaustion_probability or 0.0):.4f}"
+                    ),
+                )
+            )
+
+        if self._require_large_trade_confirmation:
+            large_trade_score = self._resolve_large_trade_score(inputs)
+            if large_trade_score <= 0:
+                results.append(
+                    FilterResult(
+                        name="whale_breakout_large_trade_filter",
+                        decision=FilterDecision.BLOCK,
+                        reason="Large trade confirmation missing",
+                    )
+                )
+            else:
+                results.append(
+                    FilterResult(
+                        name="whale_breakout_large_trade_filter",
+                        decision=FilterDecision.PASS,
+                        reason=f"Large trade confirmation score={large_trade_score:.4f}",
+                    )
+                )
+
+        if self._block_opposite_liquidation_context:
+            dominant_side = self._side_from_signal(signal)
+            if self._has_opposite_liquidation_context(inputs, dominant_side):
+                results.append(
+                    FilterResult(
+                        name="whale_breakout_liquidation_context_filter",
+                        decision=FilterDecision.BLOCK,
+                        reason="Opposite liquidation context detected",
+                    )
+                )
+
+        return results
+
+    # =========================================================================
+    # Analytics payload helpers
+    # =========================================================================
+
+    def _resolve_cluster_score(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> float | None:
+        cluster = inputs.get("cluster") or {}
+        cluster_update = inputs.get("cluster_update") or {}
+        cluster_exhaustion = inputs.get("cluster_exhaustion") or {}
+
+        return self._first_float(
+            cluster.get("cluster_score"),
+            cluster.get("score"),
+            cluster_update.get("cluster_score"),
+            cluster_update.get("score"),
+            cluster_exhaustion.get("cluster_score"),
+            cluster_exhaustion.get("score"),
+        )
+
+    def _resolve_continuation_probability(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> float | None:
+        cluster = inputs.get("cluster") or {}
+        cluster_update = inputs.get("cluster_update") or {}
+
+        return self._first_float(
+            cluster.get("continuation_probability"),
+            cluster_update.get("continuation_probability"),
+        )
+
+    def _resolve_exhaustion_probability(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> float | None:
+        cluster = inputs.get("cluster") or {}
+        cluster_update = inputs.get("cluster_update") or {}
+        cluster_exhaustion = inputs.get("cluster_exhaustion") or {}
+
+        return self._first_float(
+            cluster_exhaustion.get("exhaustion_probability"),
+            cluster_exhaustion.get("probability"),
+            cluster_update.get("exhaustion_probability"),
+            cluster.get("exhaustion_probability"),
+        )
+
+    def _resolve_cluster_side(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> str:
+        cluster = inputs.get("cluster") or {}
+        cluster_update = inputs.get("cluster_update") or {}
+        cluster_exhaustion = inputs.get("cluster_exhaustion") or {}
+
+        return self._side_value(
+            cluster.get("cluster_side")
+            or cluster.get("side")
+            or cluster_update.get("cluster_side")
+            or cluster_update.get("side")
+            or cluster_exhaustion.get("cluster_side")
+            or cluster_exhaustion.get("side")
+        )
+
+    def _resolve_exhausted_side(
+        self,
+        inputs: dict[str, dict[str, Any]],
+    ) -> str:
+        cluster_exhaustion = inputs.get("cluster_exhaustion") or {}
+        cluster_update = inputs.get("cluster_update") or {}
+        cluster = inputs.get("cluster") or {}
+
+        return self._side_value(
+            cluster_exhaustion.get("exhausted_side")
+            or cluster_exhaustion.get("cluster_side")
+            or cluster_update.get("exhausted_side")
+            or cluster.get("exhausted_side")
+        )
+
+    def _resolve_large_trade_notional(
+        self,
+        large_trade: dict[str, Any],
+    ) -> float:
+        return (
+            self._first_float(
+                large_trade.get("notional"),
+                large_trade.get("trade_notional"),
+                large_trade.get("total_notional"),
+            )
+            or 0.0
+        )
+
+    def _resolve_large_trade_zscore(
+        self,
+        large_trade: dict[str, Any],
+    ) -> float | None:
+        return self._first_float(
+            large_trade.get("zscore"),
+            large_trade.get("z_score"),
+            large_trade.get("notional_zscore"),
+        )
+
+    def _resolve_liquidation_notional(
+        self,
+        liq_ctx: dict[str, Any],
+    ) -> float:
+        return (
+            self._first_float(
+                liq_ctx.get("liquidation_notional"),
+                liq_ctx.get("total_liquidation_notional"),
+                liq_ctx.get("notional"),
+                liq_ctx.get("total_notional"),
+                liq_ctx.get("opposite_liquidation_notional"),
+            )
+            or 0.0
+        )
+
+    def _has_opposite_liquidation_context(
+        self,
+        inputs: dict[str, dict[str, Any]],
+        dominant_side: str,
+    ) -> bool:
+        liq_ctx = inputs.get("liquidation_context") or {}
+        if not liq_ctx:
+            return False
+
+        context_strength = self._safe_float(
+            liq_ctx.get("context_strength")
+            or liq_ctx.get("liquidation_context_strength")
+            or liq_ctx.get("strength"),
+            default=0.0,
+        ) or 0.0
+
+        liquidation_notional = self._resolve_liquidation_notional(liq_ctx)
+
+        if context_strength < self._min_liquidation_context_strength:
+            return False
+
+        if liquidation_notional < self._min_liquidation_notional:
+            return False
+
+        liquidation_side = self._side_value(
+            liq_ctx.get("liquidation_side")
+            or liq_ctx.get("liquidated_side")
+            or liq_ctx.get("opposite_side")
+        )
+
+        if dominant_side == "buy":
+            return liquidation_side == "sell"
+
+        if dominant_side == "sell":
+            return liquidation_side == "buy"
+
+        return False
+
+    def _build_market_scope_metadata(
+        self,
+        context: SignalContext,
+        inputs: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        pressure = inputs.get("pressure") or {}
+        activity = inputs.get("activity") or {}
+        scope = pressure.get("scope") if isinstance(pressure.get("scope"), dict) else {}
+
+        return {
+            "symbol": context.symbol,
+            "timeframe": str(context.timeframe),
+            "exchange": (
+                pressure.get("exchange")
+                or activity.get("exchange")
+                or scope.get("exchange")
+            ),
+            "market_type": (
+                pressure.get("market_type")
+                or activity.get("market_type")
+                or scope.get("market_type")
+            ),
+        }
+
+    def _side_value(
+        self,
+        value: Any,
+    ) -> str:
+        if value is None:
+            return ""
+
+        normalized = str(value).strip().lower()
+
+        if normalized in {"buy", "bid", "long", "bull", "bullish", "b"}:
+            return "buy"
+
+        if normalized in {"sell", "ask", "short", "bear", "bearish", "s"}:
+            return "sell"
+
+        if normalized in {"unknown", "none", "neutral"}:
+            return "unknown"
+
+        return normalized
+
+    def _side_from_signal(
+        self,
+        signal: StrategySignal,
+    ) -> str:
+        if signal.side == SignalSide.LONG:
+            return "buy"
+
+        if signal.side == SignalSide.SHORT:
+            return "sell"
+
+        return "unknown"
+
+    def _first_float(
+        self,
+        *values: Any,
+    ) -> float | None:
+        for value in values:
+            resolved = self._safe_float(value, default=None)
+            if resolved is not None:
+                return resolved
+        return None

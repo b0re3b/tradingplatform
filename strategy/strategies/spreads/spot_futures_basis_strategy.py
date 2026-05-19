@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from analytics.spreads.enums import (
     InstrumentType,
+    QuoteValidity,
+    SpreadDirection,
     SpreadRegime,
     SpreadSignalType,
     SpreadType,
 )
-from analytics.spreads.models import SpreadSignal, SpreadSnapshot
+from analytics.spreads.models import DEFAULT_TIMEFRAME, SpreadSignal, SpreadSnapshot
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
 
@@ -20,6 +22,7 @@ from .base_spread_strategy import (
     SpreadStrategyState,
     SPOT_FUTURES_SNAPSHOT_EVENT,
     SPREAD_SIGNAL_EVENT as ANALYTICS_SPREAD_SIGNAL_EVENT,
+    STATE_CANCELLED,
     STATE_CLOSED,
 )
 
@@ -31,6 +34,19 @@ DECIMAL_ONE = Decimal("1")
 # ============================================================
 # Config helpers
 # ============================================================
+
+def _to_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
+    if value is None:
+        return default
+
+    if isinstance(value, Decimal):
+        return value
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
 
 def _validate_non_negative_decimal(name: str, value: Decimal) -> None:
     if value < DECIMAL_ZERO:
@@ -64,6 +80,12 @@ def _normalize_exchange_set(values: set[str] | list[str] | tuple[str, ...] | Non
     }
 
 
+def _enum_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
 # ============================================================
 # Config
 # ============================================================
@@ -95,14 +117,28 @@ class SpotFuturesBasisStrategyConfig(BaseSpreadStrategyConfig):
     min_funding_adjusted_edge: Decimal = Decimal("0")
     min_basis_abs: Decimal = Decimal("0")
 
+    # Update thresholds
+    min_update_confidence_delta: Decimal = Decimal("0.05")
+    min_update_edge_delta: Decimal = Decimal("0")
+    min_update_zscore_delta: Decimal = Decimal("0.25")
+
     # Confirmation policy
     require_mean_reversion_signal: bool = False
     require_regime_shift_confirmation: bool = False
     allow_regime_shift_entry: bool = True
 
+    # Signal confluence policy
+    allow_anomaly_entry: bool = True
+    allow_widening_entry: bool = False
+    widening_requires_wait: bool = True
+
     # Data-quality signal policy
     close_on_data_quality_signal: bool = True
     block_entry_on_data_quality_signal: bool = True
+
+    # Quote/snapshot quality policy
+    require_valid_quote: bool = True
+    require_snapshot_edge: bool = True
 
     # Confirmation bucket policy
     max_signals_per_key: int = 20
@@ -123,6 +159,28 @@ class SpotFuturesBasisStrategyConfig(BaseSpreadStrategyConfig):
     def __post_init__(self) -> None:
         BaseSpreadStrategyConfig.__post_init__(self)
 
+        self.entry_zscore = _to_decimal(self.entry_zscore, Decimal("2.0")) or Decimal("2.0")
+        self.exit_zscore = _to_decimal(self.exit_zscore, Decimal("0.75")) or Decimal("0.75")
+        self.reduce_zscore = _to_decimal(self.reduce_zscore, Decimal("1.25")) or Decimal("1.25")
+        self.stop_zscore = _to_decimal(self.stop_zscore, Decimal("4.5")) or Decimal("4.5")
+
+        self.min_funding_adjusted_edge = (
+            _to_decimal(self.min_funding_adjusted_edge, DECIMAL_ZERO) or DECIMAL_ZERO
+        )
+        self.min_basis_abs = _to_decimal(self.min_basis_abs, DECIMAL_ZERO) or DECIMAL_ZERO
+
+        self.min_update_confidence_delta = (
+            _to_decimal(self.min_update_confidence_delta, Decimal("0.05"))
+            or Decimal("0.05")
+        )
+        self.min_update_edge_delta = (
+            _to_decimal(self.min_update_edge_delta, DECIMAL_ZERO) or DECIMAL_ZERO
+        )
+        self.min_update_zscore_delta = (
+            _to_decimal(self.min_update_zscore_delta, Decimal("0.25"))
+            or Decimal("0.25")
+        )
+
         self.allowed_regimes = _normalize_regime_set(self.allowed_regimes)
         self.allowed_spot_exchanges = _normalize_exchange_set(self.allowed_spot_exchanges)
         self.allowed_futures_exchanges = _normalize_exchange_set(
@@ -142,6 +200,18 @@ class SpotFuturesBasisStrategyConfig(BaseSpreadStrategyConfig):
             self.min_funding_adjusted_edge,
         )
         _validate_non_negative_decimal("min_basis_abs", self.min_basis_abs)
+        _validate_non_negative_decimal(
+            "min_update_confidence_delta",
+            self.min_update_confidence_delta,
+        )
+        _validate_non_negative_decimal(
+            "min_update_edge_delta",
+            self.min_update_edge_delta,
+        )
+        _validate_non_negative_decimal(
+            "min_update_zscore_delta",
+            self.min_update_zscore_delta,
+        )
 
         if self.exit_zscore > self.reduce_zscore:
             raise ValueError("exit_zscore must be <= reduce_zscore")
@@ -177,7 +247,8 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
 
     Роль:
     - слухати готові analytics payload-и;
-    - перевіряти contract/freshness/allowlists;
+    - перевіряти contract/freshness/allowlists/quote_validity;
+    - використовувати basis / funding_adjusted_spread / zscore / regime;
     - визначати LONG_BASIS / SHORT_BASIS;
     - вести lifecycle setup-а;
     - публікувати strategy-level intents через signal.*.
@@ -249,6 +320,10 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                 "data_quality_blocks": 0,
                 "stale_signals_removed": 0,
                 "bias_flips": 0,
+                "quote_quality_blocks": 0,
+                "edge_blocks": 0,
+                "scoped_key_hits": 0,
+                "legacy_key_fallbacks": 0,
             }
         )
 
@@ -295,6 +370,10 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             "data_quality_blocks": self._stats["data_quality_blocks"],
             "stale_signals_removed": self._stats["stale_signals_removed"],
             "bias_flips": self._stats["bias_flips"],
+            "quote_quality_blocks": self._stats["quote_quality_blocks"],
+            "edge_blocks": self._stats["edge_blocks"],
+            "scoped_key_hits": self._stats["scoped_key_hits"],
+            "legacy_key_fallbacks": self._stats["legacy_key_fallbacks"],
             "tracked_snapshots": len(self._latest_snapshots),
             "tracked_signal_keys": len(self._latest_signals),
             "tracked_signals": sum(len(items) for items in self._latest_signals.values()),
@@ -305,11 +384,19 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         symbol: str,
         spot_exchange: str,
         futures_exchange: str,
+        *,
+        spot_market_type: str | None = "spot",
+        futures_market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> SpreadSnapshot | None:
-        key = self._build_state_key(
-            self._normalize_symbol(symbol),
-            self._normalize_exchange(spot_exchange),
-            self._normalize_exchange(futures_exchange),
+        key = self._build_scoped_state_key(
+            spread_type=SpreadType.SPOT_FUTURES,
+            symbol=symbol,
+            exchange_a=spot_exchange,
+            exchange_b=futures_exchange,
+            market_type_a=spot_market_type,
+            market_type_b=futures_market_type,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
         )
         return self._latest_snapshots.get(key)
 
@@ -318,11 +405,19 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         symbol: str,
         spot_exchange: str,
         futures_exchange: str,
+        *,
+        spot_market_type: str | None = "spot",
+        futures_market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> list[SpreadSignal]:
-        key = self._build_state_key(
-            self._normalize_symbol(symbol),
-            self._normalize_exchange(spot_exchange),
-            self._normalize_exchange(futures_exchange),
+        key = self._build_scoped_state_key(
+            spread_type=SpreadType.SPOT_FUTURES,
+            symbol=symbol,
+            exchange_a=spot_exchange,
+            exchange_b=futures_exchange,
+            market_type_a=spot_market_type,
+            market_type_b=futures_market_type,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
         )
         self._prune_stale_signals(key)
         return list(self._latest_signals.get(key, []))
@@ -365,7 +460,7 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                     self._stats["invalid_contracts"] += 1
                     self._stats["ignored_signals"] += 1
                     self._logger.warning(
-                        "Spread signal cannot be correlated | strategy=%s symbol=%s exchange_a=%s exchange_b=%s signal_type=%s",
+                        "Spot/futures spread signal cannot be correlated | strategy=%s symbol=%s exchange_a=%s exchange_b=%s signal_type=%s",
                         self.STRATEGY_NAME,
                         signal.symbol,
                         signal.exchange_a,
@@ -378,13 +473,15 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                 self._record_signal_confirmation(signal)
 
                 if (
-                    signal.signal_type in {
+                    signal.signal_type
+                    in {
                         SpreadSignalType.STALE_DATA,
                         SpreadSignalType.INVALID_DATA,
                     }
                     and self._config.close_on_data_quality_signal
                 ):
                     await self._handle_data_quality_signal(key, signal)
+                    return
 
             except Exception as exc:
                 self._mark_exception(
@@ -532,13 +629,11 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                     exchange_a=snapshot.leg_a_exchange,
                     exchange_b=snapshot.leg_b_exchange,
                     bias=bias,
-                    metadata={
-                        "spread_type": SpreadType.SPOT_FUTURES.value,
-                        "spot_exchange": snapshot.leg_a_exchange,
-                        "futures_exchange": snapshot.leg_b_exchange,
-                        "spot_instrument_type": snapshot.leg_a_type.value,
-                        "futures_instrument_type": snapshot.leg_b_type.value,
-                    },
+                    metadata=self._build_snapshot_metadata(
+                        snapshot,
+                        confirmation,
+                        bias,
+                    ),
                 )
 
                 if self._should_open(snapshot, state, confirmation):
@@ -659,6 +754,12 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
                     )
                     return
 
+                self._ignore_snapshot(
+                    snapshot,
+                    key,
+                    reason="no_state_transition",
+                )
+
             except Exception as exc:
                 self._mark_exception(
                     "Failed to process spot/futures snapshot",
@@ -673,27 +774,55 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
     # ------------------------------------------------------------------
 
     def _build_key_from_snapshot(self, snapshot: SpreadSnapshot) -> str:
-        return self._build_state_key(
-            self._normalize_symbol(snapshot.symbol),
-            self._normalize_exchange(snapshot.leg_a_exchange),
-            self._normalize_exchange(snapshot.leg_b_exchange),
+        self._stats["scoped_key_hits"] += 1
+        return self._build_scoped_state_key(
+            spread_type=snapshot.spread_type,
+            symbol=snapshot.symbol,
+            exchange_a=snapshot.leg_a_exchange,
+            exchange_b=snapshot.leg_b_exchange,
+            market_type_a=snapshot.leg_a_market_type,
+            market_type_b=snapshot.leg_b_market_type,
+            timeframe=snapshot.timeframe,
         )
 
     def _build_key_from_signal(self, signal: SpreadSignal) -> str:
-        exchange_a = signal.exchange_a or signal.metadata.get("spot_exchange")
-        exchange_b = signal.exchange_b or signal.metadata.get("futures_exchange")
+        metadata_key = self._metadata_str(
+            signal.metadata,
+            "state_key",
+            "spot_futures_key",
+            "basis_key",
+        )
+        if metadata_key:
+            return metadata_key
 
-        normalized_symbol = self._normalize_symbol(signal.symbol)
-        normalized_a = self._normalize_exchange(str(exchange_a) if exchange_a else None)
-        normalized_b = self._normalize_exchange(str(exchange_b) if exchange_b else None)
+        exchange_a = signal.exchange_a or self._metadata_str(
+            signal.metadata,
+            "spot_exchange",
+            "exchange_a",
+            "leg_a_exchange",
+        )
+        exchange_b = signal.exchange_b or self._metadata_str(
+            signal.metadata,
+            "futures_exchange",
+            "exchange_b",
+            "leg_b_exchange",
+        )
 
-        if not normalized_symbol or not normalized_a or not normalized_b:
+        if not signal.symbol or not exchange_a or not exchange_b:
             return ""
 
-        return self._build_state_key(
-            normalized_symbol,
-            normalized_a,
-            normalized_b,
+        return self._build_scoped_state_key(
+            spread_type=signal.spread_type,
+            symbol=signal.symbol,
+            exchange_a=exchange_a,
+            exchange_b=exchange_b,
+            market_type_a=signal.market_type_a
+            or self._metadata_str(signal.metadata, "spot_market_type", "market_type_a"),
+            market_type_b=signal.market_type_b
+            or self._metadata_str(signal.metadata, "futures_market_type", "market_type_b"),
+            timeframe=signal.timeframe
+            or self._metadata_str(signal.metadata, "timeframe")
+            or DEFAULT_TIMEFRAME,
         )
 
     def _snapshot_contract_error(self, snapshot: SpreadSnapshot) -> str | None:
@@ -715,6 +844,9 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if not snapshot.leg_b_exchange:
             return "missing_futures_exchange"
 
+        if self._config.require_valid_quote and snapshot.quote_validity != QuoteValidity.VALID:
+            return "invalid_quote_validity"
+
         return None
 
     def _reject_snapshot_exchanges(self, snapshot: SpreadSnapshot) -> bool:
@@ -734,39 +866,15 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         return False
 
     # ------------------------------------------------------------------
-    # Signal storage / confirmation helpers
+    # Signal confirmation helpers
     # ------------------------------------------------------------------
 
     def _store_signal(self, key: str, signal: SpreadSignal) -> None:
         bucket = self._latest_signals.setdefault(key, [])
         bucket.append(signal)
 
-        self._prune_stale_signals(key)
-
-        max_size = self._config.max_signals_per_key
-        if len(bucket) > max_size:
-            del bucket[:-max_size]
-
-    def _prune_stale_signals(self, key: str) -> int:
-        bucket = self._latest_signals.get(key)
-        if not bucket:
-            return 0
-
-        before = len(bucket)
-        bucket[:] = [
-            signal
-            for signal in bucket
-            if self._is_signal_fresh(signal.timestamp)
-        ]
-        removed = before - len(bucket)
-
-        if removed:
-            self._stats["stale_signals_removed"] += removed
-
-        if not bucket:
-            self._latest_signals.pop(key, None)
-
-        return removed
+        if len(bucket) > self._config.max_signals_per_key:
+            del bucket[: len(bucket) - self._config.max_signals_per_key]
 
     def _record_signal_confirmation(self, signal: SpreadSignal) -> None:
         if signal.signal_type == SpreadSignalType.MEAN_REVERSION:
@@ -777,11 +885,6 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             self._stats["anomaly_confirmations"] += 1
         elif signal.signal_type == SpreadSignalType.WIDENING:
             self._stats["widening_confirmations"] += 1
-        elif signal.signal_type in {
-            SpreadSignalType.STALE_DATA,
-            SpreadSignalType.INVALID_DATA,
-        }:
-            self._stats["data_quality_blocks"] += 1
 
     def _resolve_confirmation(self, snapshot: SpreadSnapshot) -> dict[str, Any]:
         key = self._build_key_from_snapshot(snapshot)
@@ -789,66 +892,63 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
 
         signals = self._latest_signals.get(key, [])
 
-        mean_reversion_signal: SpreadSignal | None = None
-        regime_shift_signal: SpreadSignal | None = None
-        anomaly_signal: SpreadSignal | None = None
-        widening_signal: SpreadSignal | None = None
-        stale_data_signal: SpreadSignal | None = None
-        invalid_data_signal: SpreadSignal | None = None
-
-        for signal in reversed(signals):
-            if (
-                signal.signal_type == SpreadSignalType.MEAN_REVERSION
-                and mean_reversion_signal is None
-            ):
-                mean_reversion_signal = signal
-            elif (
-                signal.signal_type == SpreadSignalType.REGIME_SHIFT
-                and regime_shift_signal is None
-            ):
-                regime_shift_signal = signal
-            elif (
-                signal.signal_type == SpreadSignalType.ANOMALY
-                and anomaly_signal is None
-            ):
-                anomaly_signal = signal
-            elif (
-                signal.signal_type == SpreadSignalType.WIDENING
-                and widening_signal is None
-            ):
-                widening_signal = signal
-            elif (
-                signal.signal_type == SpreadSignalType.STALE_DATA
-                and stale_data_signal is None
-            ):
-                stale_data_signal = signal
-            elif (
-                signal.signal_type == SpreadSignalType.INVALID_DATA
-                and invalid_data_signal is None
-            ):
-                invalid_data_signal = signal
-
-        has_data_quality_block = (
-            stale_data_signal is not None
-            or invalid_data_signal is not None
+        has_mean_reversion = any(
+            signal.signal_type == SpreadSignalType.MEAN_REVERSION
+            for signal in signals
+        )
+        has_regime_shift = any(
+            signal.signal_type == SpreadSignalType.REGIME_SHIFT
+            for signal in signals
+        )
+        has_anomaly = any(
+            signal.signal_type == SpreadSignalType.ANOMALY
+            for signal in signals
+        )
+        has_widening = any(
+            signal.signal_type == SpreadSignalType.WIDENING
+            for signal in signals
+        )
+        has_data_quality_block = any(
+            signal.signal_type
+            in {
+                SpreadSignalType.STALE_DATA,
+                SpreadSignalType.INVALID_DATA,
+            }
+            for signal in signals
         )
 
         return {
-            "has_mean_reversion_signal": mean_reversion_signal is not None,
-            "has_regime_shift_signal": regime_shift_signal is not None,
-            "has_anomaly_signal": anomaly_signal is not None,
-            "has_widening_signal": widening_signal is not None,
-            "has_stale_data_signal": stale_data_signal is not None,
-            "has_invalid_data_signal": invalid_data_signal is not None,
+            "key": key,
+            "has_mean_reversion_signal": has_mean_reversion,
+            "has_regime_shift_signal": has_regime_shift,
+            "has_anomaly_signal": has_anomaly,
+            "has_widening_signal": has_widening,
             "has_data_quality_block": has_data_quality_block,
-            "mean_reversion_signal": mean_reversion_signal,
-            "regime_shift_signal": regime_shift_signal,
-            "anomaly_signal": anomaly_signal,
-            "widening_signal": widening_signal,
-            "stale_data_signal": stale_data_signal,
-            "invalid_data_signal": invalid_data_signal,
-            "signal_count": len(signals),
+            "signals": [
+                self._signal_metadata(signal)
+                for signal in signals
+            ],
         }
+
+    def _prune_stale_signals(self, key: str) -> None:
+        signals = self._latest_signals.get(key)
+        if not signals:
+            return
+
+        fresh = [
+            signal
+            for signal in signals
+            if self._is_signal_fresh(signal.timestamp)
+        ]
+
+        removed = len(signals) - len(fresh)
+        if removed:
+            self._stats["stale_signals_removed"] += removed
+
+        if fresh:
+            self._latest_signals[key] = fresh
+        else:
+            self._latest_signals.pop(key, None)
 
     async def _handle_data_quality_signal(
         self,
@@ -859,120 +959,51 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if state is None or not state.is_active:
             return
 
-        snapshot = self._latest_snapshots.get(key)
-        if snapshot is None:
-            self._set_state_closed(
-                state,
-                status=STATE_CLOSED,
-                reason="data_quality_signal_without_latest_snapshot",
-                metadata={
-                    "signal_type": signal.signal_type.value,
-                    "signal_message": signal.message,
-                    "signal_timestamp": self._safe_isoformat(signal.timestamp),
-                },
-                now=signal.timestamp,
-            )
-            self._stats["stopped_setups"] += 1
+        self._set_state_closed(
+            state,
+            status=STATE_CANCELLED,
+            reason=f"data_quality_signal:{signal.signal_type.value}",
+            metadata={
+                "signal": self._signal_metadata(signal),
+            },
+            now=signal.timestamp,
+        )
+        self._stats["stopped_setups"] += 1
 
-            await self._emit_closed(
-                action=self.ACTION_STOP,
-                symbol=signal.symbol,
-                state_key=state.key,
-                exchange_a=signal.exchange_a,
-                exchange_b=signal.exchange_b,
-                reason="data_quality_signal_without_latest_snapshot",
-                confidence=signal.confidence,
-                spread_type=SpreadType.SPOT_FUTURES.value,
-                timestamp=signal.timestamp,
-                metadata={
-                    "source": "spread_signal",
-                    "signal_type": signal.signal_type.value,
-                    "signal_message": signal.message,
-                    "signal_timestamp": self._safe_isoformat(signal.timestamp),
-                },
-            )
-            return
-
-        await self._stop_from_snapshot(
-            snapshot=snapshot,
-            state=state,
-            reason=f"data_quality_signal_{signal.signal_type.value}",
-            confirmation=self._resolve_confirmation(snapshot),
+        await self._emit_cancelled(
+            action=self.ACTION_STOP,
+            symbol=signal.symbol,
+            state_key=state.key,
+            exchange_a=state.exchange_a,
+            exchange_b=state.exchange_b,
+            reason=f"data_quality_signal:{signal.signal_type.value}",
+            confidence=signal.confidence or state.confidence,
+            spread_type=SpreadType.SPOT_FUTURES.value,
+            timestamp=signal.timestamp,
+            metadata={
+                "state": state.to_payload(),
+                "signal": self._signal_metadata(signal),
+            },
         )
 
     # ------------------------------------------------------------------
-    # Decision helpers
+    # Tradeability / lifecycle decisions
     # ------------------------------------------------------------------
-
-    def _extract_zscore(self, snapshot: SpreadSnapshot) -> Decimal | None:
-        if snapshot.stats is None:
-            return None
-        return snapshot.stats.zscore
-
-    def _resolve_bias(self, snapshot: SpreadSnapshot) -> str | None:
-        zscore = self._extract_zscore(snapshot)
-        if zscore is None:
-            return None
-
-        if zscore >= self._config.entry_zscore:
-            return self.BIAS_SHORT
-
-        if zscore <= -self._config.entry_zscore:
-            return self.BIAS_LONG
-
-        return None
-
-    def _resolve_confidence(
-        self,
-        snapshot: SpreadSnapshot,
-        confirmation: dict[str, Any],
-    ) -> Decimal:
-        base = Decimal("0.50")
-
-        zscore = self._extract_zscore(snapshot)
-        if zscore is not None:
-            abs_zscore = abs(zscore)
-
-            if abs_zscore >= self._config.entry_zscore:
-                base += Decimal("0.10")
-            if abs_zscore >= self._config.reduce_zscore:
-                base += Decimal("0.05")
-            if abs_zscore >= self._config.stop_zscore:
-                base -= Decimal("0.10")
-
-        if snapshot.regime.value in self._config.allowed_regimes:
-            base += Decimal("0.10")
-
-        if confirmation.get("has_mean_reversion_signal"):
-            base += Decimal("0.10")
-
-        if confirmation.get("has_regime_shift_signal"):
-            base += Decimal("0.05")
-
-        if confirmation.get("has_anomaly_signal"):
-            base += Decimal("0.05")
-
-        if confirmation.get("has_widening_signal"):
-            base += Decimal("0.03")
-
-        if confirmation.get("has_data_quality_block"):
-            base -= Decimal("0.25")
-
-        if snapshot.funding_adjusted_spread is not None:
-            base += Decimal("0.05")
-
-        if snapshot.basis is not None:
-            base += Decimal("0.02")
-
-        return min(max(base, DECIMAL_ZERO), Decimal("0.99"))
 
     def _is_tradeable(
         self,
         snapshot: SpreadSnapshot,
         confirmation: dict[str, Any],
     ) -> bool:
-        if confirmation.get("has_data_quality_block"):
+        if self._config.require_valid_quote and snapshot.quote_validity != QuoteValidity.VALID:
+            self._stats["quote_quality_blocks"] += 1
             return False
+
+        if self._config.require_snapshot_edge:
+            has_edge = getattr(snapshot, "has_edge", None)
+            if has_edge is False:
+                self._stats["edge_blocks"] += 1
+                return False
 
         zscore = self._extract_zscore(snapshot)
         if zscore is None:
@@ -997,6 +1028,8 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
 
         has_mean_reversion = bool(confirmation.get("has_mean_reversion_signal"))
         has_regime_shift = bool(confirmation.get("has_regime_shift_signal"))
+        has_anomaly = bool(confirmation.get("has_anomaly_signal"))
+        has_widening = bool(confirmation.get("has_widening_signal"))
 
         if self._config.require_mean_reversion_signal and not has_mean_reversion:
             return False
@@ -1005,6 +1038,15 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             return False
 
         if has_regime_shift and not self._config.allow_regime_shift_entry:
+            return False
+
+        if has_widening and self._config.widening_requires_wait:
+            return False
+
+        if has_anomaly and not self._config.allow_anomaly_entry:
+            return False
+
+        if has_widening and not self._config.allow_widening_entry and not has_mean_reversion:
             return False
 
         if self._resolve_bias(snapshot) is None:
@@ -1064,6 +1106,9 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if state.bias is not None and bias_now is not None and bias_now != state.bias:
             return True
 
+        if self._config.require_valid_quote and snapshot.quote_validity != QuoteValidity.VALID:
+            return True
+
         return False
 
     def _should_stop(
@@ -1086,6 +1131,9 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             if entry_zscore is not None and abs(zscore) > abs(entry_zscore):
                 return True
 
+        if self._config.require_valid_quote and snapshot.quote_validity != QuoteValidity.VALID:
+            return True
+
         return False
 
     def _should_update(
@@ -1103,7 +1151,10 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         if old_confidence is None:
             return True
 
-        confidence_changed = abs(new_confidence - old_confidence) >= Decimal("0.05")
+        confidence_changed = (
+            abs(new_confidence - old_confidence)
+            >= self._config.min_update_confidence_delta
+        )
 
         current_edge = snapshot.funding_adjusted_spread
         previous_edge = state.entry_net_edge
@@ -1111,10 +1162,20 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         edge_changed = (
             current_edge is not None
             and previous_edge is not None
-            and abs(current_edge - previous_edge) >= self._config.min_funding_adjusted_edge
+            and abs(current_edge - previous_edge) >= self._config.min_update_edge_delta
         )
 
-        return confidence_changed or edge_changed
+        current_zscore = self._extract_zscore(snapshot)
+        previous_zscore = state.entry_zscore
+
+        zscore_changed = (
+            current_zscore is not None
+            and previous_zscore is not None
+            and abs(current_zscore - previous_zscore)
+            >= self._config.min_update_zscore_delta
+        )
+
+        return confidence_changed or edge_changed or zscore_changed
 
     # ------------------------------------------------------------------
     # State transitions / emissions
@@ -1171,9 +1232,13 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
 
         self._set_state_closed(
             state,
-            status="rejected",
+            status=STATE_CLOSED,
             reason=reason,
-            metadata=self._build_snapshot_metadata(snapshot, {}, None),
+            metadata=self._build_snapshot_metadata(
+                snapshot,
+                confirmation={},
+                bias=None,
+            ),
             now=snapshot.timestamp,
         )
         self._stats["rejected_setups"] += 1
@@ -1185,10 +1250,51 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             exchange_a=snapshot.leg_a_exchange,
             exchange_b=snapshot.leg_b_exchange,
             reason=reason,
-            confidence=self._resolve_confidence(snapshot, {}),
+            confidence=self._extract_snapshot_confidence(snapshot),
             spread_type=SpreadType.SPOT_FUTURES.value,
             timestamp=snapshot.timestamp,
-            metadata=self._build_snapshot_metadata(snapshot, {}, None),
+            metadata={
+                "state": state.to_payload(),
+                "snapshot": self._build_snapshot_metadata(
+                    snapshot,
+                    confirmation={},
+                    bias=None,
+                ),
+            },
+        )
+
+    async def _stop_from_snapshot(
+        self,
+        *,
+        snapshot: SpreadSnapshot,
+        state: SpreadStrategyState,
+        reason: str,
+        confirmation: dict[str, Any],
+    ) -> None:
+        self._set_state_closed(
+            state,
+            status=STATE_CANCELLED,
+            reason=reason,
+            metadata=self._build_snapshot_metadata(
+                snapshot,
+                confirmation,
+                state.bias,
+            ),
+            now=snapshot.timestamp,
+        )
+        self._stats["stopped_setups"] += 1
+
+        await self._emit_cancelled(
+            action=self.ACTION_STOP,
+            symbol=snapshot.symbol,
+            state_key=state.key,
+            exchange_a=snapshot.leg_a_exchange,
+            exchange_b=snapshot.leg_b_exchange,
+            reason=reason,
+            confidence=self._resolve_confidence(snapshot, confirmation),
+            spread_type=SpreadType.SPOT_FUTURES.value,
+            timestamp=snapshot.timestamp,
+            metadata=self._build_stop_payload(snapshot, state, confirmation),
         )
 
     async def _close_from_snapshot(
@@ -1197,15 +1303,17 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         snapshot: SpreadSnapshot,
         state: SpreadStrategyState,
         reason: str,
-        confirmation: dict[str, Any] | None = None,
+        confirmation: dict[str, Any],
     ) -> None:
-        confirmation = confirmation or self._resolve_confirmation(snapshot)
-
         self._set_state_closed(
             state,
-            status="closed",
+            status=STATE_CLOSED,
             reason=reason,
-            metadata=self._build_snapshot_metadata(snapshot, confirmation, state.bias),
+            metadata=self._build_snapshot_metadata(
+                snapshot,
+                confirmation,
+                state.bias,
+            ),
             now=snapshot.timestamp,
         )
         self._stats["closed_setups"] += 1
@@ -1217,46 +1325,14 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
             exchange_a=snapshot.leg_a_exchange,
             exchange_b=snapshot.leg_b_exchange,
             reason=reason,
-            confidence=state.confidence,
+            confidence=self._resolve_confidence(snapshot, confirmation),
             spread_type=SpreadType.SPOT_FUTURES.value,
             timestamp=snapshot.timestamp,
-            metadata=self._build_close_payload(snapshot, state, reason, confirmation),
-        )
-
-    async def _stop_from_snapshot(
-        self,
-        *,
-        snapshot: SpreadSnapshot,
-        state: SpreadStrategyState,
-        reason: str,
-        confirmation: dict[str, Any] | None = None,
-    ) -> None:
-        confirmation = confirmation or self._resolve_confirmation(snapshot)
-
-        self._set_state_closed(
-            state,
-            status="closed",
-            reason=reason,
-            metadata=self._build_snapshot_metadata(snapshot, confirmation, state.bias),
-            now=snapshot.timestamp,
-        )
-        self._stats["stopped_setups"] += 1
-
-        await self._emit_closed(
-            action=self.ACTION_STOP,
-            symbol=snapshot.symbol,
-            state_key=state.key,
-            exchange_a=snapshot.leg_a_exchange,
-            exchange_b=snapshot.leg_b_exchange,
-            reason=reason,
-            confidence=state.confidence,
-            spread_type=SpreadType.SPOT_FUTURES.value,
-            timestamp=snapshot.timestamp,
-            metadata=self._build_close_payload(snapshot, state, reason, confirmation),
+            metadata=self._build_close_payload(snapshot, state, confirmation),
         )
 
     # ------------------------------------------------------------------
-    # Payload builders
+    # Metadata / payload builders
     # ------------------------------------------------------------------
 
     def _build_snapshot_metadata(
@@ -1268,48 +1344,45 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         zscore = self._extract_zscore(snapshot)
 
         return {
+            "source": "analytics.spreads.spot_futures.updated",
+            "analytics_topic": self.SNAPSHOT_EVENT,
+            "spread_type": snapshot.spread_type.value,
+            "symbol": snapshot.symbol,
+            "timeframe": snapshot.timeframe,
             "spot_exchange": snapshot.leg_a_exchange,
             "futures_exchange": snapshot.leg_b_exchange,
-            "bias": bias,
-            "basis": self._to_decimal_str(snapshot.basis),
-            "spread_bps": self._to_decimal_str(snapshot.spread_bps),
-            "spread_pct": self._to_decimal_str(snapshot.spread_pct),
+            "spot_market_type": snapshot.leg_a_market_type,
+            "futures_market_type": snapshot.leg_b_market_type,
+            "spot_exchange_symbol": snapshot.leg_a_exchange_symbol,
+            "futures_exchange_symbol": snapshot.leg_b_exchange_symbol,
+            "spot_instrument_type": snapshot.leg_a_type.value,
+            "futures_instrument_type": snapshot.leg_b_type.value,
+            "pricing_source": snapshot.pricing_source.value,
             "raw_spread": self._to_decimal_str(snapshot.raw_spread),
+            "spread_pct": self._to_decimal_str(snapshot.spread_pct),
+            "spread_bps": self._to_decimal_str(snapshot.spread_bps),
             "net_spread": self._to_decimal_str(snapshot.net_spread),
+            "basis": self._to_decimal_str(snapshot.basis),
             "funding_adjusted_spread": self._to_decimal_str(
                 snapshot.funding_adjusted_spread
             ),
-            "zscore": self._to_decimal_str(zscore),
-            "regime": snapshot.regime.value,
             "direction": snapshot.direction.value,
-            "pricing_source": snapshot.pricing_source.value,
+            "regime": snapshot.regime.value,
+            "zscore": self._to_decimal_str(zscore),
             "quote_validity": snapshot.quote_validity.value,
-            "leg_a_type": snapshot.leg_a_type.value,
-            "leg_b_type": snapshot.leg_b_type.value,
-            "leg_a_mid": self._to_decimal_str(snapshot.leg_a_mid),
-            "leg_b_mid": self._to_decimal_str(snapshot.leg_b_mid),
+            "has_edge": getattr(snapshot, "has_edge", None),
+            "bias": bias,
             "leg_a_bid": self._to_decimal_str(snapshot.leg_a_bid),
             "leg_a_ask": self._to_decimal_str(snapshot.leg_a_ask),
+            "leg_a_mid": self._to_decimal_str(snapshot.leg_a_mid),
             "leg_b_bid": self._to_decimal_str(snapshot.leg_b_bid),
             "leg_b_ask": self._to_decimal_str(snapshot.leg_b_ask),
-            "snapshot_timestamp": self._safe_isoformat(snapshot.timestamp),
-            "snapshot_metadata": dict(snapshot.metadata),
-            "has_mean_reversion_signal": bool(
-                confirmation.get("has_mean_reversion_signal", False)
-            ),
-            "has_regime_shift_signal": bool(
-                confirmation.get("has_regime_shift_signal", False)
-            ),
-            "has_anomaly_signal": bool(
-                confirmation.get("has_anomaly_signal", False)
-            ),
-            "has_widening_signal": bool(
-                confirmation.get("has_widening_signal", False)
-            ),
-            "has_data_quality_block": bool(
-                confirmation.get("has_data_quality_block", False)
-            ),
-            "confirmation_signal_count": confirmation.get("signal_count", 0),
+            "leg_b_mid": self._to_decimal_str(snapshot.leg_b_mid),
+            "estimated_fees": self._to_decimal_str(snapshot.estimated_fees),
+            "estimated_slippage": self._to_decimal_str(snapshot.estimated_slippage),
+            "timestamp": snapshot.timestamp.isoformat(),
+            "confirmation": self._confirmation_payload(confirmation),
+            "analytics_metadata": dict(snapshot.metadata),
         }
 
     def _build_open_payload(
@@ -1320,13 +1393,22 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         bias: str | None,
     ) -> dict[str, Any]:
         return {
-            **self._build_snapshot_metadata(snapshot, confirmation, bias),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "state_opened_at": self._safe_isoformat(state.opened_at),
-            "entry_zscore": self._to_decimal_str(state.entry_zscore),
-            "entry_spread_bps": self._to_decimal_str(state.entry_value),
-            "entry_net_edge": self._to_decimal_str(state.entry_net_edge),
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(snapshot, confirmation, bias),
+            "entry_policy": {
+                "entry_zscore": str(self._config.entry_zscore),
+                "min_basis_abs": str(self._config.min_basis_abs),
+                "min_funding_adjusted_edge": str(
+                    self._config.min_funding_adjusted_edge
+                ),
+                "require_mean_reversion_signal": (
+                    self._config.require_mean_reversion_signal
+                ),
+                "require_regime_shift_confirmation": (
+                    self._config.require_regime_shift_confirmation
+                ),
+                "allowed_regimes": sorted(self._config.allowed_regimes),
+            },
         }
 
     def _build_reduce_payload(
@@ -1336,12 +1418,16 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         confirmation: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            **self._build_snapshot_metadata(snapshot, confirmation, state.bias),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "entry_zscore": self._to_decimal_str(state.entry_zscore),
-            "current_zscore": self._to_decimal_str(self._extract_zscore(snapshot)),
-            "reduce_reason": "mean_reversion_progress",
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(
+                snapshot,
+                confirmation,
+                state.bias,
+            ),
+            "reduce_policy": {
+                "exit_zscore": str(self._config.exit_zscore),
+                "reduce_zscore": str(self._config.reduce_zscore),
+            },
         }
 
     def _build_update_payload(
@@ -1351,36 +1437,207 @@ class SpotFuturesBasisStrategy(BaseSpreadStrategy):
         confirmation: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            **self._build_snapshot_metadata(snapshot, confirmation, state.bias),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "state_updated_at": self._safe_isoformat(state.updated_at),
-            "state_confidence": self._to_decimal_str(state.confidence),
-            "state_entry_net_edge": self._to_decimal_str(state.entry_net_edge),
-            "current_net_edge": self._to_decimal_str(snapshot.funding_adjusted_spread),
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(
+                snapshot,
+                confirmation,
+                state.bias,
+            ),
+            "update_policy": {
+                "min_update_confidence_delta": str(
+                    self._config.min_update_confidence_delta
+                ),
+                "min_update_edge_delta": str(self._config.min_update_edge_delta),
+                "min_update_zscore_delta": str(self._config.min_update_zscore_delta),
+            },
+        }
+
+    def _build_stop_payload(
+        self,
+        snapshot: SpreadSnapshot,
+        state: SpreadStrategyState,
+        confirmation: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(
+                snapshot,
+                confirmation,
+                state.bias,
+            ),
+            "stop_policy": {
+                "stop_zscore": str(self._config.stop_zscore),
+                "close_on_data_quality_signal": self._config.close_on_data_quality_signal,
+                "require_valid_quote": self._config.require_valid_quote,
+            },
         }
 
     def _build_close_payload(
         self,
         snapshot: SpreadSnapshot,
         state: SpreadStrategyState,
-        reason: str,
-        confirmation: dict[str, Any] | None = None,
+        confirmation: dict[str, Any],
     ) -> dict[str, Any]:
-        confirmation = confirmation or {}
-
         return {
-            **self._build_snapshot_metadata(snapshot, confirmation, state.bias),
-            "state_status_before_close": state.status,
-            "state_bias": state.bias,
-            "state_opened_at": self._safe_isoformat(state.opened_at),
-            "state_updated_at": self._safe_isoformat(state.updated_at),
-            "state_closed_at": self._safe_isoformat(state.closed_at),
-            "close_reason": reason,
-            "entry_zscore": self._to_decimal_str(state.entry_zscore),
-            "current_zscore": self._to_decimal_str(self._extract_zscore(snapshot)),
-            "entry_spread_bps": self._to_decimal_str(state.entry_value),
-            "current_spread_bps": self._to_decimal_str(snapshot.spread_bps),
-            "entry_net_edge": self._to_decimal_str(state.entry_net_edge),
-            "current_net_edge": self._to_decimal_str(snapshot.funding_adjusted_spread),
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(
+                snapshot,
+                confirmation,
+                state.bias,
+            ),
+            "exit_policy": {
+                "exit_zscore": str(self._config.exit_zscore),
+                "normal_or_compressed_regime_closes": True,
+            },
         }
+
+    def _signal_metadata(self, signal: SpreadSignal) -> dict[str, Any]:
+        return {
+            "signal_type": signal.signal_type.value,
+            "spread_type": signal.spread_type.value,
+            "symbol": signal.symbol,
+            "exchange_a": signal.exchange_a,
+            "exchange_b": signal.exchange_b,
+            "market_type_a": signal.market_type_a,
+            "market_type_b": signal.market_type_b,
+            "timeframe": signal.timeframe,
+            "exchange_symbol_a": signal.exchange_symbol_a,
+            "exchange_symbol_b": signal.exchange_symbol_b,
+            "value": self._to_decimal_str(signal.value),
+            "threshold": self._to_decimal_str(signal.threshold),
+            "confidence": self._to_decimal_str(signal.confidence),
+            "message": signal.message,
+            "timestamp": signal.timestamp.isoformat(),
+            "metadata": dict(signal.metadata),
+        }
+
+    def _confirmation_payload(self, confirmation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "has_mean_reversion_signal": bool(
+                confirmation.get("has_mean_reversion_signal")
+            ),
+            "has_regime_shift_signal": bool(
+                confirmation.get("has_regime_shift_signal")
+            ),
+            "has_anomaly_signal": bool(confirmation.get("has_anomaly_signal")),
+            "has_widening_signal": bool(confirmation.get("has_widening_signal")),
+            "has_data_quality_block": bool(
+                confirmation.get("has_data_quality_block")
+            ),
+            "signals": list(confirmation.get("signals", [])),
+        }
+
+    # ------------------------------------------------------------------
+    # Extractors / resolvers
+    # ------------------------------------------------------------------
+
+    def _extract_zscore(self, snapshot: SpreadSnapshot) -> Decimal | None:
+        if snapshot.stats is not None and snapshot.stats.zscore is not None:
+            return snapshot.stats.zscore
+
+        metadata_value = self._metadata_str(
+            snapshot.metadata,
+            "zscore",
+            "current_zscore",
+        )
+        return _to_decimal(metadata_value)
+
+    def _extract_snapshot_confidence(self, snapshot: SpreadSnapshot) -> Decimal | None:
+        metadata_value = self._metadata_str(
+            snapshot.metadata,
+            "confidence",
+            "snapshot_confidence",
+        )
+        return _to_decimal(metadata_value)
+
+    def _resolve_confidence(
+        self,
+        snapshot: SpreadSnapshot,
+        confirmation: dict[str, Any],
+    ) -> Decimal:
+        metadata_confidence = self._extract_snapshot_confidence(snapshot)
+        if metadata_confidence is not None:
+            confidence = metadata_confidence
+        else:
+            confidence = Decimal("0.50")
+
+        zscore = self._extract_zscore(snapshot)
+        if zscore is not None:
+            # 0.50 base + up to 0.35 from zscore strength.
+            zscore_component = min(abs(zscore) / self._config.stop_zscore, DECIMAL_ONE)
+            confidence += zscore_component * Decimal("0.35")
+
+        if snapshot.regime == SpreadRegime.EXTREME:
+            confidence += Decimal("0.05")
+        elif snapshot.regime == SpreadRegime.DISLOCATED:
+            confidence += Decimal("0.03")
+        elif snapshot.regime == SpreadRegime.ELEVATED:
+            confidence += Decimal("0.02")
+
+        if confirmation.get("has_mean_reversion_signal"):
+            confidence += Decimal("0.05")
+
+        if confirmation.get("has_regime_shift_signal"):
+            confidence += Decimal("0.03")
+
+        if confirmation.get("has_anomaly_signal"):
+            confidence += Decimal("0.03")
+
+        if confirmation.get("has_widening_signal") and self._config.widening_requires_wait:
+            confidence -= Decimal("0.05")
+
+        if confirmation.get("has_data_quality_block"):
+            confidence -= Decimal("0.25")
+
+        if snapshot.quote_validity != QuoteValidity.VALID:
+            confidence -= Decimal("0.25")
+
+        if confidence < DECIMAL_ZERO:
+            return DECIMAL_ZERO
+
+        if confidence > DECIMAL_ONE:
+            return DECIMAL_ONE
+
+        return confidence
+
+    def _resolve_bias(self, snapshot: SpreadSnapshot) -> str | None:
+        edge = snapshot.funding_adjusted_spread
+        if edge is None:
+            edge = snapshot.basis
+
+        if edge is None:
+            return None
+
+        if edge > DECIMAL_ZERO:
+            return self.BIAS_SHORT
+
+        if edge < DECIMAL_ZERO:
+            return self.BIAS_LONG
+
+        if snapshot.direction == SpreadDirection.WIDENING:
+            return self.BIAS_SHORT
+
+        if snapshot.direction == SpreadDirection.COMPRESSING:
+            return self.BIAS_LONG
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+
+    def _metadata_str(
+        self,
+        metadata: dict[str, Any] | None,
+        *keys: str,
+    ) -> str | None:
+        if not metadata:
+            return None
+
+        for key in keys:
+            if key in metadata and metadata.get(key) is not None:
+                value = str(metadata.get(key)).strip()
+                if value:
+                    return value
+
+        return None

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from analytics.spreads.config import (
@@ -15,10 +15,27 @@ from analytics.spreads.config import (
     DEFAULT_SPOT_FUTURES_SNAPSHOT_TOPIC,
     DEFAULT_SPREAD_SIGNAL_TOPIC,
 )
+from analytics.spreads.enums import (
+    OpportunityStatus,
+    QuoteValidity,
+    SpreadDirection,
+    SpreadRegime,
+    SpreadSignalType,
+    SpreadType,
+    parse_instrument_type,
+    parse_pricing_source,
+    parse_spread_type,
+)
+from analytics.spreads.models import (
+    DEFAULT_TIMEFRAME,
+    ArbitrageOpportunity,
+    RollingStats,
+    SpreadSignal,
+    SpreadSnapshot,
+)
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
-
 
 PayloadHandler = Callable[[Any], None | Awaitable[None]]
 EventHandler = Callable[[Event], None | Awaitable[None]]
@@ -67,7 +84,7 @@ CLOSED_STATES = frozenset({STATE_CLOSED, STATE_CANCELLED, STATE_REJECTED})
 
 
 # ============================================================
-# Validation helpers
+# Validation / normalization helpers
 # ============================================================
 
 DECIMAL_ZERO = Decimal("0")
@@ -76,11 +93,6 @@ DECIMAL_ZERO = Decimal("0")
 def _validate_non_negative_int(name: str, value: int) -> None:
     if value < 0:
         raise ValueError(f"{name} must be >= 0")
-
-
-def _validate_positive_float(name: str, value: float) -> None:
-    if value <= 0:
-        raise ValueError(f"{name} must be > 0")
 
 
 def _validate_non_negative_decimal(name: str, value: Decimal) -> None:
@@ -124,6 +136,102 @@ def _metadata_copy(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     if metadata is None:
         return {}
     return dict(metadata)
+
+
+def _to_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
+    if value is None:
+        return default
+
+    if isinstance(value, Decimal):
+        return value
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _datetime_from_payload(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return datetime.utcfromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        try:
+            timestamp = float(raw)
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000
+            return datetime.utcfromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            pass
+
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    return None
+
+
+def _first_present(payload: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload and payload.get(key) is not None:
+            return payload.get(key)
+    return None
+
+
+def _nested_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
+    value = payload.get(key)
+    return value if isinstance(value, Mapping) else None
+
+
+def _scope_value(
+    payload: Mapping[str, Any],
+    scope_key: str,
+    field_name: str,
+    *fallback_keys: str,
+) -> Any:
+    scope = _nested_mapping(payload, scope_key)
+    if scope is not None and scope.get(field_name) is not None:
+        return scope.get(field_name)
+
+    return _first_present(payload, *fallback_keys)
+
+
+def _enum_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    return str(raw)
+
+
+def _safe_str_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    return raw or None
 
 
 # ============================================================
@@ -173,6 +281,7 @@ class BaseSpreadStrategyConfig:
     def __post_init__(self) -> None:
         self.allowed_symbols = _normalize_symbol_set(self.allowed_symbols)
         self.allowed_exchanges = _normalize_exchange_set(self.allowed_exchanges)
+        self.min_confidence = _to_decimal(self.min_confidence, DECIMAL_ZERO) or DECIMAL_ZERO
         self.metadata = _metadata_copy(self.metadata)
         self.validate()
 
@@ -241,6 +350,10 @@ class SpreadStrategyState:
         self.symbol = _normalize_symbol_value(self.symbol)
         self.exchange_a = _normalize_exchange_value(self.exchange_a)
         self.exchange_b = _normalize_exchange_value(self.exchange_b)
+        self.entry_value = _to_decimal(self.entry_value)
+        self.entry_zscore = _to_decimal(self.entry_zscore)
+        self.entry_net_edge = _to_decimal(self.entry_net_edge)
+        self.confidence = _to_decimal(self.confidence)
         self.metadata = _metadata_copy(self.metadata)
 
         if not self.key:
@@ -305,6 +418,7 @@ class BaseSpreadStrategy(ABC):
     - constructor dependency injection через core.EventBus / core.Scheduler / config;
     - async lifecycle: register / unregister / start / stop;
     - EventBus subscribe wrappers для Event і payload handlers;
+    - normalizing bridge для analytics.spreads dict/model payload;
     - EventBus.emit() helpers для strategy-level signal intents;
     - Scheduler cleanup job для closed states;
     - centralized logger через core.logger.get_logger;
@@ -408,18 +522,12 @@ class BaseSpreadStrategy(ABC):
         """
         Дочірня strategy сама визначає, які analytics.spreads.* події слухати.
 
-        Приклади:
-            await self._subscribe_payload(
-                SPOT_FUTURES_SNAPSHOT_EVENT,
-                self.on_spot_futures_snapshot,
-                name="on_spot_futures_snapshot",
-            )
+        `_subscribe_payload()` автоматично нормалізує:
+        - spot_futures/cross_exchange snapshot topic -> SpreadSnapshot;
+        - spread signal topic -> SpreadSignal;
+        - arbitrage opportunity topic -> ArbitrageOpportunity.
 
-            await self._subscribe_payload(
-                ARBITRAGE_OPPORTUNITY_EVENT,
-                self.on_arbitrage_opportunity,
-                name="on_arbitrage_opportunity",
-            )
+        Тому дочірні handlers можуть лишатися типізованими під analytics-моделі.
         """
         raise NotImplementedError
 
@@ -490,7 +598,6 @@ class BaseSpreadStrategy(ABC):
 
         self._subscriptions.clear()
         self._disable_cleanup_job()
-
         self._registered = False
 
         self._logger.info(
@@ -501,12 +608,6 @@ class BaseSpreadStrategy(ABC):
     async def start(self) -> None:
         """
         Запускає strategy.
-
-        start():
-        - не створює власних loops;
-        - гарантує register(), якщо strategy ще не зареєстрована;
-        - не містить trading/execution logic;
-        - lifecycle event публікується best-effort.
         """
         if self._running:
             self._logger.warning(
@@ -540,15 +641,9 @@ class BaseSpreadStrategy(ABC):
         """
         Зупиняє strategy.
 
-        За замовчуванням:
-        - strategy перестає обробляти handlers через is_running guard у дочірніх класах;
-        - subscriptions лишаються, щоб повторний start() був дешевим;
-        - cleanup job може залишатися зареєстрованим.
-
         Якщо unregister=True:
         - EventBus subscriptions знімаються;
-        - cleanup job disable-иться;
-        - strategy треба буде register() перед повторним start().
+        - cleanup job disable-иться.
         """
         if not self._running and not unregister:
             self._logger.debug(
@@ -669,17 +764,24 @@ class BaseSpreadStrategy(ABC):
         """
         Підписує payload-handler на EventBus topic.
 
-        core.EventBus передає handler-у Event, тому wrapper передає в
-        бізнес-handler тільки event.payload.
+        Важливо:
+        analytics.spreads може публікувати як dataclass-модель, так і dict payload.
+        Цей wrapper нормалізує dict payload назад у canonical analytics model.
         """
         if not event_name or not event_name.strip():
             raise ValueError("event_name must not be empty")
 
+        event_name = event_name.strip()
         handler_name = name or getattr(handler, "__name__", "payload_handler")
 
         async def _event_wrapper(event: Event) -> None:
             try:
-                result = handler(event.payload)
+                payload = self._normalize_analytics_payload(
+                    topic=event_name,
+                    payload=event.payload,
+                    event=event,
+                )
+                result = handler(payload)
                 if inspect.isawaitable(result):
                     await result
             except Exception as exc:
@@ -690,6 +792,7 @@ class BaseSpreadStrategy(ABC):
                     event_id=getattr(event, "event_id", None),
                     correlation_id=getattr(event, "correlation_id", None),
                     handler=handler_name,
+                    payload_type=type(getattr(event, "payload", None)).__name__,
                 )
 
         subscription = self._event_bus.subscribe(
@@ -721,6 +824,7 @@ class BaseSpreadStrategy(ABC):
         if not event_name or not event_name.strip():
             raise ValueError("event_name must not be empty")
 
+        event_name = event_name.strip()
         handler_name = name or getattr(handler, "__name__", "event_handler")
 
         async def _event_wrapper(event: Event) -> None:
@@ -760,10 +864,7 @@ class BaseSpreadStrategy(ABC):
         handler: PayloadHandler,
     ) -> Subscription:
         """
-        Backward-compatible alias для старих дочірніх класів.
-
-        Новий код краще пише явно:
-            await self._subscribe_payload(...)
+        Backward-compatible alias.
         """
         return await self._subscribe_payload(event_name, handler)
 
@@ -778,9 +879,6 @@ class BaseSpreadStrategy(ABC):
     ) -> bool:
         """
         Єдиний helper для EventBus.emit().
-
-        Не використовує EventBus.publish(topic, payload), бо core.publish()
-        у твоїй архітектурі працює з готовим Event object.
         """
         if not event_name or not event_name.strip():
             raise ValueError("event_name must not be empty")
@@ -845,6 +943,259 @@ class BaseSpreadStrategy(ABC):
             )
 
     # ------------------------------------------------------------------
+    # Analytics payload normalization bridge
+    # ------------------------------------------------------------------
+
+    def _normalize_analytics_payload(
+        self,
+        *,
+        topic: str,
+        payload: Any,
+        event: Event | None = None,
+    ) -> Any:
+        """
+        Нормалізує EventBus payload із analytics.spreads.
+
+        Чому це потрібно:
+        - analyzer-и можуть емiтити dataclass-модель;
+        - BaseSpreadAnalyzer перед EventBus часто конвертує модель у dict через to_payload();
+        - strategy handlers мають працювати стабільно в обох випадках.
+        """
+        try:
+            if topic == SPOT_FUTURES_SNAPSHOT_EVENT:
+                return self._normalize_spread_snapshot_payload(payload)
+
+            if topic == CROSS_EXCHANGE_SNAPSHOT_EVENT:
+                return self._normalize_spread_snapshot_payload(payload)
+
+            if topic == SPREAD_SIGNAL_EVENT:
+                return self._normalize_spread_signal_payload(payload)
+
+            if topic == ARBITRAGE_OPPORTUNITY_EVENT:
+                return self._normalize_arbitrage_opportunity_payload(payload)
+
+            return payload
+
+        except Exception as exc:
+            self._stats["payload_normalization_failures"] += 1
+            self._mark_exception(
+                "Failed to normalize analytics.spreads payload",
+                exc,
+                topic=topic,
+                event_id=getattr(event, "event_id", None),
+                correlation_id=getattr(event, "correlation_id", None),
+                payload_type=type(payload).__name__,
+            )
+            return payload
+
+    def _normalize_spread_snapshot_payload(self, payload: Any) -> SpreadSnapshot:
+        if isinstance(payload, SpreadSnapshot):
+            return payload
+
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"SpreadSnapshot payload must be Mapping, got {type(payload)!r}")
+
+        stats_payload = payload.get("stats")
+        stats = self._normalize_rolling_stats_payload(stats_payload)
+
+        metadata = _metadata_copy(payload.get("metadata"))
+
+        return SpreadSnapshot(
+            spread_type=parse_spread_type(payload.get("spread_type")),
+            symbol=str(payload["symbol"]),
+            timeframe=str(payload.get("timeframe") or DEFAULT_TIMEFRAME),
+            leg_a_exchange=str(
+                _scope_value(payload, "leg_a_scope", "exchange", "leg_a_exchange", "exchange_a")
+            ),
+            leg_b_exchange=str(
+                _scope_value(payload, "leg_b_scope", "exchange", "leg_b_exchange", "exchange_b")
+            ),
+            leg_a_type=parse_instrument_type(
+                _first_present(payload, "leg_a_type", "instrument_type_a", "instrument_type")
+            ),
+            leg_b_type=parse_instrument_type(
+                _first_present(payload, "leg_b_type", "instrument_type_b", "instrument_type")
+            ),
+            leg_a_market_type=_safe_str_or_none(
+                _scope_value(
+                    payload,
+                    "leg_a_scope",
+                    "market_type",
+                    "leg_a_market_type",
+                    "market_type_a",
+                    "market_type",
+                )
+            ),
+            leg_b_market_type=_safe_str_or_none(
+                _scope_value(
+                    payload,
+                    "leg_b_scope",
+                    "market_type",
+                    "leg_b_market_type",
+                    "market_type_b",
+                    "market_type",
+                )
+            ),
+            leg_a_exchange_symbol=_safe_str_or_none(
+                _first_present(payload, "leg_a_exchange_symbol", "exchange_symbol_a")
+            ),
+            leg_b_exchange_symbol=_safe_str_or_none(
+                _first_present(payload, "leg_b_exchange_symbol", "exchange_symbol_b")
+            ),
+            pricing_source=parse_pricing_source(payload.get("pricing_source")),
+            raw_spread=_to_decimal(payload.get("raw_spread")),
+            spread_pct=_to_decimal(payload.get("spread_pct")),
+            spread_bps=_to_decimal(payload.get("spread_bps")),
+            net_spread=_to_decimal(payload.get("net_spread")),
+            basis=_to_decimal(payload.get("basis")),
+            funding_adjusted_spread=_to_decimal(payload.get("funding_adjusted_spread")),
+            direction=SpreadDirection.from_value(
+                payload.get("direction"),
+                default=SpreadDirection.FLAT,
+            ),
+            regime=SpreadRegime.from_value(
+                payload.get("regime"),
+                default=SpreadRegime.NORMAL,
+            ),
+            stats=stats,
+            leg_a_bid=_to_decimal(payload.get("leg_a_bid")),
+            leg_a_ask=_to_decimal(payload.get("leg_a_ask")),
+            leg_b_bid=_to_decimal(payload.get("leg_b_bid")),
+            leg_b_ask=_to_decimal(payload.get("leg_b_ask")),
+            leg_a_mid=_to_decimal(payload.get("leg_a_mid")),
+            leg_b_mid=_to_decimal(payload.get("leg_b_mid")),
+            estimated_fees=_to_decimal(payload.get("estimated_fees")),
+            estimated_slippage=_to_decimal(payload.get("estimated_slippage")),
+            quote_validity=QuoteValidity.from_value(
+                payload.get("quote_validity"),
+                default=QuoteValidity.VALID,
+            ),
+            timestamp=_datetime_from_payload(payload.get("timestamp")) or self._utcnow(),
+            metadata=metadata,
+        )
+
+    def _normalize_spread_signal_payload(self, payload: Any) -> SpreadSignal:
+        if isinstance(payload, SpreadSignal):
+            return payload
+
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"SpreadSignal payload must be Mapping, got {type(payload)!r}")
+
+        metadata = _metadata_copy(payload.get("metadata"))
+
+        return SpreadSignal(
+            signal_type=SpreadSignalType.from_value(payload.get("signal_type"), strict=True),
+            spread_type=parse_spread_type(payload.get("spread_type")),
+            symbol=str(payload["symbol"]),
+            message=str(payload.get("message") or payload.get("reason") or "Spread signal"),
+            value=_to_decimal(payload.get("value")),
+            threshold=_to_decimal(payload.get("threshold")),
+            confidence=_to_decimal(payload.get("confidence")),
+            exchange_a=_safe_str_or_none(payload.get("exchange_a")),
+            exchange_b=_safe_str_or_none(payload.get("exchange_b")),
+            market_type_a=_safe_str_or_none(
+                _scope_value(payload, "leg_a_scope", "market_type", "market_type_a")
+            ),
+            market_type_b=_safe_str_or_none(
+                _scope_value(payload, "leg_b_scope", "market_type", "market_type_b")
+            ),
+            timeframe=str(payload.get("timeframe") or DEFAULT_TIMEFRAME),
+            exchange_symbol_a=_safe_str_or_none(payload.get("exchange_symbol_a")),
+            exchange_symbol_b=_safe_str_or_none(payload.get("exchange_symbol_b")),
+            timestamp=_datetime_from_payload(payload.get("timestamp")) or self._utcnow(),
+            metadata=metadata,
+        )
+
+    def _normalize_arbitrage_opportunity_payload(self, payload: Any) -> ArbitrageOpportunity:
+        if isinstance(payload, ArbitrageOpportunity):
+            return payload
+
+        if isinstance(payload, Mapping) and isinstance(payload.get("opportunity"), Mapping):
+            payload = payload["opportunity"]
+
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                f"ArbitrageOpportunity payload must be Mapping, got {type(payload)!r}"
+            )
+
+        metadata = _metadata_copy(payload.get("metadata"))
+
+        buy_scope = _nested_mapping(payload, "buy_scope")
+        sell_scope = _nested_mapping(payload, "sell_scope")
+
+        buy_market_type = _safe_str_or_none(
+            _first_present(payload, "buy_market_type")
+            or (buy_scope.get("market_type") if buy_scope else None)
+        )
+        sell_market_type = _safe_str_or_none(
+            _first_present(payload, "sell_market_type")
+            or (sell_scope.get("market_type") if sell_scope else None)
+        )
+
+        timeframe = str(
+            payload.get("timeframe")
+            or (buy_scope.get("timeframe") if buy_scope else None)
+            or (sell_scope.get("timeframe") if sell_scope else None)
+            or DEFAULT_TIMEFRAME
+        )
+
+        return ArbitrageOpportunity(
+            symbol=str(payload["symbol"]),
+            buy_exchange=str(payload["buy_exchange"]),
+            sell_exchange=str(payload["sell_exchange"]),
+            buy_instrument_type=parse_instrument_type(payload.get("buy_instrument_type")),
+            sell_instrument_type=parse_instrument_type(payload.get("sell_instrument_type")),
+            buy_price=_to_decimal(payload.get("buy_price"), DECIMAL_ZERO) or DECIMAL_ZERO,
+            sell_price=_to_decimal(payload.get("sell_price"), DECIMAL_ZERO) or DECIMAL_ZERO,
+            gross_edge=_to_decimal(payload.get("gross_edge"), DECIMAL_ZERO) or DECIMAL_ZERO,
+            estimated_fees=(
+                _to_decimal(payload.get("estimated_fees"), DECIMAL_ZERO) or DECIMAL_ZERO
+            ),
+            estimated_slippage=(
+                _to_decimal(payload.get("estimated_slippage"), DECIMAL_ZERO)
+                or DECIMAL_ZERO
+            ),
+            net_edge=_to_decimal(payload.get("net_edge"), DECIMAL_ZERO) or DECIMAL_ZERO,
+            spread_pct=_to_decimal(payload.get("spread_pct")),
+            spread_bps=_to_decimal(payload.get("spread_bps")),
+            confidence=_to_decimal(payload.get("confidence")),
+            status=OpportunityStatus.from_value(
+                payload.get("status"),
+                default=OpportunityStatus.ACTIVE,
+            ),
+            timestamp=_datetime_from_payload(payload.get("timestamp")) or self._utcnow(),
+            expires_at=_datetime_from_payload(payload.get("expires_at")),
+            buy_market_type=buy_market_type,
+            sell_market_type=sell_market_type,
+            timeframe=timeframe,
+            buy_exchange_symbol=_safe_str_or_none(payload.get("buy_exchange_symbol")),
+            sell_exchange_symbol=_safe_str_or_none(payload.get("sell_exchange_symbol")),
+            metadata=metadata,
+        )
+
+    def _normalize_rolling_stats_payload(self, payload: Any) -> RollingStats | None:
+        if payload is None:
+            return None
+
+        if isinstance(payload, RollingStats):
+            return payload
+
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"RollingStats payload must be Mapping, got {type(payload)!r}")
+
+        return RollingStats(
+            count=_to_int(payload.get("count"), default=0),
+            mean=_to_decimal(payload.get("mean")),
+            std=_to_decimal(payload.get("std")),
+            min_value=_to_decimal(payload.get("min_value")),
+            max_value=_to_decimal(payload.get("max_value")),
+            ema=_to_decimal(payload.get("ema")),
+            last_value=_to_decimal(payload.get("last_value")),
+            zscore=_to_decimal(payload.get("zscore")),
+            percentile_rank=_to_decimal(payload.get("percentile_rank")),
+        )
+
+    # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
 
@@ -859,6 +1210,81 @@ class BaseSpreadStrategy(ABC):
             cleaned.append(value if value else "na")
 
         return "|".join(cleaned)
+
+    def _build_scoped_state_key(
+        self,
+        *,
+        spread_type: SpreadType | str | None,
+        symbol: str,
+        exchange_a: str | None,
+        exchange_b: str | None,
+        market_type_a: str | None = None,
+        market_type_b: str | None = None,
+        timeframe: str | None = None,
+        suffix: str | None = None,
+    ) -> str:
+        """
+        Новий preferred key format для узгодження з analytics scope:
+        spread_type | symbol | exchange_a | market_type_a | exchange_b | market_type_b | timeframe | suffix
+
+        Старий _build_state_key лишається для backward compatibility.
+        """
+        return self._build_state_key(
+            _enum_value(spread_type) or "spread",
+            self._normalize_symbol(symbol),
+            self._normalize_exchange(exchange_a),
+            market_type_a or "na",
+            self._normalize_exchange(exchange_b),
+            market_type_b or "na",
+            timeframe or DEFAULT_TIMEFRAME,
+            suffix,
+        )
+
+    def _build_snapshot_state_key(self, snapshot: SpreadSnapshot, *, suffix: str | None = None) -> str:
+        return self._build_scoped_state_key(
+            spread_type=snapshot.spread_type,
+            symbol=snapshot.symbol,
+            exchange_a=snapshot.leg_a_exchange,
+            exchange_b=snapshot.leg_b_exchange,
+            market_type_a=snapshot.leg_a_market_type,
+            market_type_b=snapshot.leg_b_market_type,
+            timeframe=snapshot.timeframe,
+            suffix=suffix,
+        )
+
+    def _build_signal_state_key(self, signal: SpreadSignal, *, suffix: str | None = None) -> str:
+        return self._build_scoped_state_key(
+            spread_type=signal.spread_type,
+            symbol=signal.symbol,
+            exchange_a=signal.exchange_a,
+            exchange_b=signal.exchange_b,
+            market_type_a=signal.market_type_a,
+            market_type_b=signal.market_type_b,
+            timeframe=signal.timeframe,
+            suffix=suffix,
+        )
+
+    def _build_opportunity_state_key(
+        self,
+        opportunity: ArbitrageOpportunity,
+        *,
+        use_opportunity_key: bool = False,
+    ) -> str:
+        if use_opportunity_key:
+            opportunity_key = getattr(opportunity, "opportunity_key", None)
+            if opportunity_key:
+                return str(opportunity_key)
+
+        return self._build_scoped_state_key(
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=opportunity.symbol,
+            exchange_a=opportunity.buy_exchange,
+            exchange_b=opportunity.sell_exchange,
+            market_type_a=getattr(opportunity, "buy_market_type", None),
+            market_type_b=getattr(opportunity, "sell_market_type", None),
+            timeframe=getattr(opportunity, "timeframe", DEFAULT_TIMEFRAME),
+            suffix=opportunity.buy_instrument_type.value,
+        )
 
     def _get_state(self, key: str) -> SpreadStrategyState | None:
         return self._states.get(key)
@@ -1411,162 +1837,95 @@ class BaseSpreadStrategy(ABC):
 
         return len(keys_to_delete)
 
+    def get_base_stats(self) -> dict[str, Any]:
+        return {
+            **self._stats.copy(),
+            "strategy": self.STRATEGY_NAME,
+            "running": self._running,
+            "registered": self._registered,
+            "subscriptions": len(self._subscriptions),
+            "cleanup_job_id": self._cleanup_job_id,
+            "states_total": len(self._states),
+            "states_active": len(self.active_states),
+            "states_closed": len(self.closed_states),
+        }
+
     def _build_base_stats(self) -> dict[str, int]:
         return {
             "events_received": 0,
             "events_rejected": 0,
             "events_failed": 0,
+            "exceptions": 0,
+            "payload_normalization_failures": 0,
+            "state_created": 0,
+            "state_updated": 0,
+            "state_closed": 0,
             "signals_generated": 0,
             "signals_updated": 0,
             "signals_rejected": 0,
             "signals_cancelled": 0,
             "signals_closed": 0,
             "cooldown_skips": 0,
+            "duplicate_skips": 0,
             "disabled_skips": 0,
-            "confidence_skips": 0,
-            "freshness_skips": 0,
             "symbol_skips": 0,
             "exchange_skips": 0,
-            "duplicate_skips": 0,
-            "state_created": 0,
-            "state_updated": 0,
-            "state_closed": 0,
+            "confidence_skips": 0,
+            "freshness_skips": 0,
             "cleanup_runs": 0,
             "cleanup_removed_states": 0,
-            "exceptions": 0,
         }
 
     def _build_start_log_extra(self) -> dict[str, Any]:
         return {
-            "strategy": self.STRATEGY_NAME,
             "enabled": self._config.enabled,
             "cooldown_seconds": self._config.cooldown_seconds,
-            "min_confidence": str(self._config.min_confidence),
+            "min_confidence": self._to_decimal_str(self._config.min_confidence),
             "max_snapshot_age_ms": self._config.max_snapshot_age_ms,
             "max_signal_age_ms": self._config.max_signal_age_ms,
-            "allowed_symbols_count": len(self._config.allowed_symbols),
-            "allowed_exchanges_count": len(self._config.allowed_exchanges),
-            "cleanup_closed_states_interval_seconds": (
-                self._config.cleanup_closed_states_interval_seconds
-            ),
-            "cleanup_closed_states_older_than_seconds": (
-                self._config.cleanup_closed_states_older_than_seconds
-            ),
+            "allowed_symbols": sorted(self._config.allowed_symbols),
+            "allowed_exchanges": sorted(self._config.allowed_exchanges),
             "subscriptions": len(self._subscriptions),
             "cleanup_job_id": self._cleanup_job_id,
+            "analytics_input_topics": [
+                SPOT_FUTURES_SNAPSHOT_EVENT,
+                CROSS_EXCHANGE_SNAPSHOT_EVENT,
+                SPREAD_SIGNAL_EVENT,
+                ARBITRAGE_OPPORTUNITY_EVENT,
+            ],
+            "scope": "spread_type:symbol:exchange_a:market_type_a:exchange_b:market_type_b:timeframe",
         }
 
     def _build_stop_log_extra(self) -> dict[str, Any]:
         return {
-            "strategy": self.STRATEGY_NAME,
             "stats": self._stats.copy(),
-            "active_states": len(self.active_states),
-            "closed_states": len(self.closed_states),
-            "total_states": len(self._states),
-            "registered": self._registered,
             "subscriptions": len(self._subscriptions),
             "cleanup_job_id": self._cleanup_job_id,
-        }
-
-    def get_base_stats(self) -> dict[str, Any]:
-        return {
-            **self._stats,
-            "running": self._running,
-            "registered": self._registered,
-            "enabled": self._config.enabled,
-            "strategy": self.STRATEGY_NAME,
             "states_total": len(self._states),
-            "states_active": len(self.active_states),
-            "states_closed": len(self.closed_states),
-            "subscriptions": len(self._subscriptions),
-            "cleanup_job_id": self._cleanup_job_id,
         }
-
-    async def _maybe_await(self, value: Any) -> Any:
-        if inspect.isawaitable(value):
-            return await value
-        return value
-
-    async def _run_safely(
-        self,
-        operation_name: str,
-        coro: Awaitable[Any],
-        **context: Any,
-    ) -> Any:
-        try:
-            return await coro
-        except Exception as exc:
-            self._mark_exception(
-                f"Strategy operation failed: {operation_name}",
-                exc,
-                **context,
-            )
-            return None
 
     def _mark_exception(
         self,
         message: str,
         exc: Exception,
-        **context: Any,
+        **extra: Any,
     ) -> None:
         self._stats["exceptions"] += 1
         self._logger.exception(
             message,
             extra={
-                "strategy": self.STRATEGY_NAME,
-                **context,
                 "error": str(exc),
+                "strategy": self.STRATEGY_NAME,
+                **extra,
             },
         )
 
     async def _safe_cleanup_after_failed_register(self) -> None:
-        for subscription in list(self._subscriptions):
-            try:
-                self._event_bus.unsubscribe(subscription)
-            except Exception:
-                self._logger.exception(
-                    "Failed to cleanup subscription after register failure | strategy=%s",
-                    self.STRATEGY_NAME,
-                )
-
-        self._subscriptions.clear()
-        self._disable_cleanup_job()
-        self._registered = False
-
-
-__all__ = [
-    # Input analytics.spreads events
-    "SPOT_FUTURES_SNAPSHOT_EVENT",
-    "CROSS_EXCHANGE_SNAPSHOT_EVENT",
-    "SPREAD_SIGNAL_EVENT",
-    "ARBITRAGE_OPPORTUNITY_EVENT",
-
-    # Output strategy events
-    "STRATEGY_SIGNAL_GENERATED_EVENT",
-    "STRATEGY_SIGNAL_UPDATED_EVENT",
-    "STRATEGY_SIGNAL_REJECTED_EVENT",
-    "STRATEGY_SIGNAL_CANCELLED_EVENT",
-    "STRATEGY_SIGNAL_CLOSED_EVENT",
-    "STRATEGY_STARTED_EVENT",
-    "STRATEGY_STOPPED_EVENT",
-    "STRATEGY_HEARTBEAT_EVENT",
-
-    # State constants
-    "STATE_IDLE",
-    "STATE_PENDING",
-    "STATE_OPEN",
-    "STATE_BLOCKED",
-    "STATE_CLOSING",
-    "STATE_CLOSED",
-    "STATE_CANCELLED",
-    "STATE_REJECTED",
-    "ACTIVE_STATES",
-    "CLOSED_STATES",
-
-    # Types
-    "PayloadHandler",
-    "EventHandler",
-    "BaseSpreadStrategyConfig",
-    "SpreadStrategyState",
-    "BaseSpreadStrategy",
-]
+        try:
+            await self.unregister()
+        except Exception as exc:
+            self._mark_exception(
+                "Failed to cleanup spread strategy after failed register",
+                exc,
+                strategy=self.STRATEGY_NAME,
+            )

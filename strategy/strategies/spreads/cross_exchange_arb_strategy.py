@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from analytics.spreads.enums import (
     InstrumentType,
     OpportunityStatus,
+    QuoteValidity,
     SpreadSignalType,
     SpreadType,
 )
-from analytics.spreads.models import ArbitrageOpportunity, SpreadSignal, SpreadSnapshot
+from analytics.spreads.models import (
+    DEFAULT_TIMEFRAME,
+    ArbitrageOpportunity,
+    SpreadSignal,
+    SpreadSnapshot,
+)
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
 from .base_spread_strategy import (
     ARBITRAGE_OPPORTUNITY_EVENT,
     CROSS_EXCHANGE_SNAPSHOT_EVENT,
@@ -27,10 +32,8 @@ from .base_spread_strategy import (
     STATE_REJECTED,
 )
 
-
 DECIMAL_ZERO = Decimal("0")
 DECIMAL_ONE = Decimal("1")
-DECIMAL_10_000 = Decimal("10000")
 
 
 # ============================================================
@@ -80,6 +83,16 @@ def _normalize_instrument_type_set(
         normalized.add(raw)
 
     return normalized
+
+
+def _enum_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
+def _safe_abs_decimal(value: Decimal | None) -> Decimal | None:
+    return abs(value) if value is not None else None
 
 
 # ============================================================
@@ -132,11 +145,46 @@ class CrossExchangeArbStrategyConfig(BaseSpreadStrategyConfig):
     close_on_data_quality_signal: bool = True
     block_entry_on_data_quality_signal: bool = True
 
-    # Instrument filters
+    # Instrument filters.
+    # Empty set means "allow all tradeable analytics instrument types".
     allowed_instrument_types: set[str] = field(default_factory=set)
+
+    # Correlation policy.
+    # Preferred для analytics.spreads, бо ArbitrageOpportunity.to_payload()
+    # уже містить canonical opportunity_key.
+    prefer_opportunity_key: bool = True
 
     def __post_init__(self) -> None:
         BaseSpreadStrategyConfig.__post_init__(self)
+
+        self.entry_min_net_edge = _to_decimal(
+            self.entry_min_net_edge,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
+        self.entry_min_bps = _to_decimal(
+            self.entry_min_bps,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
+        self.exit_min_net_edge = _to_decimal(
+            self.exit_min_net_edge,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
+        self.exit_min_bps = _to_decimal(
+            self.exit_min_bps,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
+        self.min_update_net_edge_delta = _to_decimal(
+            self.min_update_net_edge_delta,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
+        self.min_update_net_edge_bps_delta = _to_decimal(
+            self.min_update_net_edge_bps_delta,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
+        self.min_update_confidence_delta = _to_decimal(
+            self.min_update_confidence_delta,
+            DECIMAL_ZERO,
+        ) or DECIMAL_ZERO
 
         self.allowed_instrument_types = _normalize_instrument_type_set(
             self.allowed_instrument_types
@@ -183,6 +231,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
     Роль:
     - приймати готові analytics opportunities/snapshots/signals;
     - перевіряти allowlists, freshness, status, profitability, thresholds;
+    - використовувати analytics opportunity_key / scoped market_type / timeframe;
     - вести strategy-state lifecycle;
     - публікувати strategy-level intents через signal.*.
 
@@ -256,6 +305,9 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                 "snapshot_edge_closes": 0,
                 "snapshot_status_closes": 0,
                 "snapshot_updates": 0,
+                "opportunity_key_hits": 0,
+                "scoped_key_fallbacks": 0,
+                "cost_fields_forwarded": 0,
             }
         )
 
@@ -311,6 +363,9 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             "snapshot_edge_closes": self._stats["snapshot_edge_closes"],
             "snapshot_status_closes": self._stats["snapshot_status_closes"],
             "snapshot_updates": self._stats["snapshot_updates"],
+            "opportunity_key_hits": self._stats["opportunity_key_hits"],
+            "scoped_key_fallbacks": self._stats["scoped_key_fallbacks"],
+            "cost_fields_forwarded": self._stats["cost_fields_forwarded"],
             "tracked_opportunities": len(self._latest_opportunities),
             "tracked_snapshots": len(self._latest_snapshots),
             "tracked_signal_keys": len(self._latest_signals),
@@ -324,12 +379,21 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         buy_exchange: str,
         sell_exchange: str,
         instrument_type: InstrumentType | str,
+        *,
+        buy_market_type: str | None = None,
+        sell_market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> ArbitrageOpportunity | None:
-        key = self._build_state_key(
-            self._normalize_symbol(symbol),
-            self._normalize_exchange(buy_exchange),
-            self._normalize_exchange(sell_exchange),
-            self._instrument_type_value(instrument_type),
+        normalized_instrument_type = self._instrument_type_value(instrument_type)
+        key = self._build_scoped_state_key(
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=symbol,
+            exchange_a=buy_exchange,
+            exchange_b=sell_exchange,
+            market_type_a=buy_market_type,
+            market_type_b=sell_market_type,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
+            suffix=normalized_instrument_type,
         )
         return self._latest_opportunities.get(key)
 
@@ -339,14 +403,45 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         buy_exchange: str,
         sell_exchange: str,
         instrument_type: InstrumentType | str,
+        *,
+        buy_market_type: str | None = None,
+        sell_market_type: str | None = None,
+        timeframe: str | None = None,
     ) -> SpreadSnapshot | None:
-        key = self._build_state_key(
-            self._normalize_symbol(symbol),
-            self._normalize_exchange(buy_exchange),
-            self._normalize_exchange(sell_exchange),
-            self._instrument_type_value(instrument_type),
+        normalized_instrument_type = self._instrument_type_value(instrument_type)
+        key = self._build_scoped_state_key(
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=symbol,
+            exchange_a=buy_exchange,
+            exchange_b=sell_exchange,
+            market_type_a=buy_market_type,
+            market_type_b=sell_market_type,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
+            suffix=normalized_instrument_type,
         )
         return self._latest_snapshots.get(key)
+
+    def get_latest_signals(
+        self,
+        symbol: str,
+        exchange_a: str,
+        exchange_b: str,
+        *,
+        market_type_a: str | None = None,
+        market_type_b: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[SpreadSignal]:
+        key = self._build_scoped_state_key(
+            spread_type=SpreadType.CROSS_EXCHANGE,
+            symbol=symbol,
+            exchange_a=exchange_a,
+            exchange_b=exchange_b,
+            market_type_a=market_type_a,
+            market_type_b=market_type_b,
+            timeframe=timeframe or DEFAULT_TIMEFRAME,
+        )
+        self._prune_stale_signals(key)
+        return list(self._latest_signals.get(key, []))
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -446,6 +541,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                 ):
                     self._stats["data_quality_blocks"] += 1
                     state = self._get_state(key)
+
                     if state is not None and state.is_active:
                         await self._cancel_if_active(
                             opportunity=opportunity,
@@ -497,11 +593,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     exchange_a=opportunity.buy_exchange,
                     exchange_b=opportunity.sell_exchange,
                     bias=self.BIAS_ARB,
-                    metadata={
-                        "spread_type": SpreadType.CROSS_EXCHANGE.value,
-                        "buy_instrument_type": opportunity.buy_instrument_type.value,
-                        "sell_instrument_type": opportunity.sell_instrument_type.value,
-                    },
+                    metadata=self._build_common_metadata(opportunity),
                 )
 
                 if (
@@ -590,6 +682,12 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     )
                     return
 
+                self._ignore_opportunity(
+                    opportunity,
+                    key,
+                    reason="no_state_transition",
+                )
+
             except Exception as exc:
                 self._mark_exception(
                     "Failed to process arbitrage opportunity",
@@ -630,7 +728,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     self._ignore_snapshot(
                         snapshot,
                         key="",
-                        reason="snapshot_missing_arbitrage_metadata",
+                        reason="snapshot_missing_cross_exchange_scope",
                     )
                     return
 
@@ -655,6 +753,15 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                         )
                     else:
                         self._ignore_snapshot(snapshot, key, reason="snapshot_stale")
+                    return
+
+                if self._snapshot_contract_error(snapshot) is not None:
+                    self._stats["invalid_contracts"] += 1
+                    self._ignore_snapshot(
+                        snapshot,
+                        key,
+                        reason=self._snapshot_contract_error(snapshot) or "invalid_contract",
+                    )
                     return
 
                 state = self._get_state(key)
@@ -719,6 +826,13 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                         timestamp=snapshot.timestamp,
                         metadata=self._build_snapshot_update_payload(snapshot, state),
                     )
+                    return
+
+                self._ignore_snapshot(
+                    snapshot,
+                    key,
+                    reason="snapshot_no_state_transition",
+                )
 
             except Exception as exc:
                 self._mark_exception(
@@ -754,14 +868,6 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     self._stats["ignored_signals"] += 1
                     return
 
-                if signal.signal_type not in {
-                    SpreadSignalType.ARBITRAGE,
-                    SpreadSignalType.STALE_DATA,
-                    SpreadSignalType.INVALID_DATA,
-                }:
-                    self._stats["ignored_signals"] += 1
-                    return
-
                 if self._reject_stale_signal(signal.timestamp):
                     self._stats["ignored_signals"] += 1
                     return
@@ -781,20 +887,24 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                     return
 
                 self._store_signal(key, signal)
+                self._record_signal_confirmation(signal)
 
                 if signal.signal_type == SpreadSignalType.ARBITRAGE:
                     self._stats["arbitrage_signal_confirmations"] += 1
                     return
 
                 if (
-                    signal.signal_type in {
+                    signal.signal_type
+                    in {
                         SpreadSignalType.STALE_DATA,
                         SpreadSignalType.INVALID_DATA,
                     }
                     and self._config.close_on_data_quality_signal
                 ):
-                    self._stats["data_quality_blocks"] += 1
                     await self._handle_data_quality_signal(key, signal)
+                    return
+
+                self._stats["ignored_signals"] += 1
 
             except Exception as exc:
                 self._mark_exception(
@@ -807,292 +917,167 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
                 )
 
     # ------------------------------------------------------------------
-    # Key / contract helpers
+    # Key / correlation helpers
     # ------------------------------------------------------------------
 
-    def _build_key_from_opportunity(
-        self,
-        opportunity: ArbitrageOpportunity,
-    ) -> str:
-        return self._build_state_key(
-            self._normalize_symbol(opportunity.symbol),
-            self._normalize_exchange(opportunity.buy_exchange),
-            self._normalize_exchange(opportunity.sell_exchange),
-            opportunity.buy_instrument_type.value,
+    def _build_key_from_opportunity(self, opportunity: ArbitrageOpportunity) -> str:
+        if self._config.prefer_opportunity_key:
+            opportunity_key = getattr(opportunity, "opportunity_key", None)
+            if opportunity_key:
+                self._stats["opportunity_key_hits"] += 1
+                return str(opportunity_key)
+
+        self._stats["scoped_key_fallbacks"] += 1
+        return self._build_opportunity_state_key(
+            opportunity,
+            use_opportunity_key=False,
         )
 
     def _build_key_from_snapshot(self, snapshot: SpreadSnapshot) -> str:
-        """
-        Snapshot для cross-exchange arb strategy має корелюватися через
-        buy/sell direction із metadata, а не через leg_a/leg_b fallback.
+        metadata_key = self._metadata_str(
+            snapshot.metadata,
+            "opportunity_key",
+            "state_key",
+            "arb_key",
+        )
+        if metadata_key:
+            return metadata_key
 
-        Analytics CrossExchangeSpreadAnalyzer уже додає:
-        - buy_exchange;
-        - sell_exchange;
-        - instrument_type.
-        """
-        buy_exchange = snapshot.metadata.get("buy_exchange")
-        sell_exchange = snapshot.metadata.get("sell_exchange")
-        instrument_type = snapshot.metadata.get("instrument_type")
-
-        if not buy_exchange or not sell_exchange or not instrument_type:
-            return ""
-
-        return self._build_state_key(
-            self._normalize_symbol(snapshot.symbol),
-            self._normalize_exchange(str(buy_exchange)),
-            self._normalize_exchange(str(sell_exchange)),
-            str(instrument_type).strip().lower(),
+        suffix = snapshot.leg_a_type.value if snapshot.leg_a_type else None
+        return self._build_scoped_state_key(
+            spread_type=snapshot.spread_type,
+            symbol=snapshot.symbol,
+            exchange_a=snapshot.leg_a_exchange,
+            exchange_b=snapshot.leg_b_exchange,
+            market_type_a=snapshot.leg_a_market_type,
+            market_type_b=snapshot.leg_b_market_type,
+            timeframe=snapshot.timeframe,
+            suffix=suffix,
         )
 
     def _build_key_from_signal(self, signal: SpreadSignal) -> str:
-        buy_exchange = (
-            signal.metadata.get("buy_exchange")
-            or signal.exchange_a
+        metadata_key = self._metadata_str(
+            signal.metadata,
+            "opportunity_key",
+            "state_key",
+            "arb_key",
         )
-        sell_exchange = (
-            signal.metadata.get("sell_exchange")
-            or signal.exchange_b
+        if metadata_key:
+            return metadata_key
+
+        exchange_a = signal.exchange_a or self._metadata_str(
+            signal.metadata,
+            "buy_exchange",
+            "exchange_a",
+            "leg_a_exchange",
         )
-        instrument_type = (
-            signal.metadata.get("instrument_type")
-            or signal.metadata.get("buy_instrument_type")
+        exchange_b = signal.exchange_b or self._metadata_str(
+            signal.metadata,
+            "sell_exchange",
+            "exchange_b",
+            "leg_b_exchange",
         )
 
-        if not buy_exchange or not sell_exchange or not instrument_type:
+        if not signal.symbol or not exchange_a or not exchange_b:
             return ""
 
-        return self._build_state_key(
-            self._normalize_symbol(signal.symbol),
-            self._normalize_exchange(str(buy_exchange)),
-            self._normalize_exchange(str(sell_exchange)),
-            str(instrument_type).strip().lower(),
+        instrument_type = self._metadata_str(
+            signal.metadata,
+            "buy_instrument_type",
+            "instrument_type",
+            "leg_a_type",
         )
 
-    def _instrument_type_value(self, value: InstrumentType | str) -> str:
-        if isinstance(value, InstrumentType):
-            return value.value
-        return str(value).strip().lower()
-
-    # ------------------------------------------------------------------
-    # Signal storage / confirmation helpers
-    # ------------------------------------------------------------------
-
-    def _store_signal(self, key: str, signal: SpreadSignal) -> None:
-        bucket = self._latest_signals.setdefault(key, [])
-        bucket.append(signal)
-
-        self._prune_stale_signals(key)
-
-        max_size = self._config.max_signals_per_key
-        if len(bucket) > max_size:
-            del bucket[:-max_size]
-
-    def _prune_stale_signals(self, key: str) -> int:
-        bucket = self._latest_signals.get(key)
-        if not bucket:
-            return 0
-
-        before = len(bucket)
-        bucket[:] = [
-            signal
-            for signal in bucket
-            if self._is_signal_fresh(signal.timestamp)
-        ]
-        removed = before - len(bucket)
-
-        if removed:
-            self._stats["stale_signals_removed"] += removed
-
-        if not bucket:
-            self._latest_signals.pop(key, None)
-
-        return removed
-
-    def _has_arbitrage_signal_confirmation(self, key: str) -> bool:
-        self._prune_stale_signals(key)
-        return any(
-            signal.signal_type == SpreadSignalType.ARBITRAGE
-            for signal in self._latest_signals.get(key, [])
-        )
-
-    def _has_data_quality_block(self, key: str) -> bool:
-        self._prune_stale_signals(key)
-        return any(
-            signal.signal_type in {
-                SpreadSignalType.STALE_DATA,
-                SpreadSignalType.INVALID_DATA,
-            }
-            for signal in self._latest_signals.get(key, [])
-        )
-
-    async def _handle_data_quality_signal(
-        self,
-        key: str,
-        signal: SpreadSignal,
-    ) -> None:
-        state = self._get_state(key)
-        if state is None or not state.is_active:
-            return
-
-        opportunity = self._latest_opportunities.get(key)
-        if opportunity is not None:
-            await self._cancel_if_active(
-                opportunity=opportunity,
-                key=key,
-                reason=f"data_quality_signal_{signal.signal_type.value}",
-            )
-            return
-
-        self._set_state_closed(
-            state,
-            status=STATE_CANCELLED,
-            reason=f"data_quality_signal_{signal.signal_type.value}",
-            metadata={
-                "source": "spread_signal",
-                "signal_type": signal.signal_type.value,
-                "signal_message": signal.message,
-                "signal_timestamp": self._safe_isoformat(signal.timestamp),
-            },
-            now=signal.timestamp,
-        )
-        self._pending_since.pop(key, None)
-        self._stats["cancelled_setups"] += 1
-
-        await self._emit_cancelled(
-            action=self.ACTION_CANCEL,
+        return self._build_scoped_state_key(
+            spread_type=signal.spread_type,
             symbol=signal.symbol,
-            state_key=state.key,
-            exchange_a=state.exchange_a,
-            exchange_b=state.exchange_b,
-            reason=f"data_quality_signal_{signal.signal_type.value}",
-            confidence=signal.confidence,
-            spread_type=SpreadType.CROSS_EXCHANGE.value,
-            timestamp=signal.timestamp,
-            metadata={
-                "source": "spread_signal",
-                "signal_type": signal.signal_type.value,
-                "signal_message": signal.message,
-                "signal_timestamp": self._safe_isoformat(signal.timestamp),
-            },
+            exchange_a=exchange_a,
+            exchange_b=exchange_b,
+            market_type_a=signal.market_type_a
+            or self._metadata_str(signal.metadata, "buy_market_type", "market_type_a"),
+            market_type_b=signal.market_type_b
+            or self._metadata_str(signal.metadata, "sell_market_type", "market_type_b"),
+            timeframe=signal.timeframe or self._metadata_str(signal.metadata, "timeframe"),
+            suffix=instrument_type,
         )
 
     # ------------------------------------------------------------------
-    # Decision helpers
+    # Opportunity decision helpers
     # ------------------------------------------------------------------
 
-    def _reject_instrument_types(
-        self,
-        opportunity: ArbitrageOpportunity,
-    ) -> bool:
+    def _reject_instrument_types(self, opportunity: ArbitrageOpportunity) -> bool:
         allowed = self._config.allowed_instrument_types
         if not allowed:
             return False
 
-        buy_type = opportunity.buy_instrument_type.value
-        sell_type = opportunity.sell_instrument_type.value
+        buy_type = self._instrument_type_value(opportunity.buy_instrument_type)
+        sell_type = self._instrument_type_value(opportunity.sell_instrument_type)
 
-        return buy_type not in allowed or sell_type not in allowed
+        if buy_type not in allowed or sell_type not in allowed:
+            self._stats["invalid_contracts"] += 1
+            return True
 
-    def _is_opportunity_active(
-        self,
-        opportunity: ArbitrageOpportunity,
-    ) -> bool:
+        return False
+
+    def _is_opportunity_active(self, opportunity: ArbitrageOpportunity) -> bool:
+        is_active = getattr(opportunity, "is_active", None)
+        if isinstance(is_active, bool):
+            return is_active
+
         return opportunity.status == OpportunityStatus.ACTIVE
 
-    def _is_opportunity_expired(
-        self,
-        opportunity: ArbitrageOpportunity,
-    ) -> bool:
+    def _is_opportunity_expired(self, opportunity: ArbitrageOpportunity) -> bool:
+        is_expired = getattr(opportunity, "is_expired", None)
+        if isinstance(is_expired, bool):
+            return is_expired
+
         if opportunity.expires_at is None:
             return False
+
         return self._utcnow() >= opportunity.expires_at
 
-    def _is_tradeable(
-        self,
-        opportunity: ArbitrageOpportunity,
-    ) -> bool:
-        if not opportunity.is_profitable:
+    def _is_tradeable(self, opportunity: ArbitrageOpportunity) -> bool:
+        if opportunity.status != OpportunityStatus.ACTIVE:
             return False
 
-        if opportunity.net_edge <= self._config.entry_min_net_edge:
+        if self._is_opportunity_expired(opportunity):
+            return False
+
+        if not self._is_profitable(opportunity):
+            return False
+
+        if opportunity.net_edge < self._config.entry_min_net_edge:
             return False
 
         edge_bps = self._extract_edge_bps(opportunity)
-        if edge_bps is not None and edge_bps < self._config.entry_min_bps:
+        if edge_bps is None:
             return False
 
-        return True
+        return edge_bps >= self._config.entry_min_bps
 
-    def _has_persistence_confirmation(
-        self,
-        *,
-        key: str,
-        now: datetime,
-    ) -> bool:
-        first_seen_at = self._pending_since.get(key)
-        if first_seen_at is None:
-            self._pending_since[key] = now
-            return False
+    def _is_profitable(self, opportunity: ArbitrageOpportunity) -> bool:
+        is_profitable = getattr(opportunity, "is_profitable", None)
+        if isinstance(is_profitable, bool):
+            return is_profitable
 
-        required_delta = timedelta(milliseconds=self._config.min_persistence_ms)
-        if (now - first_seen_at) < required_delta:
-            return False
-
-        self._pending_since.pop(key, None)
-        return True
+        return opportunity.net_edge > DECIMAL_ZERO
 
     def _should_open(
         self,
         opportunity: ArbitrageOpportunity,
         state: SpreadStrategyState,
     ) -> bool:
-        if state.status in {"open", "pending", "closing"}:
+        if state.is_active:
             return False
 
         return self._is_tradeable(opportunity)
-
-    def _should_update(
-        self,
-        opportunity: ArbitrageOpportunity,
-        state: SpreadStrategyState,
-    ) -> bool:
-        if state.status not in {"open", "pending"}:
-            return False
-
-        previous_net_edge = state.entry_net_edge
-        previous_edge_bps = state.entry_value
-        previous_confidence = state.confidence
-
-        net_edge_changed = (
-            previous_net_edge is not None
-            and abs(opportunity.net_edge - previous_net_edge)
-            >= self._config.min_update_net_edge_delta
-        )
-
-        current_edge_bps = self._extract_edge_bps(opportunity)
-        edge_bps_changed = (
-            previous_edge_bps is not None
-            and current_edge_bps is not None
-            and abs(current_edge_bps - previous_edge_bps)
-            >= self._config.min_update_net_edge_bps_delta
-        )
-
-        confidence_changed = (
-            previous_confidence is not None
-            and opportunity.confidence is not None
-            and abs(opportunity.confidence - previous_confidence)
-            >= self._config.min_update_confidence_delta
-        )
-
-        return net_edge_changed or edge_bps_changed or confidence_changed
 
     def _should_close(
         self,
         opportunity: ArbitrageOpportunity,
         state: SpreadStrategyState,
     ) -> bool:
-        if state.status not in {"open", "pending"}:
+        if not state.is_active:
             return False
 
         if not self._is_opportunity_active(opportunity):
@@ -1105,169 +1090,233 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             return True
 
         edge_bps = self._extract_edge_bps(opportunity)
-        if edge_bps is not None and edge_bps <= self._config.exit_min_bps:
+        if edge_bps is None:
             return True
 
-        if (
-            opportunity.confidence is None
-            or opportunity.confidence < self._config.min_confidence
-        ):
-            return True
+        return edge_bps <= self._config.exit_min_bps
+
+    def _should_update(
+        self,
+        opportunity: ArbitrageOpportunity,
+        state: SpreadStrategyState,
+    ) -> bool:
+        if not state.is_active:
+            return False
+
+        if not self._is_tradeable(opportunity):
+            return False
+
+        current_edge_bps = self._extract_edge_bps(opportunity)
+        previous_edge_bps = state.entry_value
+
+        if current_edge_bps is not None and previous_edge_bps is not None:
+            if abs(current_edge_bps - previous_edge_bps) >= (
+                self._config.min_update_net_edge_bps_delta
+            ):
+                return True
+
+        if state.entry_net_edge is not None:
+            if abs(opportunity.net_edge - state.entry_net_edge) >= (
+                self._config.min_update_net_edge_delta
+            ):
+                return True
+
+        if opportunity.confidence is not None and state.confidence is not None:
+            if abs(opportunity.confidence - state.confidence) >= (
+                self._config.min_update_confidence_delta
+            ):
+                return True
 
         return False
 
+    def _has_persistence_confirmation(
+        self,
+        *,
+        key: str,
+        now: datetime,
+    ) -> bool:
+        first_seen = self._pending_since.get(key)
+        if first_seen is None:
+            self._pending_since[key] = now
+            return False
+
+        elapsed_ms = int((now - first_seen).total_seconds() * 1000)
+        return elapsed_ms >= self._config.min_persistence_ms
+
+    # ------------------------------------------------------------------
+    # Snapshot helpers
+    # ------------------------------------------------------------------
+
+    def _snapshot_contract_error(self, snapshot: SpreadSnapshot) -> str | None:
+        if snapshot.spread_type != SpreadType.CROSS_EXCHANGE:
+            return "unsupported_spread_type"
+
+        if not snapshot.symbol:
+            return "missing_symbol"
+
+        if not snapshot.leg_a_exchange:
+            return "missing_leg_a_exchange"
+
+        if not snapshot.leg_b_exchange:
+            return "missing_leg_b_exchange"
+
+        if snapshot.leg_a_type != snapshot.leg_b_type:
+            return "instrument_type_mismatch"
+
+        if snapshot.quote_validity != QuoteValidity.VALID:
+            return "invalid_quote_validity"
+
+        return None
+
     def _snapshot_status_not_active(self, snapshot: SpreadSnapshot) -> bool:
-        status = snapshot.metadata.get("opportunity_status")
+        status = self._metadata_str(
+            snapshot.metadata,
+            "opportunity_status",
+            "status",
+        )
         if status is None:
             return False
-        return str(status).strip().lower() != OpportunityStatus.ACTIVE.value
+
+        return status != OpportunityStatus.ACTIVE.value
 
     def _snapshot_edge_below_exit(self, snapshot: SpreadSnapshot) -> bool:
         net_edge = self._extract_snapshot_net_edge(snapshot)
-        if net_edge is None:
-            return True
-
-        if net_edge <= self._config.exit_min_net_edge:
+        if net_edge is not None and net_edge <= self._config.exit_min_net_edge:
             return True
 
         edge_bps = self._extract_snapshot_edge_bps(snapshot)
-        if edge_bps is not None and edge_bps <= self._config.exit_min_bps:
+        if edge_bps is None:
             return True
 
-        return False
+        return edge_bps <= self._config.exit_min_bps
 
     def _should_update_from_snapshot(
         self,
         snapshot: SpreadSnapshot,
         state: SpreadStrategyState,
     ) -> bool:
-        if state.status != "open":
-            return False
+        edge_bps = self._extract_snapshot_edge_bps(snapshot)
+        net_edge = self._extract_snapshot_net_edge(snapshot)
+        confidence = self._extract_snapshot_confidence(snapshot)
 
-        snapshot_net_edge = self._extract_snapshot_net_edge(snapshot)
-        snapshot_edge_bps = self._extract_snapshot_edge_bps(snapshot)
-        snapshot_confidence = self._extract_snapshot_confidence(snapshot)
+        if edge_bps is not None and state.entry_value is not None:
+            if abs(edge_bps - state.entry_value) >= (
+                self._config.min_update_net_edge_bps_delta
+            ):
+                return True
 
-        net_edge_changed = (
-            snapshot_net_edge is not None
-            and state.entry_net_edge is not None
-            and abs(snapshot_net_edge - state.entry_net_edge)
-            >= self._config.min_update_net_edge_delta
-        )
+        if net_edge is not None and state.entry_net_edge is not None:
+            if abs(net_edge - state.entry_net_edge) >= (
+                self._config.min_update_net_edge_delta
+            ):
+                return True
 
-        edge_bps_changed = (
-            snapshot_edge_bps is not None
-            and state.entry_value is not None
-            and abs(snapshot_edge_bps - state.entry_value)
-            >= self._config.min_update_net_edge_bps_delta
-        )
+        if confidence is not None and state.confidence is not None:
+            if abs(confidence - state.confidence) >= (
+                self._config.min_update_confidence_delta
+            ):
+                return True
 
-        confidence_changed = (
-            snapshot_confidence is not None
-            and state.confidence is not None
-            and abs(snapshot_confidence - state.confidence)
-            >= self._config.min_update_confidence_delta
-        )
-
-        return net_edge_changed or edge_bps_changed or confidence_changed
+        return False
 
     # ------------------------------------------------------------------
-    # Extraction helpers
+    # Signal helpers
     # ------------------------------------------------------------------
 
-    def _extract_edge_bps(
+    def _store_signal(self, key: str, signal: SpreadSignal) -> None:
+        bucket = self._latest_signals.setdefault(key, [])
+        bucket.append(signal)
+
+        if len(bucket) > self._config.max_signals_per_key:
+            del bucket[: len(bucket) - self._config.max_signals_per_key]
+
+    def _record_signal_confirmation(self, signal: SpreadSignal) -> None:
+        if signal.signal_type == SpreadSignalType.ARBITRAGE:
+            self._stats["arbitrage_signal_confirmations"] += 1
+
+    def _has_arbitrage_signal_confirmation(self, key: str) -> bool:
+        self._prune_stale_signals(key)
+
+        return any(
+            signal.signal_type == SpreadSignalType.ARBITRAGE
+            for signal in self._latest_signals.get(key, [])
+        )
+
+    def _has_data_quality_block(self, key: str) -> bool:
+        self._prune_stale_signals(key)
+
+        return any(
+            signal.signal_type
+            in {
+                SpreadSignalType.STALE_DATA,
+                SpreadSignalType.INVALID_DATA,
+            }
+            for signal in self._latest_signals.get(key, [])
+        )
+
+    def _prune_stale_signals(self, key: str) -> None:
+        signals = self._latest_signals.get(key)
+        if not signals:
+            return
+
+        fresh: list[SpreadSignal] = [
+            signal
+            for signal in signals
+            if self._is_signal_fresh(signal.timestamp)
+        ]
+
+        removed = len(signals) - len(fresh)
+        if removed:
+            self._stats["stale_signals_removed"] += removed
+
+        if fresh:
+            self._latest_signals[key] = fresh
+        else:
+            self._latest_signals.pop(key, None)
+
+    async def _handle_data_quality_signal(
         self,
-        opportunity: ArbitrageOpportunity,
-    ) -> Decimal | None:
-        metadata_value = opportunity.metadata.get("net_edge_bps")
-        metadata_bps = _to_decimal(metadata_value)
-        if metadata_bps is not None:
-            return metadata_bps
-
-        reference_notional = _to_decimal(opportunity.metadata.get("reference_buy_notional"))
-        if reference_notional is not None and reference_notional > DECIMAL_ZERO:
-            return (opportunity.net_edge / reference_notional) * DECIMAL_10_000
-
-        return opportunity.spread_bps
-
-    def _extract_snapshot_net_edge(self, snapshot: SpreadSnapshot) -> Decimal | None:
-        metadata_net_edge = _to_decimal(snapshot.metadata.get("opportunity_net_edge"))
-        if metadata_net_edge is not None:
-            return metadata_net_edge
-
-        return snapshot.net_spread
-
-    def _extract_snapshot_edge_bps(self, snapshot: SpreadSnapshot) -> Decimal | None:
-        metadata_edge_bps = _to_decimal(snapshot.metadata.get("opportunity_net_edge_bps"))
-        if metadata_edge_bps is not None:
-            return metadata_edge_bps
-
-        return snapshot.spread_bps
-
-    def _extract_snapshot_confidence(self, snapshot: SpreadSnapshot) -> Decimal | None:
-        return _to_decimal(snapshot.metadata.get("opportunity_confidence"))
-
-    # ------------------------------------------------------------------
-    # State transitions / emissions
-    # ------------------------------------------------------------------
-
-    def _ignore_opportunity(
-        self,
-        opportunity: ArbitrageOpportunity,
         key: str,
-        *,
-        reason: str,
+        signal: SpreadSignal,
     ) -> None:
-        self._stats["ignored_opportunities"] += 1
-        self._logger.debug(
-            "Cross-exchange opportunity ignored | strategy=%s symbol=%s key=%s reason=%s",
-            self.STRATEGY_NAME,
-            opportunity.symbol,
-            key,
-            reason,
-            extra={
-                "strategy": self.STRATEGY_NAME,
-                "symbol": opportunity.symbol,
-                "state_key": key,
-                "reason": reason,
-                "buy_exchange": opportunity.buy_exchange,
-                "sell_exchange": opportunity.sell_exchange,
-                "net_edge": self._to_decimal_str(opportunity.net_edge),
-                "edge_bps": self._to_decimal_str(self._extract_edge_bps(opportunity)),
-                "status": opportunity.status.value,
+        state = self._get_state(key)
+
+        if state is None or not state.is_active:
+            return
+
+        self._set_state_closed(
+            state,
+            status=STATE_CANCELLED,
+            reason=f"data_quality_signal:{signal.signal_type.value}",
+            metadata={
+                "signal_type": signal.signal_type.value,
+                "signal_timestamp": signal.timestamp.isoformat(),
+                "signal_message": signal.message,
+                "signal_metadata": dict(signal.metadata),
+            },
+            now=signal.timestamp,
+        )
+        self._stats["cancelled_setups"] += 1
+
+        await self._emit_cancelled(
+            action=self.ACTION_CANCEL,
+            symbol=signal.symbol,
+            state_key=state.key,
+            exchange_a=state.exchange_a,
+            exchange_b=state.exchange_b,
+            reason=f"data_quality_signal:{signal.signal_type.value}",
+            confidence=signal.confidence or state.confidence,
+            spread_type=SpreadType.CROSS_EXCHANGE.value,
+            timestamp=signal.timestamp,
+            metadata={
+                "state": state.to_payload(),
+                "signal": self._signal_metadata(signal),
             },
         )
 
-    def _ignore_snapshot(
-        self,
-        snapshot: SpreadSnapshot,
-        key: str,
-        *,
-        reason: str,
-    ) -> None:
-        self._stats["ignored_snapshots"] += 1
-        self._logger.debug(
-            "Cross-exchange snapshot ignored | strategy=%s symbol=%s key=%s reason=%s",
-            self.STRATEGY_NAME,
-            snapshot.symbol,
-            key,
-            reason,
-            extra={
-                "strategy": self.STRATEGY_NAME,
-                "symbol": snapshot.symbol,
-                "state_key": key,
-                "reason": reason,
-                "leg_a_exchange": snapshot.leg_a_exchange,
-                "leg_b_exchange": snapshot.leg_b_exchange,
-                "net_edge": self._to_decimal_str(
-                    self._extract_snapshot_net_edge(snapshot)
-                ),
-                "edge_bps": self._to_decimal_str(
-                    self._extract_snapshot_edge_bps(snapshot)
-                ),
-                "snapshot_metadata": dict(snapshot.metadata),
-            },
-        )
+    # ------------------------------------------------------------------
+    # State transition emit helpers
+    # ------------------------------------------------------------------
 
     async def _reject_setup(
         self,
@@ -1284,7 +1333,6 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             bias=self.BIAS_ARB,
             metadata=self._build_common_metadata(opportunity),
         )
-
         self._set_state_closed(
             state,
             status=STATE_REJECTED,
@@ -1292,7 +1340,6 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             metadata=self._build_common_metadata(opportunity),
             now=opportunity.timestamp,
         )
-        self._pending_since.pop(key, None)
         self._stats["rejected_setups"] += 1
 
         await self._emit_rejected(
@@ -1305,7 +1352,10 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             confidence=opportunity.confidence,
             spread_type=SpreadType.CROSS_EXCHANGE.value,
             timestamp=opportunity.timestamp,
-            metadata=self._build_common_metadata(opportunity),
+            metadata={
+                "state": state.to_payload(),
+                "opportunity": self._opportunity_metadata(opportunity),
+            },
         )
 
     async def _cancel_if_active(
@@ -1327,7 +1377,6 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             metadata=self._build_common_metadata(opportunity),
             now=opportunity.timestamp,
         )
-        self._pending_since.pop(key, None)
         self._stats["cancelled_setups"] += 1
 
         await self._emit_cancelled(
@@ -1340,7 +1389,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             confidence=opportunity.confidence,
             spread_type=SpreadType.CROSS_EXCHANGE.value,
             timestamp=opportunity.timestamp,
-            metadata=self._build_close_payload(opportunity, state, reason),
+            metadata=self._build_cancel_payload(opportunity, state),
         )
 
     async def _close_active_setup(
@@ -1357,7 +1406,6 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             metadata=self._build_common_metadata(opportunity),
             now=opportunity.timestamp,
         )
-        self._pending_since.pop(state.key, None)
         self._stats["closed_setups"] += 1
 
         await self._emit_closed(
@@ -1370,7 +1418,7 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             confidence=opportunity.confidence,
             spread_type=SpreadType.CROSS_EXCHANGE.value,
             timestamp=opportunity.timestamp,
-            metadata=self._build_close_payload(opportunity, state, reason),
+            metadata=self._build_close_payload(opportunity, state),
         )
 
     async def _close_from_snapshot(
@@ -1387,7 +1435,6 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             metadata=self._build_snapshot_metadata(snapshot),
             now=snapshot.timestamp,
         )
-        self._pending_since.pop(state.key, None)
         self._stats["closed_setups"] += 1
 
         await self._emit_closed(
@@ -1397,71 +1444,78 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
             exchange_a=state.exchange_a,
             exchange_b=state.exchange_b,
             reason=reason,
-            confidence=state.confidence,
+            confidence=self._extract_snapshot_confidence(snapshot) or state.confidence,
             spread_type=SpreadType.CROSS_EXCHANGE.value,
             timestamp=snapshot.timestamp,
-            metadata=self._build_snapshot_close_payload(snapshot, state, reason),
+            metadata=self._build_snapshot_close_payload(snapshot, state),
         )
 
     # ------------------------------------------------------------------
-    # Payload builders
+    # Ignore helpers
+    # ------------------------------------------------------------------
+
+    def _ignore_opportunity(
+        self,
+        opportunity: ArbitrageOpportunity,
+        key: str,
+        *,
+        reason: str,
+    ) -> None:
+        self._stats["ignored_opportunities"] += 1
+        self._logger.debug(
+            "Cross-exchange opportunity ignored | strategy=%s key=%s reason=%s symbol=%s buy=%s sell=%s",
+            self.STRATEGY_NAME,
+            key,
+            reason,
+            opportunity.symbol,
+            opportunity.buy_exchange,
+            opportunity.sell_exchange,
+        )
+
+    def _ignore_snapshot(
+        self,
+        snapshot: SpreadSnapshot,
+        key: str,
+        *,
+        reason: str,
+    ) -> None:
+        self._stats["ignored_snapshots"] += 1
+        self._logger.debug(
+            "Cross-exchange snapshot ignored | strategy=%s key=%s reason=%s symbol=%s exchange_a=%s exchange_b=%s",
+            self.STRATEGY_NAME,
+            key,
+            reason,
+            snapshot.symbol,
+            snapshot.leg_a_exchange,
+            snapshot.leg_b_exchange,
+        )
+
+    # ------------------------------------------------------------------
+    # Metadata / payload builders
     # ------------------------------------------------------------------
 
     def _build_common_metadata(
         self,
         opportunity: ArbitrageOpportunity,
     ) -> dict[str, Any]:
-        return {
-            "source": "arbitrage_opportunity",
-            "buy_exchange": opportunity.buy_exchange,
-            "sell_exchange": opportunity.sell_exchange,
-            "buy_instrument_type": opportunity.buy_instrument_type.value,
-            "sell_instrument_type": opportunity.sell_instrument_type.value,
-            "buy_price": self._to_decimal_str(opportunity.buy_price),
-            "sell_price": self._to_decimal_str(opportunity.sell_price),
-            "gross_edge": self._to_decimal_str(opportunity.gross_edge),
-            "estimated_fees": self._to_decimal_str(opportunity.estimated_fees),
-            "estimated_slippage": self._to_decimal_str(opportunity.estimated_slippage),
-            "net_edge": self._to_decimal_str(opportunity.net_edge),
-            "net_edge_bps": self._to_decimal_str(self._extract_edge_bps(opportunity)),
-            "spread_pct": self._to_decimal_str(opportunity.spread_pct),
-            "spread_bps": self._to_decimal_str(opportunity.spread_bps),
-            "confidence": self._to_decimal_str(opportunity.confidence),
-            "opportunity_status": opportunity.status.value,
-            "opportunity_timestamp": self._safe_isoformat(opportunity.timestamp),
-            "opportunity_expires_at": self._safe_isoformat(opportunity.expires_at),
-            "opportunity_metadata": dict(opportunity.metadata),
-        }
+        metadata = self._opportunity_metadata(opportunity)
 
-    def _build_snapshot_metadata(self, snapshot: SpreadSnapshot) -> dict[str, Any]:
-        return {
-            "source": "cross_exchange_snapshot",
-            "symbol": snapshot.symbol,
-            "leg_a_exchange": snapshot.leg_a_exchange,
-            "leg_b_exchange": snapshot.leg_b_exchange,
-            "leg_a_type": snapshot.leg_a_type.value,
-            "leg_b_type": snapshot.leg_b_type.value,
-            "buy_exchange": snapshot.metadata.get("buy_exchange"),
-            "sell_exchange": snapshot.metadata.get("sell_exchange"),
-            "instrument_type": snapshot.metadata.get("instrument_type"),
-            "raw_spread": self._to_decimal_str(snapshot.raw_spread),
-            "spread_pct": self._to_decimal_str(snapshot.spread_pct),
-            "spread_bps": self._to_decimal_str(snapshot.spread_bps),
-            "net_spread": self._to_decimal_str(snapshot.net_spread),
-            "opportunity_net_edge": self._to_decimal_str(
-                self._extract_snapshot_net_edge(snapshot)
-            ),
-            "opportunity_net_edge_bps": self._to_decimal_str(
-                self._extract_snapshot_edge_bps(snapshot)
-            ),
-            "estimated_fees": self._to_decimal_str(snapshot.estimated_fees),
-            "estimated_slippage": self._to_decimal_str(snapshot.estimated_slippage),
-            "quote_validity": snapshot.quote_validity.value,
-            "direction": snapshot.direction.value,
-            "regime": snapshot.regime.value,
-            "snapshot_timestamp": self._safe_isoformat(snapshot.timestamp),
-            "snapshot_metadata": dict(snapshot.metadata),
-        }
+        metadata.update(
+            {
+                "spread_type": SpreadType.CROSS_EXCHANGE.value,
+                "source": "analytics.spreads.arbitrage.opportunity",
+                "analytics_topic": self.OPPORTUNITY_EVENT,
+                "opportunity_key": getattr(opportunity, "opportunity_key", None),
+                "buy_scope": self._safe_scope_payload(
+                    getattr(opportunity, "buy_key", None)
+                ),
+                "sell_scope": self._safe_scope_payload(
+                    getattr(opportunity, "sell_key", None)
+                ),
+            }
+        )
+
+        return metadata
 
     def _build_open_payload(
         self,
@@ -1469,12 +1523,17 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         state: SpreadStrategyState,
     ) -> dict[str, Any]:
         return {
-            **self._build_common_metadata(opportunity),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "entry_net_edge": self._to_decimal_str(state.entry_net_edge),
-            "entry_edge_bps": self._to_decimal_str(state.entry_value),
-            "state_opened_at": self._safe_isoformat(state.opened_at),
+            "state": state.to_payload(),
+            "opportunity": self._opportunity_metadata(opportunity),
+            "entry_policy": {
+                "entry_min_net_edge": str(self._config.entry_min_net_edge),
+                "entry_min_bps": str(self._config.entry_min_bps),
+                "require_persistence": self._config.require_persistence,
+                "require_arbitrage_signal_confirmation": (
+                    self._config.require_arbitrage_signal_confirmation
+                ),
+            },
+            "confirmations": self._confirmation_metadata(state.key),
         }
 
     def _build_update_payload(
@@ -1483,32 +1542,76 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         state: SpreadStrategyState,
     ) -> dict[str, Any]:
         return {
-            **self._build_common_metadata(opportunity),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "previous_entry_net_edge": self._to_decimal_str(state.entry_net_edge),
-            "current_net_edge": self._to_decimal_str(opportunity.net_edge),
-            "previous_entry_edge_bps": self._to_decimal_str(state.entry_value),
-            "current_edge_bps": self._to_decimal_str(
-                self._extract_edge_bps(opportunity)
-            ),
-            "state_updated_at": self._safe_isoformat(state.updated_at),
+            "state": state.to_payload(),
+            "opportunity": self._opportunity_metadata(opportunity),
+            "update_policy": {
+                "min_update_net_edge_delta": str(
+                    self._config.min_update_net_edge_delta
+                ),
+                "min_update_net_edge_bps_delta": str(
+                    self._config.min_update_net_edge_bps_delta
+                ),
+                "min_update_confidence_delta": str(
+                    self._config.min_update_confidence_delta
+                ),
+            },
+            "confirmations": self._confirmation_metadata(state.key),
+        }
+
+    def _build_cancel_payload(
+        self,
+        opportunity: ArbitrageOpportunity,
+        state: SpreadStrategyState,
+    ) -> dict[str, Any]:
+        return {
+            "state": state.to_payload(),
+            "opportunity": self._opportunity_metadata(opportunity),
         }
 
     def _build_close_payload(
         self,
         opportunity: ArbitrageOpportunity,
         state: SpreadStrategyState,
-        reason: str,
     ) -> dict[str, Any]:
         return {
-            **self._build_common_metadata(opportunity),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "state_opened_at": self._safe_isoformat(state.opened_at),
-            "state_closed_at": self._safe_isoformat(state.closed_at),
-            "close_reason": reason,
+            "state": state.to_payload(),
+            "opportunity": self._opportunity_metadata(opportunity),
+            "exit_policy": {
+                "exit_min_net_edge": str(self._config.exit_min_net_edge),
+                "exit_min_bps": str(self._config.exit_min_bps),
+            },
         }
+
+    def _build_snapshot_metadata(self, snapshot: SpreadSnapshot) -> dict[str, Any]:
+        metadata = {
+            "source": "analytics.spreads.cross_exchange.updated",
+            "analytics_topic": self.SNAPSHOT_EVENT,
+            "spread_type": snapshot.spread_type.value,
+            "symbol": snapshot.symbol,
+            "timeframe": snapshot.timeframe,
+            "leg_a_exchange": snapshot.leg_a_exchange,
+            "leg_b_exchange": snapshot.leg_b_exchange,
+            "leg_a_market_type": snapshot.leg_a_market_type,
+            "leg_b_market_type": snapshot.leg_b_market_type,
+            "leg_a_type": snapshot.leg_a_type.value,
+            "leg_b_type": snapshot.leg_b_type.value,
+            "raw_spread": self._to_str(snapshot.raw_spread),
+            "spread_pct": self._to_str(snapshot.spread_pct),
+            "spread_bps": self._to_str(snapshot.spread_bps),
+            "net_spread": self._to_str(snapshot.net_spread),
+            "estimated_fees": self._to_str(snapshot.estimated_fees),
+            "estimated_slippage": self._to_str(snapshot.estimated_slippage),
+            "quote_validity": snapshot.quote_validity.value,
+            "regime": snapshot.regime.value,
+            "direction": snapshot.direction.value,
+            "timestamp": snapshot.timestamp.isoformat(),
+            "metadata": dict(snapshot.metadata),
+        }
+
+        if snapshot.estimated_fees is not None or snapshot.estimated_slippage is not None:
+            self._stats["cost_fields_forwarded"] += 1
+
+        return metadata
 
     def _build_snapshot_update_payload(
         self,
@@ -1516,27 +1619,205 @@ class CrossExchangeArbStrategy(BaseSpreadStrategy):
         state: SpreadStrategyState,
     ) -> dict[str, Any]:
         return {
-            **self._build_snapshot_metadata(snapshot),
-            "state_status": state.status,
-            "state_bias": state.bias,
-            "state_updated_at": self._safe_isoformat(state.updated_at),
-            "state_confidence": self._to_decimal_str(state.confidence),
-            "state_entry_net_edge": self._to_decimal_str(state.entry_net_edge),
-            "state_entry_edge_bps": self._to_decimal_str(state.entry_value),
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(snapshot),
+            "confirmations": self._confirmation_metadata(state.key),
         }
 
     def _build_snapshot_close_payload(
         self,
         snapshot: SpreadSnapshot,
         state: SpreadStrategyState,
-        reason: str,
     ) -> dict[str, Any]:
         return {
-            **self._build_snapshot_metadata(snapshot),
-            "state_status_before_close": state.status,
-            "state_bias": state.bias,
-            "state_opened_at": self._safe_isoformat(state.opened_at),
-            "state_updated_at": self._safe_isoformat(state.updated_at),
-            "state_closed_at": self._safe_isoformat(state.closed_at),
-            "close_reason": reason,
+            "state": state.to_payload(),
+            "snapshot": self._build_snapshot_metadata(snapshot),
+            "exit_policy": {
+                "exit_min_net_edge": str(self._config.exit_min_net_edge),
+                "exit_min_bps": str(self._config.exit_min_bps),
+            },
         }
+
+    def _opportunity_metadata(
+        self,
+        opportunity: ArbitrageOpportunity,
+    ) -> dict[str, Any]:
+        metadata = {
+            "symbol": opportunity.symbol,
+            "timeframe": getattr(opportunity, "timeframe", DEFAULT_TIMEFRAME),
+            "buy_exchange": opportunity.buy_exchange,
+            "sell_exchange": opportunity.sell_exchange,
+            "buy_market_type": getattr(opportunity, "buy_market_type", None),
+            "sell_market_type": getattr(opportunity, "sell_market_type", None),
+            "buy_exchange_symbol": getattr(opportunity, "buy_exchange_symbol", None),
+            "sell_exchange_symbol": getattr(opportunity, "sell_exchange_symbol", None),
+            "buy_instrument_type": opportunity.buy_instrument_type.value,
+            "sell_instrument_type": opportunity.sell_instrument_type.value,
+            "buy_price": self._to_str(opportunity.buy_price),
+            "sell_price": self._to_str(opportunity.sell_price),
+            "gross_edge": self._to_str(opportunity.gross_edge),
+            "estimated_fees": self._to_str(opportunity.estimated_fees),
+            "estimated_slippage": self._to_str(opportunity.estimated_slippage),
+            "total_costs": self._to_str(getattr(opportunity, "total_costs", None)),
+            "net_edge": self._to_str(opportunity.net_edge),
+            "edge_after_costs": self._to_str(
+                getattr(opportunity, "edge_after_costs", None)
+            ),
+            "spread_pct": self._to_str(opportunity.spread_pct),
+            "spread_bps": self._to_str(opportunity.spread_bps),
+            "confidence": self._to_str(opportunity.confidence),
+            "status": opportunity.status.value,
+            "timestamp": opportunity.timestamp.isoformat(),
+            "expires_at": (
+                opportunity.expires_at.isoformat()
+                if opportunity.expires_at is not None
+                else None
+            ),
+            "is_profitable": self._is_profitable(opportunity),
+            "is_active": self._is_opportunity_active(opportunity),
+            "is_expired": self._is_opportunity_expired(opportunity),
+            "opportunity_key": getattr(opportunity, "opportunity_key", None),
+            "metadata": dict(opportunity.metadata),
+        }
+
+        self._stats["cost_fields_forwarded"] += 1
+        return metadata
+
+    def _signal_metadata(self, signal: SpreadSignal) -> dict[str, Any]:
+        return {
+            "signal_type": signal.signal_type.value,
+            "spread_type": signal.spread_type.value,
+            "symbol": signal.symbol,
+            "exchange_a": signal.exchange_a,
+            "exchange_b": signal.exchange_b,
+            "market_type_a": getattr(signal, "market_type_a", None),
+            "market_type_b": getattr(signal, "market_type_b", None),
+            "timeframe": getattr(signal, "timeframe", DEFAULT_TIMEFRAME),
+            "value": self._to_str(signal.value),
+            "threshold": self._to_str(signal.threshold),
+            "confidence": self._to_str(signal.confidence),
+            "message": signal.message,
+            "timestamp": signal.timestamp.isoformat(),
+            "metadata": dict(signal.metadata),
+        }
+
+    def _confirmation_metadata(self, key: str) -> dict[str, Any]:
+        self._prune_stale_signals(key)
+        signals = self._latest_signals.get(key, [])
+
+        return {
+            "has_arbitrage_signal": any(
+                signal.signal_type == SpreadSignalType.ARBITRAGE
+                for signal in signals
+            ),
+            "has_data_quality_block": any(
+                signal.signal_type
+                in {
+                    SpreadSignalType.STALE_DATA,
+                    SpreadSignalType.INVALID_DATA,
+                }
+                for signal in signals
+            ),
+            "signals": [
+                self._signal_metadata(signal)
+                for signal in signals
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # Extractors
+    # ------------------------------------------------------------------
+
+    def _extract_edge_bps(self, opportunity: ArbitrageOpportunity) -> Decimal | None:
+        if opportunity.spread_bps is not None:
+            return opportunity.spread_bps
+
+        if opportunity.spread_pct is not None:
+            return opportunity.spread_pct * Decimal("100")
+
+        return None
+
+    def _extract_snapshot_edge_bps(self, snapshot: SpreadSnapshot) -> Decimal | None:
+        metadata_edge = _to_decimal(
+            self._metadata_str(
+                snapshot.metadata,
+                "opportunity_net_edge_bps",
+                "net_edge_bps",
+                "edge_bps",
+            )
+        )
+        if metadata_edge is not None:
+            return metadata_edge
+
+        if snapshot.spread_bps is not None:
+            return _safe_abs_decimal(snapshot.spread_bps)
+
+        return None
+
+    def _extract_snapshot_net_edge(self, snapshot: SpreadSnapshot) -> Decimal | None:
+        metadata_edge = _to_decimal(
+            self._metadata_str(
+                snapshot.metadata,
+                "opportunity_net_edge",
+                "net_edge",
+                "edge_after_costs",
+            )
+        )
+        if metadata_edge is not None:
+            return metadata_edge
+
+        return snapshot.net_spread
+
+    def _extract_snapshot_confidence(self, snapshot: SpreadSnapshot) -> Decimal | None:
+        return _to_decimal(
+            self._metadata_str(
+                snapshot.metadata,
+                "opportunity_confidence",
+                "confidence",
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+
+    def _instrument_type_value(self, value: InstrumentType | str) -> str:
+        if isinstance(value, InstrumentType):
+            return value.value
+        return str(value).strip().lower()
+
+    def _metadata_str(
+        self,
+        metadata: dict[str, Any] | None,
+        *keys: str,
+    ) -> str | None:
+        if not metadata:
+            return None
+
+        for key in keys:
+            if key in metadata and metadata.get(key) is not None:
+                value = str(metadata.get(key)).strip()
+                if value:
+                    return value
+
+        return None
+
+    def _to_str(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    def _safe_scope_payload(self, key: Any) -> dict[str, str] | None:
+        if key is None:
+            return None
+
+        if isinstance(key, tuple) and len(key) == 4:
+            exchange, market_type, symbol, timeframe = key
+            return {
+                "exchange": str(exchange),
+                "market_type": str(market_type),
+                "symbol": str(symbol),
+                "timeframe": str(timeframe),
+            }
+
+        return None
