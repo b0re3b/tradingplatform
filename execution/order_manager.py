@@ -359,6 +359,23 @@ class OrderManager:
                     name,
                 )
 
+    def _register_submit_stats(self, result: OrderResult) -> None:
+        """
+        Register stats for create_order response.
+
+        Binance REST may immediately return terminal or partial status:
+        - FILLED
+        - PARTIALLY_FILLED
+        - REJECTED
+        - EXPIRED
+
+        Therefore submit stats and lifecycle stats must both be updated here.
+        """
+        self._stats.register_submit(result)
+
+        if result.status is not OrderStatus.NEW:
+            self._stats.register_update(result)
+
     async def submit_order(self, request: OrderRequest) -> OrderResult:
         """
         Submit an order to Binance USD-M Futures.
@@ -405,7 +422,7 @@ class OrderManager:
 
             async with self._lock:
                 self._upsert_order_state(result)
-                self._stats.register_submit(result)
+                self._register_submit_stats(result)
 
             await self._emit_order_submitted(result)
             await self._emit_order_lifecycle_event(result)

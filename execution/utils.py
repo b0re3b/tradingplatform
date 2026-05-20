@@ -853,24 +853,47 @@ def extract_symbol(payload: Mapping[str, Any]) -> str:
 
 
 def extract_executed_quantity(payload: Mapping[str, Any]) -> float:
-    value = (
-        payload.get("executed_qty")
-        if payload.get("executed_qty") is not None
-        else payload.get("executedQty")
-    )
+    """
+    Extract executed/cumulative quantity from either:
+    - Binance normalized REST payload;
+    - execution.order_* event payload produced by OrderResult.to_event_payload().
+    """
+    value = payload.get("executed_quantity")
 
     if value is None:
-        value = payload.get("cum_qty") if payload.get("cum_qty") is not None else payload.get("cumQty")
+        value = payload.get("executed_qty")
+
+    if value is None:
+        value = payload.get("executedQty")
+
+    if value is None:
+        value = payload.get("cum_qty")
+
+    if value is None:
+        value = payload.get("cumQty")
+
+    if value is None:
+        value = payload.get("cumulative_quantity")
 
     return safe_float(value, default=0.0) or 0.0
 
 
 def extract_original_quantity(payload: Mapping[str, Any]) -> float:
-    value = (
-        payload.get("orig_qty")
-        if payload.get("orig_qty") is not None
-        else payload.get("origQty")
-    )
+    """
+    Extract original requested quantity from either:
+    - Binance normalized REST payload;
+    - execution.order_* event payload produced by OrderResult.to_event_payload().
+    """
+    value = payload.get("original_quantity")
+
+    if value is None:
+        value = payload.get("orig_qty")
+
+    if value is None:
+        value = payload.get("origQty")
+
+    if value is None:
+        value = payload.get("quantity")
 
     return safe_float(value, default=0.0) or 0.0
 

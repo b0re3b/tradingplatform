@@ -75,7 +75,13 @@ from execution.sl_tp_manager import (
     SLTPManager,
 )
 from execution.smart_execution import SmartExecution
-
+from execution.trade_executor import (
+    MarketContextProvider,
+    OrderManagerProtocol,
+    PositionManagerProtocol,
+    SLTPManagerProtocol,
+    TradeExecutor,
+)
 
 __all__ = [
     # Config
@@ -145,5 +151,14 @@ __all__ = [
     "PositionManager",
     "SLTPManager",
     "SmartExecution",
+    "TradeExecutor",
 
+    # Protocols / integration contracts
+    "BinanceOrderClientProtocol",
+    "BinancePositionClientProtocol",
+    "OrderManagerProtocol",
+    "PositionManagerProtocol",
+    "SLTPManagerProtocol",
+    "SLTPOrderManagerProtocol",
+    "MarketContextProvider",
 ]

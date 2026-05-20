@@ -271,25 +271,26 @@ class SmartExecution:
         )
 
     def split_order(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
+            self,
+            intent: ExecutionIntent,
+            *,
+            market_context: Mapping[str, Any] | None = None,
     ) -> list[float]:
         """
         Split final_size into quantities for multiple execution legs.
 
         Never increases total quantity above risk-approved final_size.
+        Every returned quantity is rounded to step_size when provided.
         """
         context = dict(market_context or {})
         quantity = require_positive_number(intent.final_size, "intent.final_size")
+        step_size = self._float_or_none(context.get("step_size"))
 
         split_count = self._resolve_split_count(intent, context)
 
         if split_count <= 1:
-            return [quantity]
-
-        step_size = self._float_or_none(context.get("step_size"))
+            rounded = round_quantity(quantity, step_size)
+            return [rounded] if rounded > 0 else []
 
         base_qty = quantity / split_count
         quantities: list[float] = []
@@ -297,24 +298,37 @@ class SmartExecution:
         remaining = quantity
 
         for index in range(split_count):
+            if remaining <= 0:
+                break
+
             if index == split_count - 1:
-                leg_qty = remaining
+                leg_qty = round_quantity(remaining, step_size)
             else:
                 leg_qty = round_quantity(base_qty, step_size)
-                remaining -= leg_qty
+
+            if leg_qty <= 0:
+                continue
+
+            if leg_qty > remaining:
+                leg_qty = round_quantity(remaining, step_size)
 
             if leg_qty <= 0:
                 continue
 
             quantities.append(leg_qty)
+            remaining -= leg_qty
 
         total = sum(quantities)
 
         if total > quantity:
             scale = quantity / total
-            quantities = [qty * scale for qty in quantities]
+            quantities = [
+                round_quantity(qty * scale, step_size)
+                for qty in quantities
+            ]
+            quantities = [qty for qty in quantities if qty > 0]
 
-        return [qty for qty in quantities if qty > 0]
+        return quantities
 
     def choose_limit_price(
         self,
@@ -382,21 +396,27 @@ class SmartExecution:
     # ------------------------------------------------------------------
 
     def _build_market_plan(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None,
+            self,
+            intent: ExecutionIntent,
+            *,
+            market_context: Mapping[str, Any] | None,
     ) -> ExecutionPlan:
         quantity = self._rounded_quantity(intent.final_size, market_context)
+
+        # Binance USD-M Futures closePosition=True is not valid for plain
+        # MARKET orders. For immediate close/reduce we use quantity +
+        # reduce_only=True.
+        close_position = False
+        reduce_only = bool(intent.is_reduce_only)
 
         leg = ExecutionLeg(
             symbol=intent.symbol,
             side=intent.order_side,
             order_type=OrderType.MARKET,
-            quantity=quantity if not intent.close_position else None,
+            quantity=quantity,
             position_side=intent.side,
-            reduce_only=intent.is_reduce_only and not intent.close_position,
-            close_position=intent.close_position,
+            reduce_only=reduce_only,
+            close_position=close_position,
             trigger_type=(
                 TriggerType.RISK_CLOSE
                 if intent.order_intent is OrderIntent.CLOSE
@@ -407,6 +427,7 @@ class SmartExecution:
             metadata={
                 "execution_mode": ExecutionMode.MARKET.value,
                 "source": "smart_execution",
+                "intent_close_position": intent.close_position,
             },
         )
 

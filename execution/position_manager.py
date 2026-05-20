@@ -285,8 +285,12 @@ class PositionManager:
         """
         Apply normalized fill to local position state.
 
-        Returns emitted PositionUpdate or None when fill has zero delta after
-        deduplication.
+        Important:
+        - BUY fill increases LONG or reduces SHORT.
+        - SELL fill increases SHORT or reduces LONG.
+        - If an opposite open position exists, the fill is applied to that
+          existing position first, which matches one-way/netting futures logic.
+        - Cumulative order fills are converted to delta fills before applying.
         """
         fill.validate()
 
@@ -306,24 +310,33 @@ class PositionManager:
                     return None
 
                 self._applied_order_qty[order_key] = fill.quantity
-
                 fill = self._copy_fill_with_quantity(fill, delta_qty)
 
-            key = self._position_key(fill.symbol, fill.position_side)
-            state = self._positions.get(key)
+            state_key, state, effective_fill_side = self._resolve_position_state_for_fill(fill)
+
+            # PositionState.apply_fill() treats fill.position_side as the
+            # effective fill direction:
+            # - same as current position side => increase;
+            # - opposite to current position side => reduce/close/reverse.
+            fill.position_side = effective_fill_side
 
             if state is None:
                 state = self._new_position_state_from_fill(fill)
-                self._positions[key] = state
+                self._positions[state_key] = state
 
             self._enrich_state_from_fill_metadata(state, fill)
 
+            previous_key = state_key
             update = state.apply_fill(fill)
 
-            if update.update_type == "closed" and not state.is_open:
-                # Keep the closed state for audit/snapshot. It can be replaced
-                # by future open on the same key.
-                pass
+            # If a fill reverses the position, the runtime key must move from
+            # old side to new side. Closed positions intentionally remain under
+            # their previous side key for audit/readback compatibility.
+            if update.update_type == "reversed" and state.side is not None:
+                new_key = self._position_key(state.symbol, state.side)
+                if new_key != previous_key:
+                    self._positions.pop(previous_key, None)
+                    self._positions[new_key] = state
 
             self._stats.register_update(update)
 
@@ -684,9 +697,9 @@ class PositionManager:
             return None
 
         price = (
-            safe_float(payload.get("avg_price"))
-            or calculate_order_avg_price_from_payload(payload)
-            or safe_float(payload.get("price"))
+                safe_float(payload.get("avg_price"))
+                or calculate_order_avg_price_from_payload(payload)
+                or safe_float(payload.get("price"))
         )
 
         if price is None or price <= 0:
@@ -706,9 +719,24 @@ class PositionManager:
             )
 
         quote_qty = (
-            safe_float(payload.get("cumulative_quote_quantity"))
-            or safe_float(payload.get("cum_quote"))
-            or safe_float(payload.get("quote_quantity"))
+                safe_float(payload.get("cumulative_quote_quantity"))
+                or safe_float(payload.get("cumulative_quote_qty"))
+                or safe_float(payload.get("cum_quote"))
+                or safe_float(payload.get("quote_quantity"))
+                or safe_float(payload.get("quote_qty"))
+        )
+
+        source_metadata = dict(payload.get("metadata") or {})
+
+        stop_loss = self._payload_or_metadata(payload, "stop_loss")
+        take_profit = self._payload_or_metadata(payload, "take_profit")
+        final_risk_amount = self._payload_or_metadata(payload, "final_risk_amount")
+        final_margin = self._payload_or_metadata(payload, "final_margin")
+        final_notional = self._payload_or_metadata(payload, "final_notional")
+        final_leverage = self._payload_or_metadata(payload, "final_leverage")
+        tier = (
+                self._payload_or_metadata(payload, "tier")
+                or self._payload_or_metadata(payload, "final_tier")
         )
 
         return OrderFill(
@@ -733,23 +761,66 @@ class PositionManager:
             reservation_id=payload.get("reservation_id"),
             fill_time=payload.get("exchange_time") or payload.get("update_time") or payload.get("timestamp"),
             metadata=merge_metadata(
-                payload.get("metadata"),
+                source_metadata,
                 {
                     "source_event": "execution.order_filled",
+                    "execution_id": payload.get("execution_id"),
                     "order_status": payload.get("status"),
                     "trigger_type": payload.get("trigger_type"),
-                    "tier": payload.get("tier"),
-                    "stop_loss": payload.get("stop_loss"),
-                    "take_profit": payload.get("take_profit"),
-                    "final_risk_amount": payload.get("final_risk_amount"),
-                    "final_margin": payload.get("final_margin"),
-                    "final_notional": payload.get("final_notional"),
-                    "final_leverage": payload.get("final_leverage"),
+                    "tier": tier,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                    "final_risk_amount": final_risk_amount,
+                    "final_margin": final_margin,
+                    "final_notional": final_notional,
+                    "final_leverage": final_leverage,
                 },
             ),
             raw=dict(payload),
         )
+    def _resolve_position_state_for_fill(
+        self,
+        fill: OrderFill,
+    ) -> tuple[str, PositionState | None, PositionSide]:
+        """
+        Resolve target position state and effective fill direction.
 
+        This is intentionally netting-first:
+        - SELL first tries to reduce an existing LONG.
+        - BUY first tries to reduce an existing SHORT.
+        - If there is no opposite open position, BUY opens/increases LONG and
+          SELL opens/increases SHORT.
+
+        This avoids the bug where SELL with position_side=SHORT opens a new
+        SHORT position instead of reducing an existing LONG.
+        """
+        symbol = normalize_symbol(fill.symbol)
+
+        long_key = self._position_key(symbol, PositionSide.LONG)
+        short_key = self._position_key(symbol, PositionSide.SHORT)
+
+        long_state = self._positions.get(long_key)
+        short_state = self._positions.get(short_key)
+
+        if fill.side is OrderSide.SELL:
+            if long_state is not None and long_state.is_open:
+                return long_key, long_state, PositionSide.SHORT
+
+            if short_state is not None:
+                return short_key, short_state, PositionSide.SHORT
+
+            return short_key, None, PositionSide.SHORT
+
+        if fill.side is OrderSide.BUY:
+            if short_state is not None and short_state.is_open:
+                return short_key, short_state, PositionSide.LONG
+
+            if long_state is not None:
+                return long_key, long_state, PositionSide.LONG
+
+            return long_key, None, PositionSide.LONG
+
+        raise PositionError(f"Unsupported fill side: {fill.side!r}")
     def _new_position_state_from_fill(self, fill: OrderFill) -> PositionState:
         leverage = safe_float(fill.metadata.get("final_leverage"))
         margin_used = safe_float(fill.metadata.get("final_margin"), 0.0) or 0.0
@@ -930,7 +1001,32 @@ class PositionManager:
             return PositionSide.SHORT
 
         return None
+    @staticmethod
+    def _payload_or_metadata(
+        payload: Mapping[str, Any],
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        """
+        Read value from top-level payload first, then from payload["metadata"].
 
+        Important for execution.order_* events:
+        OrderResult.to_event_payload() may keep risk-approved fields inside
+        metadata, while PositionManager needs them to build position.opened
+        payload for SLTPManager.
+        """
+        value = payload.get(key)
+
+        if value is not None:
+            return value
+
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping):
+            value = metadata.get(key)
+            if value is not None:
+                return value
+
+        return default
     @staticmethod
     def _trade_tier_from_raw(value: Any) -> TradeTier | None:
         if value is None:

@@ -1,750 +1,1156 @@
 from __future__ import annotations
 
 import asyncio
-import math
-from collections.abc import Mapping
-from typing import Any
+import inspect
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Protocol
 
+from core.event_bus import Event, EventBus, EventPriority
 from core.logger import get_logger
-from execution.config import SmartExecutionConfig
-from execution.enums import ExecutionMode, ExecutionStatus, OrderType, TimeInForce, TriggerType
-from execution.exceptions import ExecutionPlanError, ExecutionPlanValidationError, SmartExecutionError
-from execution.models import ExecutionIntent, ExecutionLeg, ExecutionPlan, SmartExecutionStats
-from execution.utils import (
-    calculate_spread_bps,
-    now_ts,
-    require_positive_number,
-    round_price,
-    round_quantity,
+from core.scheduler import Scheduler
+from execution.config import TradeExecutorConfig
+from execution.enums import ExecutionStatus
+from execution.exceptions import (
+    ExecutionError,
+    ExecutionRejectedError,
+    KillSwitchActiveError,
 )
-from risk.enums import OrderIntent
+from execution.models import (
+    ExecutionIntent,
+    ExecutionPlan,
+    ExecutionStats,
+    OrderRequest,
+    OrderResult,
+    PositionState,
+)
+from execution.smart_execution import SmartExecution
+from execution.utils import (
+    merge_metadata,
+    normalize_exchange,
+    normalize_market_type,
+    normalize_symbol,
+    now_ms,
+    now_ts,
+    safe_float,
+)
+from risk.enums import MarginMode, OrderIntent, PositionSide, RiskMode, TradeTier
+from risk.models import RiskDecision
 
 
-class SmartExecution:
+class OrderManagerProtocol(Protocol):
+    async def submit_order(self, request: OrderRequest) -> OrderResult:
+        ...
+
+    async def cancel_all_orders(
+        self,
+        *,
+        symbol: str,
+        exchange: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        ...
+
+
+class PositionManagerProtocol(Protocol):
+    def get_position(
+        self,
+        *,
+        symbol: str,
+        side: PositionSide | str | None = None,
+    ) -> PositionState | None:
+        ...
+
+    def list_positions(
+        self,
+        *,
+        symbol: str | None = None,
+        include_closed: bool = False,
+    ) -> list[PositionState]:
+        ...
+
+
+class SLTPManagerProtocol(Protocol):
+    async def cancel_protective_orders(
+        self,
+        *,
+        symbol: str,
+        position_side: PositionSide | str | None = None,
+        position_id: str | None = None,
+        sltp_type: Any | None = None,
+        reason: str | None = None,
+    ) -> list[Any]:
+        ...
+
+
+MarketContextProvider = Callable[[ExecutionIntent], Mapping[str, Any] | Awaitable[Mapping[str, Any]]]
+
+
+class TradeExecutor:
     """
-    Execution planning layer.
+    Final execution orchestrator.
 
     Responsibilities:
-    - convert risk-approved ExecutionIntent into ExecutionPlan;
-    - choose technical order placement mode: market, limit, post-only, smart,
-      liquidity-aware or TWAP;
-    - optionally split large orders into several legs;
-    - respect execution constraints such as max slippage, max spread, min leg
-      notional and risk-approved size;
-    - never approve risk;
-    - never recalculate position size/leverage/tier;
-    - never submit orders directly.
+    - listen to risk-approved signal.confirmed events;
+    - convert RiskDecision / signal.confirmed payload into ExecutionIntent;
+    - coordinate SmartExecution -> ExecutionPlan -> OrderManager.submit_order();
+    - handle risk.position_close_requested;
+    - handle risk.position_reduce_requested;
+    - handle risk.kill_switch;
+    - emit execution lifecycle events;
+    - never listen to signal.generated;
+    - never duplicate risk sizing, guards, budgets or exposure logic.
 
-    SmartExecution output is ExecutionPlan. OrderManager is responsible for
-    actual exchange order submission.
+    Important architecture contract:
+    Strategy emits signal.generated.
+    RiskManager consumes signal.generated and emits signal.confirmed.
+    TradeExecutor consumes only signal.confirmed for new/increase entries.
     """
 
     def __init__(
         self,
-        config: SmartExecutionConfig,
+        config: TradeExecutorConfig,
         *,
-        service_name: str = "execution.smart_execution",
+        order_manager: OrderManagerProtocol,
+        position_manager: PositionManagerProtocol | None = None,
+        sltp_manager: SLTPManagerProtocol | None = None,
+        smart_execution: SmartExecution,
+        event_bus: EventBus | None = None,
+        scheduler: Scheduler | None = None,
+        market_context_provider: MarketContextProvider | None = None,
+        service_name: str = "execution.trade_executor",
+        auto_subscribe: bool | None = None,
+        register_scheduler_jobs: bool | None = None,
     ) -> None:
         self._config = config
         self._config.validate()
 
+        self._order_manager = order_manager
+        self._position_manager = position_manager
+        self._sltp_manager = sltp_manager
+        self._smart_execution = smart_execution
+
+        self._event_bus = event_bus
+        self._scheduler = scheduler
+        self._market_context_provider = market_context_provider
+
+        self._service_name = service_name
+        self._auto_subscribe = (
+            self._config.auto_subscribe if auto_subscribe is None else auto_subscribe
+        )
+        self._register_scheduler_jobs = (
+            self._config.register_scheduler_jobs
+            if register_scheduler_jobs is None
+            else register_scheduler_jobs
+        )
+
         self._logger = get_logger(
             __name__,
             service=service_name,
-            event_type="smart_execution",
+            event_type="trade_executor",
         )
 
-        self._service_name = service_name
-        self._stats = SmartExecutionStats()
+        self._lock = asyncio.Lock()
+        self._execution_semaphore = asyncio.Semaphore(self._config.max_concurrent_executions)
+        self._symbol_locks: dict[str, asyncio.Lock] = {}
+
+        self._subscriptions: list[Any] = []
+        self._scheduler_jobs: list[Any] = []
+
+        self._active_executions: dict[str, ExecutionIntent] = {}
+        self._execution_status: dict[str, ExecutionStatus] = {}
+
+        self._stats = ExecutionStats()
+
+        self._running = False
+        self._started_at: float | None = None
+        self._kill_switch_active = False
+        self._kill_switch_reason: str | None = None
 
     @property
-    def stats(self) -> SmartExecutionStats:
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def kill_switch_active(self) -> bool:
+        return self._kill_switch_active
+
+    @property
+    def stats(self) -> ExecutionStats:
         return self._stats
 
-    async def build_execution_plan(
+    async def start(self) -> None:
+        if self._running:
+            self._logger.warning("TradeExecutor already started")
+            return
+
+        self._running = True
+        self._started_at = now_ts()
+
+        if self._event_bus is not None and self._auto_subscribe:
+            self.register()
+
+        if self._scheduler is not None and self._register_scheduler_jobs:
+            self.register_scheduler_jobs()
+
+        await self._emit_event(
+            "execution.trade_executor.started",
+            {
+                "service": self._service_name,
+                "started_at": self._started_at,
+                "auto_subscribe": self._auto_subscribe,
+                "scheduler_jobs": len(self._scheduler_jobs),
+            },
+            priority=EventPriority.LOW,
+        )
+
+        self._logger.info(
+            "TradeExecutor started | subscriptions=%s scheduler_jobs=%s",
+            len(self._subscriptions),
+            len(self._scheduler_jobs),
+        )
+
+    async def stop(self) -> None:
+        if not self._running:
+            self._logger.warning("TradeExecutor already stopped")
+            return
+
+        self.unregister()
+
+        await self._emit_event(
+            "execution.trade_executor.stopped",
+            {
+                "service": self._service_name,
+                "stopped_at": now_ts(),
+            },
+            priority=EventPriority.LOW,
+        )
+
+        self._running = False
+        self._logger.info("TradeExecutor stopped")
+
+    def register(self) -> None:
+        """
+        Register EventBus subscriptions.
+
+        TradeExecutor intentionally does not subscribe to:
+        - signal.generated
+        - analytics.*
+        - strategy.*
+        """
+        if self._event_bus is None:
+            self._logger.warning("Cannot register TradeExecutor: event_bus is not configured")
+            return
+
+        if self._subscriptions:
+            self._logger.warning("TradeExecutor subscriptions already registered")
+            return
+
+        self._subscriptions.extend(
+            [
+                self._event_bus.subscribe(
+                    "signal.confirmed",
+                    self._handle_signal_confirmed,
+                    name="execution_trade_executor_on_signal_confirmed",
+                ),
+                self._event_bus.subscribe(
+                    "risk.position_close_requested",
+                    self._handle_position_close_requested,
+                    name="execution_trade_executor_on_position_close_requested",
+                ),
+                self._event_bus.subscribe(
+                    "risk.position_reduce_requested",
+                    self._handle_position_reduce_requested,
+                    name="execution_trade_executor_on_position_reduce_requested",
+                ),
+                self._event_bus.subscribe(
+                    "risk.kill_switch",
+                    self._handle_kill_switch,
+                    name="execution_trade_executor_on_kill_switch",
+                ),
+                self._event_bus.subscribe(
+                    "risk.manual_resume",
+                    self._handle_manual_resume,
+                    name="execution_trade_executor_on_manual_resume",
+                ),
+                self._event_bus.subscribe(
+                    "execution.order_filled",
+                    self._handle_execution_order_filled,
+                    name="execution_trade_executor_on_order_filled",
+                ),
+                self._event_bus.subscribe(
+                    "execution.order_failed",
+                    self._handle_execution_order_failed,
+                    name="execution_trade_executor_on_order_failed",
+                ),
+                self._event_bus.subscribe(
+                    "execution.order_rejected",
+                    self._handle_execution_order_rejected,
+                    name="execution_trade_executor_on_order_rejected",
+                ),
+                self._event_bus.subscribe(
+                    "execution.order_cancelled",
+                    self._handle_execution_order_cancelled,
+                    name="execution_trade_executor_on_order_cancelled",
+                ),
+            ]
+        )
+
+        self._logger.info(
+            "TradeExecutor subscriptions registered | count=%s",
+            len(self._subscriptions),
+        )
+
+    def unregister(self) -> None:
+        if self._event_bus is None:
+            self._subscriptions.clear()
+            return
+
+        for subscription in self._subscriptions:
+            try:
+                self._event_bus.unsubscribe(subscription)
+            except Exception:
+                self._logger.exception("Failed to unsubscribe TradeExecutor subscription")
+
+        count = len(self._subscriptions)
+        self._subscriptions.clear()
+
+        self._logger.info(
+            "TradeExecutor subscriptions unregistered | count=%s",
+            count,
+        )
+
+    def register_scheduler_jobs(self) -> None:
+        """
+        Register defensive cleanup through Scheduler.
+
+        No unmanaged asyncio loops are used.
+        """
+        if self._scheduler is None:
+            return
+
+        try:
+            job = self._scheduler.add_interval_job(
+                self.cleanup_stale_executions,
+                interval_seconds=max(5.0, self._config.execution_timeout_seconds),
+                name="execution.trade_executor.cleanup_stale_executions",
+                run_immediately=False,
+            )
+            self._scheduler_jobs.append(job)
+        except Exception:
+            self._logger.exception("Failed to register TradeExecutor scheduler job")
+
+    async def execute_intent(
         self,
         intent: ExecutionIntent,
         *,
         market_context: Mapping[str, Any] | None = None,
-        mode: ExecutionMode | None = None,
     ) -> ExecutionPlan:
         """
-        Build execution plan from risk-approved ExecutionIntent.
+        Execute one risk-approved intent.
 
-        market_context is optional and may contain:
-        - bid
-        - ask
-        - mark_price
-        - last_price
-        - tick_size
-        - step_size
-        - min_notional
-        - available_depth_notional
-        - preferred_limit_price
+        Flow:
+        ExecutionIntent -> SmartExecution.build_execution_plan()
+        -> OrderManager.submit_order(...) for each leg.
         """
+        intent.validate()
+
+        if not self._config.enabled:
+            raise ExecutionRejectedError("TradeExecutor is disabled")
+
+        self._validate_execution_allowed(intent)
+
+        symbol_lock = self._get_symbol_lock(intent.symbol)
+
+        async with self._execution_semaphore:
+            if self._config.per_symbol_execution_lock:
+                async with symbol_lock:
+                    return await self._execute_intent_locked(intent, market_context=market_context)
+
+            return await self._execute_intent_locked(intent, market_context=market_context)
+
+    async def execute_plan(self, plan: ExecutionPlan) -> list[OrderResult]:
+        """
+        Submit every order request from an already built plan.
+
+        This method does not rebuild or re-approve the plan.
+        """
+        plan.validate()
+
+        results: list[OrderResult] = []
+
+        for request in plan.to_order_requests():
+            result = await self._order_manager.submit_order(request)
+            results.append(result)
+
+        return results
+
+    async def close_position(
+        self,
+        *,
+        symbol: str,
+        side: PositionSide | str,
+        size: float | None = None,
+        position_id: str | None = None,
+        signal_id: str | None = None,
+        strategy_name: str | None = None,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ExecutionPlan:
+        """
+        Close an existing position through reduce-only execution.
+
+        RiskManager should normally request this through
+        risk.position_close_requested.
+        """
+        side_n = self._position_side_from_raw(side)
+        if side_n is None:
+            raise ExecutionRejectedError("position side is required for close_position")
+
+        position = (
+            self._position_manager.get_position(symbol=symbol, side=side_n)
+            if self._position_manager is not None
+            else None
+        )
+
+        resolved_size = size
+        if resolved_size is None and position is not None:
+            resolved_size = position.size
+
+        if resolved_size is None or resolved_size <= 0:
+            raise ExecutionRejectedError("close_position requires positive size")
+
+        intent = ExecutionIntent(
+            exchange=self._config.default_exchange,
+            market_type=self._config.default_market_type,
+            symbol=symbol,
+            side=side_n,
+            order_intent=OrderIntent.CLOSE,
+            final_size=resolved_size,
+            final_leverage=position.leverage if position and position.leverage else 1.0,
+            final_tier=position.tier if position else None,
+            final_risk_amount=position.risk_amount if position else 0.0,
+            final_margin=position.margin_used if position else 0.0,
+            final_notional=position.notional_value if position else 0.0,
+            entry_price=position.entry_price if position else None,
+            stop_loss=position.stop_loss if position else None,
+            take_profit=position.take_profit if position else None,
+            signal_id=signal_id or (position.signal_id if position else None),
+            strategy_name=strategy_name or (position.strategy_name if position else None),
+            reservation_id=position.reservation_id if position else None,
+            risk_mode=RiskMode.REDUCE_ONLY,
+            margin_mode=MarginMode.ISOLATED,
+            reduce_only=True,
+            close_position=False,
+            metadata=merge_metadata(
+                metadata,
+                {
+                    "manual_reason": reason,
+                    "position_id": position_id or (position.position_id if position else None),
+                    "source": "close_position",
+                },
+            ),
+        )
+
+        return await self.execute_intent(intent)
+
+    async def reduce_position(
+        self,
+        *,
+        symbol: str,
+        side: PositionSide | str,
+        reduce_size: float,
+        position_id: str | None = None,
+        signal_id: str | None = None,
+        strategy_name: str | None = None,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ExecutionPlan:
+        """
+        Reduce an existing position through reduce-only execution.
+        """
+        side_n = self._position_side_from_raw(side)
+        if side_n is None:
+            raise ExecutionRejectedError("position side is required for reduce_position")
+
+        if reduce_size <= 0:
+            raise ExecutionRejectedError("reduce_size must be > 0")
+
+        position = (
+            self._position_manager.get_position(symbol=symbol, side=side_n)
+            if self._position_manager is not None
+            else None
+        )
+
+        if position is not None and position.size > 0:
+            reduce_size = min(reduce_size, position.size)
+
+        intent = ExecutionIntent(
+            exchange=self._config.default_exchange,
+            market_type=self._config.default_market_type,
+            symbol=symbol,
+            side=side_n,
+            order_intent=OrderIntent.REDUCE,
+            final_size=reduce_size,
+            final_leverage=position.leverage if position and position.leverage else 1.0,
+            final_tier=position.tier if position else None,
+            final_risk_amount=position.risk_amount if position else 0.0,
+            final_margin=position.margin_used if position else 0.0,
+            final_notional=position.notional_value if position else 0.0,
+            entry_price=position.entry_price if position else None,
+            stop_loss=position.stop_loss if position else None,
+            take_profit=position.take_profit if position else None,
+            signal_id=signal_id or (position.signal_id if position else None),
+            strategy_name=strategy_name or (position.strategy_name if position else None),
+            reservation_id=position.reservation_id if position else None,
+            risk_mode=RiskMode.REDUCE_ONLY,
+            margin_mode=MarginMode.ISOLATED,
+            reduce_only=True,
+            close_position=False,
+            metadata=merge_metadata(
+                metadata,
+                {
+                    "manual_reason": reason,
+                    "position_id": position_id or (position.position_id if position else None),
+                    "source": "reduce_position",
+                },
+            ),
+        )
+
+        return await self.execute_intent(intent)
+
+    async def handle_kill_switch(
+        self,
+        *,
+        reason: str | None = None,
+        cancel_open_orders: bool = True,
+    ) -> None:
+        """
+        Activate execution kill switch.
+
+        TradeExecutor blocks new risk-increasing entries. It may cancel open
+        orders, but actual position closing should be requested explicitly by
+        RiskManager through risk.position_close_requested.
+        """
+        self._kill_switch_active = True
+        self._kill_switch_reason = reason or "risk.kill_switch"
+
+        if cancel_open_orders and self._config.kill_switch_cancels_open_orders:
+            await self._cancel_open_orders_for_known_symbols(reason=self._kill_switch_reason)
+
+        await self._emit_event(
+            "execution.kill_switch_handled",
+            {
+                "exchange": self._config.default_exchange,
+                "market_type": self._config.default_market_type,
+                "reason": self._kill_switch_reason,
+                "cancel_open_orders": cancel_open_orders,
+                "timestamp": now_ms(),
+            },
+            priority=EventPriority.CRITICAL,
+        )
+
+    async def cleanup_stale_executions(self) -> None:
+        """
+        Defensive cleanup of stale active execution metadata.
+        """
+        now = now_ts()
+        stale_ids: list[str] = []
+
+        async with self._lock:
+            for execution_id, intent in self._active_executions.items():
+                age = now - intent.created_at
+                if age >= self._config.execution_timeout_seconds:
+                    stale_ids.append(execution_id)
+
+            for execution_id in stale_ids:
+                self._active_executions.pop(execution_id, None)
+                self._execution_status[execution_id] = ExecutionStatus.EXPIRED
+
+        for execution_id in stale_ids:
+            await self._emit_event(
+                "execution.execution_expired",
+                {
+                    "execution_id": execution_id,
+                    "timestamp": now_ms(),
+                },
+                priority=EventPriority.HIGH,
+            )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "service": self._service_name,
+            "running": self._running,
+            "started_at": self._started_at,
+            "kill_switch_active": self._kill_switch_active,
+            "kill_switch_reason": self._kill_switch_reason,
+            "active_executions": len(self._active_executions),
+            "execution_status": {
+                execution_id: status.value
+                for execution_id, status in self._execution_status.items()
+            },
+            "stats": self._stats.snapshot(),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal execution flow
+    # ------------------------------------------------------------------
+
+    async def _execute_intent_locked(
+        self,
+        intent: ExecutionIntent,
+        *,
+        market_context: Mapping[str, Any] | None,
+    ) -> ExecutionPlan:
+        async with self._lock:
+            self._active_executions[intent.execution_id] = intent
+            self._execution_status[intent.execution_id] = ExecutionStatus.ACCEPTED
+            self._stats.register_started(intent.execution_id)
+
+        await self._emit_event(
+            "execution.trade_accepted",
+            intent.to_event_payload(),
+            priority=EventPriority.HIGH,
+        )
+
         try:
-            intent.validate()
+            resolved_market_context = (
+                market_context
+                if market_context is not None
+                else await self._resolve_market_context(intent)
+            )
 
-            selected_mode = mode or self.choose_execution_mode(
+            await self._emit_event(
+                "execution.execution_started",
+                intent.to_event_payload(),
+                priority=EventPriority.HIGH,
+            )
+
+            plan = await self._smart_execution.build_execution_plan(
                 intent,
-                market_context=market_context,
+                market_context=resolved_market_context,
             )
 
-            if selected_mode is ExecutionMode.MARKET:
-                plan = self._build_market_plan(intent, market_context=market_context)
+            async with self._lock:
+                self._execution_status[intent.execution_id] = ExecutionStatus.PLANNED
 
-            elif selected_mode is ExecutionMode.LIMIT:
-                plan = self._build_limit_plan(
-                    intent,
-                    market_context=market_context,
-                    post_only=False,
+            await self._emit_event(
+                "execution.execution_plan_created",
+                plan.to_event_payload(),
+                priority=EventPriority.HIGH,
+            )
+
+            results = await self.execute_plan(plan)
+
+            async with self._lock:
+                self._execution_status[intent.execution_id] = ExecutionStatus.SUBMITTED
+
+            await self._emit_event(
+                "execution.execution_submitted",
+                {
+                    **plan.to_event_payload(),
+                    "orders_count": len(results),
+                    "orders": [result.to_event_payload() for result in results],
+                },
+                priority=EventPriority.HIGH,
+            )
+
+            if all(result.is_filled for result in results):
+                async with self._lock:
+                    self._execution_status[intent.execution_id] = ExecutionStatus.COMPLETED
+                    self._active_executions.pop(intent.execution_id, None)
+                    self._stats.register_completed(intent.execution_id)
+
+                await self._emit_event(
+                    "execution.execution_completed",
+                    {
+                        **plan.to_event_payload(),
+                        "orders_count": len(results),
+                        "orders": [result.to_event_payload() for result in results],
+                    },
+                    priority=EventPriority.CRITICAL,
                 )
-
-            elif selected_mode is ExecutionMode.POST_ONLY:
-                plan = self._build_limit_plan(
-                    intent,
-                    market_context=market_context,
-                    post_only=True,
-                )
-
-            elif selected_mode is ExecutionMode.TWAP:
-                plan = self._build_twap_plan(intent, market_context=market_context)
-
-            elif selected_mode is ExecutionMode.LIQUIDITY_AWARE:
-                plan = self._build_liquidity_aware_plan(
-                    intent,
-                    market_context=market_context,
-                )
-
-            elif selected_mode is ExecutionMode.SMART:
-                plan = self._build_smart_plan(intent, market_context=market_context)
-
             else:
-                raise ExecutionPlanError(f"Unsupported execution mode: {selected_mode!r}")
-
-            plan.validate()
-            self._stats.register_plan(plan)
-
-            self._logger.info(
-                "Execution plan created | execution_id=%s symbol=%s mode=%s legs=%s qty=%s",
-                intent.execution_id,
-                intent.symbol,
-                plan.mode.value,
-                len(plan.legs),
-                plan.total_quantity,
-            )
+                async with self._lock:
+                    self._execution_status[intent.execution_id] = ExecutionStatus.SUBMITTED
 
             return plan
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._stats.register_failure(str(exc))
-            self._logger.exception(
-                "Failed to build execution plan | execution_id=%s symbol=%s",
-                intent.execution_id,
-                intent.symbol,
-            )
-            raise SmartExecutionError(f"Failed to build execution plan: {exc}") from exc
+            async with self._lock:
+                self._execution_status[intent.execution_id] = ExecutionStatus.FAILED
+                self._active_executions.pop(intent.execution_id, None)
+                self._stats.register_failed(str(exc), intent.execution_id)
 
-    def choose_execution_mode(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
-    ) -> ExecutionMode:
-        """
-        Choose execution mode.
-
-        This is not a risk decision. It only selects technical placement.
-        """
-        if not self._config.enabled:
-            return self._config.fallback_mode
-
-        if intent.reduces_risk and self._config.prefer_market_for_exits:
-            return ExecutionMode.MARKET
-
-        if intent.close_position:
-            return ExecutionMode.MARKET
-
-        context = dict(market_context or {})
-
-        spread_bps = self.estimate_spread_bps(context)
-        if spread_bps is not None and spread_bps > self._config.max_spread_bps:
-            if self._config.prefer_limit_for_entries:
-                return ExecutionMode.LIMIT
-            return self._config.fallback_mode
-
-        if self._config.default_mode is ExecutionMode.LIQUIDITY_AWARE:
-            if self._has_sufficient_depth(intent, context):
-                return ExecutionMode.LIQUIDITY_AWARE
-            return self._config.fallback_mode
-
-        if self._config.default_mode is ExecutionMode.TWAP:
-            if self._config.twap_enabled and self._should_split_order(intent, context):
-                return ExecutionMode.TWAP
-            return self._config.fallback_mode
-
-        if self._config.default_mode is ExecutionMode.SMART:
-            return ExecutionMode.SMART
-
-        return self._config.default_mode
-
-    def estimate_spread_bps(
-        self,
-        market_context: Mapping[str, Any] | None,
-    ) -> float | None:
-        context = dict(market_context or {})
-
-        bid = self._float_or_none(context.get("bid"))
-        ask = self._float_or_none(context.get("ask"))
-
-        if bid is None or ask is None or bid <= 0 or ask <= 0:
-            return None
-
-        try:
-            return calculate_spread_bps(bid=bid, ask=ask)
-        except ValueError:
-            return None
-
-    def estimate_slippage_bps(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
-    ) -> float | None:
-        """
-        Conservative rough slippage estimate.
-
-        If market_context already contains expected_slippage_bps, use it.
-        Otherwise approximate from order notional vs available depth.
-        """
-        context = dict(market_context or {})
-
-        explicit = self._float_or_none(context.get("expected_slippage_bps"))
-        if explicit is not None:
-            return max(0.0, explicit)
-
-        available_depth = self._float_or_none(context.get("available_depth_notional"))
-        if available_depth is None or available_depth <= 0:
-            return None
-
-        pressure = intent.final_notional / available_depth
-        return max(0.0, pressure * 10.0)
-
-    def should_use_market_order(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
-    ) -> bool:
-        if intent.reduces_risk and self._config.prefer_market_for_exits:
-            return True
-
-        slippage_bps = self.estimate_slippage_bps(intent, market_context=market_context)
-        if slippage_bps is not None and slippage_bps > self._config.max_slippage_bps:
-            return False
-
-        spread_bps = self.estimate_spread_bps(market_context)
-        if spread_bps is not None and spread_bps > self._config.max_spread_bps:
-            return False
-
-        return self._config.default_mode is ExecutionMode.MARKET
-
-    def should_use_post_only(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
-    ) -> bool:
-        if intent.reduces_risk:
-            return False
-
-        if self._config.default_mode is ExecutionMode.POST_ONLY:
-            return True
-
-        spread_bps = self.estimate_spread_bps(market_context)
-        return bool(
-            spread_bps is not None
-            and spread_bps <= self._config.max_spread_bps
-            and self._config.prefer_limit_for_entries
-        )
-
-    def split_order(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
-    ) -> list[float]:
-        """
-        Split final_size into quantities for multiple execution legs.
-
-        Never increases total quantity above risk-approved final_size.
-        """
-        context = dict(market_context or {})
-        quantity = require_positive_number(intent.final_size, "intent.final_size")
-
-        split_count = self._resolve_split_count(intent, context)
-
-        if split_count <= 1:
-            return [quantity]
-
-        step_size = self._float_or_none(context.get("step_size"))
-
-        base_qty = quantity / split_count
-        quantities: list[float] = []
-
-        remaining = quantity
-
-        for index in range(split_count):
-            if index == split_count - 1:
-                leg_qty = remaining
-            else:
-                leg_qty = round_quantity(base_qty, step_size)
-                remaining -= leg_qty
-
-            if leg_qty <= 0:
-                continue
-
-            quantities.append(leg_qty)
-
-        total = sum(quantities)
-
-        if total > quantity:
-            scale = quantity / total
-            quantities = [qty * scale for qty in quantities]
-
-        return [qty for qty in quantities if qty > 0]
-
-    def choose_limit_price(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None = None,
-        post_only: bool = False,
-    ) -> float:
-        """
-        Choose limit price from context.
-
-        Uses preferred_limit_price if provided. Otherwise derives from bid/ask.
-        """
-        context = dict(market_context or {})
-
-        preferred = self._float_or_none(context.get("preferred_limit_price"))
-        tick_size = self._float_or_none(context.get("tick_size"))
-
-        if preferred is not None and preferred > 0:
-            return round_price(preferred, tick_size)
-
-        bid = self._float_or_none(context.get("bid"))
-        ask = self._float_or_none(context.get("ask"))
-        mark_price = self._float_or_none(context.get("mark_price"))
-        last_price = self._float_or_none(context.get("last_price"))
-        reference = mark_price or last_price or intent.entry_price
-
-        if bid is None or ask is None:
-            if reference is None:
-                raise ExecutionPlanError("Cannot choose limit price without bid/ask or reference price")
-            return round_price(reference, tick_size)
-
-        offset_bps = (
-            self._config.post_only_price_offset_bps
-            if post_only
-            else self._config.limit_price_offset_bps
-        )
-
-        offset = offset_bps / 10_000.0
-
-        if intent.order_side.is_buy:
-            if post_only:
-                price = bid * (1.0 - offset)
-            else:
-                price = ask * (1.0 - offset)
-        else:
-            if post_only:
-                price = ask * (1.0 + offset)
-            else:
-                price = bid * (1.0 + offset)
-
-        return round_price(price, tick_size)
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "service": self._service_name,
-            "enabled": self._config.enabled,
-            "default_mode": self._config.default_mode.value,
-            "fallback_mode": self._config.fallback_mode.value,
-            "stats": self._stats.snapshot(),
-        }
-
-    # ------------------------------------------------------------------
-    # Plan builders
-    # ------------------------------------------------------------------
-
-    def _build_market_plan(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None,
-    ) -> ExecutionPlan:
-        quantity = self._rounded_quantity(intent.final_size, market_context)
-
-        leg = ExecutionLeg(
-            symbol=intent.symbol,
-            side=intent.order_side,
-            order_type=OrderType.MARKET,
-            quantity=quantity if not intent.close_position else None,
-            position_side=intent.side,
-            reduce_only=intent.is_reduce_only and not intent.close_position,
-            close_position=intent.close_position,
-            trigger_type=(
-                TriggerType.RISK_CLOSE
-                if intent.order_intent is OrderIntent.CLOSE
-                else TriggerType.RISK_REDUCE
-                if intent.reduces_risk
-                else TriggerType.NONE
-            ),
-            metadata={
-                "execution_mode": ExecutionMode.MARKET.value,
-                "source": "smart_execution",
-            },
-        )
-
-        return ExecutionPlan(
-            intent=intent,
-            mode=ExecutionMode.MARKET,
-            legs=[leg],
-            status=ExecutionStatus.PLANNED,
-            metadata=self._plan_metadata(intent, market_context, mode=ExecutionMode.MARKET),
-        )
-
-    def _build_limit_plan(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None,
-        post_only: bool,
-    ) -> ExecutionPlan:
-        quantity = self._rounded_quantity(intent.final_size, market_context)
-        price = self.choose_limit_price(intent, market_context=market_context, post_only=post_only)
-
-        leg = ExecutionLeg(
-            symbol=intent.symbol,
-            side=intent.order_side,
-            order_type=OrderType.LIMIT,
-            quantity=quantity,
-            price=price,
-            position_side=intent.side,
-            time_in_force=TimeInForce.GTX if post_only else TimeInForce.GTC,
-            reduce_only=intent.is_reduce_only,
-            close_position=False,
-            trigger_type=(
-                TriggerType.RISK_CLOSE
-                if intent.order_intent is OrderIntent.CLOSE
-                else TriggerType.RISK_REDUCE
-                if intent.reduces_risk
-                else TriggerType.NONE
-            ),
-            metadata={
-                "execution_mode": ExecutionMode.POST_ONLY.value if post_only else ExecutionMode.LIMIT.value,
-                "source": "smart_execution",
-                "post_only": post_only,
-            },
-        )
-
-        mode = ExecutionMode.POST_ONLY if post_only else ExecutionMode.LIMIT
-
-        return ExecutionPlan(
-            intent=intent,
-            mode=mode,
-            legs=[leg],
-            status=ExecutionStatus.PLANNED,
-            metadata=self._plan_metadata(intent, market_context, mode=mode),
-        )
-
-    def _build_smart_plan(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None,
-    ) -> ExecutionPlan:
-        if intent.reduces_risk and self._config.prefer_market_for_exits:
-            return self._build_market_plan(intent, market_context=market_context)
-
-        if self.should_use_post_only(intent, market_context=market_context):
-            return self._build_limit_plan(
-                intent,
-                market_context=market_context,
-                post_only=True,
+            await self._emit_event(
+                "execution.execution_failed",
+                {
+                    **intent.to_event_payload(),
+                    "error": str(exc),
+                    "failure_stage": "execute_intent",
+                },
+                priority=EventPriority.CRITICAL,
             )
 
-        slippage_bps = self.estimate_slippage_bps(intent, market_context=market_context)
-        spread_bps = self.estimate_spread_bps(market_context)
+            raise ExecutionError(f"Execution failed: {exc}") from exc
+
+    def _validate_execution_allowed(self, intent: ExecutionIntent) -> None:
+        if self._kill_switch_active:
+            if intent.increases_risk and self._config.kill_switch_blocks_new_entries:
+                self._stats.register_rejected(
+                    kill_switch=True,
+                    error=self._kill_switch_reason,
+                )
+                raise KillSwitchActiveError(
+                    self._kill_switch_reason or "Kill switch is active"
+                )
+
+            if intent.reduces_risk and not self._config.kill_switch_allows_reduce_only:
+                raise KillSwitchActiveError("Kill switch blocks reduce-only executions")
+
+        if intent.increases_risk and not self._config.allow_new_entries:
+            self._stats.register_rejected(error="new entries disabled")
+            raise ExecutionRejectedError("New entries are disabled")
+
+        if intent.order_intent is OrderIntent.REDUCE and not self._config.allow_position_reductions:
+            self._stats.register_rejected(error="position reductions disabled")
+            raise ExecutionRejectedError("Position reductions are disabled")
+
+        if intent.order_intent is OrderIntent.CLOSE and not self._config.allow_position_closes:
+            self._stats.register_rejected(error="position closes disabled")
+            raise ExecutionRejectedError("Position closes are disabled")
 
         if (
-            slippage_bps is not None
-            and slippage_bps <= self._config.max_slippage_bps
-            and (spread_bps is None or spread_bps <= self._config.max_spread_bps)
-            and not self._config.prefer_limit_for_entries
+            self._config.reject_expired_risk_reservations
+            and intent.increases_risk
+            and intent.reservation_expires_at is not None
         ):
-            return self._build_market_plan(intent, market_context=market_context)
+            expires_at = intent.reservation_expires_at + self._config.reservation_grace_seconds
+            if now_ts() >= expires_at:
+                self._stats.register_rejected(error="risk reservation expired")
+                raise ExecutionRejectedError("Risk reservation is expired")
 
-        if self._config.allow_order_splitting and self._should_split_order(intent, dict(market_context or {})):
-            return self._build_liquidity_aware_plan(intent, market_context=market_context)
+    async def _resolve_market_context(self, intent: ExecutionIntent) -> Mapping[str, Any]:
+        if self._market_context_provider is None:
+            return {}
 
-        return self._build_limit_plan(
-            intent,
-            market_context=market_context,
-            post_only=False,
-        )
+        result = self._market_context_provider(intent)
 
-    def _build_liquidity_aware_plan(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None,
-    ) -> ExecutionPlan:
-        if not self._config.liquidity_aware_enabled:
-            return self._build_market_plan(intent, market_context=market_context)
+        if inspect.isawaitable(result):
+            resolved = await result
+        else:
+            resolved = result
 
-        quantities = self.split_order(intent, market_context=market_context)
-        context = dict(market_context or {})
-        tick_size = self._float_or_none(context.get("tick_size"))
+        return dict(resolved or {})
 
-        legs: list[ExecutionLeg] = []
+    def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
+        symbol_n = normalize_symbol(symbol)
 
-        for index, quantity in enumerate(quantities):
-            if intent.reduces_risk:
-                order_type = OrderType.MARKET
-                price = None
-                time_in_force = None
-            else:
-                order_type = OrderType.LIMIT
-                price = self.choose_limit_price(
-                    intent,
-                    market_context=market_context,
-                    post_only=False,
+        lock = self._symbol_locks.get(symbol_n)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._symbol_locks[symbol_n] = lock
+
+        return lock
+
+    async def _cancel_open_orders_for_known_symbols(self, *, reason: str | None) -> None:
+        symbols: set[str] = set()
+
+        if self._position_manager is not None:
+            for position in self._position_manager.list_positions(include_closed=False):
+                symbols.add(position.symbol)
+
+        for intent in self._active_executions.values():
+            symbols.add(intent.symbol)
+
+        for symbol in sorted(symbols):
+            try:
+                await self._order_manager.cancel_all_orders(
+                    symbol=symbol,
+                    exchange=self._config.default_exchange,
+                    reason=reason or "kill_switch",
                 )
-                if price is not None:
-                    price = round_price(price, tick_size)
-                time_in_force = TimeInForce.GTC
-
-            legs.append(
-                ExecutionLeg(
-                    symbol=intent.symbol,
-                    side=intent.order_side,
-                    order_type=order_type,
-                    quantity=quantity,
-                    price=price,
-                    position_side=intent.side,
-                    time_in_force=time_in_force,
-                    reduce_only=intent.is_reduce_only,
-                    close_position=False,
-                    trigger_type=(
-                        TriggerType.RISK_REDUCE if intent.reduces_risk else TriggerType.NONE
-                    ),
-                    sequence=index,
-                    metadata={
-                        "execution_mode": ExecutionMode.LIQUIDITY_AWARE.value,
-                        "source": "smart_execution",
-                        "split_index": index,
-                        "split_count": len(quantities),
-                    },
+            except Exception:
+                self._logger.exception(
+                    "Failed to cancel open orders during kill switch | symbol=%s",
+                    symbol,
                 )
-            )
-
-        return ExecutionPlan(
-            intent=intent,
-            mode=ExecutionMode.LIQUIDITY_AWARE,
-            legs=legs,
-            status=ExecutionStatus.PLANNED,
-            metadata=self._plan_metadata(intent, market_context, mode=ExecutionMode.LIQUIDITY_AWARE),
-        )
-
-    def _build_twap_plan(
-        self,
-        intent: ExecutionIntent,
-        *,
-        market_context: Mapping[str, Any] | None,
-    ) -> ExecutionPlan:
-        if not self._config.twap_enabled:
-            return self._build_smart_plan(intent, market_context=market_context)
-
-        quantities = self.split_order(intent, market_context=market_context)
-
-        legs: list[ExecutionLeg] = []
-        interval = self._config.twap_slice_interval_seconds
-
-        for index, quantity in enumerate(quantities):
-            legs.append(
-                ExecutionLeg(
-                    symbol=intent.symbol,
-                    side=intent.order_side,
-                    order_type=OrderType.MARKET if intent.reduces_risk else OrderType.LIMIT,
-                    quantity=quantity,
-                    price=(
-                        None
-                        if intent.reduces_risk
-                        else self.choose_limit_price(intent, market_context=market_context)
-                    ),
-                    position_side=intent.side,
-                    time_in_force=None if intent.reduces_risk else TimeInForce.GTC,
-                    reduce_only=intent.is_reduce_only,
-                    close_position=False,
-                    trigger_type=TriggerType.RISK_REDUCE if intent.reduces_risk else TriggerType.NONE,
-                    sequence=index,
-                    metadata={
-                        "execution_mode": ExecutionMode.TWAP.value,
-                        "source": "smart_execution",
-                        "split_index": index,
-                        "split_count": len(quantities),
-                        "delay_seconds": index * interval,
-                    },
-                )
-            )
-
-        return ExecutionPlan(
-            intent=intent,
-            mode=ExecutionMode.TWAP,
-            legs=legs,
-            status=ExecutionStatus.PLANNED,
-            metadata=self._plan_metadata(intent, market_context, mode=ExecutionMode.TWAP),
-        )
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Event handlers
     # ------------------------------------------------------------------
 
-    def _rounded_quantity(
-        self,
-        quantity: float,
-        market_context: Mapping[str, Any] | None,
-    ) -> float:
-        context = dict(market_context or {})
-        step_size = self._float_or_none(context.get("step_size"))
-        rounded = round_quantity(quantity, step_size)
-
-        if rounded <= 0:
-            raise ExecutionPlanValidationError("Rounded quantity must be > 0")
-
-        return rounded
-
-    def _resolve_split_count(
-        self,
-        intent: ExecutionIntent,
-        context: Mapping[str, Any],
-    ) -> int:
-        if not self._config.allow_order_splitting:
-            return 1
-
-        if intent.close_position:
-            return 1
-
-        if intent.final_notional <= 0:
-            return 1
-
-        available_depth = self._float_or_none(context.get("available_depth_notional"))
-
-        if available_depth is None or available_depth <= 0:
-            if intent.final_notional <= self._config.min_leg_notional * 2:
-                return 1
-            return min(2, self._config.max_split_count)
-
-        target_leg_notional = max(
-            self._config.min_leg_notional,
-            available_depth / self._config.min_depth_notional_multiplier,
-        )
-
-        split_count = math.ceil(intent.final_notional / target_leg_notional)
-        split_count = max(self._config.min_split_count, split_count)
-        split_count = min(split_count, self._config.max_split_count)
-
-        if split_count <= 1:
-            return 1
-
-        leg_notional = intent.final_notional / split_count
-        if leg_notional < self._config.min_leg_notional:
-            split_count = max(1, math.floor(intent.final_notional / self._config.min_leg_notional))
-
-        return max(1, min(split_count, self._config.max_split_count))
-
-    def _should_split_order(
-        self,
-        intent: ExecutionIntent,
-        context: Mapping[str, Any],
-    ) -> bool:
-        if not self._config.allow_order_splitting:
-            return False
-
-        if intent.close_position:
-            return False
-
-        if intent.final_notional < self._config.min_leg_notional * 2:
-            return False
-
-        split_count = self._resolve_split_count(intent, context)
-        return split_count > 1
-
-    def _has_sufficient_depth(
-        self,
-        intent: ExecutionIntent,
-        context: Mapping[str, Any],
-    ) -> bool:
-        available_depth = self._float_or_none(context.get("available_depth_notional"))
-
-        if available_depth is None or available_depth <= 0:
-            return False
-
-        required_depth = intent.final_notional * self._config.min_depth_notional_multiplier
-        return available_depth >= required_depth
-
-    def _plan_metadata(
-        self,
-        intent: ExecutionIntent,
-        market_context: Mapping[str, Any] | None,
-        *,
-        mode: ExecutionMode,
-    ) -> dict[str, Any]:
-        context = dict(market_context or {})
-
-        spread_bps = self.estimate_spread_bps(context)
-        slippage_bps = self.estimate_slippage_bps(intent, market_context=context)
-
-        return {
-            "service": self._service_name,
-            "mode": mode.value,
-            "created_at": now_ts(),
-            "risk_approved": True,
-            "risk_mode": intent.risk_mode.value,
-            "final_size": intent.final_size,
-            "final_leverage": intent.final_leverage,
-            "final_notional": intent.final_notional,
-            "final_margin": intent.final_margin,
-            "final_risk_amount": intent.final_risk_amount,
-            "reservation_id": intent.reservation_id,
-            "estimated_spread_bps": spread_bps,
-            "estimated_slippage_bps": slippage_bps,
-            "max_slippage_bps": self._config.max_slippage_bps,
-            "max_spread_bps": self._config.max_spread_bps,
-            "market_context_keys": sorted(context.keys()),
-        }
-
-    @staticmethod
-    def _float_or_none(value: Any) -> float | None:
-        if value is None or value == "":
-            return None
+    async def _handle_signal_confirmed(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._event_payload(event)
 
         try:
-            value_f = float(value)
-        except (TypeError, ValueError, OverflowError):
+            intent = self._intent_from_signal_confirmed_payload(payload)
+
+            await self._emit_event(
+                "execution.trade_requested",
+                intent.to_event_payload(),
+                priority=EventPriority.HIGH,
+            )
+
+            await self.execute_intent(intent)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._stats.register_rejected(error=str(exc))
+            self._logger.exception("Failed to handle signal.confirmed")
+
+            await self._emit_event(
+                "execution.trade_rejected",
+                {
+                    **payload,
+                    "error": str(exc),
+                    "failure_stage": "signal_confirmed",
+                },
+                priority=EventPriority.CRITICAL,
+            )
+
+    async def _handle_position_close_requested(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._event_payload(event)
+
+        try:
+            await self.close_position(
+                symbol=str(payload["symbol"]),
+                side=payload.get("side") or payload.get("position_side"),
+                size=safe_float(payload.get("size") or payload.get("quantity")),
+                position_id=payload.get("position_id"),
+                signal_id=payload.get("signal_id"),
+                strategy_name=payload.get("strategy_name"),
+                reason=payload.get("reason"),
+                metadata=payload.get("metadata"),
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._stats.register_failed(str(exc))
+            self._logger.exception("Failed to handle risk.position_close_requested")
+
+            await self._emit_event(
+                "execution.execution_failed",
+                {
+                    **payload,
+                    "error": str(exc),
+                    "failure_stage": "risk_position_close_requested",
+                },
+                priority=EventPriority.CRITICAL,
+            )
+
+    async def _handle_position_reduce_requested(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._event_payload(event)
+
+        try:
+            reduce_size = safe_float(payload.get("reduce_size") or payload.get("size") or payload.get("quantity"))
+            if reduce_size is None:
+                raise ExecutionRejectedError("reduce_size is required")
+
+            await self.reduce_position(
+                symbol=str(payload["symbol"]),
+                side=payload.get("side") or payload.get("position_side"),
+                reduce_size=reduce_size,
+                position_id=payload.get("position_id"),
+                signal_id=payload.get("signal_id"),
+                strategy_name=payload.get("strategy_name"),
+                reason=payload.get("reason"),
+                metadata=payload.get("metadata"),
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._stats.register_failed(str(exc))
+            self._logger.exception("Failed to handle risk.position_reduce_requested")
+
+            await self._emit_event(
+                "execution.execution_failed",
+                {
+                    **payload,
+                    "error": str(exc),
+                    "failure_stage": "risk_position_reduce_requested",
+                },
+                priority=EventPriority.CRITICAL,
+            )
+
+    async def _handle_kill_switch(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._event_payload(event)
+
+        await self.handle_kill_switch(
+            reason=payload.get("reason") or payload.get("message"),
+            cancel_open_orders=bool(payload.get("cancel_open_orders", True)),
+        )
+
+    async def _handle_manual_resume(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._event_payload(event)
+
+        self._kill_switch_active = False
+        self._kill_switch_reason = None
+
+        await self._emit_event(
+            "execution.kill_switch_released",
+            {
+                "exchange": self._config.default_exchange,
+                "market_type": self._config.default_market_type,
+                "reason": payload.get("reason") or "risk.manual_resume",
+                "timestamp": now_ms(),
+            },
+            priority=EventPriority.HIGH,
+        )
+
+    async def _handle_execution_order_filled(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._event_payload(event)
+        execution_id = payload.get("execution_id")
+
+        if not execution_id:
+            return
+
+        async with self._lock:
+            if execution_id in self._active_executions:
+                self._execution_status[execution_id] = ExecutionStatus.FILLED
+
+    async def _handle_execution_order_failed(self, event: Event | Mapping[str, Any]) -> None:
+        await self._mark_execution_terminal_from_order_event(
+            event,
+            status=ExecutionStatus.FAILED,
+        )
+
+    async def _handle_execution_order_rejected(self, event: Event | Mapping[str, Any]) -> None:
+        await self._mark_execution_terminal_from_order_event(
+            event,
+            status=ExecutionStatus.REJECTED,
+        )
+
+    async def _handle_execution_order_cancelled(self, event: Event | Mapping[str, Any]) -> None:
+        await self._mark_execution_terminal_from_order_event(
+            event,
+            status=ExecutionStatus.CANCELLED,
+        )
+
+    async def _mark_execution_terminal_from_order_event(
+        self,
+        event: Event | Mapping[str, Any],
+        *,
+        status: ExecutionStatus,
+    ) -> None:
+        payload = self._event_payload(event)
+        execution_id = payload.get("execution_id")
+
+        if not execution_id:
+            return
+
+        async with self._lock:
+            self._execution_status[execution_id] = status
+            self._active_executions.pop(execution_id, None)
+
+    # ------------------------------------------------------------------
+    # Payload -> intent helpers
+    # ------------------------------------------------------------------
+
+    def _intent_from_signal_confirmed_payload(self, payload: Mapping[str, Any]) -> ExecutionIntent:
+        risk_decision = payload.get("risk_decision") or payload.get("decision")
+
+        if isinstance(risk_decision, RiskDecision):
+            return ExecutionIntent.from_risk_decision(
+                risk_decision,
+                exchange=self._config.default_exchange,
+                market_type=self._config.default_market_type,
+                metadata=payload.get("metadata"),
+            )
+
+        # Some EventBus payloads may be the RiskDecision fields directly.
+        return self._intent_from_mapping(payload)
+
+    def _intent_from_mapping(self, payload: Mapping[str, Any]) -> ExecutionIntent:
+        symbol = payload.get("symbol")
+        if not symbol:
+            raise ExecutionRejectedError("signal.confirmed payload missing symbol")
+
+        side = self._position_side_from_raw(payload.get("side"))
+        if side is None:
+            raise ExecutionRejectedError("signal.confirmed payload missing side")
+
+        order_intent = self._order_intent_from_raw(payload.get("order_intent") or OrderIntent.OPEN)
+
+        final_size = safe_float(payload.get("final_size") or payload.get("size"))
+        final_leverage = safe_float(payload.get("final_leverage") or payload.get("leverage"))
+        final_risk_amount = safe_float(payload.get("final_risk_amount") or payload.get("risk_amount"), 0.0)
+        final_margin = safe_float(payload.get("final_margin") or payload.get("margin"), 0.0)
+        final_notional = safe_float(payload.get("final_notional") or payload.get("notional"), 0.0)
+
+        if final_size is None:
+            raise ExecutionRejectedError("signal.confirmed payload missing final_size")
+
+        if final_leverage is None:
+            raise ExecutionRejectedError("signal.confirmed payload missing final_leverage")
+
+        tier = self._trade_tier_from_raw(payload.get("final_tier") or payload.get("tier"))
+        risk_mode = self._risk_mode_from_raw(payload.get("risk_mode") or RiskMode.NORMAL)
+        margin_mode = self._margin_mode_from_raw(payload.get("margin_mode") or MarginMode.ISOLATED)
+
+        intent = ExecutionIntent(
+            exchange=normalize_exchange(payload.get("exchange") or self._config.default_exchange),
+            market_type=normalize_market_type(payload.get("market_type") or self._config.default_market_type),
+            symbol=normalize_symbol(str(symbol)),
+            side=side,
+            order_intent=order_intent,
+            final_size=final_size,
+            final_leverage=final_leverage,
+            final_tier=tier,
+            final_risk_amount=final_risk_amount or 0.0,
+            final_margin=final_margin or 0.0,
+            final_notional=final_notional or 0.0,
+            entry_price=safe_float(payload.get("entry_price")),
+            stop_loss=safe_float(payload.get("stop_loss")),
+            take_profit=safe_float(payload.get("take_profit")),
+            signal_id=payload.get("signal_id"),
+            strategy_name=payload.get("strategy_name"),
+            reservation_id=payload.get("reservation_id"),
+            reservation_expires_at=safe_float(payload.get("reservation_expires_at")),
+            risk_mode=risk_mode,
+            margin_mode=margin_mode,
+            reduce_only=bool(payload.get("reduce_only", False) or order_intent.reduces_risk),
+            close_position=bool(payload.get("close_position", False)),
+            metadata=merge_metadata(
+                payload.get("metadata"),
+                {
+                    "source_event": "signal.confirmed",
+                    "raw_decision": payload.get("decision"),
+                },
+            ),
+        )
+        intent.validate()
+        return intent
+
+    @staticmethod
+    def _position_side_from_raw(value: Any) -> PositionSide | None:
+        if value is None:
             return None
 
-        if not math.isfinite(value_f):
+        if isinstance(value, PositionSide):
+            return value
+
+        normalized = str(value).strip().lower()
+
+        if normalized in {"long", "buy"}:
+            return PositionSide.LONG
+
+        if normalized in {"short", "sell"}:
+            return PositionSide.SHORT
+
+        if normalized.upper() == "LONG":
+            return PositionSide.LONG
+
+        if normalized.upper() == "SHORT":
+            return PositionSide.SHORT
+
+        return None
+
+    @staticmethod
+    def _order_intent_from_raw(value: Any) -> OrderIntent:
+        if isinstance(value, OrderIntent):
+            return value
+
+        normalized = str(value).strip().lower()
+
+        for item in OrderIntent:
+            if item.value == normalized or item.name.lower() == normalized:
+                return item
+
+        raise ExecutionRejectedError(f"Unsupported order_intent: {value!r}")
+
+    @staticmethod
+    def _trade_tier_from_raw(value: Any) -> TradeTier | None:
+        if value is None:
             return None
 
-        return value_f
+        if isinstance(value, TradeTier):
+            return value
+
+        normalized = str(value).strip()
+
+        for item in TradeTier:
+            if item.value == normalized or item.name == normalized:
+                return item
+
+        return None
+
+    @staticmethod
+    def _risk_mode_from_raw(value: Any) -> RiskMode:
+        if isinstance(value, RiskMode):
+            return value
+
+        normalized = str(value).strip().lower()
+
+        for item in RiskMode:
+            if item.value == normalized or item.name.lower() == normalized:
+                return item
+
+        return RiskMode.NORMAL
+
+    @staticmethod
+    def _margin_mode_from_raw(value: Any) -> MarginMode:
+        if isinstance(value, MarginMode):
+            return value
+
+        normalized = str(value).strip().lower()
+
+        for item in MarginMode:
+            if item.value.lower() == normalized or item.name.lower() == normalized:
+                return item
+
+        return MarginMode.ISOLATED
+
+    @staticmethod
+    def _event_payload(event: Event | Mapping[str, Any]) -> dict[str, Any]:
+        if isinstance(event, Mapping):
+            return dict(event)
+
+        payload = getattr(event, "payload", None)
+
+        if isinstance(payload, Mapping):
+            return dict(payload)
+
+        return {}
+
+    async def _emit_event(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority = EventPriority.NORMAL,
+    ) -> None:
+        if self._event_bus is None:
+            return
+
+        try:
+            maybe_result = self._event_bus.emit(
+                topic,
+                payload,
+                priority=priority,
+                source=self._service_name,
+            )
+
+            if inspect.isawaitable(maybe_result):
+                await maybe_result
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "Failed to emit TradeExecutor event | topic=%s",
+                topic,
+            )
 
 
 __all__ = [
-    "SmartExecution",
+    "OrderManagerProtocol",
+    "PositionManagerProtocol",
+    "SLTPManagerProtocol",
+    "MarketContextProvider",
+    "TradeExecutor",
 ]

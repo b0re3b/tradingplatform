@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -513,9 +513,50 @@ class ExecutionPlan:
             raise ExecutionPlanValidationError("ExecutionPlan expires_at must be after created_at")
 
     def to_order_requests(self) -> list["OrderRequest"]:
+        """
+        Convert plan legs into OrderRequest objects.
+
+        Important:
+        Intent-level risk-approved fields must be propagated into every
+        OrderRequest metadata, because OrderManager -> OrderResult ->
+        execution.order_filled -> PositionManager depends on this metadata
+        to build position.opened payload with stop_loss / take_profit /
+        leverage / margin / risk amount.
+
+        Without this propagation SLTPManager receives position.opened without
+        protective levels and therefore does not place SL/TP orders.
+        """
         self.validate()
-        return [
-            leg.to_order_request(
+
+        requests: list[OrderRequest] = []
+
+        intent_metadata = {
+            "execution_id": self.intent.execution_id,
+            "signal_id": self.intent.signal_id,
+            "strategy_name": self.intent.strategy_name,
+            "reservation_id": self.intent.reservation_id,
+            "side": self.intent.side.value,
+            "order_intent": self.intent.order_intent.value,
+            "risk_mode": self.intent.risk_mode.value,
+            "margin_mode": self.intent.margin_mode.value,
+            "final_size": self.intent.final_size,
+            "final_leverage": self.intent.final_leverage,
+            "final_tier": self.intent.final_tier.value if self.intent.final_tier else None,
+            "final_risk_amount": self.intent.final_risk_amount,
+            "final_margin": self.intent.final_margin,
+            "final_notional": self.intent.final_notional,
+            "entry_price": self.intent.entry_price,
+            "stop_loss": self.intent.stop_loss,
+            "take_profit": self.intent.take_profit,
+            "reduce_only": self.intent.reduce_only,
+            "close_position": self.intent.close_position,
+            "reservation_expires_at": self.intent.reservation_expires_at,
+            "plan_id": self.plan_id,
+            "execution_mode": self.mode.value,
+        }
+
+        for leg in self.legs:
+            request = leg.to_order_request(
                 execution_id=self.intent.execution_id,
                 signal_id=self.intent.signal_id,
                 strategy_name=self.intent.strategy_name,
@@ -523,8 +564,18 @@ class ExecutionPlan:
                 exchange=self.intent.exchange,
                 market_type=self.intent.market_type,
             )
-            for leg in self.legs
-        ]
+
+            request.metadata = merge_metadata(
+                self.intent.metadata,
+                intent_metadata,
+                self.metadata,
+                leg.metadata,
+                request.metadata,
+            )
+
+            requests.append(request)
+
+        return requests
 
     def to_event_payload(self) -> dict[str, Any]:
         return {
@@ -1799,7 +1850,7 @@ class ExecutionStats:
         self.updated_at = now_ts()
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -1858,7 +1909,7 @@ class OrderManagerStats:
         self.updated_at = now_ts()
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -1902,7 +1953,7 @@ class PositionManagerStats:
         self.updated_at = now_ts()
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -1950,7 +2001,7 @@ class SLTPManagerStats:
         self.updated_at = now_ts()
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return asdict(self)
 
 
 @dataclass(slots=True)
@@ -1986,7 +2037,7 @@ class SmartExecutionStats:
         self.updated_at = now_ts()
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------
