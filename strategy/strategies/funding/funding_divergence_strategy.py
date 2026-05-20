@@ -2,23 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from ...config import StrategyConfig, StrategyDefinitionConfig
-from ...enums import (
-    FeatureSource,
-    SetupType,
-    SignalPriority,
-    SignalSide,
-    StrategyCategory,
-)
-from ...exceptions import StrategyConfigError, StrategyEvaluationError
-from ...models import StrategyContext, StrategySignal, clamp
 from .base import (
     FUNDING_FEATURES,
     FundingStrategyConfig,
@@ -35,18 +23,24 @@ from .utils import (
     first_present,
     freshness_score,
     funding_item,
-    funding_path,
     is_directional_side,
     is_stale,
     normalize_label,
     serialize_for_metadata,
     side_from_bias,
-    to_bool,
     to_float,
     unit_score,
     weighted_score,
 )
-
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategySignal, clamp
 
 _ALIGNMENT_BONUS_BASE: float = 0.50
 _ALIGNMENT_BONUS_PER_DIMENSION: float = 0.25

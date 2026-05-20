@@ -5,11 +5,10 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, TypeVar
+from typing import TypeVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from core.logger import get_logger
-
 from .config import NewsAIConfig, NewsFeatureConfig, NewsSourceConfig
 from .enums import (
     NewsCategory,
@@ -28,7 +27,6 @@ from .models import (
     RawNewsItem,
     utc_now,
 )
-
 
 T = TypeVar("T")
 

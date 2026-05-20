@@ -34,6 +34,7 @@ from .enums import (
     StrategyMarketType,
     StrategyOrderIntent,
     StrategyTradeTier,
+    Timeframe,
     TriggerType,
 )
 from .exceptions import (
@@ -158,6 +159,7 @@ class NormalizedPayload:
     source: FeatureSource
     symbol: str
     timestamp: datetime
+    timeframe: Timeframe = Timeframe.M1
     domain_data: dict[str, Any] = field(default_factory=dict)
     features: list[FeatureSnapshot] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -384,9 +386,85 @@ class ProcessedSignalBatch:
 class SignalNormalizer(BaseStrategyComponent):
     """
     Normalizes analytics payloads into StrategyContext domain data and features.
+
+    Supported analytics payload shapes:
+    - explicit payload["features"] as list[dict];
+    - payload["feature_map"] as dict[str, value | dict];
+    - nested analytics sections: stats, context, signal, analysis, result,
+      metrics, snapshot, state, pressure, regime, divergence, anomaly;
+    - top-level scalar fallback.
+
+    The normalizer keeps domain_data intact for concrete strategies that read
+    context.domain_dict(source), while also producing FeatureSnapshot entries
+    for registry routing and required_features checks.
     """
 
     component_namespace = "strategy.processor.normalizer"
+
+    _FEATURE_CONTAINER_KEYS: tuple[str, ...] = (
+        "features",
+        "feature_map",
+        "stats",
+        "context",
+        "signal",
+        "analysis",
+        "result",
+        "metrics",
+        "snapshot",
+        "state",
+        "pressure",
+        "regime",
+        "divergence",
+        "anomaly",
+        "event",
+        "setup",
+    )
+
+    _DOMAIN_EXCLUDED_KEYS: set[str] = {
+        "symbol",
+        "instrument",
+        "market",
+        "timestamp",
+        "ts",
+        "source",
+        "features",
+        "feature_map",
+        "metadata",
+    }
+
+    _SCALAR_FEATURE_EXCLUDED_KEYS: set[str] = {
+        "symbol",
+        "instrument",
+        "market",
+        "timestamp",
+        "ts",
+        "source",
+        "metadata",
+        "scope",
+        "key",
+        "orderflow_key",
+        "scope_key",
+        "exchange_symbol",
+    }
+
+    _TIMEFRAME_ALIASES: dict[str, Timeframe] = {
+        "1m": Timeframe.M1,
+        "m1": Timeframe.M1,
+        "3m": Timeframe.M3,
+        "m3": Timeframe.M3,
+        "5m": Timeframe.M5,
+        "m5": Timeframe.M5,
+        "15m": Timeframe.M15,
+        "m15": Timeframe.M15,
+        "30m": Timeframe.M30,
+        "m30": Timeframe.M30,
+        "1h": Timeframe.H1,
+        "h1": Timeframe.H1,
+        "4h": Timeframe.H4,
+        "h4": Timeframe.H4,
+        "1d": Timeframe.D1,
+        "d1": Timeframe.D1,
+    }
 
     def normalize_event(
         self,
@@ -403,6 +481,7 @@ class SignalNormalizer(BaseStrategyComponent):
         source = self._resolve_source(event_name, payload)
         symbol = self._extract_symbol(payload)
         ts = self._extract_timestamp(payload, timestamp)
+        timeframe = self._extract_timeframe(payload)
 
         domain_data = self._extract_domain_data(payload)
         features = self._extract_features(
@@ -416,11 +495,14 @@ class SignalNormalizer(BaseStrategyComponent):
             source=source,
             symbol=symbol,
             timestamp=ts,
+            timeframe=timeframe,
             domain_data=domain_data,
             features=features,
             metadata={
                 "event_name": event_name,
                 "raw_payload_keys": sorted(payload.keys()),
+                "features_count": len(features),
+                "timeframe": timeframe.value,
             },
         )
 
@@ -429,7 +511,9 @@ class SignalNormalizer(BaseStrategyComponent):
             event_name=event_name,
             source=source.value,
             symbol=symbol,
+            timeframe=timeframe.value,
             features_count=len(features),
+            feature_names=[feature.name for feature in features],
         )
         return normalized
 
@@ -446,6 +530,7 @@ class SignalNormalizer(BaseStrategyComponent):
             )
 
         context.timestamp = normalized.timestamp
+        context.timeframe = normalized.timeframe
 
         for key, value in normalized.domain_data.items():
             context.put_domain_feature(normalized.source, key, value)
@@ -458,6 +543,8 @@ class SignalNormalizer(BaseStrategyComponent):
         context.metadata.setdefault("updated_by", self.component_name)
         context.metadata["last_source"] = normalized.source.value
         context.metadata["last_event_name"] = normalized.metadata.get("event_name")
+        context.metadata["last_timeframe"] = normalized.timeframe.value
+        context.metadata["last_feature_count"] = len(normalized.features)
 
         context.validate()
         return context
@@ -493,6 +580,10 @@ class SignalNormalizer(BaseStrategyComponent):
         if resolved is not None:
             return resolved
 
+        resolved = self._resolve_source_from_payload(payload)
+        if resolved is not None:
+            return resolved
+
         raise SignalNormalizationError(
             f"unable to resolve FeatureSource for event '{event_name}'"
         )
@@ -522,19 +613,55 @@ class SignalNormalizer(BaseStrategyComponent):
 
         return None
 
+    @classmethod
+    def _resolve_source_from_payload(cls, payload: dict[str, Any]) -> FeatureSource | None:
+        candidates = [
+            payload.get("metric"),
+            payload.get("category"),
+            payload.get("domain"),
+            payload.get("source_type"),
+            payload.get("event_type"),
+        ]
+
+        for value in candidates:
+            if isinstance(value, str):
+                resolved = cls._resolve_source_from_text(value)
+                if resolved is not None:
+                    return resolved
+
+        return None
+
     @staticmethod
     def _extract_symbol(payload: dict[str, Any]) -> str:
-        raw = payload.get("symbol") or payload.get("instrument") or payload.get("market")
+        raw = (
+            payload.get("symbol")
+            or payload.get("instrument")
+            or payload.get("market")
+            or payload.get("exchange_symbol")
+        )
+
+        if not isinstance(raw, str) or not raw.strip():
+            scope = payload.get("scope")
+            if isinstance(scope, dict):
+                raw = scope.get("symbol")
+
         if not isinstance(raw, str) or not raw.strip():
             raise SignalNormalizationError("payload does not contain valid symbol")
-        return raw.strip()
+
+        return raw.strip().upper()
 
     @staticmethod
     def _extract_timestamp(
         payload: dict[str, Any],
         fallback: datetime | None = None,
     ) -> datetime:
-        raw = payload.get("timestamp") or payload.get("ts") or fallback
+        raw = (
+            payload.get("timestamp")
+            or payload.get("ts")
+            or payload.get("created_at")
+            or payload.get("event_time")
+            or fallback
+        )
 
         if raw is None:
             return utcnow()
@@ -547,22 +674,45 @@ class SignalNormalizer(BaseStrategyComponent):
                 return datetime.fromtimestamp(raw / 1000.0, tz=timezone.utc)
             return datetime.fromtimestamp(raw, tz=timezone.utc)
 
+        if isinstance(raw, str):
+            try:
+                return ensure_aware_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except ValueError:
+                raise SignalNormalizationError("unsupported timestamp string in payload")
+
         raise SignalNormalizationError("unsupported timestamp type in payload")
 
-    @staticmethod
-    def _extract_domain_data(payload: dict[str, Any]) -> dict[str, Any]:
-        excluded = {
-            "symbol",
-            "instrument",
-            "market",
-            "timestamp",
-            "ts",
-            "source",
-            "features",
-            "feature_map",
-            "metadata",
+    @classmethod
+    def _extract_timeframe(cls, payload: dict[str, Any]) -> Timeframe:
+        raw = payload.get("timeframe")
+
+        if raw is None:
+            scope = payload.get("scope")
+            if isinstance(scope, dict):
+                raw = scope.get("timeframe")
+
+        if isinstance(raw, Timeframe):
+            return raw
+
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in cls._TIMEFRAME_ALIASES:
+                return cls._TIMEFRAME_ALIASES[normalized]
+
+            try:
+                return Timeframe(normalized)
+            except ValueError:
+                return Timeframe.M1
+
+        return Timeframe.M1
+
+    @classmethod
+    def _extract_domain_data(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in payload.items()
+            if key not in cls._DOMAIN_EXCLUDED_KEYS
         }
-        return {key: value for key, value in payload.items() if key not in excluded}
 
     def _extract_features(
         self,
@@ -572,50 +722,172 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime,
     ) -> list[FeatureSnapshot]:
-        explicit = payload.get("features")
+        result: dict[str, FeatureSnapshot] = {}
 
+        for snapshot in self._extract_explicit_features(
+            source=source,
+            symbol=symbol,
+            payload=payload,
+            timestamp=timestamp,
+        ):
+            result[snapshot.name] = snapshot
+
+        for snapshot in self._extract_feature_map(
+            source=source,
+            symbol=symbol,
+            payload=payload,
+            timestamp=timestamp,
+        ):
+            result.setdefault(snapshot.name, snapshot)
+
+        for snapshot in self._extract_nested_features(
+            source=source,
+            symbol=symbol,
+            payload=payload,
+            timestamp=timestamp,
+        ):
+            result.setdefault(snapshot.name, snapshot)
+
+        for snapshot in self._build_implicit_features(
+            source=source,
+            symbol=symbol,
+            payload=payload,
+            timestamp=timestamp,
+        ):
+            result.setdefault(snapshot.name, snapshot)
+
+        return list(result.values())
+
+    def _extract_explicit_features(
+        self,
+        *,
+        source: FeatureSource,
+        symbol: str,
+        payload: dict[str, Any],
+        timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        explicit = payload.get("features")
         if explicit is None:
-            return self._build_implicit_features(
-                source=source,
-                symbol=symbol,
-                payload=payload,
-                timestamp=timestamp,
-            )
+            return []
+
+        if isinstance(explicit, dict):
+            explicit = [
+                {"name": name, "value": value}
+                for name, value in explicit.items()
+            ]
 
         if not isinstance(explicit, list):
-            raise SignalNormalizationError("payload['features'] must be a list")
+            raise SignalNormalizationError("payload['features'] must be a list or dict")
 
         result: list[FeatureSnapshot] = []
 
         for item in explicit:
+            if isinstance(item, FeatureSnapshot):
+                item.validate()
+                result.append(item)
+                continue
+
             if not isinstance(item, dict):
                 raise SignalNormalizationError("each feature item must be a dict")
 
-            name = item.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise SignalNormalizationError("feature item must contain non-empty 'name'")
-
-            confidence = self._safe_confidence(
-                item.get("confidence", payload.get("confidence", 0.0))
-            )
-            normalized_value = self._safe_normalized_value(item.get("normalized_value"))
-
-            snapshot = FeatureSnapshot(
-                name=name.strip(),
-                value=item.get("value"),
+            snapshot = self._snapshot_from_feature_item(
                 source=source,
                 symbol=symbol,
+                item=item,
                 timestamp=timestamp,
-                confidence=confidence,
-                normalized_value=normalized_value,
-                freshness_seconds=self._resolve_freshness_seconds(
-                    feature_name=name.strip(),
-                    explicit=item.get("freshness_seconds"),
-                ),
-                metadata=dict(item.get("metadata") or {}),
+                default_confidence=payload.get("confidence", 0.0),
+                metadata={"origin": "features"},
             )
-            snapshot.validate()
             result.append(snapshot)
+
+        return result
+
+    def _extract_feature_map(
+        self,
+        *,
+        source: FeatureSource,
+        symbol: str,
+        payload: dict[str, Any],
+        timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        feature_map = payload.get("feature_map")
+        if feature_map is None:
+            return []
+
+        if not isinstance(feature_map, dict):
+            raise SignalNormalizationError("payload['feature_map'] must be a dict")
+
+        result: list[FeatureSnapshot] = []
+        default_confidence = payload.get("confidence", 0.0)
+
+        for name, value in feature_map.items():
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            if isinstance(value, dict):
+                item = {"name": name, **value}
+            else:
+                item = {"name": name, "value": value}
+
+            snapshot = self._snapshot_from_feature_item(
+                source=source,
+                symbol=symbol,
+                item=item,
+                timestamp=timestamp,
+                default_confidence=default_confidence,
+                metadata={"origin": "feature_map"},
+            )
+            result.append(snapshot)
+
+        return result
+
+    def _extract_nested_features(
+        self,
+        *,
+        source: FeatureSource,
+        symbol: str,
+        payload: dict[str, Any],
+        timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        default_confidence = payload.get("confidence", payload.get("strength", 0.0))
+
+        for container_name in self._FEATURE_CONTAINER_KEYS:
+            container = payload.get(container_name)
+
+            if container is None:
+                continue
+            if container_name in {"features", "feature_map"}:
+                continue
+
+            if not isinstance(container, dict):
+                continue
+
+            flattened = self._flatten_scalar_dict(container)
+
+            for path, value in flattened.items():
+                leaf_name = path.rsplit(".", 1)[-1]
+                feature_names = self._feature_name_candidates(
+                    container_name=container_name,
+                    path=path,
+                    leaf_name=leaf_name,
+                    payload=payload,
+                )
+
+                for feature_name in feature_names:
+                    snapshot = self._snapshot_from_raw_value(
+                        source=source,
+                        symbol=symbol,
+                        name=feature_name,
+                        value=value,
+                        timestamp=timestamp,
+                        confidence=default_confidence,
+                        metadata={
+                            "origin": container_name,
+                            "path": path,
+                        },
+                    )
+                    result.append(snapshot)
 
         return result
 
@@ -627,39 +899,170 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime,
     ) -> list[FeatureSnapshot]:
-        excluded = {
-            "symbol",
-            "instrument",
-            "market",
-            "timestamp",
-            "ts",
-            "source",
-            "metadata",
-        }
-
         base_confidence = self._safe_confidence(payload.get("confidence", 0.0))
         result: list[FeatureSnapshot] = []
 
         for key, value in payload.items():
-            if key in excluded or key.startswith("_"):
+            if key in self._SCALAR_FEATURE_EXCLUDED_KEYS or key.startswith("_"):
+                continue
+            if key in self._FEATURE_CONTAINER_KEYS:
                 continue
 
-            if isinstance(value, (int, float, bool, str)):
-                snapshot = FeatureSnapshot(
-                    name=key,
-                    value=value,
+            if self._is_feature_scalar(value):
+                snapshot = self._snapshot_from_raw_value(
                     source=source,
                     symbol=symbol,
+                    name=key,
+                    value=value,
                     timestamp=timestamp,
                     confidence=base_confidence,
-                    normalized_value=self._infer_normalized_value(value),
-                    freshness_seconds=self._resolve_freshness_seconds(key, None),
-                    metadata={},
+                    metadata={"origin": "top_level"},
                 )
-                snapshot.validate()
                 result.append(snapshot)
 
         return result
+
+    def _snapshot_from_feature_item(
+        self,
+        *,
+        source: FeatureSource,
+        symbol: str,
+        item: dict[str, Any],
+        timestamp: datetime,
+        default_confidence: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> FeatureSnapshot:
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SignalNormalizationError("feature item must contain non-empty 'name'")
+
+        confidence = self._safe_confidence(item.get("confidence", default_confidence))
+        normalized_value = self._safe_normalized_value(
+            item.get("normalized_value", item.get("normalized"))
+        )
+
+        snapshot = FeatureSnapshot(
+            name=self._normalize_feature_name(name),
+            value=item.get("value"),
+            source=source,
+            symbol=symbol,
+            timestamp=timestamp,
+            confidence=confidence,
+            normalized_value=normalized_value,
+            freshness_seconds=self._resolve_freshness_seconds(
+                feature_name=self._normalize_feature_name(name),
+                explicit=item.get("freshness_seconds"),
+            ),
+            metadata={
+                **dict(metadata or {}),
+                **dict(item.get("metadata") or {}),
+            },
+        )
+        snapshot.validate()
+        return snapshot
+
+    def _snapshot_from_raw_value(
+        self,
+        *,
+        source: FeatureSource,
+        symbol: str,
+        name: str,
+        value: Any,
+        timestamp: datetime,
+        confidence: Any,
+        metadata: dict[str, Any] | None = None,
+    ) -> FeatureSnapshot:
+        feature_name = self._normalize_feature_name(name)
+        snapshot = FeatureSnapshot(
+            name=feature_name,
+            value=value,
+            source=source,
+            symbol=symbol,
+            timestamp=timestamp,
+            confidence=self._safe_confidence(confidence),
+            normalized_value=self._infer_normalized_value(value),
+            freshness_seconds=self._resolve_freshness_seconds(feature_name, None),
+            metadata=dict(metadata or {}),
+        )
+        snapshot.validate()
+        return snapshot
+
+    @classmethod
+    def _feature_name_candidates(
+        cls,
+        *,
+        container_name: str,
+        path: str,
+        leaf_name: str,
+        payload: dict[str, Any],
+    ) -> list[str]:
+        metric = payload.get("metric")
+        names: list[str] = []
+
+        # Main lookup should be leaf name: cvd, delta_ratio, imbalance_ratio, etc.
+        names.append(leaf_name)
+
+        # Also add metric-prefixed names for disambiguation:
+        # cvd.delta_ratio, volume_delta.delta_ratio, etc.
+        if isinstance(metric, str) and metric.strip():
+            names.append(f"{metric.strip()}.{leaf_name}")
+
+        # Also add container-prefixed names:
+        # stats.delta_ratio, context.absorption_score, etc.
+        names.append(f"{container_name}.{path}")
+
+        return list(dict.fromkeys(cls._normalize_feature_name(name) for name in names))
+
+    @classmethod
+    def _flatten_scalar_dict(
+        cls,
+        value: dict[str, Any],
+        *,
+        prefix: str = "",
+        max_depth: int = 4,
+    ) -> dict[str, Any]:
+        if max_depth <= 0:
+            return {}
+
+        result: dict[str, Any] = {}
+
+        for key, item in value.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            if key.startswith("_"):
+                continue
+
+            normalized_key = cls._normalize_feature_name(key)
+            path = f"{prefix}.{normalized_key}" if prefix else normalized_key
+
+            if cls._is_feature_scalar(item):
+                result[path] = item
+                continue
+
+            if isinstance(item, dict):
+                result.update(
+                    cls._flatten_scalar_dict(
+                        item,
+                        prefix=path,
+                        max_depth=max_depth - 1,
+                    )
+                )
+
+        return result
+
+    @staticmethod
+    def _is_feature_scalar(value: Any) -> bool:
+        return isinstance(value, (int, float, bool, str)) and value is not None
+
+    @staticmethod
+    def _normalize_feature_name(value: str) -> str:
+        return (
+            str(value)
+            .strip()
+            .lower()
+            .replace(" ", "_")
+            .replace("-", "_")
+        )
 
     def _resolve_freshness_seconds(
         self,
@@ -2545,11 +2948,14 @@ class SignalProcessor(BaseStrategyComponent):
         existing = self.state.contexts.get_context(normalized.symbol)
         if existing is not None:
             existing.timestamp = normalized.timestamp
+            existing.timeframe = normalized.timeframe
+            existing.validate()
             return existing
 
         return self.state.build_context(
             normalized.symbol,
             timestamp=normalized.timestamp,
+            timeframe=normalized.timeframe,
             include_regime=True,
             include_portfolio=True,
         )

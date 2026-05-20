@@ -8,19 +8,6 @@ from typing import Any
 
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from ...config import StrategyConfig, StrategyDefinitionConfig
-from ...enums import (
-    FeatureSource,
-    MarketRegime,
-    SetupType,
-    SignalPriority,
-    SignalSide,
-    StrategyCategory,
-    Timeframe,
-)
-from ...exceptions import StrategyConfigError
-from ...models import StrategyContext, StrategyMetadata, StrategySignal
 from .base import (
     HYBRID_FEATURES,
     HybridCompositeSnapshot,
@@ -30,7 +17,6 @@ from .base import (
 from .utils import (
     DirectionVote,
     HybridScoreBreakdown,
-    OI_FUNDING_SQUEEZE_SOURCES,
     average_score,
     confidence_from_components,
     conflicting_source_names,
@@ -50,6 +36,18 @@ from .utils import (
     votes_for_side,
     weighted_score,
 )
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    FeatureSource,
+    MarketRegime,
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+    Timeframe,
+)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)

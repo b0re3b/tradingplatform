@@ -5,7 +5,7 @@ MarketReplay is the bridge between historical data and the production-style
 event-driven trading pipeline.
 
 It takes replay-ready BacktestDataset/BacktestEvent objects and emits the same
-market.* topics that exchange adapters would emit in live trading:
+raw market.* topics that exchange adapters would emit in live trading:
 
 - market.candle
 - market.trade
@@ -18,18 +18,24 @@ The rest of the system should not care whether events came from live exchange
 adapters or from historical replay.
 
 Important:
+- MarketReplay does not emit market.*.updated.
+- MarketReplay does not run analytics directly.
 - MarketReplay does not run strategies directly.
 - MarketReplay does not call RiskManager directly.
 - MarketReplay does not simulate execution.
-- MarketReplay only advances simulated time and emits historical market events.
+- MarketReplay only advances simulated time and emits historical raw market events.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+from core.event_bus import EventBus, EventPriority
+from core.logger import get_logger
 
 from backtesting.backtest_time import BacktestClock
 from backtesting.config import MarketReplayConfig
@@ -39,7 +45,6 @@ from backtesting.enums import (
     BacktestStatus,
     ReplayEventPriority,
     ReplayMode,
-    ReplaySpeed,
     WarmupPolicy,
 )
 from backtesting.exceptions import (
@@ -63,15 +68,6 @@ from backtesting.models import (
     timestamp_ms,
     utcnow,
 )
-
-
-try:
-    from core.logger import get_logger
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str) -> logging.Logger:
-        return logging.getLogger(name)
 
 
 @dataclass(slots=True)
@@ -132,25 +128,13 @@ class MarketReplay:
     """
     Deterministic historical market replay.
 
-    Usage:
-
-        replay = MarketReplay(
-            config=MarketReplayConfig(),
-            event_bus=event_bus,
-            clock=clock,
-        )
-
-        replay.prepare(dataset)
-        await replay.start()
-        await replay.replay()
-        await replay.stop()
-
     Event flow:
 
         BacktestDataset.events
             -> BacktestClock.advance_to(event.timestamp_ms)
-            -> EventBus.emit("market.*", event.payload)
-            -> data caches
+            -> core.EventBus.emit("market.*", payload)
+            -> production data caches
+            -> market.*.updated
             -> analytics
             -> strategy
             -> risk
@@ -158,11 +142,13 @@ class MarketReplay:
             -> position simulator
     """
 
+    component_name = "MarketReplay"
+
     def __init__(
         self,
         config: MarketReplayConfig | None = None,
         *,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
         clock: BacktestClock | None = None,
         logger_name: str = "backtesting.market_replay",
     ) -> None:
@@ -181,6 +167,7 @@ class MarketReplay:
         self._paused = False
         self._stopped = False
         self._prepared = False
+        self._registered = False
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -189,10 +176,13 @@ class MarketReplay:
 
     def register(self) -> None:
         """
-        Placeholder for consistency with project components.
+        Lifecycle-compatible no-op.
 
-        MarketReplay does not subscribe to production topics by default.
+        MarketReplay does not subscribe to production topics. It only emits raw
+        market.* replay events when replay() / replay_step() is called.
         """
+
+        self._registered = True
 
     def prepare(
         self,
@@ -205,7 +195,19 @@ class MarketReplay:
         """
 
         if dataset.is_empty:
-            raise MarketReplayNotPreparedError("Cannot prepare MarketReplay with an empty dataset.")
+            raise MarketReplayNotPreparedError(
+                "Cannot prepare MarketReplay with an empty dataset."
+            )
+
+        if self.event_bus is None:
+            raise MarketReplayNotPreparedError(
+                "MarketReplay requires core EventBus before prepare()."
+            )
+
+        if not isinstance(self.event_bus, EventBus):
+            raise MarketReplayNotPreparedError(
+                "MarketReplay requires core.event_bus.EventBus for full-pipeline replay."
+            )
 
         self.dataset = dataset
 
@@ -228,6 +230,10 @@ class MarketReplay:
             status=BacktestStatus.CREATED,
             total_events=len(dataset.events),
             current_index=0,
+            metadata={
+                "event_bus_type": self.event_bus.__class__.__name__,
+                "raw_market_topics": self.raw_market_topics(),
+            },
         )
 
         self._prepared = True
@@ -239,6 +245,10 @@ class MarketReplay:
     async def start(self) -> None:
         """
         Start replay lifecycle.
+
+        Does not start analytics/strategy/risk/execution. StrategyTester owns
+        component lifecycle. MarketReplay only starts its own replay state and
+        simulated clock if the clock is not already started.
         """
 
         async with self._lock:
@@ -250,7 +260,8 @@ class MarketReplay:
             assert self.clock is not None
             assert self.dataset is not None
 
-            self.clock.start(total_events=len(self.dataset.events))
+            if not self.clock.started:
+                self.clock.start(total_events=len(self.dataset.events))
 
             self._running = True
             self._paused = False
@@ -266,17 +277,23 @@ class MarketReplay:
                     "total_events": self.stats_state.total_events,
                     "replay_mode": self.config.replay_mode.value,
                     "replay_speed": self.config.replay_speed.value,
+                    "raw_market_topics": self.raw_market_topics(),
                 },
             )
 
     async def stop(self) -> None:
         """
         Stop replay lifecycle.
+
+        MarketReplay may stop its simulated clock, but it does not stop the
+        production EventBus or any injected production components.
         """
 
         async with self._lock:
             if not self._prepared:
                 return
+
+            already_stopped = self._stopped
 
             self._running = False
             self._paused = False
@@ -291,6 +308,9 @@ class MarketReplay:
 
             if self.clock is not None and self.clock.started and not self.clock.stopped:
                 self.clock.stop()
+
+        if already_stopped:
+            return
 
         if self.config.emit_replay_lifecycle_events:
             await self._emit_lifecycle(
@@ -348,7 +368,8 @@ class MarketReplay:
 
         if self.config.replay_mode == ReplayMode.STEP_BY_STEP:
             raise MarketReplayError(
-                "MarketReplay.replay() cannot be used in STEP_BY_STEP mode. Use replay_step()."
+                "MarketReplay.replay() cannot be used in STEP_BY_STEP mode. "
+                "Use replay_step()."
             )
 
         if self.config.batch_events_by_timestamp or self.config.replay_mode == ReplayMode.BATCHED:
@@ -425,8 +446,6 @@ class MarketReplay:
         assert self.dataset is not None
 
         batches = self.dataset.batches_by_timestamp()
-
-        # Find batch matching current_index.
         event_index = self.stats_state.current_index
         batch_start_index = 0
 
@@ -489,8 +508,8 @@ class MarketReplay:
             if index < skip_before_index:
                 continue
 
-            await self._emit_replay_event(event)
-            self._update_stats_after_event(event, emitted=True)
+            emitted = await self._emit_replay_event(event)
+            self._update_stats_after_event(event, emitted=emitted)
             self.stats_state.current_index = index
 
     async def _process_event(
@@ -513,8 +532,8 @@ class MarketReplay:
         )
 
         try:
-            await self._emit_replay_event(event)
-            self._update_stats_after_event(event, emitted=True)
+            emitted = await self._emit_replay_event(event)
+            self._update_stats_after_event(event, emitted=emitted)
             self.stats_state.current_index = index
 
         except Exception:
@@ -525,18 +544,20 @@ class MarketReplay:
     # Emit logic
     # ------------------------------------------------------------------
 
-    async def _emit_replay_event(self, event: BacktestEvent) -> None:
+    async def _emit_replay_event(self, event: BacktestEvent) -> bool:
         """
-        Emit one replay event through EventBus.
+        Emit one replay event through the production EventBus.
+
+        Returns:
+            True  - event was emitted;
+            False - event was intentionally skipped.
         """
 
         if event.event_type != BacktestEventType.MARKET:
-            self.stats_state.skipped_events += 1
-            return
+            return False
 
         if not self._should_emit_event(event):
-            self.stats_state.skipped_events += 1
-            return
+            return False
 
         topic = self._resolve_topic(event)
         payload = self._build_payload(event)
@@ -547,11 +568,37 @@ class MarketReplay:
                 details={"event_id": event.event_id},
             )
 
+        if not topic.startswith("market."):
+            raise ReplayEventError(
+                "MarketReplay is allowed to emit only raw market.* topics.",
+                details={
+                    "event_id": event.event_id,
+                    "topic": topic,
+                },
+            )
+
+        if topic.endswith(".updated"):
+            raise ReplayEventError(
+                "MarketReplay must not emit market.*.updated topics. "
+                "Updated events are produced by production data caches.",
+                details={
+                    "event_id": event.event_id,
+                    "topic": topic,
+                },
+            )
+
         if self.event_bus is None:
             raise ReplayEmitError("MarketReplay requires EventBus to emit market events.")
 
         try:
-            await self._emit(topic, payload)
+            await self._emit(
+                topic,
+                payload,
+                priority=self._event_priority(event),
+                source="MarketReplay",
+                headers=self._event_headers(event, topic),
+            )
+            return True
 
         except Exception as exc:
             self.stats_state.failed_events += 1
@@ -570,28 +617,50 @@ class MarketReplay:
                 ) from exc
 
             self.logger.warning(
-                "Failed to emit replay event %s topic=%s: %s",
-                event.event_id,
-                topic,
-                exc,
+                "Failed to emit replay event",
+                extra={
+                    "event_id": event.event_id,
+                    "topic": topic,
+                    "timestamp_ms": event.timestamp_ms,
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
             )
+            return False
 
-    async def _emit(self, topic: str, payload: dict[str, Any]) -> None:
+    async def _emit(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority = EventPriority.NORMAL,
+        source: str = "MarketReplay",
+        headers: dict[str, Any] | None = None,
+    ) -> None:
         """
-        Emit/publish through project EventBus.
+        Emit through production core.EventBus.
         """
 
-        emit = getattr(self.event_bus, "emit", None) or getattr(self.event_bus, "publish", None)
+        if self.event_bus is None:
+            raise ReplayEmitError("EventBus is not configured.")
 
-        if emit is None:
+        emit = getattr(self.event_bus, "emit", None)
+
+        if not callable(emit):
             raise ReplayEmitError(
-                "EventBus does not expose emit() or publish().",
+                "EventBus does not expose emit().",
                 details={"event_bus_type": self.event_bus.__class__.__name__},
             )
 
-        result = emit(topic, payload)
+        result = emit(
+            topic,
+            payload,
+            priority=priority,
+            source=source,
+            headers=headers or {},
+        )
 
-        if hasattr(result, "__await__"):
+        if inspect.isawaitable(result):
             await result
 
     async def _emit_lifecycle(self, topic: str, payload: dict[str, Any]) -> None:
@@ -612,12 +681,21 @@ class MarketReplay:
                     if self.clock is not None
                     else timestamp_ms(utcnow()),
                 },
+                priority=EventPriority.LOW,
+                source="MarketReplay",
+                headers={
+                    "component": "backtesting.market_replay",
+                    "event_type": "backtest_lifecycle",
+                },
             )
         except Exception as exc:
             self.logger.warning(
-                "Failed to emit replay lifecycle event %s: %s",
-                topic,
-                exc,
+                "Failed to emit replay lifecycle event",
+                extra={
+                    "topic": topic,
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
             )
 
     async def _maybe_emit_progress(self) -> None:
@@ -665,7 +743,7 @@ class MarketReplay:
             if not self.config.emit_warmup_events:
                 return False
 
-        topic = event.topic
+        topic = self._resolve_topic(event)
 
         if topic == self.config.market_candle_topic:
             return self.config.emit_market_candles
@@ -685,15 +763,15 @@ class MarketReplay:
         if topic == self.config.market_liquidation_topic:
             return self.config.emit_market_liquidations
 
-        # If topic is production-compatible but not explicitly listed, allow it.
-        return topic.startswith("market.")
+        # Unknown market.* raw topics are allowed for future extensions.
+        return topic.startswith("market.") and not topic.endswith(".updated")
 
     def _resolve_topic(self, event: BacktestEvent) -> str:
         """
-        Resolve production market topic.
+        Resolve production raw market topic.
 
-        BacktestEvent should already carry topic, but this method gives a
-        fallback based on metadata data_type.
+        BacktestEvent should already carry a topic, but this method provides
+        fallback based on metadata["data_type"].
         """
 
         if event.topic:
@@ -706,39 +784,28 @@ class MarketReplay:
         except Exception:
             return ""
 
-        if data_type == BacktestDataType.CANDLES:
-            return self.config.market_candle_topic
-
-        if data_type == BacktestDataType.TRADES:
-            return self.config.market_trade_topic
-
-        if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
-            return self.config.market_orderbook_topic
-
-        if data_type == BacktestDataType.FUNDING:
-            return self.config.market_funding_topic
-
-        if data_type == BacktestDataType.OPEN_INTEREST:
-            return self.config.market_open_interest_topic
-
-        if data_type == BacktestDataType.LIQUIDATIONS:
-            return self.config.market_liquidation_topic
-
-        return ""
+        return market_topic_for_data_type(data_type, config=self.config)
 
     def _build_payload(self, event: BacktestEvent) -> dict[str, Any]:
         """
-        Add replay metadata to market payload without changing domain fields.
+        Add replay metadata to market payload without overwriting domain fields.
         """
 
         payload = dict(event.payload)
 
-        if self.config.mark_warmup_payloads:
-            payload.setdefault("is_warmup", event.is_warmup)
-
+        payload.setdefault("timestamp_ms", event.timestamp_ms)
+        payload.setdefault("received_at_ms", event.timestamp_ms)
         payload.setdefault("source", "market_replay")
         payload.setdefault("replay_event_id", event.event_id)
         payload.setdefault("replay_sequence", event.sequence)
+        payload.setdefault("run_id", event.run_id)
+
+        if self.config.mark_warmup_payloads:
+            payload.setdefault("is_warmup", event.is_warmup)
+
+        data_type = event.metadata.get("data_type")
+        if data_type is not None:
+            payload.setdefault("data_type", data_type)
 
         metadata = dict(payload.get("metadata") or {})
         metadata.update(
@@ -746,12 +813,54 @@ class MarketReplay:
                 "backtest": True,
                 "replay_event_id": event.event_id,
                 "replay_source": event.source,
+                "replay_sequence": event.sequence,
                 "replay_is_warmup": event.is_warmup,
+                "replay_timestamp_ms": event.timestamp_ms,
+                "data_type": data_type,
+                "record_type": event.metadata.get("record_type"),
+                "instrument_key": event.metadata.get("instrument_key"),
             }
         )
         payload["metadata"] = metadata
 
         return payload
+
+    def _event_priority(self, event: BacktestEvent) -> EventPriority:
+        """
+        Map replay priority to core EventBus priority.
+
+        Market replay events generally use NORMAL priority. Higher priority is
+        reserved for lifecycle/errors; deterministic ordering is controlled by
+        BacktestDataset sorting, not EventBus priority.
+        """
+
+        if event.priority in {
+            ReplayEventPriority.LIQUIDATION,
+            ReplayEventPriority.ORDERBOOK,
+        }:
+            return EventPriority.NORMAL
+
+        if event.priority in {
+            ReplayEventPriority.FUNDING,
+            ReplayEventPriority.OPEN_INTEREST,
+            ReplayEventPriority.MARK_PRICE,
+            ReplayEventPriority.INDEX_PRICE,
+        }:
+            return EventPriority.NORMAL
+
+        return EventPriority.NORMAL
+
+    @staticmethod
+    def _event_headers(event: BacktestEvent, topic: str) -> dict[str, Any]:
+        return {
+            "component": "backtesting.market_replay",
+            "topic": topic,
+            "replay_event_id": event.event_id,
+            "replay_sequence": event.sequence,
+            "is_warmup": event.is_warmup,
+            "data_type": event.metadata.get("data_type"),
+            "record_type": event.metadata.get("record_type"),
+        }
 
     # ------------------------------------------------------------------
     # Seeking / checkpoints
@@ -786,8 +895,8 @@ class MarketReplay:
         """
         Seek replay to event index.
 
-        This is intended for debugging. For deterministic full backtests,
-        prefer running from the beginning.
+        Intended for debugging. For deterministic full backtests, prefer running
+        from the beginning.
         """
 
         async with self._lock:
@@ -811,7 +920,6 @@ class MarketReplay:
             self.stats_state.current_timestamp_ms = event.timestamp_ms
             self.stats_state.processed_events = index
 
-            # Seeking only moves clock if monotonic rules allow it.
             if event.timestamp_ms >= self.clock.timestamp_ms_or_wall_clock():
                 self.clock.advance_to(event.timestamp_ms, allow_equal=True)
             elif self.clock.config.allow_time_travel_backwards:
@@ -861,14 +969,29 @@ class MarketReplay:
         payload.update(
             {
                 "prepared": self._prepared,
+                "registered": self._registered,
                 "running": self._running,
                 "paused": self._paused,
                 "stopped": self._stopped,
                 "checkpoints": len(self._checkpoints),
+                "event_bus_type": self.event_bus.__class__.__name__
+                if self.event_bus is not None
+                else None,
+                "raw_market_topics": self.raw_market_topics(),
             }
         )
 
         return payload
+
+    def raw_market_topics(self) -> list[str]:
+        return [
+            self.config.market_candle_topic,
+            self.config.market_trade_topic,
+            self.config.market_orderbook_topic,
+            self.config.market_funding_topic,
+            self.config.market_open_interest_topic,
+            self.config.market_liquidation_topic,
+        ]
 
     # ------------------------------------------------------------------
     # Internal stats
@@ -885,11 +1008,16 @@ class MarketReplay:
 
         if emitted:
             self.stats_state.emitted_events += 1
+        else:
+            self.stats_state.skipped_events += 1
 
         if event.is_warmup:
             self.stats_state.warmup_events += 1
         else:
             self.stats_state.trading_events += 1
+
+        if not emitted:
+            return
 
         topic = self._resolve_topic(event)
 
@@ -917,9 +1045,10 @@ class MarketReplay:
             )
 
         if self.clock is None:
-            raise MarketReplayNotPreparedError(
-                "MarketReplay clock is missing."
-            )
+            raise MarketReplayNotPreparedError("MarketReplay clock is missing.")
+
+        if self.event_bus is None:
+            raise MarketReplayNotPreparedError("MarketReplay EventBus is missing.")
 
     def _ensure_running(self) -> None:
         self._ensure_prepared()
@@ -962,7 +1091,7 @@ def market_topic_for_data_type(
     config: MarketReplayConfig | None = None,
 ) -> str:
     """
-    Resolve default market topic for a historical data type.
+    Resolve default raw market topic for a historical data type.
     """
 
     replay_config = config or MarketReplayConfig()
@@ -994,6 +1123,9 @@ def market_topic_for_data_type(
 def replay_priority_for_data_type(data_type: BacktestDataType) -> ReplayEventPriority | None:
     """
     Resolve deterministic replay priority for a historical data type.
+
+    This priority is used by BacktestDataset sorting/replay ordering, not as a
+    trading decision priority.
     """
 
     if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:

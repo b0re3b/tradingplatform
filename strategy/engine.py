@@ -730,7 +730,7 @@ class StrategyLifecycleManager(BaseStrategyComponent):
             self.scheduler.add_interval_job(
                 name=self._cleanup_job_name,
                 func=self._cleanup_state_job,
-                interval_seconds=cleanup_interval,
+                interval=cleanup_interval,
                 run_immediately=False,
             )
         except TypeError:

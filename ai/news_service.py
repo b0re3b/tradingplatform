@@ -168,7 +168,7 @@ class NewsAIService:
 
         self.scheduler.add_interval_job(
             name=f"{self.config.service_name}.collect",
-            interval_seconds=self.config.collect_interval_seconds,
+            interval=self.config.collect_interval_seconds,
             func=self.collect_once,
             run_immediately=self.config.startup_collect_enabled,
             max_retries=1,

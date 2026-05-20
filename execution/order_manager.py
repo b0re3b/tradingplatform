@@ -348,7 +348,7 @@ class OrderManager:
             try:
                 job = self._scheduler.add_interval_job(
                     callback,
-                    interval_seconds=interval_seconds,
+                    interval=interval_seconds,
                     name=name,
                     run_immediately=False,
                 )

@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
 
 from core.logger import get_logger
-
 from .config import NewsAIConfig, NewsSourceConfig
 from .enums import (
     NewsFailureReason,
-    NewsFetchStatus,
     NewsProcessingStage,
     NewsSourceStatus,
 )

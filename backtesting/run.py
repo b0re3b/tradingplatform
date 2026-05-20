@@ -1,11 +1,11 @@
-# backtesting/run_backtest_full.py
+# backtesting/run.py
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import importlib
 import inspect
+import json
 import os
 import pkgutil
 from dataclasses import dataclass, field
@@ -19,11 +19,11 @@ from core.logger import get_logger
 from core.scheduler import Scheduler
 
 from backtesting.config import BacktestConfig
-from backtesting.exceptions import DataLoadError
 from backtesting.data_loader import DataLoader
 from backtesting.enums import (
     BacktestDataType,
     BacktestMode,
+    CommissionModel,
     DataGapPolicy,
     DataValidationLevel,
     FillModel,
@@ -31,11 +31,11 @@ from backtesting.enums import (
     LiquidityModel,
     PnLAccountingMode,
     PositionAccountingMode,
-    ReplayMode,
     ReportFormat,
     ReportSection,
     SlippageModel,
 )
+from backtesting.exceptions import DataLoadError
 from backtesting.strategy_tester import StrategyTester
 
 from data.candles_cache import CandlesCache
@@ -49,55 +49,72 @@ from risk.risk_manager import RiskManager
 
 from strategy.base import BaseStrategy
 from strategy.config import StrategyConfig
-from strategy.state import StrategyRuntimeState
 from strategy.engine import StrategyEngine
-from strategy.presets import build_default_strategy_config, build_default_strategy_registry
+from strategy.presets import (
+    build_default_strategy_config,
+    build_default_strategy_registry,
+)
 from strategy.processor import SignalProcessor
+from strategy.state import StrategyRuntimeState
 
 
-logger = get_logger("backtesting.run_backtest_full")
-
-
-# =============================================================================
-# DataLoader compatibility
-# =============================================================================
-
-
-class SortingDataLoader(DataLoader):
-    """
-    DataLoader compatibility layer for multi-symbol datasets.
-
-    Current DataLoader.load_bundle() validates record ordering before calling
-    _sort_bundle(). With multi-symbol files, records are loaded per file/symbol
-    and are often grouped as BTC -> DOGE -> SOL rather than globally sorted by
-    timestamp. This subclass sorts before validation, then lets the original
-    DataLoader flow continue.
-    """
-
-    def validate_bundle(self, bundle: Any, *, period: Any | None = None) -> None:
-        self._sort_bundle(bundle)
-        super().validate_bundle(bundle, period=period)
+logger = get_logger("backtesting.run")
 
 
 # =============================================================================
-# Paths
+# Paths / defaults
 # =============================================================================
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
+DEFAULT_RUN_NAME = "btc_doge_sol_last_2d_full_pipeline"
+DEFAULT_EXCHANGE = "binance"
+DEFAULT_MARKET_TYPE = "usdm_futures"
+DEFAULT_SYMBOLS = ["BTCUSDT", "DOGEUSDT", "SOLUSDT"]
+DEFAULT_TIMEFRAMES = ["1m"]
+DEFAULT_BACKTEST_DAYS = 2
+
+
+def _rolling_end_time() -> datetime:
+    return datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+
+def _rolling_start_time(days: int = DEFAULT_BACKTEST_DAYS) -> datetime:
+    return _rolling_end_time() - timedelta(days=days)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+
+    if raw is None:
+        return default
+
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name)
+
+    if raw is None or not raw.strip():
+        return list(default)
+
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
+def _env_path(name: str, default: str | Path) -> Path:
+    return Path(os.getenv(name, str(default))).expanduser()
+
+
+def _file_exists_any(path_without_suffix: Path) -> bool:
+    return any(
+        path_without_suffix.with_suffix(suffix).exists()
+        for suffix in (".csv", ".parquet", ".json", ".jsonl")
+    )
+
 
 def _candidate_history_dirs() -> list[Path]:
-    """
-    Candidate historical data roots.
-
-    The downloader may be executed from project root or from the backtesting
-    folder. This runner resolves both layouts:
-    - <project>/data/history
-    - <project>/backtesting/data/history
-    """
-
     candidates: list[Path] = []
 
     env_dir = os.getenv("BACKTEST_DATA_DIR")
@@ -118,8 +135,10 @@ def _candidate_history_dirs() -> list[Path]:
     for path in candidates:
         resolved = path.resolve()
         key = str(resolved)
+
         if key in seen:
             continue
+
         unique.append(resolved)
         seen.add(key)
 
@@ -160,11 +179,6 @@ def resolve_history_dir(
     symbols: list[str],
     timeframes: list[str],
 ) -> Path:
-    """
-    Resolve the first data directory that contains required candles for every
-    requested symbol.
-    """
-
     candidates = _candidate_history_dirs()
 
     for candidate in candidates:
@@ -178,6 +192,7 @@ def resolve_history_dir(
             return candidate
 
     checked = "\n".join(f"- {item}" for item in candidates)
+
     raise FileNotFoundError(
         "Could not find historical candles for all requested symbols.\n"
         f"symbols={symbols}\n"
@@ -189,68 +204,23 @@ def resolve_history_dir(
 
 
 # =============================================================================
-# Constants
-# =============================================================================
-
-
-DEFAULT_RUN_NAME = "btc_doge_sol_last_2d_full_pipeline"
-DEFAULT_EXCHANGE = "binance"
-DEFAULT_MARKET_TYPE = "usdm_futures"
-DEFAULT_SYMBOLS = ["BTCUSDT", "DOGEUSDT", "SOLUSDT"]
-DEFAULT_TIMEFRAMES = ["1m"]
-
-DEFAULT_BACKTEST_DAYS = 2
-
-
-def _rolling_end_time() -> datetime:
-    return datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
-
-def _rolling_start_time(days: int = DEFAULT_BACKTEST_DAYS) -> datetime:
-    return _rolling_end_time() - timedelta(days=days)
-
-
-# =============================================================================
 # Runtime config
 # =============================================================================
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_list(name: str, default: list[str]) -> list[str]:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return list(default)
-    return [item.strip().upper() for item in raw.split(",") if item.strip()]
-
-
-def _env_path(name: str, default: str | Path) -> Path:
-    return Path(os.getenv(name, str(default))).expanduser()
 
 
 @dataclass(slots=True)
 class FullBacktestRunConfig:
     """
-    Runtime settings for the final full-pipeline backtest runner.
+    Runtime settings for full-pipeline backtest runner.
 
-    This script assumes you already downloaded historical data with
-    backtesting.history_downloader.HistoryDownloader.
-
-    Default expected data:
-        data/history/binance/usdm_futures/candles/BTCUSDT/1m/BTCUSDT_1m.csv
-        data/history/binance/usdm_futures/candles/DOGEUSDT/1m/DOGEUSDT_1m.csv
-        data/history/binance/usdm_futures/candles/SOLUSDT/1m/SOLUSDT_1m.csv
-        data/history/binance/usdm_futures/funding/<SYMBOL>/<SYMBOL>.csv
-        data/history/binance/usdm_futures/open_interest/<SYMBOL>/5m/<SYMBOL>_5m.csv
-
-    Optional:
-        data/history/binance/usdm_futures/open_interest/BTCUSDT/5m/BTCUSDT_5m.csv
-        data/history/binance/usdm_futures/trades/BTCUSDT/BTCUSDT.csv
+    This runner uses:
+    - real core.EventBus;
+    - real core.Scheduler wrapped by BacktestSchedulerCompatAdapter;
+    - production data caches;
+    - production analytics;
+    - production StrategyEngine / SignalProcessor;
+    - production RiskManager;
+    - backtesting ExecutionSimulator and PositionSimulator via StrategyTester.
     """
 
     run_name: str = DEFAULT_RUN_NAME
@@ -289,8 +259,9 @@ class FullBacktestRunConfig:
     analytics_specs: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_env(cls) -> "FullBacktestRunConfig":
+    def from_env(cls) -> FullBacktestRunConfig:
         input_format_raw = os.getenv("BACKTEST_INPUT_FORMAT", "csv").strip().lower()
+
         try:
             input_format = HistoricalDataFormat(input_format_raw)
         except ValueError:
@@ -298,6 +269,13 @@ class FullBacktestRunConfig:
                 "BACKTEST_INPUT_FORMAT must be one of: "
                 f"{', '.join(item.value for item in HistoricalDataFormat)}"
             ) from None
+
+        backtest_days = int(os.getenv("BACKTEST_DAYS", str(DEFAULT_BACKTEST_DAYS)).strip())
+        end_time = _rolling_end_time()
+        start_time = end_time - timedelta(days=backtest_days)
+
+        symbols = _env_list("SYMBOLS", DEFAULT_SYMBOLS)
+        timeframes = [item.lower() for item in _env_list("TIMEFRAMES", DEFAULT_TIMEFRAMES)]
 
         analytics_specs_raw = os.getenv("ANALYTICS_COMPONENTS", "").strip()
         analytics_specs = [
@@ -313,29 +291,23 @@ class FullBacktestRunConfig:
             if item.strip()
         ]
 
-        backtest_days_raw = os.getenv("BACKTEST_DAYS", str(DEFAULT_BACKTEST_DAYS)).strip()
-        backtest_days = int(backtest_days_raw)
-
-        end_time = _rolling_end_time()
-        start_time = end_time - timedelta(days=backtest_days)
-
-        symbols = _env_list("SYMBOLS", DEFAULT_SYMBOLS)
-        timeframes = [item.lower() for item in _env_list("TIMEFRAMES", DEFAULT_TIMEFRAMES)]
-
         data_dir = resolve_history_dir(
-            exchange=DEFAULT_EXCHANGE,
-            market_type=DEFAULT_MARKET_TYPE,
+            exchange=os.getenv("BACKTEST_EXCHANGE", DEFAULT_EXCHANGE).strip().lower() or DEFAULT_EXCHANGE,
+            market_type=os.getenv("BACKTEST_MARKET_TYPE", DEFAULT_MARKET_TYPE).strip().lower() or DEFAULT_MARKET_TYPE,
             symbols=symbols,
             timeframes=timeframes,
         )
 
         return cls(
             run_name=os.getenv("BACKTEST_RUN_NAME", DEFAULT_RUN_NAME).strip() or DEFAULT_RUN_NAME,
+            exchange=os.getenv("BACKTEST_EXCHANGE", DEFAULT_EXCHANGE).strip().lower() or DEFAULT_EXCHANGE,
+            market_type=os.getenv("BACKTEST_MARKET_TYPE", DEFAULT_MARKET_TYPE).strip().lower() or DEFAULT_MARKET_TYPE,
             symbols=symbols,
             timeframes=timeframes,
             data_dir=data_dir,
             output_dir=_env_path("BACKTEST_OUTPUT_DIR", "reports/backtests"),
             input_format=input_format,
+            initial_balance=float(os.getenv("INITIAL_BALANCE", "10000")),
             backtest_days=backtest_days,
             start_time=start_time,
             end_time=end_time,
@@ -343,8 +315,8 @@ class FullBacktestRunConfig:
             include_funding=_env_bool("INCLUDE_FUNDING", True),
             include_open_interest=_env_bool("INCLUDE_OPEN_INTEREST", True),
             include_trades=_env_bool("INCLUDE_TRADES", False),
-            include_orderbook=_env_bool("INCLUDE_ORDERBOOK", True),
-            include_liquidations=_env_bool("INCLUDE_LIQUIDATIONS", True),
+            include_orderbook=_env_bool("INCLUDE_ORDERBOOK", False),
+            include_liquidations=_env_bool("INCLUDE_LIQUIDATIONS", False),
             require_analytics=_env_bool("REQUIRE_ANALYTICS", True),
             stop_on_first_error=_env_bool("STOP_ON_FIRST_ERROR", True),
             cleanup_after_run=_env_bool("CLEANUP_AFTER_RUN", True),
@@ -361,436 +333,6 @@ class FullBacktestRunConfig:
 # =============================================================================
 
 
-@dataclass(slots=True)
-class InlineSubscription:
-    pattern: str
-    handler: Any
-    name: str = "anonymous_handler"
-
-    @property
-    def topic(self) -> str:
-        return self.pattern
-
-
-class InlineBacktestEvent(dict):
-    """
-    Dict-compatible event object for inline backtesting.
-
-    It supports both handler styles:
-    - payload-style handlers: event.get("symbol")
-    - core Event-style handlers: event.payload / event.topic
-
-    The dict itself contains the payload fields plus a `topic` key.
-    The `.payload` property returns the original payload dict.
-    """
-
-    def __init__(self, topic: str, payload: Any, **metadata: Any) -> None:
-        payload_dict = dict(payload or {}) if isinstance(payload, dict) else {"payload": payload}
-        super().__init__(payload_dict)
-        self["topic"] = topic
-        self._topic = topic
-        self._payload = payload_dict
-        self._metadata = metadata
-
-    @property
-    def topic(self) -> str:
-        return self._topic
-
-    @property
-    def payload(self) -> dict[str, Any]:
-        return self._payload
-
-    @property
-    def correlation_id(self) -> str | None:
-        return self._metadata.get("correlation_id")
-
-    @property
-    def source(self) -> str | None:
-        return self._metadata.get("source")
-
-    @property
-    def headers(self) -> dict[str, Any]:
-        return dict(self._metadata.get("headers") or {})
-
-
-class InlineBacktestEventBus:
-    """
-    Synchronous/inline EventBus for deterministic backtests.
-
-    The production core.EventBus is queue/worker based. That is good for live
-    runtime, but in backtesting we need every MarketReplay.emit() to complete
-    the whole downstream chain before moving on to the next event:
-
-        market.* -> data cache -> analytics.* -> strategy -> risk -> execution -> position
-
-    This bus keeps the same basic API:
-    - subscribe(pattern, handler, name=None)
-    - unsubscribe(subscription)
-    - emit(topic, payload, **kwargs)
-    - publish(event_or_topic, payload=None)
-    - start()/stop()
-
-    It supports exact topics and simple suffix wildcards like "signal.*".
-    """
-
-    def __init__(self) -> None:
-        self._subscriptions: list[InlineSubscription] = []
-        self._running = False
-        self._metrics: dict[str, Any] = {
-            "published": 0,
-            "processed": 0,
-            "failed": 0,
-            "subscriptions": 0,
-            "topic_published": {},
-            "topic_processed": {},
-            "handler_errors": {},
-        }
-
-    async def start(self) -> None:
-        self._running = True
-
-    async def stop(self, *, drain: bool = True, timeout: float = 10.0) -> None:
-        self._running = False
-
-    def subscribe(
-        self,
-        pattern: str,
-        handler: Any,
-        *,
-        name: str | None = None,
-    ) -> InlineSubscription:
-        subscription = InlineSubscription(
-            pattern=pattern,
-            handler=handler,
-            name=name or getattr(handler, "__name__", "anonymous_handler"),
-        )
-        self._subscriptions.append(subscription)
-        self._metrics["subscriptions"] = len(self._subscriptions)
-        return subscription
-
-    def unsubscribe(self, subscription: Any, handler: Any | None = None) -> None:
-        if isinstance(subscription, InlineSubscription):
-            self._subscriptions = [
-                item for item in self._subscriptions if item is not subscription
-            ]
-        elif isinstance(subscription, str) and handler is not None:
-            self._subscriptions = [
-                item
-                for item in self._subscriptions
-                if not (item.pattern == subscription and item.handler == handler)
-            ]
-        self._metrics["subscriptions"] = len(self._subscriptions)
-
-    def add_middleware(self, middleware: Any) -> None:
-        # Compatibility no-op. Inline bus is intentionally minimal.
-        return None
-
-    def set_error_handler(self, handler: Any) -> None:
-        self._error_handler = handler
-
-    async def emit(
-        self,
-        topic: str,
-        payload: Any,
-        *,
-        priority: Any = None,
-        source: str | None = None,
-        correlation_id: str | None = None,
-        headers: dict[str, Any] | None = None,
-    ) -> bool:
-        event = InlineBacktestEvent(
-            topic,
-            payload,
-            source=source,
-            correlation_id=correlation_id,
-            headers=headers or {},
-            priority=priority,
-        )
-
-        self._metrics["published"] += 1
-        self._metrics["topic_published"][topic] = (
-            self._metrics["topic_published"].get(topic, 0) + 1
-        )
-
-        handlers = self._matching_handlers(topic)
-
-        for subscription in handlers:
-            try:
-                result = subscription.handler(event)
-                if inspect.isawaitable(result):
-                    await result
-
-                self._metrics["processed"] += 1
-                self._metrics["topic_processed"][topic] = (
-                    self._metrics["topic_processed"].get(topic, 0) + 1
-                )
-
-            except Exception as exc:
-                self._metrics["failed"] += 1
-                key = f"{subscription.pattern}:{subscription.name}"
-                self._metrics["handler_errors"][key] = (
-                    self._metrics["handler_errors"].get(key, 0) + 1
-                )
-                raise
-
-        return True
-
-    async def publish(self, event_or_topic: Any, payload: Any | None = None, **kwargs: Any) -> bool:
-        if isinstance(event_or_topic, str):
-            return await self.emit(event_or_topic, payload, **kwargs)
-
-        topic = getattr(event_or_topic, "topic", None)
-        event_payload = getattr(event_or_topic, "payload", payload)
-
-        if topic is None:
-            raise TypeError("publish() expects topic string or object with .topic")
-
-        return await self.emit(
-            topic,
-            event_payload,
-            source=getattr(event_or_topic, "source", None),
-            correlation_id=getattr(event_or_topic, "correlation_id", None),
-            headers=getattr(event_or_topic, "headers", None) or {},
-        )
-
-    def _matching_handlers(self, topic: str) -> list[InlineSubscription]:
-        result: list[InlineSubscription] = []
-
-        for subscription in list(self._subscriptions):
-            pattern = subscription.pattern
-
-            if pattern == topic:
-                result.append(subscription)
-                continue
-
-            if pattern.endswith(".*") and topic.startswith(pattern[:-1]):
-                result.append(subscription)
-                continue
-
-            if pattern == "*":
-                result.append(subscription)
-
-        return result
-
-    def stats(self) -> dict[str, Any]:
-        return dict(self._metrics)
-
-
-class BacktestSchedulerCompatAdapter:
-    """
-    Compatibility wrapper around core Scheduler for backtesting components.
-
-    Supported component-side call styles:
-    - add_interval_job(name=..., func=..., interval=...)
-    - add_interval_job(name=..., callback=..., interval_seconds=...)
-    - add_interval_job(name, func, interval)
-    - add_interval_job(name, callback, interval_seconds)
-
-    Current core Scheduler contract is:
-        add_interval_job(name, func, *, interval: float, ...)
-
-    The adapter forwards every other attribute/method to the wrapped scheduler.
-    """
-
-    def __init__(self, scheduler: Scheduler) -> None:
-        self._scheduler = scheduler
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._scheduler, name)
-
-    def add_interval_job(self, *args: Any, **kwargs: Any) -> Any:
-        """
-        Normalize all scheduler call styles used across the project.
-
-        Supported forms:
-        - add_interval_job(name, func, interval)
-        - add_interval_job(func, interval_seconds=..., name=...)
-        - add_interval_job(name=..., func=..., interval=...)
-        - add_interval_job(name=..., callback=..., interval_seconds=...)
-        - add_interval_job(name=..., coro=..., interval_seconds=...)
-        """
-
-        name = kwargs.pop("name", None)
-
-        func = kwargs.pop("func", None)
-        callback = kwargs.pop("callback", None)
-        coro = kwargs.pop("coro", None)
-        coroutine = kwargs.pop("coroutine", None)
-        job_func = kwargs.pop("job_func", None)
-        handler = kwargs.pop("handler", None)
-
-        resolved_func = func or callback or coro or coroutine or job_func or handler
-
-        interval = kwargs.pop("interval", None)
-        interval_seconds = kwargs.pop("interval_seconds", None)
-        resolved_interval = interval if interval is not None else interval_seconds
-
-        remaining_args = list(args)
-
-        # RiskManager uses: add_interval_job(callback, interval_seconds=..., name=...)
-        if remaining_args:
-            first = remaining_args.pop(0)
-
-            if name is not None and callable(first) and resolved_func is None:
-                resolved_func = first
-            elif name is None:
-                name = first
-            elif resolved_func is None:
-                resolved_func = first
-
-        if remaining_args and resolved_func is None:
-            resolved_func = remaining_args.pop(0)
-
-        if remaining_args and resolved_interval is None:
-            resolved_interval = remaining_args.pop(0)
-
-        if name is None:
-            raise TypeError("add_interval_job() missing required argument: 'name'")
-
-        if resolved_func is None:
-            raise TypeError("add_interval_job() missing required argument: 'func'/'callback'/'coro'")
-
-        if resolved_interval is None:
-            raise TypeError("add_interval_job() missing required argument: 'interval' or 'interval_seconds'")
-
-        if isinstance(resolved_interval, timedelta):
-            resolved_interval = resolved_interval.total_seconds()
-
-        resolved_interval = float(resolved_interval)
-
-        supported = _scheduler_add_interval_job_parameters(self._scheduler)
-        forwarded: dict[str, Any] = {}
-
-        # Alias cleanup.
-        if "overlap" in kwargs and "allow_overlap" in supported and "allow_overlap" not in kwargs:
-            kwargs["allow_overlap"] = kwargs.pop("overlap")
-
-        for key in (
-            "args",
-            "kwargs",
-            "run_immediately",
-            "max_retries",
-            "retry_delay",
-            "timeout",
-            "allow_overlap",
-            "enabled",
-        ):
-            if key in kwargs and key in supported:
-                forwarded[key] = kwargs.pop(key)
-
-        # Drop legacy/non-core fields.
-        kwargs.pop("job_id", None)
-        kwargs.pop("metadata", None)
-        kwargs.pop("max_runs", None)
-        kwargs.pop("start_at", None)
-
-        for key in list(kwargs):
-            if key in supported:
-                forwarded[key] = kwargs.pop(key)
-            else:
-                kwargs.pop(key)
-
-        return self._scheduler.add_interval_job(
-            str(name),
-            resolved_func,
-            interval=resolved_interval,
-            **forwarded,
-        )
-
-    def add_delayed_job(self, *args: Any, **kwargs: Any) -> Any:
-        name = kwargs.pop("name", None)
-
-        func = kwargs.pop("func", None)
-        callback = kwargs.pop("callback", None)
-        coro = kwargs.pop("coro", None)
-        coroutine = kwargs.pop("coroutine", None)
-        job_func = kwargs.pop("job_func", None)
-        handler = kwargs.pop("handler", None)
-
-        resolved_func = func or callback or coro or coroutine or job_func or handler
-
-        delay = kwargs.pop("delay", None)
-        delay_seconds = kwargs.pop("delay_seconds", None)
-        resolved_delay = delay if delay is not None else delay_seconds
-
-        remaining_args = list(args)
-
-        if remaining_args:
-            first = remaining_args.pop(0)
-
-            if name is not None and callable(first) and resolved_func is None:
-                resolved_func = first
-            elif name is None:
-                name = first
-            elif resolved_func is None:
-                resolved_func = first
-
-        if remaining_args and resolved_func is None:
-            resolved_func = remaining_args.pop(0)
-
-        if remaining_args and resolved_delay is None:
-            resolved_delay = remaining_args.pop(0)
-
-        if name is None:
-            raise TypeError("add_delayed_job() missing required argument: 'name'")
-
-        if resolved_func is None:
-            raise TypeError("add_delayed_job() missing required argument: 'func'/'callback'/'coro'")
-
-        if resolved_delay is None:
-            raise TypeError("add_delayed_job() missing required argument: 'delay' or 'delay_seconds'")
-
-        if isinstance(resolved_delay, timedelta):
-            resolved_delay = resolved_delay.total_seconds()
-
-        resolved_delay = float(resolved_delay)
-
-        supported = _scheduler_add_delayed_job_parameters(self._scheduler)
-
-        forwarded: dict[str, Any] = {}
-
-        for key in (
-            "args",
-            "kwargs",
-            "max_retries",
-            "retry_delay",
-            "timeout",
-            "enabled",
-        ):
-            if key in kwargs and key in supported:
-                forwarded[key] = kwargs.pop(key)
-
-        kwargs.pop("job_id", None)
-        kwargs.pop("metadata", None)
-
-        for key in list(kwargs):
-            if key in supported:
-                forwarded[key] = kwargs.pop(key)
-            else:
-                kwargs.pop(key)
-
-        return self._scheduler.add_delayed_job(
-            str(name),
-            resolved_func,
-            delay=resolved_delay,
-            **forwarded,
-        )
-
-
-def _scheduler_add_interval_job_parameters(scheduler: Scheduler) -> set[str]:
-    try:
-        return set(inspect.signature(scheduler.add_interval_job).parameters)
-    except Exception:
-        return set()
-
-
-def _scheduler_add_delayed_job_parameters(scheduler: Scheduler) -> set[str]:
-    try:
-        return set(inspect.signature(scheduler.add_delayed_job).parameters)
-    except Exception:
-        return set()
-
-
 async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -799,43 +341,350 @@ async def maybe_await(value: Any) -> Any:
 
 async def start_if_supported(component: Any) -> None:
     method = getattr(component, "start", None)
+
     if callable(method):
         await maybe_await(method())
 
 
 async def stop_if_supported(component: Any) -> None:
     method = getattr(component, "stop", None)
+
     if callable(method):
         await maybe_await(method())
 
 
 def stats_if_supported(component: Any) -> dict[str, Any]:
     method = getattr(component, "stats", None)
+
     if callable(method):
         try:
             value = method()
             return value if isinstance(value, dict) else {"value": value}
         except Exception as exc:
             return {"error": str(exc)}
+
     return {}
+
+
+class BacktestSchedulerCompatAdapter:
+    """
+    Compatibility wrapper around real core.scheduler.Scheduler.
+
+    Backtesting still uses the real Scheduler instance, but this adapter accepts
+    older/different call styles from production components without changing
+    production code.
+
+    Supported add_interval_job() call styles:
+
+        add_interval_job(name=..., callback=..., interval_seconds=...)
+        add_interval_job(name=..., callback=..., interval=...)
+        add_interval_job(name=..., callback=..., seconds=...)
+        add_interval_job(name, callback, interval_seconds)
+    """
+
+    def __init__(self, scheduler: Scheduler) -> None:
+        self._scheduler = scheduler
+
+    @property
+    def wrapped(self) -> Scheduler:
+        return self._scheduler
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._scheduler, name)
+
+    async def start(self) -> Any:
+        return await maybe_await(self._scheduler.start())
+
+    async def stop(self) -> Any:
+        return await maybe_await(self._scheduler.stop())
+
+    def stats(self) -> dict[str, Any]:
+        stats = getattr(self._scheduler, "stats", None)
+
+        if callable(stats):
+            value = stats()
+            return value if isinstance(value, dict) else {"value": value}
+
+        return {}
+
+    def add_interval_job(self, *args: Any, **kwargs: Any) -> Any:
+        name = kwargs.pop("name", None)
+
+        callback = (
+                kwargs.pop("callback", None)
+                or kwargs.pop("func", None)
+                or kwargs.pop("job_func", None)
+                or kwargs.pop("job", None)
+                or kwargs.pop("coro", None)
+                or kwargs.pop("coroutine", None)
+                or kwargs.pop("handler", None)
+                or kwargs.pop("target", None)
+        )
+
+        interval_seconds = kwargs.pop("interval_seconds", None)
+        interval = kwargs.pop("interval", None)
+        seconds = kwargs.pop("seconds", None)
+        every_seconds = kwargs.pop("every_seconds", None)
+
+        run_immediately = kwargs.pop("run_immediately", None)
+        enabled = kwargs.pop("enabled", None)
+        timeout = kwargs.pop("timeout", None)
+        retry_count = kwargs.pop("retry_count", None)
+        retry_delay = kwargs.pop("retry_delay", None)
+        allow_overlap = kwargs.pop("allow_overlap", None)
+
+        if args:
+            if name is None and len(args) >= 1 and isinstance(args[0], str):
+                name = args[0]
+
+            if callback is None:
+                if len(args) >= 2 and isinstance(args[0], str):
+                    callback = args[1]
+                elif len(args) >= 1 and callable(args[0]):
+                    callback = args[0]
+
+            if (
+                    interval_seconds is None
+                    and interval is None
+                    and seconds is None
+                    and every_seconds is None
+            ):
+                if len(args) >= 3 and isinstance(args[0], str):
+                    interval_seconds = args[2]
+                elif len(args) >= 2 and callable(args[0]):
+                    interval_seconds = args[1]
+
+        if name is None:
+            raise TypeError("add_interval_job() missing required argument: name")
+
+        if callback is None:
+            raise TypeError("add_interval_job() missing required argument: callback")
+
+        normalized_interval = (
+            interval_seconds
+            if interval_seconds is not None
+            else interval
+            if interval is not None
+            else seconds
+            if seconds is not None
+            else every_seconds
+        )
+
+        if normalized_interval is None:
+            raise TypeError(
+                "add_interval_job() missing interval; expected one of "
+                "interval_seconds, interval, seconds, every_seconds"
+            )
+
+        optional_kwargs = {
+            "run_immediately": run_immediately,
+            "enabled": enabled,
+            "timeout": timeout,
+            "retry_count": retry_count,
+            "retry_delay": retry_delay,
+            "allow_overlap": allow_overlap,
+            **kwargs,
+        }
+        optional_kwargs = {
+            key: value
+            for key, value in optional_kwargs.items()
+            if value is not None
+        }
+
+        attempts = [
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                interval=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                seconds=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                every_seconds=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                interval_seconds=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                interval=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                seconds=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                every_seconds=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                interval_seconds=normalized_interval,
+                **optional_kwargs,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                interval=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                seconds=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                every_seconds=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name=name,
+                callback=callback,
+                interval_seconds=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                interval=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                seconds=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                every_seconds=normalized_interval,
+            ),
+            lambda: self._scheduler.add_interval_job(
+                name,
+                callback,
+                interval_seconds=normalized_interval,
+            ),
+        ]
+
+        last_error: Exception | None = None
+
+        for attempt in attempts:
+            try:
+                return attempt()
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        raise TypeError(
+            "Could not adapt add_interval_job() call to core Scheduler signature. "
+            f"name={name!r}, interval={normalized_interval!r}, last_error={last_error}"
+        ) from last_error
+
+    def add_delayed_job(self, *args: Any, **kwargs: Any) -> Any:
+        if not hasattr(self._scheduler, "add_delayed_job"):
+            raise AttributeError("Wrapped Scheduler does not expose add_delayed_job")
+
+        delay_seconds = kwargs.pop("delay_seconds", None)
+
+        if delay_seconds is None:
+            return self._scheduler.add_delayed_job(*args, **kwargs)
+
+        attempts = [
+            lambda: self._scheduler.add_delayed_job(
+                *args,
+                delay=delay_seconds,
+                **kwargs,
+            ),
+            lambda: self._scheduler.add_delayed_job(
+                *args,
+                seconds=delay_seconds,
+                **kwargs,
+            ),
+            lambda: self._scheduler.add_delayed_job(
+                *args,
+                delay_seconds=delay_seconds,
+                **kwargs,
+            ),
+        ]
+
+        last_error: Exception | None = None
+
+        for attempt in attempts:
+            try:
+                return attempt()
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        raise TypeError(
+            f"Could not adapt add_delayed_job() call. last_error={last_error}"
+        ) from last_error
 
 
 def _get_attr(component: Any, names: Iterable[str]) -> Any | None:
     for name in names:
         if hasattr(component, name):
             return getattr(component, name)
+
     return None
 
 
+def _event_payload(event_or_payload: Any) -> dict[str, Any]:
+    if isinstance(event_or_payload, dict):
+        return dict(event_or_payload)
+
+    payload = getattr(event_or_payload, "payload", None)
+
+    if isinstance(payload, dict):
+        return dict(payload)
+
+    return {}
+
+
+def _event_topic(event_or_payload: Any, fallback: str = "") -> str:
+    value = getattr(event_or_payload, "topic", None)
+
+    if isinstance(value, str) and value:
+        return value
+
+    if isinstance(event_or_payload, dict):
+        value = event_or_payload.get("topic")
+        if isinstance(value, str):
+            return value
+
+    return fallback
+
+
+def _subscribe(
+    event_bus: EventBus,
+    topic: str,
+    handler: Any,
+    *,
+    name: str,
+) -> Any:
+    try:
+        return event_bus.subscribe(topic, handler, name=name)
+    except TypeError:
+        return event_bus.subscribe(pattern=topic, handler=handler, name=name)
+
+
 def _instantiate_flexibly(cls: type, **available_kwargs: Any) -> Any:
-    """
-    Instantiate a class using only kwargs supported by its __init__ signature.
-
-    This keeps the run script stable when project components have slightly
-    different constructor names, while still preserving constructor dependency
-    injection.
-    """
-
     signature = inspect.signature(cls)
     kwargs: dict[str, Any] = {}
 
@@ -845,12 +694,36 @@ def _instantiate_flexibly(cls: type, **available_kwargs: Any) -> Any:
     )
 
     if accepts_var_kwargs:
-        kwargs = {
-            key: value
-            for key, value in available_kwargs.items()
-            if value is not None
-        }
-        return cls(**kwargs)
+        return cls(
+            **{
+                key: value
+                for key, value in available_kwargs.items()
+                if value is not None
+            }
+        )
+
+    aliases = {
+        "app_config": ["app_config", "config"],
+        "core_config": ["app_config", "config"],
+        "settings": ["app_config", "config"],
+        "cfg": ["config", "app_config"],
+        "strategy_config": ["strategy_config", "config"],
+        "risk_config": ["risk_config", "config"],
+        "event_bus": ["event_bus"],
+        "bus": ["event_bus"],
+        "scheduler": ["scheduler"],
+        "candles_cache": ["candles_cache"],
+        "candle_cache": ["candles_cache"],
+        "trades_cache": ["trades_cache"],
+        "trade_cache": ["trades_cache"],
+        "funding_cache": ["funding_cache"],
+        "open_interest_cache": ["open_interest_cache"],
+        "oi_cache": ["open_interest_cache"],
+        "orderbook_cache": ["orderbook_cache"],
+        "order_book_cache": ["orderbook_cache"],
+        "data_caches": ["data_caches"],
+        "caches": ["data_caches"],
+    }
 
     for name, parameter in signature.parameters.items():
         if name == "self":
@@ -859,31 +732,6 @@ def _instantiate_flexibly(cls: type, **available_kwargs: Any) -> Any:
         if name in available_kwargs and available_kwargs[name] is not None:
             kwargs[name] = available_kwargs[name]
             continue
-
-        # Common aliases used across packages.
-        aliases = {
-            "app_config": ["app_config", "config"],
-            "core_config": ["app_config", "config"],
-            "settings": ["app_config", "config"],
-            "cfg": ["config", "app_config"],
-            "strategy_config": ["strategy_config", "config"],
-            "risk_config": ["risk_config", "config"],
-            "event_bus": ["event_bus"],
-            "bus": ["event_bus"],
-            "scheduler": ["scheduler"],
-            "clock": ["clock"],
-            "candles_cache": ["candles_cache"],
-            "candle_cache": ["candles_cache"],
-            "trades_cache": ["trades_cache"],
-            "trade_cache": ["trades_cache"],
-            "funding_cache": ["funding_cache"],
-            "open_interest_cache": ["open_interest_cache"],
-            "oi_cache": ["open_interest_cache"],
-            "orderbook_cache": ["orderbook_cache"],
-            "order_book_cache": ["orderbook_cache"],
-            "data_caches": ["data_caches"],
-            "caches": ["data_caches"],
-        }
 
         for alias in aliases.get(name, []):
             if alias in available_kwargs and available_kwargs[alias] is not None:
@@ -894,23 +742,13 @@ def _instantiate_flexibly(cls: type, **available_kwargs: Any) -> Any:
 
 
 def _try_build_config_from_annotation(annotation: Any) -> Any | None:
-    """
-    Try to build a domain-specific config object from an __init__ annotation.
-
-    Many analytics classes have signatures like:
-        __init__(config: FundingAnalyticsConfig | None = None, ...)
-
-    Passing core.Config into such classes is wrong. This helper builds the
-    annotated config when it can be constructed without arguments.
-    """
-
     if annotation is inspect.Signature.empty:
         return None
 
     candidates: list[Any] = []
 
-    # Python 3.10 union annotations expose __args__.
     args = getattr(annotation, "__args__", None)
+
     if args:
         candidates.extend(item for item in args if item is not type(None))  # noqa: E721
     else:
@@ -921,6 +759,7 @@ def _try_build_config_from_annotation(annotation: Any) -> Any | None:
             continue
 
         name = candidate.__name__.lower()
+
         if not name.endswith("config"):
             continue
 
@@ -937,20 +776,9 @@ def _instantiate_runtime_component(
     *,
     app_config: Config,
     event_bus: EventBus,
-    scheduler: Scheduler,
+    scheduler: Any,
     **available_kwargs: Any,
 ) -> Any:
-    """
-    Instantiate runtime project components safely.
-
-    Important:
-    - Do NOT pass core.Config as the generic `config` argument into analytics
-      components. Analytics modules usually have their own config dataclasses.
-    - If a constructor's `config` annotation looks like a domain config class,
-      instantiate that config class.
-    - Still pass core Config via `app_config` / `core_config` if supported.
-    """
-
     signature = inspect.signature(cls)
     kwargs: dict[str, Any] = {}
 
@@ -960,9 +788,8 @@ def _instantiate_runtime_component(
     )
 
     if accepts_var_kwargs:
-        # Keep this conservative: do not include generic config=app_config.
-        kwargs.update(
-            {
+        return cls(
+            **{
                 "app_config": app_config,
                 "event_bus": event_bus,
                 "scheduler": scheduler,
@@ -973,7 +800,20 @@ def _instantiate_runtime_component(
                 },
             }
         )
-        return cls(**kwargs)
+
+    aliases = {
+        "candles_cache": ["candles_cache"],
+        "candle_cache": ["candles_cache"],
+        "trades_cache": ["trades_cache"],
+        "trade_cache": ["trades_cache"],
+        "funding_cache": ["funding_cache"],
+        "open_interest_cache": ["open_interest_cache"],
+        "oi_cache": ["open_interest_cache"],
+        "orderbook_cache": ["orderbook_cache"],
+        "order_book_cache": ["orderbook_cache"],
+        "data_caches": ["data_caches"],
+        "caches": ["data_caches"],
+    }
 
     for name, parameter in signature.parameters.items():
         if name == "self":
@@ -983,8 +823,6 @@ def _instantiate_runtime_component(
             domain_config = _try_build_config_from_annotation(parameter.annotation)
             if domain_config is not None:
                 kwargs[name] = domain_config
-            # If config has a default and we cannot infer the domain config,
-            # leave it unset. This is safer than passing core.Config.
             continue
 
         if name in {"app_config", "core_config", "settings"}:
@@ -1003,20 +841,6 @@ def _instantiate_runtime_component(
             kwargs[name] = available_kwargs[name]
             continue
 
-        aliases = {
-            "candles_cache": ["candles_cache"],
-            "candle_cache": ["candles_cache"],
-            "trades_cache": ["trades_cache"],
-            "trade_cache": ["trades_cache"],
-            "funding_cache": ["funding_cache"],
-            "open_interest_cache": ["open_interest_cache"],
-            "oi_cache": ["open_interest_cache"],
-            "orderbook_cache": ["orderbook_cache"],
-            "order_book_cache": ["orderbook_cache"],
-            "data_caches": ["data_caches"],
-            "caches": ["data_caches"],
-        }
-
         for alias in aliases.get(name, []):
             if alias in available_kwargs and available_kwargs[alias] is not None:
                 kwargs[name] = available_kwargs[alias]
@@ -1028,13 +852,6 @@ def _instantiate_runtime_component(
 # =============================================================================
 # Historical stream detection
 # =============================================================================
-
-
-def _file_exists_any(path_without_suffix: Path) -> bool:
-    return any(
-        path_without_suffix.with_suffix(suffix).exists()
-        for suffix in (".csv", ".parquet", ".json", ".jsonl")
-    )
 
 
 def _stream_exists(
@@ -1051,6 +868,7 @@ def _stream_exists(
     if data_type == BacktestDataType.CANDLES:
         if timeframe is None:
             return False
+
         return _file_exists_any(
             base / "candles" / symbol / timeframe / f"{symbol}_{timeframe}"
         )
@@ -1059,10 +877,6 @@ def _stream_exists(
         return _file_exists_any(base / "funding" / symbol / symbol)
 
     if data_type == BacktestDataType.OPEN_INTEREST:
-        # HistoryDownloader may store OI either as:
-        #   open_interest/SYMBOL/5m/SYMBOL_5m.csv
-        # or:
-        #   open_interest/SYMBOL/SYMBOL.csv
         oi_root = base / "open_interest" / symbol
 
         if timeframe is not None and _file_exists_any(oi_root / timeframe / f"{symbol}_{timeframe}"):
@@ -1077,11 +891,6 @@ def _stream_exists(
         return _file_exists_any(base / "trades" / symbol / symbol)
 
     if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
-        # DataLoader discovers this stream as data_type="orderbook" and expects:
-        #   orderbook/<SYMBOL>/<SYMBOL>.<format>
-        #
-        # Do not treat orderbook_snapshot/<SYMBOL>/<SYMBOL> as compatible here,
-        # because DataLoader will still ask for "orderbook" and fail.
         return _file_exists_any(base / "orderbook" / symbol / symbol)
 
     if data_type == BacktestDataType.LIQUIDATIONS:
@@ -1091,12 +900,6 @@ def _stream_exists(
 
 
 def _copy_file_if_needed(source_base: Path, target_base: Path) -> bool:
-    """
-    Copy source_base.* to target_base.* if target does not exist.
-
-    Returns True when a compatible file exists or was created.
-    """
-
     for suffix in (".csv", ".parquet", ".json", ".jsonl"):
         source = source_base.with_suffix(suffix)
         target = target_base.with_suffix(suffix)
@@ -1115,26 +918,11 @@ def _copy_file_if_needed(source_base: Path, target_base: Path) -> bool:
 
 
 def ensure_open_interest_timeframe_compat(runtime: FullBacktestRunConfig) -> None:
-    """
-    DataLoader currently discovers open_interest with runtime.timeframes, which
-    is usually ["1m"] for candle replay. Binance OI history is downloaded at
-    5m, so the files are often stored as:
-
-        open_interest/SYMBOL/5m/SYMBOL_5m.csv
-
-    while DataLoader asks for:
-
-        open_interest/SYMBOL/1m/SYMBOL_1m.csv
-
-    This helper creates lightweight compatibility copies for the configured
-    loader timeframe. The data remains 5m OI internally; this only satisfies
-    DataLoader's file discovery convention.
-    """
-
     if not runtime.include_open_interest:
         return
 
     target_timeframe = runtime.timeframes[0]
+
     if target_timeframe == "5m":
         return
 
@@ -1142,19 +930,16 @@ def ensure_open_interest_timeframe_compat(runtime: FullBacktestRunConfig) -> Non
 
     for symbol in runtime.symbols:
         symbol_root = root / symbol
-
         target_base = symbol_root / target_timeframe / f"{symbol}_{target_timeframe}"
 
         if _file_exists_any(target_base):
             continue
 
-        # Most common HistoryDownloader layout.
         source_candidates = [
             symbol_root / "5m" / f"{symbol}_5m",
             symbol_root / symbol,
         ]
 
-        # Fallback: any file under open_interest/SYMBOL matching symbol.
         source_candidates.extend(
             candidate.with_suffix("")
             for candidate in symbol_root.glob(f"**/{symbol}*.*")
@@ -1175,14 +960,6 @@ def ensure_open_interest_timeframe_compat(runtime: FullBacktestRunConfig) -> Non
 
 
 def detect_available_data_types(runtime: FullBacktestRunConfig) -> set[BacktestDataType]:
-    """
-    Detect streams available for all requested symbols.
-
-    Candles are required for every symbol. Optional streams are enabled only
-    when local files exist for every requested symbol, so DataLoader does not
-    fail on a partially downloaded multi-symbol dataset.
-    """
-
     selected: set[BacktestDataType] = set()
     timeframe = runtime.timeframes[0]
 
@@ -1273,8 +1050,8 @@ def build_backtest_config(runtime: FullBacktestRunConfig) -> BacktestConfig:
     config.use_trades = BacktestDataType.TRADES in data_types
     config.use_orderbook = BacktestDataType.ORDERBOOK in data_types
     config.use_liquidations = BacktestDataType.LIQUIDATIONS in data_types
-    config.use_mark_price = True
-    config.use_index_price = True
+    config.use_mark_price = False
+    config.use_index_price = False
 
     config.data_loader.data_dir = runtime.data_dir
     config.data_loader.input_format = runtime.input_format
@@ -1282,49 +1059,33 @@ def build_backtest_config(runtime: FullBacktestRunConfig) -> BacktestConfig:
     config.data_loader.market_type = runtime.market_type
     config.data_loader.symbols = list(runtime.symbols)
     config.data_loader.timeframes = list(runtime.timeframes)
-    # Keep DataLoader strictly aligned with detected local files.
-    # This prevents defaults from BacktestConfig.default_binance_futures()
-    # from re-introducing unavailable streams such as orderbook.
     config.data_loader.data_types = set(data_types)
-    config.data_loader.require_orderbook = False
-    config.data_loader.require_trades = False
-    config.data_loader.require_funding = False
-    config.data_loader.require_open_interest = False
-
     config.data_loader.require_candles = True
+    config.data_loader.require_orderbook = False
+    config.data_loader.require_trades = False
     config.data_loader.require_funding = False
     config.data_loader.require_open_interest = False
-    config.data_loader.require_trades = False
-    config.data_loader.require_orderbook = False
     config.data_loader.allow_empty_optional_streams = True
     config.data_loader.validation_level = DataValidationLevel.BASIC
     config.data_loader.gap_policy = DataGapPolicy.WARN
     config.data_loader.drop_duplicate_events = True
 
-    config.market_replay.replay_mode = ReplayMode.FULL_RUN
-    config.market_replay.batch_events_by_timestamp = True
-    config.market_replay.deterministic_replay = True
-    config.market_replay.fail_on_emit_error = True
-    config.market_replay.emit_replay_lifecycle_events = True
     config.market_replay.emit_market_candles = BacktestDataType.CANDLES in data_types
     config.market_replay.emit_market_trades = BacktestDataType.TRADES in data_types
     config.market_replay.emit_market_orderbook = BacktestDataType.ORDERBOOK in data_types
     config.market_replay.emit_market_funding = BacktestDataType.FUNDING in data_types
     config.market_replay.emit_market_open_interest = BacktestDataType.OPEN_INTEREST in data_types
     config.market_replay.emit_market_liquidations = BacktestDataType.LIQUIDATIONS in data_types
+    config.market_replay.emit_replay_lifecycle_events = True
 
     config.cost_model.slippage_model = SlippageModel.FIXED_BPS
     config.cost_model.fixed_slippage_bps = 2.0
+    config.cost_model.commission_model = CommissionModel.MAKER_TAKER
     config.cost_model.maker_fee_bps = 2.0
     config.cost_model.taker_fee_bps = 4.0
-    config.cost_model.include_commissions = True
-    config.cost_model.include_slippage = True
-    config.cost_model.include_spread_cost = True
-    config.cost_model.include_funding = BacktestDataType.FUNDING in data_types
+    config.cost_model.default_fee_bps = 4.0
 
-    config.execution_simulator.exchange = runtime.exchange
-    config.execution_simulator.market_type = runtime.market_type
-    config.execution_simulator.fill_model = FillModel.NEXT_CANDLE_OPEN
+    config.execution_simulator.fill_model = FillModel.NEXT_CANDLE_CLOSE
     config.execution_simulator.liquidity_model = LiquidityModel.CANDLE_VOLUME_PERCENT
     config.execution_simulator.max_volume_participation_pct = 10.0
     config.execution_simulator.allow_market_orders = True
@@ -1336,6 +1097,7 @@ def build_backtest_config(runtime: FullBacktestRunConfig) -> BacktestConfig:
     config.execution_simulator.reject_if_no_liquidity = False
     config.execution_simulator.record_orders = True
     config.execution_simulator.record_fills = True
+    config.execution_simulator.emit_execution_events = True
 
     config.position_simulator.initial_balance = runtime.initial_balance
     config.position_simulator.quote_currency = "USDT"
@@ -1353,7 +1115,7 @@ def build_backtest_config(runtime: FullBacktestRunConfig) -> BacktestConfig:
 
     config.report_builder.enabled = True
     config.report_builder.output_dir = runtime.output_dir
-    config.report_builder.report_title = "BTC/DOGE/SOL Last 2 Days Full Pipeline Backtest"
+    config.report_builder.report_title = "Full Pipeline Backtest"
     config.report_builder.formats = [
         ReportFormat.MARKDOWN,
         ReportFormat.JSON,
@@ -1408,9 +1170,10 @@ def build_backtest_config(runtime: FullBacktestRunConfig) -> BacktestConfig:
 
     config.metadata.update(
         {
-            "runner": "backtesting.run_backtest_full",
+            "runner": "backtesting.run",
+            "event_bus": "core.event_bus.EventBus",
+            "scheduler": "core.scheduler.Scheduler+BacktestSchedulerCompatAdapter",
             "detected_data_types": sorted(item.value for item in data_types),
-            "period": "last_2d",
             "backtest_days": runtime.backtest_days,
         }
     )
@@ -1428,7 +1191,7 @@ def build_data_caches(
     *,
     app_config: Config,
     event_bus: EventBus,
-    scheduler: Scheduler,
+    scheduler: Any,
     enabled_data_types: set[BacktestDataType],
 ) -> list[Any]:
     caches: list[Any] = [
@@ -1479,64 +1242,47 @@ def build_data_caches(
 
 
 DEFAULT_ANALYTICS_CANDIDATES: list[tuple[str, str]] = [
-    # Common direct module/class layouts.
     ("analytics.price_action.engine", "PriceActionAnalytics"),
     ("analytics.price_action.analyzer", "PriceActionAnalytics"),
     ("analytics.price_action.market_structure", "MarketStructureAnalytics"),
     ("analytics.price_action.market_structure_analyzer", "MarketStructureAnalyzer"),
     ("analytics.funding.engine", "FundingAnalytics"),
+    ("analytics.funding.analyzer", "FundingAnalyzer"),
     ("analytics.funding.analyzer", "FundingAnalytics"),
     ("analytics.open_interest.engine", "OpenInterestAnalytics"),
+    ("analytics.open_interest.analyzer", "OIAnalyzer"),
     ("analytics.open_interest.analyzer", "OpenInterestAnalytics"),
-    ("analytics.orderflow.engine", "OrderflowAnalytics"),
-    ("analytics.orderflow.analyzer", "OrderflowAnalytics"),
+    ("analytics.orderflow.analyzer", "OrderFlowAnalyzer"),
+    ("analytics.orderflow.engine", "OrderFlowAnalyzer"),
     ("analytics.liquidations.engine", "LiquidationsAnalytics"),
     ("analytics.liquidations.analyzer", "LiquidationsAnalytics"),
     ("analytics.liquidity.engine", "LiquidityAnalytics"),
     ("analytics.liquidity.analyzer", "LiquidityAnalytics"),
-    ("analytics.spreads.engine", "SpreadsAnalytics"),
-    ("analytics.spreads.analyzer", "SpreadsAnalytics"),
+    ("analytics.spreads.engine", "SpreadAnalyzer"),
+    ("analytics.spreads.analyzer", "SpreadAnalyzer"),
     ("analytics.spoofing.engine", "SpoofingAnalytics"),
     ("analytics.spoofing.analyzer", "SpoofingAnalytics"),
     ("analytics.whales.engine", "WhalesAnalytics"),
     ("analytics.whales.analyzer", "WhalesAnalytics"),
-
-    # File-based layouts that often exist in this project structure.
-    ("analytics.price_action.market_structure_detector", "MarketStructureDetector"),
-    ("analytics.price_action.fvg_detector", "FVGDetector"),
-    ("analytics.price_action.support_resistance_detector", "SupportResistanceDetector"),
-    ("analytics.funding.funding_analyzer", "FundingAnalyzer"),
-    ("analytics.open_interest.oi_analyzer", "OpenInterestAnalyzer"),
-    ("analytics.open_interest.open_interest_analyzer", "OpenInterestAnalyzer"),
-    ("analytics.orderflow.cvd_analyzer", "CVDAnalyzer"),
-    ("analytics.orderflow.orderflow_analyzer", "OrderflowAnalyzer"),
-    ("analytics.liquidity.liquidity_analyzer", "LiquidityAnalyzer"),
-    ("analytics.liquidations.liquidation_analyzer", "LiquidationAnalyzer"),
 ]
 
 
-def _parse_analytics_specs(specs: list[str]) -> list[tuple[str, str]]:
-    parsed: list[tuple[str, str]] = []
-
-    for spec in specs:
-        if ":" not in spec:
-            raise ValueError(
-                "ANALYTICS_COMPONENTS must use module:Class format. "
-                f"Invalid item: {spec!r}"
-            )
-
+def _import_class(spec: str) -> type | None:
+    if ":" in spec:
         module_name, class_name = spec.split(":", 1)
-        parsed.append((module_name.strip(), class_name.strip()))
+    else:
+        parts = spec.rsplit(".", 1)
 
-    return parsed
+        if len(parts) != 2:
+            return None
 
+        module_name, class_name = parts
 
-def _import_class(module_name: str, class_name: str) -> type | None:
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:
         logger.debug(
-            "Analytics module import skipped",
+            "Could not import class module",
             extra={
                 "module_name": module_name,
                 "class_name": class_name,
@@ -1546,11 +1292,12 @@ def _import_class(module_name: str, class_name: str) -> type | None:
         return None
 
     cls = getattr(module, class_name, None)
+
     if isinstance(cls, type):
         return cls
 
     logger.debug(
-        "Analytics class not found in module",
+        "Class not found in module",
         extra={
             "module_name": module_name,
             "class_name": class_name,
@@ -1558,14 +1305,8 @@ def _import_class(module_name: str, class_name: str) -> type | None:
     )
     return None
 
+
 def _looks_like_analytics_class(cls: type) -> bool:
-    """
-    Best-effort filter for auto-discovered analytics components.
-
-    We only instantiate classes that look like runtime analytics components,
-    not DTOs/configs/exceptions.
-    """
-
     name = cls.__name__.lower()
 
     if name.endswith(("config", "state", "snapshot", "record", "event", "result", "error", "exception")):
@@ -1574,19 +1315,11 @@ def _looks_like_analytics_class(cls: type) -> bool:
     if not any(token in name for token in ("analytics", "analyzer", "detector", "engine")):
         return False
 
-    # Runtime components in this project normally have register/start/stop or
-    # an event-driven handler. Keep the check soft because some analytics
-    # components only expose register().
     runtime_methods = {"register", "start", "stop", "handle", "on_event"}
     return any(hasattr(cls, method) for method in runtime_methods)
 
 
 def _discover_analytics_candidates() -> list[tuple[str, str]]:
-    """
-    Scan the local analytics package and find plausible runtime analytics
-    classes. This avoids hard-coding module names in the runner.
-    """
-
     try:
         package = importlib.import_module("analytics")
     except Exception as exc:
@@ -1597,6 +1330,7 @@ def _discover_analytics_candidates() -> list[tuple[str, str]]:
         return []
 
     package_path = getattr(package, "__path__", None)
+
     if package_path is None:
         return []
 
@@ -1604,9 +1338,8 @@ def _discover_analytics_candidates() -> list[tuple[str, str]]:
 
     for module_info in pkgutil.walk_packages(package_path, prefix="analytics."):
         module_name = module_info.name
-
-        # Skip likely non-runtime modules.
         leaf = module_name.rsplit(".", 1)[-1].lower()
+
         if leaf in {"models", "enums", "exceptions", "config", "utils", "__init__"}:
             continue
 
@@ -1615,7 +1348,10 @@ def _discover_analytics_candidates() -> list[tuple[str, str]]:
         except Exception as exc:
             logger.debug(
                 "Analytics auto-discovery skipped module",
-                extra={"module_name": module_name, "error": str(exc)},
+                extra={
+                    "module_name": module_name,
+                    "error": str(exc),
+                },
             )
             continue
 
@@ -1626,16 +1362,68 @@ def _discover_analytics_candidates() -> list[tuple[str, str]]:
             if _looks_like_analytics_class(obj):
                 candidates.append((module_name, obj.__name__))
 
-    # Preserve order and remove duplicates.
     unique: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
+
     for candidate in candidates:
         if candidate in seen:
             continue
+
         unique.append(candidate)
         seen.add(candidate)
 
     return unique
+
+
+def _analytics_class_requires_missing_streams(
+    cls: type,
+    *,
+    enabled_data_types: set[BacktestDataType],
+    cache_by_name: dict[str, Any],
+) -> str | None:
+    name = cls.__name__.lower()
+    module_name = getattr(cls, "__module__", "").lower()
+    text = f"{module_name}.{name}"
+
+    needs_trades = (
+        "orderflow" in text
+        or "cvd" in text
+        or "volume_delta" in text
+        or "aggressive_trade" in text
+    )
+
+    needs_orderbook = (
+        "orderflow" in text
+        or "orderbook" in text
+        or "imbalance" in text
+        or "liquidity" in text
+        or "spoof" in text
+    )
+
+    needs_funding = "funding" in text
+    needs_open_interest = "open_interest" in text or ".oi" in text or "oi_" in text
+    needs_liquidations = "liquidation" in text
+    needs_candles = "price_action" in text or "market_structure" in text or "fvg" in text
+
+    if needs_trades and cache_by_name.get("trades_cache") is None:
+        return "requires TradesCache, but trades stream is unavailable"
+
+    if needs_orderbook and cache_by_name.get("orderbook_cache") is None:
+        return "requires OrderBookCache, but orderbook stream is unavailable"
+
+    if needs_funding and cache_by_name.get("funding_cache") is None:
+        return "requires FundingCache, but funding stream is unavailable"
+
+    if needs_open_interest and cache_by_name.get("open_interest_cache") is None:
+        return "requires OpenInterestCache, but open_interest stream is unavailable"
+
+    if needs_candles and cache_by_name.get("candles_cache") is None:
+        return "requires CandlesCache, but candles stream is unavailable"
+
+    if needs_liquidations and BacktestDataType.LIQUIDATIONS not in enabled_data_types:
+        return "requires liquidations stream, but liquidation history is unavailable"
+
+    return None
 
 
 def build_analytics_components(
@@ -1643,43 +1431,68 @@ def build_analytics_components(
     runtime: FullBacktestRunConfig,
     app_config: Config,
     event_bus: EventBus,
-    scheduler: Scheduler,
+    scheduler: Any,
     data_caches: list[Any],
     enabled_data_types: set[BacktestDataType],
 ) -> list[Any]:
-    """
-    Build production analytics components.
-
-    Priority:
-    1. ANALYTICS_COMPONENTS env, format:
-       analytics.price_action.engine:PriceActionAnalytics,analytics.funding.engine:FundingAnalytics
-    2. Default common candidates.
-
-    StrategyTester receives these components only to manage lifecycle.
-    The data flow still stays event-driven through EventBus.
-    """
-
-    cache_kwargs = {
-        "candles_cache": _get_attr_by_type(data_caches, CandlesCache),
-        "trades_cache": _get_attr_by_type(data_caches, TradesCache),
-        "funding_cache": _get_attr_by_type(data_caches, FundingCache),
-        "open_interest_cache": _get_attr_by_type(data_caches, OpenInterestCache),
-        "orderbook_cache": _get_attr_by_type(data_caches, OrderBookCache),
-        "data_caches": data_caches,
+    cache_by_name = {
+        "candles_cache": next((item for item in data_caches if isinstance(item, CandlesCache)), None),
+        "trades_cache": next((item for item in data_caches if isinstance(item, TradesCache)), None),
+        "funding_cache": next((item for item in data_caches if isinstance(item, FundingCache)), None),
+        "open_interest_cache": next((item for item in data_caches if isinstance(item, OpenInterestCache)), None),
+        "orderbook_cache": next((item for item in data_caches if isinstance(item, OrderBookCache)), None),
     }
 
-    if runtime.analytics_specs:
-        candidates = _parse_analytics_specs(runtime.analytics_specs)
-    else:
-        discovered = _discover_analytics_candidates()
-        candidates = [*DEFAULT_ANALYTICS_CANDIDATES, *discovered]
+    specs: list[tuple[str, str]] = []
+
+    for spec in runtime.analytics_specs:
+        if ":" in spec:
+            module_name, class_name = spec.split(":", 1)
+        else:
+            module_name, class_name = spec.rsplit(".", 1)
+        specs.append((module_name, class_name))
+
+    specs.extend(DEFAULT_ANALYTICS_CANDIDATES)
+    specs.extend(_discover_analytics_candidates())
 
     components: list[Any] = []
     seen_classes: set[type] = set()
 
-    for module_name, class_name in candidates:
-        cls = _import_class(module_name, class_name)
-        if cls is None or cls in seen_classes:
+    available_kwargs = {
+        "data_caches": data_caches,
+        **cache_by_name,
+        "default_exchange": runtime.exchange,
+        "default_market_type": runtime.market_type,
+        "default_timeframe": runtime.timeframes[0] if runtime.timeframes else "1m",
+    }
+
+    for module_name, class_name in specs:
+        cls = _import_class(f"{module_name}:{class_name}")
+
+        if cls is None:
+            continue
+
+        if cls in seen_classes:
+            continue
+
+        seen_classes.add(cls)
+
+        skip_reason = _analytics_class_requires_missing_streams(
+            cls,
+            enabled_data_types=enabled_data_types,
+            cache_by_name=cache_by_name,
+        )
+
+        if skip_reason is not None:
+            logger.info(
+                "Skipping analytics component because required replay stream is unavailable",
+                extra={
+                    "analytics_module": module_name,
+                    "analytics_class": class_name,
+                    "reason": skip_reason,
+                    "enabled_data_types": sorted(item.value for item in enabled_data_types),
+                },
+            )
             continue
 
         try:
@@ -1688,92 +1501,61 @@ def build_analytics_components(
                 app_config=app_config,
                 event_bus=event_bus,
                 scheduler=scheduler,
-                **cache_kwargs,
+                **available_kwargs,
             )
         except Exception as exc:
             logger.warning(
                 "Analytics component could not be instantiated",
                 extra={
-                    "module_name": module_name,
-                    "class_name": class_name,
+                    "analytics_module": module_name,
+                    "analytics_class": class_name,
                     "error": str(exc),
+                    "error_type": exc.__class__.__name__,
                 },
             )
-            if _env_bool("PRINT_ANALYTICS_WIRING_ERRORS", False):
-                print(
-                    "Analytics component could not be instantiated: "
-                    f"{module_name}:{class_name} -> {exc}"
-                )
             continue
 
         components.append(component)
-        seen_classes.add(cls)
 
     if runtime.require_analytics and not components:
         raise RuntimeError(
-            "No analytics components were loaded. "
-            "Set ANALYTICS_COMPONENTS='module.path:ClassName,...', "
-            "set REQUIRE_ANALYTICS=0 for a technical smoke run, "
-            "or ensure your analytics classes expose register()/start() and "
-            "can be instantiated with config/event_bus/scheduler/cache dependencies."
-        )
-
-    if not components:
-        logger.warning(
-            "No analytics components loaded. Backtest can run only if require_analytics=False, "
-            "but strategies probably will not receive analytics.* events."
+            "No analytics components were instantiated. "
+            "Set ANALYTICS_COMPONENTS=analytics.funding.analyzer:FundingAnalyzer,... "
+            "or fix analytics constructors."
         )
 
     return components
-
-
-def _get_attr_by_type(items: list[Any], cls: type) -> Any | None:
-    for item in items:
-        if isinstance(item, cls):
-            return item
-    return None
 
 
 def _camel_to_snake(name: str) -> str:
     chars: list[str] = []
 
     for index, char in enumerate(name):
-        if char.isupper() and index > 0:
-            previous = name[index - 1]
-            next_char = name[index + 1] if index + 1 < len(name) else ""
-            if previous != "_" and (not previous.isupper() or next_char.islower()):
-                chars.append("_")
+        if char.isupper() and index > 0 and not name[index - 1].isupper():
+            chars.append("_")
         chars.append(char.lower())
 
     return "".join(chars)
 
 
-def _strategy_name_from_class(cls: type[BaseStrategy], module_name: str) -> str:
-    class_attr = getattr(cls, "strategy_name", None)
-    if isinstance(class_attr, str) and class_attr.strip():
-        return class_attr.strip()
+def _strategy_name_from_class(cls: type, module_name: str) -> str:
+    name = cls.__name__
 
+    for suffix in ("TradingStrategy", "Strategy"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+
+    snake = _camel_to_snake(name)
     leaf = module_name.rsplit(".", 1)[-1]
 
-    for suffix in ("_strategy", "_strategies"):
-        if leaf.endswith(suffix):
-            return leaf[: -len(suffix)]
-
-    snake = _camel_to_snake(cls.__name__)
-    if snake.endswith("_strategy"):
-        snake = snake[: -len("_strategy")]
+    if leaf not in {"base", "utils", "__init__"} and leaf.endswith("_strategy"):
+        return leaf[: -len("_strategy")]
 
     return snake
 
 
 def _discover_strategy_factories() -> dict[str, type[BaseStrategy]]:
-    """
-    Discover concrete BaseStrategy subclasses under strategy.strategies.
-
-    build_default_strategy_registry() needs concrete strategy factories or
-    instances. It does not instantiate strategies from catalog metadata alone.
-    """
-
     try:
         package = importlib.import_module("strategy.strategies")
     except Exception as exc:
@@ -1784,6 +1566,7 @@ def _discover_strategy_factories() -> dict[str, type[BaseStrategy]]:
         return {}
 
     package_path = getattr(package, "__path__", None)
+
     if package_path is None:
         return {}
 
@@ -1821,6 +1604,7 @@ def _discover_strategy_factories() -> dict[str, type[BaseStrategy]]:
                 continue
 
             name = obj.__name__.lower()
+
             if name.startswith("base") or name in {"tradingstrategy", "strategyvalidationmixin"}:
                 continue
 
@@ -1847,23 +1631,15 @@ def _registry_count(registry: Any) -> int:
         return len(strategies)
 
     return 0
+from strategy.enums import StrategyCategory
 
 
 def build_strategy_stack(
     *,
     runtime: FullBacktestRunConfig,
     event_bus: EventBus,
-    scheduler: Scheduler,
+    scheduler: Any,
 ) -> tuple[Any, SignalProcessor, StrategyEngine]:
-    """
-    Build StrategyRegistry + shared StrategyRuntimeState + SignalProcessor + StrategyEngine.
-
-    StrategyConfig contains definitions/presets, but concrete strategy classes
-    still have to be registered as factories or instances. This runner discovers
-    strategy classes under strategy.strategies and passes them as factories to
-    build_default_strategy_registry().
-    """
-
     preset_name = runtime.strategy_preset or "intraday"
 
     strategy_config = build_default_strategy_config(
@@ -1871,11 +1647,36 @@ def build_strategy_stack(
         preset_name=preset_name,
         use_required_features=False,
     )
+    strategy_config.routing.event_to_categories.update(
+        {
+            # Funding analytics
+            "analytics.funding.updated": [StrategyCategory.FUNDING],
+            "analytics.funding.snapshot": [StrategyCategory.FUNDING],
+            "analytics.funding.signal": [StrategyCategory.FUNDING],
+            "analytics.funding.regime": [StrategyCategory.FUNDING],
+            "analytics.funding.flip": [StrategyCategory.FUNDING],
+
+            # OI analytics aliases used by your analytics package
+            "analytics.oi.updated": [StrategyCategory.OPEN_INTEREST],
+            "analytics.oi.anomaly": [StrategyCategory.OPEN_INTEREST],
+            "analytics.oi.capitulation": [StrategyCategory.OPEN_INTEREST],
+            "analytics.oi.regime_changed": [StrategyCategory.OPEN_INTEREST],
+            "analytics.oi.squeeze_setup": [StrategyCategory.OPEN_INTEREST],
+
+            # Canonical aliases too
+            "analytics.open_interest.updated": [StrategyCategory.OPEN_INTEREST],
+            "analytics.open_interest.anomaly": [StrategyCategory.OPEN_INTEREST],
+            "analytics.open_interest.capitulation": [StrategyCategory.OPEN_INTEREST],
+            "analytics.open_interest.regime_changed": [StrategyCategory.OPEN_INTEREST],
+            "analytics.open_interest.squeeze_setup": [StrategyCategory.OPEN_INTEREST],
+        }
+    )
+    if not isinstance(strategy_config, StrategyConfig):
+        strategy_config = StrategyConfig()
 
     if runtime.strategies:
         strategy_config.preset.enabled_strategy_names = list(runtime.strategies)
 
-    strategy_state = StrategyRuntimeState()
     strategy_factories = _discover_strategy_factories()
 
     strategy_registry = build_default_strategy_registry(
@@ -1892,14 +1693,12 @@ def build_strategy_stack(
         configured_names = ", ".join(sorted(strategy_config.strategies.keys())) or "none"
         raise RuntimeError(
             "StrategyRegistry has no registered strategies after bootstrap. "
-            "This means the preset/config exists, but no matching concrete strategy "
-            "classes were instantiated. "
             f"preset={preset_name!r}; "
             f"configured={configured_names}; "
-            f"discovered={discovered_names}. "
-            "Check that files under strategy/strategies expose concrete BaseStrategy "
-            "subclasses and their file/class names match catalog names."
+            f"discovered={discovered_names}."
         )
+
+    strategy_state = StrategyRuntimeState()
 
     signal_processor = SignalProcessor(
         config=strategy_config,
@@ -1925,7 +1724,7 @@ def build_risk_manager(
     *,
     app_config: Config,
     event_bus: EventBus,
-    scheduler: Scheduler,
+    scheduler: Any,
 ) -> RiskManager:
     risk_config = RiskConfig()
 
@@ -1940,397 +1739,98 @@ def build_risk_manager(
 
 
 # =============================================================================
-# Event debug counters
+# Diagnostics
 # =============================================================================
 
 
-DEBUG_EVENT_TOPICS: tuple[str, ...] = (
-    # Replay/raw market events.
-    "market.candle",
-    "market.trade",
-    "market.orderbook",
-    "market.funding",
-    "market.open_interest",
-    "market.liquidation",
-
-    # Data cache events.
-    "market.candles.updated",
-    "market.candle.closed",
-    "market.trades.updated",
-    "market.orderbook.updated",
-    "market.funding.updated",
-    "market.open_interest.updated",
-    "market.liquidations.updated",
-
-    # Common analytics events.
-    "analytics.price_action.updated",
-    "analytics.price_action.signal",
-    "analytics.market_structure.updated",
-    "analytics.fvg.updated",
-    "analytics.support_resistance.updated",
-    "analytics.funding.updated",
-    "analytics.funding.signal",
-    "analytics.open_interest.updated",
-    "analytics.open_interest.signal",
-    "analytics.oi.updated",
-    "analytics.oi.signal",
-    "analytics.orderflow.updated",
-    "analytics.orderflow.signal",
-    "analytics.liquidity.updated",
-    "analytics.liquidity.signal",
-    "analytics.liquidations.updated",
-    "analytics.liquidations.signal",
-    "analytics.spreads.updated",
-    "analytics.spreads.signal",
-    "analytics.spoofing.updated",
-    "analytics.spoofing.signal",
-    "analytics.whales.updated",
-    "analytics.whales.signal",
-
-    # Strategy/signal/risk/execution/position events.
-    "strategy.context.updated",
-    "strategy.evaluation.completed",
-    "strategy.signal.generated",
-    "signal.generated",
-    "signal.rejected",
-    "signal.updated",
-    "signal.confirmed",
-    "risk.position_blocked",
-    "risk.limit_warning",
-    "risk.kill_switch",
-    "risk.position_close_requested",
-    "risk.position_reduce_requested",
-    "execution.order_submitted",
-    "execution.order_accepted",
-    "execution.order_rejected",
-    "execution.order_cancelled",
-    "execution.order_filled",
-    "execution.order_partially_filled",
-    "position.opened",
-    "position.updated",
-    "position.closed",
+DEBUG_TOPICS: tuple[str, ...] = (
+    "market.*",
+    "analytics.*",
+    "strategy.*",
+    "strategy.engine.*",
+    "strategy.registry.*",
+    "system.strategy.*",
+    "system.strategy_engine.*",
+    "system.signal_processor.*",
+    "signal.*",
+    "risk.*",
+    "execution.*",
+    "position.*",
+    "system.backtest.*",
+    "system.market_replay.*",
+    "system.*",
 )
 
 
 async def register_event_debug_counters(event_bus: EventBus) -> dict[str, int]:
-    """
-    Register lightweight counters for critical backtest topics.
+    counts: dict[str, int] = {}
 
-    Works with both sync and async EventBus.subscribe() implementations.
-    """
-
-    counts: dict[str, int] = {topic: 0 for topic in DEBUG_EVENT_TOPICS}
-
-    def make_handler(topic: str):
-        async def handler(payload: Any) -> None:
+    for pattern in DEBUG_TOPICS:
+        async def handler(event: Any, *, pattern: str = pattern) -> None:
+            topic = _event_topic(event, fallback=pattern)
             counts[topic] = counts.get(topic, 0) + 1
 
-        return handler
-
-    subscribe = getattr(event_bus, "subscribe", None)
-    if not callable(subscribe):
-        raise RuntimeError("EventBus does not expose subscribe().")
-
-    for topic in DEBUG_EVENT_TOPICS:
-        result = subscribe(topic, make_handler(topic))
-        if inspect.isawaitable(result):
-            await result
+        _subscribe(
+            event_bus,
+            pattern,
+            handler,
+            name=f"backtest_debug_{pattern.replace('*', 'wildcard').replace('.', '_')}",
+        )
 
     return counts
 
 
-def print_event_debug_counts(counts: dict[str, int]) -> None:
-    print("")
-    print("========== EVENT COUNTS ==========")
-
-    groups = (
-        (
-            "Market replay/raw",
-            (
-                "market.candle",
-                "market.trade",
-                "market.orderbook",
-                "market.funding",
-                "market.open_interest",
-                "market.liquidation",
-            ),
-        ),
-        (
-            "Data cache",
-            (
-                "market.candles.updated",
-                "market.candle.closed",
-                "market.trades.updated",
-                "market.orderbook.updated",
-                "market.funding.updated",
-                "market.open_interest.updated",
-                "market.liquidations.updated",
-            ),
-        ),
-        (
-            "Analytics",
-            (
-                "analytics.price_action.updated",
-                "analytics.price_action.signal",
-                "analytics.market_structure.updated",
-                "analytics.fvg.updated",
-                "analytics.support_resistance.updated",
-                "analytics.funding.updated",
-                "analytics.funding.signal",
-                "analytics.open_interest.updated",
-                "analytics.open_interest.signal",
-                "analytics.oi.updated",
-                "analytics.oi.signal",
-                "analytics.orderflow.updated",
-                "analytics.orderflow.signal",
-                "analytics.liquidity.updated",
-                "analytics.liquidity.signal",
-                "analytics.liquidations.updated",
-                "analytics.liquidations.signal",
-                "analytics.spreads.updated",
-                "analytics.spreads.signal",
-                "analytics.spoofing.updated",
-                "analytics.spoofing.signal",
-                "analytics.whales.updated",
-                "analytics.whales.signal",
-            ),
-        ),
-        (
-            "Strategy / Signal",
-            (
-                "strategy.context.updated",
-                "strategy.evaluation.completed",
-                "strategy.signal.generated",
-                "signal.generated",
-                "signal.rejected",
-                "signal.updated",
-            ),
-        ),
-        (
-            "Risk",
-            (
-                "signal.confirmed",
-                "risk.position_blocked",
-                "risk.limit_warning",
-                "risk.kill_switch",
-                "risk.position_close_requested",
-                "risk.position_reduce_requested",
-            ),
-        ),
-        (
-            "Execution / Position",
-            (
-                "execution.order_submitted",
-                "execution.order_accepted",
-                "execution.order_rejected",
-                "execution.order_cancelled",
-                "execution.order_filled",
-                "execution.order_partially_filled",
-                "position.opened",
-                "position.updated",
-                "position.closed",
-            ),
-        ),
-    )
-
-    for title, topics in groups:
-        print(f"[{title}]")
-        for topic in topics:
-            print(f"{topic}: {counts.get(topic, 0)}")
-        print("")
-
-    print("Non-zero topics:")
-    non_zero = {topic: count for topic, count in sorted(counts.items()) if count}
-    if not non_zero:
-        print("- none")
-    else:
-        for topic, count in non_zero.items():
-            print(f"- {topic}: {count}")
-
-    print("==================================")
-
-
-def print_replay_stats(tester: Any) -> None:
-    """
-    Print MarketReplay stats after run.
-    This distinguishes "replay did not emit/process events" from
-    "diagnostic subscriptions did not capture events".
-    """
-
-    replay = getattr(getattr(tester, "components", None), "market_replay", None)
-
-    print("")
-    print("========== MARKET REPLAY STATS ==========")
-
-    if replay is None:
-        print("MarketReplay: missing")
-        print("=========================================")
-        return
-
-    stats = getattr(replay, "stats", None)
-
-    try:
-        value = stats() if callable(stats) else getattr(replay, "stats_state", None)
-    except Exception as exc:
-        print(f"Failed to read MarketReplay stats: {exc}")
-        print("=========================================")
-        return
-
-    if hasattr(value, "to_dict"):
-        value = value.to_dict()
-    elif dataclasses.is_dataclass(value):
-        value = dataclasses.asdict(value)
-
-    if isinstance(value, dict):
-        for key in (
-            "status",
-            "total_events",
-            "processed_events",
-            "emitted_events",
-            "skipped_events",
-            "failed_events",
-            "market_candles",
-            "market_trades",
-            "market_orderbooks",
-            "market_funding",
-            "market_open_interest",
-            "market_liquidations",
-            "current_index",
-            "progress_pct",
-            "last_error",
-        ):
-            if key in value:
-                print(f"{key}: {value[key]}")
-    else:
-        print(value)
-
-    print("=========================================")
+def count_prefix(counts: dict[str, int], prefix: str) -> int:
+    return sum(value for topic, value in counts.items() if topic.startswith(prefix))
 
 
 def summarize_event_pipeline(counts: dict[str, int]) -> dict[str, Any]:
-    """
-    Produce a compact diagnosis-friendly summary.
-    """
-
-    market_total = sum(
-        counts.get(topic, 0)
-        for topic in (
-            "market.candle",
-            "market.trade",
-            "market.orderbook",
-            "market.funding",
-            "market.open_interest",
-            "market.liquidation",
-        )
-    )
-
-    cache_total = sum(
-        counts.get(topic, 0)
-        for topic in (
-            "market.candles.updated",
-            "market.candle.closed",
-            "market.trades.updated",
-            "market.orderbook.updated",
-            "market.funding.updated",
-            "market.open_interest.updated",
-            "market.liquidations.updated",
-        )
-    )
-
-    analytics_total = sum(
-        count
-        for topic, count in counts.items()
-        if topic.startswith("analytics.")
-    )
-
-    signal_total = (
-        counts.get("signal.generated", 0)
-        + counts.get("strategy.signal.generated", 0)
-        + counts.get("signal.rejected", 0)
-        + counts.get("signal.updated", 0)
-    )
-
-    risk_total = (
-        counts.get("signal.confirmed", 0)
-        + counts.get("risk.position_blocked", 0)
-        + counts.get("risk.limit_warning", 0)
-        + counts.get("risk.kill_switch", 0)
-    )
-
-    execution_total = sum(
-        counts.get(topic, 0)
-        for topic in (
-            "execution.order_submitted",
-            "execution.order_accepted",
-            "execution.order_rejected",
-            "execution.order_cancelled",
-            "execution.order_filled",
-            "execution.order_partially_filled",
-        )
-    )
-
-    position_total = sum(
-        counts.get(topic, 0)
-        for topic in (
-            "position.opened",
-            "position.updated",
-            "position.closed",
-        )
-    )
-
-    if market_total <= 0:
-        likely_breakpoint = "market_replay"
-    elif cache_total <= 0:
-        likely_breakpoint = "data_caches"
-    elif analytics_total <= 0:
-        likely_breakpoint = "analytics"
-    elif signal_total <= 0:
-        likely_breakpoint = "strategy_or_signal_processor"
-    elif risk_total <= 0:
-        likely_breakpoint = "risk_manager"
-    elif execution_total <= 0:
-        likely_breakpoint = "execution_simulator"
-    elif position_total <= 0:
-        likely_breakpoint = "position_simulator"
-    else:
-        likely_breakpoint = "none"
-
-    return {
-        "market_total": market_total,
-        "cache_total": cache_total,
-        "analytics_total": analytics_total,
-        "signal_total": signal_total,
-        "risk_total": risk_total,
-        "execution_total": execution_total,
-        "position_total": position_total,
-        "likely_breakpoint": likely_breakpoint,
-        "counts": dict(counts),
+    summary = {
+        "market_raw": count_prefix(counts, "market."),
+        "market_updated": sum(
+            value
+            for topic, value in counts.items()
+            if topic.startswith("market.") and topic.endswith(".updated")
+        ),
+        "analytics": count_prefix(counts, "analytics."),
+        "strategy": count_prefix(counts, "strategy."),
+        "signals": count_prefix(counts, "signal."),
+        "risk": count_prefix(counts, "risk."),
+        "execution": count_prefix(counts, "execution."),
+        "position": count_prefix(counts, "position."),
+        "topics": dict(sorted(counts.items())),
     }
 
+    if summary["market_raw"] <= 0:
+        breakpoint = "MarketReplay did not emit market.* events"
+    elif summary["market_updated"] <= 0:
+        breakpoint = "Data caches did not emit market.*.updated events"
+    elif summary["analytics"] <= 0:
+        breakpoint = "Analytics did not emit analytics.* events"
+    elif summary["signals"] <= 0:
+        breakpoint = "Strategy did not emit signal.* events"
+    elif summary["risk"] <= 0:
+        breakpoint = "RiskManager did not emit risk/signal.confirmed events"
+    elif summary["execution"] <= 0:
+        breakpoint = "ExecutionSimulator did not emit execution.* events"
+    elif summary["position"] <= 0:
+        breakpoint = "PositionSimulator did not emit position.* events"
+    else:
+        breakpoint = "No obvious breakpoint"
 
-# =============================================================================
-# Diagnostics
-# =============================================================================
+    summary["likely_breakpoint"] = breakpoint
+    return summary
 
 
 def print_dataset_summary(config: BacktestConfig, dataset: Any) -> None:
     print("")
     print("========== DATASET ==========")
-    print(f"Run:            {config.run_name}")
-    print(f"Exchange:       {config.exchange}")
-    print(f"Market type:    {config.market_type}")
-    print(f"Symbols:        {config.symbols}")
-    print(f"Timeframes:     {config.timeframes}")
-    print(f"Data dir:       {config.data_loader.data_dir}")
-    print(f"Period:         {config.start_time.isoformat()} -> {config.end_time.isoformat()}")
-    print(f"Data types cfg: {[item.value for item in sorted(config.data_loader.data_types, key=lambda x: x.value)]}")
-    print(f"Events:         {len(dataset.events)}")
-
-    if dataset.info:
-        print(f"Data types:     {[item.value for item in sorted(dataset.info.data_types, key=lambda x: x.value)]}")
-        print(f"First event:    {dataset.info.first_event_time}")
-        print(f"Last event:     {dataset.info.last_event_time}")
-
+    print(f"Run:         {config.run_name}")
+    print(f"Events:      {len(dataset.events)}")
+    print(f"Period:      {config.start_time} -> {config.end_time}")
+    print(f"Symbols:     {config.symbols}")
+    print(f"Timeframes:  {config.timeframes}")
+    print(f"Data types:  {sorted(item.value for item in config.enabled_data_types())}")
     print("=============================")
 
 
@@ -2343,60 +1843,66 @@ def print_component_summary(
     strategy_engine: Any,
     risk_manager: Any,
 ) -> None:
-    strategies = StrategyTester._get_registered_strategies(strategy_registry)
-
     print("")
     print("========== COMPONENTS ==========")
     print("Data caches:")
-    for component in data_caches:
-        print(f"- {component.__class__.__module__}.{component.__class__.__name__}")
+    for item in data_caches:
+        print(f"- {item.__class__.__name__}")
 
     print("Analytics:")
-    if analytics_components:
-        for component in analytics_components:
-            print(f"- {component.__class__.__module__}.{component.__class__.__name__}")
-    else:
-        print("- none")
+    for item in analytics_components:
+        print(f"- {item.__class__.__name__}")
 
-    print("Strategies:")
-    print(f"- registered: {len(strategies)}")
-    for strategy in strategies[:50]:
-        print(f"  - {StrategyTester._strategy_name(strategy)}")
-    if len(strategies) > 50:
-        print(f"  ... +{len(strategies) - 50} more")
-
-    print("Processor:")
-    print(f"- {signal_processor.__class__.__module__}.{signal_processor.__class__.__name__}")
-
-    print("Engine:")
-    print(f"- {strategy_engine.__class__.__module__}.{strategy_engine.__class__.__name__}")
-
-    print("Risk:")
-    print(f"- {risk_manager.__class__.__module__}.{risk_manager.__class__.__name__}")
-
+    print(f"Strategy registry: {strategy_registry.__class__.__name__}")
+    print(f"Signal processor:  {signal_processor.__class__.__name__}")
+    print(f"Strategy engine:   {strategy_engine.__class__.__name__}")
+    print(f"Risk manager:      {risk_manager.__class__.__name__}")
     print("================================")
+
+
+def print_replay_stats(tester: StrategyTester) -> None:
+    components = tester.components
+
+    print("")
+    print("========== PIPELINE STATS ==========")
+
+    for name, component in (
+        ("market_replay", components.market_replay),
+        ("execution_simulator", components.execution_simulator),
+        ("position_simulator", components.position_simulator),
+        ("strategy_tester", tester),
+    ):
+        if component is None:
+            continue
+
+        print(f"[{name}]")
+        stats = stats_if_supported(component)
+        for key, value in stats.items():
+            if isinstance(value, (dict, list)):
+                continue
+            print(f"  {key}: {value}")
+
+    print("====================================")
+
+
+def print_event_debug_counts(counts: dict[str, int]) -> None:
+    print("")
+    print("========== EVENT DEBUG ==========")
+
+    for topic, count in sorted(counts.items()):
+        print(f"{topic}: {count}")
+
+    print("=================================")
 
 
 def print_result_summary(result: Any) -> None:
     print("")
     print("========== BACKTEST RESULT ==========")
-    print(f"Run name:       {result.run_name}")
-    print(f"Run ID:         {result.run_id}")
+    print(f"Run:            {result.run_name}")
     print(f"Status:         {result.status.value}")
-    print(f"Initial equity: {result.initial_balance:.2f}")
-    print(f"Final equity:   {result.final_equity:.2f}")
-    print(f"Final balance:  {result.final_balance:.2f}")
-
-    if result.portfolio and result.portfolio.summary:
-        summary = result.portfolio.summary
-        print("-------------------------------------")
-        print(f"Net profit:     {summary.net_profit:.2f}")
-        print(f"Net profit %:   {summary.net_profit_pct:.2f}%")
-        print(f"Total trades:   {summary.total_trades}")
-        print(f"Win rate:       {summary.win_rate:.2f}%")
-        print(f"Max DD %:       {summary.max_drawdown_pct:.2f}%")
-        print(f"Profit factor:  {summary.profit_factor:.4f}")
-
+    print(f"Initial balance:{result.initial_balance}")
+    print(f"Final balance:  {result.final_balance}")
+    print(f"Final equity:   {result.final_equity}")
     print("-------------------------------------")
     print(f"Signals:        {len(result.signals)}")
     print(f"Risk decisions: {len(result.risk_decisions)}")
@@ -2416,6 +1922,7 @@ def print_result_summary(result: Any) -> None:
         for warning in result.warnings[:30]:
             level = getattr(warning.level, "value", warning.level)
             print(f"- [{level}] {warning.message}")
+
         if len(result.warnings) > 30:
             print(f"... +{len(result.warnings) - 30} more warnings")
 
@@ -2435,10 +1942,9 @@ async def run_full_backtest() -> Any:
     app_config.validate()
     app_config.prepare_directories()
 
-    # Use inline bus for deterministic backtesting. core.EventBus is queued and
-    # can return from MarketReplay.emit() before downstream handlers finish.
-    event_bus = InlineBacktestEventBus()
-    scheduler = Scheduler(event_bus=event_bus)
+    event_bus = EventBus()
+    core_scheduler = Scheduler(event_bus=event_bus)
+    scheduler = BacktestSchedulerCompatAdapter(core_scheduler)
 
     started_components: list[Any] = []
 
@@ -2449,12 +1955,10 @@ async def run_full_backtest() -> Any:
         await start_if_supported(scheduler)
         started_components.append(scheduler)
 
-        component_scheduler = BacktestSchedulerCompatAdapter(scheduler)
-
         backtest_config = build_backtest_config(runtime)
         enabled_data_types = backtest_config.enabled_data_types()
 
-        data_loader = SortingDataLoader(backtest_config.data_loader)
+        data_loader = DataLoader(backtest_config.data_loader)
 
         try:
             dataset = data_loader.load_dataset(
@@ -2465,11 +1969,13 @@ async def run_full_backtest() -> Any:
             print("")
             print("========== DATA LOADER ERROR ==========")
             print(exc)
+
             details = getattr(exc, "details", None)
             if details:
                 print("Details:")
                 for key, value in details.items():
                     print(f"- {key}: {value}")
+
             print("")
             print("DataLoader stats:")
             print(data_loader.stats())
@@ -2481,7 +1987,7 @@ async def run_full_backtest() -> Any:
         data_caches = build_data_caches(
             app_config=app_config,
             event_bus=event_bus,
-            scheduler=component_scheduler,
+            scheduler=scheduler,
             enabled_data_types=enabled_data_types,
         )
 
@@ -2489,7 +1995,7 @@ async def run_full_backtest() -> Any:
             runtime=runtime,
             app_config=app_config,
             event_bus=event_bus,
-            scheduler=component_scheduler,
+            scheduler=scheduler,
             data_caches=data_caches,
             enabled_data_types=enabled_data_types,
         )
@@ -2497,13 +2003,13 @@ async def run_full_backtest() -> Any:
         strategy_registry, signal_processor, strategy_engine = build_strategy_stack(
             runtime=runtime,
             event_bus=event_bus,
-            scheduler=component_scheduler,
+            scheduler=scheduler,
         )
 
         risk_manager = build_risk_manager(
             app_config=app_config,
             event_bus=event_bus,
-            scheduler=component_scheduler,
+            scheduler=scheduler,
         )
 
         print_component_summary(
@@ -2521,7 +2027,7 @@ async def run_full_backtest() -> Any:
             backtest_config,
             dataset=dataset,
             event_bus=event_bus,
-            scheduler=component_scheduler,
+            scheduler=scheduler,
             data_caches=data_caches,
             analytics_components=analytics_components,
             strategy_registry=strategy_registry,
@@ -2531,7 +2037,62 @@ async def run_full_backtest() -> Any:
         )
 
         result = await tester.run()
+        print("")
+        print("========== STRATEGY DIAGNOSTICS ==========")
+        for name, component in (
+                ("strategy_engine", strategy_engine),
+                ("signal_processor", signal_processor),
+                ("strategy_registry", strategy_registry),
+        ):
+            print(f"[{name}]")
+            stats = stats_if_supported(component)
+            if not stats:
+                print("  no stats")
+            for key, value in stats.items():
+                if isinstance(value, (dict, list)):
+                    print(f"  {key}: {json.dumps(value, default=str)[:1000]}")
+                else:
+                    print(f"  {key}: {value}")
+        print("==========================================")
+        market_replay_stats = (
+            tester.components.market_replay.stats()
+            if tester.components.market_replay is not None
+            else {}
+        )
+        print("")
+        print("========== STRATEGY REGISTRY ==========")
+        try:
+            strategies = strategy_registry.list_all()
+        except Exception:
+            strategies = []
 
+        for item in strategies:
+            name = getattr(item, "name", None) or getattr(item, "strategy_name", None) or str(item)
+            category = getattr(item, "category", None)
+            enabled = getattr(item, "enabled", None)
+            print(f"- {name} | category={category} | enabled={enabled}")
+
+        print(f"Total strategies: {len(strategies)}")
+        print("=======================================")
+        print("")
+        print("========== MARKET REPLAY HARD STATS ==========")
+        for key in (
+                "total_events",
+                "processed_events",
+                "emitted_events",
+                "skipped_events",
+                "failed_events",
+                "market_candles",
+                "market_trades",
+                "market_orderbooks",
+                "market_funding",
+                "market_open_interest",
+                "market_liquidations",
+                "current_index",
+                "status",
+        ):
+            print(f"{key}: {market_replay_stats.get(key)}")
+        print("==============================================")
         event_pipeline_summary = summarize_event_pipeline(debug_event_counts)
         result.metadata.setdefault("event_debug", event_pipeline_summary)
 
@@ -2540,15 +2101,15 @@ async def run_full_backtest() -> Any:
         print("")
         print("Likely pipeline breakpoint:", event_pipeline_summary["likely_breakpoint"])
 
-        # Persist diagnostics independently from ReportBuilder, because reports
-        # may already be built inside StrategyTester before runner metadata is added.
         debug_dir = Path(backtest_config.report_builder.output_dir) / f"{result.run_name}_{result.run_id}"
         debug_dir.mkdir(parents=True, exist_ok=True)
+
         debug_path = debug_dir / "event_debug.json"
         debug_path.write_text(
-            __import__("json").dumps(event_pipeline_summary, indent=2, default=str),
+            json.dumps(event_pipeline_summary, indent=2, default=str),
             encoding="utf-8",
         )
+
         print(f"Event debug saved: {debug_path}")
 
         print_result_summary(result)
@@ -2562,7 +2123,7 @@ async def run_full_backtest() -> Any:
                 logger.exception(
                     "Failed to stop component",
                     extra={
-                        "component": component.__class__.__name__,
+                        "component_name": component.__class__.__name__,
                         "error": str(exc),
                     },
                 )

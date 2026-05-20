@@ -3,13 +3,13 @@ Full-pipeline strategy tester for backtesting.
 
 StrategyTester is the main offline orchestrator.
 
-It should run the system as close as possible to production flow:
+It runs the system as close as possible to production flow:
 
     BacktestDataset
         -> MarketReplay
-        -> EventBus market.*
-        -> data caches
-        -> analytics
+        -> core.EventBus market.*
+        -> production data caches
+        -> production analytics
         -> StrategyEngine / SignalProcessor
         -> signal.generated
         -> RiskManager
@@ -21,18 +21,22 @@ It should run the system as close as possible to production flow:
         -> PerformanceMetrics / ModelAnalytics / ReportBuilder
 
 Important:
-- StrategyTester must not call individual strategies directly.
-- StrategyTester must not bypass RiskManager.
-- StrategyTester must not open positions directly.
-- StrategyTester must not use live exchange execution.
-- Live execution must be replaced by ExecutionSimulator + PositionSimulator.
+- StrategyTester does not call individual strategies directly.
+- StrategyTester does not bypass RiskManager.
+- StrategyTester does not open positions directly.
+- StrategyTester does not use live exchange execution.
+- Live execution is replaced only by ExecutionSimulator + PositionSimulator.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
+
+from core.event_bus import EventBus
+from core.logger import get_logger
 
 from backtesting.backtest_time import BacktestClock
 from backtesting.config import BacktestConfig, StrategyTesterConfig
@@ -68,67 +72,37 @@ from backtesting.models import (
     timestamp_ms,
     utcnow,
 )
-from backtesting.performance_metrics import PerformanceMetrics, build_metrics_input_from_components
+from backtesting.performance_metrics import (
+    PerformanceMetrics,
+    build_metrics_input_from_components,
+)
 from backtesting.position_simulator import PositionSimulator
 from backtesting.report_builder import ReportBuilder
-
-try:
-    from core.logger import get_logger
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str) -> logging.Logger:
-        return logging.getLogger(name)
-
-
-# =============================================================================
-# Optional lightweight EventBus fallback
-# =============================================================================
-
-
-class InMemoryBacktestEventBus:
-    """
-    Minimal async-friendly EventBus fallback for isolated backtests.
-
-    Production/project EventBus should be injected whenever possible.
-    """
-
-    def __init__(self) -> None:
-        self._handlers: dict[str, list[Callable[..., Any]]] = {}
-
-    def subscribe(self, topic: str, handler: Callable[..., Any]) -> tuple[str, Callable[..., Any]]:
-        self._handlers.setdefault(topic, []).append(handler)
-        return topic, handler
-
-    def unsubscribe(self, topic: str, handler: Callable[..., Any]) -> None:
-        handlers = self._handlers.get(topic, [])
-        if handler in handlers:
-            handlers.remove(handler)
-
-    async def emit(self, topic: str, payload: dict[str, Any]) -> None:
-        handlers = list(self._handlers.get(topic, []))
-
-        # Wildcard support for simple diagnostics: "signal.*", "execution.*".
-        for pattern, pattern_handlers in self._handlers.items():
-            if pattern.endswith(".*") and topic.startswith(pattern[:-1]):
-                handlers.extend(pattern_handlers)
-
-        for handler in handlers:
-            result = handler(payload)
-            if hasattr(result, "__await__"):
-                await result
-
-    async def publish(self, topic: str, payload: dict[str, Any]) -> None:
-        await self.emit(topic, payload)
 
 
 @dataclass(slots=True)
 class BacktestComponentBundle:
     """
     Runtime component bundle used by StrategyTester.
+
+    Production components are injected from outside:
+    - data caches;
+    - analytics components;
+    - StrategyEngine / SignalProcessor;
+    - RiskManager.
+
+    Backtesting-only components may be built by StrategyTester:
+    - MarketReplay;
+    - ExecutionSimulator;
+    - PositionSimulator;
+    - PerformanceMetrics;
+    - ModelAnalytics;
+    - ReportBuilder;
+    - BacktestClock;
+    - TradingCostModel.
     """
 
-    event_bus: Any
+    event_bus: EventBus
     scheduler: Any | None = None
 
     data_caches: list[Any] = field(default_factory=list)
@@ -175,6 +149,10 @@ class BacktestCollectors:
 class StrategyTester:
     """
     Main full-pipeline backtest runner.
+
+    This class is intentionally an orchestrator only. It wires historical replay
+    into the real EventBus-driven production pipeline and replaces only live
+    execution/position accounting with backtesting simulators.
     """
 
     def __init__(
@@ -182,7 +160,7 @@ class StrategyTester:
         config: BacktestConfig | StrategyTesterConfig,
         *,
         dataset: BacktestDataset | None = None,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
         scheduler: Any | None = None,
         data_caches: list[Any] | None = None,
         analytics_components: list[Any] | None = None,
@@ -210,11 +188,16 @@ class StrategyTester:
             self.config = config
 
         self.dataset = dataset
-
         self.logger = get_logger(logger_name)
 
+        # Full-pipeline backtesting must use the real production EventBus.
+        # If one is injected by run.py, that exact instance is used.
+        # If omitted, StrategyTester creates a real EventBus, not a lightweight
+        # in-memory substitute.
+        resolved_event_bus = event_bus if event_bus is not None else EventBus()
+
         self.components = BacktestComponentBundle(
-            event_bus=event_bus or InMemoryBacktestEventBus(),
+            event_bus=resolved_event_bus,
             scheduler=scheduler,
             data_caches=data_caches or [],
             analytics_components=analytics_components or [],
@@ -235,6 +218,7 @@ class StrategyTester:
         self.collectors = BacktestCollectors()
         self.result: BacktestResult | None = None
 
+        self._collector_subscriptions: list[Any] = []
         self._registered = False
         self._prepared = False
         self._running = False
@@ -247,6 +231,13 @@ class StrategyTester:
     def register(self) -> None:
         """
         Register event collectors and runtime components.
+
+        Registration order matters:
+        - collectors first, so diagnostics are not missed;
+        - data caches before analytics;
+        - analytics before strategy;
+        - strategy before risk;
+        - risk before execution/position simulation.
         """
 
         if self._registered:
@@ -260,6 +251,21 @@ class StrategyTester:
                 register()
 
         self._registered = True
+
+        self.logger.info(
+            "StrategyTester registered",
+            extra={
+                "event_bus_type": self.components.event_bus.__class__.__name__,
+                "data_caches": [item.__class__.__name__ for item in self.components.data_caches],
+                "analytics_components": [
+                    item.__class__.__name__ for item in self.components.analytics_components
+                ],
+                "has_strategy_engine": self.components.strategy_engine is not None,
+                "has_signal_processor": self.components.signal_processor is not None,
+                "has_risk_manager": self.components.risk_manager is not None,
+                "collector_subscriptions": len(self._collector_subscriptions),
+            },
+        )
 
     async def prepare_environment(
         self,
@@ -281,12 +287,47 @@ class StrategyTester:
                 )
 
             self._validate_dataset()
-            self._validate_pipeline_dependencies()
             self._build_missing_backtesting_components()
+            self._validate_pipeline_dependencies()
             self._prepare_market_replay()
             self.register()
             self._prepared = True
 
+    async def _drain_event_bus_after_replay(self) -> None:
+        """
+        Give real EventBus/Scheduler time to process queued replay events.
+
+        core.EventBus may dispatch through an internal async queue. MarketReplay can
+        finish emitting before downstream handlers/counters/data caches have fully
+        processed all queued events.
+        """
+
+        event_bus = self.components.event_bus
+
+        # Prefer explicit drain/join/wait methods if core EventBus exposes them.
+        for method_name in (
+                "drain",
+                "join",
+                "wait_until_idle",
+                "wait_empty",
+                "flush",
+        ):
+            method = getattr(event_bus, method_name, None)
+
+            if not callable(method):
+                continue
+
+            try:
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
+                return
+            except TypeError:
+                continue
+
+        # Fallback: yield several event-loop ticks so EventBus workers can dispatch.
+        for _ in range(10):
+            await asyncio.sleep(0)
     async def run(
         self,
         *,
@@ -311,6 +352,7 @@ class StrategyTester:
         try:
             await self._start_components()
             await self._run_replay()
+            await self._drain_event_bus_after_replay()
             await self._stop_components()
 
             self._collect_results(result)
@@ -417,12 +459,15 @@ class StrategyTester:
 
     async def cleanup(self) -> None:
         """
-        Cleanup runtime state after run.
+        Cleanup volatile runtime flags and collector subscriptions.
         """
 
-        # Do not destroy result artifacts; only clear volatile flags.
         self._prepared = False
         self._running = False
+
+        # Do not stop/destroy production components here. StrategyTester owns
+        # only its collector subscriptions and volatile flags.
+        self._unregister_collectors()
 
     # -------------------------------------------------------------------------
     # Component setup
@@ -431,6 +476,9 @@ class StrategyTester:
     def _build_missing_backtesting_components(self) -> None:
         """
         Build missing backtesting-only components.
+
+        Production data/analytics/strategy/risk components are not built here.
+        They must be injected by the runner.
         """
 
         bt_config = self.backtest_config
@@ -522,14 +570,24 @@ class StrategyTester:
         if self.components.event_bus is None:
             raise BacktestDependencyError("EventBus is required for StrategyTester.")
 
+        if not isinstance(self.components.event_bus, EventBus):
+            raise BacktestDependencyError(
+                "StrategyTester full pipeline requires core.event_bus.EventBus.",
+                details={
+                    "event_bus_type": self.components.event_bus.__class__.__name__,
+                },
+            )
+
         if self.config.require_strategy_engine and self.components.strategy_engine is None:
             raise BacktestDependencyError(
                 "StrategyEngine is required. Inject production StrategyEngine."
             )
 
         if self.config.require_signal_processor and self.components.signal_processor is None:
-            # Some StrategyEngine implementations already own SignalProcessor.
-            if not self._component_has_attr(self.components.strategy_engine, ["signal_processor", "processor"]):
+            if not self._component_has_attr(
+                self.components.strategy_engine,
+                ["signal_processor", "processor"],
+            ):
                 raise BacktestDependencyError(
                     "SignalProcessor is required. Inject it or use StrategyEngine that owns it."
                 )
@@ -540,16 +598,73 @@ class StrategyTester:
             )
 
         if self.config.require_analytics and not self.components.analytics_components:
-            self.logger.warning(
-                "No analytics components were injected. "
-                "Backtest may only work if StrategyEngine receives prebuilt analytics events."
+            raise BacktestDependencyError(
+                "Analytics components are required. Inject production analytics components."
             )
+
+        if not self.components.data_caches:
+            self.logger.warning(
+                "No production data caches were injected. "
+                "Analytics that listen to market.*.updated will not receive replayed data."
+            )
+
+        self._assert_single_event_bus_instance()
 
         if self.config.fail_if_live_execution_detected:
             self._assert_no_live_execution_component()
 
         if self.components.strategy_registry is not None:
             self._validate_strategy_selection()
+
+    def _assert_single_event_bus_instance(self) -> None:
+        """
+        Best-effort validation that injected components use the same EventBus.
+        """
+
+        expected = self.components.event_bus
+        mismatches: list[dict[str, str]] = []
+
+        for component in self._components_using_event_bus():
+            component_bus = self._extract_component_event_bus(component)
+
+            if component_bus is None:
+                continue
+
+            if component_bus is not expected:
+                mismatches.append(
+                    {
+                        "component": component.__class__.__name__,
+                        "component_event_bus_id": str(id(component_bus)),
+                        "expected_event_bus_id": str(id(expected)),
+                    }
+                )
+
+        if mismatches:
+            raise BacktestDependencyError(
+                "All backtest pipeline components must share the same EventBus instance.",
+                details={"mismatches": mismatches},
+            )
+
+    def _components_using_event_bus(self) -> list[Any]:
+        components = [
+            *self.components.data_caches,
+            *self.components.analytics_components,
+            self.components.signal_processor,
+            self.components.strategy_engine,
+            self.components.risk_manager,
+            self.components.market_replay,
+            self.components.execution_simulator,
+            self.components.position_simulator,
+        ]
+        return [component for component in components if component is not None]
+
+    @staticmethod
+    def _extract_component_event_bus(component: Any) -> Any | None:
+        for attr in ("event_bus", "_event_bus", "bus", "_bus"):
+            value = getattr(component, attr, None)
+            if value is not None:
+                return value
+        return None
 
     def _validate_strategy_selection(self) -> None:
         registry = self.components.strategy_registry
@@ -597,16 +712,22 @@ class StrategyTester:
             "trade_executor",
             "order_manager",
             "binance_rest",
+            "bybit_rest",
+            "okx_rest",
+            "mexc_rest",
             "exchange_client",
             "rest_client",
+            "live_exchange",
         }
 
-        metadata = {
+        owners = {
             "strategy_engine": self.components.strategy_engine,
             "risk_manager": self.components.risk_manager,
+            "execution_simulator": self.components.execution_simulator,
+            "position_simulator": self.components.position_simulator,
         }
 
-        for owner_name, owner in metadata.items():
+        for owner_name, owner in owners.items():
             if owner is None:
                 continue
 
@@ -615,7 +736,6 @@ class StrategyTester:
                 if value is None:
                     continue
 
-                # Simulation components are allowed.
                 if isinstance(value, ExecutionSimulator):
                     continue
 
@@ -635,18 +755,33 @@ class StrategyTester:
     async def _start_components(self) -> None:
         """
         Start components in pipeline order.
+
+        MarketReplay is prepared earlier but replayed only after all components
+        are registered and started.
         """
+
+        if self.components.clock is not None and not self.components.clock.started:
+            self.components.clock.start(
+                total_events=len(self.dataset.events) if self.dataset else 0
+            )
 
         for component in self._components_start_order():
             await self._maybe_call(component, "start")
 
     async def _stop_components(self) -> None:
         """
-        Stop components in reverse-ish order.
+        Stop components in reverse pipeline order.
         """
 
         for component in self._components_stop_order():
             await self._maybe_call(component, "stop")
+
+        if self.components.clock is not None and self.components.clock.started:
+            try:
+                self.components.clock.stop()
+            except Exception:
+                # Clock may already be stopped by MarketReplay.
+                pass
 
     async def _run_replay(self) -> None:
         if self.components.market_replay is None:
@@ -670,7 +805,7 @@ class StrategyTester:
             ]
         )
 
-        return [component for component in components if component is not None]
+        return self._dedupe_components(components)
 
     def _components_stop_order(self) -> list[Any]:
         components = [
@@ -682,7 +817,7 @@ class StrategyTester:
             *reversed(self.components.analytics_components),
             *reversed(self.components.data_caches),
         ]
-        return [component for component in components if component is not None]
+        return self._dedupe_components(components)
 
     def _all_registerable_components(self) -> list[Any]:
         components = [
@@ -695,7 +830,25 @@ class StrategyTester:
             self.components.position_simulator,
             self.components.market_replay,
         ]
-        return [component for component in components if component is not None]
+        return self._dedupe_components(components)
+
+    @staticmethod
+    def _dedupe_components(components: list[Any]) -> list[Any]:
+        result: list[Any] = []
+        seen: set[int] = set()
+
+        for component in components:
+            if component is None:
+                continue
+
+            key = id(component)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(component)
+
+        return result
 
     @staticmethod
     async def _maybe_call(component: Any, method_name: str) -> Any:
@@ -706,7 +859,7 @@ class StrategyTester:
 
         result = method()
 
-        if hasattr(result, "__await__"):
+        if inspect.isawaitable(result):
             return await result
 
         return result
@@ -718,35 +871,150 @@ class StrategyTester:
     def _register_collectors(self) -> None:
         event_bus = self.components.event_bus
 
-        subscribe = getattr(event_bus, "subscribe", None)
-
-        if subscribe is None:
-            return
-
         if self.config.collect_signal_records:
-            subscribe("signal.generated", self._collect_signal_generated)
-            subscribe("signal.rejected", self._collect_signal_rejected)
-            subscribe("signal.updated", self._collect_signal_updated)
+            self._subscribe_collector("signal.generated", self._collect_signal_generated)
+            self._subscribe_collector("signal.rejected", self._collect_signal_rejected)
+            self._subscribe_collector("signal.updated", self._collect_signal_updated)
 
         if self.config.collect_risk_records:
-            subscribe("signal.confirmed", self._collect_signal_confirmed)
-            subscribe("risk.position_blocked", self._collect_risk_blocked)
-            subscribe("risk.kill_switch", self._collect_risk_kill_switch)
-            subscribe("risk.limit_warning", self._collect_risk_limit_warning)
+            self._subscribe_collector("signal.confirmed", self._collect_signal_confirmed)
+            self._subscribe_collector("risk.position_blocked", self._collect_risk_blocked)
+            self._subscribe_collector("risk.kill_switch", self._collect_risk_kill_switch)
+            self._subscribe_collector("risk.limit_warning", self._collect_risk_limit_warning)
 
         if self.config.collect_execution_records:
-            subscribe("execution.order_submitted", self._collect_execution_event)
-            subscribe("execution.order_rejected", self._collect_execution_event)
-            subscribe("execution.order_failed", self._collect_execution_event)
-            subscribe("execution.order_cancelled", self._collect_execution_event)
-            subscribe("execution.order_filled", self._collect_execution_event)
-            subscribe("execution.order_partially_filled", self._collect_execution_event)
+            self._subscribe_collector("execution.order_submitted", self._collect_execution_event)
+            self._subscribe_collector("execution.order_rejected", self._collect_execution_event)
+            self._subscribe_collector("execution.order_failed", self._collect_execution_event)
+            self._subscribe_collector("execution.order_cancelled", self._collect_execution_event)
+            self._subscribe_collector("execution.order_filled", self._collect_execution_event)
+            self._subscribe_collector(
+                "execution.order_partially_filled",
+                self._collect_execution_event,
+            )
 
         if self.config.collect_position_records:
-            subscribe("position.opened", self._collect_position_event)
-            subscribe("position.updated", self._collect_position_event)
-            subscribe("position.closed", self._collect_position_event)
-            subscribe("position.liquidated", self._collect_position_event)
+            self._subscribe_collector("position.opened", self._collect_position_event)
+            self._subscribe_collector("position.updated", self._collect_position_event)
+            self._subscribe_collector("position.closed", self._collect_position_event)
+            self._subscribe_collector("position.liquidated", self._collect_position_event)
+
+        if self.config.collect_event_log:
+            # Lightweight pipeline diagnostics. These are intentionally broad.
+            # They collect only payload snapshots from key production topics.
+            for topic in (
+                "market.*",
+                "analytics.*",
+                "strategy.*",
+                "signal.*",
+                "risk.*",
+                "execution.*",
+                "position.*",
+                "system.backtest.*",
+            ):
+                self._subscribe_collector(topic, self._collect_event_log)
+
+        self.logger.debug(
+            "StrategyTester collectors registered",
+            extra={
+                "subscriptions": len(self._collector_subscriptions),
+                "event_bus_type": event_bus.__class__.__name__,
+            },
+        )
+
+    def _subscribe_collector(self, topic: str, handler: Any) -> None:
+        """
+        Subscribe a collector to production EventBus.
+
+        Collector handlers accept Event or dict. This method uses production
+        EventBus API and keeps returned subscriptions so cleanup can unsubscribe.
+        """
+
+        subscribe = getattr(self.components.event_bus, "subscribe", None)
+
+        if not callable(subscribe):
+            raise BacktestDependencyError("EventBus does not support subscribe().")
+
+        wrapped_handler = self._wrap_collector_handler(topic, handler)
+
+        try:
+            subscription = subscribe(
+                topic,
+                wrapped_handler,
+                name=f"backtest_collector_{topic.replace('*', 'wildcard').replace('.', '_')}",
+            )
+        except TypeError:
+            # Compatibility with EventBus variants that use pattern=...
+            subscription = subscribe(
+                pattern=topic,
+                handler=wrapped_handler,
+                name=f"backtest_collector_{topic.replace('*', 'wildcard').replace('.', '_')}",
+            )
+
+        self._collector_subscriptions.append(subscription)
+
+    def _wrap_collector_handler(self, topic: str, handler: Any) -> Any:
+        async def _wrapped(event_or_payload: Any) -> None:
+            payload = self._payload_from_event_or_dict(event_or_payload)
+            event_topic = self._topic_from_event_or_fallback(event_or_payload, topic)
+
+            if event_topic and "topic" not in payload:
+                payload["topic"] = event_topic
+            if event_topic and "event_topic" not in payload:
+                payload["event_topic"] = event_topic
+
+            result = handler(payload)
+
+            if inspect.isawaitable(result):
+                await result
+
+        return _wrapped
+
+    def _unregister_collectors(self) -> None:
+        if not self._collector_subscriptions:
+            return
+
+        unsubscribe = getattr(self.components.event_bus, "unsubscribe", None)
+
+        if not callable(unsubscribe):
+            self._collector_subscriptions.clear()
+            return
+
+        for subscription in list(self._collector_subscriptions):
+            try:
+                unsubscribe(subscription)
+            except Exception:
+                self.logger.debug(
+                    "Failed to unsubscribe backtest collector",
+                    extra={"subscription": str(subscription)},
+                )
+
+        self._collector_subscriptions.clear()
+        self._registered = False
+
+    async def _collect_event_log(self, payload: dict[str, Any]) -> None:
+        if not self.config.collect_event_log:
+            return
+
+        topic = str(payload.get("topic") or payload.get("event_topic") or "")
+        timestamp = self._payload_timestamp(payload)
+
+        self.collectors.events.append(
+            BacktestEvent(
+                event_id=str(payload.get("event_id") or payload.get("replay_event_id") or new_id("evt")),
+                event_type=self._backtest_event_type_from_topic(topic),
+                topic=topic,
+                timestamp_ms=timestamp,
+                payload=dict(payload),
+                source=str(payload.get("source") or "event_bus"),
+                sequence=int(payload.get("sequence") or payload.get("replay_sequence") or 0),
+                is_warmup=bool(payload.get("is_warmup", False)),
+                metadata={
+                    "collected_by": "StrategyTester",
+                    "topic": topic,
+                },
+            )
+        )
 
     async def _collect_signal_generated(self, payload: dict[str, Any]) -> None:
         self.collectors.signals.append(
@@ -846,7 +1114,11 @@ class StrategyTester:
         )
 
     async def _collect_execution_event(self, payload: dict[str, Any]) -> None:
-        topic = str(payload.get("topic") or payload.get("event_topic") or self._infer_execution_topic(payload))
+        topic = str(
+            payload.get("topic")
+            or payload.get("event_topic")
+            or self._infer_execution_topic(payload)
+        )
 
         self.collectors.execution_records.append(
             BacktestExecutionRecord(
@@ -869,7 +1141,11 @@ class StrategyTester:
             self._update_signal_outcome(signal_id, SignalOutcome.ORDER_FILLED)
 
     async def _collect_position_event(self, payload: dict[str, Any]) -> None:
-        topic = str(payload.get("topic") or payload.get("event_topic") or self._infer_position_topic(payload))
+        topic = str(
+            payload.get("topic")
+            or payload.get("event_topic")
+            or self._infer_position_topic(payload)
+        )
 
         self.collectors.position_records.append(
             BacktestPositionRecord(
@@ -891,7 +1167,11 @@ class StrategyTester:
             self._update_signal_outcome(signal_id, SignalOutcome.POSITION_OPENED)
 
         if topic.endswith("position.closed") or payload.get("status") == "closed":
-            pnl = self._float_value(payload, ["net_realized_pnl", "realized_pnl", "pnl"], default=0.0)
+            pnl = self._float_value(
+                payload,
+                ["net_realized_pnl", "realized_pnl", "pnl"],
+                default=0.0,
+            )
 
             if pnl > 0:
                 outcome = SignalOutcome.POSITION_CLOSED_WIN
@@ -909,23 +1189,45 @@ class StrategyTester:
     def _create_result(self) -> BacktestResult:
         bt_config = self.backtest_config
 
+        default_models = SimulationModelSnapshot()
+
         result = BacktestResult(
             run_id=new_id("bt"),
             run_name=self.config.run_name,
             mode=self.config.mode,
             status=BacktestStatus.CREATED,
-            period=bt_config.period() if bt_config else (self.dataset.info.period if self.dataset else None),
+            period=bt_config.period()
+            if bt_config
+            else (self.dataset.info.period if self.dataset else None),
             dataset_info=self.dataset.info if self.dataset else None,
             simulation_models=SimulationModelSnapshot(
-                fill_model=bt_config.execution_simulator.fill_model if bt_config else SimulationModelSnapshot().fill_model,
-                candle_execution_path=bt_config.execution_simulator.candle_execution_path if bt_config else SimulationModelSnapshot().candle_execution_path,
-                slippage_model=bt_config.cost_model.slippage_model if bt_config else SimulationModelSnapshot().slippage_model,
-                commission_model=bt_config.cost_model.commission_model if bt_config else SimulationModelSnapshot().commission_model,
-                liquidity_model=bt_config.execution_simulator.liquidity_model if bt_config else SimulationModelSnapshot().liquidity_model,
-                latency_model=bt_config.execution_simulator.latency_model if bt_config else SimulationModelSnapshot().latency_model,
-                funding_mode=bt_config.cost_model.funding_mode if bt_config else SimulationModelSnapshot().funding_mode,
-                position_accounting_mode=bt_config.position_simulator.position_accounting_mode if bt_config else SimulationModelSnapshot().position_accounting_mode,
-                pnl_accounting_mode=bt_config.position_simulator.pnl_accounting_mode if bt_config else SimulationModelSnapshot().pnl_accounting_mode,
+                fill_model=bt_config.execution_simulator.fill_model
+                if bt_config
+                else default_models.fill_model,
+                candle_execution_path=bt_config.execution_simulator.candle_execution_path
+                if bt_config
+                else default_models.candle_execution_path,
+                slippage_model=bt_config.cost_model.slippage_model
+                if bt_config
+                else default_models.slippage_model,
+                commission_model=bt_config.cost_model.commission_model
+                if bt_config
+                else default_models.commission_model,
+                liquidity_model=bt_config.execution_simulator.liquidity_model
+                if bt_config
+                else default_models.liquidity_model,
+                latency_model=bt_config.execution_simulator.latency_model
+                if bt_config
+                else default_models.latency_model,
+                funding_mode=bt_config.cost_model.funding_mode
+                if bt_config
+                else default_models.funding_mode,
+                position_accounting_mode=bt_config.position_simulator.position_accounting_mode
+                if bt_config
+                else default_models.position_accounting_mode,
+                pnl_accounting_mode=bt_config.position_simulator.pnl_accounting_mode
+                if bt_config
+                else default_models.pnl_accounting_mode,
             ),
             initial_balance=bt_config.initial_balance if bt_config else 0.0,
             final_balance=bt_config.initial_balance if bt_config else 0.0,
@@ -936,6 +1238,7 @@ class StrategyTester:
                 "timeframes": self.config.timeframes,
                 "strategies": self.config.strategies,
                 "test_all_registered_strategies": self.config.test_all_registered_strategies,
+                "event_bus_type": self.components.event_bus.__class__.__name__,
             },
         )
 
@@ -950,35 +1253,42 @@ class StrategyTester:
         execution_simulator = self.components.execution_simulator
 
         if execution_simulator is not None:
-            result.orders = list(execution_simulator.orders.values())
-            result.fills = list(execution_simulator.fills)
-            result.execution_records = list(execution_simulator.records)
+            result.orders = list(getattr(execution_simulator, "orders", {}).values())
+            result.fills = list(getattr(execution_simulator, "fills", []))
+            result.execution_records = list(getattr(execution_simulator, "records", []))
 
         if position_simulator is not None:
             result.positions = position_simulator.all_positions()
-            result.trades = list(position_simulator.trades)
-            result.equity_curve = list(position_simulator.equity_curve)
-            result.position_records = list(position_simulator.records)
-            result.final_balance = position_simulator.balance.cash_balance
-            result.final_equity = position_simulator.balance.equity
+            result.trades = list(getattr(position_simulator, "trades", []))
+            result.equity_curve = list(getattr(position_simulator, "equity_curve", []))
+            result.position_records = list(getattr(position_simulator, "records", []))
 
-        # Merge collector records when simulator records are absent or incomplete.
+            balance = getattr(position_simulator, "balance", None)
+            if balance is not None:
+                result.final_balance = getattr(balance, "cash_balance", result.final_balance)
+                result.final_equity = getattr(balance, "equity", result.final_equity)
+
         if self.collectors.execution_records:
             known = {record.record_id for record in result.execution_records}
             result.execution_records.extend(
-                record for record in self.collectors.execution_records
+                record
+                for record in self.collectors.execution_records
                 if record.record_id not in known
             )
 
         if self.collectors.position_records:
             known = {record.record_id for record in result.position_records}
             result.position_records.extend(
-                record for record in self.collectors.position_records
+                record
+                for record in self.collectors.position_records
                 if record.record_id not in known
             )
 
         result.signals = list(self.collectors.signals)
         result.risk_decisions = list(self.collectors.risk_decisions)
+
+        if self.config.collect_event_log:
+            result.events = list(self.collectors.events)
 
     def _calculate_metrics(self, result: BacktestResult) -> None:
         metrics = self.components.performance_metrics
@@ -1101,8 +1411,11 @@ class StrategyTester:
 
     def _resolve_final_balance(self) -> float:
         position_simulator = self.components.position_simulator
+
         if position_simulator is not None:
-            return position_simulator.balance.cash_balance
+            balance = getattr(position_simulator, "balance", None)
+            if balance is not None:
+                return float(getattr(balance, "cash_balance", 0.0))
 
         if self.result is not None:
             return self.result.final_balance
@@ -1111,8 +1424,11 @@ class StrategyTester:
 
     def _resolve_final_equity(self) -> float:
         position_simulator = self.components.position_simulator
+
         if position_simulator is not None:
-            return position_simulator.balance.equity
+            balance = getattr(position_simulator, "balance", None)
+            if balance is not None:
+                return float(getattr(balance, "equity", 0.0))
 
         if self.result is not None:
             return self.result.final_equity
@@ -1121,12 +1437,22 @@ class StrategyTester:
 
     def _now_ms(self) -> int:
         clock = self.components.clock
-        if clock is not None and clock.started:
+
+        if clock is not None and getattr(clock, "started", False):
             return clock.timestamp_ms()
+
         return timestamp_ms(utcnow())
 
     def _payload_timestamp(self, payload: dict[str, Any]) -> int:
-        for key in ("timestamp_ms", "generated_at_ms", "created_at_ms", "updated_at_ms", "filled_at_ms"):
+        for key in (
+            "timestamp_ms",
+            "generated_at_ms",
+            "created_at_ms",
+            "updated_at_ms",
+            "submitted_at_ms",
+            "filled_at_ms",
+            "closed_at_ms",
+        ):
             value = payload.get(key)
             if value is not None:
                 try:
@@ -1137,13 +1463,41 @@ class StrategyTester:
         return self._now_ms()
 
     @staticmethod
+    def _payload_from_event_or_dict(event_or_payload: Any) -> dict[str, Any]:
+        if isinstance(event_or_payload, dict):
+            return dict(event_or_payload)
+
+        payload = getattr(event_or_payload, "payload", None)
+        if isinstance(payload, dict):
+            return dict(payload)
+
+        return {}
+
+    @staticmethod
+    def _topic_from_event_or_fallback(event_or_payload: Any, fallback: str) -> str:
+        for attr in ("topic", "name", "event_name", "type"):
+            value = getattr(event_or_payload, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return fallback
+
+    @staticmethod
     def _value(payload: dict[str, Any], keys: list[str], default: Any = None) -> Any:
         for key in keys:
             value = payload.get(key)
             if value is not None:
                 return value
 
-        for nested_key in ("signal", "payload", "risk_decision", "execution_intent", "metadata"):
+        for nested_key in (
+            "signal",
+            "payload",
+            "risk_decision",
+            "execution_intent",
+            "order",
+            "fill",
+            "position",
+            "metadata",
+        ):
             nested = payload.get(nested_key)
             if not isinstance(nested, dict):
                 continue
@@ -1206,121 +1560,96 @@ class StrategyTester:
     def _component_has_attr(component: Any, names: list[str]) -> bool:
         if component is None:
             return False
+
         return any(getattr(component, name, None) is not None for name in names)
 
     @staticmethod
     def _get_registered_strategies(registry: Any) -> list[Any]:
-        for attr_name in ("strategies", "_strategies", "registered_strategies"):
-            value = getattr(registry, attr_name, None)
-
-            if isinstance(value, dict):
-                return list(value.values())
-
-            if isinstance(value, list):
-                return value
-
-        for method_name in ("list", "all", "get_all", "registered"):
+        for method_name in ("all", "all_strategies", "strategies", "list_strategies"):
             method = getattr(registry, method_name, None)
-            if callable(method):
-                value = method()
-                if isinstance(value, dict):
-                    return list(value.values())
-                if isinstance(value, list):
-                    return value
+            if not callable(method):
+                continue
+
+            result = method()
+
+            if isinstance(result, dict):
+                return list(result.values())
+
+            if isinstance(result, list):
+                return result
+
+            if isinstance(result, tuple):
+                return list(result)
+
+        raw = getattr(registry, "_strategies", None)
+        if isinstance(raw, dict):
+            return list(raw.values())
 
         return []
 
     @staticmethod
     def _strategy_name(strategy: Any) -> str:
-        for attr_name in ("name", "strategy_name"):
-            value = getattr(strategy, attr_name, None)
-            if value:
-                return str(value)
-
-        metadata = getattr(strategy, "metadata", None)
-        if metadata is not None:
-            value = getattr(metadata, "name", None)
-            if value:
-                return str(value)
+        for attr in ("strategy_name", "name"):
+            value = getattr(strategy, attr, None)
+            if isinstance(value, str) and value:
+                return value
 
         return strategy.__class__.__name__
 
+    @staticmethod
+    def _backtest_event_type_from_topic(topic: str) -> Any:
+        # Import here to avoid broad enum dependency at module import time.
+        from backtesting.enums import BacktestEventType
 
-# =============================================================================
-# Convenience functions
-# =============================================================================
+        normalized = topic.lower()
 
+        if normalized.startswith("market."):
+            return BacktestEventType.MARKET
+        if normalized.startswith("analytics."):
+            return BacktestEventType.ANALYTICS
+        if normalized.startswith("strategy."):
+            return BacktestEventType.STRATEGY
+        if normalized.startswith("signal."):
+            return BacktestEventType.SIGNAL
+        if normalized.startswith("risk."):
+            return BacktestEventType.RISK
+        if normalized.startswith("execution."):
+            return BacktestEventType.EXECUTION
+        if normalized.startswith("position."):
+            return BacktestEventType.POSITION
 
-async def run_backtest(
-    config: BacktestConfig,
-    dataset: BacktestDataset,
-    *,
-    event_bus: Any | None = None,
-    scheduler: Any | None = None,
-    data_caches: list[Any] | None = None,
-    analytics_components: list[Any] | None = None,
-    strategy_registry: Any | None = None,
-    strategy_engine: Any | None = None,
-    signal_processor: Any | None = None,
-    risk_manager: Any | None = None,
-) -> BacktestResult:
-    """
-    Convenience async helper for running a full backtest.
-    """
+        return BacktestEventType.SYSTEM
 
-    tester = StrategyTester(
-        config,
-        dataset=dataset,
-        event_bus=event_bus,
-        scheduler=scheduler,
-        data_caches=data_caches,
-        analytics_components=analytics_components,
-        strategy_registry=strategy_registry,
-        strategy_engine=strategy_engine,
-        signal_processor=signal_processor,
-        risk_manager=risk_manager,
-    )
-    return await tester.run()
-
-
-def run_backtest_sync(
-    config: BacktestConfig,
-    dataset: BacktestDataset,
-    *,
-    event_bus: Any | None = None,
-    scheduler: Any | None = None,
-    data_caches: list[Any] | None = None,
-    analytics_components: list[Any] | None = None,
-    strategy_registry: Any | None = None,
-    strategy_engine: Any | None = None,
-    signal_processor: Any | None = None,
-    risk_manager: Any | None = None,
-) -> BacktestResult:
-    """
-    Synchronous wrapper for scripts/notebooks.
-    """
-
-    return asyncio.run(
-        run_backtest(
-            config,
-            dataset,
-            event_bus=event_bus,
-            scheduler=scheduler,
-            data_caches=data_caches,
-            analytics_components=analytics_components,
-            strategy_registry=strategy_registry,
-            strategy_engine=strategy_engine,
-            signal_processor=signal_processor,
-            risk_manager=risk_manager,
-        )
-    )
+    def stats(self) -> dict[str, Any]:
+        return {
+            "prepared": self._prepared,
+            "registered": self._registered,
+            "running": self._running,
+            "event_bus_type": self.components.event_bus.__class__.__name__,
+            "collector_subscriptions": len(self._collector_subscriptions),
+            "dataset_events": len(self.dataset.events) if self.dataset else 0,
+            "data_caches": [item.__class__.__name__ for item in self.components.data_caches],
+            "analytics_components": [
+                item.__class__.__name__ for item in self.components.analytics_components
+            ],
+            "has_strategy_engine": self.components.strategy_engine is not None,
+            "has_signal_processor": self.components.signal_processor is not None,
+            "has_risk_manager": self.components.risk_manager is not None,
+            "has_market_replay": self.components.market_replay is not None,
+            "has_execution_simulator": self.components.execution_simulator is not None,
+            "has_position_simulator": self.components.position_simulator is not None,
+            "collected": {
+                "events": len(self.collectors.events),
+                "signals": len(self.collectors.signals),
+                "risk_decisions": len(self.collectors.risk_decisions),
+                "execution_records": len(self.collectors.execution_records),
+                "position_records": len(self.collectors.position_records),
+            },
+        }
 
 
 __all__ = [
-    "InMemoryBacktestEventBus",
     "BacktestComponentBundle",
     "BacktestCollectors",
     "StrategyTester",
-    "run_backtest",
-    "run_backtest_sync",
 ]

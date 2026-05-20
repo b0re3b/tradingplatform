@@ -286,7 +286,7 @@ class SLTPManager:
         try:
             job = self._scheduler.add_interval_job(
                 self.reconcile_protective_orders,
-                interval_seconds=self._config.reconcile_interval_seconds,
+                interval=self._config.reconcile_interval_seconds,
                 name="execution.sltp_manager.reconcile_protective_orders",
                 run_immediately=False,
             )

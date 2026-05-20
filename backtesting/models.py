@@ -392,10 +392,44 @@ class BacktestDatasetInfo(SerializableMixin):
 # ============================================================================
 
 
+def _normalize_backtest_exchange(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        raise HistoricalDataValidationError("exchange is required.")
+    return normalized
+
+
+def _normalize_backtest_symbol(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        raise HistoricalDataValidationError("symbol is required.")
+    return normalized
+
+
+def _normalize_backtest_market_type(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        raise HistoricalDataValidationError("market_type is required.")
+    return normalized
+
+
+def _normalize_backtest_timeframe(value: str | None, *, default: str = "1m") -> str:
+    normalized = str(value or default).strip()
+    return normalized or default
+
+
+def _compact_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    return dict(metadata or {})
+
+
 @dataclass(slots=True, frozen=True)
 class HistoricalMarketRecord(SerializableMixin):
     """
     Base historical market record.
+
+    This is a backtesting DTO only. It does not emit EventBus events by itself.
+    MarketReplay converts these records into raw production-compatible market.*
+    payloads and sends them through core.EventBus.
     """
 
     exchange: str
@@ -407,24 +441,24 @@ class HistoricalMarketRecord(SerializableMixin):
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.exchange:
-            raise HistoricalDataValidationError("Historical record exchange is required.")
+        object.__setattr__(self, "exchange", _normalize_backtest_exchange(self.exchange))
+        object.__setattr__(self, "symbol", _normalize_backtest_symbol(self.symbol))
+        object.__setattr__(self, "market_type", _normalize_backtest_market_type(self.market_type))
 
-        if not self.symbol:
-            raise HistoricalDataValidationError("Historical record symbol is required.")
-
-        if self.timestamp_ms <= 0:
+        if int(self.timestamp_ms) <= 0:
             raise HistoricalDataValidationError(
                 "Historical record timestamp_ms must be positive.",
                 details={"timestamp_ms": self.timestamp_ms},
             )
 
-        object.__setattr__(self, "exchange", self.exchange.lower())
-        object.__setattr__(self, "symbol", self.symbol.upper())
-        object.__setattr__(self, "market_type", self.market_type.lower())
+        object.__setattr__(self, "timestamp_ms", int(self.timestamp_ms))
 
         if self.received_at_ms is None:
             object.__setattr__(self, "received_at_ms", self.timestamp_ms)
+        else:
+            object.__setattr__(self, "received_at_ms", int(self.received_at_ms))
+
+        object.__setattr__(self, "metadata", _compact_metadata(self.metadata))
 
     @property
     def event_time(self) -> datetime:
@@ -434,11 +468,43 @@ class HistoricalMarketRecord(SerializableMixin):
     def instrument_key(self) -> str:
         return f"{self.exchange}:{self.market_type}:{self.symbol}"
 
+    def _base_market_payload(
+        self,
+        *,
+        data_type: str,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "market_type": self.market_type,
+            "timestamp_ms": self.timestamp_ms,
+            "received_at_ms": self.received_at_ms,
+            "source": self.source or "backtest",
+            "data_type": data_type,
+            "metadata": {
+                **self.metadata,
+                "backtest": True,
+                "instrument_key": self.instrument_key,
+                "record_type": self.__class__.__name__,
+                "data_type": data_type,
+            },
+        }
+
+        if timeframe is not None:
+            payload["timeframe"] = timeframe
+            payload["metadata"]["timeframe"] = timeframe
+
+        return payload
+
 
 @dataclass(slots=True, frozen=True)
 class HistoricalCandle(HistoricalMarketRecord):
     """
     Historical OHLCV candle.
+
+    Converts to raw market.candle payload. Production CandlesCache should then
+    emit market.candles.updated and market.candle.closed.
     """
 
     timeframe: str = "1m"
@@ -456,27 +522,29 @@ class HistoricalCandle(HistoricalMarketRecord):
     def __post_init__(self) -> None:
         HistoricalMarketRecord.__post_init__(self)
 
-        open_time_ms = self.open_time_ms or self.timestamp_ms
-        close_time_ms = self.close_time_ms or self.timestamp_ms
+        object.__setattr__(self, "timeframe", _normalize_backtest_timeframe(self.timeframe))
 
-        object.__setattr__(self, "open_time_ms", int(open_time_ms))
-        object.__setattr__(self, "close_time_ms", int(close_time_ms))
+        open_time_ms = int(self.open_time_ms or self.timestamp_ms)
+        close_time_ms = int(self.close_time_ms or self.timestamp_ms)
 
-        if self.open_time_ms <= 0 or self.close_time_ms <= 0:
+        object.__setattr__(self, "open_time_ms", open_time_ms)
+        object.__setattr__(self, "close_time_ms", close_time_ms)
+
+        if open_time_ms <= 0 or close_time_ms <= 0:
             raise HistoricalDataValidationError(
                 "HistoricalCandle open_time_ms and close_time_ms must be positive.",
                 details={
-                    "open_time_ms": self.open_time_ms,
-                    "close_time_ms": self.close_time_ms,
+                    "open_time_ms": open_time_ms,
+                    "close_time_ms": close_time_ms,
                 },
             )
 
-        if self.close_time_ms < self.open_time_ms:
+        if close_time_ms < open_time_ms:
             raise HistoricalDataValidationError(
                 "HistoricalCandle close_time_ms cannot be before open_time_ms.",
                 details={
-                    "open_time_ms": self.open_time_ms,
-                    "close_time_ms": self.close_time_ms,
+                    "open_time_ms": open_time_ms,
+                    "close_time_ms": close_time_ms,
                 },
             )
 
@@ -500,37 +568,46 @@ class HistoricalCandle(HistoricalMarketRecord):
                 },
             )
 
-    def to_market_event_payload(self) -> dict[str, Any]:
-        """
-        Convert to production-compatible market.candle payload.
-        """
+        if self.volume < 0 or self.quote_volume < 0:
+            raise HistoricalDataValidationError(
+                "HistoricalCandle volume values cannot be negative.",
+                details={
+                    "volume": self.volume,
+                    "quote_volume": self.quote_volume,
+                },
+            )
 
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "timeframe": self.timeframe,
-            "timestamp_ms": self.timestamp_ms,
-            "received_at_ms": self.received_at_ms,
-            "open_time_ms": self.open_time_ms,
-            "close_time_ms": self.close_time_ms,
-            "open": self.open,
-            "high": self.high,
-            "low": self.low,
-            "close": self.close,
-            "volume": self.volume,
-            "quote_volume": self.quote_volume,
-            "trades_count": self.trades_count,
-            "is_closed": self.is_closed,
-            "source": self.source or "backtest",
-            "metadata": self.metadata,
-        }
+    def to_market_event_payload(self) -> dict[str, Any]:
+        payload = self._base_market_payload(
+            data_type=BacktestDataType.CANDLES.value,
+            timeframe=self.timeframe,
+        )
+
+        payload.update(
+            {
+                "open_time_ms": self.open_time_ms,
+                "close_time_ms": self.close_time_ms,
+                "open": float(self.open),
+                "high": float(self.high),
+                "low": float(self.low),
+                "close": float(self.close),
+                "volume": float(self.volume),
+                "quote_volume": float(self.quote_volume),
+                "trades_count": int(self.trades_count),
+                "is_closed": bool(self.is_closed),
+            }
+        )
+
+        return payload
 
 
 @dataclass(slots=True, frozen=True)
 class HistoricalTrade(HistoricalMarketRecord):
     """
     Historical trade record.
+
+    Converts to raw market.trade payload. Production TradesCache should then
+    emit market.trades.updated.
     """
 
     trade_id: str | int | None = None
@@ -540,6 +617,7 @@ class HistoricalTrade(HistoricalMarketRecord):
     side: str | None = None
     aggressor_side: str | None = None
     buyer_maker: bool | None = None
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         HistoricalMarketRecord.__post_init__(self)
@@ -557,26 +635,41 @@ class HistoricalTrade(HistoricalMarketRecord):
             )
 
         if self.quote_quantity is None:
-            object.__setattr__(self, "quote_quantity", self.price * self.quantity)
+            object.__setattr__(self, "quote_quantity", float(self.price) * float(self.quantity))
+        elif self.quote_quantity < 0:
+            raise HistoricalDataValidationError(
+                "HistoricalTrade.quote_quantity cannot be negative.",
+                details={"quote_quantity": self.quote_quantity},
+            )
+
+        if self.timeframe is not None:
+            object.__setattr__(self, "timeframe", _normalize_backtest_timeframe(self.timeframe))
 
     def to_market_event_payload(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "timestamp_ms": self.timestamp_ms,
-            "received_at_ms": self.received_at_ms,
-            "trade_id": self.trade_id,
-            "price": self.price,
-            "quantity": self.quantity,
-            "qty": self.quantity,
-            "quote_quantity": self.quote_quantity,
-            "side": self.side,
-            "aggressor_side": self.aggressor_side,
-            "buyer_maker": self.buyer_maker,
-            "source": self.source or "backtest",
-            "metadata": self.metadata,
-        }
+        payload = self._base_market_payload(
+            data_type=BacktestDataType.TRADES.value,
+            timeframe=self.timeframe,
+        )
+
+        notional = float(self.quote_quantity or (self.price * self.quantity))
+
+        payload.update(
+            {
+                "trade_id": str(self.trade_id) if self.trade_id is not None else None,
+                "price": float(self.price),
+                "quantity": float(self.quantity),
+                "qty": float(self.quantity),
+                "quote_quantity": notional,
+                "quote_volume": notional,
+                "notional": notional,
+                "side": self.side,
+                "aggressor_side": self.aggressor_side or self.side,
+                "buyer_maker": self.buyer_maker,
+                "is_buyer_maker": self.buyer_maker,
+            }
+        )
+
+        return payload
 
 
 @dataclass(slots=True, frozen=True)
@@ -606,12 +699,16 @@ class HistoricalOrderBookLevel(SerializableMixin):
 class HistoricalOrderBookSnapshot(HistoricalMarketRecord):
     """
     Historical order book snapshot.
+
+    Converts to raw market.orderbook snapshot payload. Production OrderBookCache
+    should then emit market.orderbook.updated.
     """
 
     bids: list[HistoricalOrderBookLevel] = field(default_factory=list)
     asks: list[HistoricalOrderBookLevel] = field(default_factory=list)
     sequence: int | None = None
     depth: int | None = None
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         HistoricalMarketRecord.__post_init__(self)
@@ -623,6 +720,11 @@ class HistoricalOrderBookSnapshot(HistoricalMarketRecord):
 
         if self.depth is None:
             object.__setattr__(self, "depth", max(len(self.bids), len(self.asks)))
+        else:
+            object.__setattr__(self, "depth", int(self.depth))
+
+        if self.timeframe is not None:
+            object.__setattr__(self, "timeframe", _normalize_backtest_timeframe(self.timeframe))
 
     @property
     def best_bid(self) -> float | None:
@@ -639,25 +741,37 @@ class HistoricalOrderBookSnapshot(HistoricalMarketRecord):
         return self.best_ask - self.best_bid
 
     def to_market_event_payload(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "timestamp_ms": self.timestamp_ms,
-            "received_at_ms": self.received_at_ms,
-            "sequence": self.sequence,
-            "depth": self.depth,
-            "bids": [[level.price, level.quantity] for level in self.bids],
-            "asks": [[level.price, level.quantity] for level in self.asks],
-            "source": self.source or "backtest",
-            "metadata": self.metadata,
-        }
+        payload = self._base_market_payload(
+            data_type=BacktestDataType.ORDERBOOK_SNAPSHOT.value,
+            timeframe=self.timeframe,
+        )
+
+        payload.update(
+            {
+                "type": "snapshot",
+                "update_type": "snapshot",
+                "is_snapshot": True,
+                "sequence": self.sequence,
+                "last_update_id": self.sequence,
+                "depth": self.depth,
+                "bids": [[float(level.price), float(level.quantity)] for level in self.bids],
+                "asks": [[float(level.price), float(level.quantity)] for level in self.asks],
+                "best_bid": self.best_bid,
+                "best_ask": self.best_ask,
+                "spread": self.spread,
+            }
+        )
+
+        return payload
 
 
 @dataclass(slots=True, frozen=True)
 class HistoricalFundingRecord(HistoricalMarketRecord):
     """
     Historical funding rate record.
+
+    Converts to raw market.funding payload. Production FundingCache should then
+    emit market.funding.updated.
     """
 
     funding_rate: float = 0.0
@@ -665,33 +779,50 @@ class HistoricalFundingRecord(HistoricalMarketRecord):
     mark_price: float | None = None
     index_price: float | None = None
     next_funding_time_ms: int | None = None
+    timeframe: str | None = None
+
+    def __post_init__(self) -> None:
+        HistoricalMarketRecord.__post_init__(self)
+
+        if self.timeframe is not None:
+            object.__setattr__(self, "timeframe", _normalize_backtest_timeframe(self.timeframe))
+
+        if self.next_funding_time_ms is not None:
+            object.__setattr__(self, "next_funding_time_ms", int(self.next_funding_time_ms))
 
     def to_market_event_payload(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "timestamp_ms": self.timestamp_ms,
-            "received_at_ms": self.received_at_ms,
-            "funding_rate": self.funding_rate,
-            "predicted_rate": self.predicted_rate,
-            "mark_price": self.mark_price,
-            "index_price": self.index_price,
-            "next_funding_time_ms": self.next_funding_time_ms,
-            "source": self.source or "backtest",
-            "metadata": self.metadata,
-        }
+        payload = self._base_market_payload(
+            data_type=BacktestDataType.FUNDING.value,
+            timeframe=self.timeframe,
+        )
+
+        payload.update(
+            {
+                "funding_rate": float(self.funding_rate),
+                "rate": float(self.funding_rate),
+                "predicted_rate": self.predicted_rate,
+                "mark_price": self.mark_price,
+                "index_price": self.index_price,
+                "next_funding_time_ms": self.next_funding_time_ms,
+            }
+        )
+
+        return payload
 
 
 @dataclass(slots=True, frozen=True)
 class HistoricalOpenInterestRecord(HistoricalMarketRecord):
     """
     Historical open interest record.
+
+    Converts to raw market.open_interest payload. Production OpenInterestCache
+    should then emit market.open_interest.updated.
     """
 
     open_interest: float = 0.0
     open_interest_value: float | None = None
     mark_price: float | None = None
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         HistoricalMarketRecord.__post_init__(self)
@@ -702,25 +833,42 @@ class HistoricalOpenInterestRecord(HistoricalMarketRecord):
                 details={"open_interest": self.open_interest},
             )
 
+        if self.open_interest_value is None and self.mark_price is not None:
+            object.__setattr__(
+                self,
+                "open_interest_value",
+                float(self.open_interest) * float(self.mark_price),
+            )
+
+        if self.timeframe is not None:
+            object.__setattr__(self, "timeframe", _normalize_backtest_timeframe(self.timeframe))
+
     def to_market_event_payload(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "timestamp_ms": self.timestamp_ms,
-            "received_at_ms": self.received_at_ms,
-            "open_interest": self.open_interest,
-            "open_interest_value": self.open_interest_value,
-            "mark_price": self.mark_price,
-            "source": self.source or "backtest",
-            "metadata": self.metadata,
-        }
+        payload = self._base_market_payload(
+            data_type=BacktestDataType.OPEN_INTEREST.value,
+            timeframe=self.timeframe,
+        )
+
+        payload.update(
+            {
+                "open_interest": float(self.open_interest),
+                "open_interest_qty": float(self.open_interest),
+                "open_interest_value": self.open_interest_value,
+                "mark_price": self.mark_price,
+            }
+        )
+
+        return payload
 
 
 @dataclass(slots=True, frozen=True)
 class HistoricalLiquidationRecord(HistoricalMarketRecord):
     """
     Historical liquidation event.
+
+    Converts to raw market.liquidation payload. Production liquidation analytics
+    or liquidation data cache should then emit analytics/liquidation updates
+    according to the production pipeline.
     """
 
     liquidation_id: str | int | None = None
@@ -728,6 +876,7 @@ class HistoricalLiquidationRecord(HistoricalMarketRecord):
     price: float = 0.0
     quantity: float = 0.0
     notional: float | None = None
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         HistoricalMarketRecord.__post_init__(self)
@@ -745,23 +894,284 @@ class HistoricalLiquidationRecord(HistoricalMarketRecord):
             )
 
         if self.notional is None:
-            object.__setattr__(self, "notional", self.price * self.quantity)
+            object.__setattr__(self, "notional", float(self.price) * float(self.quantity))
+        elif self.notional < 0:
+            raise HistoricalDataValidationError(
+                "HistoricalLiquidationRecord.notional cannot be negative.",
+                details={"notional": self.notional},
+            )
+
+        if self.timeframe is not None:
+            object.__setattr__(self, "timeframe", _normalize_backtest_timeframe(self.timeframe))
 
     def to_market_event_payload(self) -> dict[str, Any]:
-        return {
-            "exchange": self.exchange,
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "timestamp_ms": self.timestamp_ms,
-            "received_at_ms": self.received_at_ms,
-            "liquidation_id": self.liquidation_id,
-            "side": self.side,
-            "price": self.price,
-            "quantity": self.quantity,
-            "notional": self.notional,
-            "source": self.source or "backtest",
-            "metadata": self.metadata,
+        payload = self._base_market_payload(
+            data_type=BacktestDataType.LIQUIDATIONS.value,
+            timeframe=self.timeframe,
+        )
+
+        payload.update(
+            {
+                "liquidation_id": str(self.liquidation_id)
+                if self.liquidation_id is not None
+                else None,
+                "side": self.side,
+                "price": float(self.price),
+                "quantity": float(self.quantity),
+                "qty": float(self.quantity),
+                "notional": float(self.notional or 0.0),
+            }
+        )
+
+        return payload
+
+
+# ============================================================================
+# Replay events / dataset
+# ============================================================================
+
+
+@dataclass(slots=True, frozen=True)
+class BacktestEvent(SerializableMixin):
+    """
+    Generic event recorded or emitted during a backtest run.
+
+    For market replay, topic must be production-compatible raw market topic:
+    market.candle, market.trade, market.orderbook, market.funding,
+    market.open_interest, market.liquidation.
+
+    BacktestEvent itself does not emit EventBus events.
+    """
+
+    event_id: str = field(default_factory=lambda: new_id("evt"))
+    run_id: str | None = None
+    event_type: BacktestEventType = BacktestEventType.SYSTEM
+    topic: str = ""
+    timestamp_ms: int = 0
+    payload: dict[str, Any] = field(default_factory=dict)
+    source: str = "backtest"
+    sequence: int | None = None
+    priority: ReplayEventPriority | None = None
+    is_warmup: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if int(self.timestamp_ms) < 0:
+            raise HistoricalDataValidationError(
+                "BacktestEvent.timestamp_ms cannot be negative.",
+                details={"timestamp_ms": self.timestamp_ms},
+            )
+
+        object.__setattr__(self, "timestamp_ms", int(self.timestamp_ms))
+        object.__setattr__(self, "metadata", _compact_metadata(self.metadata))
+        object.__setattr__(self, "payload", dict(self.payload or {}))
+
+        if self.event_type == BacktestEventType.MARKET:
+            if not self.topic.startswith("market."):
+                raise HistoricalDataValidationError(
+                    "Market BacktestEvent.topic must start with 'market.'.",
+                    details={
+                        "topic": self.topic,
+                        "event_id": self.event_id,
+                    },
+                )
+
+            if self.topic.endswith(".updated"):
+                raise HistoricalDataValidationError(
+                    "MarketReplay events must be raw market.* topics, not market.*.updated.",
+                    details={
+                        "topic": self.topic,
+                        "event_id": self.event_id,
+                    },
+                )
+
+    @property
+    def event_time(self) -> datetime:
+        return datetime_from_ms(self.timestamp_ms)
+
+    def with_run_id(self, run_id: str) -> BacktestEvent:
+        return self.copy_with(run_id=run_id)
+
+    @classmethod
+    def from_market_record(
+        cls,
+        record: HistoricalMarketRecord,
+        *,
+        topic: str,
+        data_type: BacktestDataType,
+        run_id: str | None = None,
+        sequence: int | None = None,
+        priority: ReplayEventPriority | None = None,
+        is_warmup: bool = False,
+    ) -> BacktestEvent:
+        payload_method = getattr(record, "to_market_event_payload")
+        payload = payload_method()
+
+        return cls(
+            run_id=run_id,
+            event_type=BacktestEventType.MARKET,
+            topic=topic,
+            timestamp_ms=record.timestamp_ms,
+            payload=payload,
+            source="market_replay",
+            sequence=sequence,
+            priority=priority,
+            is_warmup=is_warmup,
+            metadata={
+                "data_type": data_type.value,
+                "instrument_key": record.instrument_key,
+                "record_type": record.__class__.__name__,
+            },
+        )
+
+
+@dataclass(slots=True)
+class ReplayEventBatch(SerializableMixin):
+    """
+    Batch of replay events sharing a timestamp.
+    """
+
+    batch_id: str = field(default_factory=lambda: new_id("batch"))
+    timestamp_ms: int = 0
+    events: list[BacktestEvent] = field(default_factory=list)
+    sequence_start: int | None = None
+    sequence_end: int | None = None
+    is_warmup: bool = False
+
+    def __post_init__(self) -> None:
+        if int(self.timestamp_ms) < 0:
+            raise HistoricalDataValidationError(
+                "ReplayEventBatch.timestamp_ms cannot be negative.",
+                details={"timestamp_ms": self.timestamp_ms},
+            )
+
+        self.events.sort(
+            key=lambda event: (
+                event.timestamp_ms,
+                event.sequence if event.sequence is not None else 0,
+            )
+        )
+
+    @property
+    def size(self) -> int:
+        return len(self.events)
+
+    @property
+    def event_time(self) -> datetime:
+        return datetime_from_ms(self.timestamp_ms)
+
+
+@dataclass(slots=True)
+class BacktestDataset(SerializableMixin):
+    """
+    Replay-ready historical dataset.
+
+    Dataset stores BacktestEvent objects. It does not emit EventBus events.
+    MarketReplay is responsible for replaying these events into core.EventBus.
+    """
+
+    info: BacktestDatasetInfo = field(default_factory=BacktestDatasetInfo)
+    events: list[BacktestEvent] = field(default_factory=list)
+    ordering: ReplayOrdering = ReplayOrdering.TIMESTAMP_THEN_PRIORITY
+    replay_mode: ReplayMode = ReplayMode.FULL_RUN
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.sort_events()
+        self.info.total_events = len(self.events)
+
+        if self.events:
+            self.info.first_event_time = self.events[0].event_time
+            self.info.last_event_time = self.events[-1].event_time
+
+    def __len__(self) -> int:
+        return len(self.events)
+
+    def __iter__(self) -> Iterable[BacktestEvent]:
+        return iter(self.events)
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self.events) == 0
+
+    def sort_events(self) -> None:
+        priority_order = {
+            ReplayEventPriority.ORDERBOOK: 10,
+            ReplayEventPriority.TRADE: 20,
+            ReplayEventPriority.CANDLE: 30,
+            ReplayEventPriority.FUNDING: 40,
+            ReplayEventPriority.OPEN_INTEREST: 50,
+            ReplayEventPriority.LIQUIDATION: 60,
+            ReplayEventPriority.MARK_PRICE: 70,
+            ReplayEventPriority.INDEX_PRICE: 80,
+            None: 999,
         }
+
+        if self.ordering == ReplayOrdering.TIMESTAMP_ASC:
+            self.events.sort(
+                key=lambda event: (
+                    event.timestamp_ms,
+                    event.sequence if event.sequence is not None else 0,
+                )
+            )
+            return
+
+        if self.ordering == ReplayOrdering.TIMESTAMP_THEN_PRIORITY:
+            self.events.sort(
+                key=lambda event: (
+                    event.timestamp_ms,
+                    priority_order.get(event.priority, 999),
+                    event.sequence if event.sequence is not None else 0,
+                )
+            )
+            return
+
+        if self.ordering == ReplayOrdering.STREAM_PRIORITY_THEN_TIMESTAMP:
+            self.events.sort(
+                key=lambda event: (
+                    priority_order.get(event.priority, 999),
+                    event.timestamp_ms,
+                    event.sequence if event.sequence is not None else 0,
+                )
+            )
+            return
+
+    def batches_by_timestamp(self) -> list[ReplayEventBatch]:
+        batches: list[ReplayEventBatch] = []
+        current_timestamp: int | None = None
+        current_events: list[BacktestEvent] = []
+
+        for event in self.events:
+            if current_timestamp is None:
+                current_timestamp = event.timestamp_ms
+
+            if event.timestamp_ms != current_timestamp:
+                batches.append(
+                    ReplayEventBatch(
+                        timestamp_ms=current_timestamp,
+                        events=current_events,
+                        sequence_start=current_events[0].sequence if current_events else None,
+                        sequence_end=current_events[-1].sequence if current_events else None,
+                        is_warmup=all(item.is_warmup for item in current_events),
+                    )
+                )
+                current_timestamp = event.timestamp_ms
+                current_events = []
+
+            current_events.append(event)
+
+        if current_timestamp is not None and current_events:
+            batches.append(
+                ReplayEventBatch(
+                    timestamp_ms=current_timestamp,
+                    events=current_events,
+                    sequence_start=current_events[0].sequence if current_events else None,
+                    sequence_end=current_events[-1].sequence if current_events else None,
+                    is_warmup=all(item.is_warmup for item in current_events),
+                )
+            )
+
+        return batches
 
 
 # ============================================================================

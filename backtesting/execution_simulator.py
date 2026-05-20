@@ -4,7 +4,7 @@ Simulated execution layer for backtesting.
 ExecutionSimulator is the offline replacement for live execution during
 historical backtests.
 
-It listens to risk-approved events and simulates order submission/fills:
+It listens only to risk-approved or risk-requested events:
 
 - signal.confirmed
 - risk.position_close_requested
@@ -21,19 +21,22 @@ It emits production-compatible execution events:
 - execution.order_partially_filled
 
 Important:
-- It must not listen to signal.generated.
-- It must not bypass RiskManager.
-- It must not call live exchange clients.
-- It must not own position accounting; PositionSimulator listens to fills.
+- It does not listen to signal.generated.
+- It does not bypass RiskManager.
+- It does not call live exchange clients.
+- It does not own position accounting; PositionSimulator listens to fills.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
+
+from core.event_bus import EventBus, EventPriority
+from core.logger import get_logger
 
 from backtesting.backtest_time import BacktestClock
 from backtesting.config import ExecutionSimulatorConfig
@@ -53,16 +56,15 @@ from backtesting.enums import (
 from backtesting.exceptions import (
     ExecutionSimulationError,
     ExecutionSimulatorNotReadyError,
-    FillModelError,
     LiquiditySimulationError,
     SimulatedOrderCancelError,
     SimulatedOrderRejectedError,
-    SimulatedOrderStateError,
     SimulatedOrderValidationError,
 )
 from backtesting.models import (
     BacktestExecutionRecord,
     HistoricalCandle,
+    HistoricalOrderBookLevel,
     HistoricalOrderBookSnapshot,
     SimulatedFill,
     SimulatedOrder,
@@ -71,15 +73,6 @@ from backtesting.models import (
     timestamp_ms,
     utcnow,
 )
-
-
-try:
-    from core.logger import get_logger
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str) -> logging.Logger:
-        return logging.getLogger(name)
 
 
 @dataclass(slots=True)
@@ -154,8 +147,8 @@ class ExecutionSimulatorStats(SerializableMixin):
     average_slippage_bps: float = 0.0
     average_latency_ms: float = 0.0
 
-    started_at: datetime | None = None
-    stopped_at: datetime | None = None
+    started_at: Any | None = None
+    stopped_at: Any | None = None
     last_error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -223,11 +216,13 @@ class ExecutionSimulator:
     emits execution.* events compatible with the rest of the system.
     """
 
+    component_name = "ExecutionSimulator"
+
     def __init__(
         self,
         config: ExecutionSimulatorConfig | None = None,
         *,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
         clock: BacktestClock | None = None,
         cost_model: TradingCostModel | None = None,
         random_seed: int | None = 42,
@@ -263,28 +258,73 @@ class ExecutionSimulator:
     def register(self) -> None:
         """
         Register EventBus subscriptions.
+
+        This simulator must never subscribe to signal.generated.
+        It starts only after RiskManager emits signal.confirmed or explicit
+        risk close/reduce events.
         """
 
         if self._registered:
             return
 
         if self.event_bus is None:
+            self.logger.warning("ExecutionSimulator has no EventBus; no subscriptions created")
             self._registered = True
             return
 
-        self._subscribe(self.config.signal_confirmed_topic, self._on_signal_confirmed)
+        if not isinstance(self.event_bus, EventBus):
+            raise ExecutionSimulatorNotReadyError(
+                "ExecutionSimulator requires core.event_bus.EventBus for full-pipeline backtesting."
+            )
+
+        if self.config.listen_signal_confirmed:
+            self._subscribe(self.config.signal_confirmed_topic, self._on_signal_confirmed)
+
         self._subscribe(self.config.position_close_requested_topic, self._on_position_close_requested)
         self._subscribe(self.config.position_reduce_requested_topic, self._on_position_reduce_requested)
         self._subscribe(self.config.kill_switch_topic, self._on_kill_switch)
 
-        # Market state updates are optional but useful for realistic fills.
+        # Market state updates are used only for realistic fill prices and liquidity.
+        # They do not bypass strategy/risk.
         self._subscribe("market.candle", self._on_market_candle)
         self._subscribe("market.orderbook", self._on_market_orderbook)
 
         self._registered = True
 
+        self.logger.info(
+            "ExecutionSimulator registered",
+            extra={
+                "subscriptions": len(self._subscriptions),
+                "signal_confirmed_topic": self.config.signal_confirmed_topic,
+                "close_topic": self.config.position_close_requested_topic,
+                "reduce_topic": self.config.position_reduce_requested_topic,
+                "kill_switch_topic": self.config.kill_switch_topic,
+            },
+        )
+
+    def unregister(self) -> None:
+        if self.event_bus is None:
+            self._subscriptions.clear()
+            self._registered = False
+            return
+
+        for subscription in list(self._subscriptions):
+            try:
+                self.event_bus.unsubscribe(subscription)
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsubscribe ExecutionSimulator handler",
+                    extra={"subscription": str(subscription)},
+                )
+
+        self._subscriptions.clear()
+        self._registered = False
+
     async def start(self) -> None:
         async with self._lock:
+            if self._running:
+                return
+
             self.register()
             self._running = True
             self.stats_state.status = BacktestStatus.RUNNING
@@ -297,6 +337,9 @@ class ExecutionSimulator:
 
     async def stop(self) -> None:
         async with self._lock:
+            if not self._running:
+                return
+
             self._running = False
             self.stats_state.status = BacktestStatus.COMPLETED
             self.stats_state.stopped_at = utcnow()
@@ -305,6 +348,8 @@ class ExecutionSimulator:
             "system.backtest.execution_simulator.stopped",
             self.stats(),
         )
+
+        self.unregister()
 
     async def reset(self) -> None:
         async with self._lock:
@@ -315,6 +360,37 @@ class ExecutionSimulator:
             self.stats_state = ExecutionSimulatorStats()
             self._kill_switch_active = False
 
+    def _subscribe(self, topic: str, handler: Any) -> None:
+        if self.event_bus is None:
+            return
+
+        wrapped = self._wrap_event_handler(handler)
+
+        try:
+            subscription = self.event_bus.subscribe(
+                topic,
+                wrapped,
+                name=f"backtest_execution_on_{topic.replace('.', '_')}",
+            )
+        except TypeError:
+            subscription = self.event_bus.subscribe(
+                pattern=topic,
+                handler=wrapped,
+                name=f"backtest_execution_on_{topic.replace('.', '_')}",
+            )
+
+        self._subscriptions.append(subscription)
+
+    @staticmethod
+    def _wrap_event_handler(handler: Any) -> Any:
+        async def _wrapped(event_or_payload: Any) -> None:
+            payload = ExecutionSimulator._payload_from_event_or_dict(event_or_payload)
+            result = handler(payload)
+            if inspect.isawaitable(result):
+                await result
+
+        return _wrapped
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
@@ -322,6 +398,9 @@ class ExecutionSimulator:
     async def _on_signal_confirmed(self, payload: dict[str, Any]) -> None:
         """
         Handle risk-approved signal.
+
+        This is the only signal entrypoint. ExecutionSimulator must not listen
+        to signal.generated.
         """
 
         if not self.config.listen_signal_confirmed:
@@ -335,7 +414,7 @@ class ExecutionSimulator:
 
     async def _on_position_close_requested(self, payload: dict[str, Any]) -> None:
         """
-        Handle risk-requested close.
+        Handle risk-requested position close.
         """
 
         self._ensure_running()
@@ -346,7 +425,7 @@ class ExecutionSimulator:
 
     async def _on_position_reduce_requested(self, payload: dict[str, Any]) -> None:
         """
-        Handle risk-requested reduce.
+        Handle risk-requested position reduce.
         """
 
         self._ensure_running()
@@ -357,22 +436,22 @@ class ExecutionSimulator:
 
     async def _on_kill_switch(self, payload: dict[str, Any]) -> None:
         """
-        Handle risk kill switch.
+        Activate simulated kill switch and cancel active orders.
         """
 
-        self._ensure_running()
         self.stats_state.kill_switch_events += 1
         self._kill_switch_active = True
 
-        reason = str(payload.get("reason") or "risk.kill_switch")
+        reason = str(payload.get("reason") or "risk_kill_switch")
 
         for order in list(self.orders.values()):
-            if order.is_active:
-                await self.cancel_order(order.order_id, reason=reason)
+            if not order.is_active:
+                continue
+            await self.cancel_order(order.order_id, reason=reason)
 
     async def _on_market_candle(self, payload: dict[str, Any]) -> None:
         """
-        Update local market state from market.candle.
+        Update market state from raw market.candle.
         """
 
         try:
@@ -393,7 +472,7 @@ class ExecutionSimulator:
 
     async def _on_market_orderbook(self, payload: dict[str, Any]) -> None:
         """
-        Update local market state from market.orderbook.
+        Update market state from raw market.orderbook.
         """
 
         try:
@@ -418,18 +497,29 @@ class ExecutionSimulator:
 
     async def submit_order(self, request: SimulatedOrderRequest) -> SimulatedOrder:
         """
-        Submit simulated order.
-
-        This emits order_submitted and then either rejected/failed/filled events.
+        Create, submit, accept/reject and possibly fill a simulated order.
         """
 
         self._ensure_running()
-        request.validate()
 
-        async with self._lock:
+        if self._kill_switch_active and not request.reduce_only and not request.close_position:
             order = self._create_order(request)
+            order.mark_rejected(
+                OrderRejectionReason.KILL_SWITCH,
+                message="Execution blocked by simulated kill switch.",
+                timestamp_ms_value=self._now_ms(),
+            )
             self.orders[order.order_id] = order
             self.stats_state.orders_created += 1
+            self.stats_state.orders_rejected += 1
+            await self._emit_order_event(self.config.order_rejected_topic, order)
+            return order
+
+        request.validate()
+        order = self._create_order(request)
+
+        self.orders[order.order_id] = order
+        self.stats_state.orders_created += 1
 
         try:
             await self._submit_order(order)
@@ -442,48 +532,38 @@ class ExecutionSimulator:
             return order
 
         except Exception as exc:
+            order.status = SimulatedOrderStatus.FAILED
+            order.rejection_message = str(exc)
+            self.stats_state.orders_failed += 1
             self.stats_state.last_error = str(exc)
 
-            if order.status not in {
-                SimulatedOrderStatus.REJECTED,
-                SimulatedOrderStatus.CANCELLED,
-                SimulatedOrderStatus.FILLED,
-                SimulatedOrderStatus.PARTIALLY_FILLED,
-            }:
-                order.status = SimulatedOrderStatus.FAILED
-                self.stats_state.orders_failed += 1
-                await self._emit_order_event(self.config.order_failed_topic, order)
+            await self._emit_order_event(self.config.order_failed_topic, order)
 
-            raise
+            if isinstance(exc, SimulatedOrderRejectedError):
+                raise
 
-    async def cancel_order(
-        self,
-        order_id: str,
-        *,
-        reason: str = "cancelled",
-    ) -> SimulatedOrder:
-        """
-        Cancel active simulated order.
-        """
+            raise ExecutionSimulationError(
+                "Failed to simulate order execution.",
+                details={
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            ) from exc
 
-        self._ensure_running()
-
+    async def cancel_order(self, order_id: str, *, reason: str = "cancel_requested") -> SimulatedOrder:
         order = self.orders.get(order_id)
 
         if order is None:
             raise SimulatedOrderCancelError(
-                "Simulated order not found.",
+                "Cannot cancel unknown simulated order.",
                 details={"order_id": order_id},
             )
 
         if order.is_terminal:
-            raise SimulatedOrderStateError(
-                "Cannot cancel terminal simulated order.",
-                details={
-                    "order_id": order_id,
-                    "status": order.status.value,
-                },
-            )
+            return order
 
         order.status = SimulatedOrderStatus.CANCELLED
         order.cancelled_at_ms = self._now_ms()
@@ -491,42 +571,15 @@ class ExecutionSimulator:
 
         self.stats_state.orders_cancelled += 1
         await self._emit_order_event(self.config.order_cancelled_topic, order)
+
         return order
-
-    async def cancel_all_open_orders(
-        self,
-        *,
-        symbol: str | None = None,
-        reason: str = "cancel_all",
-    ) -> int:
-        """
-        Cancel all active orders, optionally filtered by symbol.
-        """
-
-        count = 0
-
-        for order in list(self.orders.values()):
-            if not order.is_active:
-                continue
-
-            if symbol is not None and order.symbol.upper() != symbol.upper():
-                continue
-
-            await self.cancel_order(order.order_id, reason=reason)
-            count += 1
-
-        return count
-
-    # ------------------------------------------------------------------
-    # Order simulation
-    # ------------------------------------------------------------------
 
     def _create_order(self, request: SimulatedOrderRequest) -> SimulatedOrder:
         now_ms = self._now_ms()
-        client_order_id = f"bt_{new_id('cid')}"
 
         return SimulatedOrder(
-            client_order_id=client_order_id,
+            order_id=new_id("sim_order"),
+            client_order_id=self._client_order_id(request),
             run_id=request.metadata.get("run_id"),
             signal_id=request.signal_id,
             strategy_name=request.strategy_name,
@@ -640,17 +693,20 @@ class ExecutionSimulator:
                 "order_type": order.order_type,
                 "reduce_only": order.reduce_only,
                 "close_position": order.close_position,
-                "costs": costs.to_dict(),
+                "intended_price": intended_price,
+                "source_order_status": order.status.value,
             },
         )
 
         order.apply_fill(fill)
-        self.fills.append(fill)
 
+        self.fills.append(fill)
         self.stats_state.fills_created += 1
         self.stats_state.total_fees += fill.fee
         self.stats_state.total_slippage += fill.slippage
-        self._update_average_stats(fill, order)
+
+        self._update_average_slippage(fill)
+        self._update_average_latency(order)
 
         if order.status == SimulatedOrderStatus.FILLED:
             self.stats_state.orders_filled += 1
@@ -659,153 +715,103 @@ class ExecutionSimulator:
             self.stats_state.orders_partially_filled += 1
             await self._emit_fill_event(self.config.order_partially_filled_topic, order, fill)
 
+    # ------------------------------------------------------------------
+    # Validation / simulation rules
+    # ------------------------------------------------------------------
+
     def _check_rejection(self, order: SimulatedOrder) -> OrderRejectionReason:
-        if self._kill_switch_active:
-            return OrderRejectionReason.KILL_SWITCH_ACTIVE
+        order_type = order.order_type.lower()
 
-        if not self.config.allow_market_orders and order.order_type.lower() == "market":
-            return OrderRejectionReason.INVALID_ORDER
+        if self._kill_switch_active and not order.reduce_only and not order.close_position:
+            return OrderRejectionReason.KILL_SWITCH
 
-        if not self.config.allow_limit_orders and order.order_type.lower() == "limit":
-            return OrderRejectionReason.INVALID_ORDER
+        if order_type == "market" and not self.config.allow_market_orders:
+            return OrderRejectionReason.ORDER_TYPE_NOT_ALLOWED
 
-        if not self.config.allow_stop_orders and order.order_type.lower().startswith("stop"):
-            return OrderRejectionReason.INVALID_ORDER
+        if order_type in {"limit", "stop_limit"} and not self.config.allow_limit_orders:
+            return OrderRejectionReason.ORDER_TYPE_NOT_ALLOWED
+
+        if order_type in {"stop", "stop_market", "stop_limit"} and not self.config.allow_stop_orders:
+            return OrderRejectionReason.ORDER_TYPE_NOT_ALLOWED
 
         if order.reduce_only and not self.config.allow_reduce_only:
-            return OrderRejectionReason.INVALID_ORDER
+            return OrderRejectionReason.REDUCE_ONLY_NOT_ALLOWED
 
-        if self.config.reject_if_no_price:
-            try:
-                self._resolve_intended_price(order)
-            except Exception:
-                return OrderRejectionReason.PRICE_OUT_OF_RANGE
+        state = self._get_market_state(order)
 
-        if self.config.reject_if_no_liquidity:
-            available_qty = self._estimate_available_quantity(order)
-            if available_qty <= 0:
-                return OrderRejectionReason.INSUFFICIENT_LIQUIDITY
+        if self.config.reject_if_no_price and state is None:
+            return OrderRejectionReason.NO_MARKET_PRICE
+
+        if self.config.reject_if_no_price and state is not None and state.last_price is None:
+            return OrderRejectionReason.NO_MARKET_PRICE
+
+        if self.config.reject_if_no_liquidity and not self._has_liquidity(order):
+            return OrderRejectionReason.INSUFFICIENT_LIQUIDITY
+
+        if self.config.reject_if_price_outside_candle and not self._price_is_possible(order):
+            return OrderRejectionReason.PRICE_OUTSIDE_CANDLE
 
         return OrderRejectionReason.NONE
 
     def _calculate_fill_quantity(self, order: SimulatedOrder) -> float:
-        available_qty = self._estimate_available_quantity(order)
-
         if self.config.liquidity_model == LiquidityModel.UNLIMITED:
-            available_qty = order.remaining_quantity
-
-        fill_qty = min(order.remaining_quantity, available_qty)
-
-        if fill_qty <= 0:
-            return 0.0
-
-        if self.config.allow_partial_fills:
-            if self.config.partial_fill_probability > 0:
-                if self.random.random() < self.config.partial_fill_probability:
-                    ratio = max(self.config.min_fill_ratio, self.random.random())
-                    return max(0.0, min(fill_qty, order.remaining_quantity * ratio))
-
-            if fill_qty < order.remaining_quantity:
-                return max(fill_qty, order.remaining_quantity * self.config.min_fill_ratio)
-
-        return order.remaining_quantity if fill_qty >= order.remaining_quantity else fill_qty
-
-    def _estimate_available_quantity(self, order: SimulatedOrder) -> float:
-        if self.config.liquidity_model == LiquidityModel.UNLIMITED:
-            return order.remaining_quantity
+            return order.quantity
 
         state = self._get_market_state(order)
 
-        if self.config.liquidity_model == LiquidityModel.CANDLE_VOLUME_PERCENT:
-            candle = state.last_candle if state else None
+        if state is None or state.last_candle is None:
+            if self.config.reject_if_no_liquidity:
+                return 0.0
+            return order.quantity
 
-            if candle is None:
-                if self.config.reject_if_no_liquidity:
-                    return 0.0
-                return order.remaining_quantity
+        candle_volume = max(0.0, float(state.last_candle.volume))
+        max_participation = candle_volume * (self.config.max_volume_participation_pct / 100.0)
 
-            return candle.volume * self.config.max_volume_participation_pct / 100.0
+        if max_participation <= 0:
+            if self.config.reject_if_no_liquidity:
+                return 0.0
+            return order.quantity
 
-        if self.config.liquidity_model == LiquidityModel.ORDERBOOK_DEPTH:
-            orderbook = state.last_orderbook if state else None
+        fill_quantity = min(order.quantity, max_participation)
 
-            if orderbook is None:
-                if self.config.reject_if_no_liquidity:
-                    return 0.0
-                return order.remaining_quantity
-
-            levels = orderbook.asks if self._is_buy(order.side) else orderbook.bids
-            return sum(level.quantity for level in levels)
-
-        if self.config.liquidity_model == LiquidityModel.TRADE_VOLUME_PERCENT:
-            candle = state.last_candle if state else None
-
-            if candle is None:
-                return 0.0 if self.config.reject_if_no_liquidity else order.remaining_quantity
-
-            return candle.volume * self.config.max_volume_participation_pct / 100.0
-
-        if self.config.liquidity_model == LiquidityModel.PROBABILISTIC:
-            probability = max(0.0, min(1.0, self.config.max_volume_participation_pct / 100.0))
-            if self.random.random() <= probability:
-                return order.remaining_quantity
-            return 0.0
-
-        raise LiquiditySimulationError(
-            "Unsupported liquidity model.",
-            details={"model": self.config.liquidity_model.value},
-        )
-
-    def _resolve_intended_price(self, order: SimulatedOrder) -> float:
-        order_type = order.order_type.lower()
-        state = self._get_market_state(order)
-
-        if order_type in {"limit", "stop_limit"} and order.price is not None:
-            return order.price
-
-        if order_type in {"stop", "stop_market"} and order.stop_price is not None:
-            return order.stop_price
-
-        if state is None or state.last_price is None:
-            if order.price is not None:
-                return order.price
-            if order.stop_price is not None:
-                return order.stop_price
-
-            raise FillModelError(
-                "Cannot resolve intended price without market state.",
-                details={
-                    "order_id": order.order_id,
-                    "symbol": order.symbol,
-                },
+        if (
+            self.config.allow_partial_fills
+            and self.config.partial_fill_probability > 0
+            and fill_quantity < order.quantity
+            and self.random.random() < self.config.partial_fill_probability
+        ):
+            fill_quantity = max(
+                order.quantity * self.config.min_fill_ratio,
+                fill_quantity,
             )
 
-        if self.config.fill_model == FillModel.NEXT_CANDLE_OPEN:
-            candle = state.last_candle
-            if candle is not None:
-                return candle.open
+        if not self.config.allow_partial_fills and fill_quantity < order.quantity:
+            return 0.0
 
-        if self.config.fill_model == FillModel.NEXT_CANDLE_CLOSE:
-            candle = state.last_candle
-            if candle is not None:
-                return candle.close
+        return max(0.0, min(order.quantity, fill_quantity))
 
-        if self.config.fill_model == FillModel.VWAP:
-            candle = state.last_candle
-            if candle is not None:
-                return self._estimate_candle_vwap(candle)
+    def _resolve_intended_price(self, order: SimulatedOrder) -> float:
+        if order.price and order.price > 0:
+            return float(order.price)
 
-        if self.config.fill_model == FillModel.ORDERBOOK_DEPTH:
-            if state.bid is not None and state.ask is not None:
-                return state.ask if self._is_buy(order.side) else state.bid
+        state = self._get_market_state(order)
 
-        if self.config.fill_model == FillModel.OHLC_PATH:
-            candle = state.last_candle
-            if candle is not None:
-                return self._resolve_ohlc_path_price(order, candle)
+        if state is None:
+            raise LiquiditySimulationError(
+                "Cannot resolve intended price without market state.",
+                details={"order_id": order.order_id, "symbol": order.symbol},
+            )
 
-        # INSTANT / NEXT_TICK / PROBABILISTIC fallback.
-        return state.last_price
+        if state.last_price is not None and state.last_price > 0:
+            return float(state.last_price)
+
+        if state.bid is not None and state.ask is not None:
+            return (state.bid + state.ask) / 2.0
+
+        raise LiquiditySimulationError(
+            "Cannot resolve intended price.",
+            details={"order_id": order.order_id, "symbol": order.symbol},
+        )
 
     def _resolve_fill_price(
         self,
@@ -815,124 +821,156 @@ class ExecutionSimulator:
     ) -> float:
         state = self._get_market_state(order)
 
-        if self.config.fill_model == FillModel.INSTANT:
-            return self.cost_model.calculate_fill_price(
-                side=order.side,
-                intended_price=intended_price,
-                quantity=quantity,
-                candle=state.last_candle if state else None,
-                orderbook=state.last_orderbook if state else None,
-                spread=state.spread if state else None,
-            )
+        if self.config.fill_model == FillModel.EXACT_PRICE:
+            return intended_price
 
-        if self.config.fill_model == FillModel.NEXT_TICK:
-            return self.cost_model.calculate_fill_price(
-                side=order.side,
-                intended_price=intended_price,
-                quantity=quantity,
-                candle=state.last_candle if state else None,
-                orderbook=state.last_orderbook if state else None,
-                spread=state.spread if state else None,
-            )
+        if self.config.fill_model == FillModel.NEXT_CANDLE_OPEN:
+            if state is not None and state.last_candle is not None:
+                return float(state.last_candle.open)
+            return intended_price
 
-        if self.config.fill_model in {
-            FillModel.NEXT_CANDLE_OPEN,
-            FillModel.NEXT_CANDLE_CLOSE,
-            FillModel.VWAP,
-            FillModel.OHLC_PATH,
-            FillModel.ORDERBOOK_DEPTH,
-            FillModel.PROBABILISTIC,
-        }:
-            return self.cost_model.calculate_fill_price(
-                side=order.side,
-                intended_price=intended_price,
-                quantity=quantity,
-                candle=state.last_candle if state else None,
-                orderbook=state.last_orderbook if state else None,
-                spread=state.spread if state else None,
-            )
+        if self.config.fill_model == FillModel.NEXT_CANDLE_CLOSE:
+            if state is not None and state.last_candle is not None:
+                return float(state.last_candle.close)
+            return intended_price
 
-        raise FillModelError(
-            "Unsupported fill model.",
-            details={"fill_model": self.config.fill_model.value},
-        )
+        if self.config.fill_model == FillModel.CANDLE_PATH:
+            return self._resolve_candle_path_price(order, intended_price)
+
+        return intended_price
+
+    def _resolve_candle_path_price(self, order: SimulatedOrder, intended_price: float) -> float:
+        state = self._get_market_state(order)
+
+        if state is None or state.last_candle is None:
+            return intended_price
+
+        candle = state.last_candle
+
+        if self.config.candle_execution_path == CandleExecutionPath.OPEN_HIGH_LOW_CLOSE:
+            return candle.high if self._is_buy(order.side) else candle.low
+
+        if self.config.candle_execution_path == CandleExecutionPath.OPEN_LOW_HIGH_CLOSE:
+            return candle.low if self._is_buy(order.side) else candle.high
+
+        if self.config.candle_execution_path == CandleExecutionPath.OPTIMISTIC:
+            return candle.low if self._is_buy(order.side) else candle.high
+
+        if self.config.candle_execution_path == CandleExecutionPath.RANDOMIZED:
+            return self.random.choice([candle.open, candle.high, candle.low, candle.close])
+
+        # Conservative default.
+        return candle.high if self._is_buy(order.side) else candle.low
+
+    def _has_liquidity(self, order: SimulatedOrder) -> bool:
+        if self.config.liquidity_model == LiquidityModel.UNLIMITED:
+            return True
+
+        state = self._get_market_state(order)
+
+        if state is None:
+            return not self.config.reject_if_no_liquidity
+
+        if state.last_candle is None:
+            return not self.config.reject_if_no_liquidity
+
+        return state.last_candle.volume > 0
+
+    def _price_is_possible(self, order: SimulatedOrder) -> bool:
+        if order.order_type.lower() == "market":
+            return True
+
+        price = order.price or order.stop_price
+
+        if price is None:
+            return True
+
+        state = self._get_market_state(order)
+
+        if state is None or state.last_candle is None:
+            return not self.config.reject_if_price_outside_candle
+
+        candle = state.last_candle
+        return candle.low <= price <= candle.high
 
     # ------------------------------------------------------------------
-    # Payload builders
+    # Builders from risk payloads
     # ------------------------------------------------------------------
 
     def _build_order_request_from_signal_confirmed(
         self,
         payload: dict[str, Any],
     ) -> SimulatedOrderRequest:
-        """
-        Build order request from risk-approved signal payload.
-
-        Supports several payload shapes:
-        - risk decision payload with final_size/final_leverage;
-        - execution_intent-like payload;
-        - signal payload with execution_plan/entry_plan.
-        """
-
-        intent = self._extract_nested(payload, ["execution_intent", "intent", "risk_decision"], default=payload)
-
-        symbol = self._first_value(
-            intent,
+        intent = self._extract_nested(
             payload,
-            keys=["symbol", "instrument", "ticker"],
-            default="",
+            ["execution_intent", "intent", "execution", "risk_decision", "decision"],
+            default={},
         )
-        side = self._normalize_side(
-            self._first_value(intent, payload, keys=["side", "signal_side", "direction"], default="")
-        )
-
-        quantity = self._float_first(
-            intent,
+        signal = self._extract_nested(
             payload,
-            keys=["final_size", "quantity", "qty", "size", "position_size"],
-            default=0.0,
+            ["signal", "strategy_signal"],
+            default={},
+        )
+        plan = self._extract_nested(
+            payload,
+            ["execution_plan", "plan", "order"],
+            default={},
         )
 
-        entry_plan = self._extract_nested(payload, ["entry_plan", "entry", "execution_plan"], default={})
+        symbol = str(
+            self._first_value(intent, plan, signal, payload, keys=["symbol"], default="")
+        )
+        side = str(
+            self._first_value(intent, plan, signal, payload, keys=["side", "position_side"], default="")
+        )
 
         order_type = str(
             self._first_value(
+                plan,
                 intent,
-                entry_plan,
                 payload,
                 keys=["order_type", "entry_type", "type"],
                 default="market",
             )
-        ).lower()
+        )
 
-        price = self._optional_float_first(intent, entry_plan, payload, keys=["price", "entry_price", "limit_price"])
-        stop_price = self._optional_float_first(intent, entry_plan, payload, keys=["stop_price", "trigger_price"])
+        quantity = self._float_first(
+            intent,
+            plan,
+            payload,
+            keys=[
+                "final_size",
+                "quantity",
+                "qty",
+                "size",
+                "position_size",
+                "base_quantity",
+            ],
+            default=0.0,
+        )
 
-        if order_type in {"market_entry", "market"}:
-            order_type = "market"
-        elif order_type in {"limit_entry", "limit"}:
-            order_type = "limit"
-        elif order_type in {"stop_market", "stop"}:
-            order_type = "stop_market"
-
-        return SimulatedOrderRequest(
-            signal_id=self._first_value(intent, payload, keys=["signal_id", "id"], default=None),
-            strategy_name=self._first_value(intent, payload, keys=["strategy_name", "strategy"], default=None),
+        request = SimulatedOrderRequest(
+            signal_id=self._first_value(signal, intent, payload, keys=["signal_id", "id"], default=None),
+            strategy_name=self._first_value(signal, intent, payload, keys=["strategy_name", "strategy"], default=None),
             exchange=str(
                 self._first_value(intent, payload, keys=["exchange"], default=self.config.exchange)
             ),
             market_type=str(
                 self._first_value(intent, payload, keys=["market_type"], default=self.config.market_type)
             ),
-            symbol=str(symbol),
-            side=side,
-            order_type=order_type,
+            symbol=symbol,
+            side=self._normalize_order_side(side),
+            order_type=self._normalize_order_type(order_type),
             quantity=quantity,
-            price=price,
-            stop_price=stop_price,
-            reduce_only=bool(self._first_value(intent, payload, keys=["reduce_only"], default=False)),
-            close_position=bool(self._first_value(intent, payload, keys=["close_position"], default=False)),
-            time_in_force=self._first_value(intent, entry_plan, payload, keys=["time_in_force"], default=None),
+            price=self._optional_float_first(plan, intent, payload, keys=["price", "entry_price", "limit_price"]),
+            stop_price=self._optional_float_first(plan, intent, payload, keys=["stop_price", "trigger_price"]),
+            reduce_only=bool(
+                self._first_value(plan, intent, payload, keys=["reduce_only"], default=False)
+            ),
+            close_position=bool(
+                self._first_value(plan, intent, payload, keys=["close_position"], default=False)
+            ),
+            time_in_force=self._first_value(plan, intent, payload, keys=["time_in_force", "tif"], default=None),
             leverage=self._optional_float_first(intent, payload, keys=["final_leverage", "leverage"]),
             source_event=self.config.signal_confirmed_topic,
             source_payload=payload,
@@ -942,6 +980,8 @@ class ExecutionSimulator:
                 "risk_mode": self._first_value(intent, payload, keys=["risk_mode"], default=None),
             },
         )
+        request.validate()
+        return request
 
     def _build_order_request_from_close_request(
         self,
@@ -949,9 +989,15 @@ class ExecutionSimulator:
     ) -> SimulatedOrderRequest:
         symbol = str(payload.get("symbol") or "")
         side = self._opposite_side(str(payload.get("side") or payload.get("position_side") or ""))
-        quantity = float(payload.get("quantity") or payload.get("size") or payload.get("position_size") or 0.0)
+        quantity = float(
+            payload.get("quantity")
+            or payload.get("size")
+            or payload.get("position_size")
+            or payload.get("final_size")
+            or 0.0
+        )
 
-        return SimulatedOrderRequest(
+        request = SimulatedOrderRequest(
             signal_id=payload.get("signal_id"),
             strategy_name=payload.get("strategy_name"),
             exchange=str(payload.get("exchange") or self.config.exchange),
@@ -967,8 +1013,11 @@ class ExecutionSimulator:
             metadata={
                 "run_id": payload.get("run_id"),
                 "reason": payload.get("reason"),
+                "position_id": payload.get("position_id"),
             },
         )
+        request.validate()
+        return request
 
     def _build_order_request_from_reduce_request(
         self,
@@ -976,9 +1025,15 @@ class ExecutionSimulator:
     ) -> SimulatedOrderRequest:
         symbol = str(payload.get("symbol") or "")
         side = self._opposite_side(str(payload.get("side") or payload.get("position_side") or ""))
-        quantity = float(payload.get("reduce_quantity") or payload.get("quantity") or payload.get("size") or 0.0)
+        quantity = float(
+            payload.get("reduce_quantity")
+            or payload.get("quantity")
+            or payload.get("size")
+            or payload.get("position_size")
+            or 0.0
+        )
 
-        return SimulatedOrderRequest(
+        request = SimulatedOrderRequest(
             signal_id=payload.get("signal_id"),
             strategy_name=payload.get("strategy_name"),
             exchange=str(payload.get("exchange") or self.config.exchange),
@@ -994,8 +1049,11 @@ class ExecutionSimulator:
             metadata={
                 "run_id": payload.get("run_id"),
                 "reason": payload.get("reason"),
+                "position_id": payload.get("position_id"),
             },
         )
+        request.validate()
+        return request
 
     def _build_trade_cost_input(
         self,
@@ -1092,8 +1150,9 @@ class ExecutionSimulator:
             "latency_ms": order.latency_ms,
             "source": "execution_simulator",
             "metadata": {
-                **order.metadata,
+                **dict(order.metadata),
                 "backtest": True,
+                "simulated": True,
             },
         }
 
@@ -1102,47 +1161,59 @@ class ExecutionSimulator:
         order: SimulatedOrder,
         fill: SimulatedFill,
     ) -> dict[str, Any]:
-        payload = self._order_to_event_payload(order)
-        payload.update(
-            {
-                "fill_id": fill.fill_id,
-                "fill_price": fill.price,
-                "fill_quantity": fill.quantity,
-                "fill_notional": fill.notional,
-                "fee": fill.fee,
-                "fee_asset": fill.fee_asset,
-                "fill_slippage": fill.slippage,
-                "fill_slippage_bps": fill.slippage_bps,
-                "liquidity_type": fill.liquidity_type,
-                "timestamp_ms": fill.timestamp_ms,
-                "filled_at_ms": fill.timestamp_ms,
-                "fill": fill.to_dict(),
-            }
-        )
-        return payload
+        return {
+            **self._order_to_event_payload(order),
+            "fill_id": fill.fill_id,
+            "fill_price": fill.price,
+            "fill_quantity": fill.quantity,
+            "fill_notional": fill.notional,
+            "fill_fee": fill.fee,
+            "fee": fill.fee,
+            "fee_asset": fill.fee_asset,
+            "fill_slippage": fill.slippage,
+            "slippage_bps": fill.slippage_bps,
+            "timestamp_ms": fill.timestamp_ms,
+            "filled_at_ms": fill.timestamp_ms,
+            "liquidity_type": fill.liquidity_type,
+            "metadata": {
+                **dict(order.metadata),
+                **dict(fill.metadata),
+                "backtest": True,
+                "simulated": True,
+            },
+        }
 
-    async def _emit(self, topic: str, payload: dict[str, Any]) -> None:
+    async def _emit(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority = EventPriority.NORMAL,
+    ) -> None:
+        if not self.config.emit_execution_events:
+            return
+
         if self.event_bus is None:
             return
 
-        emit = getattr(self.event_bus, "emit", None) or getattr(self.event_bus, "publish", None)
+        result = self.event_bus.emit(
+            topic,
+            payload,
+            priority=priority,
+            source="ExecutionSimulator",
+        )
 
-        if emit is None:
-            raise ExecutionSimulationError(
-                "EventBus does not expose emit() or publish().",
-                details={"event_bus_type": self.event_bus.__class__.__name__},
-            )
-
-        result = emit(topic, payload)
-
-        if hasattr(result, "__await__"):
+        if inspect.isawaitable(result):
             await result
 
     async def _emit_best_effort(self, topic: str, payload: dict[str, Any]) -> None:
         try:
-            await self._emit(topic, payload)
-        except Exception as exc:
-            self.logger.warning("Failed to emit %s: %s", topic, exc)
+            await self._emit(topic, payload, priority=EventPriority.LOW)
+        except Exception:
+            self.logger.debug(
+                "Best-effort execution simulator event failed",
+                extra={"topic": topic},
+            )
 
     def _record_execution_event(
         self,
@@ -1158,41 +1229,47 @@ class ExecutionSimulator:
         if not self.config.record_fills and fill is not None:
             return
 
-        record = BacktestExecutionRecord(
-            run_id=order.run_id,
-            timestamp_ms=self._now_ms(),
-            topic=topic,
-            order_id=order.order_id,
-            fill_id=fill.fill_id if fill else None,
-            signal_id=order.signal_id,
-            strategy_name=order.strategy_name,
-            symbol=order.symbol,
-            status=order.status,
-            payload=payload,
-            metadata={"source": "execution_simulator"},
+        self.records.append(
+            BacktestExecutionRecord(
+                run_id=order.run_id,
+                timestamp_ms=fill.timestamp_ms if fill is not None else self._now_ms(),
+                topic=topic,
+                order_id=order.order_id,
+                fill_id=fill.fill_id if fill is not None else None,
+                signal_id=order.signal_id,
+                strategy_name=order.strategy_name,
+                symbol=order.symbol,
+                status=order.status,
+                payload=dict(payload),
+                metadata={
+                    "source": "execution_simulator",
+                    "simulated": True,
+                },
+            )
         )
-        self.records.append(record)
 
     # ------------------------------------------------------------------
-    # Market state conversion
+    # Market payload conversion
     # ------------------------------------------------------------------
 
     def _payload_to_candle(self, payload: dict[str, Any]) -> HistoricalCandle:
+        now_ms = self._now_ms()
+
         return HistoricalCandle(
             exchange=str(payload.get("exchange") or self.config.exchange),
             symbol=str(payload.get("symbol") or ""),
             market_type=str(payload.get("market_type") or self.config.market_type),
             timeframe=str(payload.get("timeframe") or "1m"),
-            timestamp_ms=int(payload.get("timestamp_ms") or payload.get("close_time_ms") or self._now_ms()),
-            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or self._now_ms()),
-            open_time_ms=int(payload.get("open_time_ms") or payload.get("timestamp_ms") or self._now_ms()),
-            close_time_ms=int(payload.get("close_time_ms") or payload.get("timestamp_ms") or self._now_ms()),
-            open=float(payload.get("open") or 0.0),
-            high=float(payload.get("high") or 0.0),
-            low=float(payload.get("low") or 0.0),
-            close=float(payload.get("close") or 0.0),
+            timestamp_ms=int(payload.get("timestamp_ms") or payload.get("close_time_ms") or now_ms),
+            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or now_ms),
+            open_time_ms=int(payload.get("open_time_ms") or payload.get("timestamp_ms") or now_ms),
+            close_time_ms=int(payload.get("close_time_ms") or payload.get("timestamp_ms") or now_ms),
+            open=float(payload.get("open") or payload.get("price") or payload.get("close") or 0.0),
+            high=float(payload.get("high") or payload.get("price") or payload.get("close") or 0.0),
+            low=float(payload.get("low") or payload.get("price") or payload.get("close") or 0.0),
+            close=float(payload.get("close") or payload.get("price") or 0.0),
             volume=float(payload.get("volume") or 0.0),
-            quote_volume=float(payload.get("quote_volume") or 0.0),
+            quote_volume=float(payload.get("quote_volume") or payload.get("notional") or 0.0),
             trades_count=int(payload.get("trades_count") or 0),
             is_closed=bool(payload.get("is_closed", True)),
             source="market_replay",
@@ -1200,104 +1277,57 @@ class ExecutionSimulator:
         )
 
     def _payload_to_orderbook(self, payload: dict[str, Any]) -> HistoricalOrderBookSnapshot:
-        from .models import HistoricalOrderBookLevel
-
-        bids = [
-            HistoricalOrderBookLevel(price=float(level[0]), quantity=float(level[1]))
-            for level in payload.get("bids", [])
-        ]
-        asks = [
-            HistoricalOrderBookLevel(price=float(level[0]), quantity=float(level[1]))
-            for level in payload.get("asks", [])
-        ]
+        now_ms = self._now_ms()
+        bids = self._levels_from_payload(payload.get("bids") or [])
+        asks = self._levels_from_payload(payload.get("asks") or [])
 
         return HistoricalOrderBookSnapshot(
             exchange=str(payload.get("exchange") or self.config.exchange),
             symbol=str(payload.get("symbol") or ""),
             market_type=str(payload.get("market_type") or self.config.market_type),
-            timestamp_ms=int(payload.get("timestamp_ms") or self._now_ms()),
-            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or self._now_ms()),
+            timeframe=str(payload.get("timeframe") or "1m") if payload.get("timeframe") else None,
+            timestamp_ms=int(payload.get("timestamp_ms") or now_ms),
+            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or now_ms),
             bids=bids,
             asks=asks,
-            sequence=payload.get("sequence"),
+            sequence=self._optional_int(payload.get("sequence") or payload.get("last_update_id")),
             depth=int(payload.get("depth") or max(len(bids), len(asks))),
             source="market_replay",
             metadata=dict(payload.get("metadata") or {}),
         )
 
+    @staticmethod
+    def _levels_from_payload(value: Any) -> list[HistoricalOrderBookLevel]:
+        result: list[HistoricalOrderBookLevel] = []
+
+        if not isinstance(value, list):
+            return result
+
+        for item in value:
+            if isinstance(item, dict):
+                price = item.get("price")
+                quantity = item.get("quantity") or item.get("qty")
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                price = item[0]
+                quantity = item[1]
+            else:
+                continue
+
+            try:
+                result.append(
+                    HistoricalOrderBookLevel(
+                        price=float(price),
+                        quantity=float(quantity),
+                    )
+                )
+            except Exception:
+                continue
+
+        return result
+
     # ------------------------------------------------------------------
-    # Utilities
+    # Utility helpers
     # ------------------------------------------------------------------
-
-    def _subscribe(self, topic: str, handler: Any) -> None:
-        if self.event_bus is None:
-            return
-
-        subscribe = getattr(self.event_bus, "subscribe", None)
-
-        if subscribe is None:
-            return
-
-        result = subscribe(topic, handler)
-        self._subscriptions.append(result)
-
-    def _ensure_running(self) -> None:
-        if not self._running:
-            raise ExecutionSimulatorNotReadyError(
-                "ExecutionSimulator is not running. Call start() first."
-            )
-
-    def _now_ms(self) -> int:
-        if self.clock is not None and self.clock.started:
-            return self.clock.timestamp_ms()
-        return timestamp_ms(utcnow())
-
-    async def _advance_latency(self, latency_ms: int) -> None:
-        if latency_ms <= 0:
-            return
-
-        if self.clock is not None and self.clock.started:
-            # During deterministic replay we usually do not want latency to move
-            # beyond current market event timestamp unless explicitly allowed.
-            # Store latency on order, but avoid forcing wall-clock sleeps.
-            return
-
-        await asyncio.sleep(latency_ms / 1000.0)
-
-    def _simulate_latency_ms(self) -> int:
-        if self.config.latency_model == LatencyModel.NONE:
-            return 0
-
-        if self.config.latency_model == LatencyModel.FIXED_MS:
-            return self.config.fixed_latency_ms
-
-        if self.config.latency_model == LatencyModel.RANDOM_MS:
-            return self.random.randint(
-                self.config.random_latency_min_ms,
-                self.config.random_latency_max_ms,
-            )
-
-        if self.config.latency_model == LatencyModel.DISTRIBUTION:
-            low = self.config.random_latency_min_ms
-            high = self.config.random_latency_max_ms
-            if high <= low:
-                return low
-            return int(self.random.triangular(low, high, (low + high) / 2))
-
-        return 0
-
-    def _update_average_stats(self, fill: SimulatedFill, order: SimulatedOrder) -> None:
-        fills_count = max(1, self.stats_state.fills_created)
-
-        previous_slippage_total = self.stats_state.average_slippage_bps * (fills_count - 1)
-        self.stats_state.average_slippage_bps = (
-            previous_slippage_total + fill.slippage_bps
-        ) / fills_count
-
-        previous_latency_total = self.stats_state.average_latency_ms * (fills_count - 1)
-        self.stats_state.average_latency_ms = (
-            previous_latency_total + order.latency_ms
-        ) / fills_count
 
     def _get_market_state(self, order: SimulatedOrder) -> ExecutionMarketState | None:
         return self.market_state.get(
@@ -1306,60 +1336,51 @@ class ExecutionSimulator:
 
     @staticmethod
     def _market_key(exchange: str, market_type: str, symbol: str) -> str:
-        return f"{exchange.lower()}:{market_type.lower()}:{symbol.upper()}"
+        return f"{str(exchange).lower()}:{str(market_type).lower()}:{str(symbol).upper()}"
+
+    def _now_ms(self) -> int:
+        if self.clock is not None:
+            try:
+                return self.clock.timestamp_ms_or_wall_clock()
+            except Exception:
+                pass
+        return timestamp_ms(utcnow())
+
+    async def _advance_latency(self, latency_ms: int) -> None:
+        if latency_ms <= 0:
+            return
+
+        if self.clock is not None:
+            await self.clock.advance_by_async(latency_ms)
+            return
+
+        await asyncio.sleep(0)
+
+    def _simulate_latency_ms(self) -> int:
+        if self.config.latency_model == LatencyModel.NONE:
+            return 0
+
+        if self.config.latency_model == LatencyModel.FIXED:
+            return int(self.config.fixed_latency_ms)
+
+        if self.config.latency_model == LatencyModel.RANDOM:
+            return self.random.randint(
+                int(self.config.random_latency_min_ms),
+                int(self.config.random_latency_max_ms),
+            )
+
+        return 0
 
     @staticmethod
-    def _is_buy(side: str) -> bool:
-        return side.lower() in {"buy", "long"}
+    def _payload_from_event_or_dict(event_or_payload: Any) -> dict[str, Any]:
+        if isinstance(event_or_payload, dict):
+            return dict(event_or_payload)
 
-    @staticmethod
-    def _normalize_side(side: str) -> str:
-        value = str(side).lower()
+        payload = getattr(event_or_payload, "payload", None)
+        if isinstance(payload, dict):
+            return dict(payload)
 
-        if value in {"buy", "long", "bullish"}:
-            return "buy"
-
-        if value in {"sell", "short", "bearish"}:
-            return "sell"
-
-        return value
-
-    @staticmethod
-    def _opposite_side(side: str) -> str:
-        value = side.lower()
-
-        if value in {"buy", "long"}:
-            return "sell"
-
-        if value in {"sell", "short"}:
-            return "buy"
-
-        # If position side is absent, default close side must be explicitly
-        # supplied by caller. Empty side will fail validation.
-        return ""
-
-    @staticmethod
-    def _estimate_candle_vwap(candle: HistoricalCandle) -> float:
-        if candle.volume <= 0:
-            return candle.close
-        return (candle.open + candle.high + candle.low + candle.close) / 4.0
-
-    def _resolve_ohlc_path_price(self, order: SimulatedOrder, candle: HistoricalCandle) -> float:
-        if self.config.candle_execution_path == CandleExecutionPath.OPEN_HIGH_LOW_CLOSE:
-            return candle.high if self._is_buy(order.side) else candle.low
-
-        if self.config.candle_execution_path == CandleExecutionPath.OPEN_LOW_HIGH_CLOSE:
-            return candle.low if self._is_buy(order.side) else candle.high
-
-        if self.config.candle_execution_path == CandleExecutionPath.OPTIMISTIC:
-            return candle.low if self._is_buy(order.side) else candle.high
-
-        if self.config.candle_execution_path == CandleExecutionPath.RANDOMIZED:
-            values = [candle.open, candle.high, candle.low, candle.close]
-            return self.random.choice(values)
-
-        # Conservative default.
-        return candle.high if self._is_buy(order.side) else candle.low
+        return {}
 
     @staticmethod
     def _extract_nested(
@@ -1421,6 +1442,76 @@ class ExecutionSimulator:
         except Exception:
             return None
 
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_order_type(value: str) -> str:
+        normalized = str(value or "market").strip().lower()
+
+        aliases = {
+            "market": "market",
+            "limit": "limit",
+            "stop": "stop",
+            "stop_market": "stop_market",
+            "stop_limit": "stop_limit",
+        }
+
+        return aliases.get(normalized, "market")
+
+    @staticmethod
+    def _normalize_order_side(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+
+        if normalized in {"long", "buy", "bid"}:
+            return "buy"
+
+        if normalized in {"short", "sell", "ask"}:
+            return "sell"
+
+        return normalized
+
+    @staticmethod
+    def _opposite_side(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+
+        if normalized in {"long", "buy", "bid"}:
+            return "sell"
+
+        if normalized in {"short", "sell", "ask"}:
+            return "buy"
+
+        return "sell"
+
+    @staticmethod
+    def _is_buy(side: str) -> bool:
+        return str(side).lower() in {"buy", "long", "bid"}
+
+    @staticmethod
+    def _client_order_id(request: SimulatedOrderRequest) -> str:
+        signal_part = request.signal_id or "manual"
+        return f"bt_{signal_part}_{new_id('coid')}"
+
+    def _update_average_slippage(self, fill: SimulatedFill) -> None:
+        count = max(1, self.stats_state.fills_created)
+        previous_total = self.stats_state.average_slippage_bps * max(0, count - 1)
+        self.stats_state.average_slippage_bps = (previous_total + fill.slippage_bps) / count
+
+    def _update_average_latency(self, order: SimulatedOrder) -> None:
+        total_orders = max(1, self.stats_state.orders_accepted)
+        previous_total = self.stats_state.average_latency_ms * max(0, total_orders - 1)
+        self.stats_state.average_latency_ms = (previous_total + order.latency_ms) / total_orders
+
+    def _ensure_running(self) -> None:
+        if not self._running:
+            raise ExecutionSimulatorNotReadyError("ExecutionSimulator is not running.")
+
     def stats(self) -> dict[str, Any]:
         payload = self.stats_state.to_dict()
         payload.update(
@@ -1432,6 +1523,8 @@ class ExecutionSimulator:
                 "total_orders": len(self.orders),
                 "total_fills": len(self.fills),
                 "market_states": len(self.market_state),
+                "event_bus_type": self.event_bus.__class__.__name__ if self.event_bus else None,
+                "subscriptions": len(self._subscriptions),
             }
         )
         return payload

@@ -6,21 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from analytics.spoofing.enums import SpoofingComponent, SpoofingPattern, SpoofingType
+from analytics.spoofing.enums import SpoofingComponent, SpoofingType
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from ...config import StrategyConfig, StrategyDefinitionConfig
-from ...enums import (
-    MarketRegime,
-    SetupType,
-    SignalPriority,
-    SignalSide,
-    StrategyCategory,
-    Timeframe,
-)
-from ...exceptions import StrategyConfigError
-from ...models import StrategyContext, StrategyMetadata, StrategySignal
 from .base import (
     SPOOFING_FEATURES,
     SpoofingCompositeSnapshot,
@@ -71,6 +59,17 @@ from .utils import (
     unit_score,
     weighted_score,
 )
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+    Timeframe,
+)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)

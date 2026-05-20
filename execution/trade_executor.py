@@ -331,7 +331,7 @@ class TradeExecutor:
         try:
             job = self._scheduler.add_interval_job(
                 self.cleanup_stale_executions,
-                interval_seconds=max(5.0, self._config.execution_timeout_seconds),
+                interval=max(5.0, self._config.execution_timeout_seconds),
                 name="execution.trade_executor.cleanup_stale_executions",
                 run_immediately=False,
             )

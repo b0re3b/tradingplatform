@@ -15,10 +15,8 @@ from .models import (
     normalize_exchange,
     normalize_market_type,
     normalize_symbol,
-    normalize_timeframe,
 )
 from .utils import utc_now
-
 
 DECIMAL_ZERO = Decimal("0")
 

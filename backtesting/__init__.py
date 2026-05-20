@@ -394,10 +394,8 @@ from .report_builder import (
 from .strategy_tester import (
     BacktestCollectors,
     BacktestComponentBundle,
-    InMemoryBacktestEventBus,
     StrategyTester,
-    run_backtest,
-    run_backtest_sync,
+
 )
 
 from .walk_forward import (
@@ -728,12 +726,11 @@ __all__ = [
     "export_backtest_report",
 
     # Orchestration
-    "InMemoryBacktestEventBus",
+
     "BacktestComponentBundle",
     "BacktestCollectors",
     "StrategyTester",
-    "run_backtest",
-    "run_backtest_sync",
+
     "OptimizerFactory",
     "WalkForwardStrategyTesterFactory",
     "WalkForwardSplit",

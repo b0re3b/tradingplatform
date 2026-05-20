@@ -26,9 +26,13 @@ Important:
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+from core.event_bus import EventBus, EventPriority
+from core.logger import get_logger
 
 from backtesting.backtest_time import BacktestClock
 from backtesting.config import PositionSimulatorConfig
@@ -49,7 +53,6 @@ from backtesting.exceptions import (
     PositionAccountingError,
     PositionSimulatorNotReadyError,
     SimulatedPositionNotFoundError,
-    SimulatedPositionStateError,
     SimulatedPositionValidationError,
 )
 from backtesting.models import (
@@ -67,14 +70,6 @@ from backtesting.models import (
     timestamp_ms,
     utcnow,
 )
-
-try:
-    from core.logger import get_logger
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str) -> logging.Logger:
-        return logging.getLogger(name)
 
 
 @dataclass(slots=True)
@@ -169,11 +164,13 @@ class PositionSimulator:
     - position event records.
     """
 
+    component_name = "PositionSimulator"
+
     def __init__(
         self,
         config: PositionSimulatorConfig | None = None,
         *,
-        event_bus: Any | None = None,
+        event_bus: EventBus | None = None,
         clock: BacktestClock | None = None,
         cost_model: TradingCostModel | None = None,
         logger_name: str = "backtesting.position_simulator",
@@ -220,20 +217,32 @@ class PositionSimulator:
     def register(self) -> None:
         """
         Register EventBus subscriptions.
+
+        PositionSimulator listens to execution fills and raw market state only.
+        It does not listen to signal.generated and does not bypass risk/execution.
         """
 
         if self._registered:
             return
 
         if self.event_bus is None:
+            self.logger.warning("PositionSimulator has no EventBus; no subscriptions created")
             self._registered = True
             return
+
+        if not isinstance(self.event_bus, EventBus):
+            raise PositionSimulatorNotReadyError(
+                "PositionSimulator requires core.event_bus.EventBus for full-pipeline backtesting."
+            )
 
         if self.config.listen_order_filled:
             self._subscribe(self.config.order_filled_topic, self._on_order_filled)
 
         if self.config.listen_order_partially_filled:
-            self._subscribe(self.config.order_partially_filled_topic, self._on_order_partially_filled)
+            self._subscribe(
+                self.config.order_partially_filled_topic,
+                self._on_order_partially_filled,
+            )
 
         if self.config.listen_position_close_requested:
             self._subscribe("risk.position_close_requested", self._on_position_close_requested)
@@ -241,14 +250,46 @@ class PositionSimulator:
         if self.config.listen_position_reduce_requested:
             self._subscribe("risk.position_reduce_requested", self._on_position_reduce_requested)
 
-        # Market state streams for MTM, SL/TP, liquidation and funding.
+        # Raw market streams are used only for mark-to-market, equity curve,
+        # protective checks and funding. They do not open/close positions by
+        # themselves except protective fallback checks.
         self._subscribe("market.candle", self._on_market_candle)
         self._subscribe("market.funding", self._on_market_funding)
 
         self._registered = True
 
+        self.logger.info(
+            "PositionSimulator registered",
+            extra={
+                "subscriptions": len(self._subscriptions),
+                "order_filled_topic": self.config.order_filled_topic,
+                "order_partially_filled_topic": self.config.order_partially_filled_topic,
+            },
+        )
+
+    def unregister(self) -> None:
+        if self.event_bus is None:
+            self._subscriptions.clear()
+            self._registered = False
+            return
+
+        for subscription in list(self._subscriptions):
+            try:
+                self.event_bus.unsubscribe(subscription)
+            except Exception:
+                self.logger.exception(
+                    "Failed to unsubscribe PositionSimulator handler",
+                    extra={"subscription": str(subscription)},
+                )
+
+        self._subscriptions.clear()
+        self._registered = False
+
     async def start(self) -> None:
         async with self._lock:
+            if self._running:
+                return
+
             self.register()
             self._running = True
             self.stats_state.status = BacktestStatus.RUNNING
@@ -262,6 +303,9 @@ class PositionSimulator:
 
     async def stop(self) -> None:
         async with self._lock:
+            if not self._running:
+                return
+
             self._running = False
             self.stats_state.status = BacktestStatus.COMPLETED
             self.stats_state.stopped_at = utcnow()
@@ -272,6 +316,8 @@ class PositionSimulator:
             "system.backtest.position_simulator.stopped",
             self.stats(),
         )
+
+        self.unregister()
 
     async def reset(self) -> None:
         async with self._lock:
@@ -293,6 +339,37 @@ class PositionSimulator:
                 max_equity=self.config.initial_balance,
                 min_equity=self.config.initial_balance,
             )
+
+    def _subscribe(self, topic: str, handler: Any) -> None:
+        if self.event_bus is None:
+            return
+
+        wrapped = self._wrap_event_handler(handler)
+
+        try:
+            subscription = self.event_bus.subscribe(
+                topic,
+                wrapped,
+                name=f"backtest_position_on_{topic.replace('.', '_')}",
+            )
+        except TypeError:
+            subscription = self.event_bus.subscribe(
+                pattern=topic,
+                handler=wrapped,
+                name=f"backtest_position_on_{topic.replace('.', '_')}",
+            )
+
+        self._subscriptions.append(subscription)
+
+    @staticmethod
+    def _wrap_event_handler(handler: Any) -> Any:
+        async def _wrapped(event_or_payload: Any) -> None:
+            payload = PositionSimulator._payload_from_event_or_dict(event_or_payload)
+            result = handler(payload)
+            if inspect.isawaitable(result):
+                await result
+
+        return _wrapped
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -326,7 +403,11 @@ class PositionSimulator:
 
         try:
             candle = self._payload_to_candle(payload)
-        except Exception:
+        except Exception as exc:
+            self.logger.debug(
+                "PositionSimulator skipped invalid market.candle payload",
+                extra={"error": str(exc)},
+            )
             return
 
         key = self._market_key(candle.exchange, candle.market_type, candle.symbol)
@@ -366,7 +447,11 @@ class PositionSimulator:
 
         try:
             funding = self._payload_to_funding(payload)
-        except Exception:
+        except Exception as exc:
+            self.logger.debug(
+                "PositionSimulator skipped invalid market.funding payload",
+                extra={"error": str(exc)},
+            )
             return
 
         key = self._market_key(funding.exchange, funding.market_type, funding.symbol)
@@ -384,9 +469,10 @@ class PositionSimulator:
 
     async def _on_position_close_requested(self, payload: dict[str, Any]) -> None:
         """
-        Position close request is normally executed by ExecutionSimulator first.
+        Risk close request is executed by ExecutionSimulator.
 
-        This handler is best-effort fallback for bookkeeping diagnostics only.
+        This handler only annotates open positions for diagnostics. Actual
+        closing must happen from execution.order_filled.
         """
 
         if not self._running:
@@ -395,13 +481,6 @@ class PositionSimulator:
         position_id = payload.get("position_id")
         symbol = payload.get("symbol")
 
-        if position_id and position_id not in self.positions:
-            return
-
-        if not position_id and not symbol:
-            return
-
-        # Do not close directly here; fills should close. We only mark metadata.
         for position in self._matching_open_positions(position_id=position_id, symbol=symbol):
             position.metadata["close_requested"] = True
             position.metadata["close_requested_at_ms"] = self._now_ms()
@@ -409,7 +488,9 @@ class PositionSimulator:
 
     async def _on_position_reduce_requested(self, payload: dict[str, Any]) -> None:
         """
-        Position reduce request is normally executed by ExecutionSimulator first.
+        Risk reduce request is executed by ExecutionSimulator.
+
+        This handler only annotates open positions for diagnostics.
         """
 
         if not self._running:
@@ -444,39 +525,25 @@ class PositionSimulator:
             self.stats_state.total_fees += fill.fee
             self.stats_state.total_slippage += fill.slippage
 
-            key = self._market_key(fill.exchange, fill.market_type, fill.symbol)
-            open_position = self._find_position_for_fill(fill)
+            existing = self._find_position_for_fill(fill)
 
-            if open_position is None:
+            if existing is None:
                 position = self._open_position_from_fill(fill, payload=payload or {})
                 self.positions[position.position_id] = position
                 self.stats_state.positions_opened += 1
-
-                self._apply_fill_costs_to_balance(fill)
-                self._recalculate_account_state()
-                self._record_equity_point(source="fill.open")
+                event_topic = self.config.position_opened_topic
             else:
-                position = await self._apply_fill_to_existing_position(
-                    open_position,
+                position, event_topic = self._apply_fill_to_existing_position(
+                    existing,
                     fill,
                     payload=payload or {},
                 )
-                self._apply_fill_costs_to_balance(fill)
-                self._recalculate_account_state()
-                self._record_equity_point(source="fill.update")
 
-        if position.status == SimulatedPositionStatus.OPEN:
-            await self._emit_position_event(self.config.position_opened_topic, position)
+            self._apply_fill_costs_to_balance(fill)
+            self._recalculate_account_state()
+            self._record_equity_point(source="fill")
 
-        elif position.status == SimulatedPositionStatus.CLOSED:
-            await self._emit_position_event(self.config.position_closed_topic, position)
-
-        elif position.status == SimulatedPositionStatus.LIQUIDATED:
-            await self._emit_position_event(self.config.position_liquidated_topic, position)
-
-        else:
-            await self._emit_position_event(self.config.position_updated_topic, position)
-
+        await self._emit_position_event(event_topic, position)
         return position
 
     async def mark_to_market(
@@ -518,7 +585,11 @@ class PositionSimulator:
                 if position.symbol != symbol.upper():
                     continue
 
-                position.update_mark_price(mark_price, timestamp_ms_value)
+                self._update_position_mark_price(
+                    position,
+                    mark_price=mark_price,
+                    timestamp_ms_value=timestamp_ms_value,
+                )
                 updated_positions.append(position)
 
             self._recalculate_account_state()
@@ -534,6 +605,10 @@ class PositionSimulator:
     async def apply_funding(self, funding: HistoricalFundingRecord) -> None:
         """
         Apply funding payment to matching open positions.
+
+        Positive funding_rate:
+        - longs pay;
+        - shorts receive.
         """
 
         if not self.config.enable_funding_application:
@@ -555,24 +630,27 @@ class PositionSimulator:
                 if position.symbol != funding.symbol:
                     continue
 
-                notional = abs(position.quantity * (funding.mark_price or position.mark_price or position.entry_price))
-                cashflow = self.cost_model.funding.calculate_from_record(
-                    side=position.side,
-                    notional=notional,
-                    funding=funding,
-                    holding_seconds=position.holding_time_seconds,
-                )
+                mark_price = funding.mark_price or position.mark_price or position.entry_price
+                notional = abs(position.quantity * mark_price)
+                funding_amount = notional * funding.funding_rate
+
+                if self._is_long(position.side):
+                    cashflow = -funding_amount
+                else:
+                    cashflow = funding_amount
 
                 if cashflow >= 0:
                     position.funding_received += cashflow
                     self.balance.cash_balance += cashflow
                     self.balance.realized_pnl += cashflow
+                    self.balance.total_funding += cashflow
                     self.stats_state.funding_received += cashflow
                 else:
                     paid = abs(cashflow)
                     position.funding_paid += paid
                     self.balance.cash_balance -= paid
                     self.balance.realized_pnl -= paid
+                    self.balance.total_funding -= paid
                     self.stats_state.funding_paid += paid
 
                 position.updated_at_ms = funding.timestamp_ms
@@ -595,8 +673,13 @@ class PositionSimulator:
         liquidation: bool = False,
     ) -> SimulatedPosition:
         """
-        Close an open simulated position.
+        Close an open position directly.
+
+        This is used only for protective fallback checks and liquidation checks.
+        Normal position close should happen through execution.order_filled.
         """
+
+        timestamp_value = timestamp_ms_value or self._now_ms()
 
         async with self._lock:
             position = self.positions.get(position_id)
@@ -608,41 +691,35 @@ class PositionSimulator:
                 )
 
             if not position.is_open:
-                raise SimulatedPositionStateError(
-                    "Position is not open.",
-                    details={
-                        "position_id": position_id,
-                        "status": position.status.value,
-                    },
-                )
+                return position
 
-            ts = timestamp_ms_value or self._now_ms()
-            position.close(
+            self._close_position(
+                position,
                 exit_price=exit_price,
-                timestamp_ms_value=ts,
+                timestamp_ms_value=timestamp_value,
                 reason=reason,
+                liquidation=liquidation,
             )
-
-            if liquidation:
-                position.status = SimulatedPositionStatus.LIQUIDATED
-                position.close_reason = reason
-
             self._finalize_closed_position(position)
-            self.positions.pop(position_id, None)
+
+            self.positions.pop(position.position_id, None)
             self.closed_positions.append(position)
 
+            if liquidation:
+                self.stats_state.positions_liquidated += 1
+                event_topic = self.config.position_liquidated_topic
+            else:
+                self.stats_state.positions_closed += 1
+                event_topic = self.config.position_closed_topic
+
             self._recalculate_account_state()
-            self._record_equity_point(source="close_position")
+            self._record_equity_point(source=f"position.{reason}")
 
-        if liquidation:
-            await self._emit_position_event(self.config.position_liquidated_topic, position)
-        else:
-            await self._emit_position_event(self.config.position_closed_topic, position)
-
+        await self._emit_position_event(event_topic, position)
         return position
 
     # ------------------------------------------------------------------
-    # Position accounting internals
+    # Fill accounting
     # ------------------------------------------------------------------
 
     def _open_position_from_fill(
@@ -652,29 +729,16 @@ class PositionSimulator:
         payload: dict[str, Any],
     ) -> SimulatedPosition:
         side = self._position_side_from_fill_side(fill.side)
-        leverage = self._extract_float(payload, ["leverage", "final_leverage"], default=self.config.default_leverage)
-        leverage = min(max(leverage, 1.0), self.config.max_leverage)
+        leverage = self._float_from_payload(payload, ["leverage", "final_leverage"], self.config.default_leverage)
+        leverage = max(1.0, min(float(leverage), float(self.config.max_leverage)))
 
         notional = abs(fill.price * fill.quantity)
         margin = notional / leverage
 
-        stop_loss = self._extract_optional_float(payload, ["stop_loss", "sl", "stop_price"])
-        take_profit = self._extract_optional_float(payload, ["take_profit", "tp", "target_price"])
-
-        liquidation_price = self.cost_model.calculate_liquidation_price(
-            side=side,
-            entry_price=fill.price,
-            quantity=fill.quantity,
-            leverage=leverage,
-            margin=margin,
-            maintenance_margin_rate=self.config.maintenance_margin_rate,
-            buffer_bps=self.config.liquidation_buffer_bps,
-        )
-
         position = SimulatedPosition(
             run_id=fill.run_id,
             signal_id=fill.signal_id,
-            strategy_name=fill.metadata.get("strategy_name"),
+            strategy_name=payload.get("strategy_name") or fill.metadata.get("strategy_name"),
             exchange=fill.exchange,
             symbol=fill.symbol,
             market_type=fill.market_type,
@@ -688,45 +752,46 @@ class PositionSimulator:
             notional=notional,
             fees_paid=fill.fee,
             slippage_paid=fill.slippage,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            liquidation_price=liquidation_price,
             opened_at_ms=fill.timestamp_ms,
             updated_at_ms=fill.timestamp_ms,
             source_order_ids=[fill.order_id],
+            liquidation_price=self._estimate_liquidation_price(
+                side=side,
+                entry_price=fill.price,
+                leverage=leverage,
+            ),
             metadata={
-                "entry_fill_id": fill.fill_id,
-                "entry_order_id": fill.order_id,
-                "source": "position_simulator",
+                "source": "execution_fill",
+                "fill_id": fill.fill_id,
+                "order_id": fill.order_id,
+                "payload": payload,
             },
         )
 
         self.balance.cash_balance -= fill.fee
         self.balance.cash_balance -= fill.slippage
-        self.balance.margin_used += margin
-        self.balance.available_balance = self.balance.cash_balance - self.balance.margin_used
 
         return position
 
-    async def _apply_fill_to_existing_position(
+    def _apply_fill_to_existing_position(
         self,
         position: SimulatedPosition,
         fill: SimulatedFill,
         *,
         payload: dict[str, Any],
-    ) -> SimulatedPosition:
+    ) -> tuple[SimulatedPosition, str]:
         fill_side = self._position_side_from_fill_side(fill.side)
 
         if fill_side == position.side:
             self._increase_position(position, fill)
             self.stats_state.positions_updated += 1
-            return position
+            return position, self.config.position_updated_topic
 
-        # Opposite side: reduce, close or reverse.
+        # Opposite fill: reduce, close, or reverse.
         if fill.quantity < position.quantity:
             self._reduce_position(position, fill)
             self.stats_state.positions_updated += 1
-            return position
+            return position, self.config.position_updated_topic
 
         if fill.quantity == position.quantity:
             self._close_position_by_fill(position, fill, reason="opposite_fill")
@@ -734,9 +799,9 @@ class PositionSimulator:
             self.positions.pop(position.position_id, None)
             self.closed_positions.append(position)
             self.stats_state.positions_closed += 1
-            return position
+            return position, self.config.position_closed_topic
 
-        # fill.quantity > position.quantity
+        # fill.quantity > position.quantity: close old and optionally reverse.
         if not self.config.allow_position_reversal:
             raise PositionAccountingError(
                 "Position reversal is disabled.",
@@ -748,6 +813,7 @@ class PositionSimulator:
             )
 
         remaining_qty = fill.quantity - position.quantity
+
         self._close_position_by_fill(position, fill, reason="reverse_fill")
         self._finalize_closed_position(position)
         self.positions.pop(position.position_id, None)
@@ -780,7 +846,8 @@ class PositionSimulator:
         new_position = self._open_position_from_fill(reversal_fill, payload=payload)
         self.positions[new_position.position_id] = new_position
         self.stats_state.positions_opened += 1
-        return new_position
+
+        return new_position, self.config.position_opened_topic
 
     def _increase_position(
         self,
@@ -800,57 +867,44 @@ class PositionSimulator:
         position.fees_paid += fill.fee
         position.slippage_paid += fill.slippage
         position.source_order_ids.append(fill.order_id)
-
-        position.liquidation_price = self.cost_model.calculate_liquidation_price(
+        position.liquidation_price = self._estimate_liquidation_price(
             side=position.side,
             entry_price=position.entry_price,
-            quantity=position.quantity,
             leverage=position.leverage,
-            margin=position.margin,
-            maintenance_margin_rate=self.config.maintenance_margin_rate,
-            buffer_bps=self.config.liquidation_buffer_bps,
         )
+
+        self.balance.cash_balance -= fill.fee
+        self.balance.cash_balance -= fill.slippage
 
     def _reduce_position(
         self,
         position: SimulatedPosition,
         fill: SimulatedFill,
     ) -> None:
-        if fill.quantity <= 0 or fill.quantity >= position.quantity:
-            raise PositionAccountingError(
-                "Invalid reduce fill quantity.",
-                details={
-                    "position_id": position.position_id,
-                    "position_quantity": position.quantity,
-                    "fill_quantity": fill.quantity,
-                },
-            )
-
-        realized = self._calculate_realized_pnl(
+        reduce_qty = min(position.quantity, fill.quantity)
+        gross_pnl = self._pnl_for_quantity(
             side=position.side,
             entry_price=position.entry_price,
             exit_price=fill.price,
-            quantity=fill.quantity,
+            quantity=reduce_qty,
         )
 
-        reduction_ratio = fill.quantity / position.quantity
-        released_margin = position.margin * reduction_ratio
+        closed_fraction = safe_div(reduce_qty, position.quantity)
+        released_margin = position.margin * closed_fraction
 
-        position.quantity -= fill.quantity
+        position.quantity -= reduce_qty
         position.notional = abs(position.entry_price * position.quantity)
-        position.margin -= released_margin
-        position.realized_pnl += realized
+        position.margin = max(0.0, position.margin - released_margin)
         position.mark_price = fill.price
-        position.updated_at_ms = fill.timestamp_ms
+        position.realized_pnl += gross_pnl
         position.fees_paid += fill.fee
         position.slippage_paid += fill.slippage
+        position.updated_at_ms = fill.timestamp_ms
         position.source_order_ids.append(fill.order_id)
 
-        self.balance.cash_balance += realized
+        self.balance.cash_balance += gross_pnl
         self.balance.cash_balance -= fill.fee
         self.balance.cash_balance -= fill.slippage
-        self.balance.margin_used -= released_margin
-        self.balance.realized_pnl += realized - fill.fee - fill.slippage
 
     def _close_position_by_fill(
         self,
@@ -859,58 +913,90 @@ class PositionSimulator:
         *,
         reason: str,
     ) -> None:
-        realized = self._calculate_realized_pnl(
-            side=position.side,
-            entry_price=position.entry_price,
+        self._close_position(
+            position,
             exit_price=fill.price,
-            quantity=position.quantity,
+            timestamp_ms_value=fill.timestamp_ms,
+            reason=reason,
+            liquidation=False,
         )
 
-        position.exit_price = fill.price
-        position.mark_price = fill.price
-        position.closed_at_ms = fill.timestamp_ms
-        position.updated_at_ms = fill.timestamp_ms
-        position.close_reason = reason
-        position.status = SimulatedPositionStatus.CLOSED
-        position.realized_pnl += realized
-        position.unrealized_pnl = 0.0
         position.fees_paid += fill.fee
         position.slippage_paid += fill.slippage
         position.source_order_ids.append(fill.order_id)
 
-        self.balance.cash_balance += position.margin
-        self.balance.cash_balance += realized
         self.balance.cash_balance -= fill.fee
         self.balance.cash_balance -= fill.slippage
-        self.balance.margin_used -= position.margin
-        self.balance.realized_pnl += realized - fill.fee - fill.slippage
 
-    def _finalize_closed_position(self, position: SimulatedPosition) -> SimulatedTrade:
-        net_pnl = position.net_realized_pnl
-        gross_pnl = position.realized_pnl
-        pnl_pct = calculate_return_pct(
+    def _close_position(
+        self,
+        position: SimulatedPosition,
+        *,
+        exit_price: float,
+        timestamp_ms_value: int,
+        reason: str,
+        liquidation: bool,
+    ) -> None:
+        gross_pnl = self._pnl_for_quantity(
             side=position.side,
             entry_price=position.entry_price,
-            exit_price=position.exit_price or position.mark_price,
+            exit_price=exit_price,
+            quantity=position.quantity,
         )
 
-        initial_risk = self._estimate_initial_risk(position)
-        r_multiple = calculate_r_multiple(pnl=net_pnl, initial_risk=initial_risk)
+        position.exit_price = exit_price
+        position.mark_price = exit_price
+        position.realized_pnl += gross_pnl
+        position.unrealized_pnl = 0.0
+        position.closed_at_ms = timestamp_ms_value
+        position.updated_at_ms = timestamp_ms_value
+        position.close_reason = reason
+        position.status = (
+            SimulatedPositionStatus.LIQUIDATED
+            if liquidation
+            else SimulatedPositionStatus.CLOSED
+        )
+
+        self.balance.cash_balance += gross_pnl
+
+    def _finalize_closed_position(self, position: SimulatedPosition) -> SimulatedTrade:
+        trade = self._build_trade_from_position(position)
+        self.trades.append(trade)
+        self.stats_state.trades_created += 1
+        self.stats_state.realized_pnl += trade.net_pnl
+
+        if trade.outcome == TradeOutcome.WIN:
+            self.stats_state.winning_trades += 1
+        elif trade.outcome == TradeOutcome.LOSS:
+            self.stats_state.losing_trades += 1
+        elif trade.outcome == TradeOutcome.BREAKEVEN:
+            self.stats_state.breakeven_trades += 1
+
+        return trade
+
+    def _build_trade_from_position(self, position: SimulatedPosition) -> SimulatedTrade:
+        gross_pnl = position.realized_pnl
+        net_pnl = gross_pnl - position.fees_paid - position.slippage_paid + position.net_funding
+        pnl_pct = calculate_return_pct(
+            entry_price=position.entry_price,
+            exit_price=position.exit_price or position.mark_price,
+            side=position.side,
+        )
+        r_multiple = calculate_r_multiple(
+            pnl=net_pnl,
+            risk_amount=position.metadata.get("risk_amount"),
+        )
 
         if position.status == SimulatedPositionStatus.LIQUIDATED:
             outcome = TradeOutcome.LIQUIDATED
-            self.stats_state.positions_liquidated += 1
         elif net_pnl > 0:
             outcome = TradeOutcome.WIN
-            self.stats_state.winning_trades += 1
         elif net_pnl < 0:
             outcome = TradeOutcome.LOSS
-            self.stats_state.losing_trades += 1
         else:
             outcome = TradeOutcome.BREAKEVEN
-            self.stats_state.breakeven_trades += 1
 
-        trade = SimulatedTrade(
+        return SimulatedTrade(
             run_id=position.run_id,
             position_id=position.position_id,
             signal_id=position.signal_id,
@@ -939,11 +1025,6 @@ class PositionSimulator:
             },
         )
 
-        self.trades.append(trade)
-        self.stats_state.trades_created += 1
-        self.stats_state.realized_pnl += net_pnl
-        return trade
-
     # ------------------------------------------------------------------
     # Protective checks
     # ------------------------------------------------------------------
@@ -959,9 +1040,9 @@ class PositionSimulator:
         """
         Check SL/TP using candle high/low.
 
-        This is a fallback protective simulation. In a full pipeline, SL/TP
-        orders can also be simulated by ExecutionSimulator from explicit
-        protective orders.
+        This is only fallback protective simulation. In full production-like
+        pipeline, explicit protective orders should be simulated by
+        ExecutionSimulator.
         """
 
         positions = [
@@ -1008,10 +1089,12 @@ class PositionSimulator:
             if position.liquidation_price is None:
                 continue
 
-            liquidated = self.cost_model.liquidation.is_liquidated(
-                side=position.side,
-                mark_price=position.mark_price,
-                liquidation_price=position.liquidation_price,
+            liquidated = (
+                self._is_long(position.side)
+                and position.mark_price <= position.liquidation_price
+            ) or (
+                self._is_short(position.side)
+                and position.mark_price >= position.liquidation_price
             )
 
             if not liquidated:
@@ -1030,10 +1113,10 @@ class PositionSimulator:
         if position.stop_loss is None:
             return False
 
-        if position.side.lower() in {"buy", "long"}:
+        if PositionSimulator._is_long(position.side):
             return candle.low <= position.stop_loss
 
-        if position.side.lower() in {"sell", "short"}:
+        if PositionSimulator._is_short(position.side):
             return candle.high >= position.stop_loss
 
         return False
@@ -1043,10 +1126,10 @@ class PositionSimulator:
         if position.take_profit is None:
             return False
 
-        if position.side.lower() in {"buy", "long"}:
+        if PositionSimulator._is_long(position.side):
             return candle.high >= position.take_profit
 
-        if position.side.lower() in {"sell", "short"}:
+        if PositionSimulator._is_short(position.side):
             return candle.low <= position.take_profit
 
         return False
@@ -1057,10 +1140,7 @@ class PositionSimulator:
 
     def _apply_fill_costs_to_balance(self, fill: SimulatedFill) -> None:
         """
-        Apply costs from fill.
-
-        Entry costs are applied in open/reduce/close methods too, so this
-        method only keeps aggregate fields synchronized.
+        Keep aggregate cost fields synchronized.
         """
 
         self.balance.total_fees += fill.fee
@@ -1098,7 +1178,7 @@ class PositionSimulator:
         if self.balance.equity < self.stats_state.min_equity:
             self.stats_state.min_equity = self.balance.equity
 
-        peak = self.stats_state.max_equity
+        peak = max(self.stats_state.max_equity, self.config.initial_balance)
         drawdown = max(0.0, peak - self.balance.equity)
         drawdown_pct = safe_div(drawdown, peak) * 100.0 if peak > 0 else 0.0
 
@@ -1123,7 +1203,7 @@ class PositionSimulator:
         if not self.config.record_equity_curve:
             return
 
-        peak = max(self.stats_state.max_equity, self.balance.equity)
+        peak = max(self.stats_state.max_equity, self.config.initial_balance)
         drawdown = max(0.0, peak - self.balance.equity)
         drawdown_pct = safe_div(drawdown, peak) * 100.0 if peak > 0 else 0.0
 
@@ -1137,7 +1217,9 @@ class PositionSimulator:
             realized_pnl=self.balance.realized_pnl,
             drawdown=drawdown,
             drawdown_pct=drawdown_pct,
-            open_positions=len([position for position in self.positions.values() if position.is_open]),
+            open_positions=len(
+                [position for position in self.positions.values() if position.is_open]
+            ),
             source=source,
         )
         self.equity_curve.append(point)
@@ -1180,7 +1262,7 @@ class PositionSimulator:
             "notional": position.notional,
             "realized_pnl": position.realized_pnl,
             "unrealized_pnl": position.unrealized_pnl,
-            "net_realized_pnl": position.net_realized_pnl,
+            "net_realized_pnl": self._net_realized_pnl(position),
             "fees_paid": position.fees_paid,
             "funding_paid": position.funding_paid,
             "funding_received": position.funding_received,
@@ -1198,6 +1280,7 @@ class PositionSimulator:
             "metadata": {
                 **position.metadata,
                 "backtest": True,
+                "simulated": True,
             },
         }
 
@@ -1225,110 +1308,110 @@ class PositionSimulator:
         )
         self.records.append(record)
 
-    async def _emit(self, topic: str, payload: dict[str, Any]) -> None:
+    async def _emit(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        *,
+        priority: EventPriority = EventPriority.NORMAL,
+    ) -> None:
         if not self.config.emit_position_events:
             return
 
         if self.event_bus is None:
             return
 
-        emit = getattr(self.event_bus, "emit", None) or getattr(self.event_bus, "publish", None)
+        result = self.event_bus.emit(
+            topic,
+            payload,
+            priority=priority,
+            source="PositionSimulator",
+        )
 
-        if emit is None:
-            return
-
-        result = emit(topic, payload)
-
-        if hasattr(result, "__await__"):
+        if inspect.isawaitable(result):
             await result
 
     async def _emit_best_effort(self, topic: str, payload: dict[str, Any]) -> None:
         try:
-            await self._emit(topic, payload)
-        except Exception as exc:
-            self.logger.warning("Failed to emit %s: %s", topic, exc)
+            await self._emit(topic, payload, priority=EventPriority.LOW)
+        except Exception:
+            self.logger.debug(
+                "Best-effort position simulator event failed",
+                extra={"topic": topic},
+            )
 
     # ------------------------------------------------------------------
     # Payload conversion
     # ------------------------------------------------------------------
 
     def _payload_to_fill(self, payload: dict[str, Any]) -> SimulatedFill:
-        fill_payload = payload.get("fill")
+        timestamp_value = int(
+            payload.get("timestamp_ms")
+            or payload.get("filled_at_ms")
+            or payload.get("updated_at_ms")
+            or self._now_ms()
+        )
 
-        if isinstance(fill_payload, dict):
-            return SimulatedFill(
-                fill_id=str(fill_payload.get("fill_id") or payload.get("fill_id") or new_id("sim_fill")),
-                order_id=str(fill_payload.get("order_id") or payload.get("order_id") or ""),
-                run_id=fill_payload.get("run_id") or payload.get("run_id"),
-                signal_id=fill_payload.get("signal_id") or payload.get("signal_id"),
-                position_id=fill_payload.get("position_id") or payload.get("position_id"),
-                exchange=str(fill_payload.get("exchange") or payload.get("exchange") or self.config.metadata.get("exchange", "binance")),
-                symbol=str(fill_payload.get("symbol") or payload.get("symbol") or ""),
-                market_type=str(fill_payload.get("market_type") or payload.get("market_type") or "usdm_futures"),
-                side=str(fill_payload.get("side") or payload.get("side") or ""),
-                price=float(fill_payload.get("price") or payload.get("fill_price") or 0.0),
-                quantity=float(fill_payload.get("quantity") or payload.get("fill_quantity") or 0.0),
-                notional=float(fill_payload.get("notional") or payload.get("fill_notional") or 0.0),
-                fee=float(fill_payload.get("fee") or payload.get("fee") or 0.0),
-                fee_asset=str(fill_payload.get("fee_asset") or payload.get("fee_asset") or self.config.quote_currency),
-                slippage=float(fill_payload.get("slippage") or payload.get("fill_slippage") or 0.0),
-                slippage_bps=float(fill_payload.get("slippage_bps") or payload.get("fill_slippage_bps") or 0.0),
-                liquidity_type=fill_payload.get("liquidity_type") or payload.get("liquidity_type"),
-                timestamp_ms=int(fill_payload.get("timestamp_ms") or payload.get("timestamp_ms") or payload.get("filled_at_ms") or self._now_ms()),
-                source_event_id=fill_payload.get("source_event_id") or payload.get("replay_event_id"),
-                metadata={
-                    **dict(fill_payload.get("metadata") or {}),
-                    "strategy_name": payload.get("strategy_name") or dict(fill_payload.get("metadata") or {}).get("strategy_name"),
-                    "order_type": payload.get("order_type"),
-                    "reduce_only": payload.get("reduce_only"),
-                    "close_position": payload.get("close_position"),
-                },
-            )
+        price = float(
+            payload.get("fill_price")
+            or payload.get("average_fill_price")
+            or payload.get("price")
+            or 0.0
+        )
+        quantity = float(
+            payload.get("fill_quantity")
+            or payload.get("filled_quantity")
+            or payload.get("quantity")
+            or 0.0
+        )
+        notional = float(
+            payload.get("fill_notional")
+            or payload.get("notional")
+            or abs(price * quantity)
+        )
 
         return SimulatedFill(
-            fill_id=str(payload.get("fill_id") or new_id("sim_fill")),
-            order_id=str(payload.get("order_id") or ""),
+            order_id=str(payload.get("order_id") or payload.get("client_order_id") or new_id("unknown_order")),
             run_id=payload.get("run_id"),
             signal_id=payload.get("signal_id"),
-            position_id=payload.get("position_id"),
             exchange=str(payload.get("exchange") or "binance"),
             symbol=str(payload.get("symbol") or ""),
             market_type=str(payload.get("market_type") or "usdm_futures"),
             side=str(payload.get("side") or ""),
-            price=float(payload.get("fill_price") or payload.get("price") or payload.get("average_fill_price") or 0.0),
-            quantity=float(payload.get("fill_quantity") or payload.get("filled_quantity") or 0.0),
-            notional=float(payload.get("fill_notional") or 0.0),
-            fee=float(payload.get("fee") or 0.0),
+            price=price,
+            quantity=quantity,
+            notional=notional,
+            fee=float(payload.get("fill_fee") or payload.get("fee") or 0.0),
             fee_asset=str(payload.get("fee_asset") or self.config.quote_currency),
             slippage=float(payload.get("fill_slippage") or payload.get("slippage") or 0.0),
-            slippage_bps=float(payload.get("fill_slippage_bps") or 0.0),
-            liquidity_type=payload.get("liquidity_type"),
-            timestamp_ms=int(payload.get("timestamp_ms") or payload.get("filled_at_ms") or self._now_ms()),
-            source_event_id=payload.get("replay_event_id"),
+            slippage_bps=float(payload.get("slippage_bps") or 0.0),
+            timestamp_ms=timestamp_value,
             metadata={
+                **dict(payload.get("metadata") or {}),
                 "strategy_name": payload.get("strategy_name"),
-                "order_type": payload.get("order_type"),
-                "reduce_only": payload.get("reduce_only"),
-                "close_position": payload.get("close_position"),
+                "fill_id": payload.get("fill_id"),
+                "source_payload": payload,
             },
         )
 
     def _payload_to_candle(self, payload: dict[str, Any]) -> HistoricalCandle:
+        now_ms = self._now_ms()
+
         return HistoricalCandle(
             exchange=str(payload.get("exchange") or "binance"),
             symbol=str(payload.get("symbol") or ""),
             market_type=str(payload.get("market_type") or "usdm_futures"),
             timeframe=str(payload.get("timeframe") or "1m"),
-            timestamp_ms=int(payload.get("timestamp_ms") or payload.get("close_time_ms") or self._now_ms()),
-            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or self._now_ms()),
-            open_time_ms=int(payload.get("open_time_ms") or payload.get("timestamp_ms") or self._now_ms()),
-            close_time_ms=int(payload.get("close_time_ms") or payload.get("timestamp_ms") or self._now_ms()),
-            open=float(payload.get("open") or 0.0),
-            high=float(payload.get("high") or 0.0),
-            low=float(payload.get("low") or 0.0),
-            close=float(payload.get("close") or 0.0),
+            timestamp_ms=int(payload.get("timestamp_ms") or payload.get("close_time_ms") or now_ms),
+            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or now_ms),
+            open_time_ms=int(payload.get("open_time_ms") or payload.get("timestamp_ms") or now_ms),
+            close_time_ms=int(payload.get("close_time_ms") or payload.get("timestamp_ms") or now_ms),
+            open=float(payload.get("open") or payload.get("price") or payload.get("close") or 0.0),
+            high=float(payload.get("high") or payload.get("price") or payload.get("close") or 0.0),
+            low=float(payload.get("low") or payload.get("price") or payload.get("close") or 0.0),
+            close=float(payload.get("close") or payload.get("price") or 0.0),
             volume=float(payload.get("volume") or 0.0),
-            quote_volume=float(payload.get("quote_volume") or 0.0),
+            quote_volume=float(payload.get("quote_volume") or payload.get("notional") or 0.0),
             trades_count=int(payload.get("trades_count") or 0),
             is_closed=bool(payload.get("is_closed", True)),
             source="market_replay",
@@ -1336,12 +1419,14 @@ class PositionSimulator:
         )
 
     def _payload_to_funding(self, payload: dict[str, Any]) -> HistoricalFundingRecord:
+        now_ms = self._now_ms()
+
         return HistoricalFundingRecord(
             exchange=str(payload.get("exchange") or "binance"),
             symbol=str(payload.get("symbol") or ""),
             market_type=str(payload.get("market_type") or "usdm_futures"),
-            timestamp_ms=int(payload.get("timestamp_ms") or self._now_ms()),
-            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or self._now_ms()),
+            timestamp_ms=int(payload.get("timestamp_ms") or now_ms),
+            received_at_ms=int(payload.get("received_at_ms") or payload.get("timestamp_ms") or now_ms),
             funding_rate=float(payload.get("funding_rate") or payload.get("rate") or 0.0),
             predicted_rate=self._optional_float(payload.get("predicted_rate")),
             mark_price=self._optional_float(payload.get("mark_price")),
@@ -1352,46 +1437,64 @@ class PositionSimulator:
         )
 
     # ------------------------------------------------------------------
-    # Lookup helpers
+    # Lookup / helpers
     # ------------------------------------------------------------------
 
-    def _find_position_for_fill(self, fill: SimulatedFill) -> SimulatedPosition | None:
-        """
-        Find compatible open position for fill.
+    def all_positions(self) -> list[SimulatedPosition]:
+        return [
+            *self.positions.values(),
+            *self.closed_positions,
+        ]
 
-        In NETTING mode there is one net position per exchange/market/symbol.
-        In HEDGE mode we separate long/short sides.
-        """
+    def get_open_positions(self) -> list[SimulatedPosition]:
+        return [
+            position
+            for position in self.positions.values()
+            if position.is_open
+        ]
 
-        fill_position_side = self._position_side_from_fill_side(fill.side)
+    def get_position(self, position_id: str) -> SimulatedPosition | None:
+        if position_id in self.positions:
+            return self.positions[position_id]
 
-        for position in self.positions.values():
-            if not position.is_open:
-                continue
-
-            if position.exchange != fill.exchange:
-                continue
-
-            if position.market_type != fill.market_type:
-                continue
-
-            if position.symbol != fill.symbol:
-                continue
-
-            if self.config.position_accounting_mode == PositionAccountingMode.HEDGE:
-                if position.side == fill_position_side:
-                    return position
-                continue
-
-            return position
+        for position in self.closed_positions:
+            if position.position_id == position_id:
+                return position
 
         return None
+
+    def _find_position_for_fill(self, fill: SimulatedFill) -> SimulatedPosition | None:
+        fill_side = self._position_side_from_fill_side(fill.side)
+
+        candidates = [
+            position
+            for position in self.positions.values()
+            if position.is_open
+            and position.exchange == fill.exchange
+            and position.market_type == fill.market_type
+            and position.symbol == fill.symbol
+        ]
+
+        if not candidates:
+            return None
+
+        if self.config.position_accounting_mode == PositionAccountingMode.HEDGE:
+            for position in candidates:
+                if position.side == fill_side:
+                    return position
+
+            if self.config.close_opposite_position_on_reverse:
+                return candidates[0]
+
+            return None
+
+        return candidates[0]
 
     def _matching_open_positions(
         self,
         *,
-        position_id: str | None = None,
-        symbol: str | None = None,
+        position_id: Any | None = None,
+        symbol: Any | None = None,
     ) -> list[SimulatedPosition]:
         result: list[SimulatedPosition] = []
 
@@ -1399,7 +1502,7 @@ class PositionSimulator:
             if not position.is_open:
                 continue
 
-            if position_id is not None and position.position_id != position_id:
+            if position_id is not None and position.position_id != str(position_id):
                 continue
 
             if symbol is not None and position.symbol != str(symbol).upper():
@@ -1409,148 +1512,113 @@ class PositionSimulator:
 
         return result
 
-    # ------------------------------------------------------------------
-    # Math helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _position_side_from_fill_side(side: str) -> str:
-        value = side.lower()
+        normalized = str(side or "").lower()
 
-        if value in {"buy", "long"}:
+        if normalized in {"buy", "long"}:
             return "long"
 
-        if value in {"sell", "short"}:
+        if normalized in {"sell", "short"}:
             return "short"
 
-        raise SimulatedPositionValidationError(
-            "Unsupported fill side.",
-            details={"side": side},
-        )
+        return normalized
 
     @staticmethod
-    def _calculate_realized_pnl(
+    def _pnl_for_quantity(
         *,
         side: str,
         entry_price: float,
         exit_price: float,
         quantity: float,
     ) -> float:
-        if entry_price <= 0 or exit_price <= 0:
-            raise PositionAccountingError(
-                "entry_price and exit_price must be positive.",
-                details={
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                },
-            )
-
-        if quantity <= 0:
-            raise PositionAccountingError(
-                "quantity must be positive.",
-                details={"quantity": quantity},
-            )
-
-        if side.lower() in {"buy", "long"}:
+        if PositionSimulator._is_long(side):
             return (exit_price - entry_price) * quantity
 
-        if side.lower() in {"sell", "short"}:
+        if PositionSimulator._is_short(side):
             return (entry_price - exit_price) * quantity
 
-        raise PositionAccountingError(
-            "Unsupported position side.",
-            details={"side": side},
+        return 0.0
+
+    def _update_position_mark_price(
+        self,
+        position: SimulatedPosition,
+        *,
+        mark_price: float,
+        timestamp_ms_value: int,
+    ) -> None:
+        position.mark_price = mark_price
+        position.updated_at_ms = timestamp_ms_value
+
+        position.unrealized_pnl = self._pnl_for_quantity(
+            side=position.side,
+            entry_price=position.entry_price,
+            exit_price=mark_price,
+            quantity=position.quantity,
         )
 
+    def _estimate_liquidation_price(
+        self,
+        *,
+        side: str,
+        entry_price: float,
+        leverage: float,
+    ) -> float | None:
+        if entry_price <= 0 or leverage <= 0:
+            return None
+
+        maintenance = self.config.maintenance_margin_rate
+        buffer = self.config.liquidation_buffer_bps / 10_000.0
+
+        if self._is_long(side):
+            return entry_price * (1.0 - (1.0 / leverage) + maintenance + buffer)
+
+        if self._is_short(side):
+            return entry_price * (1.0 + (1.0 / leverage) - maintenance - buffer)
+
+        return None
+
     @staticmethod
-    def _estimate_initial_risk(position: SimulatedPosition) -> float:
-        if position.stop_loss is None:
-            return position.margin if position.margin > 0 else 0.0
+    def _net_realized_pnl(position: SimulatedPosition) -> float:
+        return position.realized_pnl - position.fees_paid - position.slippage_paid + position.net_funding
 
-        if position.side.lower() in {"buy", "long"}:
-            risk_per_unit = max(0.0, position.entry_price - position.stop_loss)
-        else:
-            risk_per_unit = max(0.0, position.stop_loss - position.entry_price)
+    @staticmethod
+    def _is_long(side: str) -> bool:
+        return str(side or "").lower() in {"buy", "long"}
 
-        return risk_per_unit * position.quantity
-
-    # ------------------------------------------------------------------
-    # General utilities
-    # ------------------------------------------------------------------
-
-    def _subscribe(self, topic: str, handler: Any) -> None:
-        if self.event_bus is None:
-            return
-
-        subscribe = getattr(self.event_bus, "subscribe", None)
-
-        if subscribe is None:
-            return
-
-        result = subscribe(topic, handler)
-        self._subscriptions.append(result)
-
-    def _ensure_running(self) -> None:
-        if not self._running:
-            raise PositionSimulatorNotReadyError(
-                "PositionSimulator is not running. Call start() first."
-            )
-
-    def _now_ms(self) -> int:
-        if self.clock is not None and self.clock.started:
-            return self.clock.timestamp_ms()
-        return timestamp_ms(utcnow())
+    @staticmethod
+    def _is_short(side: str) -> bool:
+        return str(side or "").lower() in {"sell", "short"}
 
     @staticmethod
     def _market_key(exchange: str, market_type: str, symbol: str) -> str:
-        return f"{exchange.lower()}:{market_type.lower()}:{symbol.upper()}"
+        return f"{str(exchange).lower()}:{str(market_type).lower()}:{str(symbol).upper()}"
+
+    def _now_ms(self) -> int:
+        if self.clock is not None:
+            try:
+                return self.clock.timestamp_ms_or_wall_clock()
+            except Exception:
+                pass
+
+        return timestamp_ms(utcnow())
 
     @staticmethod
-    def _extract_float(
-        payload: dict[str, Any],
-        keys: list[str],
-        *,
-        default: float,
-    ) -> float:
-        for key in keys:
-            value = payload.get(key)
-            if value is not None:
-                try:
-                    return float(value)
-                except Exception:
-                    return default
-        return default
+    def _payload_from_event_or_dict(event_or_payload: Any) -> dict[str, Any]:
+        if isinstance(event_or_payload, dict):
+            return dict(event_or_payload)
 
-    @staticmethod
-    def _extract_optional_float(
-        payload: dict[str, Any],
-        keys: list[str],
-    ) -> float | None:
-        for key in keys:
-            value = payload.get(key)
-            if value is not None:
-                try:
-                    return float(value)
-                except Exception:
-                    return None
+        payload = getattr(event_or_payload, "payload", None)
+        if isinstance(payload, dict):
+            return dict(payload)
 
-        # Try nested metadata / plans.
-        metadata = payload.get("metadata")
-        if isinstance(metadata, dict):
-            for key in keys:
-                value = metadata.get(key)
-                if value is not None:
-                    try:
-                        return float(value)
-                    except Exception:
-                        return None
-
-        return None
+        return {}
 
     @staticmethod
     def _optional_float(value: Any) -> float | None:
         if value is None:
             return None
+
         try:
             return float(value)
         except Exception:
@@ -1560,20 +1628,51 @@ class PositionSimulator:
     def _optional_int(value: Any) -> int | None:
         if value is None:
             return None
+
         try:
             return int(float(value))
         except Exception:
             return None
 
-    # ------------------------------------------------------------------
-    # Public snapshots
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _float_from_payload(
+        payload: dict[str, Any],
+        keys: list[str],
+        default: float,
+    ) -> float:
+        for key in keys:
+            value = payload.get(key)
 
-    def open_positions(self) -> list[SimulatedPosition]:
-        return [position for position in self.positions.values() if position.is_open]
+            if value is None:
+                continue
 
-    def all_positions(self) -> list[SimulatedPosition]:
-        return list(self.positions.values()) + list(self.closed_positions)
+            try:
+                return float(value)
+            except Exception:
+                continue
+
+        nested_keys = ("metadata", "execution_intent", "risk_decision", "intent")
+
+        for nested_key in nested_keys:
+            nested = payload.get(nested_key)
+            if not isinstance(nested, dict):
+                continue
+
+            for key in keys:
+                value = nested.get(key)
+                if value is None:
+                    continue
+
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+
+        return float(default)
+
+    def _ensure_running(self) -> None:
+        if not self._running:
+            raise PositionSimulatorNotReadyError("PositionSimulator is not running.")
 
     def stats(self) -> dict[str, Any]:
         payload = self.stats_state.to_dict()
@@ -1581,12 +1680,14 @@ class PositionSimulator:
             {
                 "running": self._running,
                 "registered": self._registered,
-                "open_positions": len(self.open_positions()),
+                "subscriptions": len(self._subscriptions),
+                "open_positions": len(self.get_open_positions()),
                 "closed_positions": len(self.closed_positions),
                 "trades": len(self.trades),
                 "equity_points": len(self.equity_curve),
                 "records": len(self.records),
                 "balance": self.balance.to_dict(),
+                "event_bus_type": self.event_bus.__class__.__name__ if self.event_bus else None,
             }
         )
         return payload

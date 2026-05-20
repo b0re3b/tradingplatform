@@ -4,7 +4,7 @@ Historical data loader for backtesting.
 DataLoader reads already downloaded historical files from local storage and
 builds replay-ready BacktestDataset objects.
 
-Main responsibilities:
+Responsibilities:
 - discover local historical files;
 - read parquet/csv/json/jsonl;
 - normalize rows into Historical* records;
@@ -16,7 +16,7 @@ Important:
 - No live exchange calls here.
 - No strategy/risk/execution logic here.
 - No EventBus emission here.
-- MarketReplay is responsible for emitting market.* events.
+- MarketReplay is responsible for emitting raw market.* events.
 """
 
 from __future__ import annotations
@@ -44,7 +44,10 @@ from backtesting.exceptions import (
     DataValidationError,
     HistoricalDataFormatError,
 )
-from backtesting.market_replay import market_topic_for_data_type, replay_priority_for_data_type
+from backtesting.market_replay import (
+    market_topic_for_data_type,
+    replay_priority_for_data_type,
+)
 from backtesting.models import (
     BacktestDataset,
     BacktestDatasetInfo,
@@ -59,15 +62,10 @@ from backtesting.models import (
     HistoricalOrderBookLevel,
     HistoricalOrderBookSnapshot,
     HistoricalTrade,
+    timestamp_ms,
 )
 
-try:
-    from core.logger import get_logger
-except Exception:  # pragma: no cover
-    import logging
-
-    def get_logger(name: str) -> logging.Logger:
-        return logging.getLogger(name)
+from core.logger import get_logger
 
 
 @dataclass(slots=True)
@@ -133,22 +131,9 @@ class DataLoader:
     """
     Local historical data loader.
 
-    Expected default file layout from HistoryDownloader:
-
-        data/history/
-            binance/
-                usdm_futures/
-                    candles/
-                        BTCUSDT/
-                            1m/
-                                BTCUSDT_1m.parquet
-                    funding/
-                        BTCUSDT/
-                            BTCUSDT.parquet
-                    open_interest/
-                        BTCUSDT/
-                            5m/
-                                BTCUSDT_5m.parquet
+    DataLoader produces BacktestDataset only. It never emits EventBus events.
+    MarketReplay later replays BacktestDataset.events into core.EventBus as
+    raw market.* topics.
     """
 
     def __init__(
@@ -172,7 +157,7 @@ class DataLoader:
         run_id: str | None = None,
     ) -> BacktestDataset:
         """
-        Load configured historical files and build BacktestDataset.
+        Load configured historical files and build replay-ready BacktestDataset.
         """
 
         bundle = self.load_bundle(period=period)
@@ -185,6 +170,11 @@ class DataLoader:
     ) -> LoadedDataBundle:
         """
         Load all configured historical files into normalized records.
+
+        Important:
+        - sort and dedupe before validation;
+        - validation must not fail simply because files were loaded grouped by
+          symbol or stream.
         """
 
         files = self.discover_files()
@@ -214,14 +204,16 @@ class DataLoader:
                     timeframe=file_ref.timeframe,
                     source_path=file_ref.path,
                 )
-
                 records = self._filter_records_by_period(records, period)
 
                 if file_ref.data_type == BacktestDataType.CANDLES:
                     bundle.candles.extend(records)
                 elif file_ref.data_type == BacktestDataType.TRADES:
                     bundle.trades.extend(records)
-                elif file_ref.data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
+                elif file_ref.data_type in {
+                    BacktestDataType.ORDERBOOK,
+                    BacktestDataType.ORDERBOOK_SNAPSHOT,
+                }:
                     bundle.orderbooks.extend(records)
                 elif file_ref.data_type == BacktestDataType.FUNDING:
                     bundle.funding.extend(records)
@@ -233,7 +225,10 @@ class DataLoader:
             except Exception as exc:
                 message = f"Failed to load {file_ref.path}: {exc}"
 
-                if self.config.allow_empty_optional_streams and not self._is_required(file_ref.data_type):
+                if (
+                    self.config.allow_empty_optional_streams
+                    and not self._is_required(file_ref.data_type)
+                ):
                     bundle.warnings.append(message)
                     self.logger.warning(message)
                     continue
@@ -248,9 +243,25 @@ class DataLoader:
                     },
                 ) from exc
 
-        self.validate_bundle(bundle, period=period)
         self._sort_bundle(bundle)
         self._dedupe_bundle(bundle)
+        self.validate_bundle(bundle, period=period)
+
+        bundle.metadata.update(
+            {
+                "loader": "DataLoader",
+                "files": len(bundle.files),
+                "total_records": bundle.total_records,
+                "records": {
+                    "candles": len(bundle.candles),
+                    "trades": len(bundle.trades),
+                    "orderbooks": len(bundle.orderbooks),
+                    "funding": len(bundle.funding),
+                    "open_interest": len(bundle.open_interest),
+                    "liquidations": len(bundle.liquidations),
+                },
+            }
+        )
 
         return bundle
 
@@ -263,6 +274,14 @@ class DataLoader:
     ) -> BacktestDataset:
         """
         Convert normalized records into BacktestDataset.
+
+        BacktestEvent topics must be raw production market topics:
+        - market.candle
+        - market.trade
+        - market.orderbook
+        - market.funding
+        - market.open_interest
+        - market.liquidation
         """
 
         if bundle.is_empty:
@@ -291,20 +310,20 @@ class DataLoader:
                 "source": "data_loader",
                 "warnings": list(bundle.warnings),
                 "files": [str(file_ref.path) for file_ref in bundle.files],
+                "raw_market_topics_only": True,
             },
         )
 
         dataset.sort_events()
+
+        if self.config.max_events is not None:
+            dataset.events = dataset.events[: self.config.max_events]
 
         dataset.info = self._build_dataset_info(
             dataset=dataset,
             bundle=bundle,
             period=period,
         )
-
-        if self.config.max_events is not None:
-            dataset.events = dataset.events[: self.config.max_events]
-            dataset.info.total_events = len(dataset.events)
 
         return dataset
 
@@ -331,13 +350,45 @@ class DataLoader:
             )
 
         event_timestamp_ms = self._record_timestamp_ms(record)
-
         topic = market_topic_for_data_type(data_type)
         priority = replay_priority_for_data_type(data_type)
-
         is_warmup = period.is_warmup(event_timestamp_ms) if period is not None else False
 
+        if not topic.startswith("market."):
+            raise DataNormalizationError(
+                "DataLoader may only create raw market.* BacktestEvents.",
+                details={
+                    "topic": topic,
+                    "data_type": data_type.value,
+                },
+            )
+
+        if topic.endswith(".updated"):
+            raise DataNormalizationError(
+                "DataLoader must not create market.*.updated BacktestEvents.",
+                details={
+                    "topic": topic,
+                    "data_type": data_type.value,
+                },
+            )
+
         payload = record.to_market_event_payload()
+        payload.setdefault("timestamp_ms", event_timestamp_ms)
+        payload.setdefault("received_at_ms", event_timestamp_ms)
+        payload.setdefault("source", "data_loader")
+        payload.setdefault("data_type", data_type.value)
+
+        metadata = dict(payload.get("metadata") or {})
+        metadata.update(
+            {
+                "backtest": True,
+                "loader": "DataLoader",
+                "data_type": data_type.value,
+                "record_type": record.__class__.__name__,
+                "instrument_key": getattr(record, "instrument_key", None),
+            }
+        )
+        payload["metadata"] = metadata
 
         return BacktestEvent(
             run_id=run_id,
@@ -353,6 +404,7 @@ class DataLoader:
                 "data_type": data_type.value,
                 "record_type": record.__class__.__name__,
                 "instrument_key": getattr(record, "instrument_key", None),
+                "raw_market_topic": topic,
             },
         )
 
@@ -362,62 +414,71 @@ class DataLoader:
 
     def discover_files(self) -> list[DataFileRef]:
         """
-        Discover configured files under data_dir.
+        Discover configured historical files under data_dir.
         """
 
-        base_dir = Path(self.config.data_dir)
         result: list[DataFileRef] = []
 
         for data_type in self.config.data_types:
             for symbol in self.config.symbols:
+                normalized_symbol = str(symbol).strip().upper()
+
                 if data_type == BacktestDataType.CANDLES:
                     for timeframe in self.config.timeframes:
                         result.extend(
                             self._discover_for(
                                 data_type=data_type,
-                                symbol=symbol,
+                                symbol=normalized_symbol,
                                 timeframe=timeframe,
                             )
                         )
                     continue
 
-                if data_type == BacktestDataType.OPEN_INTEREST:
-                    # OI downloader may store period/timeframe subfolders.
-                    found_any = False
+                if data_type in {
+                    BacktestDataType.OPEN_INTEREST,
+                    BacktestDataType.ORDERBOOK,
+                    BacktestDataType.ORDERBOOK_SNAPSHOT,
+                }:
+                    found = False
+
                     for timeframe in self.config.timeframes:
                         refs = self._discover_for(
                             data_type=data_type,
-                            symbol=symbol,
+                            symbol=normalized_symbol,
                             timeframe=timeframe,
+                            raise_if_missing=False,
                         )
                         if refs:
-                            found_any = True
+                            found = True
                             result.extend(refs)
 
                     refs_no_tf = self._discover_for(
                         data_type=data_type,
-                        symbol=symbol,
+                        symbol=normalized_symbol,
                         timeframe=None,
+                        raise_if_missing=False,
                     )
                     if refs_no_tf:
-                        found_any = True
+                        found = True
                         result.extend(refs_no_tf)
 
-                    if not found_any and self.config.require_open_interest:
-                        self._raise_missing_file(data_type, symbol)
+                    if not found and self._is_required(data_type):
+                        self._raise_missing_file(data_type, normalized_symbol)
+
                     continue
 
                 result.extend(
                     self._discover_for(
                         data_type=data_type,
-                        symbol=symbol,
+                        symbol=normalized_symbol,
                         timeframe=None,
                     )
                 )
 
         unique: dict[str, DataFileRef] = {}
+
         for item in result:
-            unique[str(item.path)] = item
+            unique[str(item.path.resolve())] = item
 
         return list(unique.values())
 
@@ -427,6 +488,7 @@ class DataLoader:
         data_type: BacktestDataType,
         symbol: str,
         timeframe: str | None,
+        raise_if_missing: bool = True,
     ) -> list[DataFileRef]:
         symbol = symbol.upper()
         data_type_dir = self._data_type_dir_name(data_type)
@@ -469,43 +531,63 @@ class DataLoader:
                             )
                         )
 
-        # Flexible fallback: any matching file in expected folder.
         if not refs and base.exists():
-            patterns = []
-
-            if timeframe:
-                patterns.extend(
-                    [
-                        f"**/*{symbol}*{timeframe}*",
-                        f"**/{symbol}_{timeframe}*",
-                    ]
+            refs.extend(
+                self._discover_flexible(
+                    base=base,
+                    data_type=data_type,
+                    symbol=symbol,
+                    timeframe=timeframe,
                 )
-            else:
-                patterns.append(f"**/*{symbol}*")
+            )
 
-            for pattern in patterns:
-                for path in base.glob(pattern):
-                    if not path.is_file():
-                        continue
-
-                    fmt = self._format_from_suffix(path.suffix)
-                    if fmt is None:
-                        continue
-
-                    refs.append(
-                        DataFileRef(
-                            path=path,
-                            data_type=data_type,
-                            exchange=self.config.exchange,
-                            market_type=self.config.market_type,
-                            symbol=symbol,
-                            timeframe=timeframe,
-                            format=fmt,
-                        )
-                    )
-
-        if not refs and self._is_required(data_type):
+        if not refs and raise_if_missing and self._is_required(data_type):
             self._raise_missing_file(data_type, symbol, timeframe=timeframe)
+
+        return refs
+
+    def _discover_flexible(
+        self,
+        *,
+        base: Path,
+        data_type: BacktestDataType,
+        symbol: str,
+        timeframe: str | None,
+    ) -> list[DataFileRef]:
+        refs: list[DataFileRef] = []
+
+        patterns = []
+
+        if timeframe:
+            patterns.extend(
+                [
+                    f"**/*{symbol}*{timeframe}*",
+                    f"**/{symbol}_{timeframe}*",
+                ]
+            )
+        else:
+            patterns.append(f"**/*{symbol}*")
+
+        for pattern in patterns:
+            for path in base.glob(pattern):
+                if not path.is_file():
+                    continue
+
+                fmt = self._format_from_suffix(path.suffix)
+                if fmt is None:
+                    continue
+
+                refs.append(
+                    DataFileRef(
+                        path=path,
+                        data_type=data_type,
+                        exchange=self.config.exchange,
+                        market_type=self.config.market_type,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        format=fmt,
+                    )
+                )
 
         return refs
 
@@ -675,33 +757,70 @@ class DataLoader:
 
         normalized: list[Any] = []
 
-        for row in rows:
+        for row_index, row in enumerate(rows):
             try:
                 if data_type == BacktestDataType.CANDLES:
                     normalized.append(
-                        self._normalize_candle(row, symbol=symbol, timeframe=timeframe or self.config.timeframes[0])
+                        self._normalize_candle(
+                            row,
+                            symbol=symbol,
+                            timeframe=timeframe or self.config.timeframes[0],
+                        )
                     )
                 elif data_type == BacktestDataType.TRADES:
-                    normalized.append(self._normalize_trade(row, symbol=symbol))
-                elif data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
-                    normalized.append(self._normalize_orderbook(row, symbol=symbol))
+                    normalized.append(
+                        self._normalize_trade(
+                            row,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                    )
+                elif data_type in {
+                    BacktestDataType.ORDERBOOK,
+                    BacktestDataType.ORDERBOOK_SNAPSHOT,
+                }:
+                    normalized.append(
+                        self._normalize_orderbook(
+                            row,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                    )
                 elif data_type == BacktestDataType.FUNDING:
-                    normalized.append(self._normalize_funding(row, symbol=symbol))
+                    normalized.append(
+                        self._normalize_funding(
+                            row,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                    )
                 elif data_type == BacktestDataType.OPEN_INTEREST:
-                    normalized.append(self._normalize_open_interest(row, symbol=symbol))
+                    normalized.append(
+                        self._normalize_open_interest(
+                            row,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                    )
                 elif data_type == BacktestDataType.LIQUIDATIONS:
-                    normalized.append(self._normalize_liquidation(row, symbol=symbol))
-                else:
-                    continue
+                    normalized.append(
+                        self._normalize_liquidation(
+                            row,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                    )
 
             except Exception as exc:
-                if self.config.validation_level == DataValidationLevel.STRICT:
+                if self._strict_row_errors():
                     raise DataNormalizationError(
                         "Failed to normalize historical row.",
                         details={
                             "source_path": str(source_path),
                             "data_type": data_type.value,
                             "symbol": symbol,
+                            "timeframe": timeframe,
+                            "row_index": row_index,
                             "row": row,
                             "error": str(exc),
                             "error_type": exc.__class__.__name__,
@@ -709,9 +828,16 @@ class DataLoader:
                     ) from exc
 
                 self.logger.warning(
-                    "Skipping invalid historical row from %s: %s",
-                    source_path,
-                    exc,
+                    "Skipping invalid historical row",
+                    extra={
+                        "source_path": str(source_path),
+                        "data_type": data_type.value,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "row_index": row_index,
+                        "error": str(exc),
+                        "error_type": exc.__class__.__name__,
+                    },
                 )
 
         return normalized
@@ -723,7 +849,10 @@ class DataLoader:
         symbol: str,
         timeframe: str,
     ) -> HistoricalCandle:
-        open_time_ms = self._int_from_keys(row, ["open_time_ms", "openTime", "open_time", "t", "timestamp"])
+        open_time_ms = self._int_from_keys(
+            row,
+            ["open_time_ms", "openTime", "open_time", "t", "timestamp_ms", "timestamp"],
+        )
         close_time_ms = self._int_from_keys(
             row,
             ["close_time_ms", "closeTime", "close_time", "T"],
@@ -735,8 +864,16 @@ class DataLoader:
             symbol=str(row.get("symbol") or symbol).upper(),
             market_type=str(row.get("market_type") or self.config.market_type),
             timeframe=str(row.get("timeframe") or timeframe),
-            timestamp_ms=self._int_from_keys(row, ["timestamp_ms", "timestamp", "close_time_ms"], default=close_time_ms),
-            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=close_time_ms),
+            timestamp_ms=self._int_from_keys(
+                row,
+                ["timestamp_ms", "timestamp", "close_time_ms", "closeTime", "T"],
+                default=close_time_ms,
+            ),
+            received_at_ms=self._int_from_keys(
+                row,
+                ["received_at_ms", "received_at", "timestamp_ms", "timestamp"],
+                default=close_time_ms,
+            ),
             open_time_ms=open_time_ms,
             close_time_ms=close_time_ms,
             open=self._float_from_keys(row, ["open", "o"]),
@@ -744,8 +881,16 @@ class DataLoader:
             low=self._float_from_keys(row, ["low", "l"]),
             close=self._float_from_keys(row, ["close", "c"]),
             volume=self._float_from_keys(row, ["volume", "v"], default=0.0),
-            quote_volume=self._float_from_keys(row, ["quote_volume", "quoteVolume", "q"], default=0.0),
-            trades_count=self._int_from_keys(row, ["trades_count", "numberOfTrades", "n"], default=0),
+            quote_volume=self._float_from_keys(
+                row,
+                ["quote_volume", "quoteVolume", "q"],
+                default=0.0,
+            ),
+            trades_count=self._int_from_keys(
+                row,
+                ["trades_count", "numberOfTrades", "n"],
+                default=0,
+            ),
             is_closed=self._bool_from_keys(row, ["is_closed", "x"], default=True),
             source="data_loader",
             metadata=self._metadata(row),
@@ -756,27 +901,46 @@ class DataLoader:
         row: dict[str, Any],
         *,
         symbol: str,
+        timeframe: str | None,
     ) -> HistoricalTrade:
-        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "T"])
+        ts = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "T"])
 
-        buyer_maker = self._optional_bool_from_keys(row, ["buyer_maker", "m"])
-        aggressor_side = self._optional_str_from_keys(row, ["aggressor_side"])
+        buyer_maker = self._optional_bool_from_keys(
+            row,
+            ["buyer_maker", "is_buyer_maker", "m"],
+        )
+        aggressor_side = self._optional_str_from_keys(
+            row,
+            ["aggressor_side", "taker_side"],
+        )
 
         if aggressor_side is None and buyer_maker is not None:
             aggressor_side = "sell" if buyer_maker else "buy"
+
+        quantity = self._float_from_keys(row, ["quantity", "qty", "q"])
+        price = self._float_from_keys(row, ["price", "p"])
 
         return HistoricalTrade(
             exchange=str(row.get("exchange") or self.config.exchange),
             symbol=str(row.get("symbol") or symbol).upper(),
             market_type=str(row.get("market_type") or self.config.market_type),
-            timestamp_ms=timestamp,
-            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            timestamp_ms=ts,
+            received_at_ms=self._int_from_keys(
+                row,
+                ["received_at_ms", "received_at", "timestamp_ms", "timestamp"],
+                default=ts,
+            ),
             trade_id=row.get("trade_id", row.get("id", row.get("a"))),
-            price=self._float_from_keys(row, ["price", "p"]),
-            quantity=self._float_from_keys(row, ["quantity", "qty", "q"]),
+            price=price,
+            quantity=quantity,
+            quote_quantity=self._optional_float_from_keys(
+                row,
+                ["quote_quantity", "quote_volume", "notional"],
+            ),
             side=self._optional_str_from_keys(row, ["side"]),
             aggressor_side=aggressor_side,
             buyer_maker=buyer_maker,
+            timeframe=str(row.get("timeframe") or timeframe) if timeframe else None,
             source="data_loader",
             metadata=self._metadata(row),
         )
@@ -786,43 +950,47 @@ class DataLoader:
         row: dict[str, Any],
         *,
         symbol: str,
+        timeframe: str | None,
     ) -> HistoricalOrderBookSnapshot:
-        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "lastUpdateTime"])
+        ts = self._int_from_keys(
+            row,
+            ["timestamp_ms", "timestamp", "time", "lastUpdateTime", "E"],
+        )
 
-        bids_raw = row.get("bids") or []
-        asks_raw = row.get("asks") or []
-
-        if isinstance(bids_raw, str):
-            bids_raw = json.loads(bids_raw)
-
-        if isinstance(asks_raw, str):
-            asks_raw = json.loads(asks_raw)
+        bids_raw = self._parse_levels(row.get("bids") or row.get("b") or [])
+        asks_raw = self._parse_levels(row.get("asks") or row.get("a") or [])
 
         bids = [
-            HistoricalOrderBookLevel(
-                price=float(level[0] if isinstance(level, (list, tuple)) else level["price"]),
-                quantity=float(level[1] if isinstance(level, (list, tuple)) else level["quantity"]),
-            )
-            for level in bids_raw
+            HistoricalOrderBookLevel(price=float(price), quantity=float(quantity))
+            for price, quantity in bids_raw
         ]
         asks = [
-            HistoricalOrderBookLevel(
-                price=float(level[0] if isinstance(level, (list, tuple)) else level["price"]),
-                quantity=float(level[1] if isinstance(level, (list, tuple)) else level["quantity"]),
-            )
-            for level in asks_raw
+            HistoricalOrderBookLevel(price=float(price), quantity=float(quantity))
+            for price, quantity in asks_raw
         ]
 
         return HistoricalOrderBookSnapshot(
             exchange=str(row.get("exchange") or self.config.exchange),
             symbol=str(row.get("symbol") or symbol).upper(),
             market_type=str(row.get("market_type") or self.config.market_type),
-            timestamp_ms=timestamp,
-            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            timestamp_ms=ts,
+            received_at_ms=self._int_from_keys(
+                row,
+                ["received_at_ms", "received_at", "timestamp_ms", "timestamp"],
+                default=ts,
+            ),
             bids=bids,
             asks=asks,
-            sequence=self._optional_int_from_keys(row, ["sequence", "lastUpdateId", "u"]),
-            depth=self._int_from_keys(row, ["depth"], default=max(len(bids), len(asks))),
+            sequence=self._optional_int_from_keys(
+                row,
+                ["sequence", "lastUpdateId", "last_update_id", "u"],
+            ),
+            depth=self._int_from_keys(
+                row,
+                ["depth"],
+                default=max(len(bids), len(asks)),
+            ),
+            timeframe=str(row.get("timeframe") or timeframe) if timeframe else None,
             source="data_loader",
             metadata=self._metadata(row),
         )
@@ -832,20 +1000,39 @@ class DataLoader:
         row: dict[str, Any],
         *,
         symbol: str,
+        timeframe: str | None,
     ) -> HistoricalFundingRecord:
-        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "fundingTime", "funding_time", "time"])
+        ts = self._int_from_keys(
+            row,
+            ["timestamp_ms", "timestamp", "fundingTime", "funding_time", "time"],
+        )
 
         return HistoricalFundingRecord(
             exchange=str(row.get("exchange") or self.config.exchange),
             symbol=str(row.get("symbol") or symbol).upper(),
             market_type=str(row.get("market_type") or self.config.market_type),
-            timestamp_ms=timestamp,
-            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
-            funding_rate=self._float_from_keys(row, ["funding_rate", "fundingRate", "rate"], default=0.0),
-            predicted_rate=self._optional_float_from_keys(row, ["predicted_rate", "predictedRate"]),
+            timestamp_ms=ts,
+            received_at_ms=self._int_from_keys(
+                row,
+                ["received_at_ms", "received_at", "timestamp_ms", "timestamp"],
+                default=ts,
+            ),
+            funding_rate=self._float_from_keys(
+                row,
+                ["funding_rate", "fundingRate", "rate"],
+                default=0.0,
+            ),
+            predicted_rate=self._optional_float_from_keys(
+                row,
+                ["predicted_rate", "predictedRate"],
+            ),
             mark_price=self._optional_float_from_keys(row, ["mark_price", "markPrice"]),
             index_price=self._optional_float_from_keys(row, ["index_price", "indexPrice"]),
-            next_funding_time_ms=self._optional_int_from_keys(row, ["next_funding_time_ms", "nextFundingTime"]),
+            next_funding_time_ms=self._optional_int_from_keys(
+                row,
+                ["next_funding_time_ms", "nextFundingTime"],
+            ),
+            timeframe=str(row.get("timeframe") or timeframe) if timeframe else None,
             source="data_loader",
             metadata=self._metadata(row),
         )
@@ -855,15 +1042,23 @@ class DataLoader:
         row: dict[str, Any],
         *,
         symbol: str,
+        timeframe: str | None,
     ) -> HistoricalOpenInterestRecord:
-        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "sumOpenInterestTime"])
+        ts = self._int_from_keys(
+            row,
+            ["timestamp_ms", "timestamp", "time", "sumOpenInterestTime"],
+        )
 
         return HistoricalOpenInterestRecord(
             exchange=str(row.get("exchange") or self.config.exchange),
             symbol=str(row.get("symbol") or symbol).upper(),
             market_type=str(row.get("market_type") or self.config.market_type),
-            timestamp_ms=timestamp,
-            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            timestamp_ms=ts,
+            received_at_ms=self._int_from_keys(
+                row,
+                ["received_at_ms", "received_at", "timestamp_ms", "timestamp"],
+                default=ts,
+            ),
             open_interest=self._float_from_keys(
                 row,
                 ["open_interest", "openInterest", "sumOpenInterest"],
@@ -874,6 +1069,7 @@ class DataLoader:
                 ["open_interest_value", "openInterestValue", "sumOpenInterestValue"],
             ),
             mark_price=self._optional_float_from_keys(row, ["mark_price", "markPrice"]),
+            timeframe=str(row.get("timeframe") or timeframe) if timeframe else None,
             source="data_loader",
             metadata=self._metadata(row),
         )
@@ -883,23 +1079,31 @@ class DataLoader:
         row: dict[str, Any],
         *,
         symbol: str,
+        timeframe: str | None,
     ) -> HistoricalLiquidationRecord:
-        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "updateTime", "T"])
+        ts = self._int_from_keys(
+            row,
+            ["timestamp_ms", "timestamp", "time", "updateTime", "T"],
+        )
         price = self._float_from_keys(row, ["price", "p", "avgPrice", "ap"])
         quantity = self._float_from_keys(row, ["quantity", "qty", "q", "origQty"])
-        side = str(row.get("side") or row.get("S") or "").lower()
 
         return HistoricalLiquidationRecord(
             exchange=str(row.get("exchange") or self.config.exchange),
             symbol=str(row.get("symbol") or symbol).upper(),
             market_type=str(row.get("market_type") or self.config.market_type),
-            timestamp_ms=timestamp,
-            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            timestamp_ms=ts,
+            received_at_ms=self._int_from_keys(
+                row,
+                ["received_at_ms", "received_at", "timestamp_ms", "timestamp"],
+                default=ts,
+            ),
             liquidation_id=row.get("liquidation_id", row.get("orderId", row.get("id"))),
-            side=side,
+            side=str(row.get("side") or row.get("S") or "").lower(),
             price=price,
             quantity=quantity,
             notional=self._float_from_keys(row, ["notional"], default=price * quantity),
+            timeframe=str(row.get("timeframe") or timeframe) if timeframe else None,
             source="data_loader",
             metadata=self._metadata(row),
         )
@@ -915,7 +1119,7 @@ class DataLoader:
         period: BacktestPeriod | None = None,
     ) -> None:
         """
-        Validate loaded data bundle.
+        Validate loaded bundle after sorting and dedupe.
         """
 
         if bundle.is_empty:
@@ -936,11 +1140,18 @@ class DataLoader:
         if self.config.require_open_interest and not bundle.open_interest:
             raise DataValidationError("Required open interest data is missing.")
 
-        if self.config.validation_level in {DataValidationLevel.BASIC, DataValidationLevel.STRICT}:
+        if self.config.validation_level in {
+            DataValidationLevel.BASIC,
+            DataValidationLevel.STRICT,
+            DataValidationLevel.FAIL_FAST,
+        }:
             self._validate_record_ordering(bundle)
             self._validate_gaps(bundle)
 
-        if self.config.validation_level == DataValidationLevel.STRICT:
+        if self.config.validation_level in {
+            DataValidationLevel.STRICT,
+            DataValidationLevel.FAIL_FAST,
+        }:
             self._validate_symbols_and_timeframes(bundle)
 
     def _validate_record_ordering(self, bundle: LoadedDataBundle) -> None:
@@ -967,7 +1178,7 @@ class DataLoader:
             expected_gap_ms = self._timeframe_to_milliseconds(key[3])
             max_allowed_gap_ms = max(
                 expected_gap_ms,
-                self.config.max_allowed_gap_seconds * 1000,
+                int(self.config.max_allowed_gap_seconds * 1000),
             )
 
             for previous, current in zip(candles, candles[1:]):
@@ -982,7 +1193,7 @@ class DataLoader:
                     f"{previous.open_time_ms} and {current.open_time_ms}"
                 )
 
-                if self._is_gap_error_policy(self.config.gap_policy):
+                if self.config.gap_policy in {DataGapPolicy.FAIL}:
                     raise DataGapError(
                         message,
                         details={
@@ -991,10 +1202,6 @@ class DataLoader:
                             "max_allowed_gap_ms": max_allowed_gap_ms,
                         },
                     )
-
-                if self.config.gap_policy == DataGapPolicy.WARN:
-                    bundle.warnings.append(message)
-                    self.logger.warning(message)
 
                 if self.config.gap_policy == DataGapPolicy.WARN:
                     bundle.warnings.append(message)
@@ -1018,11 +1225,17 @@ class DataLoader:
                     )
 
                 timeframe = getattr(record, "timeframe", None)
-                if timeframe and data_type == BacktestDataType.CANDLES:
-                    if timeframe not in allowed_timeframes:
+                if timeframe and timeframe not in allowed_timeframes:
+                    if data_type in {
+                        BacktestDataType.CANDLES,
+                        BacktestDataType.OPEN_INTEREST,
+                        BacktestDataType.ORDERBOOK,
+                        BacktestDataType.ORDERBOOK_SNAPSHOT,
+                    }:
                         raise DataValidationError(
-                            "Candle timeframe is outside configured timeframes.",
+                            "Record timeframe is outside configured timeframes.",
                             details={
+                                "data_type": data_type.value,
                                 "timeframe": timeframe,
                                 "allowed_timeframes": sorted(allowed_timeframes),
                             },
@@ -1042,7 +1255,7 @@ class DataLoader:
         instruments = [
             BacktestInstrument(
                 exchange=self.config.exchange,
-                symbol=symbol,
+                symbol=symbol.upper(),
                 market_type=self.config.market_type,
             )
             for symbol in self.config.symbols
@@ -1065,7 +1278,6 @@ class DataLoader:
             )
             for index, file_ref in enumerate(bundle.files)
         ]
-
 
         first_event_time = dataset.events[0].event_time if dataset.events else None
         last_event_time = dataset.events[-1].event_time if dataset.events else None
@@ -1096,6 +1308,7 @@ class DataLoader:
                     "open_interest": len(bundle.open_interest),
                     "liquidations": len(bundle.liquidations),
                 },
+                "raw_market_topics_only": True,
             },
         )
 
@@ -1105,79 +1318,78 @@ class DataLoader:
 
     @staticmethod
     def _sort_bundle(bundle: LoadedDataBundle) -> None:
-        bundle.candles.sort(key=lambda item: item.open_time_ms)
-        bundle.trades.sort(key=lambda item: item.timestamp_ms)
-        bundle.orderbooks.sort(key=lambda item: item.timestamp_ms)
-        bundle.funding.sort(key=lambda item: item.timestamp_ms)
-        bundle.open_interest.sort(key=lambda item: item.timestamp_ms)
-        bundle.liquidations.sort(key=lambda item: item.timestamp_ms)
+        bundle.candles.sort(key=lambda item: (item.open_time_ms, item.symbol))
+        bundle.trades.sort(key=lambda item: (item.timestamp_ms, item.symbol))
+        bundle.orderbooks.sort(key=lambda item: (item.timestamp_ms, item.symbol))
+        bundle.funding.sort(key=lambda item: (item.timestamp_ms, item.symbol))
+        bundle.open_interest.sort(key=lambda item: (item.timestamp_ms, item.symbol))
+        bundle.liquidations.sort(key=lambda item: (item.timestamp_ms, item.symbol))
 
     def _dedupe_bundle(self, bundle: LoadedDataBundle) -> None:
-        if self.config.drop_duplicate_events:
-            bundle.candles = self._dedupe(
-                bundle.candles,
-                key=lambda item: (
-                    item.exchange,
-                    item.market_type,
-                    item.symbol,
-                    item.timeframe,
-                    item.open_time_ms,
-                ),
-            )
-            bundle.trades = self._dedupe(
-                bundle.trades,
-                key=lambda item: (
-                    item.exchange,
-                    item.market_type,
-                    item.symbol,
-                    item.trade_id or item.timestamp_ms,
-                ),
-            )
-            bundle.orderbooks = self._dedupe(
-                bundle.orderbooks,
-                key=lambda item: (
-                    item.exchange,
-                    item.market_type,
-                    item.symbol,
-                    item.timestamp_ms,
-                    item.sequence,
-                ),
-            )
-            bundle.funding = self._dedupe(
-                bundle.funding,
-                key=lambda item: (
-                    item.exchange,
-                    item.market_type,
-                    item.symbol,
-                    item.timestamp_ms,
-                ),
-            )
-            bundle.open_interest = self._dedupe(
-                bundle.open_interest,
-                key=lambda item: (
-                    item.exchange,
-                    item.market_type,
-                    item.symbol,
-                    item.timestamp_ms,
-                ),
-            )
-            bundle.liquidations = self._dedupe(
-                bundle.liquidations,
-                key=lambda item: (
-                    item.exchange,
-                    item.market_type,
-                    item.symbol,
-                    item.liquidation_id or item.timestamp_ms,
-                ),
-            )
+        if not self.config.drop_duplicate_events:
+            return
 
-    @staticmethod
-    def _is_gap_error_policy(policy: DataGapPolicy) -> bool:
-        return str(getattr(policy, "value", policy)).lower() in {
-            "error",
-            "raise",
-            "strict",
-        }
+        bundle.candles = self._dedupe(
+            bundle.candles,
+            key=lambda item: (
+                item.exchange,
+                item.market_type,
+                item.symbol,
+                item.timeframe,
+                item.open_time_ms,
+            ),
+        )
+        bundle.trades = self._dedupe(
+            bundle.trades,
+            key=lambda item: (
+                item.exchange,
+                item.market_type,
+                item.symbol,
+                item.trade_id or item.timestamp_ms,
+                item.price,
+                item.quantity,
+            ),
+        )
+        bundle.orderbooks = self._dedupe(
+            bundle.orderbooks,
+            key=lambda item: (
+                item.exchange,
+                item.market_type,
+                item.symbol,
+                item.timestamp_ms,
+                item.sequence,
+            ),
+        )
+        bundle.funding = self._dedupe(
+            bundle.funding,
+            key=lambda item: (
+                item.exchange,
+                item.market_type,
+                item.symbol,
+                item.timestamp_ms,
+            ),
+        )
+        bundle.open_interest = self._dedupe(
+            bundle.open_interest,
+            key=lambda item: (
+                item.exchange,
+                item.market_type,
+                item.symbol,
+                item.timestamp_ms,
+            ),
+        )
+        bundle.liquidations = self._dedupe(
+            bundle.liquidations,
+            key=lambda item: (
+                item.exchange,
+                item.market_type,
+                item.symbol,
+                item.liquidation_id or item.timestamp_ms,
+                item.price,
+                item.quantity,
+            ),
+        )
+
     @staticmethod
     def _dedupe(records: Iterable[Any], *, key: Any) -> list[Any]:
         seen: set[Any] = set()
@@ -1200,7 +1412,7 @@ class DataLoader:
         if period is None:
             return records
 
-        start_ms = period.warmup_start_ms
+        start_ms = period.warmup_start_ms if period.warmup_start is not None else period.start_ms
         end_ms = period.end_ms
 
         return [
@@ -1210,83 +1422,75 @@ class DataLoader:
         ]
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Config helpers
     # ------------------------------------------------------------------
-
-    def _is_required(self, data_type: BacktestDataType) -> bool:
-        if data_type == BacktestDataType.CANDLES:
-            return self.config.require_candles
-        if data_type == BacktestDataType.TRADES:
-            return self.config.require_trades
-        if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
-            return self.config.require_orderbook
-        if data_type == BacktestDataType.FUNDING:
-            return self.config.require_funding
-        if data_type == BacktestDataType.OPEN_INTEREST:
-            return self.config.require_open_interest
-        return False
-
-    @staticmethod
-    def _data_type_dir_name(data_type: BacktestDataType) -> str:
-        if data_type == BacktestDataType.ORDERBOOK_SNAPSHOT:
-            return "orderbook_snapshot"
-        return data_type.value
 
     def _candidate_formats(self) -> list[HistoricalDataFormat]:
         if self.config.input_format:
-            # Prefer configured format, then try common fallbacks.
-            formats = [
-                self.config.input_format,
-                HistoricalDataFormat.PARQUET,
-                HistoricalDataFormat.CSV,
-                HistoricalDataFormat.JSONL,
-                HistoricalDataFormat.JSON,
-            ]
-        else:
-            formats = [
-                HistoricalDataFormat.PARQUET,
-                HistoricalDataFormat.CSV,
-                HistoricalDataFormat.JSONL,
-                HistoricalDataFormat.JSON,
-            ]
+            return [self.config.input_format]
 
-        unique: list[HistoricalDataFormat] = []
-        for item in formats:
-            if item not in unique:
-                unique.append(item)
-
-        return unique
+        return [
+            HistoricalDataFormat.PARQUET,
+            HistoricalDataFormat.CSV,
+            HistoricalDataFormat.JSONL,
+            HistoricalDataFormat.JSON,
+        ]
 
     @staticmethod
-    def _format_extension(value: HistoricalDataFormat) -> str:
-        if value == HistoricalDataFormat.PARQUET:
+    def _format_extension(file_format: HistoricalDataFormat) -> str:
+        if file_format == HistoricalDataFormat.PARQUET:
             return "parquet"
-        if value == HistoricalDataFormat.CSV:
+        if file_format == HistoricalDataFormat.CSV:
             return "csv"
-        if value == HistoricalDataFormat.JSONL:
-            return "jsonl"
-        if value == HistoricalDataFormat.JSON:
+        if file_format == HistoricalDataFormat.JSON:
             return "json"
-
-        raise HistoricalDataFormatError(
-            "Unsupported historical data format.",
-            details={"format": value.value},
-        )
+        if file_format == HistoricalDataFormat.JSONL:
+            return "jsonl"
+        return file_format.value
 
     @staticmethod
     def _format_from_suffix(suffix: str) -> HistoricalDataFormat | None:
-        value = suffix.lower().lstrip(".")
+        normalized = suffix.lower().lstrip(".")
 
-        if value == "parquet":
-            return HistoricalDataFormat.PARQUET
-        if value == "csv":
-            return HistoricalDataFormat.CSV
-        if value == "jsonl":
+        for item in HistoricalDataFormat:
+            if normalized == item.value:
+                return item
+
+        if normalized == "ndjson":
             return HistoricalDataFormat.JSONL
-        if value == "json":
-            return HistoricalDataFormat.JSON
 
         return None
+
+    @staticmethod
+    def _data_type_dir_name(data_type: BacktestDataType) -> str:
+        if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
+            return "orderbook"
+        return data_type.value
+
+    def _is_required(self, data_type: BacktestDataType) -> bool:
+        if data_type == BacktestDataType.CANDLES:
+            return bool(self.config.require_candles)
+        if data_type == BacktestDataType.TRADES:
+            return bool(self.config.require_trades)
+        if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
+            return bool(self.config.require_orderbook)
+        if data_type == BacktestDataType.FUNDING:
+            return bool(self.config.require_funding)
+        if data_type == BacktestDataType.OPEN_INTEREST:
+            return bool(self.config.require_open_interest)
+        if data_type == BacktestDataType.LIQUIDATIONS:
+            return bool(getattr(self.config, "require_liquidations", False))
+        return False
+
+    def _strict_row_errors(self) -> bool:
+        return self.config.validation_level in {
+            DataValidationLevel.STRICT,
+            DataValidationLevel.FAIL_FAST,
+        }
+
+    # ------------------------------------------------------------------
+    # Primitive parsing
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _record_timestamp_ms(record: Any) -> int:
@@ -1296,9 +1500,73 @@ class DataLoader:
                 return int(value)
 
         raise DataNormalizationError(
-            "Historical record has no timestamp.",
+            "Record has no timestamp field.",
             details={"record_type": record.__class__.__name__},
         )
+
+    @staticmethod
+    def _normalize_timestamp_value(value: Any) -> int:
+        if value is None or value == "":
+            raise DataNormalizationError("timestamp value is missing")
+
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise DataNormalizationError(
+                "timestamp value is not numeric.",
+                details={"value": value},
+            ) from exc
+
+        # Treat small numeric timestamps as seconds.
+        if numeric < 10_000_000_000:
+            return int(numeric * 1000)
+
+        return int(numeric)
+
+    @classmethod
+    def _int_from_keys(
+        cls,
+        row: dict[str, Any],
+        keys: Sequence[str],
+        *,
+        default: int | None = None,
+    ) -> int:
+        for key in keys:
+            value = row.get(key)
+
+            if value is None or value == "":
+                continue
+
+            if "time" in key.lower() or "timestamp" in key.lower() or key in {"t", "T", "E"}:
+                return cls._normalize_timestamp_value(value)
+
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+
+        if default is not None:
+            return int(default)
+
+        raise DataNormalizationError(
+            "Required integer field is missing.",
+            details={"keys": list(keys), "row_keys": sorted(row.keys())},
+        )
+
+    @staticmethod
+    def _optional_int_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+    ) -> int | None:
+        for key in keys:
+            value = row.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+        return None
 
     @staticmethod
     def _float_from_keys(
@@ -1309,15 +1577,19 @@ class DataLoader:
     ) -> float:
         for key in keys:
             value = row.get(key)
-            if value is not None and value != "":
+            if value is None or value == "":
+                continue
+            try:
                 return float(value)
+            except (TypeError, ValueError):
+                continue
 
         if default is not None:
-            return default
+            return float(default)
 
         raise DataNormalizationError(
-            "Missing required float field.",
-            details={"keys": list(keys), "row": row},
+            "Required float field is missing.",
+            details={"keys": list(keys), "row_keys": sorted(row.keys())},
         )
 
     @staticmethod
@@ -1327,39 +1599,12 @@ class DataLoader:
     ) -> float | None:
         for key in keys:
             value = row.get(key)
-            if value is not None and value != "":
+            if value is None or value == "":
+                continue
+            try:
                 return float(value)
-        return None
-
-    @staticmethod
-    def _int_from_keys(
-        row: dict[str, Any],
-        keys: Sequence[str],
-        *,
-        default: int | None = None,
-    ) -> int:
-        for key in keys:
-            value = row.get(key)
-            if value is not None and value != "":
-                return int(float(value))
-
-        if default is not None:
-            return default
-
-        raise DataNormalizationError(
-            "Missing required int field.",
-            details={"keys": list(keys), "row": row},
-        )
-
-    @staticmethod
-    def _optional_int_from_keys(
-        row: dict[str, Any],
-        keys: Sequence[str],
-    ) -> int | None:
-        for key in keys:
-            value = row.get(key)
-            if value is not None and value != "":
-                return int(float(value))
+            except (TypeError, ValueError):
+                continue
         return None
 
     @staticmethod
@@ -1369,29 +1614,8 @@ class DataLoader:
         *,
         default: bool,
     ) -> bool:
-        value = None
-
-        for key in keys:
-            if key in row:
-                value = row.get(key)
-                break
-
-        if value is None:
-            return default
-
-        if isinstance(value, bool):
-            return value
-
-        if isinstance(value, int | float):
-            return bool(value)
-
-        text = str(value).strip().lower()
-        if text in {"true", "1", "yes", "y"}:
-            return True
-        if text in {"false", "0", "no", "n"}:
-            return False
-
-        return default
+        value = DataLoader._optional_bool_from_keys(row, keys)
+        return default if value is None else value
 
     @staticmethod
     def _optional_bool_from_keys(
@@ -1400,19 +1624,21 @@ class DataLoader:
     ) -> bool | None:
         for key in keys:
             value = row.get(key)
+
             if value is None or value == "":
                 continue
 
             if isinstance(value, bool):
                 return value
 
-            if isinstance(value, int | float):
+            if isinstance(value, (int, float)):
                 return bool(value)
 
             text = str(value).strip().lower()
-            if text in {"true", "1", "yes", "y"}:
+
+            if text in {"true", "1", "yes", "y", "on"}:
                 return True
-            if text in {"false", "0", "no", "n"}:
+            if text in {"false", "0", "no", "n", "off"}:
                 return False
 
         return None
@@ -1427,6 +1653,33 @@ class DataLoader:
             if value is not None and value != "":
                 return str(value)
         return None
+
+    @staticmethod
+    def _parse_levels(value: Any) -> list[tuple[float, float]]:
+        if value is None or value == "":
+            return []
+
+        if isinstance(value, str):
+            value = json.loads(value)
+
+        result: list[tuple[float, float]] = []
+
+        if not isinstance(value, list):
+            return result
+
+        for item in value:
+            if isinstance(item, dict):
+                price = item.get("price", item.get("p"))
+                quantity = item.get("quantity", item.get("qty", item.get("q")))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                price = item[0]
+                quantity = item[1]
+            else:
+                continue
+
+            result.append((float(price), float(quantity)))
+
+        return result
 
     @staticmethod
     def _metadata(row: dict[str, Any]) -> dict[str, Any]:
@@ -1448,6 +1701,18 @@ class DataLoader:
     @staticmethod
     def _timeframe_to_milliseconds(timeframe: str) -> int:
         value = timeframe.strip().lower()
+
+        aliases = {
+            "m1": "1m",
+            "m3": "3m",
+            "m5": "5m",
+            "m15": "15m",
+            "m30": "30m",
+            "h1": "1h",
+            "h4": "4h",
+            "d1": "1d",
+        }
+        value = aliases.get(value, value)
 
         units = {
             "m": 60_000,
@@ -1498,10 +1763,6 @@ def load_backtest_dataset(
     period: BacktestPeriod | None = None,
     run_id: str | None = None,
 ) -> BacktestDataset:
-    """
-    Convenience helper for loading a BacktestDataset.
-    """
-
     loader = DataLoader(config)
     return loader.load_dataset(period=period, run_id=run_id)
 
@@ -1511,10 +1772,6 @@ def load_backtest_bundle(
     *,
     period: BacktestPeriod | None = None,
 ) -> LoadedDataBundle:
-    """
-    Convenience helper for loading normalized historical records.
-    """
-
     loader = DataLoader(config)
     return loader.load_bundle(period=period)
 

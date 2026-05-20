@@ -8,23 +8,9 @@ from typing import Any
 
 from analytics.spoofing.enums import (
     SpoofingComponent,
-    SpoofingPattern,
-    SpoofingType,
 )
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
-
-from ...config import StrategyConfig, StrategyDefinitionConfig
-from ...enums import (
-    MarketRegime,
-    SetupType,
-    SignalPriority,
-    SignalSide,
-    StrategyCategory,
-    Timeframe,
-)
-from ...exceptions import StrategyConfigError
-from ...models import StrategyContext, StrategyMetadata, StrategySignal
 from .base import (
     SPOOFING_FEATURES,
     SpoofingCompositeSnapshot,
@@ -40,22 +26,15 @@ from .utils import (
     detector_agreement_ratio,
     detector_average_confidence,
     detector_count,
-    detector_confidence,
     detector_passed,
     detector_score,
     extract_cancel_to_fill_ratio,
     extract_event_time,
     extract_fill_ratio,
-    extract_layer_count,
-    extract_layer_price_span_bps,
-    extract_lifetime_ms,
     extract_price_reaction_bps,
-    extract_pressure_flip_strength,
     extract_pull_ratio,
     extract_pulled_notional,
     extract_score,
-    extract_spoofing_pattern,
-    extract_spoofing_type,
     extract_wall_notional,
     freshness_score,
     is_composite_signal,
@@ -75,6 +54,17 @@ from .utils import (
     unit_score,
     weighted_score,
 )
+from ...config import StrategyConfig, StrategyDefinitionConfig
+from ...enums import (
+    MarketRegime,
+    SetupType,
+    SignalPriority,
+    SignalSide,
+    StrategyCategory,
+    Timeframe,
+)
+from ...exceptions import StrategyConfigError
+from ...models import StrategyContext, StrategyMetadata, StrategySignal
 
 
 @dataclass(slots=True)
