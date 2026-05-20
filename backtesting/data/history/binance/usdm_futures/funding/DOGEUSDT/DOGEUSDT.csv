@@ -1,0 +1,7 @@
+exchange,symbol,market_type,timestamp_ms,received_at_ms,source,metadata,funding_rate,predicted_rate,mark_price,index_price,next_funding_time_ms
+binance,DOGEUSDT,usdm_futures,1779120000007,1779120000007,history_downloader,{},-2.652e-05,,0.10387,,
+binance,DOGEUSDT,usdm_futures,1779148800001,1779148800001,history_downloader,{},-1.694e-05,,0.10472,,
+binance,DOGEUSDT,usdm_futures,1779177600001,1779177600001,history_downloader,{},-1.324e-05,,0.10513,,
+binance,DOGEUSDT,usdm_futures,1779206400009,1779206400009,history_downloader,{},6.08e-06,,0.10354194,,
+binance,DOGEUSDT,usdm_futures,1779235200001,1779235200001,history_downloader,{},3.083e-05,,0.10293553,,
+binance,DOGEUSDT,usdm_futures,1779264000006,1779264000006,history_downloader,{},1.22e-05,,0.10356,,

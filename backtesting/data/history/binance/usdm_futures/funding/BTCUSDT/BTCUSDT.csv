@@ -1,0 +1,7 @@
+exchange,symbol,market_type,timestamp_ms,received_at_ms,source,metadata,funding_rate,predicted_rate,mark_price,index_price,next_funding_time_ms
+binance,BTCUSDT,usdm_futures,1779120000007,1779120000007,history_downloader,{},7.178e-05,,76393.5,,
+binance,BTCUSDT,usdm_futures,1779148800001,1779148800001,history_downloader,{},5.164e-05,,76963.2,,
+binance,BTCUSDT,usdm_futures,1779177600001,1779177600001,history_downloader,{},4.809e-05,,77200.3,,
+binance,BTCUSDT,usdm_futures,1779206400009,1779206400009,history_downloader,{},5.563e-05,,76487.9,,
+binance,BTCUSDT,usdm_futures,1779235200001,1779235200001,history_downloader,{},3.254e-05,,76799.9,,
+binance,BTCUSDT,usdm_futures,1779264000006,1779264000006,history_downloader,{},7.983e-05,,77250.47589205,,
