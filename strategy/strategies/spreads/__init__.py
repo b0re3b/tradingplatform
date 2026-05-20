@@ -1,115 +1,72 @@
 from __future__ import annotations
 
-# ============================================================
-# Base contracts
-# ============================================================
-
 from .base import (
-    # Input analytics.spreads events
-    SPOT_FUTURES_SNAPSHOT_EVENT,
-    CROSS_EXCHANGE_SNAPSHOT_EVENT,
-    SPREAD_SIGNAL_EVENT,
-    ARBITRAGE_OPPORTUNITY_EVENT,
-
-    # Output strategy events
-    STRATEGY_SIGNAL_GENERATED_EVENT,
-    STRATEGY_SIGNAL_UPDATED_EVENT,
-    STRATEGY_SIGNAL_REJECTED_EVENT,
-    STRATEGY_SIGNAL_CANCELLED_EVENT,
-    STRATEGY_SIGNAL_CLOSED_EVENT,
-    STRATEGY_STARTED_EVENT,
-    STRATEGY_STOPPED_EVENT,
-    STRATEGY_HEARTBEAT_EVENT,
-
-    # State constants
-    STATE_IDLE,
-    STATE_PENDING,
-    STATE_OPEN,
-    STATE_BLOCKED,
-    STATE_CLOSING,
-    STATE_CLOSED,
-    STATE_CANCELLED,
-    STATE_REJECTED,
-    ACTIVE_STATES,
-    CLOSED_STATES,
-
-    # Types / base classes
-    PayloadHandler,
-    EventHandler,
-    BaseSpreadStrategyConfig,
-    SpreadStrategyState,
-    BaseSpreadStrategy,
+    SPREADS_FEATURES,
+    SpreadCompositeSnapshot,
+    SpreadsFeatureNames,
+    SpreadsStrategyConfig,
+    SpreadsStrategyScope,
+    SpreadsTradingStrategy,
 )
-
-
-# ============================================================
-# Concrete spread strategies
-# ============================================================
-
-from .spot_futures_basis_strategy import (
-    SpotFuturesBasisStrategy,
-    SpotFuturesBasisStrategyConfig,
-)
-
 from .cross_exchange_arb_strategy import (
+    CrossExchangeArbPayload,
     CrossExchangeArbStrategy,
     CrossExchangeArbStrategyConfig,
 )
-
+from .funding_adjusted_basis_strategy import (
+    FundingAdjustedBasisPayload,
+    FundingAdjustedBasisStrategy,
+    FundingAdjustedBasisStrategyConfig,
+)
+from .spot_futures_basis_strategy import (
+    SpotFuturesBasisPayload,
+    SpotFuturesBasisStrategy,
+    SpotFuturesBasisStrategyConfig,
+)
+from .spread_mean_reversion_strategy import (
+    SpreadMeanReversionPayload,
+    SpreadMeanReversionStrategy,
+    SpreadMeanReversionStrategyConfig,
+)
+from .spread_momentum_strategy import (
+    SpreadMomentumPayload,
+    SpreadMomentumStrategy,
+    SpreadMomentumStrategyConfig,
+)
 
 __all__ = [
-    # ========================================================
-    # Input analytics.spreads events
-    # ========================================================
-    "SPOT_FUTURES_SNAPSHOT_EVENT",
-    "CROSS_EXCHANGE_SNAPSHOT_EVENT",
-    "SPREAD_SIGNAL_EVENT",
-    "ARBITRAGE_OPPORTUNITY_EVENT",
+    # Feature contract
+    "SPREADS_FEATURES",
+    "SpreadsFeatureNames",
 
-    # ========================================================
-    # Output strategy events
-    # ========================================================
-    "STRATEGY_SIGNAL_GENERATED_EVENT",
-    "STRATEGY_SIGNAL_UPDATED_EVENT",
-    "STRATEGY_SIGNAL_REJECTED_EVENT",
-    "STRATEGY_SIGNAL_CANCELLED_EVENT",
-    "STRATEGY_SIGNAL_CLOSED_EVENT",
-    "STRATEGY_STARTED_EVENT",
-    "STRATEGY_STOPPED_EVENT",
-    "STRATEGY_HEARTBEAT_EVENT",
+    # Base
+    "SpreadCompositeSnapshot",
+    "SpreadsStrategyConfig",
+    "SpreadsStrategyScope",
+    "SpreadsTradingStrategy",
 
-    # ========================================================
-    # State constants
-    # ========================================================
-    "STATE_IDLE",
-    "STATE_PENDING",
-    "STATE_OPEN",
-    "STATE_BLOCKED",
-    "STATE_CLOSING",
-    "STATE_CLOSED",
-    "STATE_CANCELLED",
-    "STATE_REJECTED",
-    "ACTIVE_STATES",
-    "CLOSED_STATES",
-
-    # ========================================================
-    # Base contracts
-    # ========================================================
-    "PayloadHandler",
-    "EventHandler",
-    "BaseSpreadStrategyConfig",
-    "SpreadStrategyState",
-    "BaseSpreadStrategy",
-
-    # ========================================================
-    # Spot/Futures basis strategy
-    # ========================================================
+    # Spot/futures basis
+    "SpotFuturesBasisPayload",
     "SpotFuturesBasisStrategy",
     "SpotFuturesBasisStrategyConfig",
 
-    # ========================================================
-    # Cross-exchange arbitrage strategy
-    # ========================================================
+    # Cross-exchange arbitrage
+    "CrossExchangeArbPayload",
     "CrossExchangeArbStrategy",
     "CrossExchangeArbStrategyConfig",
+
+    # Funding-adjusted basis
+    "FundingAdjustedBasisPayload",
+    "FundingAdjustedBasisStrategy",
+    "FundingAdjustedBasisStrategyConfig",
+
+    # Generic spread mean reversion
+    "SpreadMeanReversionPayload",
+    "SpreadMeanReversionStrategy",
+    "SpreadMeanReversionStrategyConfig",
+
+    # Generic spread momentum
+    "SpreadMomentumPayload",
+    "SpreadMomentumStrategy",
+    "SpreadMomentumStrategyConfig",
 ]

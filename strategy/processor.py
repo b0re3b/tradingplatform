@@ -513,6 +513,1142 @@ class SignalNormalizer(BaseStrategyComponent):
 
         if "snapshot" not in domain_data:
             domain_data["snapshot"] = dict(payload)
+
+    def _augment_orderflow_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        composite = payload.get("composite") or payload.get("snapshot") or payload.get("orderflow")
+        cvd = payload.get("cvd") or payload.get("cvd_stats")
+        volume_delta = payload.get("volume_delta") or payload.get("volume_delta_stats")
+        aggressive = payload.get("aggressive_trades") or payload.get("aggressive")
+        imbalance = payload.get("orderbook_imbalance") or payload.get("imbalance")
+
+        if isinstance(composite, dict):
+            domain_data.setdefault("composite", composite)
+            domain_data.setdefault("snapshot", composite)
+
+        if isinstance(cvd, dict):
+            domain_data.setdefault("cvd", cvd)
+
+        if isinstance(volume_delta, dict):
+            domain_data.setdefault("volume_delta", volume_delta)
+
+        if isinstance(aggressive, dict):
+            domain_data.setdefault("aggressive_trades", aggressive)
+
+        if isinstance(imbalance, dict):
+            domain_data.setdefault("orderbook_imbalance", imbalance)
+
+        # Якщо analytics дає flat aggregate payload, нехай він теж буде composite.
+        if "composite" not in domain_data:
+            domain_data["composite"] = dict(payload)
+
+    def _augment_open_interest_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        """
+        Add stable open-interest domain aliases expected by
+        strategy/strategies/open_interest/*.
+
+        This method does not detect OI regimes/anomalies/divergences by itself.
+        It only adapts analytics.oi.* payload shapes into the StrategyContext
+        contract consumed by OpenInterestTradingStrategy:
+
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["analysis"]
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["features"]
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["regime"]
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["divergence"]
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["anomaly"]
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["snapshot"]
+            context.domain_dict(FeatureSource.OPEN_INTEREST)["market_context"]
+
+        Supported input shapes:
+            - full analytics payload with analysis/features/regime/divergence/anomaly
+            - event-specific payload with regime_result/divergence_result/anomaly_result
+            - flat payload with oi_delta_pct, anomaly_type, divergence_type, etc.
+            - payload["feature_map"] carrying the same flat/nested data
+        """
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None) -> None:
+            if value is None:
+                return
+
+            domain_data.setdefault(target, value)
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        analysis = mapping_for(
+            "analysis",
+            "oi_analysis",
+            "open_interest_analysis",
+            "result",
+        )
+        snapshot = mapping_for(
+            "snapshot",
+            "oi_snapshot",
+            "open_interest_snapshot",
+        )
+        market_context = mapping_for(
+            "context",
+            "market_context",
+            "oi_context",
+            "open_interest_context",
+        )
+        features = mapping_for(
+            "features",
+            "oi_features",
+            "open_interest_features",
+        )
+        regime = mapping_for(
+            "regime",
+            "regime_result",
+            "oi_regime",
+            "open_interest_regime",
+            "new_regime",
+        )
+        divergence = mapping_for(
+            "divergence",
+            "divergence_result",
+            "oi_divergence",
+            "open_interest_divergence",
+        )
+        anomaly = mapping_for(
+            "anomaly",
+            "anomaly_result",
+            "oi_anomaly",
+            "open_interest_anomaly",
+        )
+
+        # If a full analysis object is present, expose its nested pieces too.
+        if analysis is not None:
+            nested_snapshot = analysis.get("snapshot")
+            nested_context = (
+                    analysis.get("context")
+                    or analysis.get("market_context")
+                    or analysis.get("oi_context")
+            )
+            nested_features = analysis.get("features")
+            nested_regime = (
+                    analysis.get("regime")
+                    or analysis.get("regime_result")
+                    or analysis.get("oi_regime")
+            )
+            nested_divergence = (
+                    analysis.get("divergence")
+                    or analysis.get("divergence_result")
+                    or analysis.get("oi_divergence")
+            )
+            nested_anomaly = (
+                    analysis.get("anomaly")
+                    or analysis.get("anomaly_result")
+                    or analysis.get("oi_anomaly")
+            )
+
+            if isinstance(nested_snapshot, dict) and snapshot is None:
+                snapshot = nested_snapshot
+            if isinstance(nested_context, dict) and market_context is None:
+                market_context = nested_context
+            if isinstance(nested_features, dict) and features is None:
+                features = nested_features
+            if isinstance(nested_regime, dict) and regime is None:
+                regime = nested_regime
+            if isinstance(nested_divergence, dict) and divergence is None:
+                divergence = nested_divergence
+            if isinstance(nested_anomaly, dict) and anomaly is None:
+                anomaly = nested_anomaly
+
+        set_aliases(
+            "analysis",
+            ("oi_analysis", "open_interest_analysis", "result"),
+            analysis,
+        )
+        set_aliases(
+            "snapshot",
+            ("oi_snapshot", "open_interest_snapshot"),
+            snapshot,
+        )
+        set_aliases(
+            "market_context",
+            ("context", "oi_context", "open_interest_context"),
+            market_context,
+        )
+        set_aliases(
+            "features",
+            ("oi_features", "open_interest_features"),
+            features,
+        )
+        set_aliases(
+            "regime",
+            ("regime_result", "oi_regime", "open_interest_regime", "new_regime"),
+            regime,
+        )
+        set_aliases(
+            "divergence",
+            ("divergence_result", "oi_divergence", "open_interest_divergence"),
+            divergence,
+        )
+        set_aliases(
+            "anomaly",
+            ("anomaly_result", "oi_anomaly", "open_interest_anomaly"),
+            anomaly,
+        )
+
+        # Build strategy-friendly fallback features from flat analytics payload.
+        if "features" not in domain_data:
+            has_feature_like_values = any(
+                key in payload or key in feature_map
+                for key in (
+                    "oi",
+                    "open_interest",
+                    "open_interest_value",
+                    "oi_delta",
+                    "oi_delta_pct",
+                    "oi_direction",
+                    "oi_acceleration",
+                    "price_delta_pct",
+                    "volume_ratio",
+                    "oi_zscore",
+                    "oi_pressure_score",
+                    "funding_rate",
+                    "liquidation_pressure",
+                    "liquidation_imbalance",
+                    "aggressive_flow_imbalance",
+                    "oi_price_efficiency",
+                )
+            )
+
+            if has_feature_like_values:
+                domain_data["features"] = {
+                    "oi": value_for("oi", "open_interest"),
+                    "open_interest": value_for("open_interest", "oi"),
+                    "open_interest_value": value_for("open_interest_value"),
+                    "oi_delta": value_for("oi_delta"),
+                    "oi_delta_pct": value_for("oi_delta_pct"),
+                    "oi_direction": value_for("oi_direction"),
+                    "oi_acceleration": value_for("oi_acceleration"),
+                    "price_delta_pct": value_for("price_delta_pct"),
+                    "volume_ratio": value_for("volume_ratio"),
+                    "oi_zscore": value_for("oi_zscore"),
+                    "oi_pressure_score": value_for("oi_pressure_score"),
+                    "funding_rate": value_for("funding_rate"),
+                    "liquidation_pressure": value_for(
+                        "liquidation_pressure",
+                        "liquidation_imbalance",
+                    ),
+                    "liquidation_imbalance": value_for(
+                        "liquidation_imbalance",
+                        "liquidation_pressure",
+                    ),
+                    "aggressive_flow_imbalance": value_for(
+                        "aggressive_flow_imbalance",
+                    ),
+                    "oi_price_efficiency": value_for("oi_price_efficiency"),
+                }
+
+        if "regime" not in domain_data:
+            regime_value = value_for(
+                "regime",
+                "oi_regime",
+                "market_regime",
+                "new_regime",
+            )
+            if regime_value is not None:
+                domain_data["regime"] = {
+                    "regime": regime_value,
+                    "confidence": value_for(
+                        "regime_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                    "score": value_for("regime_score", "score", default=0.0),
+                    "reasons": value_for("regime_reasons", "reasons", default=[]),
+                }
+
+        if "divergence" not in domain_data:
+            divergence_type = value_for(
+                "divergence_type",
+                "price_oi_divergence",
+            )
+            divergence_detected = value_for(
+                "divergence_detected",
+                "is_divergence",
+                "divergence",
+                default=None,
+            )
+
+            if divergence_type is not None or divergence_detected is not None:
+                domain_data["divergence"] = {
+                    "detected": bool(
+                        True if divergence_detected is None else divergence_detected
+                    ),
+                    "divergence_type": divergence_type,
+                    "confidence": value_for(
+                        "divergence_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                    "score": value_for("divergence_score", "score", default=0.0),
+                    "window_size": value_for("divergence_window_size", "window_size"),
+                    "reasons": value_for(
+                        "divergence_reasons",
+                        "reasons",
+                        default=[],
+                    ),
+                }
+
+        if "anomaly" not in domain_data:
+            anomaly_type = value_for("anomaly_type")
+            anomaly_detected = value_for(
+                "anomaly_detected",
+                "is_anomaly",
+                "anomaly",
+                "capitulation",
+                "squeeze_setup",
+                default=None,
+            )
+
+            if anomaly_type is not None or anomaly_detected is not None:
+                domain_data["anomaly"] = {
+                    "detected": bool(
+                        True if anomaly_detected is None else anomaly_detected
+                    ),
+                    "anomaly_type": anomaly_type,
+                    "confidence": value_for(
+                        "anomaly_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                    "score": value_for("anomaly_score", "score", default=0.0),
+                    "strength": value_for(
+                        "anomaly_strength",
+                        "strength",
+                        default=value_for("score", default=0.0),
+                    ),
+                    "capitulation": bool(value_for("capitulation", default=False)),
+                    "capitulation_score": value_for(
+                        "capitulation_score",
+                        default=value_for("score", default=0.0),
+                    ),
+                    "squeeze_setup": bool(value_for("squeeze_setup", default=False)),
+                    "squeeze_score": value_for(
+                        "squeeze_score",
+                        default=value_for("score", default=0.0),
+                    ),
+                    "liquidation_imbalance": value_for(
+                        "liquidation_imbalance",
+                        "liquidation_pressure",
+                    ),
+                    "reasons": value_for("anomaly_reasons", "reasons", default=[]),
+                }
+
+        # Keep a full raw fallback for debugging / metadata, but do not overwrite
+        # canonical nested contracts above.
+        domain_data.setdefault("raw", dict(payload))
+
+    def _augment_liquidations_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        for target, aliases in {
+            "cascade": (
+                    "cascade",
+                    "cascade_result",
+                    "cascade_detection",
+                    "cascade_detected",
+                    "result",
+            ),
+            "exhaustion": (
+                    "exhaustion",
+                    "exhaustion_result",
+                    "exhaustion_detection",
+                    "exhaustion_detected",
+                    "reversal_context",
+            ),
+            "squeeze": (
+                    "squeeze",
+                    "squeeze_result",
+                    "squeeze_reversal",
+                    "squeeze_context",
+                    "pending_confirmation",
+            ),
+            "cluster": (
+                    "cluster",
+                    "liquidation_cluster",
+                    "cluster_stats",
+            ),
+            "signal": (
+                    "signal",
+                    "liquidation_signal",
+                    "analytics_signal",
+            ),
+        }.items():
+            value = mapping_for(*aliases)
+            if value is not None:
+                domain_data.setdefault(target, value)
+                for alias in aliases:
+                    domain_data.setdefault(alias, value)
+
+        # analytics.liquidations.cascade_detected often arrives as flat payload.
+        if "cascade" not in domain_data and (
+                "direction" in payload
+                or "cascade_direction" in payload
+                or "intensity_score" in payload
+                or "total_notional_usd" in payload
+                or "event_count" in payload
+        ):
+            domain_data["cascade"] = dict(payload)
+            domain_data.setdefault("result", domain_data["cascade"])
+
+        # analytics.liquidations.exhaustion_detected may also be flat.
+        if "exhaustion" not in domain_data and (
+                "exhaustion_bias" in payload
+                or "bias_delta" in payload
+                or "reversal_side" in payload
+        ):
+            domain_data["exhaustion"] = dict(payload)
+            domain_data.setdefault("exhaustion_result", domain_data["exhaustion"])
+
+        # Squeeze reversal context may be flat.
+        if "squeeze" not in domain_data and (
+                "squeeze_score" in payload
+                or "squeeze_confirmed" in payload
+                or "squeeze_direction" in payload
+        ):
+            domain_data["squeeze"] = dict(payload)
+            domain_data.setdefault("squeeze_result", domain_data["squeeze"])
+
+        domain_data.setdefault("raw", dict(payload))
+
+    def _augment_liquidity_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        for target, aliases in {
+            "snapshot": (
+                    "snapshot",
+                    "liquidity_map_snapshot",
+                    "map_snapshot",
+                    "last_snapshot",
+                    "liquidity",
+                    "result",
+            ),
+            "signal": (
+                    "signal",
+                    "liquidity_signal",
+                    "analytics_signal",
+            ),
+            "levels": (
+                    "levels",
+                    "active_levels",
+                    "liquidity_levels",
+            ),
+            "clusters": (
+                    "clusters",
+                    "stop_clusters",
+                    "liquidity_clusters",
+            ),
+            "zones": (
+                    "zones",
+                    "liquidity_zones",
+            ),
+            "sweep_risk": (
+                    "sweep_risk",
+                    "sweep_risks",
+            ),
+            "magnet": (
+                    "magnet",
+                    "magnets",
+                    "liquidity_magnets",
+            ),
+        }.items():
+            value = mapping_for(*aliases)
+            if value is not None:
+                domain_data.setdefault(target, value)
+                for alias in aliases:
+                    domain_data.setdefault(alias, value)
+
+        # Flat liquidity map update fallback.
+        if "snapshot" not in domain_data and (
+                "above_liquidity_score" in payload
+                or "below_liquidity_score" in payload
+                or "liquidity_pressure_score" in payload
+                or "bias" in payload
+                or "active_levels" in payload
+                or "stop_clusters" in payload
+                or "zones" in payload
+        ):
+            domain_data["snapshot"] = dict(payload)
+            domain_data.setdefault("map_snapshot", domain_data["snapshot"])
+            domain_data.setdefault("liquidity_map_snapshot", domain_data["snapshot"])
+
+        if "signal" not in domain_data and (
+                "bias" in payload
+                or "score" in payload
+                or "confidence" in payload
+                or "above_liquidity_score" in payload
+                or "below_liquidity_score" in payload
+        ):
+            domain_data["signal"] = dict(payload)
+
+        current_price = None
+        for key in ("current_price", "price", "mark_price", "last_price", "close"):
+            if key in payload:
+                current_price = payload[key]
+                break
+            if key in feature_map:
+                current_price = feature_map[key]
+                break
+
+        if current_price is not None:
+            domain_data.setdefault("current_price", current_price)
+            domain_data.setdefault("price", current_price)
+
+        domain_data.setdefault("raw", dict(payload))
+
+    def _augment_price_action_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        state = mapping_for(
+            "state",
+            "composite",
+            "price_action",
+            "snapshot",
+            "result",
+        )
+
+        if state is not None:
+            domain_data.setdefault("state", state)
+            domain_data.setdefault("composite", state)
+            domain_data.setdefault("price_action", state)
+            domain_data.setdefault("snapshot", state)
+
+        for target, aliases in {
+            "market_structure": (
+                    "market_structure",
+                    "structure",
+                    "ms",
+            ),
+            "support_resistance": (
+                    "support_resistance",
+                    "sr",
+                    "levels",
+            ),
+            "fair_value_gap": (
+                    "fair_value_gap",
+                    "fvg",
+                    "fair_value_gaps",
+            ),
+            "trend": (
+                    "trend",
+                    "trend_state",
+            ),
+            "liquidity_levels": (
+                    "liquidity_levels",
+                    "liquidity",
+            ),
+        }.items():
+            value = mapping_for(*aliases)
+
+            if value is None and isinstance(state, dict):
+                for alias in aliases:
+                    nested = state.get(alias)
+                    if isinstance(nested, dict):
+                        value = nested
+                        break
+
+            if value is not None:
+                domain_data.setdefault(target, value)
+                for alias in aliases:
+                    domain_data.setdefault(alias, value)
+
+        # Event-specific fallbacks for analytics.price_action.<module>.<event>
+        event_payload = dict(payload)
+
+        topic = (
+            str(payload.get("event_name") or payload.get("topic") or "")
+            .strip()
+            .lower()
+        )
+
+        if "market_structure" not in domain_data and (
+                "market_structure" in topic
+                or any(
+            key in payload
+            for key in (
+                    "swing_type",
+                    "event_type",
+                    "break_distance_pct",
+                    "market_bias",
+                    "bias",
+                    "mtf_alignment",
+            )
+        )
+        ):
+            domain_data["market_structure"] = event_payload
+            domain_data.setdefault("structure", event_payload)
+
+        if "support_resistance" not in domain_data and (
+                "support_resistance" in topic
+                or any(
+            key in payload
+            for key in (
+                    "level_type",
+                    "level_status",
+                    "level_price",
+                    "touch_count",
+                    "reaction_count",
+                    "break_count",
+            )
+        )
+        ):
+            domain_data["support_resistance"] = event_payload
+            domain_data.setdefault("sr", event_payload)
+
+        if "fair_value_gap" not in domain_data and (
+                "fair_value_gap" in topic
+                or ".fvg_" in topic
+                or "fvg" in topic
+                or any(
+            key in payload
+            for key in (
+                    "fvg_direction",
+                    "gap_size_pct",
+                    "fill_pct",
+                    "upper_price",
+                    "lower_price",
+                    "mid_price",
+            )
+        )
+        ):
+            domain_data["fair_value_gap"] = event_payload
+            domain_data.setdefault("fvg", event_payload)
+
+        if "trend" not in domain_data and (
+                "trend" in topic
+                or any(
+            key in payload
+            for key in (
+                    "trend_direction",
+                    "trend_regime",
+                    "continuation_probability",
+                    "reversal_risk",
+                    "exhaustion_score",
+                    "overall_trend_score",
+            )
+        )
+        ):
+            domain_data["trend"] = event_payload
+
+        if "liquidity_levels" not in domain_data and (
+                "liquidity_levels" in topic
+                or any(
+            key in payload
+            for key in (
+                    "liquidity_touched",
+                    "liquidity_swept",
+                    "liquidity_reclaimed",
+                    "stop_run",
+                    "failed_breakout",
+            )
+        )
+        ):
+            domain_data["liquidity_levels"] = event_payload
+
+        current_price = value_for(
+            "current_price",
+            "price",
+            "last_price",
+            "close",
+            default=None,
+        )
+        if current_price is not None:
+            domain_data.setdefault("current_price", current_price)
+            domain_data.setdefault("last_price", current_price)
+            domain_data.setdefault("price", current_price)
+
+        timestamp_value = value_for(
+            "timestamp",
+            "event_time",
+            "updated_at",
+            "created_at",
+            default=None,
+        )
+        if timestamp_value is not None:
+            domain_data.setdefault("timestamp", timestamp_value)
+
+        domain_data.setdefault("raw", dict(payload))
+
+    def _augment_spoofing_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        composite = mapping_for(
+            "composite",
+            "spoofing",
+            "snapshot",
+            "result",
+        )
+        signal = mapping_for(
+            "signal",
+            "spoofing_signal",
+            "analytics_signal",
+            "event",
+        )
+        features = mapping_for(
+            "features",
+            "spoofing_features",
+        )
+        detector_results = mapping_for(
+            "detector_results",
+            "detectors",
+            "detector_result",
+        )
+        score_breakdown = mapping_for(
+            "score_breakdown",
+            "scores",
+            "score_components",
+        )
+        analytics_metadata = mapping_for(
+            "analytics_metadata",
+            "metadata",
+        )
+
+        if composite is not None:
+            domain_data.setdefault("composite", composite)
+            domain_data.setdefault("spoofing", composite)
+            domain_data.setdefault("snapshot", composite)
+            domain_data.setdefault("result", composite)
+
+        if signal is not None:
+            domain_data.setdefault("signal", signal)
+            domain_data.setdefault("spoofing_signal", signal)
+            domain_data.setdefault("analytics_signal", signal)
+
+        if features is not None:
+            domain_data.setdefault("features", features)
+            domain_data.setdefault("spoofing_features", features)
+
+        if detector_results is not None:
+            domain_data.setdefault("detector_results", detector_results)
+            domain_data.setdefault("detectors", detector_results)
+
+        if score_breakdown is not None:
+            domain_data.setdefault("score_breakdown", score_breakdown)
+            domain_data.setdefault("scores", score_breakdown)
+            domain_data.setdefault("score_components", score_breakdown)
+
+        if analytics_metadata is not None:
+            domain_data.setdefault("analytics_metadata", analytics_metadata)
+            domain_data.setdefault("metadata", analytics_metadata)
+
+        if "signal" not in domain_data and (
+                "spoofing_type" in payload
+                or "type" in payload
+                or "pattern" in payload
+                or "side" in payload
+                or "score" in payload
+                or "confidence" in payload
+                or "pull_ratio" in payload
+                or "fill_ratio" in payload
+        ):
+            domain_data["signal"] = dict(payload)
+            domain_data.setdefault("spoofing_signal", domain_data["signal"])
+
+        if "features" not in domain_data and (
+                "pull_ratio" in payload
+                or "fill_ratio" in payload
+                or "price_reaction_bps" in payload
+                or "lifetime_ms" in payload
+                or "wall_notional" in payload
+                or "pulled_notional" in payload
+                or "cancel_to_fill_ratio" in payload
+                or "distance_from_mid_bps" in payload
+                or "layer_count" in payload
+                or "layer_price_span_bps" in payload
+                or "pressure_flip_strength" in payload
+        ):
+            domain_data["features"] = {
+                "pull_ratio": payload.get("pull_ratio"),
+                "fill_ratio": payload.get("fill_ratio"),
+                "price_reaction_bps": payload.get("price_reaction_bps"),
+                "signed_price_reaction_bps": payload.get(
+                    "signed_price_reaction_bps",
+                    payload.get("price_reaction_bps"),
+                ),
+                "lifetime_ms": payload.get("lifetime_ms"),
+                "wall_notional": payload.get("wall_notional"),
+                "pulled_notional": payload.get("pulled_notional"),
+                "cancel_to_fill_ratio": payload.get("cancel_to_fill_ratio"),
+                "distance_from_mid_bps": payload.get("distance_from_mid_bps"),
+                "layer_count": payload.get("layer_count"),
+                "layer_price_span_bps": payload.get("layer_price_span_bps"),
+                "pressure_flip_strength": payload.get("pressure_flip_strength"),
+            }
+            domain_data.setdefault("spoofing_features", domain_data["features"])
+
+        domain_data.setdefault("raw", dict(payload))
+
+    def _augment_spreads_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        snapshot = mapping_for(
+            "snapshot",
+            "spread_snapshot",
+            "spot_futures",
+            "spot_futures_snapshot",
+            "cross_exchange",
+            "cross_exchange_snapshot",
+            "result",
+        )
+        signal = mapping_for(
+            "signal",
+            "spread_signal",
+            "analytics_signal",
+            "event",
+        )
+        opportunity = mapping_for(
+            "opportunity",
+            "arbitrage_opportunity",
+            "arb_opportunity",
+        )
+        metadata = mapping_for(
+            "metadata",
+            "spread_metadata",
+        )
+
+        if snapshot is not None:
+            domain_data.setdefault("snapshot", snapshot)
+            domain_data.setdefault("spread_snapshot", snapshot)
+            domain_data.setdefault("result", snapshot)
+
+        if signal is not None:
+            domain_data.setdefault("signal", signal)
+            domain_data.setdefault("spread_signal", signal)
+            domain_data.setdefault("analytics_signal", signal)
+
+        if opportunity is not None:
+            domain_data.setdefault("opportunity", opportunity)
+            domain_data.setdefault("arbitrage_opportunity", opportunity)
+            domain_data.setdefault("arb_opportunity", opportunity)
+
+        if metadata is not None:
+            domain_data.setdefault("metadata", metadata)
+            domain_data.setdefault("spread_metadata", metadata)
+
+        if "snapshot" not in domain_data and (
+                "spread_type" in payload
+                or "spread_bps" in payload
+                or "basis" in payload
+                or "funding_adjusted_spread" in payload
+                or "zscore" in payload
+                or "regime" in payload
+                or "quote_validity" in payload
+        ):
+            domain_data["snapshot"] = dict(payload)
+            domain_data.setdefault("spread_snapshot", domain_data["snapshot"])
+
+        if "signal" not in domain_data and (
+                "signal_type" in payload
+                or "spread_signal_type" in payload
+                or "direction" in payload
+                or "spread_direction" in payload
+                or "confidence" in payload
+        ):
+            domain_data["signal"] = dict(payload)
+            domain_data.setdefault("spread_signal", domain_data["signal"])
+
+        if "opportunity" not in domain_data and (
+                "opportunity_key" in payload
+                or "net_edge" in payload
+                or "net_edge_bps" in payload
+                or "buy_exchange" in payload
+                or "sell_exchange" in payload
+                or "opportunity_status" in payload
+        ):
+            domain_data["opportunity"] = dict(payload)
+            domain_data.setdefault("arbitrage_opportunity", domain_data["opportunity"])
+
+        domain_data.setdefault("raw", dict(payload))
+
+    def _augment_whales_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        for target, aliases in {
+            "composite": (
+                    "composite",
+                    "whales",
+                    "snapshot",
+                    "result",
+            ),
+            "activity": (
+                    "activity",
+                    "whale_activity",
+                    "activity_context",
+            ),
+            "pressure": (
+                    "pressure",
+                    "whale_pressure",
+                    "pressure_context",
+            ),
+            "large_trade": (
+                    "large_trade",
+                    "large_trade_event",
+                    "large_trade_context",
+            ),
+            "cluster": (
+                    "cluster",
+                    "whale_cluster",
+                    "cluster_context",
+            ),
+            "liquidation_context": (
+                    "liquidation_context",
+                    "whale_liquidation_context",
+                    "liquidations",
+                    "liquidation",
+            ),
+            "exhaustion": (
+                    "exhaustion",
+                    "cluster_exhaustion",
+                    "exhaustion_context",
+            ),
+            "signal": (
+                    "signal",
+                    "whale_signal",
+                    "analytics_signal",
+                    "event",
+            ),
+        }.items():
+            value = mapping_for(*aliases)
+            if value is not None:
+                domain_data.setdefault(target, value)
+                for alias in aliases:
+                    domain_data.setdefault(alias, value)
+
+        if "composite" not in domain_data and (
+                "whale_side" in payload
+                or "activity_notional" in payload
+                or "pressure_score" in payload
+                or "cluster_score" in payload
+                or "liquidation_context_strength" in payload
+                or "exhaustion_probability" in payload
+        ):
+            domain_data["composite"] = dict(payload)
+            domain_data.setdefault("whales", domain_data["composite"])
+            domain_data.setdefault("snapshot", domain_data["composite"])
+
+        if "activity" not in domain_data and (
+                "activity_notional" in payload
+                or "activity_trade_count" in payload
+                or "activity_side" in payload
+                or "whale_activity" in payload
+        ):
+            domain_data["activity"] = dict(payload)
+            domain_data.setdefault("whale_activity", domain_data["activity"])
+
+        if "pressure" not in domain_data and (
+                "pressure_score" in payload
+                or "pressure_side" in payload
+                or "pressure_imbalance_ratio" in payload
+                or "whale_pressure" in payload
+        ):
+            domain_data["pressure"] = dict(payload)
+            domain_data.setdefault("whale_pressure", domain_data["pressure"])
+
+        if "large_trade" not in domain_data and (
+                "large_trade_notional" in payload
+                or "large_trade_zscore" in payload
+                or "large_trade_side" in payload
+        ):
+            domain_data["large_trade"] = dict(payload)
+            domain_data.setdefault("large_trade_event", domain_data["large_trade"])
+
+        if "cluster" not in domain_data and (
+                "cluster_score" in payload
+                or "cluster_side" in payload
+                or "continuation_probability" in payload
+                or "exhaustion_probability" in payload
+        ):
+            domain_data["cluster"] = dict(payload)
+            domain_data.setdefault("whale_cluster", domain_data["cluster"])
+
+        if "liquidation_context" not in domain_data and (
+                "liquidation_side" in payload
+                or "liquidation_notional" in payload
+                or "total_liquidation_notional" in payload
+                or "liquidation_context_strength" in payload
+        ):
+            domain_data["liquidation_context"] = dict(payload)
+            domain_data.setdefault(
+                "whale_liquidation_context",
+                domain_data["liquidation_context"],
+            )
+
+        if "exhaustion" not in domain_data and (
+                "exhaustion_probability" in payload
+                or "exhaustion_side" in payload
+        ):
+            domain_data["exhaustion"] = dict(payload)
+            domain_data.setdefault("cluster_exhaustion", domain_data["exhaustion"])
+
+        if "signal" not in domain_data and (
+                "side" in payload
+                or "whale_side" in payload
+                or "score" in payload
+                or "confidence" in payload
+        ):
+            domain_data["signal"] = dict(payload)
+            domain_data.setdefault("whale_signal", domain_data["signal"])
+
+        domain_data.setdefault("raw", dict(payload))
+        
     def _augment_domain_data_contracts(
             self,
             *,
@@ -537,8 +1673,154 @@ class SignalNormalizer(BaseStrategyComponent):
                 payload=payload,
                 domain_data=domain_data,
             )
+        elif source is FeatureSource.LIQUIDATIONS:
+            self._augment_liquidations_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.LIQUIDITY:
+            self._augment_liquidity_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.PRICE_ACTION:
+            self._augment_price_action_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.SPOOFING:
+            self._augment_spoofing_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.SPREADS:
+            self._augment_spreads_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.WHALES:
+            self._augment_whales_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
 
         return domain_data
+
+    def _build_hybrid_contract_features(
+            self,
+            *,
+            source: FeatureSource,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=source,  # важливо: НЕ FeatureSource.HYBRID
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "hybrid",
+                        "trigger_source": getattr(source, "value", str(source)),
+                    },
+                )
+            )
+
+        dominant_side = value_for(
+            "hybrid.dominant_side",
+            "dominant_side",
+            "side",
+            "bias",
+            "direction",
+            default="unknown",
+        )
+        alignment_score = value_for(
+            "hybrid.alignment_score",
+            "alignment_score",
+            "alignment",
+            default=0.0,
+        )
+        conflict_score = value_for(
+            "hybrid.conflict_score",
+            "conflict_score",
+            "conflict",
+            default=0.0,
+        )
+        confluence_score = value_for(
+            "hybrid.confluence_score",
+            "confluence_score",
+            "confluence",
+            "score",
+            default=0.0,
+        )
+        hybrid_confidence = value_for(
+            "hybrid.confidence",
+            "hybrid_confidence",
+            "confidence",
+            default=confidence,
+        )
+        votes = value_for(
+            "hybrid.votes",
+            "votes",
+            default=[],
+        )
+
+        add("hybrid.dominant_side", dominant_side)
+        add("hybrid.alignment_score", alignment_score)
+        add("hybrid.conflict_score", conflict_score)
+        add("hybrid.confluence_score", confluence_score)
+        add("hybrid.confidence", hybrid_confidence)
+        add("hybrid.votes", votes)
+
+        for domain_name in (
+                "orderflow",
+                "liquidity",
+                "liquidations",
+                "whales",
+                "open_interest",
+                "funding",
+                "price_action",
+                "spoofing",
+                "spreads",
+        ):
+            value = value_for(
+                f"hybrid.{domain_name}",
+                domain_name,
+                f"hybrid_{domain_name}",
+                default=None,
+            )
+            if value is not None:
+                add(f"hybrid.{domain_name}", value)
+
+        add("hybrid.symbol", value_for("hybrid.symbol", "symbol", default=symbol))
+        add("hybrid.exchange", value_for("hybrid.exchange", "exchange", default="unknown"))
+        add("hybrid.market_type", value_for("hybrid.market_type", "market_type", default="usdm_futures"))
+        add("hybrid.timeframe", value_for("hybrid.timeframe", "timeframe", default=None))
+        add("hybrid.exchange_symbol", value_for("hybrid.exchange_symbol", "exchange_symbol", default=symbol))
+        add("hybrid.timestamp", value_for("hybrid.timestamp", "timestamp", default=timestamp))
+
+        return result
+
     def normalize_event(
         self,
         *,
@@ -800,21 +2082,2186 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+
         if source is FeatureSource.OPEN_INTEREST:
-            return self._build_open_interest_contract_features(
-                symbol=symbol,
-                payload=payload,
-                timestamp=timestamp,
-            )
-        if source is FeatureSource.FUNDING:
-            return self._build_funding_contract_features(
-                symbol=symbol,
-                payload=payload,
-                timestamp=timestamp,
+            result.extend(
+                self._build_open_interest_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
             )
 
-        return []
+        elif source is FeatureSource.FUNDING:
+            result.extend(
+                self._build_funding_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
 
+        elif source is FeatureSource.ORDERFLOW:
+            result.extend(
+                self._build_orderflow_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+
+        elif source is FeatureSource.LIQUIDATIONS:
+            result.extend(
+                self._build_liquidations_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+        elif source is FeatureSource.LIQUIDITY:
+            result.extend(
+                self._build_liquidity_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+        elif source is FeatureSource.PRICE_ACTION:
+            result.extend(
+                self._build_price_action_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+        elif source is FeatureSource.SPOOFING:
+            result.extend(
+                self._build_spoofing_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+        elif source is FeatureSource.SPREADS:
+            result.extend(
+                self._build_spreads_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+        elif source is FeatureSource.WHALES:
+            result.extend(
+                self._build_whales_contract_features(
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+
+        if source in {
+            FeatureSource.OPEN_INTEREST,
+            FeatureSource.FUNDING,
+            FeatureSource.ORDERFLOW,
+            FeatureSource.LIQUIDITY,
+            FeatureSource.LIQUIDATIONS,
+            FeatureSource.WHALES,
+            FeatureSource.PRICE_ACTION,
+            FeatureSource.SPOOFING,
+            FeatureSource.SPREADS,
+        }:
+            result.extend(
+                self._build_hybrid_contract_features(
+                    source=source,
+                    symbol=symbol,
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+            )
+
+        return result
+
+    def _build_whales_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        composite = mapping_for(
+            "composite",
+            "whales",
+            "snapshot",
+            "result",
+        )
+        activity = mapping_for(
+            "activity",
+            "whale_activity",
+            "activity_context",
+        )
+        pressure = mapping_for(
+            "pressure",
+            "whale_pressure",
+            "pressure_context",
+        )
+        large_trade = mapping_for(
+            "large_trade",
+            "large_trade_event",
+            "large_trade_context",
+        )
+        cluster = mapping_for(
+            "cluster",
+            "whale_cluster",
+            "cluster_context",
+        )
+        liquidation_context = mapping_for(
+            "liquidation_context",
+            "whale_liquidation_context",
+            "liquidations",
+            "liquidation",
+        )
+        exhaustion = mapping_for(
+            "exhaustion",
+            "cluster_exhaustion",
+            "exhaustion_context",
+        )
+        signal = mapping_for(
+            "signal",
+            "whale_signal",
+            "analytics_signal",
+            "event",
+        )
+
+        if composite:
+            if not activity:
+                for key in ("activity", "whale_activity", "activity_context"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        activity = value
+                        break
+
+            if not pressure:
+                for key in ("pressure", "whale_pressure", "pressure_context"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        pressure = value
+                        break
+
+            if not large_trade:
+                for key in ("large_trade", "large_trade_event", "large_trade_context"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        large_trade = value
+                        break
+
+            if not cluster:
+                for key in ("cluster", "whale_cluster", "cluster_context"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        cluster = value
+                        break
+
+            if not liquidation_context:
+                for key in (
+                        "liquidation_context",
+                        "whale_liquidation_context",
+                        "liquidations",
+                        "liquidation",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        liquidation_context = value
+                        break
+
+            if not exhaustion:
+                for key in ("exhaustion", "cluster_exhaustion", "exhaustion_context"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        exhaustion = value
+                        break
+
+            if not signal:
+                for key in ("signal", "whale_signal", "analytics_signal", "event"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        signal = value
+                        break
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in signal:
+                    return signal[key]
+                if key in activity:
+                    return activity[key]
+                if key in pressure:
+                    return pressure[key]
+                if key in large_trade:
+                    return large_trade[key]
+                if key in cluster:
+                    return cluster[key]
+                if key in liquidation_context:
+                    return liquidation_context[key]
+                if key in exhaustion:
+                    return exhaustion[key]
+                if key in composite:
+                    return composite[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.WHALES,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "whales",
+                    },
+                )
+            )
+
+        # Main sections
+        add("whales.composite", composite or payload)
+        add("whales.signal", signal)
+        add("whales.activity", activity)
+        add("whales.pressure", pressure)
+        add("whales.large_trade", large_trade)
+        add("whales.cluster", cluster)
+        add("whales.liquidation_context", liquidation_context)
+        add("whales.exhaustion", exhaustion)
+
+        # Common identity / direction
+        add(
+            "whales.side",
+            value_for(
+                "side",
+                "whale_side",
+                "direction",
+                "bias",
+                default=None,
+            ),
+        )
+        add(
+            "whales.score",
+            value_for(
+                "score",
+                "whale_score",
+                default=0.0,
+            ),
+        )
+        add(
+            "whales.confidence",
+            value_for(
+                "confidence",
+                "whale_confidence",
+                default=0.0,
+            ),
+        )
+        add(
+            "whales.event_time",
+            value_for(
+                "event_time",
+                "timestamp",
+                "created_at",
+                "time",
+                default=timestamp,
+            ),
+        )
+
+        # Activity
+        add(
+            "whales.activity.notional",
+            nested_value(
+                activity,
+                "notional",
+                "total_notional",
+                "total_notional_usd",
+                default=value_for(
+                    "activity_notional",
+                    "total_notional",
+                    "total_notional_usd",
+                    default=0.0,
+                ),
+            ),
+        )
+        add(
+            "whales.activity.trade_count",
+            nested_value(
+                activity,
+                "trade_count",
+                "trades_count",
+                "event_count",
+                default=value_for("activity_trade_count", "trade_count", default=0),
+            ),
+        )
+        add(
+            "whales.activity.side",
+            nested_value(
+                activity,
+                "side",
+                "dominant_side",
+                default=value_for("activity_side", "dominant_side", default=None),
+            ),
+        )
+        add(
+            "whales.activity.score",
+            nested_value(
+                activity,
+                "score",
+                default=value_for("activity_score", default=0.0),
+            ),
+        )
+
+        # Pressure
+        add(
+            "whales.pressure.side",
+            nested_value(
+                pressure,
+                "side",
+                "dominant_side",
+                default=value_for("pressure_side", "dominant_side", default=None),
+            ),
+        )
+        add(
+            "whales.pressure.score",
+            nested_value(
+                pressure,
+                "score",
+                "pressure_score",
+                default=value_for("pressure_score", default=0.0),
+            ),
+        )
+        add(
+            "whales.pressure.imbalance_ratio",
+            nested_value(
+                pressure,
+                "imbalance_ratio",
+                "pressure_imbalance_ratio",
+                default=value_for("pressure_imbalance_ratio", default=0.0),
+            ),
+        )
+
+        # Large trade
+        add(
+            "whales.large_trade.notional",
+            nested_value(
+                large_trade,
+                "notional",
+                "notional_usd",
+                default=value_for("large_trade_notional", "notional_usd", default=0.0),
+            ),
+        )
+        add(
+            "whales.large_trade.zscore",
+            nested_value(
+                large_trade,
+                "zscore",
+                "z_score",
+                default=value_for("large_trade_zscore", "zscore", default=0.0),
+            ),
+        )
+        add(
+            "whales.large_trade.side",
+            nested_value(
+                large_trade,
+                "side",
+                "trade_side",
+                default=value_for("large_trade_side", "trade_side", default=None),
+            ),
+        )
+
+        # Cluster
+        add(
+            "whales.cluster.score",
+            nested_value(
+                cluster,
+                "score",
+                "cluster_score",
+                default=value_for("cluster_score", default=0.0),
+            ),
+        )
+        add(
+            "whales.cluster.side",
+            nested_value(
+                cluster,
+                "side",
+                "cluster_side",
+                "dominant_side",
+                default=value_for("cluster_side", default=None),
+            ),
+        )
+        add(
+            "whales.cluster.continuation_probability",
+            nested_value(
+                cluster,
+                "continuation_probability",
+                "continuation_prob",
+                default=value_for("continuation_probability", default=0.0),
+            ),
+        )
+        add(
+            "whales.cluster.exhaustion_probability",
+            nested_value(
+                cluster,
+                "exhaustion_probability",
+                "exhaustion_prob",
+                default=value_for("exhaustion_probability", default=0.0),
+            ),
+        )
+
+        # Liquidation context
+        add(
+            "whales.liquidation_context.side",
+            nested_value(
+                liquidation_context,
+                "side",
+                "liquidation_side",
+                default=value_for("liquidation_side", default=None),
+            ),
+        )
+        add(
+            "whales.liquidation_context.notional",
+            nested_value(
+                liquidation_context,
+                "notional",
+                "notional_usd",
+                "total_notional_usd",
+                default=value_for(
+                    "liquidation_notional",
+                    "total_liquidation_notional",
+                    default=0.0,
+                ),
+            ),
+        )
+        add(
+            "whales.liquidation_context.strength",
+            nested_value(
+                liquidation_context,
+                "strength",
+                "context_strength",
+                default=value_for("liquidation_context_strength", "context_strength", default=0.0),
+            ),
+        )
+
+        # Exhaustion
+        add(
+            "whales.exhaustion.probability",
+            nested_value(
+                exhaustion,
+                "probability",
+                "exhaustion_probability",
+                default=value_for("exhaustion_probability", default=0.0),
+            ),
+        )
+        add(
+            "whales.exhaustion.side",
+            nested_value(
+                exhaustion,
+                "side",
+                "exhaustion_side",
+                default=value_for("exhaustion_side", default=None),
+            ),
+        )
+
+        return result
+
+    def _build_spreads_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        snapshot = mapping_for(
+            "snapshot",
+            "spread_snapshot",
+            "spot_futures",
+            "spot_futures_snapshot",
+            "cross_exchange",
+            "cross_exchange_snapshot",
+            "result",
+        )
+        signal = mapping_for(
+            "signal",
+            "spread_signal",
+            "analytics_signal",
+            "event",
+        )
+        opportunity = mapping_for(
+            "opportunity",
+            "arbitrage_opportunity",
+            "arb_opportunity",
+        )
+        metadata = mapping_for(
+            "metadata",
+            "spread_metadata",
+        )
+
+        if snapshot:
+            if not signal:
+                for key in ("signal", "spread_signal", "analytics_signal", "event"):
+                    value = snapshot.get(key)
+                    if isinstance(value, dict):
+                        signal = value
+                        break
+
+            if not opportunity:
+                for key in ("opportunity", "arbitrage_opportunity", "arb_opportunity"):
+                    value = snapshot.get(key)
+                    if isinstance(value, dict):
+                        opportunity = value
+                        break
+
+            if not metadata:
+                for key in ("metadata", "spread_metadata"):
+                    value = snapshot.get(key)
+                    if isinstance(value, dict):
+                        metadata = value
+                        break
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in signal:
+                    return signal[key]
+                if key in opportunity:
+                    return opportunity[key]
+                if key in snapshot:
+                    return snapshot[key]
+                if key in metadata:
+                    return metadata[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.SPREADS,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "spreads",
+                    },
+                )
+            )
+
+        # Main sections
+        add("spreads.snapshot", snapshot or payload)
+        add("spreads.signal", signal)
+        add("spreads.opportunity", opportunity)
+
+        # Identity
+        add(
+            "spreads.type",
+            value_for(
+                "spread_type",
+                "type",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.symbol",
+            value_for(
+                "symbol",
+                default=symbol,
+            ),
+        )
+
+        # Legs / venues
+        add(
+            "spreads.exchange_a",
+            value_for(
+                "exchange_a",
+                "spot_exchange",
+                "buy_exchange",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.exchange_b",
+            value_for(
+                "exchange_b",
+                "futures_exchange",
+                "sell_exchange",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.market_type_a",
+            value_for(
+                "market_type_a",
+                "spot_market_type",
+                "buy_market_type",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.market_type_b",
+            value_for(
+                "market_type_b",
+                "futures_market_type",
+                "sell_market_type",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.exchange_symbol_a",
+            value_for(
+                "exchange_symbol_a",
+                "symbol_a",
+                "buy_exchange_symbol",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.exchange_symbol_b",
+            value_for(
+                "exchange_symbol_b",
+                "symbol_b",
+                "sell_exchange_symbol",
+                default=None,
+            ),
+        )
+
+        # Spread metrics
+        add(
+            "spreads.spread_bps",
+            value_for(
+                "spread_bps",
+                "basis_bps",
+                default=0.0,
+            ),
+        )
+        add(
+            "spreads.basis",
+            value_for(
+                "basis",
+                "basis_value",
+                default=0.0,
+            ),
+        )
+        add(
+            "spreads.funding_adjusted_spread",
+            value_for(
+                "funding_adjusted_spread",
+                "funding_adjusted_edge",
+                default=0.0,
+            ),
+        )
+        add(
+            "spreads.net_edge",
+            value_for(
+                "net_edge",
+                "edge",
+                default=0.0,
+            ),
+        )
+        add(
+            "spreads.net_edge_bps",
+            value_for(
+                "net_edge_bps",
+                "edge_bps",
+                default=0.0,
+            ),
+        )
+        add(
+            "spreads.zscore",
+            value_for(
+                "zscore",
+                "z_score",
+                default=0.0,
+            ),
+        )
+
+        # Signal / regime
+        add(
+            "spreads.regime",
+            value_for(
+                "regime",
+                "spread_regime",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.direction",
+            value_for(
+                "direction",
+                "spread_direction",
+                "bias",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.signal_type",
+            value_for(
+                "signal_type",
+                "spread_signal_type",
+                "type",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.quote_validity",
+            value_for(
+                "quote_validity",
+                "validity",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.has_edge",
+            value_for(
+                "has_edge",
+                "tradeable_edge",
+                default=False,
+            ),
+        )
+        add(
+            "spreads.confidence",
+            value_for(
+                "confidence",
+                "signal_confidence",
+                default=0.0,
+            ),
+        )
+
+        # Opportunity
+        add(
+            "spreads.opportunity_key",
+            value_for(
+                "opportunity_key",
+                "key",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.opportunity_status",
+            value_for(
+                "opportunity_status",
+                "status",
+                default=None,
+            ),
+        )
+        add(
+            "spreads.persistence_ms",
+            value_for(
+                "persistence_ms",
+                "duration_ms",
+                default=0,
+            ),
+        )
+
+        # Arbitrage leg direction
+        add(
+            "spreads.buy_exchange",
+            value_for(
+                "buy_exchange",
+                default=nested_value(opportunity, "buy_exchange"),
+            ),
+        )
+        add(
+            "spreads.sell_exchange",
+            value_for(
+                "sell_exchange",
+                default=nested_value(opportunity, "sell_exchange"),
+            ),
+        )
+        add(
+            "spreads.buy_market_type",
+            value_for(
+                "buy_market_type",
+                default=nested_value(opportunity, "buy_market_type"),
+            ),
+        )
+        add(
+            "spreads.sell_market_type",
+            value_for(
+                "sell_market_type",
+                default=nested_value(opportunity, "sell_market_type"),
+            ),
+        )
+
+        # Instrument type compatibility
+        add(
+            "spreads.leg_a.instrument_type",
+            value_for(
+                "leg_a_instrument_type",
+                "instrument_type_a",
+                default=nested_value(snapshot, "leg_a", default={}).get("instrument_type")
+                if isinstance(nested_value(snapshot, "leg_a", default={}), dict)
+                else None,
+            ),
+        )
+        add(
+            "spreads.leg_b.instrument_type",
+            value_for(
+                "leg_b_instrument_type",
+                "instrument_type_b",
+                default=nested_value(snapshot, "leg_b", default={}).get("instrument_type")
+                if isinstance(nested_value(snapshot, "leg_b", default={}), dict)
+                else None,
+            ),
+        )
+        add(
+            "spreads.instrument_type",
+            value_for(
+                "instrument_type",
+                default=None,
+            ),
+        )
+
+        add("spreads.metadata", metadata)
+
+        return result
+
+    def _build_spoofing_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        composite = mapping_for(
+            "composite",
+            "spoofing",
+            "snapshot",
+            "result",
+        )
+        signal = mapping_for(
+            "signal",
+            "spoofing_signal",
+            "analytics_signal",
+            "event",
+        )
+        features = mapping_for(
+            "features",
+            "spoofing_features",
+        )
+        detector_results = mapping_for(
+            "detector_results",
+            "detectors",
+            "detector_result",
+        )
+        score_breakdown = mapping_for(
+            "score_breakdown",
+            "scores",
+            "score_components",
+        )
+        analytics_metadata = mapping_for(
+            "analytics_metadata",
+            "metadata",
+        )
+
+        if composite:
+            if not signal:
+                for key in ("signal", "spoofing_signal", "analytics_signal", "event"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        signal = value
+                        break
+
+            if not features:
+                for key in ("features", "spoofing_features"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        features = value
+                        break
+
+            if not detector_results:
+                for key in ("detector_results", "detectors", "detector_result"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        detector_results = value
+                        break
+
+            if not score_breakdown:
+                for key in ("score_breakdown", "scores", "score_components"):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        score_breakdown = value
+                        break
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in signal:
+                    return signal[key]
+                if key in features:
+                    return features[key]
+                if key in composite:
+                    return composite[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.SPOOFING,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "spoofing",
+                    },
+                )
+            )
+
+        # Composite / signal
+        add("spoofing.composite", composite or payload)
+        add("spoofing.signal", signal or payload)
+
+        # Nested contract sections
+        add("spoofing.features", features)
+        add("spoofing.detector_results", detector_results)
+        add("spoofing.score_breakdown", score_breakdown)
+        add("spoofing.analytics_metadata", analytics_metadata)
+
+        # Core signal identity
+        add(
+            "spoofing.type",
+            value_for(
+                "spoofing_type",
+                "type",
+                "signal_type",
+                default=None,
+            ),
+        )
+        add(
+            "spoofing.pattern",
+            value_for(
+                "pattern",
+                "spoofing_pattern",
+                default=None,
+            ),
+        )
+        add(
+            "spoofing.side",
+            value_for(
+                "side",
+                "spoofing_side",
+                "direction",
+                "bias",
+                default=None,
+            ),
+        )
+        add(
+            "spoofing.severity",
+            value_for(
+                "severity",
+                "spoofing_severity",
+                default=None,
+            ),
+        )
+        add(
+            "spoofing.status",
+            value_for(
+                "status",
+                "spoofing_status",
+                default=None,
+            ),
+        )
+
+        # Scores
+        add(
+            "spoofing.score",
+            value_for(
+                "score",
+                "spoofing_score",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.confidence",
+            value_for(
+                "confidence",
+                "spoofing_confidence",
+                default=0.0,
+            ),
+        )
+
+        # Position / wall identity
+        add(
+            "spoofing.price_level",
+            value_for(
+                "price_level",
+                "level",
+                "wall_price",
+                default=None,
+            ),
+        )
+        add(
+            "spoofing.wall_id",
+            value_for(
+                "wall_id",
+                "id",
+                "order_id",
+                default=None,
+            ),
+        )
+        add(
+            "spoofing.event_time",
+            value_for(
+                "event_time",
+                "timestamp",
+                "created_at",
+                "time",
+                default=timestamp,
+            ),
+        )
+
+        # Feature metrics
+        add(
+            "spoofing.features.pull_ratio",
+            value_for(
+                "pull_ratio",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.fill_ratio",
+            value_for(
+                "fill_ratio",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.price_reaction_bps",
+            value_for(
+                "price_reaction_bps",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.signed_price_reaction_bps",
+            value_for(
+                "signed_price_reaction_bps",
+                "price_reaction_bps",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.lifetime_ms",
+            value_for(
+                "lifetime_ms",
+                "wall_lifetime_ms",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.wall_notional",
+            value_for(
+                "wall_notional",
+                "notional",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.pulled_notional",
+            value_for(
+                "pulled_notional",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.cancel_to_fill_ratio",
+            value_for(
+                "cancel_to_fill_ratio",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.distance_from_mid_bps",
+            value_for(
+                "distance_from_mid_bps",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.layer_count",
+            value_for(
+                "layer_count",
+                "layers_count",
+                default=0,
+            ),
+        )
+        add(
+            "spoofing.features.layer_price_span_bps",
+            value_for(
+                "layer_price_span_bps",
+                default=0.0,
+            ),
+        )
+        add(
+            "spoofing.features.pressure_flip_strength",
+            value_for(
+                "pressure_flip_strength",
+                "flip_strength",
+                default=0.0,
+            ),
+        )
+
+        return result
+
+    def _build_price_action_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        state = mapping_for(
+            "state",
+            "composite",
+            "price_action",
+            "snapshot",
+            "result",
+        )
+        market_structure = mapping_for(
+            "market_structure",
+            "structure",
+            "ms",
+        )
+        support_resistance = mapping_for(
+            "support_resistance",
+            "sr",
+            "levels",
+        )
+        fair_value_gap = mapping_for(
+            "fair_value_gap",
+            "fvg",
+            "fair_value_gaps",
+        )
+        trend = mapping_for(
+            "trend",
+            "trend_state",
+        )
+        liquidity_levels = mapping_for(
+            "liquidity_levels",
+            "liquidity",
+        )
+
+        if state:
+            if not market_structure:
+                for key in ("market_structure", "structure", "ms"):
+                    value = state.get(key)
+                    if isinstance(value, dict):
+                        market_structure = value
+                        break
+
+            if not support_resistance:
+                for key in ("support_resistance", "sr", "levels"):
+                    value = state.get(key)
+                    if isinstance(value, dict):
+                        support_resistance = value
+                        break
+
+            if not fair_value_gap:
+                for key in ("fair_value_gap", "fvg", "fair_value_gaps"):
+                    value = state.get(key)
+                    if isinstance(value, dict):
+                        fair_value_gap = value
+                        break
+
+            if not trend:
+                for key in ("trend", "trend_state"):
+                    value = state.get(key)
+                    if isinstance(value, dict):
+                        trend = value
+                        break
+
+            if not liquidity_levels:
+                for key in ("liquidity_levels", "liquidity"):
+                    value = state.get(key)
+                    if isinstance(value, dict):
+                        liquidity_levels = value
+                        break
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in state:
+                    return state[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.PRICE_ACTION,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "price_action",
+                    },
+                )
+            )
+
+        current_price = value_for(
+            "current_price",
+            "price",
+            "last_price",
+            "close",
+            default=None,
+        )
+
+        # Composite / global
+        add("price_action.composite", state or payload)
+        add("price_action.current_price", current_price)
+        add(
+            "price_action.last_price",
+            value_for(
+                "last_price",
+                "price",
+                "close",
+                default=current_price,
+            ),
+        )
+        add(
+            "price_action.timestamp",
+            value_for(
+                "timestamp",
+                "event_time",
+                default=timestamp,
+            ),
+        )
+
+        # Market structure
+        add("price_action.market_structure", market_structure or payload)
+        add(
+            "price_action.market_structure.internal",
+            nested_value(
+                market_structure,
+                "internal",
+                default={},
+            ),
+        )
+        add(
+            "price_action.market_structure.external",
+            nested_value(
+                market_structure,
+                "external",
+                default={},
+            ),
+        )
+        add(
+            "price_action.market_structure.last_break_event",
+            nested_value(
+                market_structure,
+                "last_break_event",
+                "last_event",
+                "event",
+                default=value_for("last_break_event", "event", default=None),
+            ),
+        )
+        add(
+            "price_action.market_structure.mtf_alignment",
+            nested_value(
+                market_structure,
+                "mtf_alignment",
+                "multi_timeframe_alignment",
+                default=value_for("mtf_alignment", default=0.0),
+            ),
+        )
+
+        # Support / resistance
+        add("price_action.support_resistance", support_resistance or payload)
+        add(
+            "price_action.support_resistance.internal",
+            nested_value(
+                support_resistance,
+                "internal",
+                default={},
+            ),
+        )
+        add(
+            "price_action.support_resistance.external",
+            nested_value(
+                support_resistance,
+                "external",
+                default={},
+            ),
+        )
+        add(
+            "price_action.support_resistance.last_event",
+            nested_value(
+                support_resistance,
+                "last_event",
+                "event",
+                default=value_for("last_event", "event", default=None),
+            ),
+        )
+        add(
+            "price_action.support_resistance.nearest_support",
+            nested_value(
+                support_resistance,
+                "nearest_support",
+                "support",
+                default=value_for("nearest_support", default=None),
+            ),
+        )
+        add(
+            "price_action.support_resistance.nearest_resistance",
+            nested_value(
+                support_resistance,
+                "nearest_resistance",
+                "resistance",
+                default=value_for("nearest_resistance", default=None),
+            ),
+        )
+
+        # Fair value gap / FVG
+        add("price_action.fair_value_gap", fair_value_gap or payload)
+        add("price_action.fvg", fair_value_gap or payload)
+        add(
+            "price_action.fair_value_gap.internal",
+            nested_value(
+                fair_value_gap,
+                "internal",
+                default={},
+            ),
+        )
+        add(
+            "price_action.fair_value_gap.external",
+            nested_value(
+                fair_value_gap,
+                "external",
+                default={},
+            ),
+        )
+        add(
+            "price_action.fair_value_gap.last_event",
+            nested_value(
+                fair_value_gap,
+                "last_event",
+                "event",
+                default=value_for("last_event", "event", default=None),
+            ),
+        )
+        add(
+            "price_action.fair_value_gap.nearest_bullish_gap",
+            nested_value(
+                fair_value_gap,
+                "nearest_bullish_gap",
+                "bullish_gap",
+                default=value_for("nearest_bullish_gap", default=None),
+            ),
+        )
+        add(
+            "price_action.fair_value_gap.nearest_bearish_gap",
+            nested_value(
+                fair_value_gap,
+                "nearest_bearish_gap",
+                "bearish_gap",
+                default=value_for("nearest_bearish_gap", default=None),
+            ),
+        )
+
+        # Trend
+        add("price_action.trend", trend or payload)
+        add(
+            "price_action.trend.internal",
+            nested_value(
+                trend,
+                "internal",
+                default={},
+            ),
+        )
+        add(
+            "price_action.trend.external",
+            nested_value(
+                trend,
+                "external",
+                default={},
+            ),
+        )
+        add(
+            "price_action.trend.last_signal",
+            nested_value(
+                trend,
+                "last_signal",
+                "last_event",
+                "event",
+                default=value_for("last_signal", "last_event", default=None),
+            ),
+        )
+        add(
+            "price_action.trend.internal_external_alignment",
+            nested_value(
+                trend,
+                "internal_external_alignment",
+                default=value_for("internal_external_alignment", default=0.0),
+            ),
+        )
+        add(
+            "price_action.trend.higher_timeframe_alignment",
+            nested_value(
+                trend,
+                "higher_timeframe_alignment",
+                "htf_alignment",
+                default=value_for(
+                    "higher_timeframe_alignment",
+                    "htf_alignment",
+                    default=0.0,
+                ),
+            ),
+        )
+        add(
+            "price_action.trend.overall_trend_score",
+            nested_value(
+                trend,
+                "overall_trend_score",
+                "score",
+                default=value_for("overall_trend_score", "score", default=0.0),
+            ),
+        )
+
+        # Price-action liquidity levels
+        add("price_action.liquidity_levels", liquidity_levels)
+
+        return result
+
+
+
+    def _build_liquidity_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        snapshot = mapping_for(
+            "snapshot",
+            "liquidity_map_snapshot",
+            "map_snapshot",
+            "last_snapshot",
+            "liquidity",
+            "result",
+        )
+        signal = mapping_for(
+            "signal",
+            "liquidity_signal",
+            "analytics_signal",
+        )
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in snapshot:
+                    return snapshot[key]
+                if key in signal:
+                    return signal[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.LIQUIDITY,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "liquidity",
+                    },
+                )
+            )
+
+        current_price = value_for(
+            "current_price",
+            "price",
+            "mark_price",
+            "last_price",
+            "close",
+        )
+
+        add("liquidity.snapshot", snapshot or payload)
+        add("liquidity.map.snapshot", snapshot or payload)
+        add("liquidity.current_price", current_price)
+
+        add(
+            "liquidity.above_liquidity_score",
+            value_for("above_liquidity_score", "above_score", default=0.0),
+        )
+        add(
+            "liquidity.below_liquidity_score",
+            value_for("below_liquidity_score", "below_score", default=0.0),
+        )
+        add(
+            "liquidity.pressure_score",
+            value_for(
+                "liquidity_pressure_score",
+                "pressure_score",
+                "liquidity_pressure",
+                default=0.0,
+            ),
+        )
+        add(
+            "liquidity.bias",
+            value_for("bias", "liquidity_bias", "direction", default=None),
+        )
+
+        sweep_risk = mapping_for("sweep_risk", "sweep_risks")
+        magnet = mapping_for("magnet", "magnets", "liquidity_magnets")
+
+        add(
+            "liquidity.sweep_risk.up",
+            nested_value(
+                sweep_risk,
+                "up",
+                "upside",
+                "above",
+                default=value_for("sweep_risk_up", "upside_sweep_risk", default=0.0),
+            ),
+        )
+        add(
+            "liquidity.sweep_risk.down",
+            nested_value(
+                sweep_risk,
+                "down",
+                "downside",
+                "below",
+                default=value_for("sweep_risk_down", "downside_sweep_risk", default=0.0),
+            ),
+        )
+        add(
+            "liquidity.magnet.up",
+            nested_value(
+                magnet,
+                "up",
+                "upside",
+                "above",
+                default=value_for("magnet_up", "upside_magnet", default=0.0),
+            ),
+        )
+        add(
+            "liquidity.magnet.down",
+            nested_value(
+                magnet,
+                "down",
+                "downside",
+                "below",
+                default=value_for("magnet_down", "downside_magnet", default=0.0),
+            ),
+        )
+
+        add(
+            "liquidity.nearest_above_level",
+            value_for("nearest_above_level", "nearest_liquidity_above"),
+        )
+        add(
+            "liquidity.nearest_below_level",
+            value_for("nearest_below_level", "nearest_liquidity_below"),
+        )
+        add(
+            "liquidity.strongest_cluster_above",
+            value_for("strongest_cluster_above"),
+        )
+        add(
+            "liquidity.strongest_cluster_below",
+            value_for("strongest_cluster_below"),
+        )
+
+        add(
+            "liquidity.equal_levels",
+            value_for("equal_levels", default=[]),
+        )
+        add(
+            "liquidity.active_levels",
+            value_for("active_levels", "levels", "liquidity_levels", default=[]),
+        )
+        add(
+            "liquidity.stop_clusters",
+            value_for("stop_clusters", "clusters", "liquidity_clusters", default=[]),
+        )
+        add(
+            "liquidity.zones",
+            value_for("zones", "liquidity_zones", default=[]),
+        )
+
+        if signal:
+            add("liquidity.signal", signal)
+
+        return result
+    def _build_liquidations_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        cascade = mapping_for(
+            "cascade",
+            "cascade_result",
+            "cascade_detection",
+            "cascade_detected",
+            "result",
+        )
+        exhaustion = mapping_for(
+            "exhaustion",
+            "exhaustion_result",
+            "exhaustion_detection",
+            "exhaustion_detected",
+            "reversal_context",
+        )
+        squeeze = mapping_for(
+            "squeeze",
+            "squeeze_result",
+            "squeeze_reversal",
+            "squeeze_context",
+            "pending_confirmation",
+        )
+        cluster = mapping_for(
+            "cluster",
+            "liquidation_cluster",
+            "cluster_stats",
+        )
+        signal = mapping_for(
+            "signal",
+            "liquidation_signal",
+            "analytics_signal",
+        )
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.LIQUIDATIONS,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "liquidations",
+                    },
+                )
+            )
+
+        # Cascade
+        add("liquidations.cascade", cascade or payload)
+        add(
+            "liquidations.cascade.confidence",
+            nested_value(cascade, "confidence", default=value_for("confidence", default=0.0)),
+        )
+        add(
+            "liquidations.cascade.intensity_score",
+            nested_value(
+                cascade,
+                "intensity_score",
+                "intensity",
+                default=value_for("intensity_score", default=0.0),
+            ),
+        )
+        add(
+            "liquidations.cascade.direction",
+            nested_value(
+                cascade,
+                "direction",
+                "cascade_direction",
+                "side",
+                default=value_for("direction", "cascade_direction", "side"),
+            ),
+        )
+        add(
+            "liquidations.cascade.severity",
+            nested_value(
+                cascade,
+                "severity",
+                "severity_label",
+                default=value_for("severity", "severity_label"),
+            ),
+        )
+        add(
+            "liquidations.cascade.continuation_bias",
+            nested_value(
+                cascade,
+                "continuation_bias",
+                default=value_for("continuation_bias", default=0.0),
+            ),
+        )
+        add(
+            "liquidations.cascade.exhaustion_bias",
+            nested_value(
+                cascade,
+                "exhaustion_bias",
+                default=value_for("exhaustion_bias", default=0.0),
+            ),
+        )
+        add(
+            "liquidations.cascade.total_notional_usd",
+            nested_value(
+                cascade,
+                "total_notional_usd",
+                "notional_usd",
+                default=value_for("total_notional_usd", "notional_usd", default=0.0),
+            ),
+        )
+        add(
+            "liquidations.cascade.event_count",
+            nested_value(
+                cascade,
+                "event_count",
+                "events_count",
+                default=value_for("event_count", "events_count", default=0),
+            ),
+        )
+
+        # Exhaustion
+        if exhaustion:
+            add("liquidations.exhaustion", exhaustion)
+            add(
+                "liquidations.exhaustion.confidence",
+                nested_value(exhaustion, "confidence", default=value_for("confidence", default=0.0)),
+            )
+            add(
+                "liquidations.exhaustion.exhaustion_bias",
+                nested_value(
+                    exhaustion,
+                    "exhaustion_bias",
+                    default=value_for("exhaustion_bias", default=0.0),
+                ),
+            )
+            add(
+                "liquidations.exhaustion.bias_delta",
+                nested_value(
+                    exhaustion,
+                    "bias_delta",
+                    default=value_for("bias_delta", default=0.0),
+                ),
+            )
+            add(
+                "liquidations.exhaustion.confirmed",
+                nested_value(
+                    exhaustion,
+                    "confirmed",
+                    "is_confirmed",
+                    default=value_for("confirmed", "is_confirmed", default=False),
+                ),
+            )
+
+        # Squeeze
+        if squeeze:
+            add("liquidations.squeeze", squeeze)
+            add(
+                "liquidations.squeeze.confirmed",
+                nested_value(
+                    squeeze,
+                    "confirmed",
+                    "is_confirmed",
+                    default=value_for("squeeze_confirmed", default=False),
+                ),
+            )
+            add(
+                "liquidations.squeeze.score",
+                nested_value(
+                    squeeze,
+                    "score",
+                    default=value_for("squeeze_score", "score", default=0.0),
+                ),
+            )
+            add(
+                "liquidations.squeeze.direction",
+                nested_value(
+                    squeeze,
+                    "direction",
+                    "reversal_side",
+                    "side",
+                    default=value_for("squeeze_direction", "reversal_side", "side"),
+                ),
+            )
+
+        # Cluster
+        if cluster:
+            add("liquidations.cluster", cluster)
+            add(
+                "liquidations.cluster.duration_seconds",
+                nested_value(cluster, "duration_seconds", default=value_for("duration_seconds")),
+            )
+            add(
+                "liquidations.cluster.avg_notional_per_event",
+                nested_value(
+                    cluster,
+                    "avg_notional_per_event",
+                    default=value_for("avg_notional_per_event"),
+                ),
+            )
+            add(
+                "liquidations.cluster.side_imbalance_ratio",
+                nested_value(
+                    cluster,
+                    "side_imbalance_ratio",
+                    default=value_for("side_imbalance_ratio"),
+                ),
+            )
+            add(
+                "liquidations.cluster.event_imbalance_ratio",
+                nested_value(
+                    cluster,
+                    "event_imbalance_ratio",
+                    default=value_for("event_imbalance_ratio"),
+                ),
+            )
+            add(
+                "liquidations.cluster.acceleration_ratio",
+                nested_value(
+                    cluster,
+                    "acceleration_ratio",
+                    default=value_for("acceleration_ratio"),
+                ),
+            )
+
+        if signal:
+            add("liquidations.signal", signal)
+
+        return result
+    def _build_orderflow_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        composite = payload.get("composite") or payload.get("snapshot") or payload.get("orderflow")
+        if not isinstance(composite, dict):
+            composite = {}
+
+        cvd = payload.get("cvd") or payload.get("cvd_stats") or composite.get("cvd")
+        volume_delta = (
+                payload.get("volume_delta")
+                or payload.get("volume_delta_stats")
+                or composite.get("volume_delta")
+        )
+        aggressive = (
+                payload.get("aggressive_trades")
+                or payload.get("aggressive")
+                or composite.get("aggressive_trades")
+        )
+        imbalance = (
+                payload.get("orderbook_imbalance")
+                or payload.get("imbalance")
+                or composite.get("orderbook_imbalance")
+        )
+
+        cvd = cvd if isinstance(cvd, dict) else {}
+        volume_delta = volume_delta if isinstance(volume_delta, dict) else {}
+        aggressive = aggressive if isinstance(aggressive, dict) else {}
+        imbalance = imbalance if isinstance(imbalance, dict) else {}
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in composite:
+                    return composite[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            snapshot = self._snapshot_from_raw_value(
+                source=FeatureSource.ORDERFLOW,
+                symbol=symbol,
+                name=name,
+                value=value,
+                timestamp=timestamp,
+                confidence=confidence,
+                metadata={
+                    "origin": "contract_feature",
+                    "contract": "orderflow",
+                },
+            )
+            result.append(snapshot)
+
+        cvd_delta_ratio = value_for(
+            "cvd_delta_ratio",
+            "delta_ratio",
+            default=nested_value(cvd, "delta_ratio", "cvd_delta_ratio", default=0.0),
+        )
+        cvd_change_pct = value_for(
+            "cvd_change_pct",
+            default=nested_value(cvd, "cvd_change_pct", "change_pct", default=0.0),
+        )
+        cvd_slope = value_for(
+            "cvd_slope",
+            default=nested_value(cvd, "cvd_slope", "slope", default=0.0),
+        )
+        price_change_pct = value_for(
+            "price_change_pct",
+            default=nested_value(cvd, "price_change_pct", default=0.0),
+        )
+
+        volume_delta_ratio = value_for(
+            "volume_delta_ratio",
+            default=nested_value(volume_delta, "delta_ratio", "volume_delta_ratio", default=0.0),
+        )
+        volume_delta_value = value_for(
+            "volume_delta",
+            default=nested_value(volume_delta, "volume_delta", "delta", default=0.0),
+        )
+
+        aggressive_buy_ratio = value_for(
+            "aggressive_buy_ratio",
+            "buy_ratio",
+            default=nested_value(aggressive, "buy_ratio", "aggressive_buy_ratio", default=0.0),
+        )
+        aggressive_sell_ratio = value_for(
+            "aggressive_sell_ratio",
+            "sell_ratio",
+            default=nested_value(aggressive, "sell_ratio", "aggressive_sell_ratio", default=0.0),
+        )
+
+        imbalance_ratio = value_for(
+            "orderbook_imbalance_ratio",
+            "imbalance_ratio",
+            default=nested_value(imbalance, "ratio", "imbalance_ratio", default=0.0),
+        )
+        imbalance_diff = value_for(
+            "orderbook_imbalance_diff",
+            "imbalance_diff",
+            default=nested_value(imbalance, "diff", "imbalance_diff", default=0.0),
+        )
+
+        add("orderflow.composite", composite or payload)
+        add("orderflow.cvd", cvd or {
+            "delta_ratio": cvd_delta_ratio,
+            "cvd_change_pct": cvd_change_pct,
+            "cvd_slope": cvd_slope,
+            "price_change_pct": price_change_pct,
+        })
+        add("orderflow.cvd.delta_ratio", cvd_delta_ratio)
+        add("orderflow.cvd.cvd_change_pct", cvd_change_pct)
+        add("orderflow.cvd.cvd_slope", cvd_slope)
+        add("orderflow.cvd.price_change_pct", price_change_pct)
+
+        add("orderflow.volume_delta", volume_delta or {
+            "delta_ratio": volume_delta_ratio,
+            "volume_delta": volume_delta_value,
+        })
+        add("orderflow.volume_delta.delta_ratio", volume_delta_ratio)
+        add("orderflow.volume_delta.volume_delta", volume_delta_value)
+
+        add("orderflow.aggressive_trades", aggressive or {
+            "buy_ratio": aggressive_buy_ratio,
+            "sell_ratio": aggressive_sell_ratio,
+        })
+        add("orderflow.aggressive_trades.buy_ratio", aggressive_buy_ratio)
+        add("orderflow.aggressive_trades.sell_ratio", aggressive_sell_ratio)
+
+        add("orderflow.orderbook_imbalance", imbalance or {
+            "ratio": imbalance_ratio,
+            "diff": imbalance_diff,
+        })
+        add("orderflow.orderbook_imbalance.ratio", imbalance_ratio)
+        add("orderflow.orderbook_imbalance.diff", imbalance_diff)
+
+        add("orderflow.trades_count", value_for("trades_count", default=0))
+        add("orderflow.total_volume", value_for("total_volume", default=0.0))
+        add("orderflow.total_notional", value_for("total_notional", default=0.0))
+        add("orderflow.last_price", value_for("last_price", "price", default=None))
+        add("orderflow.price_change_pct", price_change_pct)
+
+        return result
     def _build_open_interest_contract_features(
             self,
             *,
