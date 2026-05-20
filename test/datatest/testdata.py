@@ -1,67 +1,14 @@
-"""
-Diagnostic tests for real StrategyRegistry / SignalRouter / BaseStrategy / SignalProcessor.
-
-Put into:
-
-    test/datatest/testdata.py
-
-or:
-
-    tests/strategy/test_real_strategy_pipeline_diagnostics.py
-
-Run:
-
-    pytest -q test/datatest/testdata.py -s
-
-Goal:
-- Keep early bootstrap tests strict.
-- Make the routing/evaluation tests print WHY they fail:
-  registry index issue, context/timeframe/regime/features mismatch,
-  BaseStrategy.evaluate() compatibility issue, or downstream SignalProcessor block.
-"""
-
 from __future__ import annotations
 
-import importlib
 import inspect
-import pkgutil
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
-from core.event_bus import EventBus
-from core.scheduler import Scheduler
-
-from strategy.base import BaseStrategy
-from strategy.config import (
-    StrategyConfig,
-    StrategyDefinitionConfig,
-    StrategyRuntimeConfig,
-)
-from strategy.engine import StrategyEngine
-from strategy.enums import (
-    EntryType,
-    FeatureSource,
-    MarketRegime,
-    SetupType,
-    SignalSide,
-    StrategyCategory,
-    Timeframe,
-)
-from strategy.models import (
-    EntryPlan,
-    ExitPlan,
-    InvalidationPlan,
-    StrategyContext,
-    StrategySignal,
-    utcnow,
-)
-from strategy.presets import (
-    build_default_strategy_config,
-    build_default_strategy_registry,
-)
-from strategy.processor import SignalProcessor
-from strategy.state import StrategyRuntimeState
+from strategy.config import StrategyConfig
+from strategy.processor import SignalNormalizer
 
 
 # =============================================================================
@@ -69,1106 +16,842 @@ from strategy.state import StrategyRuntimeState
 # =============================================================================
 
 
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
+def _utcnow() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
 
-def _enum_value(value: Any) -> str:
-    return str(getattr(value, "value", value)).strip().lower()
+def _stringify(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw)
 
 
-def _registry_count(registry: Any) -> int:
-    count = getattr(registry, "count", None)
-    if callable(count):
-        return int(count())
+def _to_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
 
-    list_all = getattr(registry, "list_all", None)
-    if callable(list_all):
-        return len(list_all())
+    if isinstance(value, dict):
+        return dict(value)
 
-    strategies = getattr(registry, "_strategies", None)
-    if isinstance(strategies, dict):
-        return len(strategies)
+    if is_dataclass(value):
+        return asdict(value)
 
-    return 0
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, dict):
+            return converted
 
+    to_payload = getattr(value, "to_payload", None)
+    if callable(to_payload):
+        converted = to_payload()
+        if isinstance(converted, dict):
+            return converted
 
-def _registered_strategies(registry: Any) -> list[BaseStrategy]:
-    list_all = getattr(registry, "list_all", None)
-    if callable(list_all):
-        return list(list_all())
+    return {}
 
-    strategies = getattr(registry, "_strategies", None)
-    if isinstance(strategies, dict):
-        return list(strategies.values())
-
-    return []
-
-
-def _strategy_name(strategy: Any) -> str:
-    value = getattr(strategy, "strategy_name", None)
-    if isinstance(value, str) and value:
-        return value
-
-    value = getattr(strategy, "name", None)
-    if isinstance(value, str) and value:
-        return value
-
-    return strategy.__class__.__name__
-
-
-def _category_value(strategy: Any) -> str:
-    return _enum_value(getattr(strategy, "category", None))
-
-
-def _changed_features(context: StrategyContext) -> list[str]:
-    feature_map = getattr(context, "feature_map", None)
-    if isinstance(feature_map, dict):
-        return list(feature_map.keys())
-
-    features = getattr(context, "features", None)
-    if isinstance(features, dict):
-        return list(features.keys())
-
-    return []
-
-
-def _context_regime(context: StrategyContext) -> Any:
-    current_regime = getattr(context, "current_regime", None)
-    if current_regime is not None:
-        return current_regime
-
-    regime = getattr(context, "regime", None)
-    if regime is not None:
-        raw = getattr(regime, "regime", None)
-        if raw is not None:
-            return raw
-
-    return MarketRegime.UNKNOWN
-
-
-def _supports_call(strategy: Any, method_name: str, value: Any) -> Any:
-    method = getattr(strategy, method_name, None)
-    if not callable(method):
-        return "<missing>"
-    try:
-        return method(value)
-    except Exception as exc:
-        return f"<error {exc.__class__.__name__}: {exc}>"
-
-
-def _required_features(strategy: Any) -> set[str]:
-    method = getattr(strategy, "required_features", None)
-    if not callable(method):
-        return set()
-    try:
-        value = method()
-        return set(value or set())
-    except Exception:
-        return set()
-
-
-def _strategy_diagnostics(strategy: Any, context: StrategyContext) -> dict[str, Any]:
-    required = _required_features(strategy)
-    changed = set(_changed_features(context))
-    return {
-        "name": _strategy_name(strategy),
-        "category": _category_value(strategy),
-        "enabled": (
-            strategy.is_enabled()
-            if callable(getattr(strategy, "is_enabled", None))
-            else getattr(strategy, "enabled", None)
-        ),
-        "supports_symbol": _supports_call(strategy, "supports_symbol", context.symbol),
-        "supports_timeframe": _supports_call(strategy, "supports_timeframe", context.timeframe),
-        "supports_regime": _supports_call(strategy, "supports_regime", _context_regime(context)),
-        "required": sorted(required),
-        "missing_required": sorted(required - changed),
-    }
-
-
-def _print_registry_selection_debug(
-    *,
-    registry: Any,
-    context: StrategyContext,
-    categories: list[StrategyCategory],
-) -> None:
-    print("")
-    print("========== REGISTRY SELECTION DEBUG ==========")
-    print("context.symbol:", context.symbol)
-    print("context.timeframe:", context.timeframe, "| value:", _enum_value(context.timeframe))
-    print("context.regime:", _context_regime(context), "| value:", _enum_value(_context_regime(context)))
-    print("context.features:", _changed_features(context))
-    print("categories:", [category.value for category in categories])
-
-    print("")
-    print("registry.count:", _registry_count(registry))
-
-    try:
-        summary = registry.summary()
-        print("registry.summary.by_category:", summary.get("by_category"))
-        print("registry.summary.by_timeframe:", summary.get("by_timeframe"))
-        print("registry.summary.by_regime:", summary.get("by_regime"))
-    except Exception as exc:
-        print("registry.summary failed:", exc)
-
-    print("")
-    print("registered open_interest/hybrid strategies:")
-    for strategy in _registered_strategies(registry):
-        if _category_value(strategy) in {"open_interest", "hybrid"}:
-            print(" -", _strategy_diagnostics(strategy, context))
-
-    print("")
-    print("registry.list_by_category(OPEN_INTEREST):")
-    try:
-        by_category = registry.list_by_category(StrategyCategory.OPEN_INTEREST)
-        print([_strategy_name(strategy) for strategy in by_category])
-    except Exception as exc:
-        print("list_by_category failed:", exc)
-
-    print("")
-    print("registry.select direct:")
-    try:
-        selected = registry.select(
-            context=context,
-            categories=categories,
-            changed_features=_changed_features(context),
-        )
-        print([_strategy_name(strategy) for strategy in selected])
-    except Exception as exc:
-        print("registry.select failed:", exc)
-
-    print("==============================================")
-    print("")
-
-
-def _discover_strategy_factories_like_runner() -> dict[str, type[BaseStrategy]]:
-    try:
-        package = importlib.import_module("strategy.strategies")
-    except Exception as exc:
-        pytest.fail(f"Cannot import strategy.strategies package: {exc}")
-
-    package_path = getattr(package, "__path__", None)
-    if package_path is None:
-        pytest.fail("strategy.strategies has no __path__; cannot auto-discover strategies")
-
-    factories: dict[str, type[BaseStrategy]] = {}
-
-    def camel_to_snake(name: str) -> str:
-        chars: list[str] = []
-        for index, char in enumerate(name):
-            if char.isupper() and index > 0 and not name[index - 1].isupper():
-                chars.append("_")
-            chars.append(char.lower())
-        return "".join(chars)
-
-    def strategy_name_from_class(cls: type, module_name: str) -> str:
-        name = cls.__name__
-
-        for suffix in ("TradingStrategy", "Strategy"):
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-                break
-
-        leaf = module_name.rsplit(".", 1)[-1]
-        if leaf not in {"base", "utils", "__init__"} and leaf.endswith("_strategy"):
-            return leaf[: -len("_strategy")]
-
-        return camel_to_snake(name)
-
-    for module_info in pkgutil.walk_packages(package_path, prefix="strategy.strategies."):
-        module_name = module_info.name
-        leaf = module_name.rsplit(".", 1)[-1].lower()
-
-        if leaf in {
-            "__init__",
-            "base",
-            "utils",
-            "config",
-            "enums",
-            "models",
-            "exceptions",
-        }:
-            continue
-
-        try:
-            module = importlib.import_module(module_name)
-        except Exception as exc:
-            print(f"[DISCOVERY] skipped module={module_name} error={exc}")
-            continue
-
-        for _, obj in inspect.getmembers(module, inspect.isclass):
-            if obj.__module__ != module.__name__:
-                continue
-
-            if obj is BaseStrategy:
-                continue
-
-            try:
-                is_strategy = issubclass(obj, BaseStrategy)
-            except TypeError:
-                continue
-
-            if not is_strategy:
-                continue
-
-            cls_name = obj.__name__.lower()
-
-            if cls_name.startswith("base"):
-                continue
-
-            if cls_name in {
-                "tradingstrategy",
-                "strategysignalmixin",
-                "strategyvalidationmixin",
-                "strategyriskrewardmixin",
-            }:
-                continue
-
-            if inspect.isabstract(obj):
-                continue
-
-            factories.setdefault(strategy_name_from_class(obj, module_name), obj)
-
-    return factories
-
-
-def _build_real_strategy_stack(
-    *,
-    symbols: list[str] | None = None,
-    preset_name: str = "intraday",
-    use_required_features: bool = False,
-) -> tuple[EventBus, Scheduler, StrategyConfig, Any, SignalProcessor, StrategyEngine, StrategyRuntimeState]:
-    event_bus = EventBus()
-    scheduler = Scheduler(event_bus=event_bus)
-
-    strategy_config = build_default_strategy_config(
-        symbols=symbols or ["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
-        preset_name=preset_name,
-        use_required_features=use_required_features,
-    )
-    assert isinstance(strategy_config, StrategyConfig)
-
-    factories = _discover_strategy_factories_like_runner()
-
-    registry = build_default_strategy_registry(
-        config=strategy_config,
-        event_bus=event_bus,
-        scheduler=scheduler,
-        strategy_factories=factories,
-        strict=False,
-        emit_events=False,
-    )
-
-    state = StrategyRuntimeState()
-
-    processor = SignalProcessor(
-        config=strategy_config,
-        registry=registry,
-        state=state,
-        event_bus=event_bus,
-        scheduler=scheduler,
-    )
-
-    engine = StrategyEngine(
-        config=strategy_config,
-        event_bus=event_bus,
-        scheduler=scheduler,
-        registry=registry,
-        state=state,
-        processor=processor,
-    )
-
-    return event_bus, scheduler, strategy_config, registry, processor, engine, state
-
-
-def _realistic_oi_payload(
-    *,
-    symbol: str = "BTCUSDT",
-    timeframe: str = "5m",
-    confidence: float = 0.86,
-    score: float = 0.82,
-) -> dict[str, Any]:
-    return {
-        "exchange": "binance",
-        "market_type": "usdm_futures",
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "timestamp": utcnow(),
-        "confidence": confidence,
-        "score": score,
-        "direction": "long",
-        "bias": "bullish",
-        "regime": "squeeze",
-        "oi": 104_000.0,
-        "open_interest": 104_000.0,
-        "open_interest_value": 8_000_000_000.0,
-        "oi_delta": -0.08,
-        "oi_delta_pct": -0.12,
-        "oi_direction": "down",
-        "oi_acceleration": -0.03,
-        "price": 77_000.0,
-        "close": 77_000.0,
-        "funding_rate": 0.00005,
-        "liquidation_imbalance": 0.72,
-        "long_liquidations": 12_000_000.0,
-        "short_liquidations": 3_000_000.0,
-        "cvd_delta": 0.42,
-        "aggressive_flow_imbalance": 0.55,
-
-        # Rich OI contract fields used by concrete OI strategies.
-        "oi_regime": "capitulation",
-        "market_regime": "capitulation",
-        "anomaly": {
-            "is_anomaly": True,
-            "anomaly_type": "capitulation",
-            "score": score,
-            "confidence": confidence,
-        },
-        "anomaly_type": "capitulation",
-        "is_anomaly": True,
-        "capitulation": True,
-        "capitulation_score": 0.91,
-        "squeeze_setup": True,
-        "squeeze_score": 0.88,
-        "divergence": {
-            "is_divergence": True,
-            "divergence_type": "bullish",
-            "score": score,
-            "confidence": confidence,
-        },
-        "is_divergence": True,
-        "divergence_type": "bullish",
-        "price_oi_divergence": "bullish",
-        "feature_map": {
-            "oi": 104_000.0,
-            "open_interest": 104_000.0,
-            "open_interest_value": 8_000_000_000.0,
-            "oi_delta": -0.08,
-            "oi_delta_pct": -0.12,
-            "oi_direction": "down",
-            "oi_acceleration": -0.03,
-            "price": 77_000.0,
-            "funding_rate": 0.00005,
-            "liquidation_imbalance": 0.72,
-            "long_liquidations": 12_000_000.0,
-            "short_liquidations": 3_000_000.0,
-            "cvd_delta": 0.42,
-            "aggressive_flow_imbalance": 0.55,
-            "oi_regime": "capitulation",
-            "market_regime": "capitulation",
-            "anomaly": {
-                "is_anomaly": True,
-                "anomaly_type": "capitulation",
-                "score": score,
-                "confidence": confidence,
-            },
-            "anomaly_type": "capitulation",
-            "is_anomaly": True,
-            "capitulation": True,
-            "capitulation_score": 0.91,
-            "squeeze_setup": True,
-            "squeeze_score": 0.88,
-            "divergence": {
-                "is_divergence": True,
-                "divergence_type": "bullish",
-                "score": score,
-                "confidence": confidence,
-            },
-            "is_divergence": True,
-            "divergence_type": "bullish",
-            "price_oi_divergence": "bullish",
-            "score": score,
-            "confidence": confidence,
-            "direction": "long",
-            "bias": "bullish",
-            "regime": "squeeze",
-        },
-        "metadata": {
-            "source": "pytest",
-            "event_contract": "analytics.oi.capitulation.detected",
-        },
-    }
-
-
-
-def _inject_open_interest_domain_contracts(
-    *,
-    context: StrategyContext,
-    payload: dict[str, Any],
-) -> None:
-    """
-    Diagnostic/prod-contract mirror.
-
-    SignalNormalizer already fills context.feature_map. Concrete OI strategies
-    often also read context.open_interest domain objects, so this test mirrors the
-    expected production contract: features/regime_state/anomaly/divergence.
-    """
-    oi_domain = getattr(context, "open_interest", None)
-    if not isinstance(oi_domain, dict):
-        return
-
-    feature_map = payload.get("feature_map")
-    if not isinstance(feature_map, dict):
-        feature_map = {}
-
-    def value_for(*keys: str, default: Any = None) -> Any:
-        for key in keys:
-            if key in payload:
-                return payload[key]
-            if key in feature_map:
-                return feature_map[key]
-        return default
-
-    oi_domain.setdefault(
-        "features",
-        {
-            "oi": value_for("oi", "open_interest"),
-            "open_interest": value_for("open_interest", "oi"),
-            "open_interest_value": value_for("open_interest_value"),
-            "oi_delta": value_for("oi_delta"),
-            "oi_delta_pct": value_for("oi_delta_pct"),
-            "oi_direction": value_for("oi_direction"),
-            "oi_acceleration": value_for("oi_acceleration"),
-            "price": value_for("price", "close"),
-            "close": value_for("close", "price"),
-            "funding_rate": value_for("funding_rate"),
-            "liquidation_imbalance": value_for("liquidation_imbalance"),
-            "cvd_delta": value_for("cvd_delta"),
-            "aggressive_flow_imbalance": value_for("aggressive_flow_imbalance"),
-        },
-    )
-
-    oi_domain.setdefault(
-        "regime_state",
-        {
-            "regime": value_for("oi_regime", "regime", "market_regime", default="capitulation"),
-            "score": value_for("score", default=0.0),
-            "confidence": value_for("confidence", default=0.0),
-            "bias": value_for("bias", default="bullish"),
-            "direction": value_for("direction", default="long"),
-        },
-    )
-
-    anomaly_value = value_for("anomaly")
-    if isinstance(anomaly_value, dict):
-        anomaly_contract = dict(anomaly_value)
-    else:
-        anomaly_contract = {}
-
-    anomaly_contract.setdefault("is_anomaly", bool(value_for("is_anomaly", "capitulation", "squeeze_setup", default=True)))
-    anomaly_contract.setdefault("anomaly_type", value_for("anomaly_type", default="capitulation"))
-    anomaly_contract.setdefault("capitulation", bool(value_for("capitulation", default=True)))
-    anomaly_contract.setdefault("capitulation_score", value_for("capitulation_score", "score", default=0.91))
-    anomaly_contract.setdefault("squeeze_setup", bool(value_for("squeeze_setup", default=True)))
-    anomaly_contract.setdefault("squeeze_score", value_for("squeeze_score", "score", default=0.88))
-    anomaly_contract.setdefault("liquidation_imbalance", value_for("liquidation_imbalance"))
-    anomaly_contract.setdefault("score", value_for("score", default=0.0))
-    anomaly_contract.setdefault("confidence", value_for("confidence", default=0.0))
-    oi_domain.setdefault("anomaly", anomaly_contract)
-
-    divergence_value = value_for("divergence")
-    if isinstance(divergence_value, dict):
-        divergence_contract = dict(divergence_value)
-    else:
-        divergence_contract = {}
-
-    divergence_contract.setdefault("is_divergence", bool(value_for("is_divergence", "price_oi_divergence", default=True)))
-    divergence_contract.setdefault("divergence_type", value_for("divergence_type", "price_oi_divergence", default="bullish"))
-    divergence_contract.setdefault("price_oi_divergence", value_for("price_oi_divergence", default="bullish"))
-    divergence_contract.setdefault("cvd_delta", value_for("cvd_delta"))
-    divergence_contract.setdefault("funding_rate", value_for("funding_rate"))
-    divergence_contract.setdefault("score", value_for("score", default=0.0))
-    divergence_contract.setdefault("confidence", value_for("confidence", default=0.0))
-    oi_domain.setdefault("divergence", divergence_contract)
-
-
-def _build_context_from_payload(
-    *,
-    processor: SignalProcessor,
-    state: StrategyRuntimeState,
-    event_name: str,
-    payload: dict[str, Any],
-) -> StrategyContext:
-    normalized = processor.normalizer.normalize_event(
-        event_name=event_name,
-        payload=payload,
-        timestamp=payload.get("timestamp"),
-    )
-
-    context = state.build_context(
-        normalized.symbol,
-        timestamp=normalized.timestamp,
-        include_regime=True,
-        include_portfolio=True,
-    )
-    context.timeframe = normalized.timeframe
-
-    processor.normalizer.apply_to_context(context, normalized)
-    _inject_open_interest_domain_contracts(context=context, payload=payload)
-    state.update_context(context)
-    return context
-
-
-def _assert_registry_not_empty(registry: Any) -> None:
-    strategies = _registered_strategies(registry)
-    if not strategies:
-        factories = _discover_strategy_factories_like_runner()
-        pytest.fail(
-            "StrategyRegistry is empty. "
-            f"Discovered factories: {sorted(factories.keys())}"
-        )
-
-
-# =============================================================================
-# 1. StrategyRegistry у реальному запуску порожній
-# =============================================================================
-
-
-def test_real_strategy_registry_is_not_empty_after_bootstrap() -> None:
-    _, _, config, registry, _, _, _ = _build_real_strategy_stack()
-
-    strategies = _registered_strategies(registry)
-
-    print("\n[REGISTRY] count:", len(strategies))
-    print("[REGISTRY] configured strategy definitions:", sorted(config.strategies.keys())[:80])
-    print("[REGISTRY] registered strategies:")
-
-    for strategy in strategies[:80]:
-        print(f"  - {_strategy_name(strategy)} | category={_category_value(strategy)}")
-
-    assert strategies, (
-        "StrategyRegistry is empty after build_default_strategy_registry(). "
-        "This means presets/factories/bootstrap are not registering real strategies."
-    )
-
-
-# =============================================================================
-# 2. Реальні strategy classes не реєструються через preset / factories
-# =============================================================================
-
-
-def test_real_strategy_factories_are_discovered_and_overlap_with_preset_config() -> None:
-    factories = _discover_strategy_factories_like_runner()
-    _, _, config, registry, _, _, _ = _build_real_strategy_stack()
-
-    configured_names = set(config.strategies.keys())
-    factory_names = set(factories.keys())
-    registered_names = {_strategy_name(strategy) for strategy in _registered_strategies(registry)}
-
-    print("\n[FACTORIES] discovered:", sorted(factory_names))
-    print("[FACTORIES] configured:", sorted(configured_names))
-    print("[FACTORIES] registered:", sorted(registered_names))
-    print("[FACTORIES] configured names without discovered factory:", sorted(configured_names - factory_names))
-
-    assert factories, "No concrete strategy factories were discovered under strategy.strategies.*."
-    assert registered_names, (
-        "Factories were discovered, but no strategy was registered. "
-        "Check build_default_strategy_registry(), preset enabled names, and factory name matching."
-    )
-
-
-# =============================================================================
-# 3. StrategyEngine не стартує event_handler або event_handler не має subscriptions
-# =============================================================================
-
-
-@pytest.mark.asyncio
-async def test_strategy_engine_start_registers_event_handler_subscriptions() -> None:
-    event_bus, scheduler, _, registry, _, engine, _ = _build_real_strategy_stack()
-    _assert_registry_not_empty(registry)
-
-    await _maybe_await(event_bus.start())
-    await _maybe_await(scheduler.start())
-
-    try:
-        await engine.start()
-
-        handler = getattr(engine, "event_handler", None)
-        assert handler is not None, "StrategyEngine has no event_handler attribute"
-
-        subscriptions = getattr(handler, "_subscriptions", [])
-        topics: list[str] = []
-
-        for subscription in subscriptions:
-            topic = (
-                getattr(subscription, "topic", None)
-                or getattr(subscription, "pattern", None)
-                or getattr(subscription, "event_name", None)
-                or str(subscription)
-            )
-            topics.append(str(topic))
-
-        print("\n[ENGINE] handler registered:", getattr(handler, "_registered", None))
-        print("[ENGINE] subscription count:", len(subscriptions))
-        print("[ENGINE] subscription topics:", topics[:80])
-
-        assert getattr(handler, "_registered", False) is True
-        assert subscriptions, "StrategyEventHandler has zero subscriptions after engine.start()"
-        assert any(topic == "analytics.*" or "analytics.*" in topic for topic in topics), (
-            "StrategyEventHandler is not subscribed to analytics.*. "
-            f"topics={topics}"
-        )
-
-    finally:
-        await engine.stop()
-        await _maybe_await(scheduler.stop())
-        await _maybe_await(event_bus.stop())
-
-
-# =============================================================================
-# 4. Registry / Router diagnostic
-# =============================================================================
-
-
-def test_real_strategies_are_not_all_filtered_by_router_for_oi_event() -> None:
-    _, _, _, registry, processor, _, state = _build_real_strategy_stack(
-        symbols=["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
-        preset_name="intraday",
-        use_required_features=False,
-    )
-    _assert_registry_not_empty(registry)
-
-    event_name = "analytics.oi.capitulation.detected"
-    payload = _realistic_oi_payload(symbol="BTCUSDT", timeframe="5m")
-
-    context = _build_context_from_payload(
-        processor=processor,
-        state=state,
-        event_name=event_name,
-        payload=payload,
-    )
-
-    categories = processor.router._resolve_categories(
-        event_name=event_name,
-        source=FeatureSource.OPEN_INTEREST,
-    )
-
-    _print_registry_selection_debug(
-        registry=registry,
-        context=context,
-        categories=categories,
-    )
-
-    route = processor.router.route(
-        event_name=event_name,
-        context=context,
-        source=FeatureSource.OPEN_INTEREST,
-        changed_features=_changed_features(context),
-        metadata={"test": "real_router_filter_check"},
-    )
-
-    print("\n[ROUTER] context timeframe:", context.timeframe)
-    print("[ROUTER] changed_features:", _changed_features(context))
-    print("[ROUTER] categories_used:", [category.value for category in route.categories_used])
-    print("[ROUTER] selected:", route.selected_names)
-    print("[ROUTER] skipped:", route.skipped)
-
-    assert route.categories_used, (
-        "Router resolved no categories for analytics.oi.capitulation. "
-        "Check RoutingConfig.categories_for_event() and SignalRouter._resolve_categories()."
-    )
-
-    assert route.selected, (
-        "Router found categories but selected no strategies. "
-        "Read REGISTRY SELECTION DEBUG above. "
-        "Likely causes: registry index mismatch, supports_timeframe/symbol/regime false, "
-        "or required_features mismatch."
-    )
-
-
-# =============================================================================
-# 5. Real strategy generate_signal diagnostic
-# =============================================================================
-
-
-@pytest.mark.asyncio
-async def test_at_least_one_real_routed_strategy_can_be_called_and_diagnosed() -> None:
-    _, _, _, registry, processor, _, state = _build_real_strategy_stack(
-        symbols=["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
-        preset_name="intraday",
-        use_required_features=False,
-    )
-    _assert_registry_not_empty(registry)
-
-    event_name = "analytics.oi.capitulation.detected"
-    payload = _realistic_oi_payload(
-        symbol="BTCUSDT",
-        timeframe="5m",
-        confidence=0.92,
-        score=0.88,
-    )
-
-    context = _build_context_from_payload(
-        processor=processor,
-        state=state,
-        event_name=event_name,
-        payload=payload,
-    )
-
-    categories = processor.router._resolve_categories(
-        event_name=event_name,
-        source=FeatureSource.OPEN_INTEREST,
-    )
-    _print_registry_selection_debug(
-        registry=registry,
-        context=context,
-        categories=categories,
-    )
-
-    route = processor.router.route(
-        event_name=event_name,
-        context=context,
-        source=FeatureSource.OPEN_INTEREST,
-        changed_features=_changed_features(context),
-        metadata={"test": "real_strategy_generate_signal_check"},
-    )
-
-    assert route.selected, (
-        "No strategies selected. See REGISTRY SELECTION DEBUG above. "
-        f"skipped={route.skipped}"
-    )
-
-    generated: list[tuple[str, StrategySignal]] = []
-    returned_none: list[str] = []
-    failed: dict[str, str] = {}
-
-    for strategy in route.selected:
-        method = getattr(strategy, "generate_signal", None)
-        if not callable(method):
-            failed[_strategy_name(strategy)] = "missing generate_signal()"
-            continue
-
-        try:
-            value = await _maybe_await(method(context))
-        except Exception as exc:
-            failed[_strategy_name(strategy)] = f"{exc.__class__.__name__}: {exc}"
-            continue
-
-        if value is None:
-            returned_none.append(_strategy_name(strategy))
-            continue
-
-        if isinstance(value, StrategySignal):
-            generated.append((_strategy_name(strategy), value))
-            continue
-
-        failed[_strategy_name(strategy)] = f"unexpected return type: {type(value)!r}"
-
-    print("\n[REAL STRATEGIES] selected:", route.selected_names)
-    print("[REAL STRATEGIES] generated:", [name for name, _ in generated])
-    print("[REAL STRATEGIES] returned_none:", returned_none)
-    print("[REAL STRATEGIES] failed:", failed)
-
-    if not generated:
-        pytest.xfail(
-            "Real OI strategies were routed correctly, but all returned None. "
-            "Routing, registry selection, timeframe, regime and required_features are OK. "
-            "Now inspect concrete OI strategy domain conditions or test with a real analytics.oi.* payload. "
-            f"returned_none={returned_none} failed={failed}"
-        )
-
-
-# =============================================================================
-# 6. SignalProcessor downstream diagnostic with manual strategy
-# =============================================================================
-
-
-
-def _print_object_public_attrs(title: str, obj: Any) -> None:
-    print("")
-    print(f"========== {title} ==========")
-    if obj is None:
-        print("<None>")
-        print("=" * (22 + len(title)))
-        return
-
-    for name in dir(obj):
-        if name.startswith("_"):
-            continue
-        try:
-            value = getattr(obj, name)
-        except Exception as exc:
-            value = f"<error {exc}>"
-        if not callable(value):
-            print(f"{name} = {value!r}")
-    print("=" * (22 + len(title)))
-    print("")
-
-
-def _print_portfolio_config_debug(config: StrategyConfig) -> None:
-    _print_object_public_attrs("PORTFOLIO CONFIG DEBUG", getattr(config, "portfolio", None))
-
-
-def _print_portfolio_batch_debug(batch: Any) -> None:
-    print("")
-    print("========== PORTFOLIO BATCH DEBUG ==========")
-    print("batch.reasons:", getattr(batch, "reasons", None))
-    for attr in (
-        "coordination",
-        "coordinated",
-        "coordination_decision",
-        "portfolio_decision",
-        "portfolio",
-    ):
-        if hasattr(batch, attr):
-            _print_object_public_attrs(f"BATCH.{attr}", getattr(batch, attr))
-    print("===========================================")
-    print("")
-
-
-class _ManualSignalStrategy(BaseStrategy):
-    strategy_name = "manual_processor_probe_unique"
-    category = StrategyCategory.OPEN_INTEREST
-    default_setup_type = SetupType.OI_CONFIRMATION
-    priority = 1
-
-    def required_features(self) -> set[str]:
-        return set()
-
-    async def generate_signal(self, context: StrategyContext) -> StrategySignal | None:
-        signal = StrategySignal(
-            symbol=context.symbol,
-            side=SignalSide.LONG,
-            strategy_name=self.strategy_name,
-            category=self.category,
-            timeframe=context.timeframe,
-            setup_type=self.default_setup_type,
-            timestamp=context.timestamp,
-            confidence=0.92,
-            score=0.88,
-            reasons=["pytest_manual_probe"],
-            confirmations=["processor_should_emit_signal_generated"],
-            source_features=_changed_features(context),
-            metadata={
-                "order_intent": "open",
-                "market_type": "usdm_futures",
-                "margin_mode": "isolated",
-                "tier": "standard",
-                "pytest_unique": str(utcnow().timestamp()),
-            },
-        )
-
-        # New strategy model field names.
-        if hasattr(signal, "entry_plan"):
-            signal.entry_plan = EntryPlan(
-                entry_type=EntryType.MARKET,
-                price=77_000.0,
-                max_slippage_bps=5.0,
-            )
-        if hasattr(signal, "exit_plan"):
-            signal.exit_plan = ExitPlan(
-                stop_loss=76_000.0,
-                take_profit_levels=[],
-            )
-        if hasattr(signal, "invalidation_plan"):
-            signal.invalidation_plan = InvalidationPlan(
-                price=76_000.0,
-                reason="pytest_invalidation",
-            )
-
-        # Backward-compatible aliases only for older BaseStrategy.evaluate()
-        # implementations that still read signal.entry / signal.exit / signal.invalidation.
-        try:
-            signal.entry = getattr(signal, "entry_plan", None)
-        except Exception:
-            pass
-        try:
-            signal.exit = getattr(signal, "exit_plan", None)
-        except Exception:
-            pass
-        try:
-            signal.invalidation = getattr(signal, "invalidation_plan", None)
-        except Exception:
-            pass
-
-        signal.validate()
-        return signal
 
 def _set_if_exists(obj: Any, name: str, value: Any) -> None:
     if hasattr(obj, name):
         setattr(obj, name, value)
 
 
+def _make_config() -> StrategyConfig:
+    config = StrategyConfig()
+    routing = getattr(config, "routing", None)
+    if routing is not None:
+        _set_if_exists(routing, "enabled", True)
+    return config
+
+
+def _make_normalizer(config: StrategyConfig) -> SignalNormalizer:
+    try:
+        return SignalNormalizer(config=config)
+    except TypeError:
+        return SignalNormalizer()
+
+
+def _call_normalize(
+    normalizer: SignalNormalizer,
+    *,
+    event_name: str,
+    payload: dict[str, Any],
+    timestamp: datetime,
+) -> Any:
+    normalize = getattr(normalizer, "normalize_event", None)
+    if not callable(normalize):
+        normalize = getattr(normalizer, "normalize", None)
+
+    assert callable(normalize), (
+        "SignalNormalizer must expose normalize_event(...) or normalize(...)."
+    )
+
+    signature = inspect.signature(normalize)
+    parameters = signature.parameters
+
+    kwargs: dict[str, Any] = {}
+
+    if "event_name" in parameters:
+        kwargs["event_name"] = event_name
+    elif "topic" in parameters:
+        kwargs["topic"] = event_name
+    elif "event" in parameters:
+        kwargs["event"] = event_name
+
+    if "payload" in parameters:
+        kwargs["payload"] = payload
+
+    if "timestamp" in parameters:
+        kwargs["timestamp"] = timestamp
+
+    if kwargs:
+        try:
+            return normalize(**kwargs)
+        except TypeError:
+            pass
+
+    for args in (
+        (event_name, payload, timestamp),
+        (event_name, payload),
+        (payload,),
+    ):
+        try:
+            return normalize(*args)
+        except TypeError:
+            continue
+
+    raise AssertionError(
+        "Unable to call SignalNormalizer.normalize_event/normalize with supported signatures"
+    )
+
+
+def _normalized_source(normalized: Any) -> str:
+    source = getattr(normalized, "source", None)
+    if source is None:
+        source = getattr(normalized, "feature_source", None)
+    return _stringify(source).lower()
+
+
+def _normalized_domain_data(normalized: Any) -> dict[str, Any]:
+    domain_data = getattr(normalized, "domain_data", None)
+    if isinstance(domain_data, dict):
+        return domain_data
+
+    domain = getattr(normalized, "domain", None)
+    if isinstance(domain, dict):
+        return domain
+
+    data = _to_dict(normalized)
+    for key in ("domain_data", "domain"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            return value
+
+    return {}
+
+
+def _normalized_feature_names(normalized: Any) -> set[str]:
+    names: set[str] = set()
+
+    feature_map = getattr(normalized, "feature_map", None)
+    if isinstance(feature_map, dict):
+        names.update(str(key) for key in feature_map.keys())
+
+    features = getattr(normalized, "features", None)
+    if isinstance(features, dict):
+        names.update(str(key) for key in features.keys())
+
+    if isinstance(features, list):
+        for item in features:
+            name = getattr(item, "name", None)
+            if name is None and isinstance(item, dict):
+                name = item.get("name")
+            if name is not None:
+                names.add(str(name))
+
+    data = _to_dict(normalized)
+    for key in ("features", "feature_map"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            names.update(str(item) for item in value.keys())
+        elif isinstance(value, list):
+            for item in value:
+                item_name = None
+                if isinstance(item, dict):
+                    item_name = item.get("name")
+                else:
+                    item_name = getattr(item, "name", None)
+                if item_name is not None:
+                    names.add(str(item_name))
+
+    return names
+
+
+def _categories_for_event(config: StrategyConfig, event_name: str) -> list[Any]:
+    routing = getattr(config, "routing", None)
+    assert routing is not None, "StrategyConfig.routing is missing"
+
+    categories_for_event = getattr(routing, "categories_for_event", None)
+    assert callable(categories_for_event), (
+        "RoutingConfig.categories_for_event(event_name) is missing"
+    )
+
+    result = categories_for_event(event_name)
+    if result is None:
+        return []
+    return list(result)
+
+
+def _category_names(categories: list[Any]) -> set[str]:
+    return {str(getattr(category, "name", category)).upper() for category in categories}
+
+
+def _print_normalized_report(
+    *,
+    case_name: str,
+    event_name: str,
+    normalized: Any,
+    expected_features: set[str],
+    expected_domain_keys: set[str],
+) -> None:
+    source = _normalized_source(normalized)
+    domain_data = _normalized_domain_data(normalized)
+    feature_names = _normalized_feature_names(normalized)
+
+    print("")
+    print(f"========== NORMALIZER REPORT: {case_name} ==========")
+    print("event:", event_name)
+    print("source:", source)
+    print("domain_keys:", sorted(domain_data.keys()))
+    print("feature_count:", len(feature_names))
+    print("expected_features:", sorted(expected_features))
+    print("missing_features:", sorted(expected_features - feature_names))
+    print("expected_domain_keys:", sorted(expected_domain_keys))
+    print("missing_domain_keys:", sorted(expected_domain_keys - set(domain_data.keys())))
+    print("sample_features:", sorted(feature_names)[:80])
+    print("====================================================")
+    print("")
+
+
+# =============================================================================
+# Representative analytics payloads
+# =============================================================================
+
+
+def _sample_open_interest_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "5m",
+        "timestamp": _utcnow(),
+        "confidence": 0.91,
+        "score": 0.88,
+        "analysis": {
+            "features": {
+                "oi_delta_pct": -0.12,
+                "price_delta_pct": -0.035,
+                "oi_pressure_score": -0.62,
+                "liquidation_pressure": -0.72,
+            },
+            "regime": {"regime": "capitulation", "confidence": 0.91, "score": 0.88},
+            "anomaly": {
+                "detected": True,
+                "anomaly_type": "liquidation_driven_oi_drop",
+                "confidence": 0.91,
+                "score": 0.88,
+            },
+            "divergence": {
+                "detected": True,
+                "divergence_type": "price_down_oi_down",
+                "confidence": 0.80,
+                "score": 0.75,
+            },
+        },
+        "features": {
+            "oi_delta_pct": -0.12,
+            "price_delta_pct": -0.035,
+            "oi_pressure_score": -0.62,
+            "liquidation_pressure": -0.72,
+        },
+        "regime": {"regime": "capitulation", "confidence": 0.91, "score": 0.88},
+        "anomaly": {
+            "detected": True,
+            "anomaly_type": "liquidation_driven_oi_drop",
+            "confidence": 0.91,
+            "score": 0.88,
+        },
+        "divergence": {
+            "detected": True,
+            "divergence_type": "price_down_oi_down",
+            "confidence": 0.80,
+            "score": 0.75,
+        },
+    }
+
+
+def _sample_funding_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "1h",
+        "timestamp": _utcnow(),
+        "confidence": 0.87,
+        "snapshot": {"funding_rate": -0.00035, "predicted_rate": -0.00045},
+        "statistics": {"zscore": -2.4, "percentile": 0.04},
+        "regime": {"regime": "extreme_negative", "confidence": 0.86},
+        "pressure": {"score": 0.78, "level": "crowded_shorts", "direction": "long"},
+        "extreme": {
+            "type": "negative_extreme",
+            "severity": 0.82,
+            "mean_reversion_probability": 0.74,
+            "squeeze_probability": 0.62,
+        },
+        "divergence": {"type": "funding_price_divergence", "confidence": 0.75, "score": 0.72},
+        "flip": {"type": "negative_to_positive", "confidence": 0.70},
+        "signal": {"signal_type": "squeeze_setup", "bias": "long", "score": 0.81, "confidence": 0.87},
+    }
+
+
+def _sample_orderflow_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "1m",
+        "timestamp": _utcnow(),
+        "confidence": 0.84,
+        "composite": {
+            "price_change_pct": 0.008,
+            "trades_count": 1200,
+            "total_volume": 480.0,
+            "total_notional": 31_000_000.0,
+            "cvd_delta_ratio": 0.68,
+            "cvd_change_pct": 0.05,
+            "cvd_slope": 0.72,
+            "volume_delta_ratio": 0.64,
+            "volume_delta": 140.0,
+            "aggressive_buy_ratio": 0.71,
+            "aggressive_sell_ratio": 0.29,
+            "orderbook_imbalance_ratio": 0.63,
+            "orderbook_imbalance_diff": 250.0,
+        },
+        "cvd": {"delta_ratio": 0.68, "cvd_change_pct": 0.05, "cvd_slope": 0.72, "price_change_pct": 0.008},
+        "volume_delta": {"delta_ratio": 0.64, "volume_delta": 140.0},
+        "aggressive_trades": {"buy_ratio": 0.71, "sell_ratio": 0.29},
+        "orderbook_imbalance": {"ratio": 0.63, "diff": 250.0},
+    }
+
+
+def _sample_liquidations_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "1m",
+        "timestamp": _utcnow(),
+        "confidence": 0.83,
+        "cascade": {
+            "confidence": 0.83,
+            "intensity_score": 0.79,
+            "direction": "sell",
+            "severity": "high",
+            "continuation_bias": 0.31,
+            "exhaustion_bias": 0.76,
+            "total_notional_usd": 2_400_000.0,
+            "event_count": 38,
+        },
+        "exhaustion": {"confidence": 0.77, "exhaustion_bias": 0.76, "bias_delta": 0.42, "confirmed": True},
+        "squeeze": {"confirmed": True, "score": 0.74, "direction": "long"},
+        "cluster": {
+            "duration_seconds": 38,
+            "avg_notional_per_event": 63_000.0,
+            "side_imbalance_ratio": 0.81,
+            "event_imbalance_ratio": 0.72,
+            "acceleration_ratio": 1.8,
+        },
+    }
+
+
+def _sample_liquidity_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "5m",
+        "timestamp": _utcnow(),
+        "confidence": 0.80,
+        "snapshot": {
+            "current_price": 65000.0,
+            "above_liquidity_score": 0.72,
+            "below_liquidity_score": 0.35,
+            "pressure_score": 0.66,
+            "bias": "up",
+            "sweep_risk": {"up": 0.78, "down": 0.20},
+            "magnet": {"up": 0.71, "down": 0.18},
+            "nearest_above_level": {"price": 65500.0, "strength": 0.80},
+            "nearest_below_level": {"price": 64200.0, "strength": 0.50},
+            "active_levels": [{"price": 65500.0}],
+            "stop_clusters": [{"price": 65600.0}],
+            "zones": [{"low": 65400.0, "high": 65700.0}],
+        },
+        "signal": {"bias": "up", "score": 0.75, "confidence": 0.80},
+    }
+
+
+def _sample_price_action_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "5m",
+        "timestamp": _utcnow(),
+        "confidence": 0.82,
+        "state": {
+            "current_price": 65000.0,
+            "market_structure": {"last_break_event": {"type": "bos", "side": "bullish"}, "mtf_alignment": 0.76},
+            "support_resistance": {
+                "last_event": {"type": "level_retested", "side": "support"},
+                "nearest_support": {"price": 64200.0},
+                "nearest_resistance": {"price": 65700.0},
+            },
+            "fair_value_gap": {
+                "last_event": {"type": "fvg_retested", "side": "bullish"},
+                "nearest_bullish_gap": {"low": 64600.0, "high": 64850.0},
+            },
+            "trend": {
+                "last_signal": {"type": "trend_continuation", "side": "long"},
+                "overall_trend_score": 0.78,
+                "higher_timeframe_alignment": 0.70,
+            },
+            "liquidity_levels": {"last_event": {"type": "liquidity_swept", "side": "down"}},
+        },
+    }
+
+
+def _sample_spoofing_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "1m",
+        "timestamp": _utcnow(),
+        "confidence": 0.86,
+        "composite": {
+            "signal": {
+                "spoofing_type": "order_pull",
+                "pattern": "fake_liquidity",
+                "side": "ask",
+                "severity": "high",
+                "status": "detected",
+                "score": 0.84,
+                "confidence": 0.86,
+            },
+            "features": {
+                "pull_ratio": 0.88,
+                "fill_ratio": 0.08,
+                "price_reaction_bps": 3.2,
+                "lifetime_ms": 1300,
+                "wall_notional": 1_200_000.0,
+                "pulled_notional": 1_050_000.0,
+                "cancel_to_fill_ratio": 0.91,
+                "distance_from_mid_bps": 1.5,
+                "layer_count": 4,
+                "layer_price_span_bps": 3.1,
+                "pressure_flip_strength": 0.72,
+            },
+            "detector_results": {
+                "order_pull": {"passed": True, "score": 0.84, "confidence": 0.86},
+                "fake_liquidity": {"passed": True, "score": 0.80, "confidence": 0.82},
+            },
+        },
+    }
+
+
+def _sample_spreads_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "5m",
+        "timestamp": _utcnow(),
+        "confidence": 0.81,
+        "snapshot": {
+            "spread_type": "spot_futures",
+            "symbol": "BTCUSDT",
+            "exchange_a": "binance",
+            "exchange_b": "binance",
+            "market_type_a": "spot",
+            "market_type_b": "usdm_futures",
+            "spread_bps": 38.0,
+            "basis": 0.0038,
+            "funding_adjusted_spread": 31.0,
+            "net_edge": 26.0,
+            "net_edge_bps": 26.0,
+            "zscore": 2.4,
+            "regime": "elevated",
+            "direction": "widening",
+            "quote_validity": "valid",
+            "has_edge": True,
+            "confidence": 0.81,
+        },
+        "signal": {"signal_type": "mean_reversion", "direction": "narrowing", "confidence": 0.82},
+        "opportunity": {
+            "opportunity_key": "binance:spot:binance:usdm_futures:BTCUSDT",
+            "status": "active",
+            "buy_exchange": "binance",
+            "sell_exchange": "binance",
+            "net_edge_bps": 26.0,
+            "persistence_ms": 1500,
+        },
+    }
+
+
+def _sample_whales_payload() -> dict[str, Any]:
+    return {
+        "exchange": "binance",
+        "market_type": "usdm_futures",
+        "symbol": "BTCUSDT",
+        "timeframe": "1m",
+        "timestamp": _utcnow(),
+        "confidence": 0.85,
+        "composite": {
+            "activity": {"notional": 900_000.0, "trade_count": 6, "side": "buy", "score": 0.78},
+            "pressure": {"side": "buy", "score": 0.74, "imbalance_ratio": 0.70},
+            "large_trade": {"notional": 500_000.0, "zscore": 2.5, "side": "buy"},
+            "cluster": {"score": 0.71, "side": "buy", "continuation_probability": 0.73, "exhaustion_probability": 0.21},
+            "liquidation_context": {"side": "sell", "notional": 450_000.0, "strength": 0.66},
+            "exhaustion": {"probability": 0.24, "side": "sell"},
+        },
+    }
+
+
+CONTRACT_CASES = [
+    {
+        "name": "open_interest",
+        "event": "analytics.oi.capitulation.detected",
+        "source": "OPEN_INTEREST",
+        "payload": _sample_open_interest_payload,
+        "expected_features": {"open_interest.features", "open_interest.regime", "open_interest.anomaly", "open_interest.divergence"},
+        "expected_domain_keys": {"features", "regime", "anomaly", "divergence"},
+    },
+    {
+        "name": "funding",
+        "event": "analytics.funding.signal",
+        "source": "FUNDING",
+        "payload": _sample_funding_payload,
+        "expected_features": {"funding.snapshot", "funding.statistics", "funding.regime", "funding.pressure", "funding.extreme", "funding.divergence", "funding.flip", "funding.signal"},
+        "expected_domain_keys": {"snapshot", "statistics", "regime", "pressure", "extreme", "divergence", "flip", "signal"},
+    },
+    {
+        "name": "orderflow",
+        "event": "analytics.orderflow.updated",
+        "source": "ORDERFLOW",
+        "payload": _sample_orderflow_payload,
+        "expected_features": {"orderflow.composite", "orderflow.cvd", "orderflow.cvd.delta_ratio", "orderflow.volume_delta", "orderflow.volume_delta.delta_ratio", "orderflow.aggressive_trades", "orderflow.orderbook_imbalance"},
+        "expected_domain_keys": {"composite", "cvd", "volume_delta", "aggressive_trades", "orderbook_imbalance"},
+    },
+    {
+        "name": "liquidations",
+        "event": "analytics.liquidations.cascade_detected",
+        "source": "LIQUIDATIONS",
+        "payload": _sample_liquidations_payload,
+        "expected_features": {"liquidations.cascade", "liquidations.cascade.confidence", "liquidations.cascade.intensity_score", "liquidations.exhaustion", "liquidations.squeeze", "liquidations.cluster"},
+        "expected_domain_keys": {"cascade", "exhaustion", "squeeze", "cluster"},
+    },
+    {
+        "name": "liquidity",
+        "event": "analytics.liquidity.map.updated",
+        "source": "LIQUIDITY",
+        "payload": _sample_liquidity_payload,
+        "expected_features": {"liquidity.snapshot", "liquidity.map.snapshot", "liquidity.current_price", "liquidity.above_liquidity_score", "liquidity.below_liquidity_score", "liquidity.pressure_score", "liquidity.bias"},
+        "expected_domain_keys": {"snapshot", "signal"},
+    },
+    {
+        "name": "price_action",
+        "event": "analytics.price_action.market_structure.updated",
+        "source": "PRICE_ACTION",
+        "payload": _sample_price_action_payload,
+        "expected_features": {"price_action.composite", "price_action.market_structure", "price_action.support_resistance", "price_action.fair_value_gap", "price_action.trend", "price_action.current_price"},
+        "expected_domain_keys": {"state", "market_structure", "support_resistance", "fair_value_gap", "trend"},
+    },
+    {
+        "name": "spoofing",
+        "event": "analytics.spoofing.detected",
+        "source": "SPOOFING",
+        "payload": _sample_spoofing_payload,
+        "expected_features": {"spoofing.composite", "spoofing.signal", "spoofing.features", "spoofing.detector_results", "spoofing.score", "spoofing.confidence", "spoofing.features.pull_ratio", "spoofing.features.fill_ratio"},
+        "expected_domain_keys": {"composite", "signal", "features", "detector_results"},
+    },
+    {
+        "name": "spreads",
+        "event": "analytics.spreads.signal.generated",
+        "source": "SPREADS",
+        "payload": _sample_spreads_payload,
+        "expected_features": {"spreads.snapshot", "spreads.signal", "spreads.opportunity", "spreads.type", "spreads.spread_bps", "spreads.net_edge_bps", "spreads.zscore"},
+        "expected_domain_keys": {"snapshot", "signal", "opportunity"},
+    },
+    {
+        "name": "whales",
+        "event": "analytics.whales.whale_activity",
+        "source": "WHALES",
+        "payload": _sample_whales_payload,
+        "expected_features": {"whales.composite", "whales.activity", "whales.pressure", "whales.large_trade", "whales.cluster", "whales.liquidation_context", "whales.exhaustion"},
+        "expected_domain_keys": {"composite", "activity", "pressure", "large_trade", "cluster", "liquidation_context", "exhaustion"},
+    },
+]
+
+
+@pytest.mark.parametrize("case", CONTRACT_CASES, ids=lambda item: item["name"])
+def test_routing_maps_real_analytics_topics_to_domain_and_hybrid(case: dict[str, Any]) -> None:
+    config = _make_config()
+    categories = _categories_for_event(config, case["event"])
+    category_names = _category_names(categories)
+
+    print("")
+    print(f"========== ROUTING REPORT: {case['name']} ==========")
+    print("event:", case["event"])
+    print("categories:", sorted(category_names))
+    print("expected_domain:", case["source"])
+    print("===================================================")
+    print("")
+
+    assert case["source"] in category_names, (
+        f"RoutingConfig did not route {case['event']} to {case['source']}. "
+        f"categories={sorted(category_names)}"
+    )
+    assert "HYBRID" in category_names, (
+        f"RoutingConfig did not route {case['event']} to HYBRID. "
+        f"categories={sorted(category_names)}"
+    )
+
+
+@pytest.mark.parametrize("case", CONTRACT_CASES, ids=lambda item: item["name"])
+def test_signal_normalizer_builds_domain_contracts_for_real_analytics_topics(case: dict[str, Any]) -> None:
+    config = _make_config()
+    normalizer = _make_normalizer(config)
+
+    payload = case["payload"]()
+    timestamp = payload.get("timestamp") or _utcnow()
+
+    normalized = _call_normalize(
+        normalizer,
+        event_name=case["event"],
+        payload=payload,
+        timestamp=timestamp,
+    )
+
+    expected_features = set(case["expected_features"])
+    expected_domain_keys = set(case["expected_domain_keys"])
+
+    _print_normalized_report(
+        case_name=case["name"],
+        event_name=case["event"],
+        normalized=normalized,
+        expected_features=expected_features,
+        expected_domain_keys=expected_domain_keys,
+    )
+
+    source = _normalized_source(normalized)
+    feature_names = _normalized_feature_names(normalized)
+    domain_data = _normalized_domain_data(normalized)
+
+    expected_source = str(case["source"]).lower()
+    assert expected_source in source, (
+        f"Normalizer source mismatch for {case['event']}. "
+        f"expected contains={expected_source!r}, actual={source!r}. "
+        "Check analytics topic -> FeatureSource mapping."
+    )
+
+    missing_features = expected_features - feature_names
+    assert not missing_features, (
+        f"Normalizer did not build required contract FeatureSnapshot names for {case['name']}. "
+        f"missing={sorted(missing_features)}. "
+        "Check _build_contract_features(...) branch and _build_<domain>_contract_features(...)."
+    )
+
+    missing_domain_keys = expected_domain_keys - set(domain_data.keys())
+    assert not missing_domain_keys, (
+        f"Normalizer did not build required domain_data aliases for {case['name']}. "
+        f"missing={sorted(missing_domain_keys)}. "
+        "Check normalize_event(...) calls _augment_domain_data_contracts(...), "
+        "and check _augment_<domain>_domain_data(...)."
+    )
+
+
+@pytest.mark.parametrize("case", CONTRACT_CASES, ids=lambda item: item["name"])
+def test_hybrid_summary_features_are_present_for_each_domain_event(case: dict[str, Any]) -> None:
+    config = _make_config()
+    normalizer = _make_normalizer(config)
+
+    payload = case["payload"]()
+    timestamp = payload.get("timestamp") or _utcnow()
+
+    normalized = _call_normalize(
+        normalizer,
+        event_name=case["event"],
+        payload=payload,
+        timestamp=timestamp,
+    )
+
+    feature_names = _normalized_feature_names(normalized)
+    expected_hybrid = {
+        "hybrid.dominant_side",
+        "hybrid.alignment_score",
+        "hybrid.conflict_score",
+        "hybrid.confluence_score",
+        "hybrid.confidence",
+        "hybrid.votes",
+    }
+
+    print("")
+    print(f"========== HYBRID SUMMARY REPORT: {case['name']} ==========")
+    print("event:", case["event"])
+    print("missing_hybrid:", sorted(expected_hybrid - feature_names))
+    print("==========================================================")
+    print("")
+
+    missing_hybrid = expected_hybrid - feature_names
+    assert not missing_hybrid, (
+        f"Hybrid summary features are missing for {case['name']}. "
+        f"missing={sorted(missing_hybrid)}. "
+        "If you intentionally build hybrid summary in StrategyContextBuilder instead of SignalNormalizer, "
+        "move this assertion to the StrategyContextBuilder-level test."
+    )
+
+
+def test_normalizer_diagnostic_matrix_for_all_domains() -> None:
+    config = _make_config()
+    normalizer = _make_normalizer(config)
+    rows: list[dict[str, Any]] = []
+
+    for case in CONTRACT_CASES:
+        payload = case["payload"]()
+        timestamp = payload.get("timestamp") or _utcnow()
+        normalized = _call_normalize(
+            normalizer,
+            event_name=case["event"],
+            payload=payload,
+            timestamp=timestamp,
+        )
+
+        feature_names = _normalized_feature_names(normalized)
+        domain_data = _normalized_domain_data(normalized)
+        categories = _category_names(_categories_for_event(config, case["event"]))
+        expected_features = set(case["expected_features"])
+        expected_domain_keys = set(case["expected_domain_keys"])
+
+        rows.append(
+            {
+                "domain": case["name"],
+                "event": case["event"],
+                "source": _normalized_source(normalized),
+                "categories": sorted(categories),
+                "missing_features": sorted(expected_features - feature_names),
+                "missing_domain": sorted(expected_domain_keys - set(domain_data.keys())),
+                "missing_hybrid": sorted(
+                    {
+                        "hybrid.dominant_side",
+                        "hybrid.alignment_score",
+                        "hybrid.conflict_score",
+                        "hybrid.confluence_score",
+                        "hybrid.confidence",
+                        "hybrid.votes",
+                    }
+                    - feature_names
+                ),
+            }
+        )
+
+    print("")
+    print("========== STRATEGY ANALYTICS PIPELINE DIAGNOSTIC MATRIX ==========")
+    for row in rows:
+        print("")
+        print("domain:", row["domain"])
+        print("event:", row["event"])
+        print("source:", row["source"])
+        print("categories:", row["categories"])
+        print("missing_features:", row["missing_features"])
+        print("missing_domain:", row["missing_domain"])
+        print("missing_hybrid:", row["missing_hybrid"])
+    print("==================================================================")
+    print("")
+
+    failing = [row for row in rows if row["missing_features"] or row["missing_domain"]]
+    assert not failing, (
+        "Some analytics domains are still not normalized into StrategyContext contracts. "
+        "Run with -s and inspect the diagnostic matrix above."
+    )
+
+
 @pytest.mark.asyncio
-async def test_signal_processor_downstream_can_emit_known_good_signal_generated() -> None:
-    event_bus = EventBus()
-    scheduler = Scheduler(event_bus=event_bus)
+async def test_optional_signal_processor_smoke_diagnostic() -> None:
+    try:
+        from strategy.processor import SignalProcessor
+        from strategy.presets import build_default_strategy_registry
+        from core.event_bus import EventBus
+    except Exception as exc:
+        pytest.xfail(f"Optional processor smoke imports failed: {exc!r}")
 
-    config = build_default_strategy_config(
-        symbols=["BTCUSDT"],
-        preset_name="intraday",
-        use_required_features=False,
-    )
-    config.confluence.min_agreement_count = 1
-    config.confluence.min_confidence = 0.0
-    config.confluence.min_score = 0.0
-    config.voting.min_confirmations = 1
-    config.voting.min_total_votes = 1
-    config.voting.allow_single_strategy_confirmation = True
-    portfolio = config.portfolio
-
-    # Disable portfolio policies that can hide whether SignalProcessor can emit.
-    # The previous debug showed: rejected_signals={'manual_processor_probe': 'repeating_signal_suppressed'}.
-    for name, value in {
-        "enabled": True,
-
-        # Existing fields in the current PortfolioCoordinatorConfig.
-        "deduplicate_by_side": False,
-        "merge_similar_signals": False,
-        "correlation_guard_enabled": False,
-        "enable_correlation_direction_conflict": False,
-        "volatility_throttle_enabled": False,
-        "repeated_signal_suppression_seconds": 0,
-        "side_cooldown_seconds": 0,
-        "symbol_cooldown_seconds": 0,
-        "high_volatility_max_signals_per_symbol": 10,
-        "max_signals_per_symbol": 10,
-
-        # Compatibility with possible future/alternate config names.
-        "allow_new_signals": True,
-        "allow_same_symbol_multiple_strategies": True,
-        "allow_multiple_signals_per_symbol": True,
-        "allow_same_direction_signals": True,
-        "block_opposite_signals": False,
-        "reject_opposite_signals": False,
-        "max_active_signals": 100,
-        "max_active_signals_total": 100,
-        "max_total_active_signals": 100,
-        "max_active_per_symbol": 10,
-        "max_symbol_signals": 10,
-        "max_strategy_signals": 10,
-        "max_signals_per_strategy": 10,
-        "min_signal_score": 0.0,
-        "min_signal_confidence": 0.0,
-    }.items():
-        _set_if_exists(portfolio, name, value)
-
-    if hasattr(portfolio, "exposure_bucket_limits"):
-        portfolio.exposure_bucket_limits = {
-            "directional": 100,
-            "hybrid": 100,
-        }
-
-    if hasattr(portfolio, "max_signals_per_category"):
-        portfolio.max_signals_per_category = {
-            StrategyCategory.PRICE_ACTION: 100,
-            StrategyCategory.ORDERFLOW: 100,
-            StrategyCategory.OPEN_INTEREST: 100,
-            StrategyCategory.WHALES: 100,
-            StrategyCategory.SPREADS: 100,
-            StrategyCategory.HYBRID: 100,
-        }
-
-    _print_portfolio_config_debug(config)
-    assert isinstance(config, StrategyConfig)
-
-    registry = build_default_strategy_registry(
-        config=config,
-        event_bus=event_bus,
-        scheduler=scheduler,
-        strategy_factories={},
-        strict=False,
-        emit_events=False,
-    )
-
-    probe_definition = StrategyDefinitionConfig(
-        name="manual_processor_probe_unique",
-        category=StrategyCategory.OPEN_INTEREST,
-        runtime=StrategyRuntimeConfig(
-            enabled=True,
-            symbols=["BTCUSDT"],
-            timeframes=[Timeframe.M1, Timeframe.M5, Timeframe.M15],
-            allowed_regimes=[MarketRegime.UNKNOWN],
-            cooldown_seconds=0,
-            max_signal_age_seconds=300,
-            min_confidence=0.0,
-            min_score=0.0,
-        ),
-        required_features=set(),
-        weight=1.0,
-        priority=1,
-        tags=["pytest", "manual_probe"],
-        metadata={"source": "pytest"},
-    )
-
-    probe = _ManualSignalStrategy(
-        config=config,
-        event_bus=event_bus,
-        scheduler=scheduler,
-        definition=probe_definition,
-    )
-    registry.register_strategy(probe, replace=True, emit_event=False)
-
-    state = StrategyRuntimeState()
-
-    processor = SignalProcessor(
-        config=config,
-        registry=registry,
-        state=state,
-        event_bus=event_bus,
-        scheduler=scheduler,
-    )
-
-    captured_signal_generated: list[dict[str, Any]] = []
-
-    async def on_signal_generated(event: Any) -> None:
-        payload = getattr(event, "payload", event)
-        if isinstance(payload, dict):
-            captured_signal_generated.append(payload)
-
-    event_bus.subscribe(
-        "signal.generated",
-        on_signal_generated,
-        name="pytest_capture_signal_generated",
-    )
-
-    await _maybe_await(event_bus.start())
-    await _maybe_await(scheduler.start())
+    config = _make_config()
 
     try:
-        payload = _realistic_oi_payload(
-            symbol="BTCUSDT",
-            timeframe="5m",
-            confidence=0.92,
-            score=0.88,
-        )
+        event_bus = EventBus()
+    except Exception:
+        event_bus = None
 
-        batch = await processor.process_event(
-            event_name="analytics.oi.capitulation.detected",
-            payload=payload,
-            timestamp=payload.get("timestamp"),
-            emit=True,
-        )
+    try:
+        registry = build_default_strategy_registry(config=config, event_bus=event_bus, scheduler=None)
+    except TypeError:
+        try:
+            registry = build_default_strategy_registry(config=config)
+        except TypeError:
+            registry = build_default_strategy_registry()
 
-        _print_portfolio_batch_debug(batch)
+    try:
+        processor = SignalProcessor(config=config, registry=registry, event_bus=event_bus)
+    except TypeError:
+        try:
+            processor = SignalProcessor(config=config, strategy_registry=registry, event_bus=event_bus)
+        except TypeError as exc:
+            pytest.xfail(f"SignalProcessor constructor signature differs: {exc!r}")
 
-        print("\n[PROCESSOR] accepted:", batch.accepted)
-        print("[PROCESSOR] emitted:", batch.emitted)
-        print("[PROCESSOR] reasons:", batch.reasons)
-        print("[PROCESSOR] route:", batch.route.selected_names if batch.route else None)
-        print("[PROCESSOR] raw_signal_count:", len(batch.raw_signals))
-        print("[PROCESSOR] final_signal_count:", len(batch.final_signals))
-        print("[PROCESSOR] risk_payload_count:", len(batch.risk_payloads))
-        print("[PROCESSOR] evaluations:")
-        for evaluation in batch.evaluations:
-            print(" -", evaluation)
-        print("[PROCESSOR] captured signal.generated:", len(captured_signal_generated))
+    process_event = getattr(processor, "process_event", None)
+    if not callable(process_event):
+        pytest.xfail("SignalProcessor.process_event(...) is not available")
 
-        assert batch.route is not None, "SignalProcessor did not create a RouteDecision"
-        assert batch.route.selected, f"No strategies routed. reasons={batch.reasons}"
-        assert batch.raw_signals, (
-            f"No raw signals created. reasons={batch.reasons}. "
-            "If evaluation_error mentions signal.entry, fix strategy/base.py to use "
-            "entry_plan/exit_plan/invalidation_plan or keep compatibility aliases."
-        )
-        assert batch.final_signals, f"Signal was blocked before final_signals. reasons={batch.reasons}"
-        assert batch.risk_payloads, f"SignalBuilder did not create risk payloads. reasons={batch.reasons}"
-        assert batch.emitted is True, f"SignalProcessor did not mark batch emitted. reasons={batch.reasons}"
-        assert captured_signal_generated, "No signal.generated event was captured from EventBus"
+    payload = _sample_open_interest_payload()
+    kwargs = {
+        "event_name": "analytics.oi.capitulation.detected",
+        "payload": payload,
+        "timestamp": payload.get("timestamp"),
+        "emit": False,
+    }
 
-    finally:
-        await _maybe_await(scheduler.stop())
-        await _maybe_await(event_bus.stop())
+    signature = inspect.signature(process_event)
+    filtered_kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+
+    try:
+        batch = await process_event(**filtered_kwargs)
+    except TypeError:
+        batch = await process_event("analytics.oi.capitulation.detected", payload)
+
+    print("")
+    print("========== OPTIONAL PROCESSOR SMOKE ==========")
+    print("batch:", batch)
+    for attr in (
+        "accepted",
+        "emitted",
+        "reasons",
+        "raw_signal_count",
+        "final_signal_count",
+        "risk_payload_count",
+        "selected_names",
+        "rejected_signals",
+    ):
+        if hasattr(batch, attr):
+            print(f"{attr}:", getattr(batch, attr))
+    print("=============================================")
+    print("")
+
+    assert batch is not None

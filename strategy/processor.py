@@ -1324,6 +1324,61 @@ class SignalNormalizer(BaseStrategyComponent):
         )
 
         if composite is not None:
+            if signal is None:
+                for key in (
+                        "signal",
+                        "spoofing_signal",
+                        "analytics_signal",
+                        "event",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        signal = value
+                        break
+
+            if features is None:
+                for key in (
+                        "features",
+                        "spoofing_features",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        features = value
+                        break
+
+            if detector_results is None:
+                for key in (
+                        "detector_results",
+                        "detectors",
+                        "detector_result",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        detector_results = value
+                        break
+
+            if score_breakdown is None:
+                for key in (
+                        "score_breakdown",
+                        "scores",
+                        "score_components",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        score_breakdown = value
+                        break
+
+            if analytics_metadata is None:
+                for key in (
+                        "analytics_metadata",
+                        "metadata",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        analytics_metadata = value
+                        break
+
+        if composite is not None:
             domain_data.setdefault("composite", composite)
             domain_data.setdefault("spoofing", composite)
             domain_data.setdefault("snapshot", composite)
@@ -1341,6 +1396,7 @@ class SignalNormalizer(BaseStrategyComponent):
         if detector_results is not None:
             domain_data.setdefault("detector_results", detector_results)
             domain_data.setdefault("detectors", detector_results)
+            domain_data.setdefault("detector_result", detector_results)
 
         if score_breakdown is not None:
             domain_data.setdefault("score_breakdown", score_breakdown)
@@ -1521,56 +1577,171 @@ class SignalNormalizer(BaseStrategyComponent):
 
             return None
 
-        for target, aliases in {
-            "composite": (
-                    "composite",
-                    "whales",
-                    "snapshot",
-                    "result",
-            ),
-            "activity": (
-                    "activity",
-                    "whale_activity",
-                    "activity_context",
-            ),
-            "pressure": (
-                    "pressure",
-                    "whale_pressure",
-                    "pressure_context",
-            ),
-            "large_trade": (
-                    "large_trade",
-                    "large_trade_event",
-                    "large_trade_context",
-            ),
-            "cluster": (
-                    "cluster",
-                    "whale_cluster",
-                    "cluster_context",
-            ),
-            "liquidation_context": (
-                    "liquidation_context",
-                    "whale_liquidation_context",
-                    "liquidations",
-                    "liquidation",
-            ),
-            "exhaustion": (
-                    "exhaustion",
-                    "cluster_exhaustion",
-                    "exhaustion_context",
-            ),
-            "signal": (
-                    "signal",
-                    "whale_signal",
-                    "analytics_signal",
-                    "event",
-            ),
-        }.items():
-            value = mapping_for(*aliases)
-            if value is not None:
-                domain_data.setdefault(target, value)
-                for alias in aliases:
-                    domain_data.setdefault(alias, value)
+        composite = mapping_for(
+            "composite",
+            "whales",
+            "snapshot",
+            "result",
+        )
+        activity = mapping_for(
+            "activity",
+            "whale_activity",
+            "activity_context",
+        )
+        pressure = mapping_for(
+            "pressure",
+            "whale_pressure",
+            "pressure_context",
+        )
+        large_trade = mapping_for(
+            "large_trade",
+            "large_trade_event",
+            "large_trade_context",
+        )
+        cluster = mapping_for(
+            "cluster",
+            "whale_cluster",
+            "cluster_context",
+        )
+        liquidation_context = mapping_for(
+            "liquidation_context",
+            "whale_liquidation_context",
+            "liquidations",
+            "liquidation",
+        )
+        exhaustion = mapping_for(
+            "exhaustion",
+            "cluster_exhaustion",
+            "exhaustion_context",
+        )
+        signal = mapping_for(
+            "signal",
+            "whale_signal",
+            "analytics_signal",
+            "event",
+        )
+
+        if composite is not None:
+            if activity is None:
+                for key in (
+                        "activity",
+                        "whale_activity",
+                        "activity_context",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        activity = value
+                        break
+
+            if pressure is None:
+                for key in (
+                        "pressure",
+                        "whale_pressure",
+                        "pressure_context",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        pressure = value
+                        break
+
+            if large_trade is None:
+                for key in (
+                        "large_trade",
+                        "large_trade_event",
+                        "large_trade_context",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        large_trade = value
+                        break
+
+            if cluster is None:
+                for key in (
+                        "cluster",
+                        "whale_cluster",
+                        "cluster_context",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        cluster = value
+                        break
+
+            if liquidation_context is None:
+                for key in (
+                        "liquidation_context",
+                        "whale_liquidation_context",
+                        "liquidations",
+                        "liquidation",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        liquidation_context = value
+                        break
+
+            if exhaustion is None:
+                for key in (
+                        "exhaustion",
+                        "cluster_exhaustion",
+                        "exhaustion_context",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        exhaustion = value
+                        break
+
+            if signal is None:
+                for key in (
+                        "signal",
+                        "whale_signal",
+                        "analytics_signal",
+                        "event",
+                ):
+                    value = composite.get(key)
+                    if isinstance(value, dict):
+                        signal = value
+                        break
+
+        if composite is not None:
+            domain_data.setdefault("composite", composite)
+            domain_data.setdefault("whales", composite)
+            domain_data.setdefault("snapshot", composite)
+            domain_data.setdefault("result", composite)
+
+        if activity is not None:
+            domain_data.setdefault("activity", activity)
+            domain_data.setdefault("whale_activity", activity)
+            domain_data.setdefault("activity_context", activity)
+
+        if pressure is not None:
+            domain_data.setdefault("pressure", pressure)
+            domain_data.setdefault("whale_pressure", pressure)
+            domain_data.setdefault("pressure_context", pressure)
+
+        if large_trade is not None:
+            domain_data.setdefault("large_trade", large_trade)
+            domain_data.setdefault("large_trade_event", large_trade)
+            domain_data.setdefault("large_trade_context", large_trade)
+
+        if cluster is not None:
+            domain_data.setdefault("cluster", cluster)
+            domain_data.setdefault("whale_cluster", cluster)
+            domain_data.setdefault("cluster_context", cluster)
+
+        if liquidation_context is not None:
+            domain_data.setdefault("liquidation_context", liquidation_context)
+            domain_data.setdefault("whale_liquidation_context", liquidation_context)
+            domain_data.setdefault("liquidations", liquidation_context)
+            domain_data.setdefault("liquidation", liquidation_context)
+
+        if exhaustion is not None:
+            domain_data.setdefault("exhaustion", exhaustion)
+            domain_data.setdefault("cluster_exhaustion", exhaustion)
+            domain_data.setdefault("exhaustion_context", exhaustion)
+
+        if signal is not None:
+            domain_data.setdefault("signal", signal)
+            domain_data.setdefault("whale_signal", signal)
+            domain_data.setdefault("analytics_signal", signal)
 
         if "composite" not in domain_data and (
                 "whale_side" in payload
@@ -1592,6 +1763,7 @@ class SignalNormalizer(BaseStrategyComponent):
         ):
             domain_data["activity"] = dict(payload)
             domain_data.setdefault("whale_activity", domain_data["activity"])
+            domain_data.setdefault("activity_context", domain_data["activity"])
 
         if "pressure" not in domain_data and (
                 "pressure_score" in payload
@@ -1601,6 +1773,7 @@ class SignalNormalizer(BaseStrategyComponent):
         ):
             domain_data["pressure"] = dict(payload)
             domain_data.setdefault("whale_pressure", domain_data["pressure"])
+            domain_data.setdefault("pressure_context", domain_data["pressure"])
 
         if "large_trade" not in domain_data and (
                 "large_trade_notional" in payload
@@ -1609,6 +1782,7 @@ class SignalNormalizer(BaseStrategyComponent):
         ):
             domain_data["large_trade"] = dict(payload)
             domain_data.setdefault("large_trade_event", domain_data["large_trade"])
+            domain_data.setdefault("large_trade_context", domain_data["large_trade"])
 
         if "cluster" not in domain_data and (
                 "cluster_score" in payload
@@ -1618,6 +1792,7 @@ class SignalNormalizer(BaseStrategyComponent):
         ):
             domain_data["cluster"] = dict(payload)
             domain_data.setdefault("whale_cluster", domain_data["cluster"])
+            domain_data.setdefault("cluster_context", domain_data["cluster"])
 
         if "liquidation_context" not in domain_data and (
                 "liquidation_side" in payload
@@ -1630,6 +1805,8 @@ class SignalNormalizer(BaseStrategyComponent):
                 "whale_liquidation_context",
                 domain_data["liquidation_context"],
             )
+            domain_data.setdefault("liquidations", domain_data["liquidation_context"])
+            domain_data.setdefault("liquidation", domain_data["liquidation_context"])
 
         if "exhaustion" not in domain_data and (
                 "exhaustion_probability" in payload
@@ -1637,6 +1814,7 @@ class SignalNormalizer(BaseStrategyComponent):
         ):
             domain_data["exhaustion"] = dict(payload)
             domain_data.setdefault("cluster_exhaustion", domain_data["exhaustion"])
+            domain_data.setdefault("exhaustion_context", domain_data["exhaustion"])
 
         if "signal" not in domain_data and (
                 "side" in payload
@@ -1646,9 +1824,10 @@ class SignalNormalizer(BaseStrategyComponent):
         ):
             domain_data["signal"] = dict(payload)
             domain_data.setdefault("whale_signal", domain_data["signal"])
+            domain_data.setdefault("analytics_signal", domain_data["signal"])
 
         domain_data.setdefault("raw", dict(payload))
-        
+
     def _augment_domain_data_contracts(
             self,
             *,
@@ -4262,6 +4441,7 @@ class SignalNormalizer(BaseStrategyComponent):
         add("orderflow.price_change_pct", price_change_pct)
 
         return result
+
     def _build_open_interest_contract_features(
             self,
             *,
@@ -4276,19 +4456,138 @@ class SignalNormalizer(BaseStrategyComponent):
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def has_any(*keys: str) -> bool:
-            return any(key in payload or key in feature_map for key in keys)
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
 
-        def value_for(*keys: str, default: Any = True) -> Any:
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        analysis = mapping_for(
+            "analysis",
+            "oi_analysis",
+            "open_interest_analysis",
+            "result",
+        )
+        features = mapping_for(
+            "features",
+            "oi_features",
+            "open_interest_features",
+        )
+        snapshot = mapping_for(
+            "snapshot",
+            "oi_snapshot",
+            "open_interest_snapshot",
+        )
+        market_context = mapping_for(
+            "context",
+            "market_context",
+            "oi_context",
+            "open_interest_context",
+        )
+        regime = mapping_for(
+            "regime",
+            "regime_result",
+            "oi_regime",
+            "open_interest_regime",
+        )
+        anomaly = mapping_for(
+            "anomaly",
+            "anomaly_result",
+            "oi_anomaly",
+            "open_interest_anomaly",
+        )
+        divergence = mapping_for(
+            "divergence",
+            "divergence_result",
+            "oi_divergence",
+            "open_interest_divergence",
+        )
+
+        if analysis:
+            if not features:
+                value = analysis.get("features")
+                if isinstance(value, dict):
+                    features = value
+
+            if not snapshot:
+                value = analysis.get("snapshot")
+                if isinstance(value, dict):
+                    snapshot = value
+
+            if not market_context:
+                for key in ("context", "market_context", "oi_context"):
+                    value = analysis.get(key)
+                    if isinstance(value, dict):
+                        market_context = value
+                        break
+
+            if not regime:
+                for key in ("regime", "regime_result", "oi_regime"):
+                    value = analysis.get(key)
+                    if isinstance(value, dict):
+                        regime = value
+                        break
+
+            if not anomaly:
+                for key in ("anomaly", "anomaly_result", "oi_anomaly"):
+                    value = analysis.get(key)
+                    if isinstance(value, dict):
+                        anomaly = value
+                        break
+
+            if not divergence:
+                for key in ("divergence", "divergence_result", "oi_divergence"):
+                    value = analysis.get(key)
+                    if isinstance(value, dict):
+                        divergence = value
+                        break
+
+        def has_any(*keys: str) -> bool:
+            for key in keys:
+                if key in payload:
+                    return True
+                if key in feature_map:
+                    return True
+                if key in features:
+                    return True
+                if key in regime:
+                    return True
+                if key in anomaly:
+                    return True
+                if key in divergence:
+                    return True
+                if key in analysis:
+                    return True
+
+            return False
+
+        def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
                 if key in payload:
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
+                if key in features:
+                    return features[key]
+                if key in regime:
+                    return regime[key]
+                if key in anomaly:
+                    return anomaly[key]
+                if key in divergence:
+                    return divergence[key]
+                if key in analysis:
+                    return analysis[key]
+
             return default
 
         def add(name: str, value: Any = True) -> None:
-            snapshot = self._snapshot_from_raw_value(
+            snapshot_obj = self._snapshot_from_raw_value(
                 source=FeatureSource.OPEN_INTEREST,
                 symbol=symbol,
                 name=name,
@@ -4300,9 +4599,19 @@ class SignalNormalizer(BaseStrategyComponent):
                     "contract": "open_interest",
                 },
             )
-            result.append(snapshot)
+            result.append(snapshot_obj)
 
-        if has_any(
+        # Main OI contract sections
+        if analysis:
+            add("open_interest.analysis", analysis)
+
+        if snapshot:
+            add("open_interest.snapshot", snapshot)
+
+        if market_context:
+            add("open_interest.market_context", market_context)
+
+        if features or has_any(
                 "oi",
                 "open_interest",
                 "open_interest_value",
@@ -4310,26 +4619,87 @@ class SignalNormalizer(BaseStrategyComponent):
                 "oi_delta_pct",
                 "oi_direction",
                 "oi_acceleration",
+                "price_delta_pct",
+                "volume_ratio",
+                "oi_zscore",
+                "oi_pressure_score",
+                "funding_rate",
+                "liquidation_pressure",
+                "liquidation_imbalance",
+                "aggressive_flow_imbalance",
+                "oi_price_efficiency",
         ):
             add(
                 "open_interest.features",
-                {
+                features or {
                     "oi": value_for("oi", "open_interest", default=None),
+                    "open_interest": value_for("open_interest", "oi", default=None),
                     "open_interest_value": value_for("open_interest_value", default=None),
                     "oi_delta": value_for("oi_delta", default=None),
                     "oi_delta_pct": value_for("oi_delta_pct", default=None),
                     "oi_direction": value_for("oi_direction", default=None),
                     "oi_acceleration": value_for("oi_acceleration", default=None),
+                    "price_delta_pct": value_for("price_delta_pct", default=None),
+                    "volume_ratio": value_for("volume_ratio", default=None),
+                    "oi_zscore": value_for("oi_zscore", default=None),
+                    "oi_pressure_score": value_for("oi_pressure_score", default=None),
+                    "funding_rate": value_for("funding_rate", default=None),
+                    "liquidation_pressure": value_for(
+                        "liquidation_pressure",
+                        "liquidation_imbalance",
+                        default=None,
+                    ),
+                    "liquidation_imbalance": value_for(
+                        "liquidation_imbalance",
+                        "liquidation_pressure",
+                        default=None,
+                    ),
+                    "aggressive_flow_imbalance": value_for(
+                        "aggressive_flow_imbalance",
+                        default=None,
+                    ),
+                    "oi_price_efficiency": value_for(
+                        "oi_price_efficiency",
+                        default=None,
+                    ),
                 },
             )
 
-        if has_any("regime", "oi_regime", "market_regime"):
+        if regime or has_any(
+                "regime",
+                "oi_regime",
+                "market_regime",
+                "new_regime",
+        ):
             add(
                 "open_interest.regime",
-                value_for("regime", "oi_regime", "market_regime"),
+                regime or {
+                    "regime": value_for(
+                        "regime",
+                        "oi_regime",
+                        "market_regime",
+                        "new_regime",
+                        default=None,
+                    ),
+                    "confidence": value_for(
+                        "regime_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                    "score": value_for(
+                        "regime_score",
+                        "score",
+                        default=0.0,
+                    ),
+                    "reasons": value_for(
+                        "regime_reasons",
+                        "reasons",
+                        default=[],
+                    ),
+                },
             )
 
-        if has_any(
+        if anomaly or has_any(
                 "anomaly",
                 "anomaly_type",
                 "capitulation",
@@ -4337,35 +4707,109 @@ class SignalNormalizer(BaseStrategyComponent):
                 "squeeze_setup",
                 "squeeze_score",
                 "liquidation_imbalance",
+                "anomaly_detected",
+                "is_anomaly",
         ):
             add(
                 "open_interest.anomaly",
-                {
-                    "anomaly": value_for("anomaly", default=None),
+                anomaly or {
+                    "detected": value_for(
+                        "anomaly_detected",
+                        "is_anomaly",
+                        "anomaly",
+                        "capitulation",
+                        "squeeze_setup",
+                        default=True,
+                    ),
                     "anomaly_type": value_for("anomaly_type", default=None),
+                    "confidence": value_for(
+                        "anomaly_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                    "score": value_for(
+                        "anomaly_score",
+                        "score",
+                        default=0.0,
+                    ),
+                    "strength": value_for(
+                        "anomaly_strength",
+                        "strength",
+                        default=value_for("score", default=0.0),
+                    ),
                     "capitulation": value_for("capitulation", default=None),
-                    "capitulation_score": value_for("capitulation_score", default=None),
+                    "capitulation_score": value_for(
+                        "capitulation_score",
+                        default=None,
+                    ),
                     "squeeze_setup": value_for("squeeze_setup", default=None),
-                    "squeeze_score": value_for("squeeze_score", default=None),
-                    "liquidation_imbalance": value_for("liquidation_imbalance", default=None),
+                    "squeeze_score": value_for(
+                        "squeeze_score",
+                        default=None,
+                    ),
+                    "liquidation_imbalance": value_for(
+                        "liquidation_imbalance",
+                        "liquidation_pressure",
+                        default=None,
+                    ),
+                    "reasons": value_for(
+                        "anomaly_reasons",
+                        "reasons",
+                        default=[],
+                    ),
                 },
             )
 
-        if has_any(
+        if divergence or has_any(
                 "divergence",
                 "divergence_type",
                 "price_oi_divergence",
                 "cvd_delta",
                 "funding_rate",
+                "divergence_detected",
+                "is_divergence",
         ):
             add(
                 "open_interest.divergence",
-                {
-                    "divergence": value_for("divergence", default=None),
-                    "divergence_type": value_for("divergence_type", default=None),
-                    "price_oi_divergence": value_for("price_oi_divergence", default=None),
+                divergence or {
+                    "detected": value_for(
+                        "divergence_detected",
+                        "is_divergence",
+                        "divergence",
+                        default=True,
+                    ),
+                    "divergence_type": value_for(
+                        "divergence_type",
+                        "price_oi_divergence",
+                        default=None,
+                    ),
+                    "price_oi_divergence": value_for(
+                        "price_oi_divergence",
+                        "divergence_type",
+                        default=None,
+                    ),
+                    "confidence": value_for(
+                        "divergence_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                    "score": value_for(
+                        "divergence_score",
+                        "score",
+                        default=0.0,
+                    ),
+                    "window_size": value_for(
+                        "divergence_window_size",
+                        "window_size",
+                        default=None,
+                    ),
                     "cvd_delta": value_for("cvd_delta", default=None),
                     "funding_rate": value_for("funding_rate", default=None),
+                    "reasons": value_for(
+                        "divergence_reasons",
+                        "reasons",
+                        default=[],
+                    ),
                 },
             )
 
