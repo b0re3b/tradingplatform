@@ -9,11 +9,11 @@ from typing import Any
 from core.event_bus import Event, EventBus, EventPriority
 from core.scheduler import Scheduler
 
-from .base import BaseStrategy, BaseStrategyComponent
-from .config import StrategyConfig
-from .enums import FeatureSource, SignalStatus, Timeframe
-from .exceptions import StrategyEvaluationError, StrategyStateError
-from .models import (
+from strategy.base import BaseStrategy, BaseStrategyComponent
+from strategy.config import StrategyConfig
+from strategy.enums import FeatureSource, SignalStatus, Timeframe, MarketRegime
+from strategy.exceptions import StrategyEvaluationError, StrategyStateError
+from strategy.models import (
     FeatureSnapshot,
     PortfolioSnapshot,
     PriceSnapshot,
@@ -22,10 +22,11 @@ from .models import (
     StrategyEvaluation,
     ensure_aware_utc,
     utcnow,
+    clamp
 )
-from .processor import ProcessedSignalBatch, SignalProcessor
-from .registry import StrategyRegistry
-from .state import StrategyRuntimeState
+from strategy.processor import ProcessedSignalBatch, SignalProcessor
+from strategy.registry import StrategyRegistry
+from strategy.state import StrategyRuntimeState
 
 
 def _payload_from_event(event: Event | Any) -> dict[str, Any]:
@@ -413,10 +414,10 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
     @staticmethod
     def _extract_regime_snapshot(
-        *,
-        symbol: str,
-        payload: dict[str, Any],
-        timestamp: datetime,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
     ) -> RegimeSnapshot | None:
         raw = payload.get("regime") or payload.get("market_regime")
         if raw is None:
@@ -425,13 +426,26 @@ class StrategyContextBuilder(BaseStrategyComponent):
         if isinstance(raw, RegimeSnapshot):
             return raw
 
+        regime = (
+            raw
+            if isinstance(raw, MarketRegime)
+            else MarketRegime.safe_parse(raw, MarketRegime.UNKNOWN)
+        )
+
+        raw_confidence = payload.get("regime_confidence", 0.0)
+        try:
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
         snapshot = RegimeSnapshot(
             symbol=symbol,
             timestamp=timestamp,
-            regime=raw,
-            confidence=payload.get("regime_confidence", 0.0),
+            regime=regime,
+            confidence=clamp(confidence, 0.0, 1.0),
             metadata={
                 "source": "payload",
+                "raw_regime": raw if isinstance(raw, str) else str(raw),
             },
         )
         snapshot.validate()
@@ -630,15 +644,26 @@ class StrategyEventHandler(BaseStrategyComponent):
         state.update_signal(signal, active=signal.is_active)
 
     def _analytics_topics(self) -> list[str]:
+        """
+        Analytics subscriptions for StrategyEngine.
+
+        Important:
+        - event_to_categories is a routing map, not a subscription allowlist;
+        - StrategyEngine must always listen to analytics.*;
+        - RoutingConfig.categories_for_event() decides whether a concrete topic is
+          strategy-routable.
+        """
         configured = getattr(self.config.routing, "event_to_categories", {}) or {}
-        topics = [topic for topic in configured.keys() if isinstance(topic, str) and topic.strip()]
 
-        if topics:
-            return list(dict.fromkeys(topics))
-
-        return [
-            "analytics.*",
+        topics = [
+            topic.strip()
+            for topic in configured.keys()
+            if isinstance(topic, str) and topic.strip()
         ]
+
+        topics.append("analytics.*")
+
+        return list(dict.fromkeys(topics))
 
 
 class StrategyLifecycleManager(BaseStrategyComponent):
@@ -719,27 +744,30 @@ class StrategyLifecycleManager(BaseStrategyComponent):
 
     def _schedule_cleanup_job(self) -> None:
         if self.scheduler is None:
+            self.log_debug(
+                "Strategy cleanup job skipped because scheduler is not configured"
+            )
             return
 
-        cleanup_interval = max(
+        cleanup_interval_seconds = max(
             5,
             int(self.config.routing.stale_feature_threshold_seconds),
         )
 
-        try:
-            self.scheduler.add_interval_job(
-                name=self._cleanup_job_name,
-                func=self._cleanup_state_job,
-                interval=cleanup_interval,
-                run_immediately=False,
-            )
-        except TypeError:
-            self.scheduler.add_interval_job(
-                self._cleanup_job_name,
-                self._cleanup_state_job,
-                cleanup_interval,
-            )
+        job = self.scheduler.add_interval_job(
+            name=self._cleanup_job_name,
+            func=self._cleanup_state_job,
+            interval=cleanup_interval_seconds,
+            run_immediately=False,
+        )
 
+        self._scheduler_jobs.append(job)
+
+        self.log_info(
+            "Strategy cleanup job scheduled",
+            job_name=self._cleanup_job_name,
+            interval_seconds=cleanup_interval_seconds,
+        )
     async def _cleanup_state_job(self) -> None:
         removed = self.state.prune(
             max_signal_age_seconds=self.config.runtime.max_signal_age_seconds,

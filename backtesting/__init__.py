@@ -279,8 +279,6 @@ from .backtest_time import (
 # History downloader / data loader / replay
 # ============================================================================
 
-from .history_downloader import HistoryDownloader
-
 from .data_loader import (
     DataFileRef,
     DataLoader,
@@ -289,15 +287,7 @@ from .data_loader import (
     load_backtest_dataset,
 )
 
-from .market_replay import (
-    MarketReplay,
-    MarketReplayCheckpoint,
-    MarketReplayStats,
-    build_dataset_from_records,
-    build_replay_event_from_record,
-    market_topic_for_data_type,
-    replay_priority_for_data_type,
-)
+
 
 # ============================================================================
 # Cost models
@@ -647,19 +637,12 @@ __all__ = [
     "build_backtest_clock",
 
     # Downloader / loader / replay
-    "HistoryDownloader",
     "DataFileRef",
     "LoadedDataBundle",
     "DataLoader",
     "load_backtest_dataset",
     "load_backtest_bundle",
-    "MarketReplayStats",
-    "MarketReplayCheckpoint",
-    "MarketReplay",
-    "market_topic_for_data_type",
-    "replay_priority_for_data_type",
-    "build_replay_event_from_record",
-    "build_dataset_from_records",
+
 
     # Cost models
     "CommissionInput",

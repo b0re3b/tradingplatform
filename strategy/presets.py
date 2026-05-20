@@ -10,8 +10,8 @@ from typing import TypeAlias, cast
 from core.event_bus import EventBus
 from core.scheduler import Scheduler
 
-from .base import BaseStrategy
-from .config import (
+from strategy.base import BaseStrategy
+from strategy.config import (
     BuilderConfig,
     ConfidenceConfig,
     ConflictConfig,
@@ -27,15 +27,15 @@ from .config import (
     VotingConfig,
     WeightingConfig,
 )
-from .enums import (
+from strategy.enums import (
     EntryType,
     MarketRegime,
     PresetMode,
     StrategyCategory,
     Timeframe,
 )
-from .exceptions import StrategyConfigError, StrategyRegistrationError
-from .registry import StrategyRegistry
+from strategy.exceptions import StrategyConfigError, StrategyRegistrationError
+from strategy.registry import StrategyRegistry
 
 
 Timeframes: TypeAlias = tuple[Timeframe, ...]

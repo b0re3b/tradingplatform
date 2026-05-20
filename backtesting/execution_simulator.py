@@ -1,38 +1,10 @@
-"""
-Simulated execution layer for backtesting.
-
-ExecutionSimulator is the offline replacement for live execution during
-historical backtests.
-
-It listens only to risk-approved or risk-requested events:
-
-- signal.confirmed
-- risk.position_close_requested
-- risk.position_reduce_requested
-- risk.kill_switch
-
-It emits production-compatible execution events:
-
-- execution.order_submitted
-- execution.order_rejected
-- execution.order_failed
-- execution.order_cancelled
-- execution.order_filled
-- execution.order_partially_filled
-
-Important:
-- It does not listen to signal.generated.
-- It does not bypass RiskManager.
-- It does not call live exchange clients.
-- It does not own position accounting; PositionSimulator listens to fills.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import inspect
 import random
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from core.event_bus import EventBus, EventPriority
@@ -311,7 +283,7 @@ class ExecutionSimulator:
         for subscription in list(self._subscriptions):
             try:
                 self.event_bus.unsubscribe(subscription)
-            except Exception:
+            except (RuntimeError, ValueError, TypeError) as exc:
                 self.logger.exception(
                     "Failed to unsubscribe ExecutionSimulator handler",
                     extra={"subscription": str(subscription)},
@@ -456,7 +428,7 @@ class ExecutionSimulator:
 
         try:
             candle = self._payload_to_candle(payload)
-        except Exception:
+        except (KeyError, TypeError, ValueError, SimulatedOrderValidationError):
             return
 
         key = self._market_key(candle.exchange, candle.market_type, candle.symbol)
@@ -477,7 +449,7 @@ class ExecutionSimulator:
 
         try:
             orderbook = self._payload_to_orderbook(payload)
-        except Exception:
+        except (KeyError, TypeError, ValueError, SimulatedOrderValidationError):
             return
 
         key = self._market_key(orderbook.exchange, orderbook.market_type, orderbook.symbol)
@@ -505,7 +477,7 @@ class ExecutionSimulator:
         if self._kill_switch_active and not request.reduce_only and not request.close_position:
             order = self._create_order(request)
             order.mark_rejected(
-                OrderRejectionReason.KILL_SWITCH,
+                OrderRejectionReason.KILL_SWITCH_ACTIVE,
                 message="Execution blocked by simulated kill switch.",
                 timestamp_ms_value=self._now_ms(),
             )
@@ -531,7 +503,7 @@ class ExecutionSimulator:
             await self._simulate_fill(order)
             return order
 
-        except Exception as exc:
+        except (ExecutionSimulationError, LiquiditySimulationError, SimulatedOrderValidationError, SimulatedOrderRejectedError, ValueError, TypeError) as exc:
             order.status = SimulatedOrderStatus.FAILED
             order.rejection_message = str(exc)
             self.stats_state.orders_failed += 1
@@ -723,33 +695,33 @@ class ExecutionSimulator:
         order_type = order.order_type.lower()
 
         if self._kill_switch_active and not order.reduce_only and not order.close_position:
-            return OrderRejectionReason.KILL_SWITCH
+            return OrderRejectionReason.KILL_SWITCH_ACTIVE
 
         if order_type == "market" and not self.config.allow_market_orders:
-            return OrderRejectionReason.ORDER_TYPE_NOT_ALLOWED
+            return OrderRejectionReason.INVALID_ORDER
 
         if order_type in {"limit", "stop_limit"} and not self.config.allow_limit_orders:
-            return OrderRejectionReason.ORDER_TYPE_NOT_ALLOWED
+            return OrderRejectionReason.INVALID_ORDER
 
         if order_type in {"stop", "stop_market", "stop_limit"} and not self.config.allow_stop_orders:
-            return OrderRejectionReason.ORDER_TYPE_NOT_ALLOWED
+            return OrderRejectionReason.INVALID_ORDER
 
         if order.reduce_only and not self.config.allow_reduce_only:
-            return OrderRejectionReason.REDUCE_ONLY_NOT_ALLOWED
+            return OrderRejectionReason.INVALID_ORDER
 
         state = self._get_market_state(order)
 
         if self.config.reject_if_no_price and state is None:
-            return OrderRejectionReason.NO_MARKET_PRICE
+            return OrderRejectionReason.INVALID_ORDER
 
         if self.config.reject_if_no_price and state is not None and state.last_price is None:
-            return OrderRejectionReason.NO_MARKET_PRICE
+            return OrderRejectionReason.INVALID_ORDER
 
         if self.config.reject_if_no_liquidity and not self._has_liquidity(order):
             return OrderRejectionReason.INSUFFICIENT_LIQUIDITY
 
         if self.config.reject_if_price_outside_candle and not self._price_is_possible(order):
-            return OrderRejectionReason.PRICE_OUTSIDE_CANDLE
+            return OrderRejectionReason.PRICE_OUT_OF_RANGE
 
         return OrderRejectionReason.NONE
 
@@ -821,7 +793,7 @@ class ExecutionSimulator:
     ) -> float:
         state = self._get_market_state(order)
 
-        if self.config.fill_model == FillModel.EXACT_PRICE:
+        if self.config.fill_model == FillModel.INSTANT:
             return intended_price
 
         if self.config.fill_model == FillModel.NEXT_CANDLE_OPEN:
@@ -834,7 +806,7 @@ class ExecutionSimulator:
                 return float(state.last_candle.close)
             return intended_price
 
-        if self.config.fill_model == FillModel.CANDLE_PATH:
+        if self.config.fill_model == FillModel.OHLC_PATH:
             return self._resolve_candle_path_price(order, intended_price)
 
         return intended_price
@@ -950,8 +922,8 @@ class ExecutionSimulator:
         )
 
         request = SimulatedOrderRequest(
-            signal_id=self._first_value(signal, intent, payload, keys=["signal_id", "id"], default=None),
-            strategy_name=self._first_value(signal, intent, payload, keys=["strategy_name", "strategy"], default=None),
+            signal_id=self._optional_str(self._first_value(signal, intent, payload, keys=["signal_id", "id"], default=None)),
+            strategy_name=self._optional_str(self._first_value(signal, intent, payload, keys=["strategy_name", "strategy"], default=None)),
             exchange=str(
                 self._first_value(intent, payload, keys=["exchange"], default=self.config.exchange)
             ),
@@ -970,7 +942,7 @@ class ExecutionSimulator:
             close_position=bool(
                 self._first_value(plan, intent, payload, keys=["close_position"], default=False)
             ),
-            time_in_force=self._first_value(plan, intent, payload, keys=["time_in_force", "tif"], default=None),
+            time_in_force=self._optional_str(self._first_value(plan, intent, payload, keys=["time_in_force", "tif"], default=None)),
             leverage=self._optional_float_first(intent, payload, keys=["final_leverage", "leverage"]),
             source_event=self.config.signal_confirmed_topic,
             source_payload=payload,
@@ -998,8 +970,8 @@ class ExecutionSimulator:
         )
 
         request = SimulatedOrderRequest(
-            signal_id=payload.get("signal_id"),
-            strategy_name=payload.get("strategy_name"),
+            signal_id=self._optional_str(payload.get("signal_id")),
+            strategy_name=self._optional_str(payload.get("strategy_name")),
             exchange=str(payload.get("exchange") or self.config.exchange),
             market_type=str(payload.get("market_type") or self.config.market_type),
             symbol=symbol,
@@ -1034,8 +1006,8 @@ class ExecutionSimulator:
         )
 
         request = SimulatedOrderRequest(
-            signal_id=payload.get("signal_id"),
-            strategy_name=payload.get("strategy_name"),
+            signal_id=self._optional_str(payload.get("signal_id")),
+            strategy_name=self._optional_str(payload.get("strategy_name")),
             exchange=str(payload.get("exchange") or self.config.exchange),
             market_type=str(payload.get("market_type") or self.config.market_type),
             symbol=symbol,
@@ -1115,7 +1087,8 @@ class ExecutionSimulator:
             payload=payload,
         )
 
-    def _order_to_event_payload(self, order: SimulatedOrder) -> dict[str, Any]:
+    @staticmethod
+    def _order_to_event_payload(order: SimulatedOrder) -> dict[str, Any]:
         return {
             "order_id": order.order_id,
             "client_order_id": order.client_order_id,
@@ -1209,7 +1182,7 @@ class ExecutionSimulator:
     async def _emit_best_effort(self, topic: str, payload: dict[str, Any]) -> None:
         try:
             await self._emit(topic, payload, priority=EventPriority.LOW)
-        except Exception:
+        except (RuntimeError, ValueError, TypeError) as exc:
             self.logger.debug(
                 "Best-effort execution simulator event failed",
                 extra={"topic": topic},
@@ -1320,7 +1293,7 @@ class ExecutionSimulator:
                         quantity=float(quantity),
                     )
                 )
-            except Exception:
+            except (TypeError, ValueError, SimulatedOrderValidationError):
                 continue
 
         return result
@@ -1342,7 +1315,7 @@ class ExecutionSimulator:
         if self.clock is not None:
             try:
                 return self.clock.timestamp_ms_or_wall_clock()
-            except Exception:
+            except (RuntimeError, ValueError, TypeError):
                 pass
         return timestamp_ms(utcnow())
 
@@ -1351,7 +1324,7 @@ class ExecutionSimulator:
             return
 
         if self.clock is not None:
-            await self.clock.advance_by_async(latency_ms)
+            await self.clock.advance_by_async(timedelta(milliseconds=latency_ms))
             return
 
         await asyncio.sleep(0)
@@ -1360,10 +1333,10 @@ class ExecutionSimulator:
         if self.config.latency_model == LatencyModel.NONE:
             return 0
 
-        if self.config.latency_model == LatencyModel.FIXED:
+        if self.config.latency_model == LatencyModel.FIXED_MS:
             return int(self.config.fixed_latency_ms)
 
-        if self.config.latency_model == LatencyModel.RANDOM:
+        if self.config.latency_model == LatencyModel.RANDOM_MS:
             return self.random.randint(
                 int(self.config.random_latency_min_ms),
                 int(self.config.random_latency_max_ms),
@@ -1423,7 +1396,7 @@ class ExecutionSimulator:
 
         try:
             return float(value)
-        except Exception:
+        except (KeyError, TypeError, ValueError, SimulatedOrderValidationError):
             return default
 
     @classmethod
@@ -1439,8 +1412,14 @@ class ExecutionSimulator:
 
         try:
             return float(value)
-        except Exception:
+        except (KeyError, TypeError, ValueError, SimulatedOrderValidationError):
             return None
+
+    @staticmethod
+    def _optional_str(value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value)
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:
@@ -1448,7 +1427,7 @@ class ExecutionSimulator:
             return None
         try:
             return int(float(value))
-        except Exception:
+        except (KeyError, TypeError, ValueError, SimulatedOrderValidationError):
             return None
 
     @staticmethod

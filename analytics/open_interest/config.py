@@ -52,7 +52,7 @@ RAW_OI_MARKET_TOPICS = {
 # =============================================================================
 
 DEFAULT_OI_UPDATED_TOPIC = "analytics.oi.updated"
-DEFAULT_OI_REGIME_CHANGED_TOPIC = "analytics.oi.regime_changed"
+DEFAULT_OI_REGIME_CHANGED_TOPIC = "analytics.oi.regime.changed"
 DEFAULT_OI_DIVERGENCE_TOPIC = "analytics.oi.divergence"
 DEFAULT_OI_ANOMALY_TOPIC = "analytics.oi.anomaly"
 DEFAULT_OI_SQUEEZE_SETUP_TOPIC = "analytics.oi.squeeze_setup"

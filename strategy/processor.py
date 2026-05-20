@@ -10,15 +10,15 @@ from typing import Any, TypeVar
 from core.event_bus import EventBus, EventPriority
 from core.scheduler import Scheduler
 
-from .base import BaseStrategy, BaseStrategyComponent
-from .config import (
+from strategy.base import BaseStrategy, BaseStrategyComponent
+from strategy.config import (
     BuilderConfig,
     ConfluenceConfig,
     PortfolioCoordinatorConfig,
     RoutingConfig,
     StrategyConfig,
 )
-from .enums import (
+from strategy.enums import (
     ConflictType,
     EntryType,
     ExitType,
@@ -37,7 +37,7 @@ from .enums import (
     Timeframe,
     TriggerType,
 )
-from .exceptions import (
+from strategy.exceptions import (
     BuilderError,
     ConfluenceError,
     PortfolioCoordinationError,
@@ -45,7 +45,7 @@ from .exceptions import (
     SignalRoutingError,
     StrategyEvaluationError,
 )
-from .models import (
+from strategy.models import (
     ConflictRecord,
     ConfluenceResult,
     EntryPlan,
@@ -66,8 +66,8 @@ from .models import (
     ensure_aware_utc,
     utcnow,
 )
-from .registry import StrategyRegistry
-from .state import StrategyRuntimeState
+from strategy.registry import StrategyRegistry
+from strategy.state import StrategyRuntimeState
 
 
 EnumT = TypeVar("EnumT")
@@ -466,6 +466,79 @@ class SignalNormalizer(BaseStrategyComponent):
         "d1": Timeframe.D1,
     }
 
+    def _augment_funding_domain_data(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return None
+
+        for target, aliases in {
+            "snapshot": ("snapshot", "funding_snapshot"),
+            "statistics": ("statistics", "stats", "funding_statistics"),
+            "regime": ("regime", "regime_state", "funding_regime"),
+            "pressure": ("pressure", "pressure_state", "funding_pressure"),
+            "extreme": ("extreme", "extreme_event", "funding_extreme"),
+            "divergence": ("divergence", "divergence_event", "funding_divergence"),
+            "flip": ("flip", "flip_event", "funding_flip"),
+            "signal": ("signal", "funding_signal"),
+        }.items():
+            value = mapping_for(*aliases)
+            if value is not None:
+                domain_data.setdefault(target, value)
+                domain_data.setdefault(aliases[0], value)
+
+        if "signal" not in domain_data and (
+                "signal_type" in payload
+                or "bias" in payload
+                or "score" in payload
+                or "confidence" in payload
+        ):
+            domain_data["signal"] = dict(payload)
+
+        if "snapshot" not in domain_data:
+            domain_data["snapshot"] = dict(payload)
+    def _augment_domain_data_contracts(
+            self,
+            *,
+            source: FeatureSource,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        if source is FeatureSource.OPEN_INTEREST:
+            self._augment_open_interest_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+
+        elif source is FeatureSource.ORDERFLOW:
+            self._augment_orderflow_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+
+        elif source is FeatureSource.FUNDING:
+            self._augment_funding_domain_data(
+                payload=payload,
+                domain_data=domain_data,
+            )
+
+        return domain_data
     def normalize_event(
         self,
         *,
@@ -484,6 +557,11 @@ class SignalNormalizer(BaseStrategyComponent):
         timeframe = self._extract_timeframe(payload)
 
         domain_data = self._extract_domain_data(payload)
+        domain_data = self._augment_domain_data_contracts(
+            source=source,
+            payload=payload,
+            domain_data=domain_data,
+        )
         features = self._extract_features(
             source=source,
             symbol=symbol,
@@ -714,57 +792,351 @@ class SignalNormalizer(BaseStrategyComponent):
             if key not in cls._DOMAIN_EXCLUDED_KEYS
         }
 
+    def _build_contract_features(
+            self,
+            *,
+            source: FeatureSource,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        if source is FeatureSource.OPEN_INTEREST:
+            return self._build_open_interest_contract_features(
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
+            )
+        if source is FeatureSource.FUNDING:
+            return self._build_funding_contract_features(
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
+            )
+
+        return []
+
+    def _build_open_interest_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def has_any(*keys: str) -> bool:
+            return any(key in payload or key in feature_map for key in keys)
+
+        def value_for(*keys: str, default: Any = True) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        def add(name: str, value: Any = True) -> None:
+            snapshot = self._snapshot_from_raw_value(
+                source=FeatureSource.OPEN_INTEREST,
+                symbol=symbol,
+                name=name,
+                value=value,
+                timestamp=timestamp,
+                confidence=confidence,
+                metadata={
+                    "origin": "contract_feature",
+                    "contract": "open_interest",
+                },
+            )
+            result.append(snapshot)
+
+        if has_any(
+                "oi",
+                "open_interest",
+                "open_interest_value",
+                "oi_delta",
+                "oi_delta_pct",
+                "oi_direction",
+                "oi_acceleration",
+        ):
+            add(
+                "open_interest.features",
+                {
+                    "oi": value_for("oi", "open_interest", default=None),
+                    "open_interest_value": value_for("open_interest_value", default=None),
+                    "oi_delta": value_for("oi_delta", default=None),
+                    "oi_delta_pct": value_for("oi_delta_pct", default=None),
+                    "oi_direction": value_for("oi_direction", default=None),
+                    "oi_acceleration": value_for("oi_acceleration", default=None),
+                },
+            )
+
+        if has_any("regime", "oi_regime", "market_regime"):
+            add(
+                "open_interest.regime",
+                value_for("regime", "oi_regime", "market_regime"),
+            )
+
+        if has_any(
+                "anomaly",
+                "anomaly_type",
+                "capitulation",
+                "capitulation_score",
+                "squeeze_setup",
+                "squeeze_score",
+                "liquidation_imbalance",
+        ):
+            add(
+                "open_interest.anomaly",
+                {
+                    "anomaly": value_for("anomaly", default=None),
+                    "anomaly_type": value_for("anomaly_type", default=None),
+                    "capitulation": value_for("capitulation", default=None),
+                    "capitulation_score": value_for("capitulation_score", default=None),
+                    "squeeze_setup": value_for("squeeze_setup", default=None),
+                    "squeeze_score": value_for("squeeze_score", default=None),
+                    "liquidation_imbalance": value_for("liquidation_imbalance", default=None),
+                },
+            )
+
+        if has_any(
+                "divergence",
+                "divergence_type",
+                "price_oi_divergence",
+                "cvd_delta",
+                "funding_rate",
+        ):
+            add(
+                "open_interest.divergence",
+                {
+                    "divergence": value_for("divergence", default=None),
+                    "divergence_type": value_for("divergence_type", default=None),
+                    "price_oi_divergence": value_for("price_oi_divergence", default=None),
+                    "cvd_delta": value_for("cvd_delta", default=None),
+                    "funding_rate": value_for("funding_rate", default=None),
+                },
+            )
+
+        return result
+
+    def _build_funding_contract_features(
+            self,
+            *,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        result: list[FeatureSnapshot] = []
+        confidence = payload.get("confidence", 0.0)
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def mapping_for(*keys: str) -> dict[str, Any]:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, dict):
+                    return value
+
+                value = feature_map.get(key)
+                if isinstance(value, dict):
+                    return value
+
+            return {}
+
+        snapshot = mapping_for("snapshot", "funding_snapshot")
+        statistics = mapping_for("statistics", "stats", "funding_statistics")
+        regime = mapping_for("regime", "regime_state", "funding_regime")
+        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
+        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
+        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
+        flip = mapping_for("flip", "flip_event", "funding_flip")
+        signal = mapping_for("signal", "funding_signal")
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in mapping:
+                    return mapping[key]
+            return default
+
+        def add(name: str, value: Any) -> None:
+            snapshot_obj = self._snapshot_from_raw_value(
+                source=FeatureSource.FUNDING,
+                symbol=symbol,
+                name=name,
+                value=value,
+                timestamp=timestamp,
+                confidence=confidence,
+                metadata={
+                    "origin": "contract_feature",
+                    "contract": "funding",
+                },
+            )
+            result.append(snapshot_obj)
+
+        add("funding.snapshot", snapshot or payload)
+        add("funding.statistics", statistics)
+
+        add("funding.regime", regime)
+        add(
+            "funding.regime.confidence",
+            nested_value(regime, "confidence", default=value_for("regime_confidence", default=0.0)),
+        )
+
+        add("funding.pressure", pressure)
+        add(
+            "funding.pressure.score",
+            nested_value(pressure, "score", "pressure_score", default=value_for("pressure_score", default=0.0)),
+        )
+        add(
+            "funding.pressure.level",
+            nested_value(pressure, "level", "pressure_level", default=value_for("pressure_level", default=None)),
+        )
+        add(
+            "funding.pressure.direction",
+            nested_value(pressure, "direction", "bias", default=value_for("pressure_direction", default=None)),
+        )
+
+        add("funding.extreme", extreme)
+        add(
+            "funding.extreme.type",
+            nested_value(extreme, "type", "extreme_type", default=value_for("extreme_type", default=None)),
+        )
+        add(
+            "funding.extreme.severity",
+            nested_value(extreme, "severity", "score", default=value_for("extreme_severity", default=0.0)),
+        )
+        add(
+            "funding.extreme.mean_reversion_probability",
+            nested_value(
+                extreme,
+                "mean_reversion_probability",
+                "reversion_probability",
+                default=value_for("mean_reversion_probability", default=0.0),
+            ),
+        )
+        add(
+            "funding.extreme.squeeze_probability",
+            nested_value(extreme, "squeeze_probability", default=value_for("squeeze_probability", default=0.0)),
+        )
+
+        add("funding.divergence", divergence)
+        add(
+            "funding.divergence.type",
+            nested_value(divergence, "type", "divergence_type", default=value_for("divergence_type", default=None)),
+        )
+        add(
+            "funding.divergence.confidence",
+            nested_value(divergence, "confidence", default=value_for("divergence_confidence", default=0.0)),
+        )
+        add(
+            "funding.divergence.score",
+            nested_value(divergence, "score", default=value_for("divergence_score", default=0.0)),
+        )
+
+        add("funding.flip", flip)
+        add(
+            "funding.flip.type",
+            nested_value(flip, "type", "flip_type", default=value_for("flip_type", default=None)),
+        )
+        add(
+            "funding.flip.confidence",
+            nested_value(flip, "confidence", default=value_for("flip_confidence", default=0.0)),
+        )
+
+        add("funding.signal", signal)
+        add(
+            "funding.signal.type",
+            nested_value(signal, "type", "signal_type", default=value_for("signal_type", default=None)),
+        )
+        add(
+            "funding.signal.score",
+            nested_value(signal, "score", default=value_for("signal_score", "score", default=0.0)),
+        )
+        add(
+            "funding.signal.confidence",
+            nested_value(signal, "confidence", default=value_for("signal_confidence", "confidence", default=0.0)),
+        )
+        add(
+            "funding.signal.bias",
+            nested_value(signal, "bias", "direction", default=value_for("bias", "direction", default=None)),
+        )
+
+        return result
+
     def _extract_features(
-        self,
-        *,
-        source: FeatureSource,
-        symbol: str,
-        payload: dict[str, Any],
-        timestamp: datetime,
+            self,
+            *,
+            source: FeatureSource,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: dict[str, FeatureSnapshot] = {}
 
         for snapshot in self._extract_explicit_features(
-            source=source,
-            symbol=symbol,
-            payload=payload,
-            timestamp=timestamp,
+                source=source,
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
         ):
             result[snapshot.name] = snapshot
 
         for snapshot in self._extract_feature_map(
-            source=source,
-            symbol=symbol,
-            payload=payload,
-            timestamp=timestamp,
+                source=source,
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
         ):
             result.setdefault(snapshot.name, snapshot)
 
         for snapshot in self._extract_nested_features(
-            source=source,
-            symbol=symbol,
-            payload=payload,
-            timestamp=timestamp,
+                source=source,
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
         ):
             result.setdefault(snapshot.name, snapshot)
 
         for snapshot in self._build_implicit_features(
-            source=source,
-            symbol=symbol,
-            payload=payload,
-            timestamp=timestamp,
+                source=source,
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
+        ):
+            result.setdefault(snapshot.name, snapshot)
+
+        for snapshot in self._build_contract_features(
+                source=source,
+                symbol=symbol,
+                payload=payload,
+                timestamp=timestamp,
         ):
             result.setdefault(snapshot.name, snapshot)
 
         return list(result.values())
 
     def _extract_explicit_features(
-        self,
-        *,
-        source: FeatureSource,
-        symbol: str,
-        payload: dict[str, Any],
-        timestamp: datetime,
+            self,
+            *,
+            source: FeatureSource,
+            symbol: str,
+            payload: dict[str, Any],
+            timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         explicit = payload.get("features")
         if explicit is None:
@@ -787,8 +1159,32 @@ class SignalNormalizer(BaseStrategyComponent):
                 result.append(item)
                 continue
 
+            if isinstance(item, str):
+                feature_name = self._normalize_feature_name(item)
+
+                value = payload.get(item)
+                if value is None:
+                    value = payload.get(feature_name)
+
+                snapshot = self._snapshot_from_raw_value(
+                    source=source,
+                    symbol=symbol,
+                    name=feature_name,
+                    value=True if value is None else value,
+                    timestamp=timestamp,
+                    confidence=payload.get("confidence", 0.0),
+                    metadata={
+                        "origin": "features",
+                        "feature_declared_only": value is None,
+                    },
+                )
+                result.append(snapshot)
+                continue
+
             if not isinstance(item, dict):
-                raise SignalNormalizationError("each feature item must be a dict")
+                raise SignalNormalizationError(
+                    "each feature item must be a dict, str, or FeatureSnapshot"
+                )
 
             snapshot = self._snapshot_from_feature_item(
                 source=source,
@@ -1230,27 +1626,32 @@ class SignalRouter(BaseStrategyComponent):
         return EventPriority.NORMAL
 
     def _resolve_categories(
-        self,
-        *,
-        event_name: str,
-        source: FeatureSource | None,
+            self,
+            *,
+            event_name: str,
+            source: FeatureSource | None,
     ) -> list[StrategyCategory]:
-        categories: list[StrategyCategory] = []
-        event_lower = event_name.lower()
-
-        for configured_event, configured_categories in self.routing_config.event_to_categories.items():
-            if configured_event and configured_event.lower() in event_lower:
-                categories.extend(configured_categories)
+        categories = self.routing_config.categories_for_event(event_name)
 
         if categories:
-            return list(dict.fromkeys(categories))
+            return categories
 
-        if source is not None:
-            mapped = self._map_source_to_category(source)
-            if mapped is not None:
-                categories.append(mapped)
+        if source is None:
+            return []
 
-        return list(dict.fromkeys(categories))
+        mapped = self._map_source_to_category(source)
+        if mapped is None:
+            return []
+
+        categories = [mapped]
+
+        if (
+                self.routing_config.route_hybrid_on_domain_signal
+                and StrategyCategory.HYBRID not in categories
+        ):
+            categories.append(StrategyCategory.HYBRID)
+
+        return categories
 
     @staticmethod
     def _map_source_to_category(source: FeatureSource) -> StrategyCategory | None:

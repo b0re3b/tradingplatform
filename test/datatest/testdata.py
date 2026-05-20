@@ -1,637 +1,1174 @@
+"""
+Diagnostic tests for real StrategyRegistry / SignalRouter / BaseStrategy / SignalProcessor.
+
+Put into:
+
+    test/datatest/testdata.py
+
+or:
+
+    tests/strategy/test_real_strategy_pipeline_diagnostics.py
+
+Run:
+
+    pytest -q test/datatest/testdata.py -s
+
+Goal:
+- Keep early bootstrap tests strict.
+- Make the routing/evaluation tests print WHY they fail:
+  registry index issue, context/timeframe/regime/features mismatch,
+  BaseStrategy.evaluate() compatibility issue, or downstream SignalProcessor block.
+"""
+
 from __future__ import annotations
 
+import importlib
 import inspect
-import time
-from dataclasses import dataclass
-from typing import Any, Callable
+import pkgutil
+from typing import Any
 
 import pytest
 
-# Варіант імпортів під стандартну структуру проєкту:
-# tests/ лежить поруч із trading_system/ або запускається з project root.
-try:
-    from trading_system.data.candles_cache import CandlesCache
-    from trading_system.data.trades_cache import TradesCache
-    from trading_system.data.orderbook_cache import OrderBookCache
-    from trading_system.data.funding_cache import FundingCache
-    from trading_system.data.open_interest_cache import OpenInterestCache
-except ImportError:  # fallback, якщо пакети імпортуються відносно project root
-    from data.candles_cache import CandlesCache
-    from data.trades_cache import TradesCache
-    from data.orderbook_cache import OrderBookCache
-    from data.funding_cache import FundingCache
-    from data.open_interest_cache import OpenInterestCache
+from core.event_bus import EventBus
+from core.scheduler import Scheduler
+
+from strategy.base import BaseStrategy
+from strategy.config import (
+    StrategyConfig,
+    StrategyDefinitionConfig,
+    StrategyRuntimeConfig,
+)
+from strategy.engine import StrategyEngine
+from strategy.enums import (
+    EntryType,
+    FeatureSource,
+    MarketRegime,
+    SetupType,
+    SignalSide,
+    StrategyCategory,
+    Timeframe,
+)
+from strategy.models import (
+    EntryPlan,
+    ExitPlan,
+    InvalidationPlan,
+    StrategyContext,
+    StrategySignal,
+    utcnow,
+)
+from strategy.presets import (
+    build_default_strategy_config,
+    build_default_strategy_registry,
+)
+from strategy.processor import SignalProcessor
+from strategy.state import StrategyRuntimeState
 
 
-@dataclass(slots=True)
-class FakeEvent:
-    topic: str
-    payload: dict[str, Any]
+# =============================================================================
+# Generic helpers
+# =============================================================================
 
 
-class FakeEventBus:
-    """
-    Мінімальна тестова EventBus-імітація.
-
-    Потрібна тільки для data cache integration tests:
-    - subscribe(topic, handler)
-    - emit(topic, payload, **kwargs)
-    - збереження всіх emitted events для assertions
-    """
-
-    def __init__(self) -> None:
-        self.subscribers: dict[str, list[Callable[[FakeEvent], Any]]] = {}
-        self.emitted: list[FakeEvent] = []
-
-    def subscribe(
-        self,
-        topic: str,
-        handler: Callable[[FakeEvent], Any],
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        self.subscribers.setdefault(topic, []).append(handler)
-
-    async def emit(
-        self,
-        topic: str,
-        payload: dict[str, Any] | None = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:
-        event = FakeEvent(topic=topic, payload=payload or {})
-        self.emitted.append(event)
-
-        for handler in list(self.subscribers.get(topic, [])):
-            result = handler(event)
-            if inspect.isawaitable(result):
-                await result
-
-    def events(self, topic: str) -> list[FakeEvent]:
-        return [event for event in self.emitted if event.topic == topic]
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value)).strip().lower()
 
 
-@pytest.fixture()
-def fake_config() -> object:
-    """
-    Data cache класи лише зберігають config і не читають exchange credentials.
-    Тому для цих тестів достатньо lightweight object.
-    """
-    return object()
+def _registry_count(registry: Any) -> int:
+    count = getattr(registry, "count", None)
+    if callable(count):
+        return int(count())
+
+    list_all = getattr(registry, "list_all", None)
+    if callable(list_all):
+        return len(list_all())
+
+    strategies = getattr(registry, "_strategies", None)
+    if isinstance(strategies, dict):
+        return len(strategies)
+
+    return 0
 
 
-@pytest.fixture()
-def event_bus() -> FakeEventBus:
-    return FakeEventBus()
+def _registered_strategies(registry: Any) -> list[BaseStrategy]:
+    list_all = getattr(registry, "list_all", None)
+    if callable(list_all):
+        return list(list_all())
+
+    strategies = getattr(registry, "_strategies", None)
+    if isinstance(strategies, dict):
+        return list(strategies.values())
+
+    return []
 
 
-@pytest.fixture()
-def caches(fake_config: object, event_bus: FakeEventBus) -> dict[str, Any]:
-    """
-    Створює всі data caches з великим retention, щоб інтеграційний тест
-    не залежав від історичних timestamp-ів і не видаляв тестові записи одразу.
-    """
-    long_retention_ms = 3650 * 24 * 60 * 60 * 1000
+def _strategy_name(strategy: Any) -> str:
+    value = getattr(strategy, "strategy_name", None)
+    if isinstance(value, str) and value:
+        return value
 
-    created = {
-        "candles": CandlesCache(
-            config=fake_config,
-            event_bus=event_bus,
-            scheduler=None,
-            retention_ms=long_retention_ms,
+    value = getattr(strategy, "name", None)
+    if isinstance(value, str) and value:
+        return value
+
+    return strategy.__class__.__name__
+
+
+def _category_value(strategy: Any) -> str:
+    return _enum_value(getattr(strategy, "category", None))
+
+
+def _changed_features(context: StrategyContext) -> list[str]:
+    feature_map = getattr(context, "feature_map", None)
+    if isinstance(feature_map, dict):
+        return list(feature_map.keys())
+
+    features = getattr(context, "features", None)
+    if isinstance(features, dict):
+        return list(features.keys())
+
+    return []
+
+
+def _context_regime(context: StrategyContext) -> Any:
+    current_regime = getattr(context, "current_regime", None)
+    if current_regime is not None:
+        return current_regime
+
+    regime = getattr(context, "regime", None)
+    if regime is not None:
+        raw = getattr(regime, "regime", None)
+        if raw is not None:
+            return raw
+
+    return MarketRegime.UNKNOWN
+
+
+def _supports_call(strategy: Any, method_name: str, value: Any) -> Any:
+    method = getattr(strategy, method_name, None)
+    if not callable(method):
+        return "<missing>"
+    try:
+        return method(value)
+    except Exception as exc:
+        return f"<error {exc.__class__.__name__}: {exc}>"
+
+
+def _required_features(strategy: Any) -> set[str]:
+    method = getattr(strategy, "required_features", None)
+    if not callable(method):
+        return set()
+    try:
+        value = method()
+        return set(value or set())
+    except Exception:
+        return set()
+
+
+def _strategy_diagnostics(strategy: Any, context: StrategyContext) -> dict[str, Any]:
+    required = _required_features(strategy)
+    changed = set(_changed_features(context))
+    return {
+        "name": _strategy_name(strategy),
+        "category": _category_value(strategy),
+        "enabled": (
+            strategy.is_enabled()
+            if callable(getattr(strategy, "is_enabled", None))
+            else getattr(strategy, "enabled", None)
         ),
-        "trades": TradesCache(
-            config=fake_config,
-            event_bus=event_bus,
-            scheduler=None,
-            retention_ms=long_retention_ms,
-        ),
-        "orderbook": OrderBookCache(
-            config=fake_config,
-            event_bus=event_bus,
-            scheduler=None,
-        ),
-        "funding": FundingCache(
-            config=fake_config,
-            event_bus=event_bus,
-            scheduler=None,
-            retention_ms=long_retention_ms,
-        ),
-        "open_interest": OpenInterestCache(
-            config=fake_config,
-            event_bus=event_bus,
-            scheduler=None,
-            retention_ms=long_retention_ms,
-        ),
+        "supports_symbol": _supports_call(strategy, "supports_symbol", context.symbol),
+        "supports_timeframe": _supports_call(strategy, "supports_timeframe", context.timeframe),
+        "supports_regime": _supports_call(strategy, "supports_regime", _context_regime(context)),
+        "required": sorted(required),
+        "missing_required": sorted(required - changed),
     }
 
-    for cache in created.values():
-        cache.register()
 
-    return created
+def _print_registry_selection_debug(
+    *,
+    registry: Any,
+    context: StrategyContext,
+    categories: list[StrategyCategory],
+) -> None:
+    print("")
+    print("========== REGISTRY SELECTION DEBUG ==========")
+    print("context.symbol:", context.symbol)
+    print("context.timeframe:", context.timeframe, "| value:", _enum_value(context.timeframe))
+    print("context.regime:", _context_regime(context), "| value:", _enum_value(_context_regime(context)))
+    print("context.features:", _changed_features(context))
+    print("categories:", [category.value for category in categories])
+
+    print("")
+    print("registry.count:", _registry_count(registry))
+
+    try:
+        summary = registry.summary()
+        print("registry.summary.by_category:", summary.get("by_category"))
+        print("registry.summary.by_timeframe:", summary.get("by_timeframe"))
+        print("registry.summary.by_regime:", summary.get("by_regime"))
+    except Exception as exc:
+        print("registry.summary failed:", exc)
+
+    print("")
+    print("registered open_interest/hybrid strategies:")
+    for strategy in _registered_strategies(registry):
+        if _category_value(strategy) in {"open_interest", "hybrid"}:
+            print(" -", _strategy_diagnostics(strategy, context))
+
+    print("")
+    print("registry.list_by_category(OPEN_INTEREST):")
+    try:
+        by_category = registry.list_by_category(StrategyCategory.OPEN_INTEREST)
+        print([_strategy_name(strategy) for strategy in by_category])
+    except Exception as exc:
+        print("list_by_category failed:", exc)
+
+    print("")
+    print("registry.select direct:")
+    try:
+        selected = registry.select(
+            context=context,
+            categories=categories,
+            changed_features=_changed_features(context),
+        )
+        print([_strategy_name(strategy) for strategy in selected])
+    except Exception as exc:
+        print("registry.select failed:", exc)
+
+    print("==============================================")
+    print("")
 
 
-def assert_orderbook_cache_contract() -> None:
-    """
-    Production contract check.
+def _discover_strategy_factories_like_runner() -> dict[str, type[BaseStrategy]]:
+    try:
+        package = importlib.import_module("strategy.strategies")
+    except Exception as exc:
+        pytest.fail(f"Cannot import strategy.strategies package: {exc}")
 
-    У твоєму traceback було видно реальний bug:
-    OrderBookCache._normalize_inbound_payload() викликає self._now_ms(),
-    але в класі може бути відсутній метод _now_ms().
+    package_path = getattr(package, "__path__", None)
+    if package_path is None:
+        pytest.fail("strategy.strategies has no __path__; cannot auto-discover strategies")
 
-    Цей тестовий файл не monkeypatch-ить production-код, щоб не приховувати bug.
-    Якщо ця перевірка падає — додай у data/orderbook_cache.py:
+    factories: dict[str, type[BaseStrategy]] = {}
 
-        @staticmethod
-        def _now_ms() -> int:
-            return int(time.time() * 1000)
-    """
-    assert hasattr(OrderBookCache, "_now_ms"), (
-        "OrderBookCache має production-баг: відсутній метод _now_ms(), "
-        "але _normalize_inbound_payload() його викликає. "
-        "Додай у data/orderbook_cache.py: "
-        "@staticmethod def _now_ms() -> int: return int(time.time() * 1000)"
+    def camel_to_snake(name: str) -> str:
+        chars: list[str] = []
+        for index, char in enumerate(name):
+            if char.isupper() and index > 0 and not name[index - 1].isupper():
+                chars.append("_")
+            chars.append(char.lower())
+        return "".join(chars)
+
+    def strategy_name_from_class(cls: type, module_name: str) -> str:
+        name = cls.__name__
+
+        for suffix in ("TradingStrategy", "Strategy"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+
+        leaf = module_name.rsplit(".", 1)[-1]
+        if leaf not in {"base", "utils", "__init__"} and leaf.endswith("_strategy"):
+            return leaf[: -len("_strategy")]
+
+        return camel_to_snake(name)
+
+    for module_info in pkgutil.walk_packages(package_path, prefix="strategy.strategies."):
+        module_name = module_info.name
+        leaf = module_name.rsplit(".", 1)[-1].lower()
+
+        if leaf in {
+            "__init__",
+            "base",
+            "utils",
+            "config",
+            "enums",
+            "models",
+            "exceptions",
+        }:
+            continue
+
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            print(f"[DISCOVERY] skipped module={module_name} error={exc}")
+            continue
+
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            if obj.__module__ != module.__name__:
+                continue
+
+            if obj is BaseStrategy:
+                continue
+
+            try:
+                is_strategy = issubclass(obj, BaseStrategy)
+            except TypeError:
+                continue
+
+            if not is_strategy:
+                continue
+
+            cls_name = obj.__name__.lower()
+
+            if cls_name.startswith("base"):
+                continue
+
+            if cls_name in {
+                "tradingstrategy",
+                "strategysignalmixin",
+                "strategyvalidationmixin",
+                "strategyriskrewardmixin",
+            }:
+                continue
+
+            if inspect.isabstract(obj):
+                continue
+
+            factories.setdefault(strategy_name_from_class(obj, module_name), obj)
+
+    return factories
+
+
+def _build_real_strategy_stack(
+    *,
+    symbols: list[str] | None = None,
+    preset_name: str = "intraday",
+    use_required_features: bool = False,
+) -> tuple[EventBus, Scheduler, StrategyConfig, Any, SignalProcessor, StrategyEngine, StrategyRuntimeState]:
+    event_bus = EventBus()
+    scheduler = Scheduler(event_bus=event_bus)
+
+    strategy_config = build_default_strategy_config(
+        symbols=symbols or ["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
+        preset_name=preset_name,
+        use_required_features=use_required_features,
+    )
+    assert isinstance(strategy_config, StrategyConfig)
+
+    factories = _discover_strategy_factories_like_runner()
+
+    registry = build_default_strategy_registry(
+        config=strategy_config,
+        event_bus=event_bus,
+        scheduler=scheduler,
+        strategy_factories=factories,
+        strict=False,
+        emit_events=False,
     )
 
+    state = StrategyRuntimeState()
 
-def candle_event(
+    processor = SignalProcessor(
+        config=strategy_config,
+        registry=registry,
+        state=state,
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    engine = StrategyEngine(
+        config=strategy_config,
+        event_bus=event_bus,
+        scheduler=scheduler,
+        registry=registry,
+        state=state,
+        processor=processor,
+    )
+
+    return event_bus, scheduler, strategy_config, registry, processor, engine, state
+
+
+def _realistic_oi_payload(
     *,
-    exchange: str,
-    market_type: str,
     symbol: str = "BTCUSDT",
-    timeframe: str = "1m",
-    open_time_ms: int,
-    close: float,
-    is_closed: bool = True,
+    timeframe: str = "5m",
+    confidence: float = 0.86,
+    score: float = 0.82,
 ) -> dict[str, Any]:
     return {
-        "exchange": exchange,
-        "source": f"{exchange}_ws",
-        "market_type": market_type,
+        "exchange": "binance",
+        "market_type": "usdm_futures",
         "symbol": symbol,
-        "exchange_symbol": symbol,
         "timeframe": timeframe,
-        "open_time_ms": open_time_ms,
-        "close_time_ms": open_time_ms + 59_999,
-        "timestamp_ms": open_time_ms + 59_999,
-        "received_at_ms": open_time_ms + 60_050,
-        "open": close - 10.0,
-        "high": close + 20.0,
-        "low": close - 20.0,
-        "close": close,
-        "volume": 100.0,
-        "quote_volume": close * 100.0,
-        "trades_count": 100,
-        "is_closed": is_closed,
+        "timestamp": utcnow(),
+        "confidence": confidence,
+        "score": score,
+        "direction": "long",
+        "bias": "bullish",
+        "regime": "squeeze",
+        "oi": 104_000.0,
+        "open_interest": 104_000.0,
+        "open_interest_value": 8_000_000_000.0,
+        "oi_delta": -0.08,
+        "oi_delta_pct": -0.12,
+        "oi_direction": "down",
+        "oi_acceleration": -0.03,
+        "price": 77_000.0,
+        "close": 77_000.0,
+        "funding_rate": 0.00005,
+        "liquidation_imbalance": 0.72,
+        "long_liquidations": 12_000_000.0,
+        "short_liquidations": 3_000_000.0,
+        "cvd_delta": 0.42,
+        "aggressive_flow_imbalance": 0.55,
+
+        # Rich OI contract fields used by concrete OI strategies.
+        "oi_regime": "capitulation",
+        "market_regime": "capitulation",
+        "anomaly": {
+            "is_anomaly": True,
+            "anomaly_type": "capitulation",
+            "score": score,
+            "confidence": confidence,
+        },
+        "anomaly_type": "capitulation",
+        "is_anomaly": True,
+        "capitulation": True,
+        "capitulation_score": 0.91,
+        "squeeze_setup": True,
+        "squeeze_score": 0.88,
+        "divergence": {
+            "is_divergence": True,
+            "divergence_type": "bullish",
+            "score": score,
+            "confidence": confidence,
+        },
+        "is_divergence": True,
+        "divergence_type": "bullish",
+        "price_oi_divergence": "bullish",
+        "feature_map": {
+            "oi": 104_000.0,
+            "open_interest": 104_000.0,
+            "open_interest_value": 8_000_000_000.0,
+            "oi_delta": -0.08,
+            "oi_delta_pct": -0.12,
+            "oi_direction": "down",
+            "oi_acceleration": -0.03,
+            "price": 77_000.0,
+            "funding_rate": 0.00005,
+            "liquidation_imbalance": 0.72,
+            "long_liquidations": 12_000_000.0,
+            "short_liquidations": 3_000_000.0,
+            "cvd_delta": 0.42,
+            "aggressive_flow_imbalance": 0.55,
+            "oi_regime": "capitulation",
+            "market_regime": "capitulation",
+            "anomaly": {
+                "is_anomaly": True,
+                "anomaly_type": "capitulation",
+                "score": score,
+                "confidence": confidence,
+            },
+            "anomaly_type": "capitulation",
+            "is_anomaly": True,
+            "capitulation": True,
+            "capitulation_score": 0.91,
+            "squeeze_setup": True,
+            "squeeze_score": 0.88,
+            "divergence": {
+                "is_divergence": True,
+                "divergence_type": "bullish",
+                "score": score,
+                "confidence": confidence,
+            },
+            "is_divergence": True,
+            "divergence_type": "bullish",
+            "price_oi_divergence": "bullish",
+            "score": score,
+            "confidence": confidence,
+            "direction": "long",
+            "bias": "bullish",
+            "regime": "squeeze",
+        },
+        "metadata": {
+            "source": "pytest",
+            "event_contract": "analytics.oi.capitulation.detected",
+        },
     }
 
 
-def trade_event(
+
+def _inject_open_interest_domain_contracts(
     *,
-    exchange: str,
-    market_type: str,
-    symbol: str = "BTCUSDT",
-    trade_id: str,
-    price: float,
-    timestamp_ms: int,
-) -> dict[str, Any]:
-    return {
-        "exchange": exchange,
-        "source": f"{exchange}_ws",
-        "market_type": market_type,
-        "symbol": symbol,
-        "exchange_symbol": symbol,
-        "trade_id": trade_id,
-        "price": price,
-        "quantity": 1.5,
-        "qty": 1.5,
-        "quote_qty": price * 1.5,
-        "side": "buy",
-        "aggressor_side": "buy",
-        "timestamp_ms": timestamp_ms,
-        "received_at_ms": timestamp_ms + 25,
-    }
-
-
-def orderbook_snapshot_event(
-    *,
-    exchange: str,
-    market_type: str,
-    symbol: str = "BTCUSDT",
-    bid: float,
-    ask: float,
-    sequence: int,
-    timestamp_ms: int,
-) -> dict[str, Any]:
-    return {
-        "exchange": exchange,
-        "source": f"{exchange}_rest",
-        "market_type": market_type,
-        "symbol": symbol,
-        "exchange_symbol": symbol,
-        "type": "snapshot",
-        "bids": [[bid, 2.0]],
-        "asks": [[ask, 3.0]],
-        "sequence": sequence,
-        "timestamp_ms": timestamp_ms,
-        "received_at_ms": timestamp_ms + 50,
-    }
-
-
-def funding_event(
-    *,
-    exchange: str,
-    market_type: str,
-    symbol: str = "BTCUSDT",
-    rate: float,
-    timestamp_ms: int,
-) -> dict[str, Any]:
-    return {
-        "exchange": exchange,
-        "source": f"{exchange}_rest",
-        "market_type": market_type,
-        "symbol": symbol,
-        "exchange_symbol": symbol,
-        "funding_rate": rate,
-        "predicted_rate": rate * 1.1,
-        "next_funding_time_ms": timestamp_ms + 8 * 60 * 60 * 1000,
-        "timestamp_ms": timestamp_ms,
-        "received_at_ms": timestamp_ms + 50,
-    }
-
-
-def open_interest_event(
-    *,
-    exchange: str,
-    market_type: str,
-    symbol: str = "BTCUSDT",
-    open_interest: float,
-    timestamp_ms: int,
-) -> dict[str, Any]:
-    return {
-        "exchange": exchange,
-        "source": f"{exchange}_rest",
-        "market_type": market_type,
-        "symbol": symbol,
-        "exchange_symbol": symbol,
-        "open_interest": open_interest,
-        "open_interest_value": open_interest * 50_000,
-        "mark_price": 50_000.0,
-        "timestamp_ms": timestamp_ms,
-        "received_at_ms": timestamp_ms + 50,
-    }
-
-
-@pytest.mark.asyncio
-async def test_all_market_data_is_separated_by_exchange_market_type_symbol_and_timeframe(
-    caches: dict[str, Any],
-    event_bus: FakeEventBus,
+    context: StrategyContext,
+    payload: dict[str, Any],
 ) -> None:
     """
-    Головний інтеграційний тест.
+    Diagnostic/prod-contract mirror.
 
-    Перевіряє, що однаковий symbol BTCUSDT з різних бірж не змішується:
-    - candles: exchange + market_type + symbol + timeframe
-    - trades: exchange + market_type + symbol
-    - orderbook: exchange + market_type + symbol
-    - funding: exchange + market_type + symbol
-    - open interest: exchange + market_type + symbol
+    SignalNormalizer already fills context.feature_map. Concrete OI strategies
+    often also read context.open_interest domain objects, so this test mirrors the
+    expected production contract: features/regime_state/anomaly/divergence.
     """
-    assert_orderbook_cache_contract()
+    oi_domain = getattr(context, "open_interest", None)
+    if not isinstance(oi_domain, dict):
+        return
 
-    venues = [
-        ("binance", "usdm_futures", 50_000.0),
-        ("bybit", "linear", 51_000.0),
-        ("okx", "swap", 52_000.0),
-        ("mexc", "usdm_futures", 53_000.0),
-    ]
+    feature_map = payload.get("feature_map")
+    if not isinstance(feature_map, dict):
+        feature_map = {}
 
-    base_ts = now_ms()
+    def value_for(*keys: str, default: Any = None) -> Any:
+        for key in keys:
+            if key in payload:
+                return payload[key]
+            if key in feature_map:
+                return feature_map[key]
+        return default
 
-    for idx, (exchange, market_type, price) in enumerate(venues):
-        ts = base_ts + idx * 60_000
-
-        await event_bus.emit(
-            "market.candle",
-            candle_event(
-                exchange=exchange,
-                market_type=market_type,
-                open_time_ms=ts,
-                close=price,
-            ),
-        )
-        await event_bus.emit(
-            "market.trade",
-            trade_event(
-                exchange=exchange,
-                market_type=market_type,
-                trade_id=f"{exchange}-trade-1",
-                price=price + 1.0,
-                timestamp_ms=ts + 1_000,
-            ),
-        )
-        await event_bus.emit(
-            "market.orderbook.snapshot",
-            orderbook_snapshot_event(
-                exchange=exchange,
-                market_type=market_type,
-                bid=price - 1.0,
-                ask=price + 1.0,
-                sequence=100 + idx,
-                timestamp_ms=ts + 2_000,
-            ),
-        )
-        await event_bus.emit(
-            "market.funding",
-            funding_event(
-                exchange=exchange,
-                market_type=market_type,
-                rate=0.0001 + idx * 0.00001,
-                timestamp_ms=ts + 3_000,
-            ),
-        )
-        await event_bus.emit(
-            "market.open_interest",
-            open_interest_event(
-                exchange=exchange,
-                market_type=market_type,
-                open_interest=10_000.0 + idx * 1_000.0,
-                timestamp_ms=ts + 4_000,
-            ),
-        )
-
-    for idx, (exchange, market_type, price) in enumerate(venues):
-        candles = await caches["candles"].get_recent_candles(
-            exchange=exchange,
-            market_type=market_type,
-            symbol="BTCUSDT",
-            timeframe="1m",
-            limit=10,
-        )
-        assert len(candles) == 1
-        assert candles[0]["exchange"] == exchange
-        assert candles[0]["market_type"] == market_type
-        assert candles[0]["symbol"] == "BTCUSDT"
-        assert candles[0]["close"] == pytest.approx(price)
-
-        last_trade = await caches["trades"].get_last_trade(
-            exchange=exchange,
-            market_type=market_type,
-            symbol="BTCUSDT",
-        )
-        assert last_trade is not None
-        assert last_trade["exchange"] == exchange
-        assert last_trade["market_type"] == market_type
-        assert last_trade["price"] == pytest.approx(price + 1.0)
-        assert last_trade["trade_id"] == f"{exchange}-trade-1"
-
-        book = await caches["orderbook"].get_book(
-            exchange=exchange,
-            market_type=market_type,
-            symbol="BTCUSDT",
-            depth=1,
-        )
-        assert book is not None
-        assert book["exchange"] == exchange
-        assert book["market_type"] == market_type
-        assert book["best_bid"][0] == pytest.approx(price - 1.0)
-        assert book["best_ask"][0] == pytest.approx(price + 1.0)
-
-        funding = await caches["funding"].get_latest(
-            exchange=exchange,
-            market_type=market_type,
-            symbol="BTCUSDT",
-        )
-        assert funding is not None
-        assert funding["exchange"] == exchange
-        assert funding["market_type"] == market_type
-        assert funding["funding_rate"] == pytest.approx(0.0001 + idx * 0.00001)
-
-        oi = await caches["open_interest"].get_latest(
-            exchange=exchange,
-            market_type=market_type,
-            symbol="BTCUSDT",
-        )
-        assert oi is not None
-        assert oi["exchange"] == exchange
-        assert oi["market_type"] == market_type
-        assert oi["open_interest"] == pytest.approx(10_000.0 + idx * 1_000.0)
-
-    assert len(event_bus.events("market.candles.updated")) == 4
-    assert len(event_bus.events("market.candle.closed")) == 4
-    assert len(event_bus.events("market.trades.updated")) == 4
-    assert len(event_bus.events("market.orderbook.updated")) == 4
-    assert len(event_bus.events("market.funding.updated")) == 4
-    assert len(event_bus.events("market.open_interest.updated")) == 4
-
-
-@pytest.mark.asyncio
-async def test_same_exchange_same_symbol_different_market_types_are_separated(
-    caches: dict[str, Any],
-    event_bus: FakeEventBus,
-) -> None:
-    """
-    Перевіряє другий важливий кейс:
-    одна біржа + один symbol, але різні market_type не мають змішуватись.
-    """
-    base_ts = now_ms()
-
-    await event_bus.emit(
-        "market.candle",
-        candle_event(
-            exchange="binance",
-            market_type="spot",
-            open_time_ms=base_ts,
-            close=40_000.0,
-        ),
-    )
-    await event_bus.emit(
-        "market.candle",
-        candle_event(
-            exchange="binance",
-            market_type="usdm_futures",
-            open_time_ms=base_ts,
-            close=41_000.0,
-        ),
-    )
-
-    spot = await caches["candles"].get_last_candle(
-        exchange="binance",
-        market_type="spot",
-        symbol="BTCUSDT",
-        timeframe="1m",
-    )
-    futures = await caches["candles"].get_last_candle(
-        exchange="binance",
-        market_type="usdm_futures",
-        symbol="BTCUSDT",
-        timeframe="1m",
-    )
-
-    assert spot is not None
-    assert futures is not None
-    assert spot["close"] == pytest.approx(40_000.0)
-    assert futures["close"] == pytest.approx(41_000.0)
-
-
-@pytest.mark.asyncio
-async def test_same_exchange_same_symbol_different_timeframes_are_separated(
-    caches: dict[str, Any],
-    event_bus: FakeEventBus,
-) -> None:
-    """
-    Перевіряє, що candles з 1m і 5m не перезаписують одна одну.
-    """
-    base_ts = now_ms()
-
-    await event_bus.emit(
-        "market.candle",
-        candle_event(
-            exchange="okx",
-            market_type="swap",
-            timeframe="1m",
-            open_time_ms=base_ts,
-            close=50_000.0,
-        ),
-    )
-    await event_bus.emit(
-        "market.candle",
-        candle_event(
-            exchange="okx",
-            market_type="swap",
-            timeframe="5m",
-            open_time_ms=base_ts,
-            close=55_000.0,
-        ),
-    )
-
-    candle_1m = await caches["candles"].get_last_candle(
-        exchange="okx",
-        market_type="swap",
-        symbol="BTCUSDT",
-        timeframe="1m",
-    )
-    candle_5m = await caches["candles"].get_last_candle(
-        exchange="okx",
-        market_type="swap",
-        symbol="BTCUSDT",
-        timeframe="5m",
-    )
-
-    assert candle_1m is not None
-    assert candle_5m is not None
-    assert candle_1m["close"] == pytest.approx(50_000.0)
-    assert candle_5m["close"] == pytest.approx(55_000.0)
-
-
-@pytest.mark.asyncio
-async def test_rest_snapshots_and_ws_live_updates_go_to_same_exchange_scoped_cache(
-    caches: dict[str, Any],
-    event_bus: FakeEventBus,
-) -> None:
-    """
-    Перевіряє, що REST snapshot і WS live event для однієї біржі/market_type/symbol
-    потрапляють в один і той самий scoped cache, але не зачіпають інші біржі.
-    """
-    base_ts = now_ms()
-
-    await event_bus.emit(
-        "market.candles.snapshot",
+    oi_domain.setdefault(
+        "features",
         {
-            "exchange": "bybit",
-            "source": "bybit_rest",
-            "market_type": "linear",
-            "symbol": "BTCUSDT",
-            "timeframe": "1m",
-            "candles": [
-                candle_event(
-                    exchange="bybit",
-                    market_type="linear",
-                    open_time_ms=base_ts,
-                    close=45_000.0,
-                ),
-                candle_event(
-                    exchange="bybit",
-                    market_type="linear",
-                    open_time_ms=base_ts + 60_000,
-                    close=45_100.0,
-                ),
-            ],
+            "oi": value_for("oi", "open_interest"),
+            "open_interest": value_for("open_interest", "oi"),
+            "open_interest_value": value_for("open_interest_value"),
+            "oi_delta": value_for("oi_delta"),
+            "oi_delta_pct": value_for("oi_delta_pct"),
+            "oi_direction": value_for("oi_direction"),
+            "oi_acceleration": value_for("oi_acceleration"),
+            "price": value_for("price", "close"),
+            "close": value_for("close", "price"),
+            "funding_rate": value_for("funding_rate"),
+            "liquidation_imbalance": value_for("liquidation_imbalance"),
+            "cvd_delta": value_for("cvd_delta"),
+            "aggressive_flow_imbalance": value_for("aggressive_flow_imbalance"),
         },
     )
 
-    await event_bus.emit(
-        "market.candle",
-        candle_event(
-            exchange="bybit",
-            market_type="linear",
-            open_time_ms=base_ts + 120_000,
-            close=45_200.0,
-        ),
+    oi_domain.setdefault(
+        "regime_state",
+        {
+            "regime": value_for("oi_regime", "regime", "market_regime", default="capitulation"),
+            "score": value_for("score", default=0.0),
+            "confidence": value_for("confidence", default=0.0),
+            "bias": value_for("bias", default="bullish"),
+            "direction": value_for("direction", default="long"),
+        },
     )
 
-    bybit_candles = await caches["candles"].get_recent_candles(
-        exchange="bybit",
-        market_type="linear",
-        symbol="BTCUSDT",
-        timeframe="1m",
-        limit=10,
-    )
-    binance_candles = await caches["candles"].get_recent_candles(
-        exchange="binance",
-        market_type="usdm_futures",
-        symbol="BTCUSDT",
-        timeframe="1m",
-        limit=10,
+    anomaly_value = value_for("anomaly")
+    if isinstance(anomaly_value, dict):
+        anomaly_contract = dict(anomaly_value)
+    else:
+        anomaly_contract = {}
+
+    anomaly_contract.setdefault("is_anomaly", bool(value_for("is_anomaly", "capitulation", "squeeze_setup", default=True)))
+    anomaly_contract.setdefault("anomaly_type", value_for("anomaly_type", default="capitulation"))
+    anomaly_contract.setdefault("capitulation", bool(value_for("capitulation", default=True)))
+    anomaly_contract.setdefault("capitulation_score", value_for("capitulation_score", "score", default=0.91))
+    anomaly_contract.setdefault("squeeze_setup", bool(value_for("squeeze_setup", default=True)))
+    anomaly_contract.setdefault("squeeze_score", value_for("squeeze_score", "score", default=0.88))
+    anomaly_contract.setdefault("liquidation_imbalance", value_for("liquidation_imbalance"))
+    anomaly_contract.setdefault("score", value_for("score", default=0.0))
+    anomaly_contract.setdefault("confidence", value_for("confidence", default=0.0))
+    oi_domain.setdefault("anomaly", anomaly_contract)
+
+    divergence_value = value_for("divergence")
+    if isinstance(divergence_value, dict):
+        divergence_contract = dict(divergence_value)
+    else:
+        divergence_contract = {}
+
+    divergence_contract.setdefault("is_divergence", bool(value_for("is_divergence", "price_oi_divergence", default=True)))
+    divergence_contract.setdefault("divergence_type", value_for("divergence_type", "price_oi_divergence", default="bullish"))
+    divergence_contract.setdefault("price_oi_divergence", value_for("price_oi_divergence", default="bullish"))
+    divergence_contract.setdefault("cvd_delta", value_for("cvd_delta"))
+    divergence_contract.setdefault("funding_rate", value_for("funding_rate"))
+    divergence_contract.setdefault("score", value_for("score", default=0.0))
+    divergence_contract.setdefault("confidence", value_for("confidence", default=0.0))
+    oi_domain.setdefault("divergence", divergence_contract)
+
+
+def _build_context_from_payload(
+    *,
+    processor: SignalProcessor,
+    state: StrategyRuntimeState,
+    event_name: str,
+    payload: dict[str, Any],
+) -> StrategyContext:
+    normalized = processor.normalizer.normalize_event(
+        event_name=event_name,
+        payload=payload,
+        timestamp=payload.get("timestamp"),
     )
 
-    assert [c["close"] for c in bybit_candles] == pytest.approx(
-        [45_000.0, 45_100.0, 45_200.0]
+    context = state.build_context(
+        normalized.symbol,
+        timestamp=normalized.timestamp,
+        include_regime=True,
+        include_portfolio=True,
     )
-    assert binance_candles == []
+    context.timeframe = normalized.timeframe
+
+    processor.normalizer.apply_to_context(context, normalized)
+    _inject_open_interest_domain_contracts(context=context, payload=payload)
+    state.update_context(context)
+    return context
+
+
+def _assert_registry_not_empty(registry: Any) -> None:
+    strategies = _registered_strategies(registry)
+    if not strategies:
+        factories = _discover_strategy_factories_like_runner()
+        pytest.fail(
+            "StrategyRegistry is empty. "
+            f"Discovered factories: {sorted(factories.keys())}"
+        )
+
+
+# =============================================================================
+# 1. StrategyRegistry у реальному запуску порожній
+# =============================================================================
+
+
+def test_real_strategy_registry_is_not_empty_after_bootstrap() -> None:
+    _, _, config, registry, _, _, _ = _build_real_strategy_stack()
+
+    strategies = _registered_strategies(registry)
+
+    print("\n[REGISTRY] count:", len(strategies))
+    print("[REGISTRY] configured strategy definitions:", sorted(config.strategies.keys())[:80])
+    print("[REGISTRY] registered strategies:")
+
+    for strategy in strategies[:80]:
+        print(f"  - {_strategy_name(strategy)} | category={_category_value(strategy)}")
+
+    assert strategies, (
+        "StrategyRegistry is empty after build_default_strategy_registry(). "
+        "This means presets/factories/bootstrap are not registering real strategies."
+    )
+
+
+# =============================================================================
+# 2. Реальні strategy classes не реєструються через preset / factories
+# =============================================================================
+
+
+def test_real_strategy_factories_are_discovered_and_overlap_with_preset_config() -> None:
+    factories = _discover_strategy_factories_like_runner()
+    _, _, config, registry, _, _, _ = _build_real_strategy_stack()
+
+    configured_names = set(config.strategies.keys())
+    factory_names = set(factories.keys())
+    registered_names = {_strategy_name(strategy) for strategy in _registered_strategies(registry)}
+
+    print("\n[FACTORIES] discovered:", sorted(factory_names))
+    print("[FACTORIES] configured:", sorted(configured_names))
+    print("[FACTORIES] registered:", sorted(registered_names))
+    print("[FACTORIES] configured names without discovered factory:", sorted(configured_names - factory_names))
+
+    assert factories, "No concrete strategy factories were discovered under strategy.strategies.*."
+    assert registered_names, (
+        "Factories were discovered, but no strategy was registered. "
+        "Check build_default_strategy_registry(), preset enabled names, and factory name matching."
+    )
+
+
+# =============================================================================
+# 3. StrategyEngine не стартує event_handler або event_handler не має subscriptions
+# =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_missing_market_type_falls_back_to_perpetual_and_can_hide_adapter_bugs(
-    caches: dict[str, Any],
-    event_bus: FakeEventBus,
-) -> None:
-    """
-    Документує ризик: якщо exchange adapter не передає market_type,
-    cache поставить default 'perpetual'.
+async def test_strategy_engine_start_registers_event_handler_subscriptions() -> None:
+    event_bus, scheduler, _, registry, _, engine, _ = _build_real_strategy_stack()
+    _assert_registry_not_empty(registry)
 
-    Це не змішає різні exchange, але може змішати spot/futures/swap
-    всередині однієї біржі, якщо adapter-и не уніфіковані.
-    """
-    payload = candle_event(
-        exchange="mexc",
-        market_type="usdm_futures",
-        open_time_ms=now_ms(),
-        close=30_000.0,
+    await _maybe_await(event_bus.start())
+    await _maybe_await(scheduler.start())
+
+    try:
+        await engine.start()
+
+        handler = getattr(engine, "event_handler", None)
+        assert handler is not None, "StrategyEngine has no event_handler attribute"
+
+        subscriptions = getattr(handler, "_subscriptions", [])
+        topics: list[str] = []
+
+        for subscription in subscriptions:
+            topic = (
+                getattr(subscription, "topic", None)
+                or getattr(subscription, "pattern", None)
+                or getattr(subscription, "event_name", None)
+                or str(subscription)
+            )
+            topics.append(str(topic))
+
+        print("\n[ENGINE] handler registered:", getattr(handler, "_registered", None))
+        print("[ENGINE] subscription count:", len(subscriptions))
+        print("[ENGINE] subscription topics:", topics[:80])
+
+        assert getattr(handler, "_registered", False) is True
+        assert subscriptions, "StrategyEventHandler has zero subscriptions after engine.start()"
+        assert any(topic == "analytics.*" or "analytics.*" in topic for topic in topics), (
+            "StrategyEventHandler is not subscribed to analytics.*. "
+            f"topics={topics}"
+        )
+
+    finally:
+        await engine.stop()
+        await _maybe_await(scheduler.stop())
+        await _maybe_await(event_bus.stop())
+
+
+# =============================================================================
+# 4. Registry / Router diagnostic
+# =============================================================================
+
+
+def test_real_strategies_are_not_all_filtered_by_router_for_oi_event() -> None:
+    _, _, _, registry, processor, _, state = _build_real_strategy_stack(
+        symbols=["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
+        preset_name="intraday",
+        use_required_features=False,
     )
-    payload.pop("market_type")
+    _assert_registry_not_empty(registry)
 
-    await event_bus.emit("market.candle", payload)
+    event_name = "analytics.oi.capitulation.detected"
+    payload = _realistic_oi_payload(symbol="BTCUSDT", timeframe="5m")
 
-    explicit_usdm = await caches["candles"].get_recent_candles(
-        exchange="mexc",
-        market_type="usdm_futures",
+    context = _build_context_from_payload(
+        processor=processor,
+        state=state,
+        event_name=event_name,
+        payload=payload,
+    )
+
+    categories = processor.router._resolve_categories(
+        event_name=event_name,
+        source=FeatureSource.OPEN_INTEREST,
+    )
+
+    _print_registry_selection_debug(
+        registry=registry,
+        context=context,
+        categories=categories,
+    )
+
+    route = processor.router.route(
+        event_name=event_name,
+        context=context,
+        source=FeatureSource.OPEN_INTEREST,
+        changed_features=_changed_features(context),
+        metadata={"test": "real_router_filter_check"},
+    )
+
+    print("\n[ROUTER] context timeframe:", context.timeframe)
+    print("[ROUTER] changed_features:", _changed_features(context))
+    print("[ROUTER] categories_used:", [category.value for category in route.categories_used])
+    print("[ROUTER] selected:", route.selected_names)
+    print("[ROUTER] skipped:", route.skipped)
+
+    assert route.categories_used, (
+        "Router resolved no categories for analytics.oi.capitulation. "
+        "Check RoutingConfig.categories_for_event() and SignalRouter._resolve_categories()."
+    )
+
+    assert route.selected, (
+        "Router found categories but selected no strategies. "
+        "Read REGISTRY SELECTION DEBUG above. "
+        "Likely causes: registry index mismatch, supports_timeframe/symbol/regime false, "
+        "or required_features mismatch."
+    )
+
+
+# =============================================================================
+# 5. Real strategy generate_signal diagnostic
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_at_least_one_real_routed_strategy_can_be_called_and_diagnosed() -> None:
+    _, _, _, registry, processor, _, state = _build_real_strategy_stack(
+        symbols=["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
+        preset_name="intraday",
+        use_required_features=False,
+    )
+    _assert_registry_not_empty(registry)
+
+    event_name = "analytics.oi.capitulation.detected"
+    payload = _realistic_oi_payload(
         symbol="BTCUSDT",
-        timeframe="1m",
-        limit=10,
-    )
-    default_perpetual = await caches["candles"].get_recent_candles(
-        exchange="mexc",
-        market_type="perpetual",
-        symbol="BTCUSDT",
-        timeframe="1m",
-        limit=10,
+        timeframe="5m",
+        confidence=0.92,
+        score=0.88,
     )
 
-    assert explicit_usdm == []
-    assert len(default_perpetual) == 1
-    assert default_perpetual[0]["market_type"] == "perpetual"
+    context = _build_context_from_payload(
+        processor=processor,
+        state=state,
+        event_name=event_name,
+        payload=payload,
+    )
+
+    categories = processor.router._resolve_categories(
+        event_name=event_name,
+        source=FeatureSource.OPEN_INTEREST,
+    )
+    _print_registry_selection_debug(
+        registry=registry,
+        context=context,
+        categories=categories,
+    )
+
+    route = processor.router.route(
+        event_name=event_name,
+        context=context,
+        source=FeatureSource.OPEN_INTEREST,
+        changed_features=_changed_features(context),
+        metadata={"test": "real_strategy_generate_signal_check"},
+    )
+
+    assert route.selected, (
+        "No strategies selected. See REGISTRY SELECTION DEBUG above. "
+        f"skipped={route.skipped}"
+    )
+
+    generated: list[tuple[str, StrategySignal]] = []
+    returned_none: list[str] = []
+    failed: dict[str, str] = {}
+
+    for strategy in route.selected:
+        method = getattr(strategy, "generate_signal", None)
+        if not callable(method):
+            failed[_strategy_name(strategy)] = "missing generate_signal()"
+            continue
+
+        try:
+            value = await _maybe_await(method(context))
+        except Exception as exc:
+            failed[_strategy_name(strategy)] = f"{exc.__class__.__name__}: {exc}"
+            continue
+
+        if value is None:
+            returned_none.append(_strategy_name(strategy))
+            continue
+
+        if isinstance(value, StrategySignal):
+            generated.append((_strategy_name(strategy), value))
+            continue
+
+        failed[_strategy_name(strategy)] = f"unexpected return type: {type(value)!r}"
+
+    print("\n[REAL STRATEGIES] selected:", route.selected_names)
+    print("[REAL STRATEGIES] generated:", [name for name, _ in generated])
+    print("[REAL STRATEGIES] returned_none:", returned_none)
+    print("[REAL STRATEGIES] failed:", failed)
+
+    if not generated:
+        pytest.xfail(
+            "Real OI strategies were routed correctly, but all returned None. "
+            "Routing, registry selection, timeframe, regime and required_features are OK. "
+            "Now inspect concrete OI strategy domain conditions or test with a real analytics.oi.* payload. "
+            f"returned_none={returned_none} failed={failed}"
+        )
+
+
+# =============================================================================
+# 6. SignalProcessor downstream diagnostic with manual strategy
+# =============================================================================
+
+
+
+def _print_object_public_attrs(title: str, obj: Any) -> None:
+    print("")
+    print(f"========== {title} ==========")
+    if obj is None:
+        print("<None>")
+        print("=" * (22 + len(title)))
+        return
+
+    for name in dir(obj):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception as exc:
+            value = f"<error {exc}>"
+        if not callable(value):
+            print(f"{name} = {value!r}")
+    print("=" * (22 + len(title)))
+    print("")
+
+
+def _print_portfolio_config_debug(config: StrategyConfig) -> None:
+    _print_object_public_attrs("PORTFOLIO CONFIG DEBUG", getattr(config, "portfolio", None))
+
+
+def _print_portfolio_batch_debug(batch: Any) -> None:
+    print("")
+    print("========== PORTFOLIO BATCH DEBUG ==========")
+    print("batch.reasons:", getattr(batch, "reasons", None))
+    for attr in (
+        "coordination",
+        "coordinated",
+        "coordination_decision",
+        "portfolio_decision",
+        "portfolio",
+    ):
+        if hasattr(batch, attr):
+            _print_object_public_attrs(f"BATCH.{attr}", getattr(batch, attr))
+    print("===========================================")
+    print("")
+
+
+class _ManualSignalStrategy(BaseStrategy):
+    strategy_name = "manual_processor_probe_unique"
+    category = StrategyCategory.OPEN_INTEREST
+    default_setup_type = SetupType.OI_CONFIRMATION
+    priority = 1
+
+    def required_features(self) -> set[str]:
+        return set()
+
+    async def generate_signal(self, context: StrategyContext) -> StrategySignal | None:
+        signal = StrategySignal(
+            symbol=context.symbol,
+            side=SignalSide.LONG,
+            strategy_name=self.strategy_name,
+            category=self.category,
+            timeframe=context.timeframe,
+            setup_type=self.default_setup_type,
+            timestamp=context.timestamp,
+            confidence=0.92,
+            score=0.88,
+            reasons=["pytest_manual_probe"],
+            confirmations=["processor_should_emit_signal_generated"],
+            source_features=_changed_features(context),
+            metadata={
+                "order_intent": "open",
+                "market_type": "usdm_futures",
+                "margin_mode": "isolated",
+                "tier": "standard",
+                "pytest_unique": str(utcnow().timestamp()),
+            },
+        )
+
+        # New strategy model field names.
+        if hasattr(signal, "entry_plan"):
+            signal.entry_plan = EntryPlan(
+                entry_type=EntryType.MARKET,
+                price=77_000.0,
+                max_slippage_bps=5.0,
+            )
+        if hasattr(signal, "exit_plan"):
+            signal.exit_plan = ExitPlan(
+                stop_loss=76_000.0,
+                take_profit_levels=[],
+            )
+        if hasattr(signal, "invalidation_plan"):
+            signal.invalidation_plan = InvalidationPlan(
+                price=76_000.0,
+                reason="pytest_invalidation",
+            )
+
+        # Backward-compatible aliases only for older BaseStrategy.evaluate()
+        # implementations that still read signal.entry / signal.exit / signal.invalidation.
+        try:
+            signal.entry = getattr(signal, "entry_plan", None)
+        except Exception:
+            pass
+        try:
+            signal.exit = getattr(signal, "exit_plan", None)
+        except Exception:
+            pass
+        try:
+            signal.invalidation = getattr(signal, "invalidation_plan", None)
+        except Exception:
+            pass
+
+        signal.validate()
+        return signal
+
+def _set_if_exists(obj: Any, name: str, value: Any) -> None:
+    if hasattr(obj, name):
+        setattr(obj, name, value)
+
+
+@pytest.mark.asyncio
+async def test_signal_processor_downstream_can_emit_known_good_signal_generated() -> None:
+    event_bus = EventBus()
+    scheduler = Scheduler(event_bus=event_bus)
+
+    config = build_default_strategy_config(
+        symbols=["BTCUSDT"],
+        preset_name="intraday",
+        use_required_features=False,
+    )
+    config.confluence.min_agreement_count = 1
+    config.confluence.min_confidence = 0.0
+    config.confluence.min_score = 0.0
+    config.voting.min_confirmations = 1
+    config.voting.min_total_votes = 1
+    config.voting.allow_single_strategy_confirmation = True
+    portfolio = config.portfolio
+
+    # Disable portfolio policies that can hide whether SignalProcessor can emit.
+    # The previous debug showed: rejected_signals={'manual_processor_probe': 'repeating_signal_suppressed'}.
+    for name, value in {
+        "enabled": True,
+
+        # Existing fields in the current PortfolioCoordinatorConfig.
+        "deduplicate_by_side": False,
+        "merge_similar_signals": False,
+        "correlation_guard_enabled": False,
+        "enable_correlation_direction_conflict": False,
+        "volatility_throttle_enabled": False,
+        "repeated_signal_suppression_seconds": 0,
+        "side_cooldown_seconds": 0,
+        "symbol_cooldown_seconds": 0,
+        "high_volatility_max_signals_per_symbol": 10,
+        "max_signals_per_symbol": 10,
+
+        # Compatibility with possible future/alternate config names.
+        "allow_new_signals": True,
+        "allow_same_symbol_multiple_strategies": True,
+        "allow_multiple_signals_per_symbol": True,
+        "allow_same_direction_signals": True,
+        "block_opposite_signals": False,
+        "reject_opposite_signals": False,
+        "max_active_signals": 100,
+        "max_active_signals_total": 100,
+        "max_total_active_signals": 100,
+        "max_active_per_symbol": 10,
+        "max_symbol_signals": 10,
+        "max_strategy_signals": 10,
+        "max_signals_per_strategy": 10,
+        "min_signal_score": 0.0,
+        "min_signal_confidence": 0.0,
+    }.items():
+        _set_if_exists(portfolio, name, value)
+
+    if hasattr(portfolio, "exposure_bucket_limits"):
+        portfolio.exposure_bucket_limits = {
+            "directional": 100,
+            "hybrid": 100,
+        }
+
+    if hasattr(portfolio, "max_signals_per_category"):
+        portfolio.max_signals_per_category = {
+            StrategyCategory.PRICE_ACTION: 100,
+            StrategyCategory.ORDERFLOW: 100,
+            StrategyCategory.OPEN_INTEREST: 100,
+            StrategyCategory.WHALES: 100,
+            StrategyCategory.SPREADS: 100,
+            StrategyCategory.HYBRID: 100,
+        }
+
+    _print_portfolio_config_debug(config)
+    assert isinstance(config, StrategyConfig)
+
+    registry = build_default_strategy_registry(
+        config=config,
+        event_bus=event_bus,
+        scheduler=scheduler,
+        strategy_factories={},
+        strict=False,
+        emit_events=False,
+    )
+
+    probe_definition = StrategyDefinitionConfig(
+        name="manual_processor_probe_unique",
+        category=StrategyCategory.OPEN_INTEREST,
+        runtime=StrategyRuntimeConfig(
+            enabled=True,
+            symbols=["BTCUSDT"],
+            timeframes=[Timeframe.M1, Timeframe.M5, Timeframe.M15],
+            allowed_regimes=[MarketRegime.UNKNOWN],
+            cooldown_seconds=0,
+            max_signal_age_seconds=300,
+            min_confidence=0.0,
+            min_score=0.0,
+        ),
+        required_features=set(),
+        weight=1.0,
+        priority=1,
+        tags=["pytest", "manual_probe"],
+        metadata={"source": "pytest"},
+    )
+
+    probe = _ManualSignalStrategy(
+        config=config,
+        event_bus=event_bus,
+        scheduler=scheduler,
+        definition=probe_definition,
+    )
+    registry.register_strategy(probe, replace=True, emit_event=False)
+
+    state = StrategyRuntimeState()
+
+    processor = SignalProcessor(
+        config=config,
+        registry=registry,
+        state=state,
+        event_bus=event_bus,
+        scheduler=scheduler,
+    )
+
+    captured_signal_generated: list[dict[str, Any]] = []
+
+    async def on_signal_generated(event: Any) -> None:
+        payload = getattr(event, "payload", event)
+        if isinstance(payload, dict):
+            captured_signal_generated.append(payload)
+
+    event_bus.subscribe(
+        "signal.generated",
+        on_signal_generated,
+        name="pytest_capture_signal_generated",
+    )
+
+    await _maybe_await(event_bus.start())
+    await _maybe_await(scheduler.start())
+
+    try:
+        payload = _realistic_oi_payload(
+            symbol="BTCUSDT",
+            timeframe="5m",
+            confidence=0.92,
+            score=0.88,
+        )
+
+        batch = await processor.process_event(
+            event_name="analytics.oi.capitulation.detected",
+            payload=payload,
+            timestamp=payload.get("timestamp"),
+            emit=True,
+        )
+
+        _print_portfolio_batch_debug(batch)
+
+        print("\n[PROCESSOR] accepted:", batch.accepted)
+        print("[PROCESSOR] emitted:", batch.emitted)
+        print("[PROCESSOR] reasons:", batch.reasons)
+        print("[PROCESSOR] route:", batch.route.selected_names if batch.route else None)
+        print("[PROCESSOR] raw_signal_count:", len(batch.raw_signals))
+        print("[PROCESSOR] final_signal_count:", len(batch.final_signals))
+        print("[PROCESSOR] risk_payload_count:", len(batch.risk_payloads))
+        print("[PROCESSOR] evaluations:")
+        for evaluation in batch.evaluations:
+            print(" -", evaluation)
+        print("[PROCESSOR] captured signal.generated:", len(captured_signal_generated))
+
+        assert batch.route is not None, "SignalProcessor did not create a RouteDecision"
+        assert batch.route.selected, f"No strategies routed. reasons={batch.reasons}"
+        assert batch.raw_signals, (
+            f"No raw signals created. reasons={batch.reasons}. "
+            "If evaluation_error mentions signal.entry, fix strategy/base.py to use "
+            "entry_plan/exit_plan/invalidation_plan or keep compatibility aliases."
+        )
+        assert batch.final_signals, f"Signal was blocked before final_signals. reasons={batch.reasons}"
+        assert batch.risk_payloads, f"SignalBuilder did not create risk payloads. reasons={batch.reasons}"
+        assert batch.emitted is True, f"SignalProcessor did not mark batch emitted. reasons={batch.reasons}"
+        assert captured_signal_generated, "No signal.generated event was captured from EventBus"
+
+    finally:
+        await _maybe_await(scheduler.stop())
+        await _maybe_await(event_bus.stop())

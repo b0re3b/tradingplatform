@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .enums import (
+from strategy.enums import (
     EntryType,
     MarketRegime,
     PresetMode,
     StrategyCategory,
     Timeframe,
 )
-from .exceptions import StrategyConfigError
+from strategy.exceptions import StrategyConfigError
 
 
 @dataclass(slots=True)
@@ -114,7 +114,47 @@ class StrategyDefinitionConfig:
 
         self.runtime.validate()
 
+DEFAULT_ANALYTICS_EVENT_CATEGORY_PREFIXES: tuple[
+    tuple[str, tuple[StrategyCategory, ...]],
+    ...
+] = (
+    # Funding
+    ("analytics.funding.", (StrategyCategory.FUNDING,)),
 
+    # Liquidations
+    ("analytics.liquidations.", (StrategyCategory.LIQUIDATIONS,)),
+    ("analytics.liquidation.", (StrategyCategory.LIQUIDATIONS,)),
+
+    # Liquidity
+    ("analytics.liquidity.", (StrategyCategory.LIQUIDITY,)),
+
+    # Open Interest
+    ("analytics.oi.", (StrategyCategory.OPEN_INTEREST,)),
+    ("analytics.open_interest.", (StrategyCategory.OPEN_INTEREST,)),
+
+    # Orderflow
+    ("analytics.orderflow.", (StrategyCategory.ORDERFLOW,)),
+
+    # Price Action
+    ("analytics.price_action.", (StrategyCategory.PRICE_ACTION,)),
+    ("analytics.market_structure.", (StrategyCategory.PRICE_ACTION,)),
+    ("analytics.support_resistance.", (StrategyCategory.PRICE_ACTION,)),
+    ("analytics.fair_value_gap.", (StrategyCategory.PRICE_ACTION,)),
+    ("analytics.fvg.", (StrategyCategory.PRICE_ACTION,)),
+    ("analytics.trend.", (StrategyCategory.PRICE_ACTION,)),
+
+    # Spoofing
+    ("analytics.spoofing.", (StrategyCategory.SPOOFING,)),
+
+    # Spreads
+    ("analytics.spreads.", (StrategyCategory.SPREADS,)),
+    ("analytics.spread.", (StrategyCategory.SPREADS,)),
+    ("analytics.basis.", (StrategyCategory.SPREADS,)),
+
+    # Whales
+    ("analytics.whales.", (StrategyCategory.WHALES,)),
+    ("analytics.whale.", (StrategyCategory.WHALES,)),
+)
 @dataclass(slots=True)
 class RoutingConfig:
     reevaluate_on_any_update: bool = False
@@ -141,7 +181,92 @@ class RoutingConfig:
                 )
 
     def categories_for_event(self, event_name: str) -> list[StrategyCategory]:
-        return self.event_to_categories.get(event_name, [])
+        """
+        Resolve analytics topic into strategy categories.
+
+        Resolution order:
+        1. exact configured event_to_categories match;
+        2. configured parent-prefix match;
+        3. default production analytics-prefix match;
+        4. empty list if event is not routable to strategy.
+        """
+        normalized = self._normalize_event_name(event_name)
+        if not normalized:
+            return []
+
+        exact = self.event_to_categories.get(normalized)
+        if exact:
+            return self._normalize_categories(exact)
+
+        configured_prefix_match = self._categories_from_configured_prefix(normalized)
+        if configured_prefix_match:
+            return configured_prefix_match
+
+        default_prefix_match = self._categories_from_default_prefix(normalized)
+        if default_prefix_match:
+            return default_prefix_match
+
+        return []
+
+    @staticmethod
+    def _normalize_event_name(event_name: object) -> str:
+        if not isinstance(event_name, str):
+            return ""
+        return event_name.strip().lower()
+
+    def _categories_from_configured_prefix(
+            self,
+            event_name: str,
+    ) -> list[StrategyCategory]:
+        matches: list[tuple[int, list[StrategyCategory]]] = []
+
+        for configured_event, categories in self.event_to_categories.items():
+            prefix = self._normalize_event_name(configured_event)
+            if not prefix:
+                continue
+
+            dotted_prefix = prefix if prefix.endswith(".") else f"{prefix}."
+
+            if event_name.startswith(dotted_prefix):
+                matches.append((len(dotted_prefix), categories))
+
+        if not matches:
+            return []
+
+        _, categories = max(matches, key=lambda item: item[0])
+        return self._normalize_categories(categories)
+
+    def _categories_from_default_prefix(
+            self,
+            event_name: str,
+    ) -> list[StrategyCategory]:
+        for prefix, categories in DEFAULT_ANALYTICS_EVENT_CATEGORY_PREFIXES:
+            if event_name.startswith(prefix):
+                return self._normalize_categories(categories)
+
+        return []
+
+    def _normalize_categories(
+            self,
+            categories: list[StrategyCategory] | tuple[StrategyCategory, ...],
+    ) -> list[StrategyCategory]:
+        result: list[StrategyCategory] = []
+
+        for category in categories:
+            if not isinstance(category, StrategyCategory):
+                continue
+
+            if category not in result:
+                result.append(category)
+
+        if (
+                self.route_hybrid_on_domain_signal
+                and result
+                and StrategyCategory.HYBRID not in result
+        ):
+            result.append(StrategyCategory.HYBRID)
+
+        return result
 
 
 @dataclass(slots=True)

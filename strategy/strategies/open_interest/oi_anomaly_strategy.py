@@ -23,7 +23,7 @@ from .base import (
     OpenInterestStrategyConfig,
     OpenInterestTradingStrategy,
 )
-from .utils import (
+from strategies.open_interest.utils import (
     ScoreBreakdown,
     anomaly_filter_reason,
     anomaly_setup_hint,

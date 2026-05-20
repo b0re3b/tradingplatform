@@ -356,15 +356,15 @@ class RiskManager:
                 )
             )
 
-        for name, callback, interval_seconds in jobs:
+        for name, func, interval_seconds in jobs:
             try:
-                job = self._scheduler.add_interval_job(
-                    callback,
-                    interval=interval_seconds,
+                job_id = self._scheduler.add_interval_job(
                     name=name,
+                    func=func,
+                    interval=interval_seconds,
                     run_immediately=False,
                 )
-                self._scheduler_jobs.append(job)
+                self._scheduler_jobs.append(job_id)
             except Exception:
                 self._logger.exception("Failed to register risk scheduler job | name=%s", name)
 
