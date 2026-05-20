@@ -1,1008 +1,1528 @@
-# trading_system/backtesting/data_loader.py
+"""
+Historical data loader for backtesting.
+
+DataLoader reads already downloaded historical files from local storage and
+builds replay-ready BacktestDataset objects.
+
+Main responsibilities:
+- discover local historical files;
+- read parquet/csv/json/jsonl;
+- normalize rows into Historical* records;
+- validate timestamps/order/gaps;
+- convert records into BacktestEvent objects;
+- build BacktestDataset for MarketReplay.
+
+Important:
+- No live exchange calls here.
+- No strategy/risk/execution logic here.
+- No EventBus emission here.
+- MarketReplay is responsible for emitting market.* events.
+"""
 
 from __future__ import annotations
 
-import asyncio
+import csv
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, Iterable, Sequence
 
-import pandas as pd
-
-from core.logger import get_logger
-
-from .config import BacktestDataConfig
-from .enums import (
-    DataQualityStatus,
-    DuplicateHandlingPolicy,
-    GapHandlingPolicy,
-    HistoricalEventTopic,
-    HistoryDataType,
-    StorageFormat,
+from backtesting.config import DataLoaderConfig
+from backtesting.enums import (
+    BacktestDataType,
+    BacktestEventType,
+    DataGapPolicy,
+    DataValidationLevel,
+    HistoricalDataFormat,
+    ReplayOrdering,
+    ReplayMode,
 )
-from .exceptions import (
-    BacktestDataDuplicateError,
-    BacktestDataGapError,
-    BacktestDataNotFoundError,
-    BacktestDataOrderError,
-    BacktestDataQualityError,
-    BacktestDataRangeError,
-    BacktestDataSchemaError,
-    HistoryReadError,
-    build_error_context,
+from backtesting.exceptions import (
+    DataGapError,
+    DataLoadError,
+    DataNormalizationError,
+    DataValidationError,
+    HistoricalDataFormatError,
 )
-from .models import DataQualityReport, HistoricalMarketEvent
+from backtesting.market_replay import market_topic_for_data_type, replay_priority_for_data_type
+from backtesting.models import (
+    BacktestDataset,
+    BacktestDatasetInfo,
+    BacktestDataSource,
+    BacktestEvent,
+    BacktestInstrument,
+    BacktestPeriod,
+    HistoricalCandle,
+    HistoricalFundingRecord,
+    HistoricalLiquidationRecord,
+    HistoricalOpenInterestRecord,
+    HistoricalOrderBookLevel,
+    HistoricalOrderBookSnapshot,
+    HistoricalTrade,
+)
 
+try:
+    from core.logger import get_logger
+except Exception:  # pragma: no cover
+    import logging
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _enum_value(value: Any) -> str:
-    return value.value if hasattr(value, "value") else str(value)
-
-
-def _safe_int(value: Any, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_str(value: Any, default: str = "") -> str:
-    if value is None:
-        return default
-    return str(value)
-
-
-def _month_range(start_time_ms: int, end_time_ms: int) -> list[str]:
-    """
-    Return YYYY-MM partitions touched by the requested time range.
-    """
-
-    start = pd.Timestamp(start_time_ms, unit="ms", tz="UTC").to_period("M")
-    end = pd.Timestamp(end_time_ms, unit="ms", tz="UTC").to_period("M")
-
-    periods = pd.period_range(start=start, end=end, freq="M")
-    return [str(period) for period in periods]
-
-
-def _day_range(start_time_ms: int, end_time_ms: int) -> list[str]:
-    """
-    Return YYYY-MM-DD partitions touched by the requested time range.
-    """
-
-    start = pd.Timestamp(start_time_ms, unit="ms", tz="UTC").normalize()
-    end = pd.Timestamp(end_time_ms, unit="ms", tz="UTC").normalize()
-
-    days = pd.date_range(start=start, end=end, freq="D", tz="UTC")
-    return [day.strftime("%Y-%m-%d") for day in days]
-
-
-def _year_range(start_time_ms: int, end_time_ms: int) -> list[str]:
-    """
-    Return YYYY partitions touched by the requested time range.
-    """
-
-    start_year = pd.Timestamp(start_time_ms, unit="ms", tz="UTC").year
-    end_year = pd.Timestamp(end_time_ms, unit="ms", tz="UTC").year
-
-    return [str(year) for year in range(start_year, end_year + 1)]
-
-
-def _timeframe_to_ms(timeframe: str) -> int:
-    mapping = {
-        "1m": 60_000,
-        "3m": 3 * 60_000,
-        "5m": 5 * 60_000,
-        "15m": 15 * 60_000,
-        "30m": 30 * 60_000,
-        "1h": 60 * 60_000,
-        "2h": 2 * 60 * 60_000,
-        "4h": 4 * 60 * 60_000,
-        "6h": 6 * 60 * 60_000,
-        "8h": 8 * 60 * 60_000,
-        "12h": 12 * 60 * 60_000,
-        "1d": 24 * 60 * 60_000,
-    }
-
-    if timeframe not in mapping:
-        raise BacktestDataSchemaError(
-            f"Unsupported timeframe: {timeframe}",
-            context=build_error_context(timeframe=timeframe),
-        )
-
-    return mapping[timeframe]
-
-
-# ---------------------------------------------------------------------------
-# File discovery
-# ---------------------------------------------------------------------------
+    def get_logger(name: str) -> logging.Logger:
+        return logging.getLogger(name)
 
 
 @dataclass(slots=True)
-class HistoryFileRef:
+class DataFileRef:
     """
-    Reference to one local history file.
+    Reference to a local historical data file.
     """
 
     path: Path
+    data_type: BacktestDataType
     exchange: str
     market_type: str
     symbol: str
-    data_type: str
     timeframe: str | None = None
-    partition: str | None = None
-
-
-class HistoryFileResolver:
-    """
-    Resolves expected local history file paths.
-
-    Layout must match history_downloader.py:
-
-        data/history/{exchange}/{market_type}/{symbol}/{data_type}/...
-
-    Candles:
-        candles/{timeframe}/{YYYY-MM}.parquet
-
-    High-frequency event data:
-        agg_trades/{YYYY-MM-DD}.parquet
-        trades/{YYYY-MM-DD}.parquet
-        liquidations/{YYYY-MM-DD}.parquet
-        orderbook_snapshots/{YYYY-MM-DD}.parquet
-        orderbook_deltas/{YYYY-MM-DD}.parquet
-
-    Funding:
-        funding/{YYYY}.parquet
-
-    Other medium-frequency data:
-        open_interest/{YYYY-MM}.parquet
-        mark_price/{YYYY-MM}.parquet
-        index_price/{YYYY-MM}.parquet
-    """
-
-    def __init__(self, config: BacktestDataConfig) -> None:
-        self.config = config
-        self.logger = get_logger(__name__)
-
-    def resolve(self) -> list[HistoryFileRef]:
-        refs: list[HistoryFileRef] = []
-
-        exchange = _enum_value(self.config.exchange)
-        market_type = _enum_value(self.config.market_type)
-
-        for symbol in self.config.symbols:
-            for data_type_raw in self.config.data_types:
-                data_type = _enum_value(data_type_raw)
-
-                if data_type == HistoryDataType.CANDLES.value:
-                    for timeframe in self.config.timeframes:
-                        refs.extend(
-                            self._resolve_candle_files(
-                                exchange=exchange,
-                                market_type=market_type,
-                                symbol=symbol,
-                                timeframe=timeframe,
-                            )
-                        )
-                else:
-                    refs.extend(
-                        self._resolve_non_candle_files(
-                            exchange=exchange,
-                            market_type=market_type,
-                            symbol=symbol,
-                            data_type=data_type,
-                        )
-                    )
-
-        return refs
-
-    def _resolve_candle_files(
-        self,
-        *,
-        exchange: str,
-        market_type: str,
-        symbol: str,
-        timeframe: str,
-    ) -> list[HistoryFileRef]:
-        refs: list[HistoryFileRef] = []
-
-        base = (
-            Path(self.config.data_dir)
-            / exchange
-            / market_type
-            / symbol
-            / HistoryDataType.CANDLES.value
-            / timeframe
-        )
-
-        for partition in _month_range(self.config.start_time_ms, self.config.end_time_ms):
-            path = base / f"{partition}.{_enum_value(self.config.storage_format)}"
-            refs.append(
-                HistoryFileRef(
-                    path=path,
-                    exchange=exchange,
-                    market_type=market_type,
-                    symbol=symbol,
-                    data_type=HistoryDataType.CANDLES.value,
-                    timeframe=timeframe,
-                    partition=partition,
-                )
-            )
-
-        return refs
-
-    def _resolve_non_candle_files(
-        self,
-        *,
-        exchange: str,
-        market_type: str,
-        symbol: str,
-        data_type: str,
-    ) -> list[HistoryFileRef]:
-        refs: list[HistoryFileRef] = []
-
-        base = Path(self.config.data_dir) / exchange / market_type / symbol / data_type
-
-        if data_type in {
-            HistoryDataType.TRADES.value,
-            HistoryDataType.AGG_TRADES.value,
-            HistoryDataType.ORDERBOOK_SNAPSHOTS.value,
-            HistoryDataType.ORDERBOOK_DELTAS.value,
-            HistoryDataType.LIQUIDATIONS.value,
-        }:
-            partitions = _day_range(self.config.start_time_ms, self.config.end_time_ms)
-
-        elif data_type == HistoryDataType.FUNDING.value:
-            partitions = _year_range(self.config.start_time_ms, self.config.end_time_ms)
-
-        else:
-            partitions = _month_range(self.config.start_time_ms, self.config.end_time_ms)
-
-        for partition in partitions:
-            path = base / f"{partition}.{_enum_value(self.config.storage_format)}"
-            refs.append(
-                HistoryFileRef(
-                    path=path,
-                    exchange=exchange,
-                    market_type=market_type,
-                    symbol=symbol,
-                    data_type=data_type,
-                    timeframe=None,
-                    partition=partition,
-                )
-            )
-
-        return refs
-
-
-# ---------------------------------------------------------------------------
-# Local readers
-# ---------------------------------------------------------------------------
-
-
-class ParquetBacktestDataReader:
-    """
-    Reads local Parquet files and returns filtered pandas DataFrames.
-
-    This class does not convert rows into EventBus events.
-    """
-
-    def __init__(self, config: BacktestDataConfig) -> None:
-        self.config = config
-        self.logger = get_logger(__name__)
-
-    async def read_file(self, ref: HistoryFileRef) -> pd.DataFrame:
-        if not ref.path.exists():
-            raise BacktestDataNotFoundError(
-                "History file not found",
-                context=build_error_context(
-                    exchange=ref.exchange,
-                    market_type=ref.market_type,
-                    symbol=ref.symbol,
-                    timeframe=ref.timeframe,
-                    data_type=ref.data_type,
-                    data_path=str(ref.path),
-                ),
-            )
-
-        try:
-            df = await asyncio.to_thread(pd.read_parquet, ref.path)
-        except Exception as exc:
-            raise HistoryReadError(
-                "Failed to read local history file",
-                context=build_error_context(
-                    exchange=ref.exchange,
-                    market_type=ref.market_type,
-                    symbol=ref.symbol,
-                    timeframe=ref.timeframe,
-                    data_type=ref.data_type,
-                    data_path=str(ref.path),
-                ),
-                cause=exc,
-            ) from exc
-
-        if df.empty:
-            return df
-
-        if "timestamp_ms" not in df.columns:
-            raise BacktestDataSchemaError(
-                "History file is missing required timestamp_ms column",
-                context=build_error_context(
-                    exchange=ref.exchange,
-                    market_type=ref.market_type,
-                    symbol=ref.symbol,
-                    timeframe=ref.timeframe,
-                    data_type=ref.data_type,
-                    data_path=str(ref.path),
-                ),
-            )
-
-        df = df[
-            (df["timestamp_ms"] >= self.config.start_time_ms)
-            & (df["timestamp_ms"] <= self.config.end_time_ms)
-        ].copy()
-
-        if df.empty:
-            return df
-
-        if self.config.sort_events:
-            df = df.sort_values("timestamp_ms").reset_index(drop=True)
-
-        return df
-
-
-# ---------------------------------------------------------------------------
-# Schema / quality validation
-# ---------------------------------------------------------------------------
-
-
-class BacktestDataValidator:
-    """
-    Performs lightweight schema and quality validation before replay.
-
-    Heavy data cleaning should happen in ingestion/downloader layer.
-    """
-
-    REQUIRED_COLUMNS_BY_TYPE: dict[str, set[str]] = {
-        HistoryDataType.CANDLES.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "timeframe",
-            "open_time_ms",
-            "close_time_ms",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "is_closed",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.TRADES.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "trade_id",
-            "price",
-            "quantity",
-            "side",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.AGG_TRADES.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "trade_id",
-            "price",
-            "quantity",
-            "side",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.FUNDING.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "funding_rate",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.OPEN_INTEREST.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "open_interest",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.LIQUIDATIONS.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "price",
-            "quantity",
-            "side",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.MARK_PRICE.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "mark_price",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-        HistoryDataType.INDEX_PRICE.value: {
-            "exchange",
-            "symbol",
-            "market_type",
-            "index_price",
-            "timestamp_ms",
-            "received_at_ms",
-        },
-    }
-
-    def __init__(self, config: BacktestDataConfig) -> None:
-        self.config = config
-        self.logger = get_logger(__name__)
-
-    def validate_dataframe(
-        self,
-        *,
-        ref: HistoryFileRef,
-        df: pd.DataFrame,
-    ) -> DataQualityReport:
-        if df.empty:
-            return DataQualityReport(
-                exchange=ref.exchange,
-                market_type=ref.market_type,
-                symbol=ref.symbol,
-                timeframe=ref.timeframe,
-                data_type=ref.data_type,
-                status=DataQualityStatus.EMPTY,
-                start_time_ms=self.config.start_time_ms,
-                end_time_ms=self.config.end_time_ms,
-                rows=0,
-            )
-
-        if self.config.validate_schema:
-            self._validate_schema(ref=ref, df=df)
-
-        duplicate_rows = int(df.duplicated(subset=["timestamp_ms"]).sum())
-        out_of_order_rows = self._count_out_of_order_rows(df)
-
-        gap_count = 0
-        if ref.data_type == HistoryDataType.CANDLES.value and ref.timeframe:
-            gap_count = self._count_candle_gaps(df=df, timeframe=ref.timeframe)
-
-        status = DataQualityStatus.VALID
-
-        if duplicate_rows > 0:
-            status = DataQualityStatus.HAS_DUPLICATES
-
-        if gap_count > 0:
-            status = DataQualityStatus.HAS_GAPS
-
-        if out_of_order_rows > 0:
-            status = DataQualityStatus.OUT_OF_ORDER
-
-        report = DataQualityReport(
-            exchange=ref.exchange,
-            market_type=ref.market_type,
-            symbol=ref.symbol,
-            timeframe=ref.timeframe,
-            data_type=ref.data_type,
-            status=status,
-            start_time_ms=self.config.start_time_ms,
-            end_time_ms=self.config.end_time_ms,
-            rows=len(df),
-            duplicate_rows=duplicate_rows,
-            gap_count=gap_count,
-            out_of_order_rows=out_of_order_rows,
-            gap_policy=self.config.gap_policy,
-            duplicate_policy=_enum_value(self.config.duplicate_policy),
-        )
-
-        if self.config.validate_quality:
-            self._apply_quality_policy(report)
-
-        return report
-
-    def _validate_schema(self, *, ref: HistoryFileRef, df: pd.DataFrame) -> None:
-        required = self.REQUIRED_COLUMNS_BY_TYPE.get(ref.data_type)
-
-        if not required:
-            # Unknown/advanced data types may be supported later by custom loaders.
-            return
-
-        missing = required.difference(set(df.columns))
-        if missing:
-            raise BacktestDataSchemaError(
-                "History file has invalid schema",
-                context=build_error_context(
-                    exchange=ref.exchange,
-                    market_type=ref.market_type,
-                    symbol=ref.symbol,
-                    timeframe=ref.timeframe,
-                    data_type=ref.data_type,
-                    data_path=str(ref.path),
-                    missing_columns=sorted(missing),
-                ),
-            )
-
-    def _count_out_of_order_rows(self, df: pd.DataFrame) -> int:
-        timestamps = df["timestamp_ms"].tolist()
-        count = 0
-
-        previous: int | None = None
-        for value in timestamps:
-            ts = _safe_int(value)
-            if previous is not None and ts < previous:
-                count += 1
-            previous = ts
-
-        return count
-
-    def _count_candle_gaps(self, *, df: pd.DataFrame, timeframe: str) -> int:
-        if len(df) <= 1:
-            return 0
-
-        expected_step = _timeframe_to_ms(timeframe)
-
-        timestamps = sorted(_safe_int(ts) for ts in df["timestamp_ms"].tolist())
-
-        gaps = 0
-        for prev, current in zip(timestamps, timestamps[1:]):
-            if current - prev > expected_step:
-                gaps += 1
-
-        return gaps
-
-    def _apply_quality_policy(self, report: DataQualityReport) -> None:
-        gap_policy = _enum_value(self.config.gap_policy)
-        duplicate_policy = _enum_value(self.config.duplicate_policy)
-
-        if report.gap_count > 0 and gap_policy == GapHandlingPolicy.FAIL.value:
-            raise BacktestDataGapError(
-                "Historical data contains gaps",
-                context=build_error_context(
-                    exchange=report.exchange,
-                    market_type=report.market_type,
-                    symbol=report.symbol,
-                    timeframe=report.timeframe,
-                    data_type=report.data_type,
-                    start_time_ms=report.start_time_ms,
-                    end_time_ms=report.end_time_ms,
-                    gap_count=report.gap_count,
-                ),
-            )
-
-        if report.duplicate_rows > 0 and duplicate_policy == DuplicateHandlingPolicy.FAIL.value:
-            raise BacktestDataDuplicateError(
-                "Historical data contains duplicate rows",
-                context=build_error_context(
-                    exchange=report.exchange,
-                    market_type=report.market_type,
-                    symbol=report.symbol,
-                    timeframe=report.timeframe,
-                    data_type=report.data_type,
-                    duplicate_rows=report.duplicate_rows,
-                ),
-            )
-
-        if report.out_of_order_rows > 0 and self.config.enforce_chronological_order:
-            raise BacktestDataOrderError(
-                "Historical data is out of chronological order",
-                context=build_error_context(
-                    exchange=report.exchange,
-                    market_type=report.market_type,
-                    symbol=report.symbol,
-                    timeframe=report.timeframe,
-                    data_type=report.data_type,
-                    out_of_order_rows=report.out_of_order_rows,
-                ),
-            )
-
-
-# ---------------------------------------------------------------------------
-# Event builder
-# ---------------------------------------------------------------------------
-
-
-class HistoricalEventBuilder:
-    """
-    Converts normalized local history rows into HistoricalMarketEvent objects.
-    """
-
-    TOPIC_BY_DATA_TYPE: dict[str, str] = {
-        HistoryDataType.CANDLES.value: HistoricalEventTopic.MARKET_CANDLE.value,
-        HistoryDataType.TRADES.value: HistoricalEventTopic.MARKET_TRADE.value,
-        HistoryDataType.AGG_TRADES.value: HistoricalEventTopic.MARKET_TRADE.value,
-        HistoryDataType.FUNDING.value: HistoricalEventTopic.MARKET_FUNDING.value,
-        HistoryDataType.OPEN_INTEREST.value: HistoricalEventTopic.MARKET_OPEN_INTEREST.value,
-        HistoryDataType.LIQUIDATIONS.value: HistoricalEventTopic.MARKET_LIQUIDATION.value,
-        HistoryDataType.MARK_PRICE.value: HistoricalEventTopic.MARKET_MARK_PRICE.value,
-        HistoryDataType.INDEX_PRICE.value: HistoricalEventTopic.MARKET_INDEX_PRICE.value,
-        HistoryDataType.ORDERBOOK_SNAPSHOTS.value: HistoricalEventTopic.MARKET_ORDERBOOK_SNAPSHOT.value,
-        HistoryDataType.ORDERBOOK_DELTAS.value: HistoricalEventTopic.MARKET_ORDERBOOK.value,
-    }
-
-    def build_events_from_dataframe(
-        self,
-        *,
-        ref: HistoryFileRef,
-        df: pd.DataFrame,
-    ) -> list[HistoricalMarketEvent]:
-        if df.empty:
-            return []
-
-        topic = self.TOPIC_BY_DATA_TYPE.get(ref.data_type)
-        if not topic:
-            raise BacktestDataSchemaError(
-                "Unsupported data type for event building",
-                context=build_error_context(
-                    exchange=ref.exchange,
-                    market_type=ref.market_type,
-                    symbol=ref.symbol,
-                    timeframe=ref.timeframe,
-                    data_type=ref.data_type,
-                    data_path=str(ref.path),
-                ),
-            )
-
-        events: list[HistoricalMarketEvent] = []
-
-        for idx, row in enumerate(df.to_dict(orient="records")):
-            timestamp_ms = _safe_int(row.get("timestamp_ms"))
-
-            payload = self._clean_payload(row)
-
-            event = HistoricalMarketEvent(
-                topic=topic,
-                timestamp_ms=timestamp_ms,
-                payload=payload,
-                source="backtest.data_loader",
-                sequence=idx,
-                exchange=_safe_str(row.get("exchange"), ref.exchange),
-                market_type=_safe_str(row.get("market_type"), ref.market_type),
-                symbol=_safe_str(row.get("symbol"), ref.symbol),
-                timeframe=_safe_str(row.get("timeframe"), ref.timeframe or "") or None,
-                data_type=ref.data_type,
-            )
-            events.append(event)
-
-        return events
-
-    def _clean_payload(self, row: dict[str, Any]) -> dict[str, Any]:
-        """
-        Convert pandas/numpy nulls to None and keep the normalized shape.
-        """
-
-        payload: dict[str, Any] = {}
-
-        for key, value in row.items():
-            if pd.isna(value):
-                payload[key] = None
-            else:
-                payload[key] = value
-
-        return payload
-
-
-# ---------------------------------------------------------------------------
-# Stream merging
-# ---------------------------------------------------------------------------
+    format: HistoricalDataFormat = HistoricalDataFormat.PARQUET
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
-class EventBuffer:
+class LoadedDataBundle:
     """
-    Small in-memory event buffer.
-
-    For MVP and medium-sized backtests this is enough. Later, if needed,
-    this can be replaced by an external k-way merge over file streams.
+    Loaded normalized historical records.
     """
 
-    events: list[HistoricalMarketEvent] = field(default_factory=list)
+    candles: list[HistoricalCandle] = field(default_factory=list)
+    trades: list[HistoricalTrade] = field(default_factory=list)
+    orderbooks: list[HistoricalOrderBookSnapshot] = field(default_factory=list)
+    funding: list[HistoricalFundingRecord] = field(default_factory=list)
+    open_interest: list[HistoricalOpenInterestRecord] = field(default_factory=list)
+    liquidations: list[HistoricalLiquidationRecord] = field(default_factory=list)
 
-    def add(self, new_events: Iterable[HistoricalMarketEvent]) -> None:
-        self.events.extend(new_events)
+    files: list[DataFileRef] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def sort(self) -> None:
-        self.events.sort(
-            key=lambda event: (
-                event.timestamp_ms,
-                event.topic,
-                event.exchange or "",
-                event.symbol or "",
-                event.timeframe or "",
-                event.sequence if event.sequence is not None else 0,
-            )
+    @property
+    def total_records(self) -> int:
+        return (
+            len(self.candles)
+            + len(self.trades)
+            + len(self.orderbooks)
+            + len(self.funding)
+            + len(self.open_interest)
+            + len(self.liquidations)
         )
 
-    def trim(self, max_events: int | None) -> None:
-        if max_events is not None and len(self.events) > max_events:
-            self.events = self.events[:max_events]
+    @property
+    def is_empty(self) -> bool:
+        return self.total_records == 0
+
+    def records_by_type(self) -> dict[BacktestDataType, list[Any]]:
+        return {
+            BacktestDataType.CANDLES: list(self.candles),
+            BacktestDataType.TRADES: list(self.trades),
+            BacktestDataType.ORDERBOOK_SNAPSHOT: list(self.orderbooks),
+            BacktestDataType.FUNDING: list(self.funding),
+            BacktestDataType.OPEN_INTEREST: list(self.open_interest),
+            BacktestDataType.LIQUIDATIONS: list(self.liquidations),
+        }
 
 
-# ---------------------------------------------------------------------------
-# Main loader
-# ---------------------------------------------------------------------------
-
-
-class BacktestDataLoader:
+class DataLoader:
     """
-    Reads local futures historical data and yields HistoricalMarketEvent objects.
+    Local historical data loader.
 
-    Responsibility:
-    - read local files;
-    - validate schema and data quality;
-    - convert rows to HistoricalMarketEvent;
-    - emit no EventBus events;
-    - call no strategy/risk/execution code.
+    Expected default file layout from HistoryDownloader:
 
-    MarketReplay is responsible for publishing these events into EventBus.
+        data/history/
+            binance/
+                usdm_futures/
+                    candles/
+                        BTCUSDT/
+                            1m/
+                                BTCUSDT_1m.parquet
+                    funding/
+                        BTCUSDT/
+                            BTCUSDT.parquet
+                    open_interest/
+                        BTCUSDT/
+                            5m/
+                                BTCUSDT_5m.parquet
     """
 
     def __init__(
         self,
+        config: DataLoaderConfig | None = None,
         *,
-        config: BacktestDataConfig,
-        file_resolver: HistoryFileResolver | None = None,
-        reader: ParquetBacktestDataReader | None = None,
-        validator: BacktestDataValidator | None = None,
-        event_builder: HistoricalEventBuilder | None = None,
+        logger_name: str = "backtesting.data_loader",
     ) -> None:
-        self.config = config
-        self.file_resolver = file_resolver or HistoryFileResolver(config)
-        self.reader = reader or ParquetBacktestDataReader(config)
-        self.validator = validator or BacktestDataValidator(config)
-        self.event_builder = event_builder or HistoricalEventBuilder()
-
-        self.logger = get_logger(__name__)
-        self.quality_reports: list[DataQualityReport] = []
-
-    async def iter_events(self) -> AsyncIterator[HistoricalMarketEvent]:
-        """
-        Yield HistoricalMarketEvent stream in chronological order.
-
-        For now this uses an in-memory buffer. This is simple and reliable for
-        MVP candle/trade-level backtests. Later we can replace it with a true
-        streaming k-way merge if datasets become too large.
-        """
-
+        self.config = config or DataLoaderConfig()
         self.config.validate()
+        self.logger = get_logger(logger_name)
 
-        if _enum_value(self.config.storage_format) != StorageFormat.PARQUET.value:
-            raise BacktestDataSchemaError(
-                "Only Parquet storage is currently supported by BacktestDataLoader",
-                context=build_error_context(
-                    data_path=self.config.data_dir,
-                    storage_format=_enum_value(self.config.storage_format),
-                ),
-            )
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-        buffer = EventBuffer()
-
-        refs = self.file_resolver.resolve()
-
-        if not refs:
-            raise BacktestDataNotFoundError(
-                "No history file references resolved",
-                context=build_error_context(
-                    exchange=_enum_value(self.config.exchange),
-                    market_type=_enum_value(self.config.market_type),
-                    start_time_ms=self.config.start_time_ms,
-                    end_time_ms=self.config.end_time_ms,
-                    data_types=[_enum_value(item) for item in self.config.data_types],
-                ),
-            )
-
-        missing_required_files: list[str] = []
-
-        for ref in refs:
-            try:
-                df = await self.reader.read_file(ref)
-            except BacktestDataNotFoundError:
-                missing_required_files.append(str(ref.path))
-                continue
-
-            if df.empty:
-                self.quality_reports.append(
-                    DataQualityReport(
-                        exchange=ref.exchange,
-                        market_type=ref.market_type,
-                        symbol=ref.symbol,
-                        timeframe=ref.timeframe,
-                        data_type=ref.data_type,
-                        status=DataQualityStatus.EMPTY,
-                        start_time_ms=self.config.start_time_ms,
-                        end_time_ms=self.config.end_time_ms,
-                        rows=0,
-                    )
-                )
-                continue
-
-            report = self.validator.validate_dataframe(ref=ref, df=df)
-            self.quality_reports.append(report)
-
-            df = self._apply_duplicate_policy(ref=ref, df=df)
-
-            events = self.event_builder.build_events_from_dataframe(ref=ref, df=df)
-            buffer.add(events)
-
-        if missing_required_files:
-            self._handle_missing_files(missing_required_files)
-
-        if self.config.sort_events:
-            buffer.sort()
-
-        if self.config.enforce_chronological_order:
-            self._validate_event_chronology(buffer.events)
-
-        buffer.trim(self.config.max_events)
-
-        self.logger.info(
-            "Backtest historical events loaded",
-            extra={
-                "events": len(buffer.events),
-                "exchange": _enum_value(self.config.exchange),
-                "market_type": _enum_value(self.config.market_type),
-                "symbols": self.config.symbols,
-                "data_types": [_enum_value(item) for item in self.config.data_types],
-                "start_time_ms": self.config.start_time_ms,
-                "end_time_ms": self.config.end_time_ms,
-            },
-        )
-
-        for event in buffer.events:
-            yield event
-
-    async def load_all(self) -> list[HistoricalMarketEvent]:
-        """
-        Convenience method for tests and small backtests.
-        """
-
-        return [event async for event in self.iter_events()]
-
-    def get_quality_reports(self) -> list[DataQualityReport]:
-        return list(self.quality_reports)
-
-    def _apply_duplicate_policy(
+    def load_dataset(
         self,
         *,
-        ref: HistoryFileRef,
-        df: pd.DataFrame,
-    ) -> pd.DataFrame:
-        duplicate_policy = _enum_value(self.config.duplicate_policy)
-
-        if duplicate_policy == DuplicateHandlingPolicy.FAIL.value:
-            return df
-
-        if not df.duplicated(subset=["timestamp_ms"]).any():
-            return df
-
-        if duplicate_policy == DuplicateHandlingPolicy.KEEP_FIRST.value:
-            return (
-                df.drop_duplicates(subset=["timestamp_ms"], keep="first")
-                .sort_values("timestamp_ms")
-                .reset_index(drop=True)
-            )
-
-        if duplicate_policy == DuplicateHandlingPolicy.KEEP_LAST.value:
-            return (
-                df.drop_duplicates(subset=["timestamp_ms"], keep="last")
-                .sort_values("timestamp_ms")
-                .reset_index(drop=True)
-            )
-
-        if duplicate_policy == DuplicateHandlingPolicy.MERGE.value:
-            # For now merge means keep last. Advanced merge can be implemented
-            # per data type later.
-            return (
-                df.drop_duplicates(subset=["timestamp_ms"], keep="last")
-                .sort_values("timestamp_ms")
-                .reset_index(drop=True)
-            )
-
-        raise BacktestDataQualityError(
-            "Unsupported duplicate handling policy",
-            context=build_error_context(
-                exchange=ref.exchange,
-                market_type=ref.market_type,
-                symbol=ref.symbol,
-                timeframe=ref.timeframe,
-                data_type=ref.data_type,
-                duplicate_policy=duplicate_policy,
-            ),
-        )
-
-    def _handle_missing_files(self, missing_files: list[str]) -> None:
+        period: BacktestPeriod | None = None,
+        run_id: str | None = None,
+    ) -> BacktestDataset:
         """
-        Missing files are treated depending on gap_policy.
-
-        FAIL -> raise
-        WARN/SKIP/FORWARD_FILL/BACK_FILL -> log and continue
-
-        Actual filling is intentionally not done here. Filling historical market
-        data can introduce bias, so this loader only allows the run to continue.
+        Load configured historical files and build BacktestDataset.
         """
 
-        gap_policy = _enum_value(self.config.gap_policy)
+        bundle = self.load_bundle(period=period)
+        return self.build_dataset(bundle, period=period, run_id=run_id)
 
-        if gap_policy == GapHandlingPolicy.FAIL.value:
-            raise BacktestDataNotFoundError(
-                "Required history files are missing",
-                context=build_error_context(
-                    exchange=_enum_value(self.config.exchange),
-                    market_type=_enum_value(self.config.market_type),
-                    data_path=self.config.data_dir,
-                    missing_files=missing_files[:50],
-                    missing_files_count=len(missing_files),
-                ),
+    def load_bundle(
+        self,
+        *,
+        period: BacktestPeriod | None = None,
+    ) -> LoadedDataBundle:
+        """
+        Load all configured historical files into normalized records.
+        """
+
+        files = self.discover_files()
+
+        if not files:
+            raise DataLoadError(
+                "No historical data files found.",
+                details={
+                    "data_dir": str(self.config.data_dir),
+                    "exchange": self.config.exchange,
+                    "market_type": self.config.market_type,
+                    "symbols": self.config.symbols,
+                    "timeframes": self.config.timeframes,
+                    "data_types": [item.value for item in self.config.data_types],
+                },
             )
 
-        self.logger.warning(
-            "Some history files are missing",
-            extra={
-                "missing_files_count": len(missing_files),
-                "gap_policy": gap_policy,
-                "first_missing_files": missing_files[:10],
+        bundle = LoadedDataBundle(files=files)
+
+        for file_ref in files:
+            try:
+                rows = self.read_rows(file_ref.path, file_ref.format)
+                records = self.normalize_rows(
+                    rows,
+                    data_type=file_ref.data_type,
+                    symbol=file_ref.symbol,
+                    timeframe=file_ref.timeframe,
+                    source_path=file_ref.path,
+                )
+
+                records = self._filter_records_by_period(records, period)
+
+                if file_ref.data_type == BacktestDataType.CANDLES:
+                    bundle.candles.extend(records)
+                elif file_ref.data_type == BacktestDataType.TRADES:
+                    bundle.trades.extend(records)
+                elif file_ref.data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
+                    bundle.orderbooks.extend(records)
+                elif file_ref.data_type == BacktestDataType.FUNDING:
+                    bundle.funding.extend(records)
+                elif file_ref.data_type == BacktestDataType.OPEN_INTEREST:
+                    bundle.open_interest.extend(records)
+                elif file_ref.data_type == BacktestDataType.LIQUIDATIONS:
+                    bundle.liquidations.extend(records)
+
+            except Exception as exc:
+                message = f"Failed to load {file_ref.path}: {exc}"
+
+                if self.config.allow_empty_optional_streams and not self._is_required(file_ref.data_type):
+                    bundle.warnings.append(message)
+                    self.logger.warning(message)
+                    continue
+
+                raise DataLoadError(
+                    "Failed to load historical data file.",
+                    details={
+                        "path": str(file_ref.path),
+                        "data_type": file_ref.data_type.value,
+                        "error": str(exc),
+                        "error_type": exc.__class__.__name__,
+                    },
+                ) from exc
+
+        self.validate_bundle(bundle, period=period)
+        self._sort_bundle(bundle)
+        self._dedupe_bundle(bundle)
+
+        return bundle
+
+    def build_dataset(
+        self,
+        bundle: LoadedDataBundle,
+        *,
+        period: BacktestPeriod | None = None,
+        run_id: str | None = None,
+    ) -> BacktestDataset:
+        """
+        Convert normalized records into BacktestDataset.
+        """
+
+        if bundle.is_empty:
+            raise DataLoadError("Cannot build BacktestDataset from empty LoadedDataBundle.")
+
+        events: list[BacktestEvent] = []
+        sequence = 0
+
+        for data_type, records in bundle.records_by_type().items():
+            for record in records:
+                event = self.build_event_from_record(
+                    record,
+                    data_type=data_type,
+                    period=period,
+                    run_id=run_id,
+                    sequence=sequence,
+                )
+                events.append(event)
+                sequence += 1
+
+        dataset = BacktestDataset(
+            events=events,
+            ordering=ReplayOrdering.TIMESTAMP_THEN_PRIORITY,
+            replay_mode=ReplayMode.FULL_RUN,
+            metadata={
+                "source": "data_loader",
+                "warnings": list(bundle.warnings),
+                "files": [str(file_ref.path) for file_ref in bundle.files],
             },
         )
 
-    def _validate_event_chronology(self, events: list[HistoricalMarketEvent]) -> None:
-        previous_ts: int | None = None
+        dataset.sort_events()
 
-        for event in events:
-            if previous_ts is not None and event.timestamp_ms < previous_ts:
-                raise BacktestDataOrderError(
-                    "Historical events are not sorted chronologically",
-                    context=build_error_context(
-                        exchange=event.exchange,
-                        market_type=event.market_type,
-                        symbol=event.symbol,
-                        timeframe=event.timeframe,
-                        topic=event.topic,
-                        timestamp_ms=event.timestamp_ms,
-                        previous_timestamp_ms=previous_ts,
-                    ),
+        dataset.info = self._build_dataset_info(
+            dataset=dataset,
+            bundle=bundle,
+            period=period,
+        )
+
+        if self.config.max_events is not None:
+            dataset.events = dataset.events[: self.config.max_events]
+            dataset.info.total_events = len(dataset.events)
+
+        return dataset
+
+    def build_event_from_record(
+        self,
+        record: Any,
+        *,
+        data_type: BacktestDataType,
+        period: BacktestPeriod | None = None,
+        run_id: str | None = None,
+        sequence: int | None = None,
+    ) -> BacktestEvent:
+        """
+        Convert one Historical* record into BacktestEvent.
+        """
+
+        if not hasattr(record, "to_market_event_payload"):
+            raise DataNormalizationError(
+                "Historical record does not expose to_market_event_payload().",
+                details={
+                    "record_type": record.__class__.__name__,
+                    "data_type": data_type.value,
+                },
+            )
+
+        event_timestamp_ms = self._record_timestamp_ms(record)
+
+        topic = market_topic_for_data_type(data_type)
+        priority = replay_priority_for_data_type(data_type)
+
+        is_warmup = period.is_warmup(event_timestamp_ms) if period is not None else False
+
+        payload = record.to_market_event_payload()
+
+        return BacktestEvent(
+            run_id=run_id,
+            event_type=BacktestEventType.MARKET,
+            topic=topic,
+            timestamp_ms=event_timestamp_ms,
+            payload=payload,
+            source="data_loader",
+            sequence=sequence,
+            priority=priority,
+            is_warmup=is_warmup,
+            metadata={
+                "data_type": data_type.value,
+                "record_type": record.__class__.__name__,
+                "instrument_key": getattr(record, "instrument_key", None),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # File discovery
+    # ------------------------------------------------------------------
+
+    def discover_files(self) -> list[DataFileRef]:
+        """
+        Discover configured files under data_dir.
+        """
+
+        base_dir = Path(self.config.data_dir)
+        result: list[DataFileRef] = []
+
+        for data_type in self.config.data_types:
+            for symbol in self.config.symbols:
+                if data_type == BacktestDataType.CANDLES:
+                    for timeframe in self.config.timeframes:
+                        result.extend(
+                            self._discover_for(
+                                data_type=data_type,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                            )
+                        )
+                    continue
+
+                if data_type == BacktestDataType.OPEN_INTEREST:
+                    # OI downloader may store period/timeframe subfolders.
+                    found_any = False
+                    for timeframe in self.config.timeframes:
+                        refs = self._discover_for(
+                            data_type=data_type,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                        if refs:
+                            found_any = True
+                            result.extend(refs)
+
+                    refs_no_tf = self._discover_for(
+                        data_type=data_type,
+                        symbol=symbol,
+                        timeframe=None,
+                    )
+                    if refs_no_tf:
+                        found_any = True
+                        result.extend(refs_no_tf)
+
+                    if not found_any and self.config.require_open_interest:
+                        self._raise_missing_file(data_type, symbol)
+                    continue
+
+                result.extend(
+                    self._discover_for(
+                        data_type=data_type,
+                        symbol=symbol,
+                        timeframe=None,
+                    )
                 )
 
-            previous_ts = event.timestamp_ms
+        unique: dict[str, DataFileRef] = {}
+        for item in result:
+            unique[str(item.path)] = item
+
+        return list(unique.values())
+
+    def _discover_for(
+        self,
+        *,
+        data_type: BacktestDataType,
+        symbol: str,
+        timeframe: str | None,
+    ) -> list[DataFileRef]:
+        symbol = symbol.upper()
+        data_type_dir = self._data_type_dir_name(data_type)
+
+        base = (
+            Path(self.config.data_dir)
+            / self.config.exchange
+            / self.config.market_type
+            / data_type_dir
+            / symbol
+        )
+
+        if timeframe:
+            search_dirs = [base / timeframe, base]
+            filename_stems = [
+                f"{symbol}_{timeframe}",
+                symbol,
+            ]
+        else:
+            search_dirs = [base]
+            filename_stems = [symbol]
+
+        refs: list[DataFileRef] = []
+
+        for directory in search_dirs:
+            for stem in filename_stems:
+                for fmt in self._candidate_formats():
+                    path = directory / f"{stem}.{self._format_extension(fmt)}"
+
+                    if path.exists() and path.is_file():
+                        refs.append(
+                            DataFileRef(
+                                path=path,
+                                data_type=data_type,
+                                exchange=self.config.exchange,
+                                market_type=self.config.market_type,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                format=fmt,
+                            )
+                        )
+
+        # Flexible fallback: any matching file in expected folder.
+        if not refs and base.exists():
+            patterns = []
+
+            if timeframe:
+                patterns.extend(
+                    [
+                        f"**/*{symbol}*{timeframe}*",
+                        f"**/{symbol}_{timeframe}*",
+                    ]
+                )
+            else:
+                patterns.append(f"**/*{symbol}*")
+
+            for pattern in patterns:
+                for path in base.glob(pattern):
+                    if not path.is_file():
+                        continue
+
+                    fmt = self._format_from_suffix(path.suffix)
+                    if fmt is None:
+                        continue
+
+                    refs.append(
+                        DataFileRef(
+                            path=path,
+                            data_type=data_type,
+                            exchange=self.config.exchange,
+                            market_type=self.config.market_type,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            format=fmt,
+                        )
+                    )
+
+        if not refs and self._is_required(data_type):
+            self._raise_missing_file(data_type, symbol, timeframe=timeframe)
+
+        return refs
+
+    def _raise_missing_file(
+        self,
+        data_type: BacktestDataType,
+        symbol: str,
+        *,
+        timeframe: str | None = None,
+    ) -> None:
+        raise DataLoadError(
+            "Required historical data file is missing.",
+            details={
+                "data_dir": str(self.config.data_dir),
+                "exchange": self.config.exchange,
+                "market_type": self.config.market_type,
+                "data_type": data_type.value,
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Readers
+    # ------------------------------------------------------------------
+
+    def read_rows(
+        self,
+        path: Path,
+        file_format: HistoricalDataFormat,
+    ) -> list[dict[str, Any]]:
+        """
+        Read rows from local file.
+        """
+
+        if file_format == HistoricalDataFormat.PARQUET:
+            return self._read_parquet(path)
+
+        if file_format == HistoricalDataFormat.CSV:
+            return self._read_csv(path)
+
+        if file_format == HistoricalDataFormat.JSON:
+            return self._read_json(path)
+
+        if file_format == HistoricalDataFormat.JSONL:
+            return self._read_jsonl(path)
+
+        raise HistoricalDataFormatError(
+            "Unsupported historical data input format.",
+            details={
+                "path": str(path),
+                "format": file_format.value,
+            },
+        )
+
+    @staticmethod
+    def _read_parquet(path: Path) -> list[dict[str, Any]]:
+        try:
+            import pandas as pd
+        except Exception as exc:
+            raise HistoricalDataFormatError(
+                "Reading parquet requires pandas and a parquet engine.",
+                details={"path": str(path)},
+            ) from exc
+
+        try:
+            dataframe = pd.read_parquet(path)
+            return dataframe.to_dict(orient="records")
+        except Exception as exc:
+            raise DataLoadError(
+                "Failed to read parquet file.",
+                details={
+                    "path": str(path),
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            ) from exc
+
+    @staticmethod
+    def _read_csv(path: Path) -> list[dict[str, Any]]:
+        try:
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                return list(csv.DictReader(handle))
+        except Exception as exc:
+            raise DataLoadError(
+                "Failed to read CSV file.",
+                details={
+                    "path": str(path),
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            ) from exc
+
+    @staticmethod
+    def _read_json(path: Path) -> list[dict[str, Any]]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+            if isinstance(payload, list):
+                return [dict(item) for item in payload]
+
+            if isinstance(payload, dict):
+                for key in ("data", "rows", "items", "result", "records"):
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        return [dict(item) for item in value]
+
+                return [payload]
+
+            raise DataLoadError(
+                "JSON historical file must contain list or dict.",
+                details={"path": str(path)},
+            )
+
+        except DataLoadError:
+            raise
+        except Exception as exc:
+            raise DataLoadError(
+                "Failed to read JSON file.",
+                details={
+                    "path": str(path),
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            ) from exc
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rows.append(json.loads(line))
+
+            return rows
+
+        except Exception as exc:
+            raise DataLoadError(
+                "Failed to read JSONL file.",
+                details={
+                    "path": str(path),
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
+            ) from exc
+
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
+
+    def normalize_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        data_type: BacktestDataType,
+        symbol: str,
+        timeframe: str | None,
+        source_path: Path,
+    ) -> list[Any]:
+        """
+        Normalize raw rows into Historical* records.
+        """
+
+        normalized: list[Any] = []
+
+        for row in rows:
+            try:
+                if data_type == BacktestDataType.CANDLES:
+                    normalized.append(
+                        self._normalize_candle(row, symbol=symbol, timeframe=timeframe or self.config.timeframes[0])
+                    )
+                elif data_type == BacktestDataType.TRADES:
+                    normalized.append(self._normalize_trade(row, symbol=symbol))
+                elif data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
+                    normalized.append(self._normalize_orderbook(row, symbol=symbol))
+                elif data_type == BacktestDataType.FUNDING:
+                    normalized.append(self._normalize_funding(row, symbol=symbol))
+                elif data_type == BacktestDataType.OPEN_INTEREST:
+                    normalized.append(self._normalize_open_interest(row, symbol=symbol))
+                elif data_type == BacktestDataType.LIQUIDATIONS:
+                    normalized.append(self._normalize_liquidation(row, symbol=symbol))
+                else:
+                    continue
+
+            except Exception as exc:
+                if self.config.validation_level == DataValidationLevel.STRICT:
+                    raise DataNormalizationError(
+                        "Failed to normalize historical row.",
+                        details={
+                            "source_path": str(source_path),
+                            "data_type": data_type.value,
+                            "symbol": symbol,
+                            "row": row,
+                            "error": str(exc),
+                            "error_type": exc.__class__.__name__,
+                        },
+                    ) from exc
+
+                self.logger.warning(
+                    "Skipping invalid historical row from %s: %s",
+                    source_path,
+                    exc,
+                )
+
+        return normalized
+
+    def _normalize_candle(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+        timeframe: str,
+    ) -> HistoricalCandle:
+        open_time_ms = self._int_from_keys(row, ["open_time_ms", "openTime", "open_time", "t", "timestamp"])
+        close_time_ms = self._int_from_keys(
+            row,
+            ["close_time_ms", "closeTime", "close_time", "T"],
+            default=open_time_ms,
+        )
+
+        return HistoricalCandle(
+            exchange=str(row.get("exchange") or self.config.exchange),
+            symbol=str(row.get("symbol") or symbol).upper(),
+            market_type=str(row.get("market_type") or self.config.market_type),
+            timeframe=str(row.get("timeframe") or timeframe),
+            timestamp_ms=self._int_from_keys(row, ["timestamp_ms", "timestamp", "close_time_ms"], default=close_time_ms),
+            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=close_time_ms),
+            open_time_ms=open_time_ms,
+            close_time_ms=close_time_ms,
+            open=self._float_from_keys(row, ["open", "o"]),
+            high=self._float_from_keys(row, ["high", "h"]),
+            low=self._float_from_keys(row, ["low", "l"]),
+            close=self._float_from_keys(row, ["close", "c"]),
+            volume=self._float_from_keys(row, ["volume", "v"], default=0.0),
+            quote_volume=self._float_from_keys(row, ["quote_volume", "quoteVolume", "q"], default=0.0),
+            trades_count=self._int_from_keys(row, ["trades_count", "numberOfTrades", "n"], default=0),
+            is_closed=self._bool_from_keys(row, ["is_closed", "x"], default=True),
+            source="data_loader",
+            metadata=self._metadata(row),
+        )
+
+    def _normalize_trade(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> HistoricalTrade:
+        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "T"])
+
+        buyer_maker = self._optional_bool_from_keys(row, ["buyer_maker", "m"])
+        aggressor_side = self._optional_str_from_keys(row, ["aggressor_side"])
+
+        if aggressor_side is None and buyer_maker is not None:
+            aggressor_side = "sell" if buyer_maker else "buy"
+
+        return HistoricalTrade(
+            exchange=str(row.get("exchange") or self.config.exchange),
+            symbol=str(row.get("symbol") or symbol).upper(),
+            market_type=str(row.get("market_type") or self.config.market_type),
+            timestamp_ms=timestamp,
+            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            trade_id=row.get("trade_id", row.get("id", row.get("a"))),
+            price=self._float_from_keys(row, ["price", "p"]),
+            quantity=self._float_from_keys(row, ["quantity", "qty", "q"]),
+            side=self._optional_str_from_keys(row, ["side"]),
+            aggressor_side=aggressor_side,
+            buyer_maker=buyer_maker,
+            source="data_loader",
+            metadata=self._metadata(row),
+        )
+
+    def _normalize_orderbook(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> HistoricalOrderBookSnapshot:
+        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "lastUpdateTime"])
+
+        bids_raw = row.get("bids") or []
+        asks_raw = row.get("asks") or []
+
+        if isinstance(bids_raw, str):
+            bids_raw = json.loads(bids_raw)
+
+        if isinstance(asks_raw, str):
+            asks_raw = json.loads(asks_raw)
+
+        bids = [
+            HistoricalOrderBookLevel(
+                price=float(level[0] if isinstance(level, (list, tuple)) else level["price"]),
+                quantity=float(level[1] if isinstance(level, (list, tuple)) else level["quantity"]),
+            )
+            for level in bids_raw
+        ]
+        asks = [
+            HistoricalOrderBookLevel(
+                price=float(level[0] if isinstance(level, (list, tuple)) else level["price"]),
+                quantity=float(level[1] if isinstance(level, (list, tuple)) else level["quantity"]),
+            )
+            for level in asks_raw
+        ]
+
+        return HistoricalOrderBookSnapshot(
+            exchange=str(row.get("exchange") or self.config.exchange),
+            symbol=str(row.get("symbol") or symbol).upper(),
+            market_type=str(row.get("market_type") or self.config.market_type),
+            timestamp_ms=timestamp,
+            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            bids=bids,
+            asks=asks,
+            sequence=self._optional_int_from_keys(row, ["sequence", "lastUpdateId", "u"]),
+            depth=self._int_from_keys(row, ["depth"], default=max(len(bids), len(asks))),
+            source="data_loader",
+            metadata=self._metadata(row),
+        )
+
+    def _normalize_funding(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> HistoricalFundingRecord:
+        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "fundingTime", "funding_time", "time"])
+
+        return HistoricalFundingRecord(
+            exchange=str(row.get("exchange") or self.config.exchange),
+            symbol=str(row.get("symbol") or symbol).upper(),
+            market_type=str(row.get("market_type") or self.config.market_type),
+            timestamp_ms=timestamp,
+            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            funding_rate=self._float_from_keys(row, ["funding_rate", "fundingRate", "rate"], default=0.0),
+            predicted_rate=self._optional_float_from_keys(row, ["predicted_rate", "predictedRate"]),
+            mark_price=self._optional_float_from_keys(row, ["mark_price", "markPrice"]),
+            index_price=self._optional_float_from_keys(row, ["index_price", "indexPrice"]),
+            next_funding_time_ms=self._optional_int_from_keys(row, ["next_funding_time_ms", "nextFundingTime"]),
+            source="data_loader",
+            metadata=self._metadata(row),
+        )
+
+    def _normalize_open_interest(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> HistoricalOpenInterestRecord:
+        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "sumOpenInterestTime"])
+
+        return HistoricalOpenInterestRecord(
+            exchange=str(row.get("exchange") or self.config.exchange),
+            symbol=str(row.get("symbol") or symbol).upper(),
+            market_type=str(row.get("market_type") or self.config.market_type),
+            timestamp_ms=timestamp,
+            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            open_interest=self._float_from_keys(
+                row,
+                ["open_interest", "openInterest", "sumOpenInterest"],
+                default=0.0,
+            ),
+            open_interest_value=self._optional_float_from_keys(
+                row,
+                ["open_interest_value", "openInterestValue", "sumOpenInterestValue"],
+            ),
+            mark_price=self._optional_float_from_keys(row, ["mark_price", "markPrice"]),
+            source="data_loader",
+            metadata=self._metadata(row),
+        )
+
+    def _normalize_liquidation(
+        self,
+        row: dict[str, Any],
+        *,
+        symbol: str,
+    ) -> HistoricalLiquidationRecord:
+        timestamp = self._int_from_keys(row, ["timestamp_ms", "timestamp", "time", "updateTime", "T"])
+        price = self._float_from_keys(row, ["price", "p", "avgPrice", "ap"])
+        quantity = self._float_from_keys(row, ["quantity", "qty", "q", "origQty"])
+        side = str(row.get("side") or row.get("S") or "").lower()
+
+        return HistoricalLiquidationRecord(
+            exchange=str(row.get("exchange") or self.config.exchange),
+            symbol=str(row.get("symbol") or symbol).upper(),
+            market_type=str(row.get("market_type") or self.config.market_type),
+            timestamp_ms=timestamp,
+            received_at_ms=self._int_from_keys(row, ["received_at_ms", "timestamp_ms"], default=timestamp),
+            liquidation_id=row.get("liquidation_id", row.get("orderId", row.get("id"))),
+            side=side,
+            price=price,
+            quantity=quantity,
+            notional=self._float_from_keys(row, ["notional"], default=price * quantity),
+            source="data_loader",
+            metadata=self._metadata(row),
+        )
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate_bundle(
+        self,
+        bundle: LoadedDataBundle,
+        *,
+        period: BacktestPeriod | None = None,
+    ) -> None:
+        """
+        Validate loaded data bundle.
+        """
+
+        if bundle.is_empty:
+            raise DataValidationError("Loaded data bundle is empty.")
+
+        if self.config.require_candles and not bundle.candles:
+            raise DataValidationError("Required candle data is missing.")
+
+        if self.config.require_trades and not bundle.trades:
+            raise DataValidationError("Required trade data is missing.")
+
+        if self.config.require_orderbook and not bundle.orderbooks:
+            raise DataValidationError("Required orderbook data is missing.")
+
+        if self.config.require_funding and not bundle.funding:
+            raise DataValidationError("Required funding data is missing.")
+
+        if self.config.require_open_interest and not bundle.open_interest:
+            raise DataValidationError("Required open interest data is missing.")
+
+        if self.config.validation_level in {DataValidationLevel.BASIC, DataValidationLevel.STRICT}:
+            self._validate_record_ordering(bundle)
+            self._validate_gaps(bundle)
+
+        if self.config.validation_level == DataValidationLevel.STRICT:
+            self._validate_symbols_and_timeframes(bundle)
+
+    def _validate_record_ordering(self, bundle: LoadedDataBundle) -> None:
+        for data_type, records in bundle.records_by_type().items():
+            timestamps = [self._record_timestamp_ms(record) for record in records]
+            if timestamps != sorted(timestamps):
+                raise DataValidationError(
+                    "Historical records are not sorted by timestamp.",
+                    details={"data_type": data_type.value},
+                )
+
+    def _validate_gaps(self, bundle: LoadedDataBundle) -> None:
+        if not bundle.candles:
+            return
+
+        grouped: dict[tuple[str, str, str, str], list[HistoricalCandle]] = {}
+
+        for candle in bundle.candles:
+            key = (candle.exchange, candle.market_type, candle.symbol, candle.timeframe)
+            grouped.setdefault(key, []).append(candle)
+
+        for key, candles in grouped.items():
+            candles = sorted(candles, key=lambda item: item.open_time_ms)
+            expected_gap_ms = self._timeframe_to_milliseconds(key[3])
+            max_allowed_gap_ms = max(
+                expected_gap_ms,
+                self.config.max_allowed_gap_seconds * 1000,
+            )
+
+            for previous, current in zip(candles, candles[1:]):
+                gap_ms = current.open_time_ms - previous.open_time_ms
+
+                if gap_ms <= max_allowed_gap_ms:
+                    continue
+
+                message = (
+                    f"Candle gap detected for {key}: "
+                    f"{gap_ms / 1000:.0f}s gap between "
+                    f"{previous.open_time_ms} and {current.open_time_ms}"
+                )
+
+                if self._is_gap_error_policy(self.config.gap_policy):
+                    raise DataGapError(
+                        message,
+                        details={
+                            "key": key,
+                            "gap_ms": gap_ms,
+                            "max_allowed_gap_ms": max_allowed_gap_ms,
+                        },
+                    )
+
+                if self.config.gap_policy == DataGapPolicy.WARN:
+                    bundle.warnings.append(message)
+                    self.logger.warning(message)
+
+                if self.config.gap_policy == DataGapPolicy.WARN:
+                    bundle.warnings.append(message)
+                    self.logger.warning(message)
+
+    def _validate_symbols_and_timeframes(self, bundle: LoadedDataBundle) -> None:
+        allowed_symbols = {symbol.upper() for symbol in self.config.symbols}
+        allowed_timeframes = set(self.config.timeframes)
+
+        for data_type, records in bundle.records_by_type().items():
+            for record in records:
+                symbol = getattr(record, "symbol", None)
+                if symbol and symbol.upper() not in allowed_symbols:
+                    raise DataValidationError(
+                        "Record symbol is outside configured symbols.",
+                        details={
+                            "data_type": data_type.value,
+                            "symbol": symbol,
+                            "allowed_symbols": sorted(allowed_symbols),
+                        },
+                    )
+
+                timeframe = getattr(record, "timeframe", None)
+                if timeframe and data_type == BacktestDataType.CANDLES:
+                    if timeframe not in allowed_timeframes:
+                        raise DataValidationError(
+                            "Candle timeframe is outside configured timeframes.",
+                            details={
+                                "timeframe": timeframe,
+                                "allowed_timeframes": sorted(allowed_timeframes),
+                            },
+                        )
+
+    # ------------------------------------------------------------------
+    # Dataset info
+    # ------------------------------------------------------------------
+
+    def _build_dataset_info(
+        self,
+        *,
+        dataset: BacktestDataset,
+        bundle: LoadedDataBundle,
+        period: BacktestPeriod | None,
+    ) -> BacktestDatasetInfo:
+        instruments = [
+            BacktestInstrument(
+                exchange=self.config.exchange,
+                symbol=symbol,
+                market_type=self.config.market_type,
+            )
+            for symbol in self.config.symbols
+        ]
+
+        data_sources = [
+            BacktestDataSource(
+                data_type=file_ref.data_type,
+                format=file_ref.format,
+                path=str(file_ref.path),
+                exchange=file_ref.exchange,
+                symbol=file_ref.symbol,
+                market_type=file_ref.market_type,
+                timeframe=file_ref.timeframe,
+                metadata={
+                    **dict(file_ref.metadata),
+                    "source_id": str(index),
+                    "name": file_ref.path.name,
+                },
+            )
+            for index, file_ref in enumerate(bundle.files)
+        ]
 
 
-# ---------------------------------------------------------------------------
-# Convenience API
-# ---------------------------------------------------------------------------
+        first_event_time = dataset.events[0].event_time if dataset.events else None
+        last_event_time = dataset.events[-1].event_time if dataset.events else None
+
+        if period is None and first_event_time is not None and last_event_time is not None:
+            period = BacktestPeriod(
+                start=first_event_time,
+                end=last_event_time,
+            )
+
+        return BacktestDatasetInfo(
+            period=period,
+            instruments=instruments,
+            data_sources=data_sources,
+            data_types=set(self.config.data_types),
+            total_events=len(dataset.events),
+            first_event_time=first_event_time,
+            last_event_time=last_event_time,
+            metadata={
+                "loader": "DataLoader",
+                "total_records": bundle.total_records,
+                "warnings": list(bundle.warnings),
+                "records": {
+                    "candles": len(bundle.candles),
+                    "trades": len(bundle.trades),
+                    "orderbooks": len(bundle.orderbooks),
+                    "funding": len(bundle.funding),
+                    "open_interest": len(bundle.open_interest),
+                    "liquidations": len(bundle.liquidations),
+                },
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Sorting / dedupe / filtering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sort_bundle(bundle: LoadedDataBundle) -> None:
+        bundle.candles.sort(key=lambda item: item.open_time_ms)
+        bundle.trades.sort(key=lambda item: item.timestamp_ms)
+        bundle.orderbooks.sort(key=lambda item: item.timestamp_ms)
+        bundle.funding.sort(key=lambda item: item.timestamp_ms)
+        bundle.open_interest.sort(key=lambda item: item.timestamp_ms)
+        bundle.liquidations.sort(key=lambda item: item.timestamp_ms)
+
+    def _dedupe_bundle(self, bundle: LoadedDataBundle) -> None:
+        if self.config.drop_duplicate_events:
+            bundle.candles = self._dedupe(
+                bundle.candles,
+                key=lambda item: (
+                    item.exchange,
+                    item.market_type,
+                    item.symbol,
+                    item.timeframe,
+                    item.open_time_ms,
+                ),
+            )
+            bundle.trades = self._dedupe(
+                bundle.trades,
+                key=lambda item: (
+                    item.exchange,
+                    item.market_type,
+                    item.symbol,
+                    item.trade_id or item.timestamp_ms,
+                ),
+            )
+            bundle.orderbooks = self._dedupe(
+                bundle.orderbooks,
+                key=lambda item: (
+                    item.exchange,
+                    item.market_type,
+                    item.symbol,
+                    item.timestamp_ms,
+                    item.sequence,
+                ),
+            )
+            bundle.funding = self._dedupe(
+                bundle.funding,
+                key=lambda item: (
+                    item.exchange,
+                    item.market_type,
+                    item.symbol,
+                    item.timestamp_ms,
+                ),
+            )
+            bundle.open_interest = self._dedupe(
+                bundle.open_interest,
+                key=lambda item: (
+                    item.exchange,
+                    item.market_type,
+                    item.symbol,
+                    item.timestamp_ms,
+                ),
+            )
+            bundle.liquidations = self._dedupe(
+                bundle.liquidations,
+                key=lambda item: (
+                    item.exchange,
+                    item.market_type,
+                    item.symbol,
+                    item.liquidation_id or item.timestamp_ms,
+                ),
+            )
+
+    @staticmethod
+    def _is_gap_error_policy(policy: DataGapPolicy) -> bool:
+        return str(getattr(policy, "value", policy)).lower() in {
+            "error",
+            "raise",
+            "strict",
+        }
+    @staticmethod
+    def _dedupe(records: Iterable[Any], *, key: Any) -> list[Any]:
+        seen: set[Any] = set()
+        result: list[Any] = []
+
+        for record in records:
+            value = key(record)
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(record)
+
+        return result
+
+    @staticmethod
+    def _filter_records_by_period(
+        records: list[Any],
+        period: BacktestPeriod | None,
+    ) -> list[Any]:
+        if period is None:
+            return records
+
+        start_ms = period.warmup_start_ms
+        end_ms = period.end_ms
+
+        return [
+            record
+            for record in records
+            if start_ms <= DataLoader._record_timestamp_ms(record) <= end_ms
+        ]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _is_required(self, data_type: BacktestDataType) -> bool:
+        if data_type == BacktestDataType.CANDLES:
+            return self.config.require_candles
+        if data_type == BacktestDataType.TRADES:
+            return self.config.require_trades
+        if data_type in {BacktestDataType.ORDERBOOK, BacktestDataType.ORDERBOOK_SNAPSHOT}:
+            return self.config.require_orderbook
+        if data_type == BacktestDataType.FUNDING:
+            return self.config.require_funding
+        if data_type == BacktestDataType.OPEN_INTEREST:
+            return self.config.require_open_interest
+        return False
+
+    @staticmethod
+    def _data_type_dir_name(data_type: BacktestDataType) -> str:
+        if data_type == BacktestDataType.ORDERBOOK_SNAPSHOT:
+            return "orderbook_snapshot"
+        return data_type.value
+
+    def _candidate_formats(self) -> list[HistoricalDataFormat]:
+        if self.config.input_format:
+            # Prefer configured format, then try common fallbacks.
+            formats = [
+                self.config.input_format,
+                HistoricalDataFormat.PARQUET,
+                HistoricalDataFormat.CSV,
+                HistoricalDataFormat.JSONL,
+                HistoricalDataFormat.JSON,
+            ]
+        else:
+            formats = [
+                HistoricalDataFormat.PARQUET,
+                HistoricalDataFormat.CSV,
+                HistoricalDataFormat.JSONL,
+                HistoricalDataFormat.JSON,
+            ]
+
+        unique: list[HistoricalDataFormat] = []
+        for item in formats:
+            if item not in unique:
+                unique.append(item)
+
+        return unique
+
+    @staticmethod
+    def _format_extension(value: HistoricalDataFormat) -> str:
+        if value == HistoricalDataFormat.PARQUET:
+            return "parquet"
+        if value == HistoricalDataFormat.CSV:
+            return "csv"
+        if value == HistoricalDataFormat.JSONL:
+            return "jsonl"
+        if value == HistoricalDataFormat.JSON:
+            return "json"
+
+        raise HistoricalDataFormatError(
+            "Unsupported historical data format.",
+            details={"format": value.value},
+        )
+
+    @staticmethod
+    def _format_from_suffix(suffix: str) -> HistoricalDataFormat | None:
+        value = suffix.lower().lstrip(".")
+
+        if value == "parquet":
+            return HistoricalDataFormat.PARQUET
+        if value == "csv":
+            return HistoricalDataFormat.CSV
+        if value == "jsonl":
+            return HistoricalDataFormat.JSONL
+        if value == "json":
+            return HistoricalDataFormat.JSON
+
+        return None
+
+    @staticmethod
+    def _record_timestamp_ms(record: Any) -> int:
+        for attr in ("timestamp_ms", "close_time_ms", "open_time_ms"):
+            value = getattr(record, attr, None)
+            if value is not None:
+                return int(value)
+
+        raise DataNormalizationError(
+            "Historical record has no timestamp.",
+            details={"record_type": record.__class__.__name__},
+        )
+
+    @staticmethod
+    def _float_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+        *,
+        default: float | None = None,
+    ) -> float:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and value != "":
+                return float(value)
+
+        if default is not None:
+            return default
+
+        raise DataNormalizationError(
+            "Missing required float field.",
+            details={"keys": list(keys), "row": row},
+        )
+
+    @staticmethod
+    def _optional_float_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+    ) -> float | None:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and value != "":
+                return float(value)
+        return None
+
+    @staticmethod
+    def _int_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+        *,
+        default: int | None = None,
+    ) -> int:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and value != "":
+                return int(float(value))
+
+        if default is not None:
+            return default
+
+        raise DataNormalizationError(
+            "Missing required int field.",
+            details={"keys": list(keys), "row": row},
+        )
+
+    @staticmethod
+    def _optional_int_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+    ) -> int | None:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and value != "":
+                return int(float(value))
+        return None
+
+    @staticmethod
+    def _bool_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+        *,
+        default: bool,
+    ) -> bool:
+        value = None
+
+        for key in keys:
+            if key in row:
+                value = row.get(key)
+                break
+
+        if value is None:
+            return default
+
+        if isinstance(value, bool):
+            return value
+
+        if isinstance(value, int | float):
+            return bool(value)
+
+        text = str(value).strip().lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+
+        return default
+
+    @staticmethod
+    def _optional_bool_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+    ) -> bool | None:
+        for key in keys:
+            value = row.get(key)
+            if value is None or value == "":
+                continue
+
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, int | float):
+                return bool(value)
+
+            text = str(value).strip().lower()
+            if text in {"true", "1", "yes", "y"}:
+                return True
+            if text in {"false", "0", "no", "n"}:
+                return False
+
+        return None
+
+    @staticmethod
+    def _optional_str_from_keys(
+        row: dict[str, Any],
+        keys: Sequence[str],
+    ) -> str | None:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and value != "":
+                return str(value)
+        return None
+
+    @staticmethod
+    def _metadata(row: dict[str, Any]) -> dict[str, Any]:
+        metadata = row.get("metadata")
+
+        if isinstance(metadata, dict):
+            return dict(metadata)
+
+        if isinstance(metadata, str) and metadata:
+            try:
+                value = json.loads(metadata)
+                if isinstance(value, dict):
+                    return value
+            except Exception:
+                return {"raw_metadata": metadata}
+
+        return {}
+
+    @staticmethod
+    def _timeframe_to_milliseconds(timeframe: str) -> int:
+        value = timeframe.strip().lower()
+
+        units = {
+            "m": 60_000,
+            "h": 60 * 60_000,
+            "d": 24 * 60 * 60_000,
+            "w": 7 * 24 * 60 * 60_000,
+        }
+
+        if len(value) < 2:
+            raise DataValidationError(
+                "Invalid timeframe.",
+                details={"timeframe": timeframe},
+            )
+
+        amount = int(value[:-1])
+        unit = value[-1]
+
+        if unit not in units:
+            raise DataValidationError(
+                "Unsupported timeframe unit.",
+                details={"timeframe": timeframe},
+            )
+
+        return amount * units[unit]
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "data_dir": str(self.config.data_dir),
+            "input_format": self.config.input_format.value,
+            "exchange": self.config.exchange,
+            "market_type": self.config.market_type,
+            "symbols": list(self.config.symbols),
+            "timeframes": list(self.config.timeframes),
+            "data_types": [item.value for item in self.config.data_types],
+            "validation_level": self.config.validation_level.value,
+            "gap_policy": self.config.gap_policy.value,
+        }
 
 
-async def iter_backtest_events(
-    config: BacktestDataConfig,
-) -> AsyncIterator[HistoricalMarketEvent]:
+# =============================================================================
+# Convenience helpers
+# =============================================================================
+
+
+def load_backtest_dataset(
+    config: DataLoaderConfig,
+    *,
+    period: BacktestPeriod | None = None,
+    run_id: str | None = None,
+) -> BacktestDataset:
     """
-    Convenience async generator for tests/CLI.
+    Convenience helper for loading a BacktestDataset.
     """
 
-    loader = BacktestDataLoader(config=config)
-
-    async for event in loader.iter_events():
-        yield event
+    loader = DataLoader(config)
+    return loader.load_dataset(period=period, run_id=run_id)
 
 
-async def load_backtest_events(config: BacktestDataConfig) -> list[HistoricalMarketEvent]:
+def load_backtest_bundle(
+    config: DataLoaderConfig,
+    *,
+    period: BacktestPeriod | None = None,
+) -> LoadedDataBundle:
     """
-    Convenience function for small datasets.
+    Convenience helper for loading normalized historical records.
     """
 
-    loader = BacktestDataLoader(config=config)
-    return await loader.load_all()
+    loader = DataLoader(config)
+    return loader.load_bundle(period=period)
+
+
+__all__ = [
+    "DataFileRef",
+    "LoadedDataBundle",
+    "DataLoader",
+    "load_backtest_dataset",
+    "load_backtest_bundle",
+]

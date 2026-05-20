@@ -1,631 +1,716 @@
-# trading_system/backtesting/config.py
+"""
+Backtesting configuration models.
+
+This module defines typed dataclass configs for the offline backtesting package:
+history download, data loading, market replay, cost simulation, simulated
+execution, simulated positions, metrics, reports, walk-forward and optimization.
+
+Important architectural rule:
+backtesting config does not replace production strategy/risk/execution configs.
+It only aggregates them or stores backtesting-specific simulation settings.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .enums import (
+from backtesting.enums import (
+    BacktestDataType,
     BacktestMode,
-    DrawdownMode,
-    DuplicateHandlingPolicy,
-    EquityCurveMode,
-    ExchangeName,
-    ExecutionSimulationMode,
-    FeeModelType,
-    GapHandlingPolicy,
-    HistoryDataType,
-    HistorySourceType,
-    LatencyModelType,
-    MarketType,
-    OptimizationMode,
-    OptimizationObjective,
-    OrderSimulationType,
+    CandleExecutionPath,
+    CommissionModel,
+    DataAlignmentPolicy,
+    DataGapPolicy,
+    DataValidationLevel,
+    EquityUpdateMode,
+    FillModel,
+    FundingSimulationMode,
+    HistoricalDataFormat,
+    LatencyModel,
+    LiquidityModel,
+    OptimizationDirection,
+    OptimizationMethod,
+    OptimizationMetric,
+    OverfittingCheckMode,
+    PnLAccountingMode,
+    PositionAccountingMode,
     ReplayMode,
+    ReplayOrdering,
+    ReplaySpeed,
     ReportFormat,
-    SlippageModelType,
-    StorageFormat,
-    WalkForwardWindowMode,
+    ReportSection,
+    SlippageModel,
+    WalkForwardMode,
+    WarmupPolicy,
 )
-from .exceptions import BacktestConfigError, build_error_context
+from backtesting.exceptions import BacktestConfigurationError
+from backtesting.models import BacktestInstrument, BacktestPeriod, ensure_aware_utc
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Helpers
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 
-def _ensure_positive_int(value: int, field_name: str) -> None:
-    if value <= 0:
-        raise BacktestConfigError(
-            f"{field_name} must be positive",
-            context=build_error_context(**{field_name: value}),
+def _ensure_positive(
+    value: int | float,
+    name: str,
+    *,
+    allow_zero: bool = False,
+) -> None:
+    if allow_zero:
+        valid = value >= 0
+    else:
+        valid = value > 0
+
+    if not valid:
+        raise BacktestConfigurationError(
+            f"{name} must be {'non-negative' if allow_zero else 'positive'}.",
+            details={name: value},
         )
 
 
-def _ensure_non_negative_float(value: float, field_name: str) -> None:
-    if value < 0:
-        raise BacktestConfigError(
-            f"{field_name} must be non-negative",
-            context=build_error_context(**{field_name: value}),
+def _ensure_between(
+    value: int | float,
+    name: str,
+    minimum: int | float,
+    maximum: int | float,
+) -> None:
+    if not minimum <= value <= maximum:
+        raise BacktestConfigurationError(
+            f"{name} must be between {minimum} and {maximum}.",
+            details={
+                name: value,
+                "minimum": minimum,
+                "maximum": maximum,
+            },
         )
 
 
-def _ensure_time_range(start_time_ms: int, end_time_ms: int) -> None:
-    if start_time_ms <= 0:
-        raise BacktestConfigError(
-            "start_time_ms must be positive",
-            context=build_error_context(start_time_ms=start_time_ms),
-        )
-
-    if end_time_ms <= 0:
-        raise BacktestConfigError(
-            "end_time_ms must be positive",
-            context=build_error_context(end_time_ms=end_time_ms),
-        )
-
-    if start_time_ms >= end_time_ms:
-        raise BacktestConfigError(
-            "start_time_ms must be lower than end_time_ms",
-            context=build_error_context(
-                start_time_ms=start_time_ms,
-                end_time_ms=end_time_ms,
-            ),
-        )
+def _ensure_dir_path(value: str | Path, name: str) -> Path:
+    path = Path(value).expanduser()
+    if not str(path):
+        raise BacktestConfigurationError(f"{name} cannot be empty.")
+    return path
 
 
-def _ensure_non_empty_list(values: list[Any], field_name: str) -> None:
-    if not values:
-        raise BacktestConfigError(
-            f"{field_name} must not be empty",
-            context=build_error_context(**{field_name: values}),
-        )
+def _normalize_symbols(symbols: list[str]) -> list[str]:
+    normalized = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+    if not normalized:
+        raise BacktestConfigurationError("At least one symbol is required.")
+    return list(dict.fromkeys(normalized))
 
 
-def _as_value(value: Any) -> Any:
-    return value.value if hasattr(value, "value") else value
+def _normalize_timeframes(timeframes: list[str]) -> list[str]:
+    normalized = [timeframe.strip() for timeframe in timeframes if timeframe.strip()]
+    if not normalized:
+        raise BacktestConfigurationError("At least one timeframe is required.")
+    return list(dict.fromkeys(normalized))
 
 
-# ---------------------------------------------------------------------------
-# History download config
-# ---------------------------------------------------------------------------
+# ============================================================================
+# History downloader
+# ============================================================================
 
 
 @dataclass(slots=True)
-class HistoryDownloadConfig:
+class HistoryDownloaderConfig:
     """
-    Configuration for downloading futures/perpetual historical data
-    directly from exchanges/providers and writing it to local storage.
+    Configuration for history_downloader.py.
 
-    This config is used by history_downloader.py.
+    Downloader is allowed to call exchange REST APIs to fetch historical data.
+    During actual replay, live exchange calls must not be used.
     """
 
-    exchange: ExchangeName | str = ExchangeName.BINANCE
-    market_type: MarketType | str = MarketType.USDM_FUTURES
+    enabled: bool = False
 
-    symbols: list[str] = field(default_factory=lambda: ["BTCUSDT"])
+    exchange: str = "binance"
+    market_type: str = "usdm_futures"
+    symbols: list[str] = field(default_factory=list)
     timeframes: list[str] = field(default_factory=lambda: ["1m"])
 
-    start_time_ms: int = 0
-    end_time_ms: int = 0
-
-    data_types: list[HistoryDataType | str] = field(
-        default_factory=lambda: [
-            HistoryDataType.CANDLES,
-            HistoryDataType.FUNDING,
-            HistoryDataType.OPEN_INTEREST,
-        ]
+    data_types: set[BacktestDataType] = field(
+        default_factory=lambda: {
+            BacktestDataType.CANDLES,
+            BacktestDataType.FUNDING,
+            BacktestDataType.OPEN_INTEREST,
+        }
     )
 
-    source_type: HistorySourceType | str = HistorySourceType.EXCHANGE_REST
-    storage_format: StorageFormat | str = StorageFormat.PARQUET
-
-    output_dir: str = "data/history"
+    output_dir: str | Path = "data/history"
+    output_format: HistoricalDataFormat = HistoricalDataFormat.PARQUET
 
     overwrite_existing: bool = False
     skip_existing: bool = True
     validate_after_download: bool = True
 
-    request_timeout_sec: float = 15.0
+    request_limit: int = 1000
     max_retries: int = 5
-    retry_delay_sec: float = 1.0
-    rate_limit_delay_sec: float = 0.25
+    retry_delay_seconds: float = 1.0
+    request_timeout_seconds: float = 30.0
+    rate_limit_sleep_seconds: float = 0.25
 
-    max_rows_per_request: int = 1000
-    max_concurrent_symbols: int = 1
+    candle_limit_per_request: int = 1000
+    trade_limit_per_request: int = 1000
+    funding_limit_per_request: int = 1000
+    open_interest_limit_per_request: int = 500
 
-    user_agent: str = "trading-system-backtesting"
-    extra_headers: dict[str, str] = field(default_factory=dict)
-
-    provider_api_key_env: str | None = None
+    include_mark_price: bool = True
+    include_index_price: bool = True
+    include_liquidations: bool = False
+    include_orderbook_snapshots: bool = False
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_non_empty_list(self.symbols, "symbols")
-        _ensure_non_empty_list(self.data_types, "data_types")
-        _ensure_time_range(self.start_time_ms, self.end_time_ms)
+        self.exchange = self.exchange.lower()
+        self.market_type = self.market_type.lower()
+        self.output_dir = _ensure_dir_path(self.output_dir, "HistoryDownloaderConfig.output_dir")
 
-        if HistoryDataType.CANDLES in self.data_types or "candles" in self.data_types:
-            _ensure_non_empty_list(self.timeframes, "timeframes")
+        if self.enabled:
+            self.symbols = _normalize_symbols(self.symbols)
+            self.timeframes = _normalize_timeframes(self.timeframes)
 
-        _ensure_non_negative_float(self.request_timeout_sec, "request_timeout_sec")
-        _ensure_positive_int(self.max_retries, "max_retries")
-        _ensure_non_negative_float(self.retry_delay_sec, "retry_delay_sec")
-        _ensure_non_negative_float(self.rate_limit_delay_sec, "rate_limit_delay_sec")
-        _ensure_positive_int(self.max_rows_per_request, "max_rows_per_request")
-        _ensure_positive_int(self.max_concurrent_symbols, "max_concurrent_symbols")
+        if not self.data_types:
+            raise BacktestConfigurationError("HistoryDownloaderConfig.data_types cannot be empty.")
 
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "exchange": _as_value(self.exchange),
-            "market_type": _as_value(self.market_type),
-            "symbols": list(self.symbols),
-            "timeframes": list(self.timeframes),
-            "start_time_ms": self.start_time_ms,
-            "end_time_ms": self.end_time_ms,
-            "data_types": [_as_value(item) for item in self.data_types],
-            "source_type": _as_value(self.source_type),
-            "storage_format": _as_value(self.storage_format),
-            "output_dir": self.output_dir,
-            "overwrite_existing": self.overwrite_existing,
-            "skip_existing": self.skip_existing,
-            "validate_after_download": self.validate_after_download,
-            "request_timeout_sec": self.request_timeout_sec,
-            "max_retries": self.max_retries,
-            "retry_delay_sec": self.retry_delay_sec,
-            "rate_limit_delay_sec": self.rate_limit_delay_sec,
-            "max_rows_per_request": self.max_rows_per_request,
-            "max_concurrent_symbols": self.max_concurrent_symbols,
-            "user_agent": self.user_agent,
-            "provider_api_key_env": self.provider_api_key_env,
-            "metadata": dict(self.metadata),
-        }
+        _ensure_positive(self.request_limit, "HistoryDownloaderConfig.request_limit")
+        _ensure_positive(self.max_retries, "HistoryDownloaderConfig.max_retries", allow_zero=True)
+        _ensure_positive(
+            self.retry_delay_seconds,
+            "HistoryDownloaderConfig.retry_delay_seconds",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.request_timeout_seconds,
+            "HistoryDownloaderConfig.request_timeout_seconds",
+        )
+        _ensure_positive(
+            self.rate_limit_sleep_seconds,
+            "HistoryDownloaderConfig.rate_limit_sleep_seconds",
+            allow_zero=True,
+        )
 
 
-# ---------------------------------------------------------------------------
-# Data loading config
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Data loader
+# ============================================================================
 
 
 @dataclass(slots=True)
-class BacktestDataConfig:
+class DataLoaderConfig:
     """
-    Configuration for reading local historical data and building
-    HistoricalMarketEvent stream.
-
-    This config is used by data_loader.py.
+    Configuration for data_loader.py.
     """
 
-    data_dir: str = "data/history"
+    data_dir: str | Path = "data/history"
+    input_format: HistoricalDataFormat = HistoricalDataFormat.PARQUET
 
-    exchange: ExchangeName | str = ExchangeName.BINANCE
-    market_type: MarketType | str = MarketType.USDM_FUTURES
-
-    symbols: list[str] = field(default_factory=lambda: ["BTCUSDT"])
+    exchange: str = "binance"
+    market_type: str = "usdm_futures"
+    symbols: list[str] = field(default_factory=list)
     timeframes: list[str] = field(default_factory=lambda: ["1m"])
 
-    start_time_ms: int = 0
-    end_time_ms: int = 0
-
-    data_types: list[HistoryDataType | str] = field(
-        default_factory=lambda: [
-            HistoryDataType.CANDLES,
-            HistoryDataType.FUNDING,
-            HistoryDataType.OPEN_INTEREST,
-        ]
+    data_types: set[BacktestDataType] = field(
+        default_factory=lambda: {
+            BacktestDataType.CANDLES,
+            BacktestDataType.FUNDING,
+            BacktestDataType.OPEN_INTEREST,
+        }
     )
 
-    storage_format: StorageFormat | str = StorageFormat.PARQUET
+    validation_level: DataValidationLevel = DataValidationLevel.BASIC
+    gap_policy: DataGapPolicy = DataGapPolicy.WARN
+    alignment_policy: DataAlignmentPolicy = DataAlignmentPolicy.EVENT_TIME
 
-    preload_into_memory: bool = False
+    require_candles: bool = True
+    require_trades: bool = False
+    require_orderbook: bool = False
+    require_funding: bool = False
+    require_open_interest: bool = False
+
+    allow_empty_optional_streams: bool = True
+    drop_duplicate_events: bool = True
     sort_events: bool = True
-    enforce_chronological_order: bool = True
 
-    validate_schema: bool = True
-    validate_quality: bool = True
-
-    gap_policy: GapHandlingPolicy | str = GapHandlingPolicy.WARN
-    duplicate_policy: DuplicateHandlingPolicy | str = DuplicateHandlingPolicy.KEEP_LAST
-
+    max_allowed_gap_seconds: int = 60 * 60
     max_events: int | None = None
-    batch_size: int = 10_000
+
+    preload_into_memory: bool = True
+    chunk_size: int = 100_000
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_non_empty_list(self.symbols, "symbols")
-        _ensure_non_empty_list(self.data_types, "data_types")
-        _ensure_time_range(self.start_time_ms, self.end_time_ms)
-        _ensure_positive_int(self.batch_size, "batch_size")
+        self.exchange = self.exchange.lower()
+        self.market_type = self.market_type.lower()
+        self.data_dir = _ensure_dir_path(self.data_dir, "DataLoaderConfig.data_dir")
+        self.symbols = _normalize_symbols(self.symbols)
+        self.timeframes = _normalize_timeframes(self.timeframes)
+
+        if not self.data_types:
+            raise BacktestConfigurationError("DataLoaderConfig.data_types cannot be empty.")
+
+        _ensure_positive(
+            self.max_allowed_gap_seconds,
+            "DataLoaderConfig.max_allowed_gap_seconds",
+            allow_zero=True,
+        )
+        _ensure_positive(self.chunk_size, "DataLoaderConfig.chunk_size")
 
         if self.max_events is not None:
-            _ensure_positive_int(self.max_events, "max_events")
-
-        if HistoryDataType.CANDLES in self.data_types or "candles" in self.data_types:
-            _ensure_non_empty_list(self.timeframes, "timeframes")
-
-        if not Path(self.data_dir).exists:
-            raise BacktestConfigError(
-                "data_dir does not exist",
-                context=build_error_context(data_path=self.data_dir),
-            )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "data_dir": self.data_dir,
-            "exchange": _as_value(self.exchange),
-            "market_type": _as_value(self.market_type),
-            "symbols": list(self.symbols),
-            "timeframes": list(self.timeframes),
-            "start_time_ms": self.start_time_ms,
-            "end_time_ms": self.end_time_ms,
-            "data_types": [_as_value(item) for item in self.data_types],
-            "storage_format": _as_value(self.storage_format),
-            "preload_into_memory": self.preload_into_memory,
-            "sort_events": self.sort_events,
-            "enforce_chronological_order": self.enforce_chronological_order,
-            "validate_schema": self.validate_schema,
-            "validate_quality": self.validate_quality,
-            "gap_policy": _as_value(self.gap_policy),
-            "duplicate_policy": _as_value(self.duplicate_policy),
-            "max_events": self.max_events,
-            "batch_size": self.batch_size,
-            "metadata": dict(self.metadata),
-        }
+            _ensure_positive(self.max_events, "DataLoaderConfig.max_events")
 
 
-# ---------------------------------------------------------------------------
-# Replay config
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Market replay
+# ============================================================================
 
 
 @dataclass(slots=True)
-class BacktestReplayConfig:
+class MarketReplayConfig:
     """
-    Configuration for BacktestMarketReplay.
+    Configuration for market_replay.py.
     """
 
-    mode: ReplayMode | str = ReplayMode.FAST
+    replay_mode: ReplayMode = ReplayMode.FULL_RUN
+    replay_speed: ReplaySpeed = ReplaySpeed.MAX_SPEED
+    ordering: ReplayOrdering = ReplayOrdering.TIMESTAMP_THEN_PRIORITY
 
-    emit_system_events: bool = True
-    emit_progress_events: bool = True
-    progress_interval_events: int = 10_000
-    progress_interval_ms: int | None = None
+    warmup_policy: WarmupPolicy = WarmupPolicy.REPLAY_WITH_TRADING_DISABLED
+    emit_warmup_events: bool = True
+    mark_warmup_payloads: bool = True
 
-    enforce_chronological_order: bool = True
-    allow_same_timestamp_reordering: bool = True
+    batch_events_by_timestamp: bool = True
+    max_batch_size: int = 10_000
+    yield_every_events: int = 50_000
 
-    stop_on_event_error: bool = True
-    continue_on_missing_optional_data: bool = True
+    deterministic_replay: bool = True
+    fail_on_emit_error: bool = True
+    continue_on_invalid_event: bool = False
 
-    real_time_speed_multiplier: float = 1.0
-    step_wait_for_ack: bool = False
+    emit_market_candles: bool = True
+    emit_market_trades: bool = True
+    emit_market_orderbook: bool = True
+    emit_market_funding: bool = True
+    emit_market_open_interest: bool = True
+    emit_market_liquidations: bool = True
+
+    market_candle_topic: str = "market.candle"
+    market_trade_topic: str = "market.trade"
+    market_orderbook_topic: str = "market.orderbook"
+    market_funding_topic: str = "market.funding"
+    market_open_interest_topic: str = "market.open_interest"
+    market_liquidation_topic: str = "market.liquidation"
+
+    emit_replay_lifecycle_events: bool = True
+    replay_started_topic: str = "system.backtest.replay.started"
+    replay_finished_topic: str = "system.backtest.replay.finished"
+    replay_failed_topic: str = "system.backtest.replay.failed"
+    replay_progress_topic: str = "system.backtest.replay.progress"
+
+    progress_interval_events: int = 100_000
+    progress_interval_seconds: float = 5.0
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_positive_int(self.progress_interval_events, "progress_interval_events")
+        _ensure_positive(self.max_batch_size, "MarketReplayConfig.max_batch_size")
+        _ensure_positive(
+            self.yield_every_events,
+            "MarketReplayConfig.yield_every_events",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.progress_interval_events,
+            "MarketReplayConfig.progress_interval_events",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.progress_interval_seconds,
+            "MarketReplayConfig.progress_interval_seconds",
+            allow_zero=True,
+        )
 
-        if self.progress_interval_ms is not None:
-            _ensure_positive_int(self.progress_interval_ms, "progress_interval_ms")
-
-        if self.real_time_speed_multiplier <= 0:
-            raise BacktestConfigError(
-                "real_time_speed_multiplier must be positive",
-                context=build_error_context(
-                    real_time_speed_multiplier=self.real_time_speed_multiplier
-                ),
-            )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "mode": _as_value(self.mode),
-            "emit_system_events": self.emit_system_events,
-            "emit_progress_events": self.emit_progress_events,
-            "progress_interval_events": self.progress_interval_events,
-            "progress_interval_ms": self.progress_interval_ms,
-            "enforce_chronological_order": self.enforce_chronological_order,
-            "allow_same_timestamp_reordering": self.allow_same_timestamp_reordering,
-            "stop_on_event_error": self.stop_on_event_error,
-            "continue_on_missing_optional_data": self.continue_on_missing_optional_data,
-            "real_time_speed_multiplier": self.real_time_speed_multiplier,
-            "step_wait_for_ack": self.step_wait_for_ack,
-            "metadata": dict(self.metadata),
+        required_topics = {
+            "market_candle_topic": self.market_candle_topic,
+            "market_trade_topic": self.market_trade_topic,
+            "market_orderbook_topic": self.market_orderbook_topic,
+            "market_funding_topic": self.market_funding_topic,
+            "market_open_interest_topic": self.market_open_interest_topic,
+            "market_liquidation_topic": self.market_liquidation_topic,
         }
 
+        for name, topic in required_topics.items():
+            if not topic:
+                raise BacktestConfigurationError(f"MarketReplayConfig.{name} cannot be empty.")
 
-# ---------------------------------------------------------------------------
-# Cost / execution config
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# Cost models
+# ============================================================================
 
 
 @dataclass(slots=True)
-class BacktestCostConfig:
+class CostModelConfig:
     """
-    Fee, slippage and latency model configuration.
-
-    This config is used by cost_models.py and execution_simulator.py.
+    Configuration for cost_models.py.
     """
 
-    fee_model: FeeModelType | str = FeeModelType.BINANCE_FUTURES
-    slippage_model: SlippageModelType | str = SlippageModelType.FIXED_BPS
-    latency_model: LatencyModelType | str = LatencyModelType.NONE
+    commission_model: CommissionModel = CommissionModel.MAKER_TAKER
+    slippage_model: SlippageModel = SlippageModel.FIXED_BPS
+    funding_mode: FundingSimulationMode = FundingSimulationMode.APPLY_ON_FUNDING_TIMESTAMP
 
-    maker_fee_rate: float = 0.0002
-    taker_fee_rate: float = 0.0004
+    maker_fee_bps: float = 2.0
+    taker_fee_bps: float = 4.0
+    default_fee_bps: float = 4.0
+    fixed_fee: float = 0.0
 
-    fixed_slippage_ticks: float = 0.0
-    fixed_slippage_bps: float = 1.0
-    percent_slippage: float = 0.0
+    fixed_slippage_bps: float = 2.0
+    fixed_slippage_price: float = 0.0
+    spread_slippage_fraction: float = 0.5
+    volatility_slippage_multiplier: float = 0.1
+    volume_slippage_multiplier: float = 1.0
+    adverse_selection_bps: float = 0.0
 
-    volatility_slippage_multiplier: float = 1.0
+    include_commissions: bool = True
+    include_slippage: bool = True
+    include_spread_cost: bool = True
+    include_funding: bool = True
+    include_liquidation_penalty: bool = True
+
+    funding_interval_hours: int = 8
+    fallback_funding_rate: float = 0.0
+
+    liquidation_penalty_bps: float = 0.0
+
+    quote_currency: str = "USDT"
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        _ensure_positive(self.maker_fee_bps, "CostModelConfig.maker_fee_bps", allow_zero=True)
+        _ensure_positive(self.taker_fee_bps, "CostModelConfig.taker_fee_bps", allow_zero=True)
+        _ensure_positive(self.default_fee_bps, "CostModelConfig.default_fee_bps", allow_zero=True)
+        _ensure_positive(self.fixed_fee, "CostModelConfig.fixed_fee", allow_zero=True)
+
+        _ensure_positive(
+            self.fixed_slippage_bps,
+            "CostModelConfig.fixed_slippage_bps",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.fixed_slippage_price,
+            "CostModelConfig.fixed_slippage_price",
+            allow_zero=True,
+        )
+        _ensure_between(
+            self.spread_slippage_fraction,
+            "CostModelConfig.spread_slippage_fraction",
+            0.0,
+            10.0,
+        )
+        _ensure_positive(
+            self.volatility_slippage_multiplier,
+            "CostModelConfig.volatility_slippage_multiplier",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.volume_slippage_multiplier,
+            "CostModelConfig.volume_slippage_multiplier",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.adverse_selection_bps,
+            "CostModelConfig.adverse_selection_bps",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.funding_interval_hours,
+            "CostModelConfig.funding_interval_hours",
+        )
+        _ensure_positive(
+            self.liquidation_penalty_bps,
+            "CostModelConfig.liquidation_penalty_bps",
+            allow_zero=True,
+        )
+
+        if not self.quote_currency:
+            raise BacktestConfigurationError("CostModelConfig.quote_currency cannot be empty.")
+
+
+# ============================================================================
+# Execution simulator
+# ============================================================================
+
+
+@dataclass(slots=True)
+class ExecutionSimulatorConfig:
+    """
+    Configuration for execution_simulator.py.
+
+    This simulator replaces live exchange execution during backtests.
+    It must only execute risk-confirmed signals or explicit risk close/reduce
+    requests.
+    """
+
+    enabled: bool = True
+
+    exchange: str = "binance"
+    market_type: str = "usdm_futures"
+
+    fill_model: FillModel = FillModel.NEXT_CANDLE_OPEN
+    candle_execution_path: CandleExecutionPath = CandleExecutionPath.CONSERVATIVE
+    liquidity_model: LiquidityModel = LiquidityModel.CANDLE_VOLUME_PERCENT
+    latency_model: LatencyModel = LatencyModel.NONE
+
+    allow_market_orders: bool = True
+    allow_limit_orders: bool = True
+    allow_stop_orders: bool = True
+    allow_reduce_only: bool = True
+    allow_partial_fills: bool = True
+    allow_order_rejections: bool = True
+
+    max_volume_participation_pct: float = 10.0
+    min_fill_ratio: float = 0.05
+    partial_fill_probability: float = 0.0
 
     fixed_latency_ms: int = 0
     random_latency_min_ms: int = 0
     random_latency_max_ms: int = 0
 
-    fee_asset: str = "USDT"
+    reject_if_no_price: bool = True
+    reject_if_no_liquidity: bool = True
+    reject_if_price_outside_candle: bool = True
+
+    market_order_topic: str = "execution.order_submitted"
+    order_rejected_topic: str = "execution.order_rejected"
+    order_failed_topic: str = "execution.order_failed"
+    order_cancelled_topic: str = "execution.order_cancelled"
+    order_filled_topic: str = "execution.order_filled"
+    order_partially_filled_topic: str = "execution.order_partially_filled"
+
+    listen_signal_confirmed: bool = True
+    signal_confirmed_topic: str = "signal.confirmed"
+    position_close_requested_topic: str = "risk.position_close_requested"
+    position_reduce_requested_topic: str = "risk.position_reduce_requested"
+    kill_switch_topic: str = "risk.kill_switch"
+
+    emit_execution_events: bool = True
+    record_orders: bool = True
+    record_fills: bool = True
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_non_negative_float(self.maker_fee_rate, "maker_fee_rate")
-        _ensure_non_negative_float(self.taker_fee_rate, "taker_fee_rate")
-        _ensure_non_negative_float(self.fixed_slippage_ticks, "fixed_slippage_ticks")
-        _ensure_non_negative_float(self.fixed_slippage_bps, "fixed_slippage_bps")
-        _ensure_non_negative_float(self.percent_slippage, "percent_slippage")
-        _ensure_non_negative_float(
-            self.volatility_slippage_multiplier,
-            "volatility_slippage_multiplier",
+        self.exchange = self.exchange.lower()
+        self.market_type = self.market_type.lower()
+
+        _ensure_between(
+            self.max_volume_participation_pct,
+            "ExecutionSimulatorConfig.max_volume_participation_pct",
+            0.0,
+            100.0,
+        )
+        _ensure_between(
+            self.min_fill_ratio,
+            "ExecutionSimulatorConfig.min_fill_ratio",
+            0.0,
+            1.0,
+        )
+        _ensure_between(
+            self.partial_fill_probability,
+            "ExecutionSimulatorConfig.partial_fill_probability",
+            0.0,
+            1.0,
+        )
+        _ensure_positive(
+            self.fixed_latency_ms,
+            "ExecutionSimulatorConfig.fixed_latency_ms",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.random_latency_min_ms,
+            "ExecutionSimulatorConfig.random_latency_min_ms",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.random_latency_max_ms,
+            "ExecutionSimulatorConfig.random_latency_max_ms",
+            allow_zero=True,
         )
 
-        if self.fixed_latency_ms < 0:
-            raise BacktestConfigError(
-                "fixed_latency_ms must be non-negative",
-                context=build_error_context(fixed_latency_ms=self.fixed_latency_ms),
+        if self.random_latency_max_ms < self.random_latency_min_ms:
+            raise BacktestConfigurationError(
+                "ExecutionSimulatorConfig.random_latency_max_ms cannot be less than random_latency_min_ms.",
+                details={
+                    "random_latency_min_ms": self.random_latency_min_ms,
+                    "random_latency_max_ms": self.random_latency_max_ms,
+                },
             )
 
-        if self.random_latency_min_ms < 0 or self.random_latency_max_ms < 0:
-            raise BacktestConfigError(
-                "random latency bounds must be non-negative",
-                context=build_error_context(
-                    random_latency_min_ms=self.random_latency_min_ms,
-                    random_latency_max_ms=self.random_latency_max_ms,
-                ),
+        if not self.allow_market_orders and not self.allow_limit_orders and not self.allow_stop_orders:
+            raise BacktestConfigurationError(
+                "At least one simulated order type must be allowed."
             )
 
-        if self.random_latency_min_ms > self.random_latency_max_ms:
-            raise BacktestConfigError(
-                "random_latency_min_ms cannot be greater than random_latency_max_ms",
-                context=build_error_context(
-                    random_latency_min_ms=self.random_latency_min_ms,
-                    random_latency_max_ms=self.random_latency_max_ms,
-                ),
-            )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "fee_model": _as_value(self.fee_model),
-            "slippage_model": _as_value(self.slippage_model),
-            "latency_model": _as_value(self.latency_model),
-            "maker_fee_rate": self.maker_fee_rate,
-            "taker_fee_rate": self.taker_fee_rate,
-            "fixed_slippage_ticks": self.fixed_slippage_ticks,
-            "fixed_slippage_bps": self.fixed_slippage_bps,
-            "percent_slippage": self.percent_slippage,
-            "volatility_slippage_multiplier": self.volatility_slippage_multiplier,
-            "fixed_latency_ms": self.fixed_latency_ms,
-            "random_latency_min_ms": self.random_latency_min_ms,
-            "random_latency_max_ms": self.random_latency_max_ms,
-            "fee_asset": self.fee_asset,
-            "metadata": dict(self.metadata),
-        }
+# ============================================================================
+# Position simulator
+# ============================================================================
 
 
 @dataclass(slots=True)
-class BacktestExecutionConfig:
+class PositionSimulatorConfig:
     """
-    Configuration for simulated execution and position handling.
+    Configuration for position_simulator.py.
     """
 
-    simulation_mode: ExecutionSimulationMode | str = ExecutionSimulationMode.REALISTIC
-    order_simulation_type: OrderSimulationType | str = OrderSimulationType.NEXT_TICK
+    enabled: bool = True
 
     initial_balance: float = 10_000.0
-    quote_asset: str = "USDT"
+    quote_currency: str = "USDT"
 
-    leverage: float = 3.0
+    position_accounting_mode: PositionAccountingMode = PositionAccountingMode.NETTING
+    pnl_accounting_mode: PnLAccountingMode = PnLAccountingMode.REALIZED_AND_UNREALIZED
+    equity_update_mode: EquityUpdateMode = EquityUpdateMode.ON_CANDLE_CLOSE
+
+    default_leverage: float = 1.0
     max_leverage: float = 20.0
-
-    allow_short: bool = True
-    allow_long: bool = True
-
-    allow_position_increase: bool = True
-    allow_position_reduce: bool = True
-    allow_multiple_positions_per_symbol: bool = False
-
-    default_order_quantity: float | None = None
-    default_order_notional: float | None = None
-
-    min_notional: float = 5.0
-    quantity_precision: int = 3
-    price_precision: int = 2
-
-    simulate_partial_fills: bool = False
-    max_fill_ratio_per_event: float = 1.0
-
-    reject_on_insufficient_margin: bool = True
-    reject_on_missing_price: bool = True
-
-    close_positions_on_backtest_end: bool = True
-
     maintenance_margin_rate: float = 0.005
-    liquidation_fee_rate: float = 0.002
+    liquidation_buffer_bps: float = 10.0
 
-    cost: BacktestCostConfig = field(default_factory=BacktestCostConfig)
+    allow_hedge_positions: bool = False
+    allow_position_reversal: bool = True
+    close_opposite_position_on_reverse: bool = True
+
+    enable_mark_to_market: bool = True
+    enable_stop_loss: bool = True
+    enable_take_profit: bool = True
+    enable_trailing_stop: bool = True
+    enable_liquidation_check: bool = True
+    enable_funding_application: bool = True
+
+    mark_price_source: str = "candle_close"
+    equity_update_interval_seconds: int = 60
+
+    listen_order_filled: bool = True
+    listen_order_partially_filled: bool = True
+    listen_position_close_requested: bool = True
+    listen_position_reduce_requested: bool = True
+
+    order_filled_topic: str = "execution.order_filled"
+    order_partially_filled_topic: str = "execution.order_partially_filled"
+    position_opened_topic: str = "position.opened"
+    position_updated_topic: str = "position.updated"
+    position_closed_topic: str = "position.closed"
+    position_liquidated_topic: str = "position.liquidated"
+
+    emit_position_events: bool = True
+    record_positions: bool = True
+    record_trades: bool = True
+    record_equity_curve: bool = True
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_non_negative_float(self.initial_balance, "initial_balance")
-        _ensure_non_negative_float(self.leverage, "leverage")
-        _ensure_non_negative_float(self.max_leverage, "max_leverage")
-        _ensure_non_negative_float(self.min_notional, "min_notional")
-        _ensure_non_negative_float(
+        _ensure_positive(self.initial_balance, "PositionSimulatorConfig.initial_balance")
+        _ensure_positive(self.default_leverage, "PositionSimulatorConfig.default_leverage")
+        _ensure_positive(self.max_leverage, "PositionSimulatorConfig.max_leverage")
+
+        if self.default_leverage > self.max_leverage:
+            raise BacktestConfigurationError(
+                "PositionSimulatorConfig.default_leverage cannot be greater than max_leverage.",
+                details={
+                    "default_leverage": self.default_leverage,
+                    "max_leverage": self.max_leverage,
+                },
+            )
+
+        _ensure_between(
             self.maintenance_margin_rate,
-            "maintenance_margin_rate",
+            "PositionSimulatorConfig.maintenance_margin_rate",
+            0.0,
+            1.0,
         )
-        _ensure_non_negative_float(self.liquidation_fee_rate, "liquidation_fee_rate")
+        _ensure_positive(
+            self.liquidation_buffer_bps,
+            "PositionSimulatorConfig.liquidation_buffer_bps",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.equity_update_interval_seconds,
+            "PositionSimulatorConfig.equity_update_interval_seconds",
+        )
 
-        if self.initial_balance <= 0:
-            raise BacktestConfigError(
-                "initial_balance must be greater than zero",
-                context=build_error_context(initial_balance=self.initial_balance),
-            )
-
-        if self.leverage <= 0:
-            raise BacktestConfigError(
-                "leverage must be greater than zero",
-                context=build_error_context(leverage=self.leverage),
-            )
-
-        if self.leverage > self.max_leverage:
-            raise BacktestConfigError(
-                "leverage cannot be greater than max_leverage",
-                context=build_error_context(
-                    leverage=self.leverage,
-                    max_leverage=self.max_leverage,
-                ),
-            )
-
-        if not self.allow_long and not self.allow_short:
-            raise BacktestConfigError(
-                "At least one of allow_long or allow_short must be enabled"
-            )
-
-        if self.default_order_quantity is not None:
-            _ensure_non_negative_float(
-                self.default_order_quantity,
-                "default_order_quantity",
-            )
-
-        if self.default_order_notional is not None:
-            _ensure_non_negative_float(
-                self.default_order_notional,
-                "default_order_notional",
-            )
-
-        if not 0 < self.max_fill_ratio_per_event <= 1:
-            raise BacktestConfigError(
-                "max_fill_ratio_per_event must be between 0 and 1",
-                context=build_error_context(
-                    max_fill_ratio_per_event=self.max_fill_ratio_per_event
-                ),
-            )
-
-        if self.quantity_precision < 0 or self.price_precision < 0:
-            raise BacktestConfigError(
-                "quantity_precision and price_precision must be non-negative",
-                context=build_error_context(
-                    quantity_precision=self.quantity_precision,
-                    price_precision=self.price_precision,
-                ),
-            )
-
-        self.cost.validate()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "simulation_mode": _as_value(self.simulation_mode),
-            "order_simulation_type": _as_value(self.order_simulation_type),
-            "initial_balance": self.initial_balance,
-            "quote_asset": self.quote_asset,
-            "leverage": self.leverage,
-            "max_leverage": self.max_leverage,
-            "allow_short": self.allow_short,
-            "allow_long": self.allow_long,
-            "allow_position_increase": self.allow_position_increase,
-            "allow_position_reduce": self.allow_position_reduce,
-            "allow_multiple_positions_per_symbol": self.allow_multiple_positions_per_symbol,
-            "default_order_quantity": self.default_order_quantity,
-            "default_order_notional": self.default_order_notional,
-            "min_notional": self.min_notional,
-            "quantity_precision": self.quantity_precision,
-            "price_precision": self.price_precision,
-            "simulate_partial_fills": self.simulate_partial_fills,
-            "max_fill_ratio_per_event": self.max_fill_ratio_per_event,
-            "reject_on_insufficient_margin": self.reject_on_insufficient_margin,
-            "reject_on_missing_price": self.reject_on_missing_price,
-            "close_positions_on_backtest_end": self.close_positions_on_backtest_end,
-            "maintenance_margin_rate": self.maintenance_margin_rate,
-            "liquidation_fee_rate": self.liquidation_fee_rate,
-            "cost": self.cost.to_dict(),
-            "metadata": dict(self.metadata),
-        }
+        if not self.quote_currency:
+            raise BacktestConfigurationError("PositionSimulatorConfig.quote_currency cannot be empty.")
 
 
-# ---------------------------------------------------------------------------
-# Metrics / analytics / report config
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Performance metrics
+# ============================================================================
 
 
 @dataclass(slots=True)
-class BacktestMetricsConfig:
+class PerformanceMetricsConfig:
     """
     Configuration for performance_metrics.py.
     """
 
     enabled: bool = True
 
-    equity_curve_mode: EquityCurveMode | str = EquityCurveMode.ON_POSITION_UPDATE
-    drawdown_mode: DrawdownMode | str = DrawdownMode.EQUITY_BASED
+    risk_free_rate: float = 0.0
+    annualization_periods: int = 365
+    trading_days_per_year: int = 365
 
-    calculate_sharpe: bool = True
-    calculate_sortino: bool = True
-    calculate_calmar: bool = True
-    calculate_expectancy: bool = True
+    calculate_trade_stats: bool = True
+    calculate_drawdowns: bool = True
+    calculate_ratios: bool = True
+    calculate_strategy_breakdown: bool = True
+    calculate_symbol_breakdown: bool = True
+    calculate_timeframe_breakdown: bool = True
+    calculate_regime_breakdown: bool = True
+    calculate_cost_breakdown: bool = True
+    calculate_execution_stats: bool = True
+    calculate_risk_stats: bool = True
 
-    risk_free_rate_annual: float = 0.0
-    periods_per_year: int = 365
+    min_trades_for_ratios: int = 5
+    max_drawdown_periods: int = 100
 
-    track_symbol_stats: bool = True
-    track_strategy_stats: bool = True
-    track_long_short_stats: bool = True
-
-    emit_metrics_events: bool = True
-    metrics_update_interval_events: int = 10_000
+    use_log_returns: bool = False
+    include_open_positions_in_equity: bool = True
+    include_unrealized_pnl: bool = True
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_positive_int(self.periods_per_year, "periods_per_year")
-        _ensure_positive_int(
-            self.metrics_update_interval_events,
-            "metrics_update_interval_events",
+        _ensure_positive(
+            self.annualization_periods,
+            "PerformanceMetricsConfig.annualization_periods",
+        )
+        _ensure_positive(
+            self.trading_days_per_year,
+            "PerformanceMetricsConfig.trading_days_per_year",
+        )
+        _ensure_positive(
+            self.min_trades_for_ratios,
+            "PerformanceMetricsConfig.min_trades_for_ratios",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.max_drawdown_periods,
+            "PerformanceMetricsConfig.max_drawdown_periods",
+            allow_zero=True,
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "equity_curve_mode": _as_value(self.equity_curve_mode),
-            "drawdown_mode": _as_value(self.drawdown_mode),
-            "calculate_sharpe": self.calculate_sharpe,
-            "calculate_sortino": self.calculate_sortino,
-            "calculate_calmar": self.calculate_calmar,
-            "calculate_expectancy": self.calculate_expectancy,
-            "risk_free_rate_annual": self.risk_free_rate_annual,
-            "periods_per_year": self.periods_per_year,
-            "track_symbol_stats": self.track_symbol_stats,
-            "track_strategy_stats": self.track_strategy_stats,
-            "track_long_short_stats": self.track_long_short_stats,
-            "emit_metrics_events": self.emit_metrics_events,
-            "metrics_update_interval_events": self.metrics_update_interval_events,
-            "metadata": dict(self.metadata),
-        }
+
+# ============================================================================
+# Model analytics
+# ============================================================================
 
 
 @dataclass(slots=True)
@@ -636,143 +721,196 @@ class ModelAnalyticsConfig:
 
     enabled: bool = True
 
-    track_signal_quality: bool = True
-    track_confidence_calibration: bool = True
-    track_regime_performance: bool = True
-    track_symbol_performance: bool = True
-    track_timeframe_performance: bool = True
-    track_strategy_performance: bool = True
+    analyze_signal_quality: bool = True
+    analyze_strategy_attribution: bool = True
+    analyze_regime_performance: bool = True
+    analyze_feature_importance: bool = True
+    analyze_risk_decisions: bool = True
+    analyze_execution_quality: bool = True
 
-    track_mfe_mae: bool = True
-    track_signal_decay: bool = False
-    track_llm_decisions: bool = True
+    min_signals_for_strategy_stats: int = 10
+    min_trades_for_strategy_stats: int = 5
+    min_trades_for_regime_stats: int = 5
 
-    confidence_buckets: list[tuple[float, float]] = field(
-        default_factory=lambda: [
-            (0.0, 0.2),
-            (0.2, 0.4),
-            (0.4, 0.6),
-            (0.6, 0.8),
-            (0.8, 1.0),
-        ]
-    )
-
-    signal_decay_horizons_ms: list[int] = field(
-        default_factory=lambda: [
-            60_000,
-            3 * 60_000,
-            5 * 60_000,
-            15 * 60_000,
-            30 * 60_000,
-        ]
-    )
-
-    min_predictions_for_calibration: int = 30
-
-    emit_model_analytics_events: bool = True
+    include_blocked_signals: bool = True
+    include_rejected_orders: bool = True
+    include_open_trades: bool = False
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if self.min_predictions_for_calibration < 1:
-            raise BacktestConfigError(
-                "min_predictions_for_calibration must be positive",
-                context=build_error_context(
-                    min_predictions_for_calibration=self.min_predictions_for_calibration
-                ),
-            )
+        _ensure_positive(
+            self.min_signals_for_strategy_stats,
+            "ModelAnalyticsConfig.min_signals_for_strategy_stats",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.min_trades_for_strategy_stats,
+            "ModelAnalyticsConfig.min_trades_for_strategy_stats",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.min_trades_for_regime_stats,
+            "ModelAnalyticsConfig.min_trades_for_regime_stats",
+            allow_zero=True,
+        )
 
-        for start, end in self.confidence_buckets:
-            if start < 0 or end > 1 or start >= end:
-                raise BacktestConfigError(
-                    "Invalid confidence bucket",
-                    context=build_error_context(
-                        confidence_bucket_start=start,
-                        confidence_bucket_end=end,
-                    ),
-                )
 
-        for horizon in self.signal_decay_horizons_ms:
-            _ensure_positive_int(horizon, "signal_decay_horizon_ms")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "track_signal_quality": self.track_signal_quality,
-            "track_confidence_calibration": self.track_confidence_calibration,
-            "track_regime_performance": self.track_regime_performance,
-            "track_symbol_performance": self.track_symbol_performance,
-            "track_timeframe_performance": self.track_timeframe_performance,
-            "track_strategy_performance": self.track_strategy_performance,
-            "track_mfe_mae": self.track_mfe_mae,
-            "track_signal_decay": self.track_signal_decay,
-            "track_llm_decisions": self.track_llm_decisions,
-            "confidence_buckets": list(self.confidence_buckets),
-            "signal_decay_horizons_ms": list(self.signal_decay_horizons_ms),
-            "min_predictions_for_calibration": self.min_predictions_for_calibration,
-            "emit_model_analytics_events": self.emit_model_analytics_events,
-            "metadata": dict(self.metadata),
-        }
+# ============================================================================
+# Report builder
+# ============================================================================
 
 
 @dataclass(slots=True)
-class BacktestReportConfig:
+class ReportBuilderConfig:
     """
     Configuration for report_builder.py.
     """
 
     enabled: bool = True
 
-    output_dir: str = "data/backtest_reports"
-    formats: list[ReportFormat | str] = field(
-        default_factory=lambda: [ReportFormat.JSON, ReportFormat.MARKDOWN]
+    output_dir: str | Path = "reports/backtests"
+    formats: list[ReportFormat] = field(default_factory=lambda: [ReportFormat.MARKDOWN, ReportFormat.JSON])
+
+    sections: set[ReportSection] = field(
+        default_factory=lambda: {
+            ReportSection.SUMMARY,
+            ReportSection.EQUITY_CURVE,
+            ReportSection.DRAWDOWN,
+            ReportSection.TRADES,
+            ReportSection.STRATEGIES,
+            ReportSection.RISK,
+            ReportSection.EXECUTION,
+            ReportSection.COSTS,
+            ReportSection.SIGNALS,
+            ReportSection.WARNINGS,
+        }
     )
 
+    include_full_trade_list: bool = True
+    include_full_signal_list: bool = False
+    include_full_event_log: bool = False
+    include_charts: bool = True
     include_config_snapshot: bool = True
-    include_trades: bool = True
-    include_orders: bool = True
-    include_fills: bool = True
-    include_positions: bool = True
-    include_signals: bool = True
-    include_risk_blocks: bool = True
-    include_equity_curve: bool = True
-    include_drawdown_curve: bool = True
-    include_model_analytics: bool = True
+    include_metadata: bool = True
 
-    write_artifacts: bool = True
-    artifact_format: StorageFormat | str = StorageFormat.PARQUET
+    max_trades_in_markdown: int = 500
+    max_signals_in_markdown: int = 500
+    max_warnings_in_report: int = 100
+
+    save_result_json: bool = True
+    save_trades_csv: bool = True
+    save_positions_csv: bool = True
+    save_equity_curve_csv: bool = True
+    save_events_jsonl: bool = False
+
+    report_title: str = "Backtest Report"
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if self.enabled:
-            _ensure_non_empty_list(self.formats, "formats")
-            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        self.output_dir = _ensure_dir_path(self.output_dir, "ReportBuilderConfig.output_dir")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "output_dir": self.output_dir,
-            "formats": [_as_value(item) for item in self.formats],
-            "include_config_snapshot": self.include_config_snapshot,
-            "include_trades": self.include_trades,
-            "include_orders": self.include_orders,
-            "include_fills": self.include_fills,
-            "include_positions": self.include_positions,
-            "include_signals": self.include_signals,
-            "include_risk_blocks": self.include_risk_blocks,
-            "include_equity_curve": self.include_equity_curve,
-            "include_drawdown_curve": self.include_drawdown_curve,
-            "include_model_analytics": self.include_model_analytics,
-            "write_artifacts": self.write_artifacts,
-            "artifact_format": _as_value(self.artifact_format),
-            "metadata": dict(self.metadata),
-        }
+        if not self.formats:
+            raise BacktestConfigurationError("ReportBuilderConfig.formats cannot be empty.")
+
+        if not self.sections:
+            raise BacktestConfigurationError("ReportBuilderConfig.sections cannot be empty.")
+
+        _ensure_positive(
+            self.max_trades_in_markdown,
+            "ReportBuilderConfig.max_trades_in_markdown",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.max_signals_in_markdown,
+            "ReportBuilderConfig.max_signals_in_markdown",
+            allow_zero=True,
+        )
+        _ensure_positive(
+            self.max_warnings_in_report,
+            "ReportBuilderConfig.max_warnings_in_report",
+            allow_zero=True,
+        )
+
+        if not self.report_title:
+            raise BacktestConfigurationError("ReportBuilderConfig.report_title cannot be empty.")
 
 
-# ---------------------------------------------------------------------------
-# Simulated time config
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Strategy tester
+# ============================================================================
+
+
+@dataclass(slots=True)
+class StrategyTesterConfig:
+    """
+    Configuration for strategy_tester.py.
+
+    StrategyTester is the main backtest orchestrator. It should wire production
+    data caches, analytics, StrategyEngine, SignalProcessor and RiskManager,
+    then replace live execution with ExecutionSimulator + PositionSimulator.
+    """
+
+    run_name: str = "backtest"
+    mode: BacktestMode = BacktestMode.MULTI_STRATEGY
+
+    exchange: str = "binance"
+    market_type: str = "usdm_futures"
+    symbols: list[str] = field(default_factory=list)
+    timeframes: list[str] = field(default_factory=lambda: ["1m"])
+
+    strategies: list[str] = field(default_factory=list)
+    strategy_preset: str | None = None
+    test_all_registered_strategies: bool = True
+
+    require_risk_manager: bool = True
+    require_strategy_engine: bool = True
+    require_signal_processor: bool = True
+    require_analytics: bool = True
+
+    use_production_data_caches: bool = True
+    use_production_analytics: bool = True
+    use_production_strategy_engine: bool = True
+    use_production_risk_manager: bool = True
+
+    disable_live_exchange_execution: bool = True
+    fail_if_live_execution_detected: bool = True
+
+    collect_event_log: bool = True
+    collect_signal_records: bool = True
+    collect_risk_records: bool = True
+    collect_execution_records: bool = True
+    collect_position_records: bool = True
+
+    stop_on_first_error: bool = False
+    cleanup_after_run: bool = True
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not self.run_name:
+            raise BacktestConfigurationError("StrategyTesterConfig.run_name cannot be empty.")
+
+        self.exchange = self.exchange.lower()
+        self.market_type = self.market_type.lower()
+        self.symbols = _normalize_symbols(self.symbols)
+        self.timeframes = _normalize_timeframes(self.timeframes)
+
+        if not self.test_all_registered_strategies and not self.strategies and not self.strategy_preset:
+            raise BacktestConfigurationError(
+                "StrategyTesterConfig requires strategies, strategy_preset, or test_all_registered_strategies=True."
+            )
+
+        if not self.disable_live_exchange_execution:
+            raise BacktestConfigurationError(
+                "Live exchange execution must be disabled during backtesting."
+            )
+
+
+# ============================================================================
+# Backtest clock / time
+# ============================================================================
 
 
 @dataclass(slots=True)
@@ -781,88 +919,34 @@ class BacktestTimeConfig:
     Configuration for backtest_time.py.
     """
 
-    enabled: bool = True
+    use_simulated_time: bool = True
+    freeze_system_time: bool = False
 
-    use_simulated_clock: bool = True
+    timezone: str = "UTC"
+
+    scheduler_tick_interval_ms: int = 1000
+    run_scheduler_jobs: bool = True
+    run_interval_jobs_during_replay: bool = True
+    run_due_jobs_after_each_event: bool = True
+
     allow_time_travel_backwards: bool = False
-
-    scheduler_enabled: bool = True
-    scheduler_emit_events: bool = True
-
-    max_jobs_per_tick: int = 1000
-    fail_on_job_error: bool = False
+    fail_on_time_out_of_range: bool = True
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_positive_int(self.max_jobs_per_tick, "max_jobs_per_tick")
+        _ensure_positive(
+            self.scheduler_tick_interval_ms,
+            "BacktestTimeConfig.scheduler_tick_interval_ms",
+        )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "use_simulated_clock": self.use_simulated_clock,
-            "allow_time_travel_backwards": self.allow_time_travel_backwards,
-            "scheduler_enabled": self.scheduler_enabled,
-            "scheduler_emit_events": self.scheduler_emit_events,
-            "max_jobs_per_tick": self.max_jobs_per_tick,
-            "fail_on_job_error": self.fail_on_job_error,
-            "metadata": dict(self.metadata),
-        }
+        if not self.timezone:
+            raise BacktestConfigurationError("BacktestTimeConfig.timezone cannot be empty.")
 
 
-# ---------------------------------------------------------------------------
-# Walk-forward / optimizer config
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class OptimizerConfig:
-    """
-    Configuration for optimizer.py.
-    """
-
-    enabled: bool = False
-
-    mode: OptimizationMode | str = OptimizationMode.GRID_SEARCH
-    objective: OptimizationObjective | str = OptimizationObjective.NET_PNL
-
-    maximize_objective: bool = True
-
-    max_trials: int = 100
-    random_seed: int | None = 42
-
-    fail_fast: bool = False
-    parallel_trials: int = 1
-
-    parameter_grid: dict[str, list[Any]] = field(default_factory=dict)
-
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def validate(self) -> None:
-        if not self.enabled:
-            return
-
-        _ensure_positive_int(self.max_trials, "max_trials")
-        _ensure_positive_int(self.parallel_trials, "parallel_trials")
-
-        if not self.parameter_grid:
-            raise BacktestConfigError(
-                "parameter_grid must not be empty when optimizer is enabled"
-            )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "mode": _as_value(self.mode),
-            "objective": _as_value(self.objective),
-            "maximize_objective": self.maximize_objective,
-            "max_trials": self.max_trials,
-            "random_seed": self.random_seed,
-            "fail_fast": self.fail_fast,
-            "parallel_trials": self.parallel_trials,
-            "parameter_grid": dict(self.parameter_grid),
-            "metadata": dict(self.metadata),
-        }
+# ============================================================================
+# Walk-forward
+# ============================================================================
 
 
 @dataclass(slots=True)
@@ -873,267 +957,583 @@ class WalkForwardConfig:
 
     enabled: bool = False
 
-    window_mode: WalkForwardWindowMode | str = WalkForwardWindowMode.ROLLING
+    mode: WalkForwardMode = WalkForwardMode.ROLLING
 
-    train_window_ms: int = 90 * 24 * 60 * 60 * 1000
-    test_window_ms: int = 30 * 24 * 60 * 60 * 1000
-    step_ms: int = 30 * 24 * 60 * 60 * 1000
+    train_window: timedelta = timedelta(days=90)
+    validation_window: timedelta | None = None
+    test_window: timedelta = timedelta(days=30)
+    step_size: timedelta = timedelta(days=30)
 
-    require_full_windows: bool = True
-    optimize_each_window: bool = True
+    min_train_days: int = 30
+    min_test_days: int = 7
 
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    optimize_on_train: bool = True
+    validate_before_test: bool = False
+    carry_best_parameters_forward: bool = True
+
+    aggregate_results: bool = True
+    calculate_stability_score: bool = True
+    calculate_overfitting_score: bool = True
+
+    max_iterations: int | None = None
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if not self.enabled:
-            return
+        if self.train_window.total_seconds() <= 0:
+            raise BacktestConfigurationError("WalkForwardConfig.train_window must be positive.")
 
-        _ensure_positive_int(self.train_window_ms, "train_window_ms")
-        _ensure_positive_int(self.test_window_ms, "test_window_ms")
-        _ensure_positive_int(self.step_ms, "step_ms")
+        if self.validation_window is not None and self.validation_window.total_seconds() < 0:
+            raise BacktestConfigurationError(
+                "WalkForwardConfig.validation_window cannot be negative."
+            )
 
-        if self.optimize_each_window:
-            self.optimizer.enabled = True
+        if self.test_window.total_seconds() <= 0:
+            raise BacktestConfigurationError("WalkForwardConfig.test_window must be positive.")
 
-        self.optimizer.validate()
+        if self.step_size.total_seconds() <= 0:
+            raise BacktestConfigurationError("WalkForwardConfig.step_size must be positive.")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "window_mode": _as_value(self.window_mode),
-            "train_window_ms": self.train_window_ms,
-            "test_window_ms": self.test_window_ms,
-            "step_ms": self.step_ms,
-            "require_full_windows": self.require_full_windows,
-            "optimize_each_window": self.optimize_each_window,
-            "optimizer": self.optimizer.to_dict(),
-            "metadata": dict(self.metadata),
-        }
+        _ensure_positive(self.min_train_days, "WalkForwardConfig.min_train_days")
+        _ensure_positive(self.min_test_days, "WalkForwardConfig.min_test_days")
+
+        if self.max_iterations is not None:
+            _ensure_positive(self.max_iterations, "WalkForwardConfig.max_iterations")
 
 
-# ---------------------------------------------------------------------------
-# Main backtest config
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Optimizer
+# ============================================================================
+
+
+@dataclass(slots=True)
+class OptimizerConfig:
+    """
+    Configuration for optimizer.py.
+    """
+
+    enabled: bool = False
+
+    method: OptimizationMethod = OptimizationMethod.GRID_SEARCH
+    objective_metric: OptimizationMetric = OptimizationMetric.NET_PROFIT
+    direction: OptimizationDirection = OptimizationDirection.MAXIMIZE
+
+    parameter_space: dict[str, Any] = field(default_factory=dict)
+
+    max_trials: int = 100
+    random_seed: int | None = 42
+
+    parallel_jobs: int = 1
+    stop_on_trial_error: bool = False
+
+    overfitting_check: OverfittingCheckMode = OverfittingCheckMode.TRAIN_TEST_SPLIT
+    use_walk_forward_for_overfitting_check: bool = False
+
+    min_trades_required: int = 20
+    max_drawdown_pct_limit: float | None = None
+    min_profit_factor: float | None = None
+    min_win_rate: float | None = None
+
+    save_all_trials: bool = True
+    save_best_config: bool = True
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if self.enabled and not self.parameter_space:
+            raise BacktestConfigurationError(
+                "OptimizerConfig.parameter_space cannot be empty when optimizer is enabled."
+            )
+
+        _ensure_positive(self.max_trials, "OptimizerConfig.max_trials")
+        _ensure_positive(self.parallel_jobs, "OptimizerConfig.parallel_jobs")
+        _ensure_positive(
+            self.min_trades_required,
+            "OptimizerConfig.min_trades_required",
+            allow_zero=True,
+        )
+
+        if self.max_drawdown_pct_limit is not None:
+            _ensure_between(
+                self.max_drawdown_pct_limit,
+                "OptimizerConfig.max_drawdown_pct_limit",
+                0.0,
+                100.0,
+            )
+
+        if self.min_profit_factor is not None:
+            _ensure_positive(
+                self.min_profit_factor,
+                "OptimizerConfig.min_profit_factor",
+                allow_zero=True,
+            )
+
+        if self.min_win_rate is not None:
+            _ensure_between(
+                self.min_win_rate,
+                "OptimizerConfig.min_win_rate",
+                0.0,
+                100.0,
+            )
+
+
+# ============================================================================
+# Main aggregate config
+# ============================================================================
 
 
 @dataclass(slots=True)
 class BacktestConfig:
     """
-    Main configuration for one backtest run.
+    Main aggregate configuration for a full backtest run.
 
-    This is the object passed into StrategyTester.
+    This config wires all backtesting sub-configs and can also carry snapshots
+    or direct references to production configs for strategy/risk/execution.
     """
 
-    name: str = "backtest"
+    run_name: str = "backtest"
+    mode: BacktestMode = BacktestMode.MULTI_STRATEGY
 
-    mode: BacktestMode | str = BacktestMode.CANDLE
-
-    exchange: ExchangeName | str = ExchangeName.BINANCE
-    market_type: MarketType | str = MarketType.USDM_FUTURES
-
-    symbols: list[str] = field(default_factory=lambda: ["BTCUSDT"])
+    exchange: str = "binance"
+    market_type: str = "usdm_futures"
+    symbols: list[str] = field(default_factory=list)
     timeframes: list[str] = field(default_factory=lambda: ["1m"])
 
-    start_time_ms: int = 0
-    end_time_ms: int = 0
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    warmup_start_time: datetime | None = None
+    warmup_bars: int = 500
 
-    strategy_names: list[str] = field(default_factory=list)
-    model_names: list[str] = field(default_factory=list)
+    initial_balance: float = 10_000.0
+    quote_currency: str = "USDT"
 
-    auto_download_missing_history: bool = False
+    strategies: list[str] = field(default_factory=list)
+    strategy_preset: str | None = None
+    test_all_registered_strategies: bool = True
 
-    data: BacktestDataConfig = field(default_factory=BacktestDataConfig)
-    replay: BacktestReplayConfig = field(default_factory=BacktestReplayConfig)
-    execution: BacktestExecutionConfig = field(default_factory=BacktestExecutionConfig)
-    metrics: BacktestMetricsConfig = field(default_factory=BacktestMetricsConfig)
+    data_dir: str | Path = "data/history"
+    output_dir: str | Path = "reports/backtests"
+
+    use_candles: bool = True
+    use_trades: bool = False
+    use_orderbook: bool = False
+    use_funding: bool = True
+    use_open_interest: bool = True
+    use_liquidations: bool = False
+    use_mark_price: bool = True
+    use_index_price: bool = True
+
+    download_missing_data: bool = False
+
+    deterministic: bool = True
+    random_seed: int | None = 42
+
+    save_trades: bool = True
+    save_positions: bool = True
+    save_equity_curve: bool = True
+    save_events: bool = False
+    save_report: bool = True
+
+    fail_fast: bool = False
+    allow_partial_results: bool = True
+
+    # Backtesting sub-configs
+    history_downloader: HistoryDownloaderConfig = field(default_factory=HistoryDownloaderConfig)
+    data_loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+    market_replay: MarketReplayConfig = field(default_factory=MarketReplayConfig)
+    cost_model: CostModelConfig = field(default_factory=CostModelConfig)
+    execution_simulator: ExecutionSimulatorConfig = field(default_factory=ExecutionSimulatorConfig)
+    position_simulator: PositionSimulatorConfig = field(default_factory=PositionSimulatorConfig)
+    performance_metrics: PerformanceMetricsConfig = field(default_factory=PerformanceMetricsConfig)
     model_analytics: ModelAnalyticsConfig = field(default_factory=ModelAnalyticsConfig)
-    report: BacktestReportConfig = field(default_factory=BacktestReportConfig)
-    time: BacktestTimeConfig = field(default_factory=BacktestTimeConfig)
-    history_download: HistoryDownloadConfig | None = None
+    report_builder: ReportBuilderConfig = field(default_factory=ReportBuilderConfig)
+    strategy_tester: StrategyTesterConfig = field(default_factory=StrategyTesterConfig)
+    backtest_time: BacktestTimeConfig = field(default_factory=BacktestTimeConfig)
     walk_forward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
-    emit_lifecycle_events: bool = True
-    fail_fast: bool = True
+    # Production config snapshots or direct config objects.
+    # These stay intentionally untyped to avoid hard dependency cycles.
+    core_config: Any | None = None
+    strategy_config: Any | None = None
+    risk_config: Any | None = None
+    execution_config: Any | None = None
+    analytics_config: Any | None = None
 
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        _ensure_non_empty_list(self.symbols, "symbols")
-        _ensure_non_empty_list(self.timeframes, "timeframes")
-        _ensure_time_range(self.start_time_ms, self.end_time_ms)
+        """
+        Validate and propagate shared settings to sub-configs.
+        """
 
-        self._sync_child_configs()
+        if not self.run_name:
+            raise BacktestConfigurationError("BacktestConfig.run_name cannot be empty.")
 
-        self.data.validate()
-        self.replay.validate()
-        self.execution.validate()
-        self.metrics.validate()
+        self.exchange = self.exchange.lower()
+        self.market_type = self.market_type.lower()
+        self.symbols = _normalize_symbols(self.symbols)
+        self.timeframes = _normalize_timeframes(self.timeframes)
+
+        _ensure_positive(self.initial_balance, "BacktestConfig.initial_balance")
+        _ensure_positive(self.warmup_bars, "BacktestConfig.warmup_bars", allow_zero=True)
+
+        if not self.quote_currency:
+            raise BacktestConfigurationError("BacktestConfig.quote_currency cannot be empty.")
+
+        if self.start_time is None or self.end_time is None:
+            raise BacktestConfigurationError(
+                "BacktestConfig.start_time and BacktestConfig.end_time are required."
+            )
+
+        self.start_time = ensure_aware_utc(self.start_time)
+        self.end_time = ensure_aware_utc(self.end_time)
+
+        if self.warmup_start_time is not None:
+            self.warmup_start_time = ensure_aware_utc(self.warmup_start_time)
+
+        if self.end_time <= self.start_time:
+            raise BacktestConfigurationError(
+                "BacktestConfig.end_time must be greater than start_time.",
+                details={
+                    "start_time": self.start_time.isoformat(),
+                    "end_time": self.end_time.isoformat(),
+                },
+            )
+
+        if self.warmup_start_time is not None and self.warmup_start_time > self.start_time:
+            raise BacktestConfigurationError(
+                "BacktestConfig.warmup_start_time cannot be after start_time.",
+                details={
+                    "warmup_start_time": self.warmup_start_time.isoformat(),
+                    "start_time": self.start_time.isoformat(),
+                },
+            )
+
+        if not any(
+            [
+                self.use_candles,
+                self.use_trades,
+                self.use_orderbook,
+                self.use_funding,
+                self.use_open_interest,
+                self.use_liquidations,
+                self.use_mark_price,
+                self.use_index_price,
+            ]
+        ):
+            raise BacktestConfigurationError("At least one historical data stream must be enabled.")
+
+        if not self.test_all_registered_strategies and not self.strategies and not self.strategy_preset:
+            raise BacktestConfigurationError(
+                "BacktestConfig requires strategies, strategy_preset, or test_all_registered_strategies=True."
+            )
+
+        self.data_dir = _ensure_dir_path(self.data_dir, "BacktestConfig.data_dir")
+        self.output_dir = _ensure_dir_path(self.output_dir, "BacktestConfig.output_dir")
+
+        self._propagate_shared_settings()
+        self._validate_subconfigs()
+
+    def period(self) -> BacktestPeriod:
+        """
+        Build BacktestPeriod from this config.
+        """
+
+        if self.start_time is None or self.end_time is None:
+            raise BacktestConfigurationError(
+                "Cannot build BacktestPeriod without start_time and end_time."
+            )
+
+        return BacktestPeriod(
+            start=self.start_time,
+            end=self.end_time,
+            warmup_start=self.warmup_start_time,
+        )
+
+    def instruments(self) -> list[BacktestInstrument]:
+        """
+        Build BacktestInstrument list from shared symbol settings.
+        """
+
+        return [
+            BacktestInstrument(
+                exchange=self.exchange,
+                symbol=symbol,
+                market_type=self.market_type,
+                quote_asset=self.quote_currency,
+            )
+            for symbol in self.symbols
+        ]
+
+    def enabled_data_types(self) -> set[BacktestDataType]:
+        """
+        Return enabled historical data stream types.
+        """
+
+        data_types: set[BacktestDataType] = set()
+
+        if self.use_candles:
+            data_types.add(BacktestDataType.CANDLES)
+        if self.use_trades:
+            data_types.add(BacktestDataType.TRADES)
+        if self.use_orderbook:
+            data_types.add(BacktestDataType.ORDERBOOK)
+        if self.use_funding:
+            data_types.add(BacktestDataType.FUNDING)
+        if self.use_open_interest:
+            data_types.add(BacktestDataType.OPEN_INTEREST)
+        if self.use_liquidations:
+            data_types.add(BacktestDataType.LIQUIDATIONS)
+        if self.use_mark_price:
+            data_types.add(BacktestDataType.MARK_PRICE)
+        if self.use_index_price:
+            data_types.add(BacktestDataType.INDEX_PRICE)
+
+        return data_types
+
+    def _propagate_shared_settings(self) -> None:
+        """
+        Push top-level settings into sub-configs where appropriate.
+        """
+
+        data_types = self.enabled_data_types()
+
+        # Downloader
+        self.history_downloader.enabled = self.download_missing_data
+        self.history_downloader.exchange = self.exchange
+        self.history_downloader.market_type = self.market_type
+        self.history_downloader.symbols = list(self.symbols)
+        self.history_downloader.timeframes = list(self.timeframes)
+        self.history_downloader.data_types = set(data_types)
+        self.history_downloader.output_dir = self.data_dir
+        self.history_downloader.include_mark_price = self.use_mark_price
+        self.history_downloader.include_index_price = self.use_index_price
+        self.history_downloader.include_liquidations = self.use_liquidations
+        self.history_downloader.include_orderbook_snapshots = self.use_orderbook
+
+        # Loader
+        self.data_loader.data_dir = self.data_dir
+        self.data_loader.exchange = self.exchange
+        self.data_loader.market_type = self.market_type
+        self.data_loader.symbols = list(self.symbols)
+        self.data_loader.timeframes = list(self.timeframes)
+        self.data_loader.data_types = set(data_types)
+        self.data_loader.require_candles = self.use_candles
+        self.data_loader.require_trades = self.use_trades
+        self.data_loader.require_orderbook = self.use_orderbook
+        self.data_loader.require_funding = self.use_funding
+        self.data_loader.require_open_interest = self.use_open_interest
+
+        # Cost / execution / position
+        self.cost_model.quote_currency = self.quote_currency
+
+        self.execution_simulator.exchange = self.exchange
+        self.execution_simulator.market_type = self.market_type
+
+        self.position_simulator.initial_balance = self.initial_balance
+        self.position_simulator.quote_currency = self.quote_currency
+
+        # Report
+        self.report_builder.output_dir = self.output_dir
+
+        # Strategy tester
+        self.strategy_tester.run_name = self.run_name
+        self.strategy_tester.mode = self.mode
+        self.strategy_tester.exchange = self.exchange
+        self.strategy_tester.market_type = self.market_type
+        self.strategy_tester.symbols = list(self.symbols)
+        self.strategy_tester.timeframes = list(self.timeframes)
+        self.strategy_tester.strategies = list(self.strategies)
+        self.strategy_tester.strategy_preset = self.strategy_preset
+        self.strategy_tester.test_all_registered_strategies = self.test_all_registered_strategies
+
+    def _validate_subconfigs(self) -> None:
+        self.history_downloader.validate()
+        self.data_loader.validate()
+        self.market_replay.validate()
+        self.cost_model.validate()
+        self.execution_simulator.validate()
+        self.position_simulator.validate()
+        self.performance_metrics.validate()
         self.model_analytics.validate()
-        self.report.validate()
-        self.time.validate()
+        self.report_builder.validate()
+        self.strategy_tester.validate()
+        self.backtest_time.validate()
         self.walk_forward.validate()
+        self.optimizer.validate()
 
-        if self.history_download is not None:
-            self.history_download.validate()
-
-    def _sync_child_configs(self) -> None:
+    @classmethod
+    def default_binance_futures(
+        cls,
+        *,
+        symbols: list[str],
+        start_time: datetime,
+        end_time: datetime,
+        timeframes: list[str] | None = None,
+        initial_balance: float = 10_000.0,
+        run_name: str = "binance_futures_backtest",
+    ) -> BacktestConfig:
         """
-        Keep child configs aligned with main config.
-
-        This avoids subtle bugs where BacktestConfig says BTCUSDT but
-        BacktestDataConfig points to another symbol/date range.
-        """
-
-        self.data.exchange = self.exchange
-        self.data.market_type = self.market_type
-        self.data.symbols = list(self.symbols)
-        self.data.timeframes = list(self.timeframes)
-        self.data.start_time_ms = self.start_time_ms
-        self.data.end_time_ms = self.end_time_ms
-
-        if self.history_download is not None:
-            self.history_download.exchange = self.exchange
-            self.history_download.market_type = self.market_type
-            self.history_download.symbols = list(self.symbols)
-            self.history_download.timeframes = list(self.timeframes)
-            self.history_download.start_time_ms = self.start_time_ms
-            self.history_download.end_time_ms = self.end_time_ms
-
-    def build_history_download_config(self) -> HistoryDownloadConfig:
-        """
-        Build a default HistoryDownloadConfig from the current backtest config.
+        Convenient Binance USD-M Futures default config.
         """
 
-        config = self.history_download or HistoryDownloadConfig()
-
-        config.exchange = self.exchange
-        config.market_type = self.market_type
-        config.symbols = list(self.symbols)
-        config.timeframes = list(self.timeframes)
-        config.start_time_ms = self.start_time_ms
-        config.end_time_ms = self.end_time_ms
-        config.output_dir = self.data.data_dir
-        config.data_types = list(self.data.data_types)
-
+        config = cls(
+            run_name=run_name,
+            exchange="binance",
+            market_type="usdm_futures",
+            symbols=symbols,
+            timeframes=timeframes or ["1m"],
+            start_time=start_time,
+            end_time=end_time,
+            initial_balance=initial_balance,
+            quote_currency="USDT",
+            use_candles=True,
+            use_funding=True,
+            use_open_interest=True,
+            use_trades=False,
+            use_orderbook=False,
+            use_liquidations=False,
+        )
         config.validate()
         return config
 
-    def config_snapshot(self) -> dict[str, Any]:
-        """
-        Snapshot safe to store with BacktestRun and reports.
 
-        Do not put secrets or API keys here.
-        """
-
-        return self.to_dict()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "mode": _as_value(self.mode),
-            "exchange": _as_value(self.exchange),
-            "market_type": _as_value(self.market_type),
-            "symbols": list(self.symbols),
-            "timeframes": list(self.timeframes),
-            "start_time_ms": self.start_time_ms,
-            "end_time_ms": self.end_time_ms,
-            "strategy_names": list(self.strategy_names),
-            "model_names": list(self.model_names),
-            "auto_download_missing_history": self.auto_download_missing_history,
-            "data": self.data.to_dict(),
-            "replay": self.replay.to_dict(),
-            "execution": self.execution.to_dict(),
-            "metrics": self.metrics.to_dict(),
-            "model_analytics": self.model_analytics.to_dict(),
-            "report": self.report.to_dict(),
-            "time": self.time.to_dict(),
-            "history_download": (
-                self.history_download.to_dict()
-                if self.history_download is not None
-                else None
-            ),
-            "walk_forward": self.walk_forward.to_dict(),
-            "emit_lifecycle_events": self.emit_lifecycle_events,
-            "fail_fast": self.fail_fast,
-            "metadata": dict(self.metadata),
-        }
+# ============================================================================
+# Preset builders
+# ============================================================================
 
 
-# ---------------------------------------------------------------------------
-# Factory helpers
-# ---------------------------------------------------------------------------
-
-
-def build_default_backtest_config(
+def build_fast_candle_backtest_config(
     *,
-    exchange: ExchangeName | str = ExchangeName.BINANCE,
-    market_type: MarketType | str = MarketType.USDM_FUTURES,
-    symbols: list[str] | None = None,
+    symbols: list[str],
+    start_time: datetime,
+    end_time: datetime,
     timeframes: list[str] | None = None,
-    start_time_ms: int,
-    end_time_ms: int,
     initial_balance: float = 10_000.0,
-    leverage: float = 3.0,
-    mode: BacktestMode | str = BacktestMode.CANDLE,
-    data_dir: str = "data/history",
 ) -> BacktestConfig:
     """
-    Convenient factory for a standard futures backtest config.
+    Fast candle-only-ish backtest preset.
+
+    Uses candles + funding + open interest, max-speed replay and simple
+    next-candle execution. This is the best first MVP mode.
     """
 
-    config = BacktestConfig(
-        mode=mode,
-        exchange=exchange,
-        market_type=market_type,
-        symbols=symbols or ["BTCUSDT"],
+    config = BacktestConfig.default_binance_futures(
+        symbols=symbols,
+        start_time=start_time,
+        end_time=end_time,
         timeframes=timeframes or ["1m"],
-        start_time_ms=start_time_ms,
-        end_time_ms=end_time_ms,
+        initial_balance=initial_balance,
+        run_name="fast_candle_backtest",
     )
 
-    config.data.data_dir = data_dir
-    config.execution.initial_balance = initial_balance
-    config.execution.leverage = leverage
+    config.use_trades = False
+    config.use_orderbook = False
+    config.use_liquidations = False
 
-    if mode == BacktestMode.CANDLE or str(mode) == BacktestMode.CANDLE.value:
-        config.data.data_types = [
-            HistoryDataType.CANDLES,
-            HistoryDataType.FUNDING,
-            HistoryDataType.OPEN_INTEREST,
-        ]
-    elif mode == BacktestMode.TRADE_LEVEL or str(mode) == BacktestMode.TRADE_LEVEL.value:
-        config.data.data_types = [
-            HistoryDataType.CANDLES,
-            HistoryDataType.AGG_TRADES,
-            HistoryDataType.FUNDING,
-            HistoryDataType.OPEN_INTEREST,
-            HistoryDataType.LIQUIDATIONS,
-        ]
-    elif mode == BacktestMode.ORDERBOOK or str(mode) == BacktestMode.ORDERBOOK.value:
-        config.data.data_types = [
-            HistoryDataType.CANDLES,
-            HistoryDataType.AGG_TRADES,
-            HistoryDataType.ORDERBOOK_SNAPSHOTS,
-            HistoryDataType.ORDERBOOK_DELTAS,
-            HistoryDataType.FUNDING,
-            HistoryDataType.OPEN_INTEREST,
-            HistoryDataType.LIQUIDATIONS,
-        ]
+    config.market_replay.replay_speed = ReplaySpeed.MAX_SPEED
+    config.execution_simulator.fill_model = FillModel.NEXT_CANDLE_OPEN
+    config.execution_simulator.liquidity_model = LiquidityModel.CANDLE_VOLUME_PERCENT
+    config.cost_model.slippage_model = SlippageModel.FIXED_BPS
+    config.validate()
+    return config
+
+
+def build_realistic_futures_backtest_config(
+    *,
+    symbols: list[str],
+    start_time: datetime,
+    end_time: datetime,
+    timeframes: list[str] | None = None,
+    initial_balance: float = 10_000.0,
+) -> BacktestConfig:
+    """
+    More realistic Binance futures preset.
+
+    Enables trades, funding, open interest and liquidation checks. Order book
+    remains optional because historical depth can be heavy.
+    """
+
+    config = BacktestConfig.default_binance_futures(
+        symbols=symbols,
+        start_time=start_time,
+        end_time=end_time,
+        timeframes=timeframes or ["1m", "5m"],
+        initial_balance=initial_balance,
+        run_name="realistic_futures_backtest",
+    )
+
+    config.use_trades = True
+    config.use_orderbook = False
+    config.use_funding = True
+    config.use_open_interest = True
+    config.use_liquidations = True
+
+    config.execution_simulator.fill_model = FillModel.NEXT_TICK
+    config.execution_simulator.allow_partial_fills = True
+    config.execution_simulator.max_volume_participation_pct = 5.0
+
+    config.position_simulator.enable_liquidation_check = True
+    config.position_simulator.enable_funding_application = True
+
+    config.cost_model.commission_model = CommissionModel.MAKER_TAKER
+    config.cost_model.slippage_model = SlippageModel.VOLUME_BASED
+    config.cost_model.include_funding = True
 
     config.validate()
     return config
 
 
-def build_history_download_config_from_backtest(
-    config: BacktestConfig,
-) -> HistoryDownloadConfig:
+def build_walk_forward_backtest_config(
+    *,
+    symbols: list[str],
+    start_time: datetime,
+    end_time: datetime,
+    train_days: int = 90,
+    test_days: int = 30,
+    timeframes: list[str] | None = None,
+    initial_balance: float = 10_000.0,
+) -> BacktestConfig:
     """
-    Helper for StrategyTester or CLI.
+    Walk-forward preset.
+    """
 
-    Uses the same symbol/date/data scope as the backtest config.
-    """
+    config = build_fast_candle_backtest_config(
+        symbols=symbols,
+        start_time=start_time,
+        end_time=end_time,
+        timeframes=timeframes,
+        initial_balance=initial_balance,
+    )
+
+    config.run_name = "walk_forward_backtest"
+    config.mode = BacktestMode.WALK_FORWARD
+    config.walk_forward.enabled = True
+    config.walk_forward.train_window = timedelta(days=train_days)
+    config.walk_forward.test_window = timedelta(days=test_days)
+    config.walk_forward.step_size = timedelta(days=test_days)
 
     config.validate()
-    return config.build_history_download_config()
+    return config
+
+
+__all__ = [
+    "HistoryDownloaderConfig",
+    "DataLoaderConfig",
+    "MarketReplayConfig",
+    "CostModelConfig",
+    "ExecutionSimulatorConfig",
+    "PositionSimulatorConfig",
+    "PerformanceMetricsConfig",
+    "ModelAnalyticsConfig",
+    "ReportBuilderConfig",
+    "StrategyTesterConfig",
+    "BacktestTimeConfig",
+    "WalkForwardConfig",
+    "OptimizerConfig",
+    "BacktestConfig",
+    "build_fast_candle_backtest_config",
+    "build_realistic_futures_backtest_config",
+    "build_walk_forward_backtest_config",
+]

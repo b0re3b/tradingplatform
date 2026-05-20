@@ -1,224 +1,310 @@
-# trading_system/backtesting/enums.py
+"""
+Backtesting-specific enums.
+
+This module contains only enums that belong to the offline backtesting,
+market replay, simulation, reporting, walk-forward and optimization layers.
+
+It must not duplicate strategy/risk/execution domain enums unless the enum
+describes a backtesting-only concept.
+"""
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 
 
-class BacktestMode(StrEnum):
+class BacktestMode(str, Enum):
     """
-    High-level backtest mode.
-
-    Defines how deep the market replay should be.
+    Main operating mode for a backtest run.
     """
 
-    CANDLE = "candle"
-    TRADE_LEVEL = "trade_level"
-    ORDERBOOK = "orderbook"
-    MULTI_EXCHANGE = "multi_exchange"
+    SINGLE_STRATEGY = "single_strategy"
+    MULTI_STRATEGY = "multi_strategy"
+    PORTFOLIO = "portfolio"
+    WALK_FORWARD = "walk_forward"
+    OPTIMIZATION = "optimization"
+    STRESS_TEST = "stress_test"
 
 
-class ReplayMode(StrEnum):
+class BacktestStatus(str, Enum):
     """
-    Replay behavior for historical market events.
-    """
-
-    FAST = "fast"
-    REAL_TIME = "real_time"
-    STEPPED = "stepped"
-
-
-class BacktestStatus(StrEnum):
-    """
-    Lifecycle status of a backtest run.
+    Runtime status of a backtest run.
     """
 
     CREATED = "created"
-    INITIALIZING = "initializing"
-    DOWNLOADING_HISTORY = "downloading_history"
+    CONFIGURING = "configuring"
     LOADING_DATA = "loading_data"
-    REPLAYING = "replaying"
+    WARMING_UP = "warming_up"
     RUNNING = "running"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
-class HistoryDataType(StrEnum):
+class BacktestPhase(str, Enum):
     """
-    Historical data types used by downloader, local storage and replay.
+    Internal phase of the backtesting pipeline.
+    """
 
-    All types are futures/perpetual-oriented.
+    INIT = "init"
+    DATA_DOWNLOAD = "data_download"
+    DATA_LOAD = "data_load"
+    DATA_VALIDATION = "data_validation"
+    COMPONENT_BOOTSTRAP = "component_bootstrap"
+    WARMUP = "warmup"
+    MARKET_REPLAY = "market_replay"
+    SIGNAL_PROCESSING = "signal_processing"
+    RISK_PROCESSING = "risk_processing"
+    EXECUTION_SIMULATION = "execution_simulation"
+    POSITION_SIMULATION = "position_simulation"
+    METRICS_CALCULATION = "metrics_calculation"
+    REPORT_BUILDING = "report_building"
+    CLEANUP = "cleanup"
+
+
+class BacktestDataType(str, Enum):
+    """
+    Historical data streams supported by the backtesting package.
     """
 
     CANDLES = "candles"
     TRADES = "trades"
-    AGG_TRADES = "agg_trades"
-    ORDERBOOK_SNAPSHOTS = "orderbook_snapshots"
-    ORDERBOOK_DELTAS = "orderbook_deltas"
+    ORDERBOOK = "orderbook"
+    ORDERBOOK_SNAPSHOT = "orderbook_snapshot"
     FUNDING = "funding"
     OPEN_INTEREST = "open_interest"
     LIQUIDATIONS = "liquidations"
     MARK_PRICE = "mark_price"
     INDEX_PRICE = "index_price"
+    MULTI_STREAM = "multi_stream"
 
 
-class HistorySourceType(StrEnum):
+class HistoricalDataFormat(str, Enum):
     """
-    Source from which historical data is loaded or downloaded.
+    Supported historical data file/storage formats.
     """
 
-    EXCHANGE_REST = "exchange_rest"
-    EXCHANGE_DATA_PORTAL = "exchange_data_portal"
     PARQUET = "parquet"
-    POSTGRES = "postgres"
     CSV = "csv"
-    PROVIDER_API = "provider_api"
+    JSON = "json"
+    JSONL = "jsonl"
+    POSTGRES = "postgres"
+    REDIS_SNAPSHOT = "redis_snapshot"
 
 
-class HistoryDownloadStatus(StrEnum):
+class DataValidationLevel(str, Enum):
     """
-    Status of one historical download task.
-    """
-
-    PENDING = "pending"
-    RUNNING = "running"
-    PARTIALLY_COMPLETED = "partially_completed"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-    RATE_LIMITED = "rate_limited"
-
-
-class ExchangeName(StrEnum):
-    """
-    Supported futures exchanges for backtesting ingestion.
-
-    Keep values aligned with normalized payload field `exchange`.
+    Strictness level for validating historical data before replay.
     """
 
-    BINANCE = "binance"
-    BYBIT = "bybit"
-    OKX = "okx"
-    MEXC = "mexc"
+    NONE = "none"
+    BASIC = "basic"
+    STRICT = "strict"
+    FAIL_FAST = "fail_fast"
 
 
-class MarketType(StrEnum):
+class DataGapPolicy(str, Enum):
     """
-    Futures/perpetual market types.
-
-    The project is futures-focused, so spot is intentionally not included.
+    Policy for handling gaps in historical data.
     """
 
-    USDM_FUTURES = "usdm_futures"
-    COINM_FUTURES = "coinm_futures"
-    LINEAR = "linear"
-    INVERSE = "inverse"
-    SWAP = "swap"
+    IGNORE = "ignore"
+    WARN = "warn"
+    SKIP_RANGE = "skip_range"
+    FORWARD_FILL = "forward_fill"
+    FAIL = "fail"
 
 
-class HistoricalEventTopic(StrEnum):
+class DataAlignmentPolicy(str, Enum):
     """
-    Canonical market topics emitted by BacktestMarketReplay.
-
-    These must match the live EventBus topics used by exchange adapters and data caches.
+    Policy for aligning multiple historical streams by timestamp.
     """
 
-    MARKET_CANDLE = "market.candle"
-    MARKET_TRADE = "market.trade"
-    MARKET_TRADES_SNAPSHOT = "market.trades.snapshot"
-    MARKET_ORDERBOOK = "market.orderbook"
-    MARKET_ORDERBOOK_SNAPSHOT = "market.orderbook.snapshot"
-    MARKET_FUNDING = "market.funding"
-    MARKET_FUNDING_SNAPSHOT = "market.funding.snapshot"
-    MARKET_OPEN_INTEREST = "market.open_interest"
-    MARKET_OPEN_INTEREST_SNAPSHOT = "market.open_interest.snapshot"
-    MARKET_LIQUIDATION = "market.liquidation"
-    MARKET_MARK_PRICE = "market.mark_price"
-    MARKET_INDEX_PRICE = "market.index_price"
+    EVENT_TIME = "event_time"
+    RECEIVED_TIME = "received_time"
+    CANDLE_CLOSE_TIME = "candle_close_time"
+    NEAREST = "nearest"
+    STRICT_TIMESTAMP = "strict_timestamp"
 
 
-class BacktestSystemTopic(StrEnum):
+class ReplayMode(str, Enum):
     """
-    Backtest-specific system topics emitted through EventBus.
+    Market replay mode.
     """
 
-    BACKTEST_STARTED = "system.backtest.started"
-    BACKTEST_COMPLETED = "system.backtest.completed"
-    BACKTEST_FAILED = "system.backtest.failed"
-    BACKTEST_CANCELLED = "system.backtest.cancelled"
-
-    REPLAY_STARTED = "system.backtest.replay_started"
-    REPLAY_PROGRESS = "system.backtest.progress"
-    REPLAY_COMPLETED = "system.backtest.replay_completed"
-    REPLAY_FAILED = "system.backtest.replay_failed"
-
-    HISTORY_DOWNLOAD_STARTED = "system.backtest.history_download_started"
-    HISTORY_DOWNLOAD_PROGRESS = "system.backtest.history_download_progress"
-    HISTORY_DOWNLOAD_COMPLETED = "system.backtest.history_download_completed"
-    HISTORY_DOWNLOAD_FAILED = "system.backtest.history_download_failed"
+    FULL_RUN = "full_run"
+    STEP_BY_STEP = "step_by_step"
+    BATCHED = "batched"
+    EVENT_BY_EVENT = "event_by_event"
 
 
-class SignalDecision(StrEnum):
+class ReplaySpeed(str, Enum):
     """
-    Backtest-side signal decision state.
+    Replay speed mode.
 
-    This is useful for signal records, model analytics and reports.
+    MAX_SPEED should be the default for offline deterministic tests.
+    REALTIME is mostly useful for debugging dashboards or event flow.
     """
 
-    GENERATED = "generated"
-    CONFIRMED = "confirmed"
-    REJECTED = "rejected"
-    EXPIRED = "expired"
-    EXECUTED = "executed"
-    CANCELLED = "cancelled"
+    REALTIME = "realtime"
+    FAST = "fast"
+    MAX_SPEED = "max_speed"
+    STEP_BY_STEP = "step_by_step"
 
 
-class OrderSide(StrEnum):
+class ReplayOrdering(str, Enum):
     """
-    Normalized trading side.
+    Ordering rule for replaying mixed historical streams.
     """
 
-    BUY = "buy"
-    SELL = "sell"
+    TIMESTAMP_ASC = "timestamp_asc"
+    TIMESTAMP_THEN_PRIORITY = "timestamp_then_priority"
+    STREAM_PRIORITY_THEN_TIMESTAMP = "stream_priority_then_timestamp"
 
 
-class PositionSide(StrEnum):
+class ReplayEventPriority(str, Enum):
     """
-    Normalized futures position side.
-    """
+    Priority of market events when several events share the same timestamp.
 
-    LONG = "long"
-    SHORT = "short"
-
-
-class OrderType(StrEnum):
-    """
-    Simulated order type.
+    This helps make replay deterministic.
     """
 
-    MARKET = "market"
-    LIMIT = "limit"
-    STOP_MARKET = "stop_market"
-    STOP_LIMIT = "stop_limit"
-    TAKE_PROFIT_MARKET = "take_profit_market"
-    TAKE_PROFIT_LIMIT = "take_profit_limit"
+    ORDERBOOK = "orderbook"
+    TRADE = "trade"
+    CANDLE = "candle"
+    FUNDING = "funding"
+    OPEN_INTEREST = "open_interest"
+    LIQUIDATION = "liquidation"
+    MARK_PRICE = "mark_price"
+    INDEX_PRICE = "index_price"
 
 
-class TimeInForce(StrEnum):
+class WarmupPolicy(str, Enum):
     """
-    Simulated time-in-force policy.
+    Policy for warmup period handling.
     """
 
-    GTC = "gtc"
-    IOC = "ioc"
-    FOK = "fok"
-    POST_ONLY = "post_only"
+    NONE = "none"
+    LOAD_ONLY = "load_only"
+    REPLAY_WITHOUT_TRADING = "replay_without_trading"
+    REPLAY_WITH_TRADING_DISABLED = "replay_with_trading_disabled"
 
 
-class OrderStatus(StrEnum):
+class FillModel(str, Enum):
     """
-    Simulated order lifecycle status.
+    Order fill simulation model.
+    """
+
+    INSTANT = "instant"
+    NEXT_TICK = "next_tick"
+    NEXT_CANDLE_OPEN = "next_candle_open"
+    NEXT_CANDLE_CLOSE = "next_candle_close"
+    VWAP = "vwap"
+    OHLC_PATH = "ohlc_path"
+    ORDERBOOK_DEPTH = "orderbook_depth"
+    PROBABILISTIC = "probabilistic"
+
+
+class CandleExecutionPath(str, Enum):
+    """
+    Assumed intrabar path when only OHLC candles are available.
+
+    This affects whether SL or TP is considered hit first inside one candle.
+    """
+
+    OPEN_HIGH_LOW_CLOSE = "open_high_low_close"
+    OPEN_LOW_HIGH_CLOSE = "open_low_high_close"
+    CONSERVATIVE = "conservative"
+    OPTIMISTIC = "optimistic"
+    RANDOMIZED = "randomized"
+
+
+class SlippageModel(str, Enum):
+    """
+    Slippage simulation model.
+    """
+
+    NONE = "none"
+    FIXED_BPS = "fixed_bps"
+    FIXED_PRICE = "fixed_price"
+    PERCENT_OF_SPREAD = "percent_of_spread"
+    VOLUME_BASED = "volume_based"
+    VOLATILITY_BASED = "volatility_based"
+    ORDERBOOK_DEPTH = "orderbook_depth"
+    ADVERSE_SELECTION = "adverse_selection"
+
+
+class CommissionModel(str, Enum):
+    """
+    Commission/fee simulation model.
+    """
+
+    NONE = "none"
+    FIXED = "fixed"
+    PERCENTAGE = "percentage"
+    MAKER_TAKER = "maker_taker"
+    EXCHANGE_SPECIFIC = "exchange_specific"
+
+
+class FundingSimulationMode(str, Enum):
+    """
+    Funding cost simulation mode for perpetual futures.
+    """
+
+    DISABLED = "disabled"
+    APPLY_ON_FUNDING_TIMESTAMP = "apply_on_funding_timestamp"
+    PRORATED_CONTINUOUS = "prorated_continuous"
+    ESTIMATED_FROM_RATE = "estimated_from_rate"
+
+
+class LiquidityModel(str, Enum):
+    """
+    Liquidity constraint model for simulated fills.
+    """
+
+    UNLIMITED = "unlimited"
+    CANDLE_VOLUME_PERCENT = "candle_volume_percent"
+    TRADE_VOLUME_PERCENT = "trade_volume_percent"
+    ORDERBOOK_DEPTH = "orderbook_depth"
+    PROBABILISTIC = "probabilistic"
+
+
+class LatencyModel(str, Enum):
+    """
+    Simulated latency model.
+    """
+
+    NONE = "none"
+    FIXED_MS = "fixed_ms"
+    RANDOM_MS = "random_ms"
+    DISTRIBUTION = "distribution"
+
+
+class OrderRejectionReason(str, Enum):
+    """
+    Backtesting-specific order rejection reasons.
+    """
+
+    NONE = "none"
+    INSUFFICIENT_BALANCE = "insufficient_balance"
+    INSUFFICIENT_MARGIN = "insufficient_margin"
+    INSUFFICIENT_LIQUIDITY = "insufficient_liquidity"
+    PRICE_OUT_OF_RANGE = "price_out_of_range"
+    MARKET_CLOSED = "market_closed"
+    KILL_SWITCH_ACTIVE = "kill_switch_active"
+    RISK_REJECTED = "risk_rejected"
+    INVALID_ORDER = "invalid_order"
+    DUPLICATE_ORDER = "duplicate_order"
+    SIMULATION_ERROR = "simulation_error"
+
+
+class SimulatedOrderStatus(str, Enum):
+    """
+    Status of a simulated order inside the backtesting execution layer.
+
+    This is intentionally separate from production execution enums because
+    backtesting may need additional simulation-only states.
     """
 
     CREATED = "created"
@@ -229,170 +315,245 @@ class OrderStatus(StrEnum):
     CANCELLED = "cancelled"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    FAILED = "failed"
 
 
-class OrderRejectReason(StrEnum):
+class SimulatedPositionStatus(str, Enum):
     """
-    Common simulated rejection reasons.
-    """
-
-    INSUFFICIENT_BALANCE = "insufficient_balance"
-    INSUFFICIENT_MARGIN = "insufficient_margin"
-    MAX_POSITION_LIMIT = "max_position_limit"
-    DAILY_LOSS_LIMIT = "daily_loss_limit"
-    KILL_SWITCH_ACTIVE = "kill_switch_active"
-    INVALID_ORDER = "invalid_order"
-    PRICE_OUT_OF_BOUNDS = "price_out_of_bounds"
-    MIN_NOTIONAL_NOT_MET = "min_notional_not_met"
-    RATE_LIMITED = "rate_limited"
-    EXCHANGE_UNAVAILABLE = "exchange_unavailable"
-    UNKNOWN = "unknown"
-
-
-class ExecutionSimulationMode(StrEnum):
-    """
-    How strict the execution simulator should be.
-    """
-
-    IDEAL = "ideal"
-    REALISTIC = "realistic"
-    CONSERVATIVE = "conservative"
-    ORDERBOOK_BASED = "orderbook_based"
-
-
-class OrderSimulationType(StrEnum):
-    """
-    How simulated fills should be calculated.
-    """
-
-    INSTANT_FILL = "instant_fill"
-    NEXT_TICK = "next_tick"
-    NEXT_CANDLE_OPEN = "next_candle_open"
-    NEXT_CANDLE_CLOSE = "next_candle_close"
-    LIMIT_TOUCH = "limit_touch"
-    ORDERBOOK_DEPTH = "orderbook_depth"
-
-
-class FillType(StrEnum):
-    """
-    Type of simulated fill.
-    """
-
-    FULL = "full"
-    PARTIAL = "partial"
-    NONE = "none"
-
-
-class LiquidityRole(StrEnum):
-    """
-    Whether an order is simulated as maker or taker.
-    """
-
-    MAKER = "maker"
-    TAKER = "taker"
-
-
-class FeeModelType(StrEnum):
-    """
-    Fee model used by cost_models.py.
+    Status of a simulated position.
     """
 
     NONE = "none"
-    FIXED = "fixed"
-    BINANCE_FUTURES = "binance_futures"
-    BYBIT_FUTURES = "bybit_futures"
-    OKX_FUTURES = "okx_futures"
-    MEXC_FUTURES = "mexc_futures"
-    CUSTOM = "custom"
-
-
-class SlippageModelType(StrEnum):
-    """
-    Slippage model used by cost_models.py.
-    """
-
-    NONE = "none"
-    FIXED_TICKS = "fixed_ticks"
-    FIXED_BPS = "fixed_bps"
-    PERCENT = "percent"
-    VOLATILITY_BASED = "volatility_based"
-    ORDERBOOK_BASED = "orderbook_based"
-    CUSTOM = "custom"
-
-
-class LatencyModelType(StrEnum):
-    """
-    Latency model used by cost_models.py.
-    """
-
-    NONE = "none"
-    FIXED = "fixed"
-    RANDOM = "random"
-    EXCHANGE_PROFILE = "exchange_profile"
-    CUSTOM = "custom"
-
-
-class PositionStatus(StrEnum):
-    """
-    Simulated position lifecycle status.
-    """
-
+    OPENING = "opening"
     OPEN = "open"
-    PARTIALLY_CLOSED = "partially_closed"
+    REDUCING = "reducing"
+    CLOSING = "closing"
     CLOSED = "closed"
     LIQUIDATED = "liquidated"
 
 
-class PositionCloseReason(StrEnum):
+class PositionAccountingMode(str, Enum):
     """
-    Why a simulated position was closed.
-    """
-
-    SIGNAL_EXIT = "signal_exit"
-    STOP_LOSS = "stop_loss"
-    TAKE_PROFIT = "take_profit"
-    TRAILING_STOP = "trailing_stop"
-    LIQUIDATION = "liquidation"
-    MANUAL = "manual"
-    END_OF_BACKTEST = "end_of_backtest"
-    RISK_REDUCTION = "risk_reduction"
-
-
-class MarginMode(StrEnum):
-    """
-    Futures margin mode.
+    Position accounting mode.
     """
 
-    CROSS = "cross"
-    ISOLATED = "isolated"
+    NETTING = "netting"
+    HEDGE = "hedge"
 
 
-class FundingPaymentSide(StrEnum):
+class PnLAccountingMode(str, Enum):
     """
-    Direction of funding payment from the account perspective.
-    """
-
-    PAID = "paid"
-    RECEIVED = "received"
-    NONE = "none"
-
-
-class MetricPeriod(StrEnum):
-    """
-    Aggregation period for performance metrics.
+    PnL accounting mode.
     """
 
-    TRADE = "trade"
-    HOURLY = "hourly"
-    DAILY = "daily"
-    WEEKLY = "weekly"
-    MONTHLY = "monthly"
-    FULL_RUN = "full_run"
+    REALIZED_ONLY = "realized_only"
+    MARK_TO_MARKET = "mark_to_market"
+    REALIZED_AND_UNREALIZED = "realized_and_unrealized"
 
 
-class ReportFormat(StrEnum):
+class EquityUpdateMode(str, Enum):
     """
-    Supported report export formats.
+    How often the equity curve should be updated.
+    """
+
+    ON_EVERY_EVENT = "on_every_event"
+    ON_TRADE = "on_trade"
+    ON_POSITION_UPDATE = "on_position_update"
+    ON_CANDLE_CLOSE = "on_candle_close"
+    INTERVAL = "interval"
+
+
+class BacktestEventType(str, Enum):
+    """
+    Internal backtesting event categories.
+
+    These are not replacements for production EventBus topics. They are used
+    for recording, reporting and diagnostics.
+    """
+
+    MARKET = "market"
+    ANALYTICS = "analytics"
+    STRATEGY = "strategy"
+    SIGNAL = "signal"
+    RISK = "risk"
+    EXECUTION = "execution"
+    POSITION = "position"
+    COST = "cost"
+    METRIC = "metric"
+    SYSTEM = "system"
+
+
+class SignalOutcome(str, Enum):
+    """
+    Final observed outcome of a generated signal in backtest analytics.
+    """
+
+    GENERATED = "generated"
+    REJECTED_BY_STRATEGY = "rejected_by_strategy"
+    CONFIRMED_BY_RISK = "confirmed_by_risk"
+    BLOCKED_BY_RISK = "blocked_by_risk"
+    ORDER_REJECTED = "order_rejected"
+    ORDER_FILLED = "order_filled"
+    POSITION_OPENED = "position_opened"
+    POSITION_CLOSED_WIN = "position_closed_win"
+    POSITION_CLOSED_LOSS = "position_closed_loss"
+    POSITION_CLOSED_BREAKEVEN = "position_closed_breakeven"
+    EXPIRED = "expired"
+    UNKNOWN = "unknown"
+
+
+class TradeOutcome(str, Enum):
+    """
+    Final outcome of a completed simulated trade.
+    """
+
+    WIN = "win"
+    LOSS = "loss"
+    BREAKEVEN = "breakeven"
+    LIQUIDATED = "liquidated"
+    CANCELLED = "cancelled"
+    OPEN = "open"
+
+
+class MetricAggregation(str, Enum):
+    """
+    Aggregation level for performance metrics.
+    """
+
+    SYSTEM = "system"
+    STRATEGY = "strategy"
+    SYMBOL = "symbol"
+    TIMEFRAME = "timeframe"
+    SETUP_TYPE = "setup_type"
+    MARKET_REGIME = "market_regime"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+
+
+class PerformanceMetric(str, Enum):
+    """
+    Common performance metrics used for reporting, ranking and optimization.
+    """
+
+    NET_PROFIT = "net_profit"
+    NET_PROFIT_PCT = "net_profit_pct"
+    GROSS_PROFIT = "gross_profit"
+    GROSS_LOSS = "gross_loss"
+    TOTAL_TRADES = "total_trades"
+    WIN_RATE = "win_rate"
+    LOSS_RATE = "loss_rate"
+    PROFIT_FACTOR = "profit_factor"
+    EXPECTANCY = "expectancy"
+    EXPECTANCY_R = "expectancy_r"
+    AVERAGE_TRADE = "average_trade"
+    AVERAGE_WIN = "average_win"
+    AVERAGE_LOSS = "average_loss"
+    BEST_TRADE = "best_trade"
+    WORST_TRADE = "worst_trade"
+    MAX_DRAWDOWN = "max_drawdown"
+    MAX_DRAWDOWN_PCT = "max_drawdown_pct"
+    AVERAGE_DRAWDOWN = "average_drawdown"
+    SHARPE_RATIO = "sharpe_ratio"
+    SORTINO_RATIO = "sortino_ratio"
+    CALMAR_RATIO = "calmar_ratio"
+    RECOVERY_FACTOR = "recovery_factor"
+    PAYOFF_RATIO = "payoff_ratio"
+    EXPOSURE_TIME_PCT = "exposure_time_pct"
+    TOTAL_FEES = "total_fees"
+    TOTAL_SLIPPAGE = "total_slippage"
+    TOTAL_FUNDING = "total_funding"
+
+
+class OptimizationMetric(str, Enum):
+    """
+    Objective metrics supported by optimizer.
+    """
+
+    NET_PROFIT = "net_profit"
+    NET_PROFIT_PCT = "net_profit_pct"
+    SHARPE_RATIO = "sharpe_ratio"
+    SORTINO_RATIO = "sortino_ratio"
+    CALMAR_RATIO = "calmar_ratio"
+    PROFIT_FACTOR = "profit_factor"
+    EXPECTANCY = "expectancy"
+    EXPECTANCY_R = "expectancy_r"
+    MAX_DRAWDOWN = "max_drawdown"
+    MAX_DRAWDOWN_PCT = "max_drawdown_pct"
+    WIN_RATE = "win_rate"
+    RECOVERY_FACTOR = "recovery_factor"
+    CUSTOM = "custom"
+
+
+class OptimizationDirection(str, Enum):
+    """
+    Optimization direction for a metric.
+    """
+
+    MAXIMIZE = "maximize"
+    MINIMIZE = "minimize"
+
+
+class OptimizationMethod(str, Enum):
+    """
+    Supported optimization algorithms.
+    """
+
+    GRID_SEARCH = "grid_search"
+    RANDOM_SEARCH = "random_search"
+    BAYESIAN = "bayesian"
+    GENETIC = "genetic"
+    HYPERBAND = "hyperband"
+
+
+class ParameterSampling(str, Enum):
+    """
+    Parameter sampling distribution for optimizer.
+    """
+
+    GRID = "grid"
+    UNIFORM = "uniform"
+    LOG_UNIFORM = "log_uniform"
+    NORMAL = "normal"
+    CHOICE = "choice"
+    BOOLEAN = "boolean"
+
+
+class OverfittingCheckMode(str, Enum):
+    """
+    Overfitting detection mode for optimized strategies.
+    """
+
+    DISABLED = "disabled"
+    TRAIN_TEST_SPLIT = "train_test_split"
+    WALK_FORWARD = "walk_forward"
+    MONTE_CARLO = "monte_carlo"
+    PARAMETER_STABILITY = "parameter_stability"
+
+
+class WalkForwardMode(str, Enum):
+    """
+    Walk-forward evaluation mode.
+    """
+
+    ANCHORED = "anchored"
+    ROLLING = "rolling"
+    EXPANDING = "expanding"
+
+
+class WalkForwardWindowType(str, Enum):
+    """
+    Walk-forward window role.
+    """
+
+    TRAIN = "train"
+    VALIDATION = "validation"
+    TEST = "test"
+
+
+class ReportFormat(str, Enum):
+    """
+    Supported report output formats.
     """
 
     JSON = "json"
@@ -402,187 +563,115 @@ class ReportFormat(StrEnum):
     PARQUET = "parquet"
 
 
-class EquityCurveMode(StrEnum):
+class ReportSection(str, Enum):
     """
-    How equity curve should be updated.
-    """
-
-    ON_TRADE_CLOSE = "on_trade_close"
-    ON_POSITION_UPDATE = "on_position_update"
-    ON_EVERY_MARKET_EVENT = "on_every_market_event"
-
-
-class DrawdownMode(StrEnum):
-    """
-    How drawdown should be calculated.
+    Sections that may be included in a backtest report.
     """
 
-    REALIZED_ONLY = "realized_only"
-    EQUITY_BASED = "equity_based"
-
-
-class ModelAnalyticsScope(StrEnum):
-    """
-    Scope for model analytics aggregation.
-    """
-
-    MODEL = "model"
-    STRATEGY = "strategy"
-    SIGNAL_TYPE = "signal_type"
-    SYMBOL = "symbol"
-    TIMEFRAME = "timeframe"
-    MARKET_REGIME = "market_regime"
-    CONFIDENCE_BUCKET = "confidence_bucket"
-
-
-class PredictionOutcome(StrEnum):
-    """
-    Normalized outcome label for model predictions.
-    """
-
-    TRUE_POSITIVE = "true_positive"
-    FALSE_POSITIVE = "false_positive"
-    TRUE_NEGATIVE = "true_negative"
-    FALSE_NEGATIVE = "false_negative"
-    PROFITABLE = "profitable"
-    LOSING = "losing"
-    BREAKEVEN = "breakeven"
-    MISSED_OPPORTUNITY = "missed_opportunity"
-    UNKNOWN = "unknown"
-
-
-class ConfidenceBucket(StrEnum):
-    """
-    Default confidence buckets for calibration analysis.
-    """
-
-    VERY_LOW = "0.00_0.20"
-    LOW = "0.20_0.40"
-    MEDIUM = "0.40_0.60"
-    HIGH = "0.60_0.80"
-    VERY_HIGH = "0.80_1.00"
-
-
-class MarketRegime(StrEnum):
-    """
-    Common market regimes used by model analytics.
-
-    Analytics modules may produce more specific regime labels,
-    but these are the default normalized buckets.
-    """
-
-    UNKNOWN = "unknown"
-    TREND_UP = "trend_up"
-    TREND_DOWN = "trend_down"
-    RANGE = "range"
-    HIGH_VOLATILITY = "high_volatility"
-    LOW_VOLATILITY = "low_volatility"
-    LIQUIDATION_CASCADE = "liquidation_cascade"
-    FUNDING_EXTREME = "funding_extreme"
-    OPEN_INTEREST_EXPANSION = "open_interest_expansion"
-    OPEN_INTEREST_COMPRESSION = "open_interest_compression"
-
-
-class OptimizationMode(StrEnum):
-    """
-    Parameter optimization mode.
-    """
-
-    GRID_SEARCH = "grid_search"
-    RANDOM_SEARCH = "random_search"
-    WALK_FORWARD = "walk_forward"
-
-
-class OptimizationObjective(StrEnum):
-    """
-    Objective used by optimizer.py.
-    """
-
-    NET_PNL = "net_pnl"
-    TOTAL_RETURN = "total_return"
-    SHARPE = "sharpe"
-    SORTINO = "sortino"
-    CALMAR = "calmar"
-    PROFIT_FACTOR = "profit_factor"
-    MAX_DRAWDOWN = "max_drawdown"
-    EXPECTANCY = "expectancy"
-    WIN_RATE = "win_rate"
-    MODEL_ACCURACY = "model_accuracy"
-    CUSTOM = "custom"
-
-
-class WalkForwardWindowMode(StrEnum):
-    """
-    Walk-forward window behavior.
-    """
-
-    ROLLING = "rolling"
-    EXPANDING = "expanding"
-    ANCHORED = "anchored"
-
-
-class DataQualityStatus(StrEnum):
-    """
-    Data quality status for downloaded or loaded history.
-    """
-
-    VALID = "valid"
-    PARTIAL = "partial"
-    EMPTY = "empty"
-    HAS_GAPS = "has_gaps"
-    HAS_DUPLICATES = "has_duplicates"
-    OUT_OF_ORDER = "out_of_order"
-    INVALID_SCHEMA = "invalid_schema"
-
-
-class GapHandlingPolicy(StrEnum):
-    """
-    Policy used when historical data has missing intervals.
-    """
-
-    FAIL = "fail"
-    WARN = "warn"
-    SKIP = "skip"
-    FORWARD_FILL = "forward_fill"
-    BACK_FILL = "back_fill"
-
-
-class DuplicateHandlingPolicy(StrEnum):
-    """
-    Policy used when historical data contains duplicate records.
-    """
-
-    FAIL = "fail"
-    KEEP_FIRST = "keep_first"
-    KEEP_LAST = "keep_last"
-    MERGE = "merge"
-
-
-class StorageFormat(StrEnum):
-    """
-    Supported storage formats for historical data and results.
-    """
-
-    PARQUET = "parquet"
-    CSV = "csv"
-    JSON = "json"
-    POSTGRES = "postgres"
-
-
-class BacktestArtifactType(StrEnum):
-    """
-    Types of artifacts produced by a backtest run.
-    """
-
-    CONFIG_SNAPSHOT = "config_snapshot"
-    TRADES = "trades"
-    ORDERS = "orders"
-    FILLS = "fills"
-    POSITIONS = "positions"
-    SIGNALS = "signals"
-    RISK_BLOCKS = "risk_blocks"
+    SUMMARY = "summary"
     EQUITY_CURVE = "equity_curve"
-    DRAWDOWN_CURVE = "drawdown_curve"
-    PERFORMANCE_METRICS = "performance_metrics"
-    MODEL_ANALYTICS = "model_analytics"
-    REPORT = "report"
+    DRAWDOWN = "drawdown"
+    TRADES = "trades"
+    POSITIONS = "positions"
+    STRATEGIES = "strategies"
+    SYMBOLS = "symbols"
+    TIMEFRAMES = "timeframes"
+    RISK = "risk"
+    EXECUTION = "execution"
+    COSTS = "costs"
+    FUNDING = "funding"
+    SIGNALS = "signals"
+    REGIMES = "regimes"
+    WALK_FORWARD = "walk_forward"
+    OPTIMIZATION = "optimization"
+    WARNINGS = "warnings"
+
+
+class BacktestArtifactType(str, Enum):
+    """
+    Output artifact types produced by a backtest run.
+    """
+
+    RESULT_JSON = "result_json"
+    REPORT_MARKDOWN = "report_markdown"
+    REPORT_HTML = "report_html"
+    TRADES_CSV = "trades_csv"
+    POSITIONS_CSV = "positions_csv"
+    EQUITY_CURVE_CSV = "equity_curve_csv"
+    EVENTS_JSONL = "events_jsonl"
+    METRICS_JSON = "metrics_json"
+    OPTIMIZATION_RESULTS = "optimization_results"
+
+
+class BacktestWarningLevel(str, Enum):
+    """
+    Severity level for warnings generated during a backtest.
+    """
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class StressScenario(str, Enum):
+    """
+    Optional stress scenarios for robustness testing.
+    """
+
+    NONE = "none"
+    HIGH_SLIPPAGE = "high_slippage"
+    HIGH_FEES = "high_fees"
+    LOW_LIQUIDITY = "low_liquidity"
+    LATENCY_SPIKE = "latency_spike"
+    FUNDING_SPIKE = "funding_spike"
+    GAP_MOVE = "gap_move"
+    FLASH_CRASH = "flash_crash"
+    EXCHANGE_OUTAGE = "exchange_outage"
+
+
+__all__ = [
+    "BacktestMode",
+    "BacktestStatus",
+    "BacktestPhase",
+    "BacktestDataType",
+    "HistoricalDataFormat",
+    "DataValidationLevel",
+    "DataGapPolicy",
+    "DataAlignmentPolicy",
+    "ReplayMode",
+    "ReplaySpeed",
+    "ReplayOrdering",
+    "ReplayEventPriority",
+    "WarmupPolicy",
+    "FillModel",
+    "CandleExecutionPath",
+    "SlippageModel",
+    "CommissionModel",
+    "FundingSimulationMode",
+    "LiquidityModel",
+    "LatencyModel",
+    "OrderRejectionReason",
+    "SimulatedOrderStatus",
+    "SimulatedPositionStatus",
+    "PositionAccountingMode",
+    "PnLAccountingMode",
+    "EquityUpdateMode",
+    "BacktestEventType",
+    "SignalOutcome",
+    "TradeOutcome",
+    "MetricAggregation",
+    "PerformanceMetric",
+    "OptimizationMetric",
+    "OptimizationDirection",
+    "OptimizationMethod",
+    "ParameterSampling",
+    "OverfittingCheckMode",
+    "WalkForwardMode",
+    "WalkForwardWindowType",
+    "ReportFormat",
+    "ReportSection",
+    "BacktestArtifactType",
+    "BacktestWarningLevel",
+    "StressScenario",
+]
