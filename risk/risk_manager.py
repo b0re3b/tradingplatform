@@ -558,7 +558,9 @@ class RiskManager:
                 signal_id=request.signal_id,
                 strategy_name=request.strategy_name,
                 order_intent=request.order_intent,
+                **RiskManager._pass_through_from_request(request),
                 violations=self._collect_violations(checks),
+                metadata=RiskManager._metadata_for_decision(request),
                 checks=checks,
             )
             return finalize(decision)
@@ -664,7 +666,9 @@ class RiskManager:
                 signal_id=request.signal_id,
                 strategy_name=request.strategy_name,
                 order_intent=request.order_intent,
+                **RiskManager._pass_through_from_request(request),
                 violations=self._collect_violations(checks),
+                metadata=RiskManager._metadata_for_decision(request),
                 checks=checks,
             )
             return finalize(decision)
@@ -723,7 +727,9 @@ class RiskManager:
                 signal_id=request.signal_id,
                 strategy_name=request.strategy_name,
                 order_intent=request.order_intent,
+                **RiskManager._pass_through_from_request(request),
                 violations=self._collect_violations(checks),
+                metadata=RiskManager._metadata_for_decision(request),
                 checks=checks,
             )
             return finalize(decision)
@@ -856,17 +862,23 @@ class RiskManager:
             symbol=request.symbol,
             side=request.side,
             order_intent=request.order_intent,
+            **RiskManager._pass_through_from_request(request),
             violations=self._collect_violations(checks),
             checks=checks,
-            metadata={
-                "risk_unit_snapshot": risk_unit_snapshot,
-                "tier_profile": tier_profile,
-                "expected_value_snapshot": ev_snapshot,
-                "confidence": request.confidence,
-                "edge_score": request.edge_score,
-                "liquidity_class": request.liquidity_class.value,
-                "execution_quality": request.execution_quality.value,
-            },
+            metadata=RiskManager._metadata_for_decision(
+                request,
+                risk_metadata={
+                    "risk_unit_snapshot": risk_unit_snapshot,
+                    "tier_profile": tier_profile,
+                    "expected_value_snapshot": ev_snapshot,
+                    "confidence": request.confidence,
+                    "edge_score": request.edge_score,
+                    "liquidity_class": request.liquidity_class.value,
+                    "execution_quality": request.execution_quality.value,
+                    "sizing": sizing_metadata,
+                    "exposure": exposure_metadata,
+                },
+            ),
         )
 
         self._circuit_breaker.register_success()
@@ -1918,6 +1930,53 @@ class RiskManager:
         return violations
 
     @staticmethod
+    def _pass_through_from_request(request: RiskEvaluationRequest) -> dict[str, Any]:
+        """
+        Preserve non-risk strategy/source fields on every RiskDecision.
+
+        These fields are not part of risk math, but they are part of the
+        cross-module event contract required by execution, dashboard and
+        backtesting.
+        """
+        return {
+            "event_version": request.event_version,
+            "category": request.category,
+            "setup_type": request.setup_type,
+            "timeframe": request.timeframe,
+            "exchange": request.exchange,
+            "market_type": request.market_type,
+            "source_topic": request.source_topic,
+            "priority_score": request.priority_score,
+        }
+
+    @staticmethod
+    def _metadata_for_decision(
+            request: RiskEvaluationRequest,
+            *,
+            risk_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Keep the original strategy metadata and risk metadata separated.
+
+        This prevents RiskManager from overwriting strategy trace data such as
+        reasons, confirmations, source_features, setup_type, regime and
+        confluence details when it emits signal.confirmed.
+        """
+        strategy_metadata = dict(request.metadata or {})
+        return {
+            "strategy": strategy_metadata,
+            "risk": dict(risk_metadata or {}),
+            "event_version": request.event_version,
+            "category": request.category,
+            "setup_type": request.setup_type,
+            "timeframe": request.timeframe,
+            "exchange": request.exchange,
+            "market_type": request.market_type,
+            "source_topic": request.source_topic,
+            "priority_score": request.priority_score,
+        }
+
+    @staticmethod
     def _build_terminal_decision(
             *,
             request: RiskEvaluationRequest,
@@ -1951,9 +2010,23 @@ class RiskManager:
             symbol=request.symbol,
             side=request.side,
             order_intent=request.order_intent,
+            **RiskManager._pass_through_from_request(request),
             violations=RiskManager._collect_violations(checks),
             checks=checks,
-            metadata=dict(request.metadata),
+            metadata=RiskManager._metadata_for_decision(
+                request,
+                risk_metadata={
+                    "terminal_check": {
+                        "decision": check.decision.value,
+                        "reason": reason,
+                        "adjusted_tier": check.adjusted_tier.value if check.adjusted_tier else None,
+                        "adjusted_size": check.adjusted_size,
+                        "adjusted_margin": check.adjusted_margin,
+                        "adjusted_leverage": check.adjusted_leverage,
+                        "adjusted_risk_amount": check.adjusted_risk_amount,
+                    }
+                },
+            ),
         )
 
     @staticmethod
@@ -1999,10 +2072,18 @@ class RiskManager:
             decision: RiskDecision,
     ) -> dict[str, Any]:
         return {
+            "event_version": decision.event_version or request.event_version,
             "symbol": request.symbol,
             "side": request.side.value,
             "signal_id": request.signal_id,
             "strategy_name": request.strategy_name,
+            "category": decision.category or request.category,
+            "setup_type": decision.setup_type or request.setup_type,
+            "timeframe": decision.timeframe or request.timeframe,
+            "exchange": decision.exchange or request.exchange,
+            "market_type": decision.market_type or request.market_type,
+            "source_topic": decision.source_topic or request.source_topic,
+            "priority_score": decision.priority_score if decision.priority_score is not None else request.priority_score,
             "allowed": decision.allowed,
             "decision": decision.decision.value,
             "risk_mode": decision.risk_mode.value,
@@ -2091,6 +2172,38 @@ class RiskManager:
                 for key, value in raw_metadata.items()
             }
 
+        def value_for(key: str, default: Any = None) -> Any:
+            value = payload.get(key)
+            if value is not None:
+                return value
+            return metadata.get(key, default)
+
+        order_intent = RiskManager._enum_from_value(
+            OrderIntent,
+            value_for("order_intent", OrderIntent.OPEN.value),
+        )
+        reduce_only = bool(value_for("reduce_only", False))
+
+        # Normalize contradictory payloads before they reach guards. If strategy
+        # or execution sends reduce_only=True together with an increasing intent,
+        # the intent must be treated as REDUCE for risk budgeting/exposure logic.
+        if reduce_only and getattr(order_intent, "increases_risk", False):
+            order_intent = OrderIntent.REDUCE
+
+        for passthrough_key in (
+            "event_version",
+            "category",
+            "setup_type",
+            "timeframe",
+            "exchange",
+            "market_type",
+            "source_topic",
+            "priority_score",
+        ):
+            passthrough_value = payload.get(passthrough_key)
+            if passthrough_value is not None:
+                metadata.setdefault(passthrough_key, passthrough_value)
+
         return RiskEvaluationRequest(
             symbol=str(symbol),
             side=RiskManager._enum_from_value(PositionSide, side_raw),
@@ -2099,11 +2212,16 @@ class RiskManager:
             take_profit=RiskManager._to_float_or_none(payload.get("take_profit")),
             signal_id=payload.get("signal_id"),
             strategy_name=payload.get("strategy_name"),
+            event_version=str(value_for("event_version", "1.0")),
+            category=value_for("category"),
+            setup_type=value_for("setup_type"),
+            timeframe=value_for("timeframe"),
+            exchange=value_for("exchange"),
+            market_type=value_for("market_type"),
+            source_topic=value_for("source_topic"),
+            priority_score=RiskManager._to_float_or_none(value_for("priority_score")),
             tier=RiskManager._optional_enum_from_value(TradeTier, payload.get("tier")),
-            order_intent=RiskManager._enum_from_value(
-                OrderIntent,
-                payload.get("order_intent", OrderIntent.OPEN.value),
-            ),
+            order_intent=order_intent,
             liquidity_class=RiskManager._enum_from_value(
                 LiquidityClass,
                 payload.get("liquidity_class", LiquidityClass.NORMAL.value),
@@ -2127,10 +2245,10 @@ class RiskManager:
             requested_leverage=RiskManager._to_float_or_none(
                 payload.get("requested_leverage")
             ),
-            reduce_only=bool(payload.get("reduce_only", False)),
+            reduce_only=reduce_only,
             margin_mode=RiskManager._enum_from_value(
                 MarginMode,
-                payload.get("margin_mode", MarginMode.ISOLATED.value),
+                value_for("margin_mode", MarginMode.ISOLATED.value),
             ),
             timestamp=RiskManager._to_float_or_none(payload.get("timestamp")),
             metadata=metadata,

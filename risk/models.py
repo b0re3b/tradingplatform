@@ -144,6 +144,19 @@ class RiskEvaluationRequest:
     signal_id: str | None = None
     strategy_name: str | None = None
 
+    # Stable pass-through contract fields from strategy.signal_generated.
+    # Risk does not make decisions from these fields directly, but execution,
+    # dashboard and backtesting need them preserved on signal.confirmed /
+    # risk.position_blocked / risk.kill_switch payloads.
+    event_version: str = "1.0"
+    category: str | None = None
+    setup_type: str | None = None
+    timeframe: str | None = None
+    exchange: str | None = None
+    market_type: str | None = None
+    source_topic: str | None = None
+    priority_score: float | None = None
+
     tier: TradeTier | None = None
     order_intent: OrderIntent = OrderIntent.OPEN
     liquidity_class: LiquidityClass = LiquidityClass.NORMAL
@@ -327,6 +340,17 @@ class RiskDecision:
     symbol: str | None = None
     side: PositionSide | None = None
     order_intent: OrderIntent | None = None
+
+    # Pass-through source contract. These fields are copied from
+    # RiskEvaluationRequest so every downstream event has one stable shape.
+    event_version: str = "1.0"
+    category: str | None = None
+    setup_type: str | None = None
+    timeframe: str | None = None
+    exchange: str | None = None
+    market_type: str | None = None
+    source_topic: str | None = None
+    priority_score: float | None = None
 
     violations: list[RiskViolation] = field(default_factory=list)
     checks: dict[str, RiskCheckResult] = field(default_factory=dict)

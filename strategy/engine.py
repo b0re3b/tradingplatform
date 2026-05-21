@@ -537,6 +537,11 @@ class StrategyEventHandler(BaseStrategyComponent):
         feedback_topics = {
             "signal.confirmed": self._handle_signal_confirmed,
             "risk.position_blocked": self._handle_signal_blocked,
+            "risk.limit_warning": self._handle_risk_limit_warning,
+            "risk.size_adjusted": self._handle_risk_size_adjusted,
+            "risk.kill_switch": self._handle_risk_kill_switch,
+            "risk.trading_halted": self._handle_risk_trading_halted,
+            "risk.trading_resumed": self._handle_risk_trading_resumed,
             "execution.order_rejected": self._handle_execution_rejected,
             "execution.order_failed": self._handle_execution_failed,
             "execution.order_filled": self._handle_execution_filled,
@@ -624,6 +629,52 @@ class StrategyEventHandler(BaseStrategyComponent):
             reason=payload.get("reason") or "risk_position_blocked",
         )
 
+    async def _handle_risk_limit_warning(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.CONFIRMED,
+            reason=payload.get("reason") or "risk_limit_warning",
+        )
+
+    async def _handle_risk_size_adjusted(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.CONFIRMED,
+            reason=payload.get("reason") or "risk_size_adjusted",
+        )
+
+    async def _handle_risk_kill_switch(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        state = getattr(self.engine, "state", None)
+        if state is not None:
+            set_halt = getattr(state, "set_risk_halt", None)
+            if callable(set_halt):
+                set_halt(active=True, reason=payload.get("reason") or "risk_kill_switch")
+
+        self._mark_signal_status(
+            payload=payload,
+            status=SignalStatus.REJECTED,
+            reason=payload.get("reason") or "risk_kill_switch",
+        )
+
+    async def _handle_risk_trading_halted(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        state = getattr(self.engine, "state", None)
+        if state is not None:
+            set_halt = getattr(state, "set_risk_halt", None)
+            if callable(set_halt):
+                set_halt(active=True, reason=payload.get("reason") or "risk_trading_halted")
+
+    async def _handle_risk_trading_resumed(self, event: Event | Any) -> None:
+        payload = _payload_from_event(event)
+        state = getattr(self.engine, "state", None)
+        if state is not None:
+            set_halt = getattr(state, "set_risk_halt", None)
+            if callable(set_halt):
+                set_halt(active=False, reason=payload.get("reason") or "risk_trading_resumed")
+
     async def _handle_execution_rejected(self, event: Event | Any) -> None:
         payload = _payload_from_event(event)
         self._mark_signal_status(
@@ -663,32 +714,21 @@ class StrategyEventHandler(BaseStrategyComponent):
         status: SignalStatus,
         reason: str,
     ) -> None:
-        signal_id = payload.get("signal_id")
-        symbol = payload.get("symbol")
-
         state = getattr(self.engine, "state", None)
         if state is None:
             return
 
-        signal = None
-
-        signals_state = getattr(state, "signals", None)
-        if signals_state is not None:
-            by_id = getattr(signals_state, "signal_by_id", None)
-            if isinstance(by_id, dict) and isinstance(signal_id, str):
-                signal = by_id.get(signal_id)
-
-            if signal is None and isinstance(symbol, str):
-                get_last_for_symbol = getattr(signals_state, "get_last_for_symbol", None)
-                if callable(get_last_for_symbol):
-                    signal = get_last_for_symbol(symbol)
-
-        if signal is None:
-            return
-
-        signal.status = status
-        signal.add_reason(reason)
-        state.update_signal(signal, active=signal.is_active)
+        # Delegate lookup/update to StrategyRuntimeState so downstream events are
+        # matched by signal_id first and then by symbol/strategy/side. This avoids
+        # accidentally updating the last signal for a symbol when several
+        # strategies produced signals for the same instrument.
+        marker = getattr(state, "mark_signal_status_from_payload", None)
+        if callable(marker):
+            marker(
+                payload=payload,
+                status=status,
+                default_reason=reason,
+            )
 
     def _analytics_topics(self) -> list[str]:
         """

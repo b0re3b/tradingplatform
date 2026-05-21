@@ -177,13 +177,29 @@ class SignalState:
 
         Priority:
         1. signal_id;
-        2. symbol + side;
-        3. symbol;
-        4. strategy_name.
+        2. exact symbol + strategy_name + side;
+        3. exact symbol + strategy_name;
+        4. symbol + side;
+        5. symbol;
+        6. strategy_name.
         """
         signal = self.get_by_signal_id(signal_id)
         if signal is not None:
             return signal
+
+        if symbol and strategy_name and side is not None:
+            for candidate in self.signal_by_id.values():
+                if (
+                    candidate.symbol == symbol
+                    and candidate.strategy_name == strategy_name
+                    and candidate.side is side
+                ):
+                    return candidate
+
+        if symbol and strategy_name:
+            for candidate in self.signal_by_id.values():
+                if candidate.symbol == symbol and candidate.strategy_name == strategy_name:
+                    return candidate
 
         if symbol and side is not None:
             signal = self.get_last_for_symbol_side(symbol, side)
@@ -1158,6 +1174,9 @@ class StrategyRuntimeState:
     blocked_symbols: set[str] = field(default_factory=set)
     active_symbols: set[str] = field(default_factory=set)
 
+    risk_halt_active: bool = False
+    risk_halt_reason: str | None = None
+
     started_at: datetime = field(default_factory=utcnow)
     updated_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -1167,6 +1186,22 @@ class StrategyRuntimeState:
 
     def touch(self) -> None:
         self.updated_at = utcnow()
+
+    def set_risk_halt(
+        self,
+        *,
+        active: bool,
+        reason: str | None = None,
+    ) -> None:
+        """
+        Mirror global risk halt / kill-switch state for strategy runtime,
+        dashboard and backtesting.
+        """
+        self.risk_halt_active = bool(active)
+        self.risk_halt_reason = reason if active else None
+        self.metadata["risk_halt_active"] = self.risk_halt_active
+        self.metadata["risk_halt_reason"] = self.risk_halt_reason
+        self.touch()
 
     def validate(self) -> None:
         self.signals.validate()

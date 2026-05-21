@@ -12113,6 +12113,7 @@ class SignalBuilder(BaseStrategyComponent):
 
         entry_price = signal.primary_entry_price
         stop_loss = signal.primary_stop_loss
+        take_profit = signal.primary_take_profit
 
         if entry_price is None or entry_price <= 0:
             raise BuilderError("risk-ready signal requires entry_price > 0")
@@ -12120,11 +12121,20 @@ class SignalBuilder(BaseStrategyComponent):
         if stop_loss is None or stop_loss <= 0:
             raise BuilderError("risk-ready signal requires stop_loss > 0")
 
+        if take_profit is None or take_profit <= 0:
+            raise BuilderError("risk-ready signal requires take_profit > 0")
+
         if signal.side is SignalSide.LONG and stop_loss >= entry_price:
             raise BuilderError("long signal stop_loss must be below entry_price")
 
         if signal.side is SignalSide.SHORT and stop_loss <= entry_price:
             raise BuilderError("short signal stop_loss must be above entry_price")
+
+        if signal.side is SignalSide.LONG and take_profit <= entry_price:
+            raise BuilderError("long signal take_profit must be above entry_price")
+
+        if signal.side is SignalSide.SHORT and take_profit >= entry_price:
+            raise BuilderError("short signal take_profit must be below entry_price")
 
     def _resolve_entry(
         self,
