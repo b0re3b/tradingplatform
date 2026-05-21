@@ -30,15 +30,18 @@ import inspect
 import os
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from backtesting.config import BacktestConfig
-from backtesting.enums import BacktestDataType
-from backtesting.exceptions import BacktestDependencyError
 from core.config import Config
 from core.event_bus import EventBus
 from core.logger import get_logger
 from core.scheduler import Scheduler
+
+from backtesting.config import BacktestConfig
+from backtesting.enums import BacktestDataType
+from backtesting.exceptions import BacktestDependencyError
+
 
 ComponentFactory = Callable[..., Any]
 
@@ -1751,7 +1754,7 @@ class BacktestProjectBootstrap:
 
         risk_config = self.build_risk_config(core_config)
         cls = import_required("risk.risk_manager.RiskManager")
-        return construct_with_signature(
+        risk_manager = construct_with_signature(
             cls,
             {
                 "config": risk_config,
@@ -1763,90 +1766,70 @@ class BacktestProjectBootstrap:
             },
         )
 
-    def patch_risk_config_for_backtest(self, risk_config: Any) -> None:
-        if risk_config is None:
-            return
+        # Backtest-only account seed. Keep this deliberately narrow:
+        # seed only RiskManager.state / state.portfolio via the existing helper,
+        # and do not mutate StrategyTester, SignalProcessor or strategies.
+        initial_balance = float(getattr(self.backtest_config, "initial_balance", 0.0) or 0.0)
+        if initial_balance > 0.0:
+            self.seed_risk_state_for_backtest(
+                risk_manager,
+                initial_balance=initial_balance,
+            )
 
-        initial_balance = 10_000.0
-        if self.backtest_config is not None:
-            initial_balance = float(
-                getattr(self.backtest_config, "initial_balance", initial_balance) or initial_balance)
+        return risk_manager
 
-        # Account/equity/balance aliases.
-        for field_name in (
-                "initial_balance",
-                "account_balance",
-                "account_equity",
-                "equity",
-                "balance",
-                "starting_balance",
-                "portfolio_equity",
-        ):
-            if hasattr(risk_config, field_name):
-                current = getattr(risk_config, field_name, None)
-                try:
-                    current_float = float(current)
-                except (TypeError, ValueError):
-                    current_float = 0.0
-
-                if current_float <= 0:
-                    setattr(risk_config, field_name, initial_balance)
-
-        # Risk per trade aliases.
-        for field_name in (
-                "risk_per_trade_pct",
-                "max_risk_per_trade_pct",
-                "default_risk_per_trade_pct",
-        ):
-            if hasattr(risk_config, field_name):
-                current = getattr(risk_config, field_name, None)
-                try:
-                    current_float = float(current)
-                except (TypeError, ValueError):
-                    current_float = 0.0
-
-                if current_float <= 0:
-                    setattr(risk_config, field_name, 0.01)
-
-        # Fixed risk aliases.
-        for field_name in (
-                "fixed_risk_amount",
-                "default_risk_amount",
-                "min_risk_amount",
-        ):
-            if hasattr(risk_config, field_name):
-                current = getattr(risk_config, field_name, None)
-                try:
-                    current_float = float(current)
-                except (TypeError, ValueError):
-                    current_float = 0.0
-
-                if current_float <= 0:
-                    setattr(risk_config, field_name, max(1.0, initial_balance * 0.001))
-
-        validate = getattr(risk_config, "validate", None)
-        if callable(validate):
-            validate()
-    def build_risk_config(self, core_config: Config) -> Any:
+    @staticmethod
+    def build_risk_config(core_config: Config) -> Any:
         risk_config_cls = import_object_or_none("risk.config.RiskConfig")
         if risk_config_cls is None:
-            risk_config = getattr(core_config, "risk", None)
-        else:
-            existing = getattr(core_config, "risk", None)
-            if isinstance(existing, risk_config_cls):
-                risk_config = existing
-            else:
-                risk_config = construct_with_signature(
-                    risk_config_cls,
-                    {
-                        "core_config": core_config,
-                        "app_config": core_config,
-                    },
-                )
+            return getattr(core_config, "risk", None)
 
-        self.patch_risk_config_for_backtest(risk_config)
-        return risk_config
+        existing = getattr(core_config, "risk", None)
+        if isinstance(existing, risk_config_cls):
+            return existing
 
+        return construct_with_signature(
+            risk_config_cls,
+            {
+                "core_config": core_config,
+                "app_config": core_config,
+            },
+        )
+
+    def seed_risk_state_for_backtest(
+            self,
+            risk_manager: Any,
+            *,
+            initial_balance: float,
+    ) -> None:
+        state = getattr(risk_manager, "state", None)
+        if state is None:
+            return
+
+        for field_name in (
+                "equity",
+                "balance",
+                "account_equity",
+                "account_balance",
+                "available_balance",
+                "available_margin",
+                "cash",
+        ):
+            if hasattr(state, field_name):
+                setattr(state, field_name, float(initial_balance))
+
+        portfolio = getattr(state, "portfolio", None)
+        if portfolio is not None:
+            for field_name in (
+                    "equity",
+                    "balance",
+                    "account_equity",
+                    "available_balance",
+                    "available_margin",
+                    "cash",
+            ):
+                if hasattr(portfolio, field_name):
+                    setattr(portfolio, field_name, float(initial_balance))
     # ------------------------------------------------------------------
     # Generic component helpers
     # ------------------------------------------------------------------

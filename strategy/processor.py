@@ -7,7 +7,6 @@ from typing import Any, TypeVar
 
 from core.event_bus import EventBus, EventPriority
 from core.scheduler import Scheduler
-
 from strategy.base import BaseStrategy, BaseStrategyComponent
 from strategy.config import (
     BuilderConfig,
@@ -69,7 +68,6 @@ from strategy.models import (
 )
 from strategy.registry import StrategyRegistry
 from strategy.state import StrategyRuntimeState
-
 
 EnumT = TypeVar("EnumT")
 
@@ -6944,9 +6942,9 @@ class ConfluenceEngine(BaseStrategyComponent):
 
     @staticmethod
     def _merge(
-            *,
-            result: ConfluenceResult,
-            signals: list[StrategySignal],
+        *,
+        result: ConfluenceResult,
+        signals: list[StrategySignal],
     ) -> StrategySignal | None:
         if not signals:
             return None
