@@ -26,10 +26,8 @@ from typing import Any
 
 import aiohttp
 
-from trading_system.core.logger import get_logger
-
+from core.logger import get_logger
 from .config import TelegramBotConfig
-from .enums import TelegramDeliveryStatus
 from .exceptions import (
     TelegramAPIError,
     TelegramClientError,

@@ -25,16 +25,13 @@ from dataclasses import dataclass
 from time import time
 from typing import Any
 
-from trading_system.core.event_bus import Event, EventBus, EventPriority
-from trading_system.core.logger import get_logger
-
+from core.event_bus import Event, EventBus, EventPriority
+from core.logger import get_logger
 from .client import TelegramBotClient
 from .config import TelegramBotConfig
 from .enums import (
     TelegramDeliveryStatus,
-    TelegramEventCategory,
     TelegramMessageType,
-    TelegramRoutePolicy,
     TelegramTopic,
 )
 from .exceptions import (

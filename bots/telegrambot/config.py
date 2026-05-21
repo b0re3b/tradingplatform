@@ -1,17 +1,3 @@
-"""
-Telegram bot package config.
-
-Конфіг Telegram notification layer.
-
-Правила:
-- bot_token не hardcode-иться і не логиться;
-- усі параметри typed;
-- dataclass(slots=True);
-- Telegram bot не містить торгової логіки;
-- routing у topic-гілки задається через topic_ids;
-- service/client/handlers отримують цей config через constructor dependency injection.
-"""
-
 from __future__ import annotations
 
 import os
@@ -80,17 +66,9 @@ class TelegramRateLimitConfig:
     """
 
     enabled: bool = True
-
-    # Глобальний soft-limit для всього бота.
     max_messages_per_second: float = 20.0
-
-    # Soft-limit на окрему topic-гілку.
     max_messages_per_topic_per_minute: int = 60
-
-    # Якщо true — замість exception повідомлення можуть бути пропущені/відкладені.
     drop_when_limited: bool = False
-
-    # Мінімальна пауза між повідомленнями в одну й ту саму гілку.
     min_interval_per_topic_sec: float = 0.25
 
     def validate(self) -> None:
@@ -215,28 +193,26 @@ class TelegramBotConfig:
     @classmethod
     def default_topic_ids(cls) -> dict[TelegramTopic, int]:
         """
-        Повертає порожній mapping з усіма очікуваними topic keys.
+        Повертає mapping з реальними message_thread_id для кожної topic-гілки.
 
-        Реальні message_thread_id треба задати з env/config після створення
-        Telegram forum topics.
+        Значення задаються напряму в коді після створення Telegram forum topics.
         """
 
         return {
-            TelegramTopic.ORDERFLOW: 0,
-            TelegramTopic.LIQUIDITY: 0,
-            TelegramTopic.PRICE_ACTION: 0,
-            TelegramTopic.LIQUIDATIONS: 0,
-            TelegramTopic.WHALES: 0,
-            TelegramTopic.SPOOFING: 0,
-            TelegramTopic.SPREADS: 0,
-            TelegramTopic.FUNDING: 0,
-            TelegramTopic.OPEN_INTEREST: 0,
-            TelegramTopic.NEWS: 0,
-            TelegramTopic.SIGNALS: 0,
-            TelegramTopic.OPEN_TRADES: 0,
-            TelegramTopic.CLOSED_TRADES: 0,
-            TelegramTopic.RISK: 0,
-            TelegramTopic.SYSTEM: 0,
+            TelegramTopic.ORDERFLOW:     10,
+            TelegramTopic.LIQUIDITY:     21,
+            TelegramTopic.PRICE_ACTION:  12,
+            TelegramTopic.LIQUIDATIONS:  20,
+            TelegramTopic.WHALES:        24,
+            TelegramTopic.SPOOFING:      22,
+            TelegramTopic.SPREADS:       23,
+            TelegramTopic.FUNDING:       19,
+            TelegramTopic.OPEN_INTEREST: 11,
+            TelegramTopic.NEWS:          2,
+            TelegramTopic.SIGNALS:       3,
+            TelegramTopic.OPEN_TRADES:   4,
+            TelegramTopic.CLOSED_TRADES: 25,
+
         }
 
     @classmethod
@@ -244,19 +220,13 @@ class TelegramBotConfig:
         """
         Створює TelegramBotConfig з environment variables.
 
+        topic_ids беруться з default_topic_ids() — тобто задані напряму в коді.
+
         Приклади env:
         - TELEGRAM_BOT_ENABLED=true
         - TELEGRAM_BOT_TOKEN=...
         - TELEGRAM_BOT_CHAT_ID=-1001234567890
-        - TELEGRAM_BOT_TOPIC_ORDERFLOW=111
-        - TELEGRAM_BOT_TOPIC_NEWS=222
-        - TELEGRAM_BOT_TOPIC_OPEN_TRADES=333
-        - TELEGRAM_BOT_TOPIC_CLOSED_TRADES=444
-
-        Token не валідується на формат тут, тільки на наявність.
         """
-
-        topic_ids = cls._topic_ids_from_env(prefix=prefix)
 
         config = cls(
             enabled=_to_bool(os.getenv(f"{prefix}ENABLED"), default=True),
@@ -388,7 +358,7 @@ class TelegramBotConfig:
                     default=0.25,
                 ),
             ),
-            topic_ids=topic_ids,
+            topic_ids=cls.default_topic_ids(),
         )
 
         config.topics = config.build_topic_configs()
@@ -572,9 +542,6 @@ class TelegramBotConfig:
     def _validate_required_topics(self) -> None:
         """
         Перевіряє мінімальний набір topic-гілок для поточно увімкнених features.
-
-        Не вимагаємо всі analytics topics обовʼязково, бо можна поступово
-        вмикати гілки. Але ключові гілки для trading lifecycle краще задати.
         """
 
         required: list[TelegramTopic] = []
@@ -590,12 +557,6 @@ class TelegramBotConfig:
                 ]
             )
 
-        if self.enable_risk_alerts:
-            required.append(TelegramTopic.RISK)
-
-        if self.enable_system_alerts and self.route_policy == TelegramRoutePolicy.SEND_TO_SYSTEM:
-            required.append(TelegramTopic.SYSTEM)
-
         missing = [topic.value for topic in required if not self.is_topic_enabled(topic)]
 
         if missing:
@@ -603,36 +564,6 @@ class TelegramBotConfig:
                 "Telegram required topic ids are missing.",
                 details={"missing_topics": missing},
             )
-
-    @staticmethod
-    def _topic_ids_from_env(prefix: str) -> dict[TelegramTopic, int]:
-        topic_ids = TelegramBotConfig.default_topic_ids()
-
-        env_mapping: dict[TelegramTopic, str] = {
-            TelegramTopic.ORDERFLOW: "TOPIC_ORDERFLOW",
-            TelegramTopic.LIQUIDITY: "TOPIC_LIQUIDITY",
-            TelegramTopic.PRICE_ACTION: "TOPIC_PRICE_ACTION",
-            TelegramTopic.LIQUIDATIONS: "TOPIC_LIQUIDATIONS",
-            TelegramTopic.WHALES: "TOPIC_WHALES",
-            TelegramTopic.SPOOFING: "TOPIC_SPOOFING",
-            TelegramTopic.SPREADS: "TOPIC_SPREADS",
-            TelegramTopic.FUNDING: "TOPIC_FUNDING",
-            TelegramTopic.OPEN_INTEREST: "TOPIC_OPEN_INTEREST",
-            TelegramTopic.NEWS: "TOPIC_NEWS",
-            TelegramTopic.SIGNALS: "TOPIC_SIGNALS",
-            TelegramTopic.OPEN_TRADES: "TOPIC_OPEN_TRADES",
-            TelegramTopic.CLOSED_TRADES: "TOPIC_CLOSED_TRADES",
-            TelegramTopic.RISK: "TOPIC_RISK",
-            TelegramTopic.SYSTEM: "TOPIC_SYSTEM",
-        }
-
-        for topic, env_name in env_mapping.items():
-            topic_ids[topic] = _to_int(
-                os.getenv(f"{prefix}{env_name}"),
-                default=0,
-            )
-
-        return topic_ids
 
 
 def _to_bool(value: str | None, *, default: bool = False) -> bool:
@@ -695,12 +626,6 @@ def _to_optional_str(value: str | None) -> str | None:
 
 
 def _to_chat_id(value: str | None) -> int | str | None:
-    """
-    Telegram chat_id може бути:
-    - int, наприклад -1001234567890;
-    - str username/channel id, якщо використовується @name.
-    """
-
     if value is None or value.strip() == "":
         return None
 

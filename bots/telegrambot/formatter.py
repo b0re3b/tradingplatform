@@ -30,9 +30,7 @@ from .enums import (
     TelegramEventCategory,
     TelegramMessageType,
     TelegramNotificationLevel,
-    TelegramParseMode,
     TelegramPriority,
-    TelegramTopic,
     TelegramTradeResult,
 )
 from .exceptions import (
@@ -52,7 +50,6 @@ from .templates import (
     get_template_for_analytics_domain,
     get_template_for_message_type,
 )
-
 
 SENSITIVE_KEYS: frozenset[str] = frozenset(
     {

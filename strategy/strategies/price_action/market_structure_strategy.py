@@ -678,6 +678,11 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
 
         metadata = {
             "price_action_setup_family": "market_structure",
+            "contract": "price_action",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "market_structure",
+            "strategy_contract_role": "decision_module",
+            "risk_ready_payload_owner": "SignalProcessor",
             "price_action_strategy_version": "2.0.0",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,

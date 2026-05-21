@@ -775,6 +775,11 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         metadata = {
             "price_action_setup_family": "support_resistance_reaction",
             "price_action_strategy_version": "2.0.0",
+            "contract": "price_action",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "support_resistance",
+            "strategy_contract_role": "decision_module",
+            "risk_ready_payload_owner": "SignalProcessor",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,
             "event_time": view.event_time.isoformat() if view.event_time else None,

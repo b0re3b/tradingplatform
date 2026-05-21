@@ -2823,32 +2823,45 @@ class SignalNormalizer(BaseStrategyComponent):
             domain_data: dict[str, Any],
     ) -> None:
         """
-        Normalize analytics.price_action.* payloads into the stable
-        price-action domain contract consumed by concrete strategies.
+        Normalize analytics.price_action.* payloads into a stable price-action
+        StrategyContext contract.
 
-        Important:
-        - module sections are populated only when the payload actually belongs
-          to that module;
-        - event-specific payloads are wrapped into the shape expected by
-          concrete strategies, e.g. market_structure.last_break_event,
-          trend.last_signal, fair_value_gap.last_event;
-        - missing FVG/SR/Trend/MarketStructure sections are not synthesized,
-          preventing registry from routing incompatible strategies.
+        OI-style contract adapter:
+        - exposes canonical sections:
+          composite, market_structure, support_resistance, fair_value_gap, trend,
+          liquidity_levels, signal;
+        - preserves analytics-provided nested sections and typed-like objects;
+        - enriches composite/state only from real price-action sections;
+        - does not synthesize strategy setup sections without explicit signal/setup.
         """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
+
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
             for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return dict(value)
-
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return dict(value)
-
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
             return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
@@ -2857,42 +2870,111 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
+
+            for container in (
+                    composite,
+                    market_structure,
+                    support_resistance,
+                    fair_value_gap,
+                    trend,
+                    liquidity_levels,
+                    signal,
+            ):
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
             return default
 
-        def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None) -> None:
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: Any | None,
+                *,
+                override: bool = True,
+        ) -> None:
             if value is None:
                 return
 
-            # Canonical module keys must override the raw flat payload copied
-            # into domain_data earlier. Concrete strategies read these primary
-            # keys first, so setdefault() leaves stale flat views in place.
-            domain_data[target] = value
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
             for alias in aliases:
                 domain_data.setdefault(alias, value)
 
-        def trend_direction_for_strategy(value: Any) -> str | None:
-            raw = str(value or "").strip().lower()
-            if raw in {"long", "buy", "up", "uptrend", "bull", "bullish"}:
-                return "bullish"
-            if raw in {"short", "sell", "down", "downtrend", "bear", "bearish"}:
-                return "bearish"
-            if raw in {"neutral", "flat", "range", "ranging"}:
-                return "neutral"
-            return raw or None
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
 
-        def trend_regime_for_strategy(value: Any) -> str | None:
-            raw = str(value or "").strip().lower()
-            if raw in {"uptrend", "downtrend", "trend", "trending_up", "trending_down", "bullish", "bearish"}:
-                return "trending"
-            if raw in {"pullback", "retracement"}:
-                return "pullback"
-            if raw in {"consolidation", "consolidating", "range", "ranging"}:
-                return "consolidating"
-            if raw in {"reversal", "reversing"}:
-                return "reversing"
-            if raw in {"exhausted", "exhaustion"}:
-                return "exhausted"
-            return raw or None
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "active",
+                    "valid",
+                    "confirmed",
+                    "detected",
+                    "triggered",
+                    "respected",
+                    "retested",
+                    "aligned",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "inactive",
+                    "invalid",
+                    "expired",
+                    "none",
+                    "not_detected",
+                    "rejected",
+                    "misaligned",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_present(value: Any | None) -> bool:
+            if value is None:
+                return False
+
+            mapping = as_mapping(value)
+            if mapping is None:
+                return True
+
+            if not mapping:
+                return False
+
+            detected = (
+                mapping.get("detected")
+                if "detected" in mapping
+                else mapping.get(
+                    "active",
+                    mapping.get(
+                        "valid",
+                        mapping.get("confirmed", None),
+                    ),
+                )
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
 
         topic = (
             str(
@@ -2905,279 +2987,315 @@ class SignalNormalizer(BaseStrategyComponent):
             .lower()
         )
 
-        state = mapping_for("state", "composite", "price_action", "snapshot", "result")
-        if state is not None:
-            domain_data.setdefault("state", state)
-            domain_data.setdefault("composite", state)
-            domain_data.setdefault("price_action", state)
-            domain_data.setdefault("snapshot", state)
+        analysis = mapping_or_object_for(
+            "analysis",
+            "price_action_analysis",
+            "result",
+        )
+        composite = mapping_or_object_for(
+            "composite",
+            "state",
+            "snapshot",
+            "price_action",
+            "price_action_state",
+        )
+        market_structure = mapping_or_object_for(
+            "market_structure",
+            "structure",
+            "market_structure_state",
+        )
+        support_resistance = mapping_or_object_for(
+            "support_resistance",
+            "sr",
+            "support_resistance_state",
+        )
+        fair_value_gap = mapping_or_object_for(
+            "fair_value_gap",
+            "fvg",
+            "fair_value_gap_state",
+            "fvg_state",
+        )
+        trend = mapping_or_object_for(
+            "trend",
+            "trend_state",
+        )
+        liquidity_levels = mapping_or_object_for(
+            "liquidity_levels",
+            "liquidity",
+            "levels",
+        )
+        signal = mapping_or_object_for(
+            "signal",
+            "price_action_signal",
+            "analytics_signal",
+            "setup",
+        )
 
-        market_structure = mapping_for("market_structure", "structure", "ms")
-        support_resistance = mapping_for("support_resistance", "sr", "levels")
-        fair_value_gap = mapping_for("fair_value_gap", "fvg", "fair_value_gaps")
-        trend = mapping_for("trend", "trend_state")
-        liquidity_levels = mapping_for("liquidity_levels", "liquidity")
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "price_action_analysis",
+                "state",
+                "price_action",
+                "composite",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
 
-        if isinstance(state, dict):
+            nested_market_structure = (
+                    container_map.get("market_structure")
+                    or container_map.get("structure")
+                    or container_map.get("market_structure_state")
+            )
+            nested_support_resistance = (
+                    container_map.get("support_resistance")
+                    or container_map.get("sr")
+                    or container_map.get("support_resistance_state")
+            )
+            nested_fvg = (
+                    container_map.get("fair_value_gap")
+                    or container_map.get("fvg")
+                    or container_map.get("fair_value_gap_state")
+                    or container_map.get("fvg_state")
+            )
+            nested_trend = (
+                    container_map.get("trend")
+                    or container_map.get("trend_state")
+            )
+            nested_liquidity_levels = (
+                    container_map.get("liquidity_levels")
+                    or container_map.get("liquidity")
+                    or container_map.get("levels")
+            )
+            nested_signal = (
+                    container_map.get("signal")
+                    or container_map.get("price_action_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+
+            if market_structure is None and nested_market_structure is not None:
+                market_structure = nested_market_structure
+            if support_resistance is None and nested_support_resistance is not None:
+                support_resistance = nested_support_resistance
+            if fair_value_gap is None and nested_fvg is not None:
+                fair_value_gap = nested_fvg
+            if trend is None and nested_trend is not None:
+                trend = nested_trend
+            if liquidity_levels is None and nested_liquidity_levels is not None:
+                liquidity_levels = nested_liquidity_levels
+            if signal is None and nested_signal is not None:
+                signal = nested_signal
+
+        if composite is not None:
             if market_structure is None:
-                market_structure = mapping_for("state.market_structure")
-                for key in ("market_structure", "structure", "ms"):
-                    nested = state.get(key)
-                    if isinstance(nested, dict):
-                        market_structure = dict(nested)
-                        break
+                nested = get_item(composite, "market_structure", None) or get_item(
+                    composite,
+                    "structure",
+                    None,
+                )
+                if nested is not None:
+                    market_structure = nested
+
             if support_resistance is None:
-                for key in ("support_resistance", "sr", "levels"):
-                    nested = state.get(key)
-                    if isinstance(nested, dict):
-                        support_resistance = dict(nested)
-                        break
+                nested = get_item(composite, "support_resistance", None) or get_item(
+                    composite,
+                    "sr",
+                    None,
+                )
+                if nested is not None:
+                    support_resistance = nested
+
             if fair_value_gap is None:
-                for key in ("fair_value_gap", "fvg", "fair_value_gaps"):
-                    nested = state.get(key)
-                    if isinstance(nested, dict):
-                        fair_value_gap = dict(nested)
-                        break
+                nested = get_item(composite, "fair_value_gap", None) or get_item(
+                    composite,
+                    "fvg",
+                    None,
+                )
+                if nested is not None:
+                    fair_value_gap = nested
+
             if trend is None:
-                for key in ("trend", "trend_state"):
-                    nested = state.get(key)
-                    if isinstance(nested, dict):
-                        trend = dict(nested)
-                        break
+                nested = get_item(composite, "trend", None)
+                if nested is not None:
+                    trend = nested
+
             if liquidity_levels is None:
-                for key in ("liquidity_levels", "liquidity"):
-                    nested = state.get(key)
-                    if isinstance(nested, dict):
-                        liquidity_levels = dict(nested)
-                        break
-
-        event_payload = dict(payload)
-        event_payload.setdefault("timestamp", value_for("timestamp", "event_time", default=None))
-        event_payload.setdefault("price", value_for("price", "current_price", "last_price", "close", default=None))
-        event_payload.setdefault("confidence", value_for("confidence", default=0.0))
-        event_payload.setdefault("score", value_for("score", default=event_payload.get("confidence", 0.0)))
-
-        # Event-specific fallback: market structure events.
-        is_market_structure_event = (
-            "market_structure" in topic
-            or ".structure" in topic
-            or any(
-                key in payload
-                for key in (
-                    "swing_type",
-                    "break_distance_pct",
-                    "market_bias",
-                    "broken_side",
-                    "mtf_alignment",
+                nested = get_item(composite, "liquidity_levels", None) or get_item(
+                    composite,
+                    "liquidity",
+                    None,
                 )
+                if nested is not None:
+                    liquidity_levels = nested
+
+            composite_map = as_mapping(composite)
+            if composite_map is not None:
+                metadata = composite_map.get("metadata")
+                if isinstance(metadata, dict):
+                    for key in (
+                            "exchange",
+                            "market_type",
+                            "symbol",
+                            "exchange_symbol",
+                            "timeframe",
+                    ):
+                        if key in metadata:
+                            domain_data.setdefault(key, metadata[key])
+
+        # Composite is context, not a setup. It is safe to compose it from real
+        # module sections, but not from arbitrary raw payload.
+        if composite is None and any(
+                section is not None
+                for section in (
+                        market_structure,
+                        support_resistance,
+                        fair_value_gap,
+                        trend,
+                        liquidity_levels,
+                )
+        ):
+            composite = {
+                "market_structure": market_structure or {},
+                "support_resistance": support_resistance or {},
+                "fair_value_gap": fair_value_gap or {},
+                "trend": trend or {},
+                "liquidity_levels": liquidity_levels or {},
+            }
+
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+                    "current_price",
+                    "last_price",
+                    "price",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    composite[key] = value
+
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "break",
+                "bos",
+                "choch",
+                "mss",
+                "fvg",
+                "support",
+                "resistance",
+                "trend",
+                "confirmed",
+                "generated",
             )
         )
-        if market_structure is None and is_market_structure_event:
-            event_type = value_for("event_type", "type", "kind", default=None)
-            if event_type is None:
-                if ".bos" in topic or topic.endswith("bos"):
-                    event_type = "bos"
-                elif ".choch" in topic:
-                    event_type = "choch"
-                elif ".mss" in topic:
-                    event_type = "mss"
-            side = value_for("side", "direction", "bias", default=None)
-            bias = value_for("market_bias", "bias", "direction", default=side)
-            event_payload.setdefault("event_type", event_type)
-            event_payload.setdefault("side", side)
-            event_payload.setdefault("direction", side)
-            event_payload.setdefault("market_bias", bias)
-            event_payload.setdefault("confirmed", True)
-            market_structure = {
-                "last_break_event": event_payload,
-                "last_event": event_payload,
-                "event": event_payload,
-                "external": {
-                    "last_break_event": event_payload,
-                    "last_event": event_payload,
-                    "bias": bias,
-                    "market_bias": bias,
-                    "confidence": event_payload.get("confidence", 0.0),
-                    "score": event_payload.get("score", 0.0),
-                    "strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                    "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                },
-                "internal": {
-                    "bias": bias,
-                    "market_bias": bias,
-                    "confidence": event_payload.get("confidence", 0.0),
-                    "score": event_payload.get("score", 0.0),
-                },
-                "mtf_alignment": value_for("mtf_alignment", "alignment", default=event_payload.get("score", 0.0)),
-                "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
-            }
-
-        # Event-specific fallback: support/resistance reactions.
-        is_sr_event = (
-            "support_resistance" in topic
-            or topic.endswith(".sr")
-            or ".sr." in topic
-            or any(
-                key in payload
-                for key in (
-                    "level_type",
-                    "level_status",
-                    "level_price",
-                    "touch_count",
-                    "reaction_count",
-                    "break_count",
-                )
-            )
+        explicit_signal = bool(
+            signal_like_topic
+            or payload.get("signal_type") is not None
+            or payload.get("setup_type") is not None
+            or payload.get("signal_side") is not None
+            or to_bool(payload.get("signal_detected", False))
+            or to_bool(payload.get("setup_detected", False))
         )
-        if support_resistance is None and is_sr_event:
-            event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="reaction"))
-            event_payload.setdefault("confirmed", True)
-            level = {
-                **event_payload,
-                "price": value_for("level_price", "level", "price", "current_price", "close", default=None),
-                "level_type": value_for("level_type", "type", default=None),
-                "strength": value_for("strength", "score", "confidence", default=0.0),
-                "confidence": event_payload.get("confidence", 0.0),
-                "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                "touch_count": value_for("touch_count", "touches", default=1),
-                "is_active": True,
-            }
-            support_resistance = {
-                "last_event": event_payload,
-                "event": event_payload,
-                "nearest_support": level if str(level.get("level_type", "")).lower() == "support" else None,
-                "nearest_resistance": level if str(level.get("level_type", "")).lower() == "resistance" else None,
-                "external": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
-                "internal": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
+
+        if signal is None and explicit_signal:
+            signal = {
+                "detected": True,
+                "type": payload.get("signal_type") or payload.get("setup_type"),
+                "side": (
+                        payload.get("signal_side")
+                        or payload.get("side")
+                        or payload.get("direction")
+                        or payload.get("bias")
+                ),
+                "score": payload.get("signal_score", payload.get("score", 0.0)),
+                "confidence": payload.get(
+                    "signal_confidence",
+                    payload.get("confidence", 0.0),
+                ),
+                "origin": payload.get("origin", "price_action"),
             }
 
-        # Event-specific fallback: FVG reactions.
-        is_fvg_event = (
-            "fair_value_gap" in topic
-            or "fvg" in topic
-            or any(
-                key in payload
-                for key in (
-                    "fvg_direction",
-                    "gap_size_pct",
-                    "fill_pct",
-                    "upper_price",
-                    "lower_price",
-                    "mid_price",
-                )
-            )
+        set_aliases(
+            "analysis",
+            ("price_action_analysis", "result"),
+            analysis,
+            override=False,
         )
-        if fair_value_gap is None and is_fvg_event:
-            event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="retest"))
-            event_payload.setdefault("confirmed", True)
-            gap = {
-                **event_payload,
-                "direction": value_for("direction", "fvg_direction", "side", default=None),
-                "status": value_for("status", "fvg_status", default="active"),
-                "upper_price": value_for("upper_price", "upper", "high", default=None),
-                "lower_price": value_for("lower_price", "lower", "low", default=None),
-                "mid_price": value_for("mid_price", "mid", default=None),
-                "strength": value_for("strength", "score", "confidence", default=0.0),
-                "confidence": event_payload.get("confidence", 0.0),
-                "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                "is_valid": True,
-            }
-            direction_label = str(gap.get("direction") or "").lower()
-            fair_value_gap = {
-                "last_event": event_payload,
-                "event": event_payload,
-                "nearest_bullish_gap": gap if "bull" in direction_label or direction_label == "long" else None,
-                "nearest_bearish_gap": gap if "bear" in direction_label or direction_label == "short" else None,
-                "external": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
-                "internal": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
-            }
 
-        # Event-specific fallback: trend continuation/state events.
-        is_trend_event = (
-            "trend" in topic
-            or any(
-                key in payload
-                for key in (
-                    "trend_direction",
-                    "trend_regime",
-                    "continuation_probability",
-                    "reversal_risk",
-                    "exhaustion_score",
-                    "overall_trend_score",
-                )
-            )
-        )
-        if trend is None and is_trend_event:
-            event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="trend_alignment"))
-            raw_trend_direction = value_for("trend_direction", "direction", "side", default=None)
-            raw_trend_regime = value_for("trend_regime", "regime", "state", default=None)
-            normalized_trend_direction = trend_direction_for_strategy(raw_trend_direction)
-            normalized_trend_regime = trend_regime_for_strategy(raw_trend_regime or normalized_trend_direction)
-            event_payload["direction"] = normalized_trend_direction or event_payload.get("direction")
-            event_payload["trend_direction"] = normalized_trend_direction or event_payload.get("trend_direction")
-            event_payload["trend_regime"] = normalized_trend_regime or event_payload.get("trend_regime")
-            event_payload["regime"] = normalized_trend_regime or event_payload.get("regime")
-            event_payload.setdefault("continuation_probability", value_for("continuation_probability", "continuation_prob", "probability", default=event_payload.get("score", 0.0)))
-            event_payload.setdefault("confirmed", True)
-            layer = {
-                **event_payload,
-                "direction": trend_direction_for_strategy(event_payload.get("trend_direction") or event_payload.get("direction")),
-                "trend_direction": trend_direction_for_strategy(event_payload.get("trend_direction") or event_payload.get("direction")),
-                "regime": trend_regime_for_strategy(event_payload.get("trend_regime") or event_payload.get("regime")),
-                "trend_regime": trend_regime_for_strategy(event_payload.get("trend_regime") or event_payload.get("regime")),
-                "trend_strength": value_for("trend_strength", "strength", "score", default=event_payload.get("score", 0.0)),
-                "momentum_score": value_for("momentum_score", "momentum", default=event_payload.get("score", 0.0)),
-                "slope_score": value_for("slope_score", "slope", default=event_payload.get("score", 0.0)),
-                "continuation_probability": event_payload.get("continuation_probability"),
-                "confidence": event_payload.get("confidence", 0.0),
-                "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
-            }
-            trend = {
-                "last_signal": event_payload,
-                "last_event": event_payload,
-                "event": event_payload,
-                "external": layer,
-                "internal": layer,
-                "internal_external_alignment": value_for("internal_external_alignment", "alignment", default=event_payload.get("score", 0.0)),
-                "higher_timeframe_alignment": value_for("higher_timeframe_alignment", "htf_alignment", default=event_payload.get("score", 0.0)),
-                "overall_trend_score": value_for("overall_trend_score", "score", default=event_payload.get("score", 0.0)),
-            }
-
-
-        # Compatibility shape for concrete price_action strategies:
-        # Direct analytics event payloads often provide a flat module dict, while
-        # concrete strategies expect a module with external/internal layer views.
-        # Keep this in SignalNormalizer, not in concrete strategies.
-        if isinstance(market_structure, dict):
-            market_structure = self._ensure_price_action_market_structure_view(
-                module=market_structure,
-                event_payload=event_payload,
-                fallback_topic=topic,
-            )
-        if isinstance(trend, dict):
-            trend = self._ensure_price_action_trend_view(
-                module=trend,
-                event_payload=event_payload,
-                fallback_topic=topic,
+        if composite is not None:
+            set_aliases(
+                "composite",
+                ("state", "snapshot", "price_action", "price_action_state"),
+                composite,
             )
 
-        set_aliases("market_structure", ("structure", "ms"), market_structure)
-        set_aliases("support_resistance", ("sr", "levels"), support_resistance)
-        set_aliases("fair_value_gap", ("fvg", "fair_value_gaps"), fair_value_gap)
-        set_aliases("trend", ("trend_state",), trend)
-        set_aliases("liquidity_levels", ("liquidity",), liquidity_levels)
+        if market_structure is not None:
+            set_aliases(
+                "market_structure",
+                ("structure", "market_structure_state"),
+                market_structure,
+            )
 
-        current_price = value_for("current_price", "price", "last_price", "close", default=None)
-        if current_price is not None:
-            domain_data.setdefault("current_price", current_price)
-            domain_data.setdefault("last_price", current_price)
-            domain_data.setdefault("price", current_price)
+        if support_resistance is not None:
+            set_aliases(
+                "support_resistance",
+                ("sr", "support_resistance_state"),
+                support_resistance,
+            )
 
-        timestamp_value = value_for("timestamp", "event_time", "updated_at", "created_at", default=None)
-        if timestamp_value is not None:
-            domain_data.setdefault("timestamp", timestamp_value)
+        if fair_value_gap is not None:
+            set_aliases(
+                "fair_value_gap",
+                ("fvg", "fair_value_gap_state", "fvg_state"),
+                fair_value_gap,
+            )
 
-        domain_data.setdefault("raw", dict(payload))
+        if trend is not None:
+            set_aliases(
+                "trend",
+                ("trend_state",),
+                trend,
+            )
+
+        if liquidity_levels is not None:
+            set_aliases(
+                "liquidity_levels",
+                ("liquidity", "levels"),
+                liquidity_levels,
+            )
+
+        if section_present(signal):
+            set_aliases(
+                "signal",
+                ("price_action_signal", "analytics_signal", "setup"),
+                signal,
+            )
+
+        for key in (
+                "exchange",
+                "market_type",
+                "symbol",
+                "exchange_symbol",
+                "timeframe",
+                "timestamp",
+                "current_price",
+                "last_price",
+                "price",
+        ):
+            value = value_for(key, default=None)
+            if value is not None:
+                domain_data.setdefault(key, value)
 
 
     @staticmethod
@@ -3445,190 +3563,496 @@ class SignalNormalizer(BaseStrategyComponent):
         result.setdefault("overall_trend_score", result.get("overall_trend_score", score))
         return result
 
-
     def _augment_spoofing_domain_data(
             self,
             *,
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.spoofing.* payloads into the stable spoofing
+        StrategyContext contract.
+
+        OI-style contract adapter:
+        - exposes canonical sections: composite, signal, features,
+          detector_results, score_breakdown, analytics_metadata;
+        - preserves analytics-provided signal/composite objects;
+        - does not synthesize spoofing.signal from a generic payload unless the
+          event/payload explicitly represents a spoofing signal/setup;
+        - keeps detector-specific details available for concrete spoofing
+          strategies without duplicating detector logic in strategies.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
             return None
 
-        composite = mapping_for(
-            "composite",
-            "spoofing",
-            "snapshot",
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+
+            for container in (
+                    composite,
+                    signal,
+                    features,
+                    detector_results,
+                    score_breakdown,
+                    analytics_metadata,
+            ):
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
+            return default
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: Any | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "confirmed",
+                    "valid",
+                    "active",
+                    "detected",
+                    "passed",
+                    "triggered",
+                    "pulled",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "rejected",
+                    "invalid",
+                    "expired",
+                    "inactive",
+                    "none",
+                    "failed",
+                    "not_detected",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_present(value: Any | None) -> bool:
+            if value is None:
+                return False
+
+            mapping = as_mapping(value)
+            if mapping is None:
+                return True
+
+            if not mapping:
+                return False
+
+            detected = (
+                mapping.get("detected")
+                if "detected" in mapping
+                else mapping.get(
+                    "active",
+                    mapping.get(
+                        "valid",
+                        mapping.get(
+                            "passed",
+                            mapping.get("confirmed", None),
+                        ),
+                    ),
+                )
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        analysis = mapping_or_object_for(
+            "analysis",
+            "spoofing_analysis",
             "result",
         )
-        signal = mapping_for(
+        composite = mapping_or_object_for(
+            "composite",
+            "snapshot",
+            "spoofing",
+            "spoofing_snapshot",
+            "composite_snapshot",
+        )
+        signal = mapping_or_object_for(
             "signal",
             "spoofing_signal",
             "analytics_signal",
-            "event",
+            "setup",
         )
-        features = mapping_for(
+        features = mapping_or_object_for(
             "features",
             "spoofing_features",
         )
-        detector_results = mapping_for(
+        detector_results = mapping_or_object_for(
             "detector_results",
             "detectors",
-            "detector_result",
+            "detector_state",
+            "components",
         )
-        score_breakdown = mapping_for(
+        score_breakdown = mapping_or_object_for(
             "score_breakdown",
             "scores",
-            "score_components",
+            "scoring",
         )
-        analytics_metadata = mapping_for(
+        analytics_metadata = mapping_or_object_for(
             "analytics_metadata",
             "metadata",
+            "meta",
+        )
+
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "spoofing_analysis",
+                "event",
+                "spoofing",
+                "composite",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            nested_composite = (
+                    container_map.get("composite")
+                    or container_map.get("snapshot")
+                    or container_map.get("spoofing")
+                    or container_map.get("spoofing_snapshot")
+                    or container_map.get("composite_snapshot")
+            )
+            nested_signal = (
+                    container_map.get("signal")
+                    or container_map.get("spoofing_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+            nested_features = (
+                    container_map.get("features")
+                    or container_map.get("spoofing_features")
+            )
+            nested_detectors = (
+                    container_map.get("detector_results")
+                    or container_map.get("detectors")
+                    or container_map.get("detector_state")
+                    or container_map.get("components")
+            )
+            nested_score_breakdown = (
+                    container_map.get("score_breakdown")
+                    or container_map.get("scores")
+                    or container_map.get("scoring")
+            )
+            nested_metadata = (
+                    container_map.get("analytics_metadata")
+                    or container_map.get("metadata")
+                    or container_map.get("meta")
+            )
+
+            if composite is None and nested_composite is not None:
+                composite = nested_composite
+            if signal is None and nested_signal is not None:
+                signal = nested_signal
+            if features is None and nested_features is not None:
+                features = nested_features
+            if detector_results is None and nested_detectors is not None:
+                detector_results = nested_detectors
+            if score_breakdown is None and nested_score_breakdown is not None:
+                score_breakdown = nested_score_breakdown
+            if analytics_metadata is None and nested_metadata is not None:
+                analytics_metadata = nested_metadata
+
+        if signal is not None:
+            if features is None:
+                nested = get_item(signal, "features", None)
+                if nested is not None:
+                    features = nested
+
+            if detector_results is None:
+                nested = (
+                        get_item(signal, "detector_results", None)
+                        or get_item(signal, "detectors", None)
+                        or get_item(signal, "components", None)
+                )
+                if nested is not None:
+                    detector_results = nested
+
+            if score_breakdown is None:
+                nested = (
+                        get_item(signal, "score_breakdown", None)
+                        or get_item(signal, "scores", None)
+                )
+                if nested is not None:
+                    score_breakdown = nested
+
+            if analytics_metadata is None:
+                nested = get_item(signal, "metadata", None)
+                if nested is not None:
+                    analytics_metadata = nested
+
+        # Safe flat enrichment: features are context, not a strategy setup.
+        if features is None:
+            flat_features: dict[str, Any] = {}
+            for key in (
+                    "pull_ratio",
+                    "fill_ratio",
+                    "price_reaction_bps",
+                    "signed_price_reaction_bps",
+                    "lifetime_ms",
+                    "wall_notional",
+                    "pulled_notional",
+                    "cancel_to_fill_ratio",
+                    "distance_from_mid_bps",
+                    "layer_count",
+                    "layer_price_span_bps",
+                    "pressure_flip_strength",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_features[key] = value
+
+            if flat_features:
+                features = flat_features
+
+        # Spoofing signal is actionable setup context. Only synthesize it when the
+        # event/topic or explicit fields indicate analytics produced a spoofing signal.
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "spoofing",
+                "fake_liquidity",
+                "order_pull",
+                "pressure_bluff",
+                "layering",
+                "absorption",
+                "composite",
+                "confirmed",
+                "generated",
+            )
+        )
+        explicit_signal = bool(
+            signal_like_topic
+            or payload.get("spoofing_type") is not None
+            or payload.get("spoofing_side") is not None
+            or payload.get("pattern") is not None
+            or payload.get("signal_type") is not None
+            or payload.get("setup_type") is not None
+            or payload.get("signal_side") is not None
+            or to_bool(payload.get("signal_detected", False))
+            or to_bool(payload.get("setup_detected", False))
+            or to_bool(payload.get("detected", False))
+        )
+
+        if signal is None and explicit_signal:
+            signal = {
+                "detected": True,
+                "spoofing_type": payload.get("spoofing_type")
+                                 or payload.get("type")
+                                 or payload.get("signal_type")
+                                 or payload.get("setup_type"),
+                "pattern": payload.get("pattern") or payload.get("spoofing_pattern"),
+                "side": (
+                        payload.get("spoofing_side")
+                        or payload.get("signal_side")
+                        or payload.get("side")
+                        or payload.get("direction")
+                ),
+                "severity": payload.get("severity"),
+                "status": payload.get("status"),
+                "score": payload.get("score", payload.get("signal_score", 0.0)),
+                "confidence": payload.get(
+                    "confidence",
+                    payload.get("signal_confidence", 0.0),
+                ),
+                "price_level": payload.get("price_level"),
+                "wall_id": payload.get("wall_id"),
+                "event_time": payload.get("event_time") or payload.get("timestamp"),
+                "features": features or {},
+                "detector_results": detector_results or {},
+                "score_breakdown": score_breakdown or {},
+                "metadata": analytics_metadata or {},
+            }
+
+        # Composite is a context container. It may be composed from real signal/features,
+        # but not from arbitrary raw payload.
+        if composite is None and any(
+                section is not None
+                for section in (
+                        signal,
+                        features,
+                        detector_results,
+                        score_breakdown,
+                        analytics_metadata,
+                )
+        ):
+            composite = {
+                "signal": signal or {},
+                "features": features or {},
+                "detector_results": detector_results or {},
+                "score_breakdown": score_breakdown or {},
+                "analytics_metadata": analytics_metadata or {},
+            }
+
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    composite[key] = value
+
+        set_aliases(
+            "analysis",
+            ("spoofing_analysis", "result"),
+            analysis,
+            override=False,
         )
 
         if composite is not None:
-            if signal is None:
-                for key in (
-                        "signal",
-                        "spoofing_signal",
-                        "analytics_signal",
-                        "event",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        signal = value
-                        break
+            set_aliases(
+                "composite",
+                ("snapshot", "spoofing", "spoofing_snapshot", "composite_snapshot"),
+                composite,
+            )
 
-            if features is None:
-                for key in (
-                        "features",
-                        "spoofing_features",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        features = value
-                        break
-
-            if detector_results is None:
-                for key in (
-                        "detector_results",
-                        "detectors",
-                        "detector_result",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        detector_results = value
-                        break
-
-            if score_breakdown is None:
-                for key in (
-                        "score_breakdown",
-                        "scores",
-                        "score_components",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        score_breakdown = value
-                        break
-
-            if analytics_metadata is None:
-                for key in (
-                        "analytics_metadata",
-                        "metadata",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        analytics_metadata = value
-                        break
-
-        if composite is not None:
-            domain_data.setdefault("composite", composite)
-            domain_data.setdefault("spoofing", composite)
-            domain_data.setdefault("snapshot", composite)
-            domain_data.setdefault("result", composite)
-
-        if signal is not None:
-            domain_data.setdefault("signal", signal)
-            domain_data.setdefault("spoofing_signal", signal)
-            domain_data.setdefault("analytics_signal", signal)
+        if section_present(signal):
+            set_aliases(
+                "signal",
+                ("spoofing_signal", "analytics_signal", "setup"),
+                signal,
+            )
 
         if features is not None:
-            domain_data.setdefault("features", features)
-            domain_data.setdefault("spoofing_features", features)
+            set_aliases(
+                "features",
+                ("spoofing_features",),
+                features,
+            )
 
         if detector_results is not None:
-            domain_data.setdefault("detector_results", detector_results)
-            domain_data.setdefault("detectors", detector_results)
-            domain_data.setdefault("detector_result", detector_results)
+            set_aliases(
+                "detector_results",
+                ("detectors", "detector_state", "components"),
+                detector_results,
+            )
 
         if score_breakdown is not None:
-            domain_data.setdefault("score_breakdown", score_breakdown)
-            domain_data.setdefault("scores", score_breakdown)
-            domain_data.setdefault("score_components", score_breakdown)
+            set_aliases(
+                "score_breakdown",
+                ("scores", "scoring"),
+                score_breakdown,
+            )
 
         if analytics_metadata is not None:
-            domain_data.setdefault("analytics_metadata", analytics_metadata)
-            domain_data.setdefault("metadata", analytics_metadata)
+            set_aliases(
+                "analytics_metadata",
+                ("metadata", "meta"),
+                analytics_metadata,
+                override=False,
+            )
 
-        if "signal" not in domain_data and (
-                "spoofing_type" in payload
-                or "type" in payload
-                or "pattern" in payload
-                or "side" in payload
-                or "score" in payload
-                or "confidence" in payload
-                or "pull_ratio" in payload
-                or "fill_ratio" in payload
-        ):
-            domain_data["signal"] = dict(payload)
-            domain_data.setdefault("spoofing_signal", domain_data["signal"])
-
-        if "features" not in domain_data and (
-                "pull_ratio" in payload
-                or "fill_ratio" in payload
-                or "price_reaction_bps" in payload
-                or "lifetime_ms" in payload
-                or "wall_notional" in payload
-                or "pulled_notional" in payload
-                or "cancel_to_fill_ratio" in payload
-                or "distance_from_mid_bps" in payload
-                or "layer_count" in payload
-                or "layer_price_span_bps" in payload
-                or "pressure_flip_strength" in payload
-        ):
-            domain_data["features"] = {
-                "pull_ratio": payload.get("pull_ratio"),
-                "fill_ratio": payload.get("fill_ratio"),
-                "price_reaction_bps": payload.get("price_reaction_bps"),
-                "signed_price_reaction_bps": payload.get(
-                    "signed_price_reaction_bps",
-                    payload.get("price_reaction_bps"),
-                ),
-                "lifetime_ms": payload.get("lifetime_ms"),
-                "wall_notional": payload.get("wall_notional"),
-                "pulled_notional": payload.get("pulled_notional"),
-                "cancel_to_fill_ratio": payload.get("cancel_to_fill_ratio"),
-                "distance_from_mid_bps": payload.get("distance_from_mid_bps"),
-                "layer_count": payload.get("layer_count"),
-                "layer_price_span_bps": payload.get("layer_price_span_bps"),
-                "pressure_flip_strength": payload.get("pressure_flip_strength"),
-            }
-            domain_data.setdefault("spoofing_features", domain_data["features"])
-
-        domain_data.setdefault("raw", dict(payload))
+        # Stable flat aliases used by SpoofingCompositeSnapshot and concrete strategies.
+        for key, aliases in {
+            "spoofing_type": ("type", "signal_type", "setup_type"),
+            "pattern": ("spoofing_pattern",),
+            "side": ("spoofing_side", "signal_side", "direction"),
+            "severity": ("spoofing_severity",),
+            "status": ("spoofing_status",),
+            "score": ("signal_score",),
+            "confidence": ("signal_confidence",),
+            "price_level": ("level", "wall_price"),
+            "wall_id": (),
+            "event_time": ("timestamp", "time"),
+            "exchange": (),
+            "market_type": (),
+            "symbol": (),
+            "exchange_symbol": (),
+            "timeframe": (),
+        }.items():
+            value = value_for(key, *aliases, default=None)
+            if value is not None:
+                domain_data.setdefault(key, value)
 
     def _augment_spreads_domain_data(
             self,
@@ -3636,100 +4060,456 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.spreads.* payloads into the stable spreads
+        StrategyContext contract.
+
+        OI-style contract adapter:
+        - exposes canonical sections: snapshot, signal, opportunity;
+        - preserves spot/futures and cross-exchange semantics;
+        - keeps basis/funding-adjusted/cross-exchange fields under stable aliases;
+        - does not synthesize setup/signal/opportunity unless analytics supplied it;
+        - does not collapse spot_futures/cross_exchange structure.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+            to_payload = getattr(value, "to_payload", None)
+            if callable(to_payload):
+                converted = to_payload()
+                if isinstance(converted, dict):
+                    return converted
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
             return None
 
-        snapshot = mapping_for(
-            "snapshot",
-            "spread_snapshot",
-            "spot_futures",
-            "spot_futures_snapshot",
-            "cross_exchange",
-            "cross_exchange_snapshot",
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+
+            for container in (snapshot, signal, opportunity):
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
+            return default
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: Any | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "valid",
+                    "active",
+                    "tradeable",
+                    "passed",
+                    "open",
+                    "confirmed",
+                    "has_edge",
+                    "detected",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "invalid",
+                    "inactive",
+                    "expired",
+                    "closed",
+                    "failed",
+                    "none",
+                    "not_detected",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_present(value: Any | None) -> bool:
+            if value is None:
+                return False
+
+            mapping = as_mapping(value)
+            if mapping is None:
+                return True
+
+            if not mapping:
+                return False
+
+            detected = (
+                mapping.get("detected")
+                if "detected" in mapping
+                else mapping.get(
+                    "active",
+                    mapping.get(
+                        "valid",
+                        mapping.get(
+                            "tradeable",
+                            mapping.get("confirmed", None),
+                        ),
+                    ),
+                )
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        analysis = mapping_or_object_for(
+            "analysis",
+            "spreads_analysis",
+            "spread_analysis",
             "result",
         )
-        signal = mapping_for(
+        snapshot = mapping_or_object_for(
+            "snapshot",
+            "spread_snapshot",
+            "spreads_snapshot",
+            "spot_futures_snapshot",
+            "cross_exchange_snapshot",
+            "basis_snapshot",
+        )
+        signal = mapping_or_object_for(
             "signal",
             "spread_signal",
+            "spreads_signal",
             "analytics_signal",
-            "event",
+            "setup",
         )
-        opportunity = mapping_for(
+        opportunity = mapping_or_object_for(
             "opportunity",
             "arbitrage_opportunity",
             "arb_opportunity",
+            "cross_exchange_opportunity",
         )
-        metadata = mapping_for(
-            "metadata",
-            "spread_metadata",
+
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "spreads_analysis",
+                "spread_analysis",
+                "event",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            nested_snapshot = (
+                    container_map.get("snapshot")
+                    or container_map.get("spread_snapshot")
+                    or container_map.get("spreads_snapshot")
+                    or container_map.get("spot_futures_snapshot")
+                    or container_map.get("cross_exchange_snapshot")
+                    or container_map.get("basis_snapshot")
+            )
+            nested_signal = (
+                    container_map.get("signal")
+                    or container_map.get("spread_signal")
+                    or container_map.get("spreads_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+            nested_opportunity = (
+                    container_map.get("opportunity")
+                    or container_map.get("arbitrage_opportunity")
+                    or container_map.get("arb_opportunity")
+                    or container_map.get("cross_exchange_opportunity")
+            )
+
+            if snapshot is None and nested_snapshot is not None:
+                snapshot = nested_snapshot
+            if signal is None and nested_signal is not None:
+                signal = nested_signal
+            if opportunity is None and nested_opportunity is not None:
+                opportunity = nested_opportunity
+
+        # If a typed SpreadCompositeSnapshot-like object is already passed as
+        # payload/result, keep it as snapshot instead of flattening it.
+        if snapshot is None:
+            maybe_spread_type = value_for("spread_type", "type", default=None)
+            maybe_spread_bps = value_for("spread_bps", "basis", "net_edge", default=None)
+            maybe_exchange_a = value_for("exchange_a", "spot_exchange", "buy_exchange", default=None)
+            maybe_exchange_b = value_for("exchange_b", "futures_exchange", "sell_exchange", default=None)
+
+            if (
+                    maybe_spread_type is not None
+                    or maybe_spread_bps is not None
+                    or maybe_exchange_a is not None
+                    or maybe_exchange_b is not None
+            ):
+                flat_snapshot: dict[str, Any] = {}
+                for key in (
+                        "spread_type",
+                        "type",
+                        "symbol",
+                        "exchange_a",
+                        "exchange_b",
+                        "market_type_a",
+                        "market_type_b",
+                        "exchange_symbol_a",
+                        "exchange_symbol_b",
+                        "spot_exchange",
+                        "futures_exchange",
+                        "spot_symbol",
+                        "futures_symbol",
+                        "instrument_type",
+                        "leg_a",
+                        "leg_b",
+                        "spread_bps",
+                        "basis",
+                        "funding_adjusted_spread",
+                        "net_edge",
+                        "net_edge_bps",
+                        "zscore",
+                        "regime",
+                        "direction",
+                        "signal_type",
+                        "quote_validity",
+                        "has_edge",
+                        "confidence",
+                        "timestamp",
+                        "timeframe",
+                        "metadata",
+                ):
+                    value = value_for(key, default=None)
+                    if value is not None:
+                        flat_snapshot[key] = value
+
+                if flat_snapshot:
+                    snapshot = flat_snapshot
+
+        # Signal is only exposed when analytics supplied signal/setup context.
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "mean_reversion",
+                "momentum",
+                "widening",
+                "compressing",
+                "regime_shift",
+                "anomaly",
+                "confirmed",
+                "generated",
+            )
+        )
+        explicit_signal = bool(
+            signal_like_topic
+            or payload.get("signal_type") is not None
+            or payload.get("setup_type") is not None
+            or payload.get("signal_side") is not None
+            or to_bool(payload.get("signal_detected", False))
+            or to_bool(payload.get("setup_detected", False))
+        )
+
+        if signal is None and explicit_signal:
+            signal = {
+                "detected": True,
+                "signal_type": payload.get("signal_type") or payload.get("setup_type"),
+                "side": (
+                        payload.get("signal_side")
+                        or payload.get("side")
+                        or payload.get("direction")
+                        or payload.get("bias")
+                ),
+                "score": payload.get("signal_score", payload.get("score", 0.0)),
+                "confidence": payload.get(
+                    "signal_confidence",
+                    payload.get("confidence", 0.0),
+                ),
+                "origin": payload.get("origin", "spreads"),
+            }
+
+        # Opportunity is only exposed when analytics supplied arbitrage/cross-exchange
+        # opportunity context. Do not create opportunity from generic snapshot.
+        opportunity_like_topic = any(
+            token in topic
+            for token in (
+                "opportunity",
+                "arbitrage",
+                "arb",
+                "cross_exchange",
+            )
+        )
+        explicit_opportunity = bool(
+            opportunity_like_topic
+            or payload.get("opportunity_key") is not None
+            or payload.get("opportunity_status") is not None
+            or payload.get("buy_exchange") is not None
+            or payload.get("sell_exchange") is not None
+            or payload.get("net_edge") is not None
+            or payload.get("net_edge_bps") is not None
+        )
+
+        if opportunity is None and explicit_opportunity:
+            opportunity = {
+                "active": to_bool(payload.get("active", True), True),
+                "tradeable": to_bool(payload.get("tradeable", True), True),
+                "opportunity_key": payload.get("opportunity_key"),
+                "status": payload.get("opportunity_status") or payload.get("status"),
+                "buy_exchange": payload.get("buy_exchange"),
+                "sell_exchange": payload.get("sell_exchange"),
+                "buy_market_type": payload.get("buy_market_type"),
+                "sell_market_type": payload.get("sell_market_type"),
+                "net_edge": payload.get("net_edge"),
+                "net_edge_bps": payload.get("net_edge_bps"),
+                "persistence_ms": payload.get("persistence_ms"),
+                "confidence": payload.get("confidence"),
+            }
+
+        set_aliases(
+            "analysis",
+            ("spreads_analysis", "spread_analysis", "result"),
+            analysis,
+            override=False,
         )
 
         if snapshot is not None:
-            domain_data.setdefault("snapshot", snapshot)
-            domain_data.setdefault("spread_snapshot", snapshot)
-            domain_data.setdefault("result", snapshot)
+            set_aliases(
+                "snapshot",
+                (
+                    "spread_snapshot",
+                    "spreads_snapshot",
+                    "spot_futures_snapshot",
+                    "cross_exchange_snapshot",
+                    "basis_snapshot",
+                ),
+                snapshot,
+            )
 
-        if signal is not None:
-            domain_data.setdefault("signal", signal)
-            domain_data.setdefault("spread_signal", signal)
-            domain_data.setdefault("analytics_signal", signal)
+        if section_present(signal):
+            set_aliases(
+                "signal",
+                (
+                    "spread_signal",
+                    "spreads_signal",
+                    "analytics_signal",
+                    "setup",
+                ),
+                signal,
+            )
 
-        if opportunity is not None:
-            domain_data.setdefault("opportunity", opportunity)
-            domain_data.setdefault("arbitrage_opportunity", opportunity)
-            domain_data.setdefault("arb_opportunity", opportunity)
+        if section_present(opportunity):
+            set_aliases(
+                "opportunity",
+                (
+                    "arbitrage_opportunity",
+                    "arb_opportunity",
+                    "cross_exchange_opportunity",
+                ),
+                opportunity,
+            )
 
-        if metadata is not None:
-            domain_data.setdefault("metadata", metadata)
-            domain_data.setdefault("spread_metadata", metadata)
-
-        if "snapshot" not in domain_data and (
-                "spread_type" in payload
-                or "spread_bps" in payload
-                or "basis" in payload
-                or "funding_adjusted_spread" in payload
-                or "zscore" in payload
-                or "regime" in payload
-                or "quote_validity" in payload
-        ):
-            domain_data["snapshot"] = dict(payload)
-            domain_data.setdefault("spread_snapshot", domain_data["snapshot"])
-
-        if "signal" not in domain_data and (
-                "signal_type" in payload
-                or "spread_signal_type" in payload
-                or "direction" in payload
-                or "spread_direction" in payload
-                or "confidence" in payload
-        ):
-            domain_data["signal"] = dict(payload)
-            domain_data.setdefault("spread_signal", domain_data["signal"])
-
-        if "opportunity" not in domain_data and (
-                "opportunity_key" in payload
-                or "net_edge" in payload
-                or "net_edge_bps" in payload
-                or "buy_exchange" in payload
-                or "sell_exchange" in payload
-                or "opportunity_status" in payload
-        ):
-            domain_data["opportunity"] = dict(payload)
-            domain_data.setdefault("arbitrage_opportunity", domain_data["opportunity"])
-
-        domain_data.setdefault("raw", dict(payload))
+        # Stable flat aliases used by SpreadCompositeSnapshot and spread strategies.
+        for key, aliases in {
+            "spread_type": ("type",),
+            "symbol": (),
+            "exchange_a": ("spot_exchange", "buy_exchange"),
+            "exchange_b": ("futures_exchange", "sell_exchange"),
+            "market_type_a": ("spot_market_type", "buy_market_type"),
+            "market_type_b": ("futures_market_type", "sell_market_type"),
+            "exchange_symbol_a": ("spot_symbol", "buy_symbol"),
+            "exchange_symbol_b": ("futures_symbol", "sell_symbol"),
+            "spread_bps": ("basis_bps",),
+            "basis": ("basis_value",),
+            "funding_adjusted_spread": ("funding_adjusted_basis", "funding_edge"),
+            "net_edge": ("edge",),
+            "net_edge_bps": ("edge_bps",),
+            "zscore": ("z_score",),
+            "regime": ("spread_regime",),
+            "direction": ("spread_direction",),
+            "signal_type": ("spread_signal_type",),
+            "quote_validity": ("quote_status",),
+            "has_edge": ("tradeable_edge",),
+            "confidence": ("score_confidence",),
+            "opportunity_key": (),
+            "opportunity_status": ("status",),
+            "persistence_ms": (),
+            "buy_exchange": (),
+            "sell_exchange": (),
+            "buy_market_type": (),
+            "sell_market_type": (),
+            "instrument_type": (),
+            "timestamp": ("event_time", "time"),
+            "timeframe": (),
+        }.items():
+            value = value_for(key, *aliases, default=None)
+            if value is not None:
+                domain_data.setdefault(key, value)
 
     def _augment_whales_domain_data(
             self,
@@ -3737,272 +4517,571 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.whales.* payloads into the stable whales
+        StrategyContext contract.
+
+        OI-style contract adapter:
+        - exposes canonical sections:
+          pressure, activity, large_trade, cluster, cluster_update,
+          cluster_exhaustion, liquidation_context, metadata;
+        - preserves analytics-provided nested/typed sections;
+        - enriches flat fields only into the matching context section;
+        - does not create trade signals or risk-ready payloads;
+        - concrete whale strategies remain StrategyContext decision modules.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+            to_payload = getattr(value, "to_payload", None)
+            if callable(to_payload):
+                converted = to_payload()
+                if isinstance(converted, dict):
+                    return converted
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
             return None
 
-        composite = mapping_for(
-            "composite",
-            "whales",
-            "snapshot",
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+
+            for container in (
+                    pressure,
+                    activity,
+                    large_trade,
+                    cluster,
+                    cluster_update,
+                    cluster_exhaustion,
+                    liquidation_context,
+                    metadata,
+            ):
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
+            return default
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: Any | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "valid",
+                    "active",
+                    "tradeable",
+                    "passed",
+                    "confirmed",
+                    "enabled",
+                    "detected",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "invalid",
+                    "inactive",
+                    "failed",
+                    "disabled",
+                    "none",
+                    "not_detected",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_present(value: Any | None) -> bool:
+            if value is None:
+                return False
+
+            mapping = as_mapping(value)
+            if mapping is None:
+                return True
+
+            if not mapping:
+                return False
+
+            detected = mapping.get(
+                "detected",
+                mapping.get(
+                    "active",
+                    mapping.get(
+                        "valid",
+                        mapping.get("confirmed", None),
+                    ),
+                ),
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        analysis = mapping_or_object_for(
+            "analysis",
+            "whales_analysis",
+            "whale_analysis",
             "result",
         )
-        activity = mapping_for(
-            "activity",
-            "whale_activity",
-            "activity_context",
-        )
-        pressure = mapping_for(
+        pressure = mapping_or_object_for(
             "pressure",
             "whale_pressure",
-            "pressure_context",
+            "whale_pressure_signal",
         )
-        large_trade = mapping_for(
+        activity = mapping_or_object_for(
+            "activity",
+            "whale_activity",
+            "whale_activity_signal",
+        )
+        large_trade = mapping_or_object_for(
             "large_trade",
-            "large_trade_event",
-            "large_trade_context",
+            "large_trade_signal",
+            "whale_large_trade",
         )
-        cluster = mapping_for(
+        cluster = mapping_or_object_for(
             "cluster",
             "whale_cluster",
-            "cluster_context",
+            "whale_cluster_signal",
         )
-        liquidation_context = mapping_for(
+        cluster_update = mapping_or_object_for(
+            "cluster_update",
+            "whale_cluster_update",
+            "whale_cluster_update_signal",
+        )
+        cluster_exhaustion = mapping_or_object_for(
+            "cluster_exhaustion",
+            "whale_cluster_exhaustion",
+            "whale_cluster_exhaustion_signal",
+        )
+        liquidation_context = mapping_or_object_for(
             "liquidation_context",
             "whale_liquidation_context",
-            "liquidations",
-            "liquidation",
+            "whale_liquidation_context_signal",
         )
-        exhaustion = mapping_for(
-            "exhaustion",
-            "cluster_exhaustion",
-            "exhaustion_context",
-        )
-        signal = mapping_for(
-            "signal",
-            "whale_signal",
-            "analytics_signal",
-            "event",
+        metadata = mapping_or_object_for(
+            "metadata",
+            "analytics_metadata",
+            "meta",
         )
 
-        if composite is not None:
-            if activity is None:
-                for key in (
-                        "activity",
-                        "whale_activity",
-                        "activity_context",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        activity = value
-                        break
-
-            if pressure is None:
-                for key in (
-                        "pressure",
-                        "whale_pressure",
-                        "pressure_context",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        pressure = value
-                        break
-
-            if large_trade is None:
-                for key in (
-                        "large_trade",
-                        "large_trade_event",
-                        "large_trade_context",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        large_trade = value
-                        break
-
-            if cluster is None:
-                for key in (
-                        "cluster",
-                        "whale_cluster",
-                        "cluster_context",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        cluster = value
-                        break
-
-            if liquidation_context is None:
-                for key in (
-                        "liquidation_context",
-                        "whale_liquidation_context",
-                        "liquidations",
-                        "liquidation",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        liquidation_context = value
-                        break
-
-            if exhaustion is None:
-                for key in (
-                        "exhaustion",
-                        "cluster_exhaustion",
-                        "exhaustion_context",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        exhaustion = value
-                        break
-
-            if signal is None:
-                for key in (
-                        "signal",
-                        "whale_signal",
-                        "analytics_signal",
-                        "event",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        signal = value
-                        break
-
-        if composite is not None:
-            domain_data.setdefault("composite", composite)
-            domain_data.setdefault("whales", composite)
-            domain_data.setdefault("snapshot", composite)
-            domain_data.setdefault("result", composite)
-
-        if activity is not None:
-            domain_data.setdefault("activity", activity)
-            domain_data.setdefault("whale_activity", activity)
-            domain_data.setdefault("activity_context", activity)
-
-        if pressure is not None:
-            domain_data.setdefault("pressure", pressure)
-            domain_data.setdefault("whale_pressure", pressure)
-            domain_data.setdefault("pressure_context", pressure)
-
-        if large_trade is not None:
-            domain_data.setdefault("large_trade", large_trade)
-            domain_data.setdefault("large_trade_event", large_trade)
-            domain_data.setdefault("large_trade_context", large_trade)
-
-        if cluster is not None:
-            domain_data.setdefault("cluster", cluster)
-            domain_data.setdefault("whale_cluster", cluster)
-            domain_data.setdefault("cluster_context", cluster)
-
-        if liquidation_context is not None:
-            domain_data.setdefault("liquidation_context", liquidation_context)
-            domain_data.setdefault("whale_liquidation_context", liquidation_context)
-            domain_data.setdefault("liquidations", liquidation_context)
-            domain_data.setdefault("liquidation", liquidation_context)
-
-        if exhaustion is not None:
-            domain_data.setdefault("exhaustion", exhaustion)
-            domain_data.setdefault("cluster_exhaustion", exhaustion)
-            domain_data.setdefault("exhaustion_context", exhaustion)
-
-        if signal is not None:
-            domain_data.setdefault("signal", signal)
-            domain_data.setdefault("whale_signal", signal)
-            domain_data.setdefault("analytics_signal", signal)
-
-        if "composite" not in domain_data and (
-                "whale_side" in payload
-                or "activity_notional" in payload
-                or "pressure_score" in payload
-                or "cluster_score" in payload
-                or "liquidation_context_strength" in payload
-                or "exhaustion_probability" in payload
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "whales_analysis",
+                "whale_analysis",
+                "event",
         ):
-            domain_data["composite"] = dict(payload)
-            domain_data.setdefault("whales", domain_data["composite"])
-            domain_data.setdefault("snapshot", domain_data["composite"])
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
 
-        if "activity" not in domain_data and (
-                "activity_notional" in payload
-                or "activity_trade_count" in payload
-                or "activity_side" in payload
-                or "whale_activity" in payload
-        ):
-            domain_data["activity"] = dict(payload)
-            domain_data.setdefault("whale_activity", domain_data["activity"])
-            domain_data.setdefault("activity_context", domain_data["activity"])
-
-        if "pressure" not in domain_data and (
-                "pressure_score" in payload
-                or "pressure_side" in payload
-                or "pressure_imbalance_ratio" in payload
-                or "whale_pressure" in payload
-        ):
-            domain_data["pressure"] = dict(payload)
-            domain_data.setdefault("whale_pressure", domain_data["pressure"])
-            domain_data.setdefault("pressure_context", domain_data["pressure"])
-
-        if "large_trade" not in domain_data and (
-                "large_trade_notional" in payload
-                or "large_trade_zscore" in payload
-                or "large_trade_side" in payload
-        ):
-            domain_data["large_trade"] = dict(payload)
-            domain_data.setdefault("large_trade_event", domain_data["large_trade"])
-            domain_data.setdefault("large_trade_context", domain_data["large_trade"])
-
-        if "cluster" not in domain_data and (
-                "cluster_score" in payload
-                or "cluster_side" in payload
-                or "continuation_probability" in payload
-                or "exhaustion_probability" in payload
-        ):
-            domain_data["cluster"] = dict(payload)
-            domain_data.setdefault("whale_cluster", domain_data["cluster"])
-            domain_data.setdefault("cluster_context", domain_data["cluster"])
-
-        if "liquidation_context" not in domain_data and (
-                "liquidation_side" in payload
-                or "liquidation_notional" in payload
-                or "total_liquidation_notional" in payload
-                or "liquidation_context_strength" in payload
-        ):
-            domain_data["liquidation_context"] = dict(payload)
-            domain_data.setdefault(
-                "whale_liquidation_context",
-                domain_data["liquidation_context"],
+            nested_pressure = (
+                    container_map.get("pressure")
+                    or container_map.get("whale_pressure")
+                    or container_map.get("whale_pressure_signal")
             )
-            domain_data.setdefault("liquidations", domain_data["liquidation_context"])
-            domain_data.setdefault("liquidation", domain_data["liquidation_context"])
+            nested_activity = (
+                    container_map.get("activity")
+                    or container_map.get("whale_activity")
+                    or container_map.get("whale_activity_signal")
+            )
+            nested_large_trade = (
+                    container_map.get("large_trade")
+                    or container_map.get("large_trade_signal")
+                    or container_map.get("whale_large_trade")
+            )
+            nested_cluster = (
+                    container_map.get("cluster")
+                    or container_map.get("whale_cluster")
+                    or container_map.get("whale_cluster_signal")
+            )
+            nested_cluster_update = (
+                    container_map.get("cluster_update")
+                    or container_map.get("whale_cluster_update")
+                    or container_map.get("whale_cluster_update_signal")
+            )
+            nested_cluster_exhaustion = (
+                    container_map.get("cluster_exhaustion")
+                    or container_map.get("whale_cluster_exhaustion")
+                    or container_map.get("whale_cluster_exhaustion_signal")
+            )
+            nested_liquidation_context = (
+                    container_map.get("liquidation_context")
+                    or container_map.get("whale_liquidation_context")
+                    or container_map.get("whale_liquidation_context_signal")
+            )
+            nested_metadata = (
+                    container_map.get("metadata")
+                    or container_map.get("analytics_metadata")
+                    or container_map.get("meta")
+            )
 
-        if "exhaustion" not in domain_data and (
-                "exhaustion_probability" in payload
-                or "exhaustion_side" in payload
-        ):
-            domain_data["exhaustion"] = dict(payload)
-            domain_data.setdefault("cluster_exhaustion", domain_data["exhaustion"])
-            domain_data.setdefault("exhaustion_context", domain_data["exhaustion"])
+            if pressure is None and nested_pressure is not None:
+                pressure = nested_pressure
+            if activity is None and nested_activity is not None:
+                activity = nested_activity
+            if large_trade is None and nested_large_trade is not None:
+                large_trade = nested_large_trade
+            if cluster is None and nested_cluster is not None:
+                cluster = nested_cluster
+            if cluster_update is None and nested_cluster_update is not None:
+                cluster_update = nested_cluster_update
+            if cluster_exhaustion is None and nested_cluster_exhaustion is not None:
+                cluster_exhaustion = nested_cluster_exhaustion
+            if liquidation_context is None and nested_liquidation_context is not None:
+                liquidation_context = nested_liquidation_context
+            if metadata is None and nested_metadata is not None:
+                metadata = nested_metadata
 
-        if "signal" not in domain_data and (
-                "side" in payload
-                or "whale_side" in payload
-                or "score" in payload
-                or "confidence" in payload
-        ):
-            domain_data["signal"] = dict(payload)
-            domain_data.setdefault("whale_signal", domain_data["signal"])
-            domain_data.setdefault("analytics_signal", domain_data["signal"])
+        # Flat enrichment is section-specific. Do not copy the whole payload into
+        # all sections; only create a section when the relevant fields exist.
+        if pressure is None:
+            flat_pressure: dict[str, Any] = {}
+            for key in (
+                    "dominant_side",
+                    "whale_side",
+                    "imbalance_ratio",
+                    "pressure_score",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_pressure[key] = value
 
-        domain_data.setdefault("raw", dict(payload))
+            if flat_pressure:
+                pressure = flat_pressure
+
+        if activity is None:
+            flat_activity: dict[str, Any] = {}
+            for key in (
+                    "activity_side",
+                    "whale_side",
+                    "dominant_side",
+                    "total_notional",
+                    "notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_activity[key] = value
+
+            if flat_activity:
+                activity = flat_activity
+
+        if large_trade is None:
+            flat_large_trade: dict[str, Any] = {}
+            for key in (
+                    "large_trade_notional",
+                    "large_trade_zscore",
+                    "notional",
+                    "zscore",
+                    "z_score",
+                    "whale_side",
+                    "side",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_large_trade[key] = value
+
+            if flat_large_trade:
+                large_trade = flat_large_trade
+
+        if cluster is None:
+            flat_cluster: dict[str, Any] = {}
+            for key in (
+                    "cluster_side",
+                    "whale_side",
+                    "cluster_score",
+                    "context_strength",
+                    "continuation_probability",
+                    "exhaustion_probability",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_cluster[key] = value
+
+            if flat_cluster:
+                cluster = flat_cluster
+
+        if cluster_update is None:
+            flat_cluster_update: dict[str, Any] = {}
+            for key in (
+                    "cluster_update_side",
+                    "cluster_side",
+                    "cluster_score",
+                    "context_strength",
+                    "continuation_probability",
+                    "exhaustion_probability",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_cluster_update[key] = value
+
+            if flat_cluster_update:
+                cluster_update = flat_cluster_update
+
+        if cluster_exhaustion is None:
+            flat_cluster_exhaustion: dict[str, Any] = {}
+            for key in (
+                    "exhausted_side",
+                    "cluster_side",
+                    "exhaustion_probability",
+                    "context_strength",
+                    "cluster_score",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_cluster_exhaustion[key] = value
+
+            if flat_cluster_exhaustion:
+                cluster_exhaustion = flat_cluster_exhaustion
+
+        if liquidation_context is None:
+            flat_liquidation_context: dict[str, Any] = {}
+            for key in (
+                    "liquidation_side",
+                    "liquidation_notional",
+                    "context_strength",
+                    "exhaustion_probability",
+                    "continuation_probability",
+                    "total_notional",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_liquidation_context[key] = value
+
+            if flat_liquidation_context:
+                liquidation_context = flat_liquidation_context
+
+        set_aliases(
+            "analysis",
+            ("whales_analysis", "whale_analysis", "result"),
+            analysis,
+            override=False,
+        )
+
+        if section_present(pressure):
+            set_aliases(
+                "pressure",
+                ("whale_pressure", "whale_pressure_signal"),
+                pressure,
+            )
+
+        if section_present(activity):
+            set_aliases(
+                "activity",
+                ("whale_activity", "whale_activity_signal"),
+                activity,
+            )
+
+        if section_present(large_trade):
+            set_aliases(
+                "large_trade",
+                ("large_trade_signal", "whale_large_trade"),
+                large_trade,
+            )
+
+        if section_present(cluster):
+            set_aliases(
+                "cluster",
+                ("whale_cluster", "whale_cluster_signal"),
+                cluster,
+            )
+
+        if section_present(cluster_update):
+            set_aliases(
+                "cluster_update",
+                ("whale_cluster_update", "whale_cluster_update_signal"),
+                cluster_update,
+            )
+
+        if section_present(cluster_exhaustion):
+            set_aliases(
+                "cluster_exhaustion",
+                ("whale_cluster_exhaustion", "whale_cluster_exhaustion_signal"),
+                cluster_exhaustion,
+            )
+
+        if section_present(liquidation_context):
+            set_aliases(
+                "liquidation_context",
+                (
+                    "whale_liquidation_context",
+                    "whale_liquidation_context_signal",
+                ),
+                liquidation_context,
+            )
+
+        if metadata is not None:
+            set_aliases(
+                "metadata",
+                ("analytics_metadata", "meta"),
+                metadata,
+                override=False,
+            )
+
+        # Stable flat aliases used by WhaleCompositeSnapshot and whale strategies.
+        for key, aliases in {
+            "exchange": (),
+            "market_type": (),
+            "symbol": (),
+            "exchange_symbol": (),
+            "timeframe": (),
+            "dominant_side": ("whale_side", "side"),
+            "whale_side": ("dominant_side", "side"),
+            "liquidation_side": (),
+            "exhausted_side": (),
+            "cluster_side": (),
+            "imbalance_ratio": ("pressure_imbalance_ratio",),
+            "pressure_score": (),
+            "context_strength": (),
+            "cluster_score": (),
+            "continuation_probability": (),
+            "exhaustion_probability": (),
+            "total_notional": ("notional",),
+            "liquidation_notional": (),
+            "trade_count": (),
+            "large_trade_notional": ("large_notional",),
+            "large_trade_zscore": ("large_trade_z_score", "zscore", "z_score"),
+            "reference_price": ("price", "mark_price"),
+            "confidence": (),
+            "timestamp": ("event_time", "time"),
+        }.items():
+            value = value_for(key, *aliases, default=None)
+            if value is not None:
+                domain_data.setdefault(key, value)
 
     def _augment_domain_data_contracts(
             self,
@@ -4255,12 +5334,66 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        """
+        Build hybrid summary feature snapshots from a normalized analytics-domain payload.
+
+        Important:
+        - source remains the trigger domain source, not FeatureSource.HYBRID.
+        - This method must not pretend that a full multi-domain hybrid summary exists
+          when only one analytics payload is available.
+        - It always emits a domain-presence flag and, when possible, a domain vote.
+        - It emits global hybrid.dominant_side/alignment/conflict/confluence only when
+          the payload explicitly provides hybrid summary data or a multi-vote summary.
+        - Full multi-domain aggregation should still be done by StrategyContextBuilder
+          or a context-aware normalizer step that can see all current domain sections.
+        """
         result: list[FeatureSnapshot] = []
+
         confidence = payload.get("confidence", 0.0)
 
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
+
+        source_value = getattr(source, "value", str(source))
+        source_name = str(source_value).strip().lower()
+
+        domain_name_by_source: dict[str, str] = {
+            "orderflow": "orderflow",
+            "liquidity": "liquidity",
+            "liquidations": "liquidations",
+            "whales": "whales",
+            "open_interest": "open_interest",
+            "funding": "funding",
+            "price_action": "price_action",
+            "spoofing": "spoofing",
+            "spreads": "spreads",
+        }
+        trigger_domain = domain_name_by_source.get(source_name, source_name)
+
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+
+            to_payload = getattr(value, "to_payload", None)
+            if callable(to_payload):
+                converted = to_payload()
+                if isinstance(converted, dict):
+                    return converted
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
+
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -4268,97 +5401,410 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
+
+            for container_key in (
+                    "signal",
+                    "setup",
+                    "analysis",
+                    "result",
+                    "snapshot",
+                    "features",
+                    "contract",
+                    trigger_domain,
+                    f"hybrid.{trigger_domain}",
+            ):
+                container = payload.get(container_key)
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
+                container = feature_map.get(container_key)
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
             return default
 
-        def add(name: str, value: Any) -> None:
+        def to_float(value: Any, default: float | None = None) -> float | None:
+            if value is None:
+                return default
+
+            if isinstance(value, bool):
+                return float(value)
+
+            if isinstance(value, (int, float)):
+                return float(value)
+
+            raw = getattr(value, "value", value)
+
+            if isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    return default
+                try:
+                    return float(text)
+                except ValueError:
+                    return default
+
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+
+        def clamp_unit(value: Any, default: float = 0.0) -> float:
+            parsed = to_float(value, default)
+            return max(0.0, min(1.0, float(parsed if parsed is not None else default)))
+
+        def normalize_side(value: Any) -> str:
+            raw = getattr(value, "value", value)
+
+            if raw is None:
+                return "unknown"
+
+            text = str(raw).strip().lower()
+            if text in {
+                "long",
+                "buy",
+                "bid",
+                "bull",
+                "bullish",
+                "up",
+                "upside",
+                "positive",
+                "support",
+                "demand",
+                "accumulation",
+                "short_squeeze",
+                "sell_liquidations",
+                "sell_exhaustion",
+                "buy_absorption",
+            }:
+                return "long"
+
+            if text in {
+                "short",
+                "sell",
+                "ask",
+                "bear",
+                "bearish",
+                "down",
+                "downside",
+                "negative",
+                "resistance",
+                "supply",
+                "distribution",
+                "long_squeeze",
+                "buy_liquidations",
+                "buy_exhaustion",
+                "sell_absorption",
+            }:
+                return "short"
+
+            return "unknown"
+
+        def add(
+                name: str,
+                value: Any,
+                *,
+                section: str | None = None,
+                confidence_override: Any = None,
+        ) -> None:
+            if value is None:
+                return
+
             result.append(
                 self._snapshot_from_raw_value(
-                    source=source,  # важливо: НЕ FeatureSource.HYBRID
+                    source=source,
                     symbol=symbol,
                     name=name,
                     value=value,
                     timestamp=timestamp,
-                    confidence=confidence,
+                    confidence=(
+                        clamp_unit(confidence_override, clamp_unit(confidence, 0.0))
+                        if confidence_override is not None
+                        else clamp_unit(confidence, 0.0)
+                    ),
                     metadata={
                         "origin": "contract_feature",
                         "contract": "hybrid",
-                        "trigger_source": getattr(source, "value", str(source)),
+                        "trigger_source": source_value,
+                        **({"section": section} if section else {}),
                     },
                 )
             )
 
-        dominant_side = value_for(
-            "hybrid.dominant_side",
-            "dominant_side",
-            "side",
-            "bias",
-            "direction",
-            default="unknown",
-        )
-        alignment_score = value_for(
-            "hybrid.alignment_score",
-            "alignment_score",
-            "alignment",
-            default=0.0,
-        )
-        conflict_score = value_for(
-            "hybrid.conflict_score",
-            "conflict_score",
-            "conflict",
-            default=0.0,
-        )
-        confluence_score = value_for(
-            "hybrid.confluence_score",
-            "confluence_score",
-            "confluence",
-            "score",
-            default=0.0,
-        )
-        hybrid_confidence = value_for(
-            "hybrid.confidence",
-            "hybrid_confidence",
-            "confidence",
-            default=confidence,
-        )
-        votes = value_for(
-            "hybrid.votes",
-            "votes",
-            default=[],
-        )
+        def add_if_present(
+                name: str,
+                *keys: str,
+                section: str | None = None,
+                default: Any = None,
+        ) -> Any:
+            value = value_for(*keys, default=default)
+            if value is not None:
+                add(name, value, section=section)
+            return value
 
-        add("hybrid.dominant_side", dominant_side)
-        add("hybrid.alignment_score", alignment_score)
-        add("hybrid.conflict_score", conflict_score)
-        add("hybrid.confluence_score", confluence_score)
-        add("hybrid.confidence", hybrid_confidence)
-        add("hybrid.votes", votes)
+        # -------------------------------------------------------------------------
+        # 1. Domain presence flag: safe to emit from every domain payload.
+        # -------------------------------------------------------------------------
+        if trigger_domain in {
+            "orderflow",
+            "liquidity",
+            "liquidations",
+            "whales",
+            "open_interest",
+            "funding",
+            "price_action",
+            "spoofing",
+            "spreads",
+        }:
+            domain_payload = value_for(
+                f"hybrid.{trigger_domain}",
+                trigger_domain,
+                f"hybrid_{trigger_domain}",
+                "signal",
+                "setup",
+                "snapshot",
+                "features",
+                "result",
+                "analysis",
+                default=payload,
+            )
 
-        for domain_name in (
-                "orderflow",
-                "liquidity",
-                "liquidations",
-                "whales",
-                "open_interest",
-                "funding",
-                "price_action",
-                "spoofing",
-                "spreads",
-        ):
-            value = value_for(
-                f"hybrid.{domain_name}",
-                domain_name,
-                f"hybrid_{domain_name}",
+            add(
+                f"hybrid.{trigger_domain}",
+                {
+                    "available": True,
+                    "source": source_value,
+                    "payload": domain_payload,
+                },
+                section="domain",
+            )
+
+        # -------------------------------------------------------------------------
+        # 2. Build a single domain vote from the trigger analytics signal/contract.
+        #    This is safe. It does NOT mean global hybrid confluence exists yet.
+        # -------------------------------------------------------------------------
+        side = normalize_side(
+            value_for(
+                "hybrid.dominant_side",
+                "dominant_side",
+                "signal_side",
+                "side",
+                "bias",
+                "direction",
+                "whale_side",
+                "liquidation_side",
+                "funding_side",
+                "oi_side",
+                "orderflow_side",
+                "trend_side",
+                "sweep_side",
+                "reversal_side",
                 default=None,
             )
-            if value is not None:
-                add(f"hybrid.{domain_name}", value)
+        )
 
-        add("hybrid.symbol", value_for("hybrid.symbol", "symbol", default=symbol))
-        add("hybrid.exchange", value_for("hybrid.exchange", "exchange", default="unknown"))
-        add("hybrid.market_type", value_for("hybrid.market_type", "market_type", default="usdm_futures"))
-        add("hybrid.timeframe", value_for("hybrid.timeframe", "timeframe", default=None))
-        add("hybrid.exchange_symbol", value_for("hybrid.exchange_symbol", "exchange_symbol", default=symbol))
-        add("hybrid.timestamp", value_for("hybrid.timestamp", "timestamp", default=timestamp))
+        score = clamp_unit(
+            value_for(
+                "hybrid.confluence_score",
+                "confluence_score",
+                "signal_score",
+                "score",
+                "strength",
+                "pressure_score",
+                "confidence",
+                default=0.0,
+            )
+        )
+        vote_confidence = clamp_unit(
+            value_for(
+                "hybrid.confidence",
+                "hybrid_confidence",
+                "signal_confidence",
+                "confidence",
+                default=confidence,
+            )
+        )
+
+        vote = None
+        if side != "unknown":
+            vote = {
+                "source": trigger_domain,
+                "feature_source": source_value,
+                "side": side,
+                "score": score,
+                "confidence": vote_confidence,
+                "timestamp": value_for(
+                    "hybrid.timestamp",
+                    "timestamp",
+                    "event_time",
+                    default=timestamp,
+                ),
+                "reason": value_for(
+                    "reason",
+                    "setup_type",
+                    "signal_type",
+                    "type",
+                    default=f"{trigger_domain}_vote",
+                ),
+            }
+            add("hybrid.votes", [vote], section="vote", confidence_override=vote_confidence)
+            add(f"hybrid.{trigger_domain}.vote", vote, section="vote", confidence_override=vote_confidence)
+
+        # -------------------------------------------------------------------------
+        # 3. Only emit global hybrid summary if it is explicitly provided OR if the
+        #    payload already contains a multi-domain vote summary.
+        # -------------------------------------------------------------------------
+        explicit_votes = value_for("hybrid.votes", "votes", default=None)
+        explicit_hybrid_summary = any(
+            key in payload or key in feature_map
+            for key in (
+                "hybrid.dominant_side",
+                "dominant_side",
+                "hybrid.alignment_score",
+                "alignment_score",
+                "hybrid.conflict_score",
+                "conflict_score",
+                "hybrid.confluence_score",
+                "confluence_score",
+                "hybrid.confidence",
+                "hybrid_confidence",
+            )
+        )
+
+        votes_list: list[Any] = []
+        if isinstance(explicit_votes, list):
+            votes_list = explicit_votes
+        elif isinstance(explicit_votes, tuple):
+            votes_list = list(explicit_votes)
+
+        has_multi_vote_summary = len(votes_list) >= 2
+
+        if explicit_hybrid_summary or has_multi_vote_summary:
+            dominant_side = normalize_side(
+                value_for(
+                    "hybrid.dominant_side",
+                    "dominant_side",
+                    "side",
+                    "bias",
+                    "direction",
+                    default=side,
+                )
+            )
+            alignment_score = clamp_unit(
+                value_for(
+                    "hybrid.alignment_score",
+                    "alignment_score",
+                    "alignment",
+                    default=None,
+                ),
+                default=1.0 if has_multi_vote_summary else 0.0,
+            )
+            conflict_score = clamp_unit(
+                value_for(
+                    "hybrid.conflict_score",
+                    "conflict_score",
+                    "conflict",
+                    default=None,
+                ),
+                default=0.0,
+            )
+            confluence_score = clamp_unit(
+                value_for(
+                    "hybrid.confluence_score",
+                    "confluence_score",
+                    "confluence",
+                    "score",
+                    default=None,
+                ),
+                default=score,
+            )
+            hybrid_confidence = clamp_unit(
+                value_for(
+                    "hybrid.confidence",
+                    "hybrid_confidence",
+                    "confidence",
+                    default=vote_confidence,
+                )
+            )
+
+            if dominant_side != "unknown":
+                add(
+                    "hybrid.dominant_side",
+                    dominant_side,
+                    section="summary",
+                    confidence_override=hybrid_confidence,
+                )
+
+            add(
+                "hybrid.alignment_score",
+                alignment_score,
+                section="summary",
+                confidence_override=hybrid_confidence,
+            )
+            add(
+                "hybrid.conflict_score",
+                conflict_score,
+                section="summary",
+                confidence_override=hybrid_confidence,
+            )
+            add(
+                "hybrid.confluence_score",
+                confluence_score,
+                section="summary",
+                confidence_override=hybrid_confidence,
+            )
+            add(
+                "hybrid.confidence",
+                hybrid_confidence,
+                section="summary",
+                confidence_override=hybrid_confidence,
+            )
+
+            if votes_list:
+                add(
+                    "hybrid.votes",
+                    votes_list,
+                    section="summary",
+                    confidence_override=hybrid_confidence,
+                )
+
+        # -------------------------------------------------------------------------
+        # 4. Scope features.
+        # -------------------------------------------------------------------------
+        add(
+            "hybrid.symbol",
+            value_for("hybrid.symbol", "symbol", default=symbol),
+            section="scope",
+        )
+        add(
+            "hybrid.exchange",
+            value_for("hybrid.exchange", "exchange", default=None),
+            section="scope",
+        )
+        add(
+            "hybrid.market_type",
+            value_for("hybrid.market_type", "market_type", default="usdm_futures"),
+            section="scope",
+        )
+        add(
+            "hybrid.timeframe",
+            value_for("hybrid.timeframe", "timeframe", default=None),
+            section="scope",
+        )
+        add(
+            "hybrid.exchange_symbol",
+            value_for("hybrid.exchange_symbol", "exchange_symbol", default=symbol),
+            section="scope",
+        )
+        add(
+            "hybrid.timestamp",
+            value_for("hybrid.timestamp", "timestamp", "event_time", default=timestamp),
+            section="scope",
+        )
 
         return result
 
@@ -4789,122 +6235,57 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+
+            to_payload = getattr(value, "to_payload", None)
+            if callable(to_payload):
+                converted = to_payload()
+                if isinstance(converted, dict):
+                    return converted
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
+
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
             for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+        def nested_value(value: Any, *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                item = get_item(value, key, None)
+                if item is not None:
+                    return item
 
-            return {}
+            metadata = get_item(value, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
 
-        composite = mapping_for(
-            "composite",
-            "whales",
-            "snapshot",
-            "result",
-        )
-        activity = mapping_for(
-            "activity",
-            "whale_activity",
-            "activity_context",
-        )
-        pressure = mapping_for(
-            "pressure",
-            "whale_pressure",
-            "pressure_context",
-        )
-        large_trade = mapping_for(
-            "large_trade",
-            "large_trade_event",
-            "large_trade_context",
-        )
-        cluster = mapping_for(
-            "cluster",
-            "whale_cluster",
-            "cluster_context",
-        )
-        liquidation_context = mapping_for(
-            "liquidation_context",
-            "whale_liquidation_context",
-            "liquidations",
-            "liquidation",
-        )
-        exhaustion = mapping_for(
-            "exhaustion",
-            "cluster_exhaustion",
-            "exhaustion_context",
-        )
-        signal = mapping_for(
-            "signal",
-            "whale_signal",
-            "analytics_signal",
-            "event",
-        )
-
-        if composite:
-            if not activity:
-                for key in ("activity", "whale_activity", "activity_context"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        activity = value
-                        break
-
-            if not pressure:
-                for key in ("pressure", "whale_pressure", "pressure_context"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        pressure = value
-                        break
-
-            if not large_trade:
-                for key in ("large_trade", "large_trade_event", "large_trade_context"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        large_trade = value
-                        break
-
-            if not cluster:
-                for key in ("cluster", "whale_cluster", "cluster_context"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        cluster = value
-                        break
-
-            if not liquidation_context:
-                for key in (
-                        "liquidation_context",
-                        "whale_liquidation_context",
-                        "liquidations",
-                        "liquidation",
-                ):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        liquidation_context = value
-                        break
-
-            if not exhaustion:
-                for key in ("exhaustion", "cluster_exhaustion", "exhaustion_context"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        exhaustion = value
-                        break
-
-            if not signal:
-                for key in ("signal", "whale_signal", "analytics_signal", "event"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        signal = value
-                        break
+            return default
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -4912,31 +6293,27 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if key in signal:
-                    return signal[key]
-                if key in activity:
-                    return activity[key]
-                if key in pressure:
-                    return pressure[key]
-                if key in large_trade:
-                    return large_trade[key]
-                if key in cluster:
-                    return cluster[key]
-                if key in liquidation_context:
-                    return liquidation_context[key]
-                if key in exhaustion:
-                    return exhaustion[key]
-                if key in composite:
-                    return composite[key]
+
+            for container in (
+                    pressure,
+                    activity,
+                    large_trade,
+                    cluster,
+                    cluster_update,
+                    cluster_exhaustion,
+                    liquidation_context,
+                    metadata,
+            ):
+                value = nested_value(container, *keys, default=None)
+                if value is not None:
+                    return value
+
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in mapping:
-                    return mapping[key]
-            return default
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
+            if value is None:
+                return
 
-        def add(name: str, value: Any) -> None:
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.WHALES,
@@ -4948,251 +6325,467 @@ class SignalNormalizer(BaseStrategyComponent):
                     metadata={
                         "origin": "contract_feature",
                         "contract": "whales",
+                        **({"section": section} if section else {}),
                     },
                 )
             )
 
-        # Main sections
-        add("whales.composite", composite or payload)
-        add("whales.signal", signal)
-        add("whales.activity", activity)
-        add("whales.pressure", pressure)
-        add("whales.large_trade", large_trade)
-        add("whales.cluster", cluster)
-        add("whales.liquidation_context", liquidation_context)
-        add("whales.exhaustion", exhaustion)
+        analysis = mapping_or_object_for(
+            "analysis",
+            "whales_analysis",
+            "whale_analysis",
+            "result",
+        )
+        pressure = mapping_or_object_for(
+            "pressure",
+            "whale_pressure",
+            "whale_pressure_signal",
+        )
+        activity = mapping_or_object_for(
+            "activity",
+            "whale_activity",
+            "whale_activity_signal",
+        )
+        large_trade = mapping_or_object_for(
+            "large_trade",
+            "large_trade_signal",
+            "whale_large_trade",
+        )
+        cluster = mapping_or_object_for(
+            "cluster",
+            "whale_cluster",
+            "whale_cluster_signal",
+        )
+        cluster_update = mapping_or_object_for(
+            "cluster_update",
+            "whale_cluster_update",
+            "whale_cluster_update_signal",
+        )
+        cluster_exhaustion = mapping_or_object_for(
+            "cluster_exhaustion",
+            "whale_cluster_exhaustion",
+            "whale_cluster_exhaustion_signal",
+        )
+        liquidation_context = mapping_or_object_for(
+            "liquidation_context",
+            "whale_liquidation_context",
+            "whale_liquidation_context_signal",
+        )
+        metadata = mapping_or_object_for(
+            "metadata",
+            "analytics_metadata",
+            "meta",
+        )
 
-        # Common identity / direction
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "whales_analysis",
+                "whale_analysis",
+                "event",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            pressure = (
+                    pressure
+                    or container_map.get("pressure")
+                    or container_map.get("whale_pressure")
+                    or container_map.get("whale_pressure_signal")
+            )
+            activity = (
+                    activity
+                    or container_map.get("activity")
+                    or container_map.get("whale_activity")
+                    or container_map.get("whale_activity_signal")
+            )
+            large_trade = (
+                    large_trade
+                    or container_map.get("large_trade")
+                    or container_map.get("large_trade_signal")
+                    or container_map.get("whale_large_trade")
+            )
+            cluster = (
+                    cluster
+                    or container_map.get("cluster")
+                    or container_map.get("whale_cluster")
+                    or container_map.get("whale_cluster_signal")
+            )
+            cluster_update = (
+                    cluster_update
+                    or container_map.get("cluster_update")
+                    or container_map.get("whale_cluster_update")
+                    or container_map.get("whale_cluster_update_signal")
+            )
+            cluster_exhaustion = (
+                    cluster_exhaustion
+                    or container_map.get("cluster_exhaustion")
+                    or container_map.get("whale_cluster_exhaustion")
+                    or container_map.get("whale_cluster_exhaustion_signal")
+            )
+            liquidation_context = (
+                    liquidation_context
+                    or container_map.get("liquidation_context")
+                    or container_map.get("whale_liquidation_context")
+                    or container_map.get("whale_liquidation_context_signal")
+            )
+            metadata = (
+                    metadata
+                    or container_map.get("metadata")
+                    or container_map.get("analytics_metadata")
+                    or container_map.get("meta")
+            )
+
+        if pressure is None:
+            flat_pressure = {
+                key: value_for(key, default=None)
+                for key in (
+                    "dominant_side",
+                    "whale_side",
+                    "imbalance_ratio",
+                    "pressure_score",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_pressure:
+                pressure = flat_pressure
+
+        if activity is None:
+            flat_activity = {
+                key: value_for(key, default=None)
+                for key in (
+                    "activity_side",
+                    "whale_side",
+                    "dominant_side",
+                    "total_notional",
+                    "notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_activity:
+                activity = flat_activity
+
+        if large_trade is None:
+            flat_large_trade = {
+                key: value_for(key, default=None)
+                for key in (
+                    "large_trade_notional",
+                    "large_trade_zscore",
+                    "notional",
+                    "zscore",
+                    "z_score",
+                    "whale_side",
+                    "side",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_large_trade:
+                large_trade = flat_large_trade
+
+        if cluster is None:
+            flat_cluster = {
+                key: value_for(key, default=None)
+                for key in (
+                    "cluster_side",
+                    "whale_side",
+                    "cluster_score",
+                    "context_strength",
+                    "continuation_probability",
+                    "exhaustion_probability",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_cluster:
+                cluster = flat_cluster
+
+        if cluster_update is None:
+            flat_cluster_update = {
+                key: value_for(key, default=None)
+                for key in (
+                    "cluster_update_side",
+                    "cluster_side",
+                    "cluster_score",
+                    "context_strength",
+                    "continuation_probability",
+                    "exhaustion_probability",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_cluster_update:
+                cluster_update = flat_cluster_update
+
+        if cluster_exhaustion is None:
+            flat_cluster_exhaustion = {
+                key: value_for(key, default=None)
+                for key in (
+                    "exhausted_side",
+                    "cluster_side",
+                    "exhaustion_probability",
+                    "context_strength",
+                    "cluster_score",
+                    "total_notional",
+                    "trade_count",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_cluster_exhaustion:
+                cluster_exhaustion = flat_cluster_exhaustion
+
+        if liquidation_context is None:
+            flat_liquidation_context = {
+                key: value_for(key, default=None)
+                for key in (
+                    "liquidation_side",
+                    "liquidation_notional",
+                    "context_strength",
+                    "exhaustion_probability",
+                    "continuation_probability",
+                    "total_notional",
+                    "reference_price",
+                    "confidence",
+                    "timestamp",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "metadata",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_liquidation_context:
+                liquidation_context = flat_liquidation_context
+
+        add("whales.analysis", analysis, section="analysis")
+
+        if pressure is not None:
+            add("whales.pressure", pressure, section="pressure")
+
+        if activity is not None:
+            add("whales.activity", activity, section="activity")
+
+        if large_trade is not None:
+            add("whales.large_trade", large_trade, section="large_trade")
+
+        if cluster is not None:
+            add("whales.cluster", cluster, section="cluster")
+
+        if cluster_update is not None:
+            add("whales.cluster_update", cluster_update, section="cluster_update")
+
+        if cluster_exhaustion is not None:
+            add(
+                "whales.cluster_exhaustion",
+                cluster_exhaustion,
+                section="cluster_exhaustion",
+            )
+
+        if liquidation_context is not None:
+            add(
+                "whales.liquidation_context",
+                liquidation_context,
+                section="liquidation_context",
+            )
+
         add(
-            "whales.side",
-            value_for(
-                "side",
-                "whale_side",
-                "direction",
-                "bias",
-                default=None,
-            ),
+            "whales.symbol",
+            value_for("symbol", default=symbol),
+            section="scope",
         )
         add(
-            "whales.score",
+            "whales.exchange",
+            value_for("exchange", default=None),
+            section="scope",
+        )
+        add(
+            "whales.market_type",
+            value_for("market_type", default=None),
+            section="scope",
+        )
+        add(
+            "whales.timeframe",
+            value_for("timeframe", default=None),
+            section="scope",
+        )
+        add(
+            "whales.exchange_symbol",
+            value_for("exchange_symbol", default=None),
+            section="scope",
+        )
+
+        add(
+            "whales.dominant_side",
+            value_for("dominant_side", "whale_side", "side", default=None),
+            section="side",
+        )
+        add(
+            "whales.whale_side",
+            value_for("whale_side", "dominant_side", "side", default=None),
+            section="side",
+        )
+        add(
+            "whales.liquidation_side",
+            value_for("liquidation_side", default=None),
+            section="side",
+        )
+        add(
+            "whales.exhausted_side",
+            value_for("exhausted_side", default=None),
+            section="side",
+        )
+        add(
+            "whales.cluster_side",
+            value_for("cluster_side", default=None),
+            section="side",
+        )
+
+        add(
+            "whales.imbalance_ratio",
+            value_for("imbalance_ratio", "pressure_imbalance_ratio", default=None),
+            section="pressure",
+        )
+        add(
+            "whales.pressure_score",
+            value_for("pressure_score", default=None),
+            section="pressure",
+        )
+        add(
+            "whales.context_strength",
+            value_for("context_strength", default=None),
+            section="context",
+        )
+        add(
+            "whales.cluster_score",
+            value_for("cluster_score", default=None),
+            section="cluster",
+        )
+        add(
+            "whales.continuation_probability",
+            value_for("continuation_probability", default=None),
+            section="context",
+        )
+        add(
+            "whales.exhaustion_probability",
+            value_for("exhaustion_probability", default=None),
+            section="context",
+        )
+
+        add(
+            "whales.total_notional",
+            value_for("total_notional", "notional", default=None),
+            section="notional",
+        )
+        add(
+            "whales.liquidation_notional",
+            value_for("liquidation_notional", default=None),
+            section="liquidation_context",
+        )
+        add(
+            "whales.trade_count",
+            value_for("trade_count", default=None),
+            section="activity",
+        )
+        add(
+            "whales.large_trade_notional",
+            value_for("large_trade_notional", "large_notional", default=None),
+            section="large_trade",
+        )
+        add(
+            "whales.large_trade_zscore",
             value_for(
-                "score",
-                "whale_score",
-                default=0.0,
+                "large_trade_zscore",
+                "large_trade_z_score",
+                "zscore",
+                "z_score",
+                default=None,
             ),
+            section="large_trade",
+        )
+
+        add(
+            "whales.reference_price",
+            value_for("reference_price", "price", "mark_price", default=None),
+            section="price",
         )
         add(
             "whales.confidence",
-            value_for(
-                "confidence",
-                "whale_confidence",
-                default=0.0,
-            ),
+            value_for("confidence", default=None),
+            section="confidence",
         )
         add(
-            "whales.event_time",
-            value_for(
-                "event_time",
-                "timestamp",
-                "created_at",
-                "time",
-                default=timestamp,
-            ),
-        )
-
-        # Activity
-        add(
-            "whales.activity.notional",
-            nested_value(
-                activity,
-                "notional",
-                "total_notional",
-                "total_notional_usd",
-                default=value_for(
-                    "activity_notional",
-                    "total_notional",
-                    "total_notional_usd",
-                    default=0.0,
-                ),
-            ),
+            "whales.timestamp",
+            value_for("timestamp", "event_time", "time", default=None),
+            section="timestamp",
         )
         add(
-            "whales.activity.trade_count",
-            nested_value(
-                activity,
-                "trade_count",
-                "trades_count",
-                "event_count",
-                default=value_for("activity_trade_count", "trade_count", default=0),
-            ),
-        )
-        add(
-            "whales.activity.side",
-            nested_value(
-                activity,
-                "side",
-                "dominant_side",
-                default=value_for("activity_side", "dominant_side", default=None),
-            ),
-        )
-        add(
-            "whales.activity.score",
-            nested_value(
-                activity,
-                "score",
-                default=value_for("activity_score", default=0.0),
-            ),
-        )
-
-        # Pressure
-        add(
-            "whales.pressure.side",
-            nested_value(
-                pressure,
-                "side",
-                "dominant_side",
-                default=value_for("pressure_side", "dominant_side", default=None),
-            ),
-        )
-        add(
-            "whales.pressure.score",
-            nested_value(
-                pressure,
-                "score",
-                "pressure_score",
-                default=value_for("pressure_score", default=0.0),
-            ),
-        )
-        add(
-            "whales.pressure.imbalance_ratio",
-            nested_value(
-                pressure,
-                "imbalance_ratio",
-                "pressure_imbalance_ratio",
-                default=value_for("pressure_imbalance_ratio", default=0.0),
-            ),
-        )
-
-        # Large trade
-        add(
-            "whales.large_trade.notional",
-            nested_value(
-                large_trade,
-                "notional",
-                "notional_usd",
-                default=value_for("large_trade_notional", "notional_usd", default=0.0),
-            ),
-        )
-        add(
-            "whales.large_trade.zscore",
-            nested_value(
-                large_trade,
-                "zscore",
-                "z_score",
-                default=value_for("large_trade_zscore", "zscore", default=0.0),
-            ),
-        )
-        add(
-            "whales.large_trade.side",
-            nested_value(
-                large_trade,
-                "side",
-                "trade_side",
-                default=value_for("large_trade_side", "trade_side", default=None),
-            ),
-        )
-
-        # Cluster
-        add(
-            "whales.cluster.score",
-            nested_value(
-                cluster,
-                "score",
-                "cluster_score",
-                default=value_for("cluster_score", default=0.0),
-            ),
-        )
-        add(
-            "whales.cluster.side",
-            nested_value(
-                cluster,
-                "side",
-                "cluster_side",
-                "dominant_side",
-                default=value_for("cluster_side", default=None),
-            ),
-        )
-        add(
-            "whales.cluster.continuation_probability",
-            nested_value(
-                cluster,
-                "continuation_probability",
-                "continuation_prob",
-                default=value_for("continuation_probability", default=0.0),
-            ),
-        )
-        add(
-            "whales.cluster.exhaustion_probability",
-            nested_value(
-                cluster,
-                "exhaustion_probability",
-                "exhaustion_prob",
-                default=value_for("exhaustion_probability", default=0.0),
-            ),
-        )
-
-        # Liquidation context
-        add(
-            "whales.liquidation_context.side",
-            nested_value(
-                liquidation_context,
-                "side",
-                "liquidation_side",
-                default=value_for("liquidation_side", default=None),
-            ),
-        )
-        add(
-            "whales.liquidation_context.notional",
-            nested_value(
-                liquidation_context,
-                "notional",
-                "notional_usd",
-                "total_notional_usd",
-                default=value_for(
-                    "liquidation_notional",
-                    "total_liquidation_notional",
-                    default=0.0,
-                ),
-            ),
-        )
-        add(
-            "whales.liquidation_context.strength",
-            nested_value(
-                liquidation_context,
-                "strength",
-                "context_strength",
-                default=value_for("liquidation_context_strength", "context_strength", default=0.0),
-            ),
-        )
-
-        # Exhaustion
-        add(
-            "whales.exhaustion.probability",
-            nested_value(
-                exhaustion,
-                "probability",
-                "exhaustion_probability",
-                default=value_for("exhaustion_probability", default=0.0),
-            ),
-        )
-        add(
-            "whales.exhaustion.side",
-            nested_value(
-                exhaustion,
-                "side",
-                "exhaustion_side",
-                default=value_for("exhaustion_side", default=None),
-            ),
+            "whales.metadata",
+            metadata,
+            section="metadata",
         )
 
         return result
@@ -5205,70 +6798,57 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+
+            to_payload = getattr(value, "to_payload", None)
+            if callable(to_payload):
+                converted = to_payload()
+                if isinstance(converted, dict):
+                    return converted
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
+
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
             for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+        def nested_value(value: Any, *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                item = get_item(value, key, None)
+                if item is not None:
+                    return item
 
-            return {}
+            metadata = get_item(value, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
 
-        snapshot = mapping_for(
-            "snapshot",
-            "spread_snapshot",
-            "spot_futures",
-            "spot_futures_snapshot",
-            "cross_exchange",
-            "cross_exchange_snapshot",
-            "result",
-        )
-        signal = mapping_for(
-            "signal",
-            "spread_signal",
-            "analytics_signal",
-            "event",
-        )
-        opportunity = mapping_for(
-            "opportunity",
-            "arbitrage_opportunity",
-            "arb_opportunity",
-        )
-        metadata = mapping_for(
-            "metadata",
-            "spread_metadata",
-        )
-
-        if snapshot:
-            if not signal:
-                for key in ("signal", "spread_signal", "analytics_signal", "event"):
-                    value = snapshot.get(key)
-                    if isinstance(value, dict):
-                        signal = value
-                        break
-
-            if not opportunity:
-                for key in ("opportunity", "arbitrage_opportunity", "arb_opportunity"):
-                    value = snapshot.get(key)
-                    if isinstance(value, dict):
-                        opportunity = value
-                        break
-
-            if not metadata:
-                for key in ("metadata", "spread_metadata"):
-                    value = snapshot.get(key)
-                    if isinstance(value, dict):
-                        metadata = value
-                        break
+            return default
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -5276,23 +6856,18 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if key in signal:
-                    return signal[key]
-                if key in opportunity:
-                    return opportunity[key]
-                if key in snapshot:
-                    return snapshot[key]
-                if key in metadata:
-                    return metadata[key]
+
+            for container in (snapshot, signal, opportunity):
+                value = nested_value(container, *keys, default=None)
+                if value is not None:
+                    return value
+
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in mapping:
-                    return mapping[key]
-            return default
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
+            if value is None:
+                return
 
-        def add(name: str, value: Any) -> None:
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.SPREADS,
@@ -5304,59 +6879,140 @@ class SignalNormalizer(BaseStrategyComponent):
                     metadata={
                         "origin": "contract_feature",
                         "contract": "spreads",
+                        **({"section": section} if section else {}),
                     },
                 )
             )
 
-        # Main sections
-        add("spreads.snapshot", snapshot or payload)
-        add("spreads.signal", signal)
-        add("spreads.opportunity", opportunity)
+        snapshot = mapping_or_object_for(
+            "snapshot",
+            "spread_snapshot",
+            "spreads_snapshot",
+            "spot_futures_snapshot",
+            "cross_exchange_snapshot",
+            "basis_snapshot",
+        )
+        signal = mapping_or_object_for(
+            "signal",
+            "spread_signal",
+            "spreads_signal",
+            "analytics_signal",
+            "setup",
+        )
+        opportunity = mapping_or_object_for(
+            "opportunity",
+            "arbitrage_opportunity",
+            "arb_opportunity",
+            "cross_exchange_opportunity",
+        )
 
-        # Identity
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "spreads_analysis",
+                "spread_analysis",
+                "event",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            snapshot = (
+                    snapshot
+                    or container_map.get("snapshot")
+                    or container_map.get("spread_snapshot")
+                    or container_map.get("spreads_snapshot")
+                    or container_map.get("spot_futures_snapshot")
+                    or container_map.get("cross_exchange_snapshot")
+                    or container_map.get("basis_snapshot")
+            )
+            signal = (
+                    signal
+                    or container_map.get("signal")
+                    or container_map.get("spread_signal")
+                    or container_map.get("spreads_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+            opportunity = (
+                    opportunity
+                    or container_map.get("opportunity")
+                    or container_map.get("arbitrage_opportunity")
+                    or container_map.get("arb_opportunity")
+                    or container_map.get("cross_exchange_opportunity")
+            )
+
+        if snapshot is None:
+            flat_snapshot: dict[str, Any] = {}
+            for key in (
+                    "spread_type",
+                    "type",
+                    "symbol",
+                    "exchange_a",
+                    "exchange_b",
+                    "market_type_a",
+                    "market_type_b",
+                    "exchange_symbol_a",
+                    "exchange_symbol_b",
+                    "spot_exchange",
+                    "futures_exchange",
+                    "spot_symbol",
+                    "futures_symbol",
+                    "instrument_type",
+                    "leg_a",
+                    "leg_b",
+                    "spread_bps",
+                    "basis",
+                    "funding_adjusted_spread",
+                    "net_edge",
+                    "net_edge_bps",
+                    "zscore",
+                    "regime",
+                    "direction",
+                    "signal_type",
+                    "quote_validity",
+                    "has_edge",
+                    "confidence",
+                    "timestamp",
+                    "timeframe",
+                    "metadata",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_snapshot[key] = value
+
+            if flat_snapshot:
+                snapshot = flat_snapshot
+
+        add("spreads.snapshot", snapshot, section="snapshot")
+
         add(
             "spreads.type",
-            value_for(
-                "spread_type",
-                "type",
-                default=None,
-            ),
+            value_for("spread_type", "type", default=None),
+            section="snapshot",
         )
         add(
             "spreads.symbol",
-            value_for(
-                "symbol",
-                default=symbol,
-            ),
+            value_for("symbol", default=symbol),
+            section="snapshot",
         )
-
-        # Legs / venues
         add(
             "spreads.exchange_a",
-            value_for(
-                "exchange_a",
-                "spot_exchange",
-                "buy_exchange",
-                default=None,
-            ),
+            value_for("exchange_a", "spot_exchange", "buy_exchange", default=None),
+            section="snapshot",
         )
         add(
             "spreads.exchange_b",
-            value_for(
-                "exchange_b",
-                "futures_exchange",
-                "sell_exchange",
-                default=None,
-            ),
+            value_for("exchange_b", "futures_exchange", "sell_exchange", default=None),
+            section="snapshot",
         )
         add(
             "spreads.market_type_a",
-            value_for(
-                "market_type_a",
-                "spot_market_type",
-                "buy_market_type",
-                default=None,
-            ),
+            value_for("market_type_a", "spot_market_type", "buy_market_type", default=None),
+            section="snapshot",
         )
         add(
             "spreads.market_type_b",
@@ -5366,214 +7022,237 @@ class SignalNormalizer(BaseStrategyComponent):
                 "sell_market_type",
                 default=None,
             ),
+            section="snapshot",
         )
         add(
             "spreads.exchange_symbol_a",
-            value_for(
-                "exchange_symbol_a",
-                "symbol_a",
-                "buy_exchange_symbol",
-                default=None,
-            ),
+            value_for("exchange_symbol_a", "spot_symbol", "buy_symbol", default=None),
+            section="snapshot",
         )
         add(
             "spreads.exchange_symbol_b",
-            value_for(
-                "exchange_symbol_b",
-                "symbol_b",
-                "sell_exchange_symbol",
-                default=None,
-            ),
+            value_for("exchange_symbol_b", "futures_symbol", "sell_symbol", default=None),
+            section="snapshot",
         )
 
-        # Spread metrics
         add(
             "spreads.spread_bps",
-            value_for(
-                "spread_bps",
-                "basis_bps",
-                default=0.0,
-            ),
+            value_for("spread_bps", "basis_bps", default=None),
+            section="snapshot",
         )
         add(
             "spreads.basis",
-            value_for(
-                "basis",
-                "basis_value",
-                default=0.0,
-            ),
+            value_for("basis", "basis_value", default=None),
+            section="snapshot",
         )
         add(
             "spreads.funding_adjusted_spread",
             value_for(
                 "funding_adjusted_spread",
-                "funding_adjusted_edge",
-                default=0.0,
+                "funding_adjusted_basis",
+                "funding_edge",
+                default=None,
             ),
+            section="snapshot",
         )
         add(
             "spreads.net_edge",
-            value_for(
-                "net_edge",
-                "edge",
-                default=0.0,
-            ),
+            value_for("net_edge", "edge", default=None),
+            section="snapshot",
         )
         add(
             "spreads.net_edge_bps",
-            value_for(
-                "net_edge_bps",
-                "edge_bps",
-                default=0.0,
-            ),
+            value_for("net_edge_bps", "edge_bps", default=None),
+            section="snapshot",
         )
         add(
             "spreads.zscore",
-            value_for(
-                "zscore",
-                "z_score",
-                default=0.0,
-            ),
+            value_for("zscore", "z_score", default=None),
+            section="snapshot",
         )
 
-        # Signal / regime
         add(
             "spreads.regime",
-            value_for(
-                "regime",
-                "spread_regime",
-                default=None,
-            ),
+            value_for("regime", "spread_regime", default=None),
+            section="snapshot",
         )
         add(
             "spreads.direction",
-            value_for(
-                "direction",
-                "spread_direction",
-                "bias",
-                default=None,
-            ),
+            value_for("direction", "spread_direction", default=None),
+            section="snapshot",
         )
         add(
             "spreads.signal_type",
-            value_for(
-                "signal_type",
-                "spread_signal_type",
-                "type",
-                default=None,
-            ),
+            value_for("signal_type", "spread_signal_type", default=None),
+            section="snapshot",
         )
         add(
             "spreads.quote_validity",
-            value_for(
-                "quote_validity",
-                "validity",
-                default=None,
-            ),
+            value_for("quote_validity", "quote_status", default=None),
+            section="snapshot",
         )
         add(
             "spreads.has_edge",
-            value_for(
-                "has_edge",
-                "tradeable_edge",
-                default=False,
-            ),
+            value_for("has_edge", "tradeable_edge", default=None),
+            section="snapshot",
         )
         add(
             "spreads.confidence",
-            value_for(
-                "confidence",
-                "signal_confidence",
-                default=0.0,
-            ),
+            value_for("confidence", "score_confidence", default=None),
+            section="snapshot",
         )
 
-        # Opportunity
-        add(
-            "spreads.opportunity_key",
-            value_for(
-                "opportunity_key",
-                "key",
-                default=None,
-            ),
-        )
-        add(
-            "spreads.opportunity_status",
-            value_for(
-                "opportunity_status",
-                "status",
-                default=None,
-            ),
-        )
-        add(
-            "spreads.persistence_ms",
-            value_for(
-                "persistence_ms",
-                "duration_ms",
-                default=0,
-            ),
-        )
-
-        # Arbitrage leg direction
-        add(
-            "spreads.buy_exchange",
-            value_for(
-                "buy_exchange",
-                default=nested_value(opportunity, "buy_exchange"),
-            ),
-        )
-        add(
-            "spreads.sell_exchange",
-            value_for(
-                "sell_exchange",
-                default=nested_value(opportunity, "sell_exchange"),
-            ),
-        )
-        add(
-            "spreads.buy_market_type",
-            value_for(
-                "buy_market_type",
-                default=nested_value(opportunity, "buy_market_type"),
-            ),
-        )
-        add(
-            "spreads.sell_market_type",
-            value_for(
-                "sell_market_type",
-                default=nested_value(opportunity, "sell_market_type"),
-            ),
-        )
-
-        # Instrument type compatibility
         add(
             "spreads.leg_a.instrument_type",
-            value_for(
-                "leg_a_instrument_type",
-                "instrument_type_a",
-                default=nested_value(snapshot, "leg_a", default={}).get("instrument_type")
-                if isinstance(nested_value(snapshot, "leg_a", default={}), dict)
-                else None,
+            nested_value(
+                value_for("leg_a", default=None),
+                "instrument_type",
+                default=value_for("instrument_type_a", default=None),
             ),
+            section="snapshot",
         )
         add(
             "spreads.leg_b.instrument_type",
-            value_for(
-                "leg_b_instrument_type",
-                "instrument_type_b",
-                default=nested_value(snapshot, "leg_b", default={}).get("instrument_type")
-                if isinstance(nested_value(snapshot, "leg_b", default={}), dict)
-                else None,
+            nested_value(
+                value_for("leg_b", default=None),
+                "instrument_type",
+                default=value_for("instrument_type_b", default=None),
             ),
+            section="snapshot",
         )
         add(
             "spreads.instrument_type",
-            value_for(
-                "instrument_type",
-                default=None,
-            ),
+            value_for("instrument_type", default=None),
+            section="snapshot",
         )
 
-        add("spreads.metadata", metadata)
+        if signal is not None:
+            add("spreads.signal", signal, section="signal")
+            add(
+                "spreads.signal_type",
+                nested_value(
+                    signal,
+                    "signal_type",
+                    "type",
+                    "setup_type",
+                    default=value_for("signal_type", "setup_type", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "spreads.direction",
+                nested_value(
+                    signal,
+                    "direction",
+                    "spread_direction",
+                    "side",
+                    default=value_for("direction", "side", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "spreads.confidence",
+                nested_value(
+                    signal,
+                    "confidence",
+                    default=value_for("signal_confidence", "confidence", default=None),
+                ),
+                section="signal",
+            )
+
+        if opportunity is not None:
+            add("spreads.opportunity", opportunity, section="opportunity")
+            add(
+                "spreads.opportunity_key",
+                nested_value(
+                    opportunity,
+                    "opportunity_key",
+                    "key",
+                    default=value_for("opportunity_key", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.opportunity_status",
+                nested_value(
+                    opportunity,
+                    "status",
+                    "opportunity_status",
+                    default=value_for("opportunity_status", "status", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.persistence_ms",
+                nested_value(
+                    opportunity,
+                    "persistence_ms",
+                    default=value_for("persistence_ms", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.buy_exchange",
+                nested_value(
+                    opportunity,
+                    "buy_exchange",
+                    default=value_for("buy_exchange", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.sell_exchange",
+                nested_value(
+                    opportunity,
+                    "sell_exchange",
+                    default=value_for("sell_exchange", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.buy_market_type",
+                nested_value(
+                    opportunity,
+                    "buy_market_type",
+                    default=value_for("buy_market_type", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.sell_market_type",
+                nested_value(
+                    opportunity,
+                    "sell_market_type",
+                    default=value_for("sell_market_type", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.net_edge",
+                nested_value(
+                    opportunity,
+                    "net_edge",
+                    "edge",
+                    default=value_for("net_edge", "edge", default=None),
+                ),
+                section="opportunity",
+            )
+            add(
+                "spreads.net_edge_bps",
+                nested_value(
+                    opportunity,
+                    "net_edge_bps",
+                    "edge_bps",
+                    default=value_for("net_edge_bps", "edge_bps", default=None),
+                ),
+                section="opportunity",
+            )
+
+        add(
+            "spreads.metadata",
+            value_for("metadata", default=None),
+            section="metadata",
+        )
 
         return result
 
@@ -5585,83 +7264,51 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
+
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
             for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+        def nested_value(value: Any, *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                item = get_item(value, key, None)
+                if item is not None:
+                    return item
 
-            return {}
+            metadata = get_item(value, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
 
-        composite = mapping_for(
-            "composite",
-            "spoofing",
-            "snapshot",
-            "result",
-        )
-        signal = mapping_for(
-            "signal",
-            "spoofing_signal",
-            "analytics_signal",
-            "event",
-        )
-        features = mapping_for(
-            "features",
-            "spoofing_features",
-        )
-        detector_results = mapping_for(
-            "detector_results",
-            "detectors",
-            "detector_result",
-        )
-        score_breakdown = mapping_for(
-            "score_breakdown",
-            "scores",
-            "score_components",
-        )
-        analytics_metadata = mapping_for(
-            "analytics_metadata",
-            "metadata",
-        )
-
-        if composite:
-            if not signal:
-                for key in ("signal", "spoofing_signal", "analytics_signal", "event"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        signal = value
-                        break
-
-            if not features:
-                for key in ("features", "spoofing_features"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        features = value
-                        break
-
-            if not detector_results:
-                for key in ("detector_results", "detectors", "detector_result"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        detector_results = value
-                        break
-
-            if not score_breakdown:
-                for key in ("score_breakdown", "scores", "score_components"):
-                    value = composite.get(key)
-                    if isinstance(value, dict):
-                        score_breakdown = value
-                        break
+            return default
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -5669,21 +7316,25 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if key in signal:
-                    return signal[key]
-                if key in features:
-                    return features[key]
-                if key in composite:
-                    return composite[key]
+
+            for container in (
+                    composite,
+                    signal,
+                    features,
+                    detector_results,
+                    score_breakdown,
+                    analytics_metadata,
+            ):
+                value = nested_value(container, *keys, default=None)
+                if value is not None:
+                    return value
+
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in mapping:
-                    return mapping[key]
-            return default
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
+            if value is None:
+                return
 
-        def add(name: str, value: Any) -> None:
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.SPOOFING,
@@ -5695,202 +7346,303 @@ class SignalNormalizer(BaseStrategyComponent):
                     metadata={
                         "origin": "contract_feature",
                         "contract": "spoofing",
+                        **({"section": section} if section else {}),
                     },
                 )
             )
 
-        # Composite / signal
-        add("spoofing.composite", composite or payload)
-        add("spoofing.signal", signal or payload)
+        composite = mapping_or_object_for(
+            "composite",
+            "snapshot",
+            "spoofing",
+            "spoofing_snapshot",
+            "composite_snapshot",
+        )
+        signal = mapping_or_object_for(
+            "signal",
+            "spoofing_signal",
+            "analytics_signal",
+            "setup",
+        )
+        features = mapping_or_object_for(
+            "features",
+            "spoofing_features",
+        )
+        detector_results = mapping_or_object_for(
+            "detector_results",
+            "detectors",
+            "detector_state",
+            "components",
+        )
+        score_breakdown = mapping_or_object_for(
+            "score_breakdown",
+            "scores",
+            "scoring",
+        )
+        analytics_metadata = mapping_or_object_for(
+            "analytics_metadata",
+            "metadata",
+            "meta",
+        )
 
-        # Nested contract sections
-        add("spoofing.features", features)
-        add("spoofing.detector_results", detector_results)
-        add("spoofing.score_breakdown", score_breakdown)
-        add("spoofing.analytics_metadata", analytics_metadata)
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "spoofing_analysis",
+                "event",
+                "spoofing",
+                "composite",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
 
-        # Core signal identity
+            composite = (
+                    composite
+                    or container_map.get("composite")
+                    or container_map.get("snapshot")
+                    or container_map.get("spoofing")
+                    or container_map.get("spoofing_snapshot")
+                    or container_map.get("composite_snapshot")
+            )
+            signal = (
+                    signal
+                    or container_map.get("signal")
+                    or container_map.get("spoofing_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+            features = (
+                    features
+                    or container_map.get("features")
+                    or container_map.get("spoofing_features")
+            )
+            detector_results = (
+                    detector_results
+                    or container_map.get("detector_results")
+                    or container_map.get("detectors")
+                    or container_map.get("detector_state")
+                    or container_map.get("components")
+            )
+            score_breakdown = (
+                    score_breakdown
+                    or container_map.get("score_breakdown")
+                    or container_map.get("scores")
+                    or container_map.get("scoring")
+            )
+            analytics_metadata = (
+                    analytics_metadata
+                    or container_map.get("analytics_metadata")
+                    or container_map.get("metadata")
+                    or container_map.get("meta")
+            )
+
+        if signal is not None:
+            features = features or nested_value(signal, "features", default=None)
+            detector_results = detector_results or nested_value(
+                signal,
+                "detector_results",
+                "detectors",
+                "components",
+                default=None,
+            )
+            score_breakdown = score_breakdown or nested_value(
+                signal,
+                "score_breakdown",
+                "scores",
+                default=None,
+            )
+            analytics_metadata = analytics_metadata or nested_value(
+                signal,
+                "metadata",
+                "analytics_metadata",
+                default=None,
+            )
+
+        if features is None:
+            flat_features: dict[str, Any] = {}
+            for key in (
+                    "pull_ratio",
+                    "fill_ratio",
+                    "price_reaction_bps",
+                    "signed_price_reaction_bps",
+                    "lifetime_ms",
+                    "wall_notional",
+                    "pulled_notional",
+                    "cancel_to_fill_ratio",
+                    "distance_from_mid_bps",
+                    "layer_count",
+                    "layer_price_span_bps",
+                    "pressure_flip_strength",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_features[key] = value
+
+            if flat_features:
+                features = flat_features
+
+        if composite is None and any(
+                section is not None
+                for section in (
+                        signal,
+                        features,
+                        detector_results,
+                        score_breakdown,
+                        analytics_metadata,
+                )
+        ):
+            composite = {
+                "signal": signal or {},
+                "features": features or {},
+                "detector_results": detector_results or {},
+                "score_breakdown": score_breakdown or {},
+                "analytics_metadata": analytics_metadata or {},
+            }
+
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    composite[key] = value
+
+        if composite is not None:
+            add("spoofing.composite", composite, section="composite")
+
+        if signal is not None:
+            add("spoofing.signal", signal, section="signal")
+
+        if features is not None:
+            add("spoofing.features", features, section="features")
+
+        if detector_results is not None:
+            add("spoofing.detector_results", detector_results, section="detector_results")
+
+        if score_breakdown is not None:
+            add("spoofing.score_breakdown", score_breakdown, section="score_breakdown")
+
+        if analytics_metadata is not None:
+            add("spoofing.analytics_metadata", analytics_metadata, section="metadata")
+
         add(
             "spoofing.type",
-            value_for(
-                "spoofing_type",
-                "type",
-                "signal_type",
-                default=None,
-            ),
+            value_for("spoofing_type", "type", "signal_type", "setup_type", default=None),
+            section="signal",
         )
         add(
             "spoofing.pattern",
-            value_for(
-                "pattern",
-                "spoofing_pattern",
-                default=None,
-            ),
+            value_for("pattern", "spoofing_pattern", default=None),
+            section="signal",
         )
         add(
             "spoofing.side",
-            value_for(
-                "side",
-                "spoofing_side",
-                "direction",
-                "bias",
-                default=None,
-            ),
+            value_for("side", "spoofing_side", "signal_side", "direction", default=None),
+            section="signal",
         )
         add(
             "spoofing.severity",
-            value_for(
-                "severity",
-                "spoofing_severity",
-                default=None,
-            ),
+            value_for("severity", "spoofing_severity", default=None),
+            section="signal",
         )
         add(
             "spoofing.status",
-            value_for(
-                "status",
-                "spoofing_status",
-                default=None,
-            ),
+            value_for("status", "spoofing_status", default=None),
+            section="signal",
         )
-
-        # Scores
         add(
             "spoofing.score",
-            value_for(
-                "score",
-                "spoofing_score",
-                default=0.0,
-            ),
+            value_for("score", "signal_score", default=None),
+            section="signal",
         )
         add(
             "spoofing.confidence",
-            value_for(
-                "confidence",
-                "spoofing_confidence",
-                default=0.0,
-            ),
+            value_for("confidence", "signal_confidence", default=None),
+            section="signal",
         )
-
-        # Position / wall identity
         add(
             "spoofing.price_level",
-            value_for(
-                "price_level",
-                "level",
-                "wall_price",
-                default=None,
-            ),
+            value_for("price_level", "level", "wall_price", default=None),
+            section="signal",
         )
         add(
             "spoofing.wall_id",
-            value_for(
-                "wall_id",
-                "id",
-                "order_id",
-                default=None,
-            ),
+            value_for("wall_id", default=None),
+            section="signal",
         )
         add(
             "spoofing.event_time",
-            value_for(
-                "event_time",
-                "timestamp",
-                "created_at",
-                "time",
-                default=timestamp,
-            ),
+            value_for("event_time", "timestamp", "time", default=None),
+            section="signal",
         )
 
-        # Feature metrics
         add(
             "spoofing.features.pull_ratio",
-            value_for(
-                "pull_ratio",
-                default=0.0,
-            ),
+            value_for("pull_ratio", default=None),
+            section="features",
         )
         add(
             "spoofing.features.fill_ratio",
-            value_for(
-                "fill_ratio",
-                default=0.0,
-            ),
+            value_for("fill_ratio", default=None),
+            section="features",
         )
         add(
             "spoofing.features.price_reaction_bps",
-            value_for(
-                "price_reaction_bps",
-                default=0.0,
-            ),
+            value_for("price_reaction_bps", default=None),
+            section="features",
         )
         add(
             "spoofing.features.signed_price_reaction_bps",
-            value_for(
-                "signed_price_reaction_bps",
-                "price_reaction_bps",
-                default=0.0,
-            ),
+            value_for("signed_price_reaction_bps", default=None),
+            section="features",
         )
         add(
             "spoofing.features.lifetime_ms",
-            value_for(
-                "lifetime_ms",
-                "wall_lifetime_ms",
-                default=0.0,
-            ),
+            value_for("lifetime_ms", default=None),
+            section="features",
         )
         add(
             "spoofing.features.wall_notional",
-            value_for(
-                "wall_notional",
-                "notional",
-                default=0.0,
-            ),
+            value_for("wall_notional", default=None),
+            section="features",
         )
         add(
             "spoofing.features.pulled_notional",
-            value_for(
-                "pulled_notional",
-                default=0.0,
-            ),
+            value_for("pulled_notional", default=None),
+            section="features",
         )
         add(
             "spoofing.features.cancel_to_fill_ratio",
-            value_for(
-                "cancel_to_fill_ratio",
-                default=0.0,
-            ),
+            value_for("cancel_to_fill_ratio", default=None),
+            section="features",
         )
         add(
             "spoofing.features.distance_from_mid_bps",
-            value_for(
-                "distance_from_mid_bps",
-                default=0.0,
-            ),
+            value_for("distance_from_mid_bps", default=None),
+            section="features",
         )
         add(
             "spoofing.features.layer_count",
-            value_for(
-                "layer_count",
-                "layers_count",
-                default=0,
-            ),
+            value_for("layer_count", default=None),
+            section="features",
         )
         add(
             "spoofing.features.layer_price_span_bps",
-            value_for(
-                "layer_price_span_bps",
-                default=0.0,
-            ),
+            value_for("layer_price_span_bps", default=None),
+            section="features",
         )
         add(
             "spoofing.features.pressure_flip_strength",
-            value_for(
-                "pressure_flip_strength",
-                "flip_strength",
-                default=0.0,
-            ),
+            value_for("pressure_flip_strength", default=None),
+            section="features",
         )
 
         return result
@@ -5902,32 +7654,52 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
-        """
-        Build stable price-action contract features.
-
-        Unlike the old broad fallback, module-level features are emitted only
-        when a compatible section/event exists. This avoids routing FVG/SR/Trend
-        strategies from a pure market-structure event and then getting generic
-        no_signal_generated responses.
-        """
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return dict(value)
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return dict(value)
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
             return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def nested_value(value: Any, *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                item = get_item(value, key, None)
+                if item is not None:
+                    return item
+
+            metadata = get_item(value, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
+
+            return default
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -5935,21 +7707,26 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if isinstance(state, dict) and key in state:
-                    return state[key]
-            return default
 
-        def nested_value(mapping: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
-            if not mapping:
-                return default
-            for key in keys:
-                if key in mapping:
-                    return mapping[key]
+            for container in (
+                    composite,
+                    market_structure,
+                    support_resistance,
+                    fair_value_gap,
+                    trend,
+                    liquidity_levels,
+                    signal,
+            ):
+                value = nested_value(container, *keys, default=None)
+                if value is not None:
+                    return value
+
             return default
 
         def add(name: str, value: Any, *, section: str | None = None) -> None:
             if value is None:
                 return
+
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.PRICE_ACTION,
@@ -5966,187 +7743,418 @@ class SignalNormalizer(BaseStrategyComponent):
                 )
             )
 
-        topic = (
-            str(
-                payload.get("event_name")
-                or payload.get("topic")
-                or payload.get("source_topic")
-                or ""
+        composite = mapping_or_object_for(
+            "composite",
+            "state",
+            "snapshot",
+            "price_action",
+            "price_action_state",
+        )
+        market_structure = mapping_or_object_for(
+            "market_structure",
+            "structure",
+            "market_structure_state",
+        )
+        support_resistance = mapping_or_object_for(
+            "support_resistance",
+            "sr",
+            "support_resistance_state",
+        )
+        fair_value_gap = mapping_or_object_for(
+            "fair_value_gap",
+            "fvg",
+            "fair_value_gap_state",
+            "fvg_state",
+        )
+        trend = mapping_or_object_for(
+            "trend",
+            "trend_state",
+        )
+        liquidity_levels = mapping_or_object_for(
+            "liquidity_levels",
+            "liquidity",
+            "levels",
+        )
+        signal = mapping_or_object_for(
+            "signal",
+            "price_action_signal",
+            "analytics_signal",
+            "setup",
+        )
+
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "price_action_analysis",
+                "state",
+                "price_action",
+                "composite",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            composite = composite or container_map.get("composite") or container_map.get(
+                "state"
             )
-            .strip()
-            .lower()
-        )
 
-        state = mapping_for("state", "composite", "price_action", "snapshot", "result")
-        market_structure = mapping_for("market_structure", "structure", "ms")
-        support_resistance = mapping_for("support_resistance", "sr", "levels")
-        fair_value_gap = mapping_for("fair_value_gap", "fvg", "fair_value_gaps")
-        trend = mapping_for("trend", "trend_state")
-        liquidity_levels = mapping_for("liquidity_levels", "liquidity")
+            market_structure = (
+                    market_structure
+                    or container_map.get("market_structure")
+                    or container_map.get("structure")
+                    or container_map.get("market_structure_state")
+            )
+            support_resistance = (
+                    support_resistance
+                    or container_map.get("support_resistance")
+                    or container_map.get("sr")
+                    or container_map.get("support_resistance_state")
+            )
+            fair_value_gap = (
+                    fair_value_gap
+                    or container_map.get("fair_value_gap")
+                    or container_map.get("fvg")
+                    or container_map.get("fair_value_gap_state")
+                    or container_map.get("fvg_state")
+            )
+            trend = (
+                    trend
+                    or container_map.get("trend")
+                    or container_map.get("trend_state")
+            )
+            liquidity_levels = (
+                    liquidity_levels
+                    or container_map.get("liquidity_levels")
+                    or container_map.get("liquidity")
+                    or container_map.get("levels")
+            )
+            signal = (
+                    signal
+                    or container_map.get("signal")
+                    or container_map.get("price_action_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
 
-        if isinstance(state, dict):
-            for target_name, current, aliases in (
-                ("market_structure", market_structure, ("market_structure", "structure", "ms")),
-                ("support_resistance", support_resistance, ("support_resistance", "sr", "levels")),
-                ("fair_value_gap", fair_value_gap, ("fair_value_gap", "fvg", "fair_value_gaps")),
-                ("trend", trend, ("trend", "trend_state")),
-                ("liquidity_levels", liquidity_levels, ("liquidity_levels", "liquidity")),
+        if composite is not None:
+            market_structure = market_structure or nested_value(
+                composite,
+                "market_structure",
+                "structure",
+                default=None,
+            )
+            support_resistance = support_resistance or nested_value(
+                composite,
+                "support_resistance",
+                "sr",
+                default=None,
+            )
+            fair_value_gap = fair_value_gap or nested_value(
+                composite,
+                "fair_value_gap",
+                "fvg",
+                default=None,
+            )
+            trend = trend or nested_value(
+                composite,
+                "trend",
+                default=None,
+            )
+            liquidity_levels = liquidity_levels or nested_value(
+                composite,
+                "liquidity_levels",
+                "liquidity",
+                default=None,
+            )
+
+        if composite is None and any(
+                section is not None
+                for section in (
+                        market_structure,
+                        support_resistance,
+                        fair_value_gap,
+                        trend,
+                        liquidity_levels,
+                )
+        ):
+            composite = {
+                "market_structure": market_structure or {},
+                "support_resistance": support_resistance or {},
+                "fair_value_gap": fair_value_gap or {},
+                "trend": trend or {},
+                "liquidity_levels": liquidity_levels or {},
+            }
+
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+                    "current_price",
+                    "last_price",
+                    "price",
             ):
-                if current is not None:
-                    continue
-                for alias in aliases:
-                    nested = state.get(alias)
-                    if isinstance(nested, dict):
-                        if target_name == "market_structure":
-                            market_structure = dict(nested)
-                        elif target_name == "support_resistance":
-                            support_resistance = dict(nested)
-                        elif target_name == "fair_value_gap":
-                            fair_value_gap = dict(nested)
-                        elif target_name == "trend":
-                            trend = dict(nested)
-                        elif target_name == "liquidity_levels":
-                            liquidity_levels = dict(nested)
-                        break
+                value = value_for(key, default=None)
+                if value is not None:
+                    composite[key] = value
 
-        event_payload = dict(payload)
-        current_price = value_for("current_price", "price", "last_price", "close", default=None)
-        if current_price is not None:
-            event_payload.setdefault("price", current_price)
-            event_payload.setdefault("current_price", current_price)
-        event_payload.setdefault("timestamp", value_for("timestamp", "event_time", default=timestamp))
-        event_payload.setdefault("confidence", value_for("confidence", default=0.0))
-        event_payload.setdefault("score", value_for("score", default=event_payload.get("confidence", 0.0)))
+        if composite is not None:
+            add("price_action.composite", composite, section="composite")
 
-        is_market_structure_event = (
-            market_structure is not None
-            or "market_structure" in topic
-            or ".structure" in topic
-            or any(key in payload for key in ("swing_type", "break_distance_pct", "market_bias", "broken_side", "mtf_alignment"))
+        current_price = value_for(
+            "current_price",
+            "last_price",
+            "price",
+            default=None,
         )
-        is_sr_event = (
-            support_resistance is not None
-            or "support_resistance" in topic
-            or ".sr." in topic
-            or any(key in payload for key in ("level_type", "level_status", "level_price", "touch_count", "reaction_count", "break_count"))
-        )
-        is_fvg_event = (
-            fair_value_gap is not None
-            or "fair_value_gap" in topic
-            or "fvg" in topic
-            or any(key in payload for key in ("fvg_direction", "gap_size_pct", "fill_pct", "upper_price", "lower_price", "mid_price"))
-        )
-        is_trend_event = (
-            trend is not None
-            or "trend" in topic
-            or any(key in payload for key in ("trend_direction", "trend_regime", "continuation_probability", "reversal_risk", "exhaustion_score", "overall_trend_score"))
-        )
+        add("price_action.current_price", current_price, section="composite")
+        add("price_action.last_price", value_for("last_price", "price", default=None), section="composite")
+        add("price_action.timestamp", value_for("timestamp", default=None), section="composite")
 
-        # Composite / global features are safe for all price-action payloads.
-        if state is not None or any((is_market_structure_event, is_sr_event, is_fvg_event, is_trend_event, liquidity_levels is not None)):
-            add("price_action.composite", state or payload, section="composite")
-        add("price_action.current_price", current_price, section="price")
-        add("price_action.last_price", value_for("last_price", "price", "close", default=current_price), section="price")
-        add("price_action.timestamp", value_for("timestamp", "event_time", default=timestamp), section="time")
+        if market_structure is not None:
+            add(
+                "price_action.market_structure",
+                market_structure,
+                section="market_structure",
+            )
+            add(
+                "price_action.market_structure.internal",
+                nested_value(market_structure, "internal", default=None),
+                section="market_structure",
+            )
+            add(
+                "price_action.market_structure.external",
+                nested_value(market_structure, "external", default=None),
+                section="market_structure",
+            )
+            add(
+                "price_action.market_structure.last_break_event",
+                nested_value(
+                    market_structure,
+                    "last_break_event",
+                    "last_event",
+                    "break_event",
+                    default=None,
+                ),
+                section="market_structure",
+            )
+            add(
+                "price_action.market_structure.mtf_alignment",
+                nested_value(
+                    market_structure,
+                    "mtf_alignment",
+                    "mtf_alignment_score",
+                    "alignment_score",
+                    default=None,
+                ),
+                section="market_structure",
+            )
 
-        if is_market_structure_event:
-            if market_structure is None:
-                event_type = value_for("event_type", "type", "kind", default=None)
-                if event_type is None:
-                    if ".bos" in topic or topic.endswith("bos"):
-                        event_type = "bos"
-                    elif ".choch" in topic:
-                        event_type = "choch"
-                    elif ".mss" in topic:
-                        event_type = "mss"
-                side = value_for("side", "direction", "bias", default=None)
-                bias = value_for("market_bias", "bias", "direction", default=side)
-                event_payload.setdefault("event_type", event_type)
-                event_payload.setdefault("side", side)
-                event_payload.setdefault("direction", side)
-                event_payload.setdefault("market_bias", bias)
-                event_payload.setdefault("confirmed", True)
-                market_structure = {
-                    "last_break_event": event_payload,
-                    "last_event": event_payload,
-                    "event": event_payload,
-                    "external": {
-                        "last_break_event": event_payload,
-                        "last_event": event_payload,
-                        "bias": bias,
-                        "market_bias": bias,
-                        "confidence": event_payload.get("confidence", 0.0),
-                        "score": event_payload.get("score", 0.0),
-                        "strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                        "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                    },
-                    "internal": {"bias": bias, "market_bias": bias, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
-                    "mtf_alignment": value_for("mtf_alignment", "alignment", default=event_payload.get("score", 0.0)),
-                    "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                }
+        if support_resistance is not None:
+            add(
+                "price_action.support_resistance",
+                support_resistance,
+                section="support_resistance",
+            )
+            add(
+                "price_action.support_resistance.internal",
+                nested_value(support_resistance, "internal", default=None),
+                section="support_resistance",
+            )
+            add(
+                "price_action.support_resistance.external",
+                nested_value(support_resistance, "external", default=None),
+                section="support_resistance",
+            )
+            add(
+                "price_action.support_resistance.last_event",
+                nested_value(
+                    support_resistance,
+                    "last_event",
+                    "event",
+                    default=None,
+                ),
+                section="support_resistance",
+            )
+            add(
+                "price_action.support_resistance.nearest_support",
+                nested_value(
+                    support_resistance,
+                    "nearest_support",
+                    "support",
+                    default=None,
+                ),
+                section="support_resistance",
+            )
+            add(
+                "price_action.support_resistance.nearest_resistance",
+                nested_value(
+                    support_resistance,
+                    "nearest_resistance",
+                    "resistance",
+                    default=None,
+                ),
+                section="support_resistance",
+            )
 
-            add("price_action.market_structure", market_structure, section="market_structure")
-            add("price_action.market_structure.internal", nested_value(market_structure, "internal", default={}), section="market_structure")
-            add("price_action.market_structure.external", nested_value(market_structure, "external", default={}), section="market_structure")
-            add("price_action.market_structure.last_break_event", nested_value(market_structure, "last_break_event", "last_event", "event", default=event_payload), section="market_structure")
-            add("price_action.market_structure.mtf_alignment", nested_value(market_structure, "mtf_alignment", "multi_timeframe_alignment", default=value_for("mtf_alignment", default=0.0)), section="market_structure")
+        if fair_value_gap is not None:
+            add(
+                "price_action.fair_value_gap",
+                fair_value_gap,
+                section="fair_value_gap",
+            )
+            add("price_action.fvg", fair_value_gap, section="fair_value_gap")
+            add(
+                "price_action.fair_value_gap.internal",
+                nested_value(fair_value_gap, "internal", default=None),
+                section="fair_value_gap",
+            )
+            add(
+                "price_action.fair_value_gap.external",
+                nested_value(fair_value_gap, "external", default=None),
+                section="fair_value_gap",
+            )
+            add(
+                "price_action.fair_value_gap.last_event",
+                nested_value(
+                    fair_value_gap,
+                    "last_event",
+                    "event",
+                    default=None,
+                ),
+                section="fair_value_gap",
+            )
+            add(
+                "price_action.fair_value_gap.nearest_bullish_gap",
+                nested_value(
+                    fair_value_gap,
+                    "nearest_bullish_gap",
+                    "bullish_gap",
+                    default=None,
+                ),
+                section="fair_value_gap",
+            )
+            add(
+                "price_action.fair_value_gap.nearest_bearish_gap",
+                nested_value(
+                    fair_value_gap,
+                    "nearest_bearish_gap",
+                    "bearish_gap",
+                    default=None,
+                ),
+                section="fair_value_gap",
+            )
 
-        if is_sr_event:
-            add("price_action.support_resistance", support_resistance or event_payload, section="support_resistance")
-            add("price_action.support_resistance.internal", nested_value(support_resistance, "internal", default={}), section="support_resistance")
-            add("price_action.support_resistance.external", nested_value(support_resistance, "external", default={}), section="support_resistance")
-            add("price_action.support_resistance.last_event", nested_value(support_resistance, "last_event", "event", default=event_payload), section="support_resistance")
-            add("price_action.support_resistance.nearest_support", nested_value(support_resistance, "nearest_support", "support", default=value_for("nearest_support", default=None)), section="support_resistance")
-            add("price_action.support_resistance.nearest_resistance", nested_value(support_resistance, "nearest_resistance", "resistance", default=value_for("nearest_resistance", default=None)), section="support_resistance")
-
-        if is_fvg_event:
-            add("price_action.fair_value_gap", fair_value_gap or event_payload, section="fair_value_gap")
-            add("price_action.fvg", fair_value_gap or event_payload, section="fair_value_gap")
-            add("price_action.fair_value_gap.internal", nested_value(fair_value_gap, "internal", default={}), section="fair_value_gap")
-            add("price_action.fair_value_gap.external", nested_value(fair_value_gap, "external", default={}), section="fair_value_gap")
-            add("price_action.fair_value_gap.last_event", nested_value(fair_value_gap, "last_event", "event", default=event_payload), section="fair_value_gap")
-            add("price_action.fair_value_gap.nearest_bullish_gap", nested_value(fair_value_gap, "nearest_bullish_gap", "bullish_gap", default=value_for("nearest_bullish_gap", default=None)), section="fair_value_gap")
-            add("price_action.fair_value_gap.nearest_bearish_gap", nested_value(fair_value_gap, "nearest_bearish_gap", "bearish_gap", default=value_for("nearest_bearish_gap", default=None)), section="fair_value_gap")
-
-        if is_trend_event:
-            if trend is None:
-                event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="trend_alignment"))
-                event_payload.setdefault("trend_direction", value_for("trend_direction", "direction", "side", default=None))
-                event_payload.setdefault("trend_regime", value_for("trend_regime", "regime", "state", default=None))
-                event_payload.setdefault("continuation_probability", value_for("continuation_probability", "continuation_prob", "probability", default=event_payload.get("score", 0.0)))
-                layer = {
-                    **event_payload,
-                    "direction": event_payload.get("trend_direction") or event_payload.get("direction"),
-                    "trend_direction": event_payload.get("trend_direction") or event_payload.get("direction"),
-                    "regime": event_payload.get("trend_regime"),
-                    "trend_regime": event_payload.get("trend_regime"),
-                    "trend_strength": value_for("trend_strength", "strength", "score", default=event_payload.get("score", 0.0)),
-                    "momentum_score": value_for("momentum_score", "momentum", default=event_payload.get("score", 0.0)),
-                    "slope_score": value_for("slope_score", "slope", default=event_payload.get("score", 0.0)),
-                    "continuation_probability": event_payload.get("continuation_probability"),
-                    "confidence": event_payload.get("confidence", 0.0),
-                    "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
-                }
-                trend = {
-                    "last_signal": event_payload,
-                    "last_event": event_payload,
-                    "event": event_payload,
-                    "external": layer,
-                    "internal": layer,
-                    "internal_external_alignment": value_for("internal_external_alignment", "alignment", default=event_payload.get("score", 0.0)),
-                    "higher_timeframe_alignment": value_for("higher_timeframe_alignment", "htf_alignment", default=event_payload.get("score", 0.0)),
-                    "overall_trend_score": value_for("overall_trend_score", "score", default=event_payload.get("score", 0.0)),
-                }
+        if trend is not None:
             add("price_action.trend", trend, section="trend")
-            add("price_action.trend.internal", nested_value(trend, "internal", default={}), section="trend")
-            add("price_action.trend.external", nested_value(trend, "external", default={}), section="trend")
-            add("price_action.trend.last_signal", nested_value(trend, "last_signal", "last_event", "event", default=event_payload), section="trend")
-            add("price_action.trend.internal_external_alignment", nested_value(trend, "internal_external_alignment", default=value_for("internal_external_alignment", default=0.0)), section="trend")
-            add("price_action.trend.higher_timeframe_alignment", nested_value(trend, "higher_timeframe_alignment", "htf_alignment", default=value_for("higher_timeframe_alignment", "htf_alignment", default=0.0)), section="trend")
-            add("price_action.trend.overall_trend_score", nested_value(trend, "overall_trend_score", "score", default=value_for("overall_trend_score", "score", default=0.0)), section="trend")
+            add(
+                "price_action.trend.internal",
+                nested_value(trend, "internal", default=None),
+                section="trend",
+            )
+            add(
+                "price_action.trend.external",
+                nested_value(trend, "external", default=None),
+                section="trend",
+            )
+            add(
+                "price_action.trend.last_signal",
+                nested_value(
+                    trend,
+                    "last_signal",
+                    "last_event",
+                    "signal",
+                    default=None,
+                ),
+                section="trend",
+            )
+            add(
+                "price_action.trend.internal_external_alignment",
+                nested_value(
+                    trend,
+                    "internal_external_alignment",
+                    "alignment",
+                    "alignment_score",
+                    default=None,
+                ),
+                section="trend",
+            )
+            add(
+                "price_action.trend.higher_timeframe_alignment",
+                nested_value(
+                    trend,
+                    "higher_timeframe_alignment",
+                    "htf_alignment",
+                    default=None,
+                ),
+                section="trend",
+            )
+            add(
+                "price_action.trend.overall_trend_score",
+                nested_value(
+                    trend,
+                    "overall_trend_score",
+                    "overall_score",
+                    "trend_score",
+                    default=None,
+                ),
+                section="trend",
+            )
 
         if liquidity_levels is not None:
-            add("price_action.liquidity_levels", liquidity_levels, section="liquidity_levels")
+            add(
+                "price_action.liquidity_levels",
+                liquidity_levels,
+                section="liquidity_levels",
+            )
+
+        if signal is not None:
+            add("price_action.signal", signal, section="signal")
+            add(
+                "price_action.signal.type",
+                nested_value(
+                    signal,
+                    "type",
+                    "signal_type",
+                    "setup_type",
+                    default=value_for("signal_type", "setup_type", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "price_action.signal.score",
+                nested_value(
+                    signal,
+                    "score",
+                    default=value_for("signal_score", "score", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "price_action.signal.confidence",
+                nested_value(
+                    signal,
+                    "confidence",
+                    default=value_for("signal_confidence", "confidence", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "price_action.signal.side",
+                nested_value(
+                    signal,
+                    "side",
+                    "direction",
+                    "bias",
+                    default=value_for("signal_side", "side", "direction", default=None),
+                ),
+                section="signal",
+            )
 
         return result
 

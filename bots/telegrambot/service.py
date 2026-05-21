@@ -25,9 +25,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from trading_system.core.event_bus import EventBus, EventPriority, Subscription
-from trading_system.core.logger import get_logger
-from trading_system.core.scheduler import Scheduler
+from core.event_bus import EventBus, EventPriority, Subscription
+from core.logger import get_logger
+from core.scheduler import Scheduler
 
 from .client import TelegramBotClient
 from .config import TelegramBotConfig
@@ -448,7 +448,7 @@ class TelegramBotService:
         job = await self.scheduler.add_interval_job(
             name=self.HEALTHCHECK_JOB_NAME,
             func=self.health_check,
-            interval_sec=self.config.healthcheck_interval_sec,
+            interval=self.config.healthcheck_interval_sec,
             run_immediately=False,
             max_retries=1,
             retry_delay=self.config.retry.retry_delay_sec,

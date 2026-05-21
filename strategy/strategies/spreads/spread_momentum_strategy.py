@@ -442,6 +442,12 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         metadata = {
             "spreads_setup_family": "spread_momentum",
             "spreads_strategy_version": "2.0.0",
+            "contract": "spreads",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "snapshot",
+            "secondary_section": "signal",
+            "strategy_contract_role": "decision_module",
+            "risk_ready_payload_owner": "SignalProcessor",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,
             "snapshot": serialize_for_metadata(payload.snapshot.to_dict()),

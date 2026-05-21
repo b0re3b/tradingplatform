@@ -431,6 +431,11 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         metadata = {
             "hybrid_setup_family": "liquidity_orderflow_reversal",
             "hybrid_strategy_version": "2.0.0",
+            "contract": "hybrid",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "liquidity_orderflow_reversal",
+            "strategy_contract_role": "decision_module",
+            "risk_ready_payload_owner": "SignalProcessor",
             "score_breakdown": breakdown.to_dict(),
             "tags": tags,
             "snapshot": serialize_for_metadata(payload.snapshot.to_dict()),
