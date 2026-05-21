@@ -1754,7 +1754,7 @@ class BacktestProjectBootstrap:
 
         risk_config = self.build_risk_config(core_config)
         cls = import_required("risk.risk_manager.RiskManager")
-        risk_manager = construct_with_signature(
+        return construct_with_signature(
             cls,
             {
                 "config": risk_config,
@@ -1765,18 +1765,6 @@ class BacktestProjectBootstrap:
                 "scheduler": scheduler,
             },
         )
-
-        # Backtest-only account seed. Keep this deliberately narrow:
-        # seed only RiskManager.state / state.portfolio via the existing helper,
-        # and do not mutate StrategyTester, SignalProcessor or strategies.
-        initial_balance = float(getattr(self.backtest_config, "initial_balance", 0.0) or 0.0)
-        if initial_balance > 0.0:
-            self.seed_risk_state_for_backtest(
-                risk_manager,
-                initial_balance=initial_balance,
-            )
-
-        return risk_manager
 
     @staticmethod
     def build_risk_config(core_config: Config) -> Any:

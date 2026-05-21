@@ -370,35 +370,51 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         )
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
-        if not self.has_any_orderflow_data(
-            context,
-            tuple(self.cvd_config.required_orderflow_features),
-        ):
+        required_features = tuple(self.cvd_config.required_orderflow_features)
+
+        if not self.has_any_orderflow_data(context, required_features):
+            self.remember_no_signal(
+                "missing_orderflow_cvd_divergence_contract",
+                orderflow_domain_keys=sorted(self.orderflow_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
-        if self.has_stale_orderflow_features(
-            context,
-            tuple(self.cvd_config.required_orderflow_features),
-        ):
+        if self.has_stale_orderflow_features(context, required_features):
+            self.remember_no_signal(
+                "stale_orderflow_cvd_divergence_features",
+                required_features=sorted(required_features),
+            )
             return None
 
         payload = self._extract_payload(context)
         if payload is None:
+            self.remember_no_signal(
+                "orderflow_cvd_divergence_payload_not_resolved",
+                orderflow_domain=self.orderflow_domain(context),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if (
-            self.cvd_config.require_fresh_cvd
-            and is_stale(
-                event_time=payload.event_time,
-                now=context.timestamp,
+                self.cvd_config.require_fresh_cvd
+                and is_stale(
+            event_time=payload.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.cvd_config.stale_feature_max_age_seconds,
+        )
+        ):
+            self.remember_no_signal(
+                "stale_orderflow_cvd_divergence_snapshot",
+                event_time=payload.event_time.isoformat() if payload.event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
                 stale_after_seconds=self.cvd_config.stale_feature_max_age_seconds,
             )
-        ):
             return None
 
         common_rejection = cvd_divergence_filter_reason(
@@ -411,10 +427,27 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
             min_strength_for_signal=self.cvd_config.min_strength_for_signal,
         )
         if common_rejection is not None:
+            self.remember_no_signal(
+                "orderflow_cvd_divergence_quality_filter_failed",
+                filter_reason=common_rejection,
+                snapshot=serialize_for_metadata(payload.snapshot.to_dict()),
+                price_change_pct=payload.price_change_pct,
+                cvd_change_pct=payload.cvd_change_pct,
+                cvd_delta_ratio=payload.cvd_delta_ratio,
+                cvd_slope=payload.cvd_slope,
+                trades_count=payload.trades_count,
+                total_volume=payload.total_volume,
+                total_notional=payload.total_notional,
+            )
             return None
 
         side = payload.side
         if self.cvd_config.require_actionable_side and not is_directional_side(side):
+            self.remember_no_signal(
+                "orderflow_cvd_divergence_side_not_directional",
+                side=serialize_for_metadata(side),
+                snapshot=serialize_for_metadata(payload.snapshot.to_dict()),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -433,9 +466,24 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
             side_score_threshold,
         )
         if breakdown.score < min_score:
+            self.remember_no_signal(
+                "orderflow_cvd_divergence_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_score=min_score,
+                side_score_threshold=side_score_threshold,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.cvd_config.min_signal_confidence:
+            self.remember_no_signal(
+                "orderflow_cvd_divergence_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.cvd_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(payload)
@@ -456,6 +504,11 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         metadata = {
             "orderflow_setup_family": "cvd_divergence",
             "orderflow_strategy_version": "2.0.0",
+            "contract": "orderflow",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "cvd",
+            "strategy_contract_role": "decision_module",
+            "risk_ready_payload_owner": "SignalProcessor",
             "score_breakdown": breakdown.to_dict(),
             "snapshot": serialize_for_metadata(payload.snapshot.to_dict()),
             "raw": serialize_for_metadata(payload.raw),

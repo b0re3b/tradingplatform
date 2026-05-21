@@ -300,6 +300,7 @@ class PositionSimulator:
             "system.backtest.position_simulator.started",
             self.stats(),
         )
+        await self._emit("account.snapshot", self._account_to_event_payload(source="position_simulator.start"))
 
     async def stop(self) -> None:
         async with self._lock:
@@ -751,6 +752,8 @@ class PositionSimulator:
             margin=margin,
             notional=notional,
             fees_paid=fill.fee,
+            stop_loss=self._float_from_payload(payload, ["stop_loss"], None),
+            take_profit=self._float_from_payload(payload, ["take_profit"], None),
             slippage_paid=fill.slippage,
             opened_at_ms=fill.timestamp_ms,
             updated_at_ms=fill.timestamp_ms,
@@ -764,6 +767,9 @@ class PositionSimulator:
                 "source": "execution_fill",
                 "fill_id": fill.fill_id,
                 "order_id": fill.order_id,
+                "reservation_id": payload.get("reservation_id") or (payload.get("metadata") or {}).get("reservation_id"),
+                "risk_amount": self._float_from_payload(payload, ["risk_amount", "final_risk_amount", "open_risk"], 0.0),
+                "tier": payload.get("tier") or payload.get("final_tier") or (payload.get("metadata") or {}).get("final_tier"),
                 "payload": payload,
             },
         )
@@ -1241,6 +1247,7 @@ class PositionSimulator:
             position=position,
             payload=payload,
         )
+        await self._emit("account.updated", self._account_to_event_payload(source=topic))
 
     def _position_to_event_payload(self, position: SimulatedPosition) -> dict[str, Any]:
         return {
@@ -1254,12 +1261,19 @@ class PositionSimulator:
             "side": position.side,
             "status": position.status.value,
             "quantity": position.quantity,
+            "size": position.quantity,
             "entry_price": position.entry_price,
             "mark_price": position.mark_price,
             "exit_price": position.exit_price,
             "leverage": position.leverage,
             "margin": position.margin,
+            "margin_used": position.margin,
             "notional": position.notional,
+            "notional_value": position.notional,
+            "risk_amount": float(position.metadata.get("risk_amount") or 0.0),
+            "open_risk": float(position.metadata.get("risk_amount") or 0.0),
+            "reservation_id": position.metadata.get("reservation_id"),
+            "tier": position.metadata.get("tier"),
             "realized_pnl": position.realized_pnl,
             "unrealized_pnl": position.unrealized_pnl,
             "net_realized_pnl": self._net_realized_pnl(position),
@@ -1281,6 +1295,27 @@ class PositionSimulator:
                 **position.metadata,
                 "backtest": True,
                 "simulated": True,
+            },
+        }
+
+    def _account_to_event_payload(self, *, source: str) -> dict[str, Any]:
+        return {
+            "currency": self.balance.currency,
+            "balance": self.balance.cash_balance,
+            "cash_balance": self.balance.cash_balance,
+            "equity": self.balance.equity,
+            "free_balance": self.balance.available_balance,
+            "available_balance": self.balance.available_balance,
+            "used_margin": self.balance.margin_used,
+            "margin_used": self.balance.margin_used,
+            "realized_pnl": self.balance.realized_pnl,
+            "unrealized_pnl": self.balance.unrealized_pnl,
+            "timestamp_ms": self.balance.updated_at_ms,
+            "source": source,
+            "metadata": {
+                "backtest": True,
+                "simulated": True,
+                "open_positions": len([position for position in self.positions.values() if position.is_open]),
             },
         }
 

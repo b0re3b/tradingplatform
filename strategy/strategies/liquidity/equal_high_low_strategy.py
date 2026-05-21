@@ -301,20 +301,36 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         return set(base_required).union(self.equal_config.required_liquidity_features)
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
         if snapshot is None:
+            self.remember_no_signal(
+                "missing_liquidity_snapshot_contract",
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if not self.base_context_is_valid(context=context, snapshot=snapshot):
+            self.remember_no_signal(
+                "invalid_liquidity_base_context",
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+                snapshot=serialize_for_metadata(snapshot),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         current_price = self.current_price(context=context, snapshot=snapshot)
         if current_price is None or current_price <= 0:
+            self.remember_no_signal(
+                "invalid_liquidity_current_price",
+                current_price=current_price,
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+            )
             return None
 
         filters = self._run_pre_filters(
@@ -322,7 +338,14 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
             snapshot=snapshot,
             current_price=current_price,
         )
-        if any(item.blocked for item in filters):
+        blocked_filters = [item for item in filters if item.blocked]
+        if blocked_filters:
+            self.remember_no_signal(
+                "equal_high_low_pre_filters_blocked",
+                filters=[item.to_dict() for item in filters],
+                blocked_filters=[item.name for item in blocked_filters],
+                current_price=current_price,
+            )
             return None
 
         candidate = self._find_best_candidate(
@@ -330,10 +353,28 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
             current_price=current_price,
         )
         if candidate is None:
+            self.remember_no_signal(
+                "equal_high_low_candidate_not_found",
+                current_price=current_price,
+                equal_levels=serialize_for_metadata(
+                    getattr(snapshot, "equal_levels", None)
+                ),
+                active_levels=serialize_for_metadata(
+                    getattr(snapshot, "active_levels", None)
+                ),
+                stop_clusters=serialize_for_metadata(
+                    getattr(snapshot, "stop_clusters", None)
+                ),
+            )
             return None
 
         side = candidate.side
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "equal_high_low_side_not_directional",
+                side=serialize_for_metadata(side),
+                candidate=serialize_for_metadata(candidate),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -344,9 +385,23 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         )
 
         if breakdown.score < self.equal_config.min_signal_score:
+            self.remember_no_signal(
+                "equal_high_low_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.equal_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.equal_config.min_signal_confidence:
+            self.remember_no_signal(
+                "equal_high_low_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.equal_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         stop_loss = self._resolve_stop_price(
@@ -354,7 +409,11 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
             current_price=current_price,
             level=candidate.level,
         )
-        take_profit = reference_price(candidate.target) if candidate.target is not None else None
+        take_profit = (
+            reference_price(candidate.target)
+            if candidate.target is not None
+            else None
+        )
 
         target_plans = self._target_plans(
             current_price=current_price,
@@ -395,13 +454,18 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         metadata = {
             "liquidity_setup_family": "equal_high_low_reaction",
             "liquidity_strategy_version": "2.0.0",
+            "contract": "liquidity",
+            "primary_section": "snapshot",
+            "strategy_contract_role": "decision_module",
             "score_breakdown": breakdown.to_dict(),
             "tags": self._tags(candidate=candidate, snapshot=snapshot),
             "side": side.value,
             "current_price": current_price,
             "level": self._level_metadata(candidate.level),
             "level_price": candidate.level_price,
-            "level_type": serialize_for_metadata(getattr(candidate.level, "level_type", None)),
+            "level_type": serialize_for_metadata(
+                getattr(candidate.level, "level_type", None)
+            ),
             "target": self._target_metadata(candidate.target),
             "target_price": take_profit,
             "stop_loss": stop_loss,

@@ -1203,66 +1203,137 @@ class FundingTradingStrategy(TradingStrategy):
         invalidation.validate()
         return entry, exit_plan, invalidation
 
-    def build_funding_signal(
-        self,
-        *,
-        context: StrategyContext,
-        side: SignalSide,
-        confidence: float,
-        score: float,
-        setup_type: SetupType | None = None,
-        reasons: list[str] | None = None,
-        confirmations: list[str] | None = None,
-        source_features: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
-        priority: SignalPriority = SignalPriority.MEDIUM,
-        entry_price: float | None = None,
-        stop_loss: float | None = None,
-        take_profit: float | None = None,
-    ) -> StrategySignal:
-        if side not in {SignalSide.LONG, SignalSide.SHORT}:
-            raise StrategyEvaluationError(
-                f"{self.strategy_name}: funding signal side must be LONG or SHORT"
-            )
+    def scope_from_context(self, context: StrategyContext) -> FundingStrategyScope:
+        domain = self.funding_domain(context)
+        scope = domain.get("scope")
+        if not isinstance(scope, dict):
+            scope = {}
 
-        final_source_features = list(source_features or [])
-        signal_metadata = self.build_funding_trade_metadata(
-            context=context,
-            side=side,
-            setup_quality=score,
-            confluence_score=confidence,
-            risk_reward_score=0.0,
-            source_features=final_source_features,
-            extra=metadata,
+        exchange = (
+                scope.get("exchange")
+                or domain.get("exchange")
+                or "unknown"
+        )
+        market_type = (
+                scope.get("market_type")
+                or domain.get("market_type")
+                or self.funding_config.default_market_type.value
+        )
+        symbol = (
+                scope.get("symbol")
+                or domain.get("symbol")
+                or context.symbol
+        )
+        timeframe = (
+                scope.get("timeframe")
+                or domain.get("timeframe")
+                or context.timeframe.value
+        )
+        exchange_symbol = (
+                scope.get("exchange_symbol")
+                or domain.get("exchange_symbol")
+                or symbol
         )
 
-        signal = self.build_directional_signal(
+        return FundingStrategyScope(
+            exchange=str(exchange),
+            market_type=str(market_type),
+            symbol=str(symbol),
+            timeframe=str(timeframe),
+            exchange_symbol=str(exchange_symbol),
+        )
+
+    def build_funding_signal(
+            self,
+            *,
+            context: StrategyContext,
+            side: SignalSide,
+            confidence: float,
+            score: float,
+            setup_type: SetupType | None = None,
+            reasons: list[str] | None = None,
+            confirmations: list[str] | None = None,
+            source_features: list[str] | None = None,
+            metadata: dict[str, Any] | None = None,
+            priority: SignalPriority | None = None,
+    ) -> StrategySignal:
+        """
+        Build an internal strategy-layer funding signal.
+
+        This is NOT a risk-ready payload. SignalProcessor / SignalBuilder owns
+        final signal.generated payload creation for RiskManager.
+        """
+        self.validate_context_requirements(context)
+
+        domain = self.funding_domain(context)
+        scope = self.scope_from_context(context)
+
+        merged_metadata: dict[str, Any] = {
+            "domain": "funding",
+            "feature_source": FeatureSource.FUNDING.value,
+            "market_type": self.funding_config.default_market_type.value,
+            "margin_mode": self.funding_config.default_margin_mode.value,
+            "order_intent": self.funding_config.default_order_intent.value,
+            "trade_tier": self.funding_config.default_trade_tier.value,
+            "entry_type": self.funding_config.default_entry_type.value,
+            "exit_types": [
+                item.value for item in self.funding_config.default_exit_types
+            ],
+        }
+
+        if self.funding_config.requested_leverage is not None:
+            merged_metadata["requested_leverage"] = self.funding_config.requested_leverage
+
+        if self.funding_config.max_slippage_bps is not None:
+            merged_metadata["max_slippage_bps"] = self.funding_config.max_slippage_bps
+
+        if self.funding_config.entry_timeout_seconds is not None:
+            merged_metadata["entry_timeout_seconds"] = (
+                self.funding_config.entry_timeout_seconds
+            )
+
+        if self.funding_config.max_holding_seconds is not None:
+            merged_metadata["max_holding_seconds"] = (
+                self.funding_config.max_holding_seconds
+            )
+
+        if self.funding_config.attach_scope_metadata:
+            merged_metadata["scope"] = scope.to_dict()
+
+        if self.funding_config.attach_funding_context_metadata:
+            merged_metadata["funding_contract"] = serialize_for_metadata(
+                {
+                    "contract": domain.get("contract"),
+                    "scope": domain.get("scope"),
+                    "snapshot": domain.get("snapshot"),
+                    "statistics": domain.get("statistics"),
+                    "regime": domain.get("regime"),
+                    "pressure": domain.get("pressure"),
+                }
+            )
+
+        if self.funding_config.attach_feature_values_metadata:
+            merged_metadata["funding_features"] = {
+                name: serialize_for_metadata(context.get_feature(name))
+                for name in source_features or []
+                if context.has_feature(name)
+            }
+
+        merged_metadata.update(self.funding_config.metadata)
+        merged_metadata.update(metadata or {})
+
+        return self.build_signal(
             context=context,
             side=side,
             confidence=confidence,
             score=score,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
             setup_type=setup_type or self.default_setup_type,
-            reasons=reasons,
-            confirmations=confirmations,
-            source_features=final_source_features,
-            metadata=signal_metadata,
-            priority=priority,
-            tier=self.funding_config.default_trade_tier,
-            order_intent=self.funding_config.default_order_intent,
-            requested_leverage=self.funding_config.requested_leverage,
-            margin_mode=self.funding_config.default_margin_mode,
-            liquidity_class=None,
-            execution_quality=None,
-            market_type=self.funding_config.default_market_type,
+            reasons=list(reasons or []),
+            confirmations=list(confirmations or []),
+            source_features=list(source_features or []),
+            metadata=merged_metadata,
+            priority=priority or SignalPriority.MEDIUM,
         )
-
-        signal.metadata.setdefault("feature_source", FeatureSource.FUNDING.value)
-        signal.metadata.setdefault("funding_strategy_base", self.__class__.__name__)
-        signal.validate()
-        return signal
 
     # ------------------------------------------------------------------
     # Applicability

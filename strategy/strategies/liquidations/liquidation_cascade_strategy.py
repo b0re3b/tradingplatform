@@ -284,24 +284,36 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         )
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         cascade = liquidations_item(context, "cascade")
         if cascade is None:
+            self.remember_no_signal(
+                "missing_liquidations_cascade_contract",
+                liquidations_domain_keys=sorted(self.liquidations_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         event_time = extract_event_time(cascade)
         if (
-            self.cascade_config.require_fresh_cascade
-            and is_stale(
-                event_time=event_time,
-                now=context.timestamp,
-                stale_after_seconds=self.cascade_config.stale_feature_max_age_seconds,
-            )
+                self.cascade_config.require_fresh_cascade
+                and is_stale(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.cascade_config.stale_feature_max_age_seconds,
+        )
         ):
+            self.remember_no_signal(
+                "stale_liquidations_cascade",
+                event_time=event_time.isoformat() if event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
+                stale_after_seconds=self.cascade_config.stale_feature_max_age_seconds,
+                cascade=serialize_for_metadata(cascade),
+            )
             return None
 
         common_rejection = quality_filter_reason(
@@ -315,13 +327,62 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
             require_actionable_direction=self.cascade_config.require_actionable_direction,
         )
         if common_rejection is not None:
+            self.remember_no_signal(
+                "liquidations_cascade_quality_filter_failed",
+                filter_reason=common_rejection,
+                cascade=serialize_for_metadata(cascade),
+                confidence=extract_confidence(cascade),
+                score=extract_score(cascade),
+                intensity_score=extract_intensity_score(cascade),
+                total_notional_usd=str(extract_notional_usd(cascade)),
+                event_count=extract_event_count(cascade),
+                min_confidence=self.cascade_config.min_confidence,
+                min_intensity_score=self.cascade_config.min_intensity_score,
+                min_total_notional_usd=str(self.cascade_config.min_total_notional_usd),
+                min_event_count=self.cascade_config.min_event_count,
+            )
             return None
 
         if not self._passes_cascade_filters(cascade):
+            self.remember_no_signal(
+                "liquidations_cascade_strategy_filters_failed",
+                cascade=serialize_for_metadata(cascade),
+                severity=self._severity(cascade),
+                allowed_severities=list(self.cascade_config.allowed_severities),
+                continuation_bias=extract_continuation_bias(cascade),
+                min_continuation_bias=self.cascade_config.min_continuation_bias,
+                exhaustion_bias=extract_exhaustion_bias(cascade),
+                max_exhaustion_bias_for_continuation=(
+                    self.cascade_config.max_exhaustion_bias_for_continuation
+                ),
+                bias_delta=extract_bias_delta(cascade),
+                min_bias_delta=self.cascade_config.min_bias_delta,
+                side_imbalance_ratio=extract_side_imbalance_ratio(cascade),
+                min_side_imbalance_ratio=self.cascade_config.min_side_imbalance_ratio,
+                event_imbalance_ratio=extract_event_imbalance_ratio(cascade),
+                min_event_imbalance_ratio=self.cascade_config.min_event_imbalance_ratio,
+                acceleration_ratio=extract_acceleration_ratio(cascade),
+                min_acceleration_ratio=self.cascade_config.min_acceleration_ratio,
+                cluster_duration_seconds=extract_cluster_duration_seconds(cascade),
+                max_cluster_duration_seconds=self.cascade_config.max_cluster_duration_seconds,
+                cluster_avg_notional_per_event=str(
+                    extract_cluster_avg_notional_per_event(cascade)
+                ),
+                min_avg_notional_per_event=(
+                    str(self.cascade_config.min_avg_notional_per_event)
+                    if self.cascade_config.min_avg_notional_per_event is not None
+                    else None
+                ),
+            )
             return None
 
         side = self._derive_continuation_side(cascade)
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "liquidations_cascade_side_not_directional",
+                cascade=serialize_for_metadata(cascade),
+                cascade_direction=serialize_for_metadata(extract_direction(cascade)),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -330,9 +391,23 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         )
 
         if breakdown.score < self.cascade_config.min_signal_score:
+            self.remember_no_signal(
+                "liquidations_cascade_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.cascade_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.cascade_config.min_signal_confidence:
+            self.remember_no_signal(
+                "liquidations_cascade_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.cascade_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(cascade)
@@ -352,6 +427,8 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         metadata = {
             "liquidations_setup_family": "liquidation_cascade_continuation",
             "liquidations_strategy_version": "2.0.0",
+            "contract": "liquidations",
+            "primary_section": "cascade",
             "score_breakdown": breakdown.to_dict(),
             "cascade": serialize_for_metadata(cascade),
             "event_time": event_time.isoformat() if event_time else None,

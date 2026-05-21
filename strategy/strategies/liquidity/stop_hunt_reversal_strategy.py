@@ -251,20 +251,36 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         )
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
         if snapshot is None:
+            self.remember_no_signal(
+                "missing_liquidity_snapshot_contract",
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if not self.base_context_is_valid(context=context, snapshot=snapshot):
+            self.remember_no_signal(
+                "invalid_liquidity_base_context",
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+                snapshot=serialize_for_metadata(snapshot),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         current_price = self.current_price(context=context, snapshot=snapshot)
         if current_price is None or current_price <= 0:
+            self.remember_no_signal(
+                "invalid_liquidity_current_price",
+                current_price=current_price,
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+            )
             return None
 
         filters = self._run_pre_filters(
@@ -272,7 +288,14 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
             snapshot=snapshot,
             current_price=current_price,
         )
-        if any(item.blocked for item in filters):
+        blocked_filters = [item for item in filters if item.blocked]
+        if blocked_filters:
+            self.remember_no_signal(
+                "stop_hunt_reversal_pre_filters_blocked",
+                filters=[item.to_dict() for item in filters],
+                blocked_filters=[item.name for item in blocked_filters],
+                current_price=current_price,
+            )
             return None
 
         candidate = self._find_reversal_candidate(
@@ -280,10 +303,21 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
             current_price=current_price,
         )
         if candidate is None:
+            self.remember_no_signal(
+                "stop_hunt_reversal_candidate_not_found",
+                current_price=current_price,
+                swept_levels=serialize_for_metadata(swept_levels(snapshot)),
+                swept_clusters=serialize_for_metadata(swept_clusters(snapshot)),
+            )
             return None
 
         side = candidate["side"]
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "stop_hunt_reversal_side_not_directional",
+                side=serialize_for_metadata(side),
+                candidate=serialize_for_metadata(candidate),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -294,9 +328,23 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         )
 
         if breakdown.score < self.stop_hunt_config.min_signal_score:
+            self.remember_no_signal(
+                "stop_hunt_reversal_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.stop_hunt_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.stop_hunt_config.min_signal_confidence:
+            self.remember_no_signal(
+                "stop_hunt_reversal_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.stop_hunt_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         evidence = candidate.get("evidence")
@@ -332,6 +380,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         metadata = {
             "liquidity_setup_family": "stop_hunt_reversal",
             "liquidity_strategy_version": "2.0.0",
+            "contract": "liquidity",
+            "primary_section": "snapshot",
+            "strategy_contract_role": "decision_module",
             "score_breakdown": breakdown.to_dict(),
             "tags": self._tags(candidate=candidate, snapshot=snapshot),
             "side": side.value,

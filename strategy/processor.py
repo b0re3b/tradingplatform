@@ -473,6 +473,17 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.funding.* payloads into the stable funding
+        StrategyContext contract.
+
+        OI-style contract adapter only:
+        - expose analytics-provided sections under stable canonical aliases;
+        - extract nested analysis/result sections;
+        - enrich flat funding payloads into snapshot/statistics only when safe;
+        - do NOT synthesize extreme/divergence/flip/signal unless analytics
+          explicitly supplied a detected/actionable context.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -481,39 +492,393 @@ class SignalNormalizer(BaseStrategyComponent):
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
             return None
 
-        for target, aliases in {
-            "snapshot": ("snapshot", "funding_snapshot"),
-            "statistics": ("statistics", "stats", "funding_statistics"),
-            "regime": ("regime", "regime_state", "funding_regime"),
-            "pressure": ("pressure", "pressure_state", "funding_pressure"),
-            "extreme": ("extreme", "extreme_event", "funding_extreme"),
-            "divergence": ("divergence", "divergence_event", "funding_divergence"),
-            "flip": ("flip", "flip_event", "funding_flip"),
-            "signal": ("signal", "funding_signal"),
-        }.items():
-            value = mapping_for(*aliases)
-            if value is not None:
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "detected",
+                    "active",
+                    "confirmed",
+                    "triggered",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "none",
+                    "not_detected",
+                    "inactive",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_detected(section: dict[str, Any] | None) -> bool:
+            if not section:
+                return False
+
+            detected = section.get(
+                "detected",
+                section.get(
+                    "is_detected",
+                    section.get(
+                        "active",
+                        section.get("confirmed", None),
+                    ),
+                ),
+            )
+
+            if detected is None:
+                # Typed nested analytics section without explicit detected flag is
+                # considered analytics-provided/actionable. Empty dicts are rejected.
+                return True
+
+            return to_bool(detected, default=False)
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: dict[str, Any] | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            # Canonical funding sections should override raw/flat fields already
+            # copied into domain_data. This mirrors the OI contract behavior.
+            if override:
+                domain_data[target] = value
+            else:
                 domain_data.setdefault(target, value)
-                domain_data.setdefault(aliases[0], value)
 
-        if "signal" not in domain_data and (
-                "signal_type" in payload
-                or "bias" in payload
-                or "score" in payload
-                or "confidence" in payload
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        analysis = mapping_for(
+            "analysis",
+            "result",
+            "funding_analysis",
+            "funding_result",
+        )
+        snapshot = mapping_for(
+            "snapshot",
+            "funding_snapshot",
+        )
+        statistics = mapping_for(
+            "statistics",
+            "stats",
+            "funding_statistics",
+        )
+        regime = mapping_for(
+            "regime",
+            "regime_state",
+            "funding_regime",
+            "funding_regime_state",
+        )
+        pressure = mapping_for(
+            "pressure",
+            "pressure_state",
+            "funding_pressure",
+            "funding_pressure_state",
+        )
+        extreme = mapping_for(
+            "extreme",
+            "extreme_event",
+            "funding_extreme",
+            "funding_extreme_event",
+        )
+        divergence = mapping_for(
+            "divergence",
+            "divergence_event",
+            "funding_divergence",
+            "funding_divergence_event",
+        )
+        flip = mapping_for(
+            "flip",
+            "flip_event",
+            "funding_flip",
+            "funding_flip_event",
+        )
+        signal = mapping_for(
+            "signal",
+            "funding_signal",
+            "strategy_signal",
+            "setup",
+        )
+
+        if analysis is not None:
+            nested_snapshot = (
+                    analysis.get("snapshot")
+                    or analysis.get("funding_snapshot")
+            )
+            nested_statistics = (
+                    analysis.get("statistics")
+                    or analysis.get("stats")
+                    or analysis.get("funding_statistics")
+            )
+            nested_regime = (
+                    analysis.get("regime")
+                    or analysis.get("regime_state")
+                    or analysis.get("funding_regime")
+            )
+            nested_pressure = (
+                    analysis.get("pressure")
+                    or analysis.get("pressure_state")
+                    or analysis.get("funding_pressure")
+            )
+            nested_extreme = (
+                    analysis.get("extreme")
+                    or analysis.get("extreme_event")
+                    or analysis.get("funding_extreme")
+            )
+            nested_divergence = (
+                    analysis.get("divergence")
+                    or analysis.get("divergence_event")
+                    or analysis.get("funding_divergence")
+            )
+            nested_flip = (
+                    analysis.get("flip")
+                    or analysis.get("flip_event")
+                    or analysis.get("funding_flip")
+            )
+            nested_signal = (
+                    analysis.get("signal")
+                    or analysis.get("funding_signal")
+                    or analysis.get("setup")
+            )
+
+            if isinstance(nested_snapshot, dict) and snapshot is None:
+                snapshot = dict(nested_snapshot)
+            if isinstance(nested_statistics, dict) and statistics is None:
+                statistics = dict(nested_statistics)
+            if isinstance(nested_regime, dict) and regime is None:
+                regime = dict(nested_regime)
+            if isinstance(nested_pressure, dict) and pressure is None:
+                pressure = dict(nested_pressure)
+            if isinstance(nested_extreme, dict) and extreme is None:
+                extreme = dict(nested_extreme)
+            if isinstance(nested_divergence, dict) and divergence is None:
+                divergence = dict(nested_divergence)
+            if isinstance(nested_flip, dict) and flip is None:
+                flip = dict(nested_flip)
+            if isinstance(nested_signal, dict) and signal is None:
+                signal = dict(nested_signal)
+
+        # Safe flat enrichment: snapshot/statistics are context sections, not
+        # trade/setup sections.
+        if snapshot is None:
+            flat_snapshot: dict[str, Any] = {}
+            for key in (
+                    "funding_rate",
+                    "current_rate",
+                    "next_funding_rate",
+                    "predicted_rate",
+                    "annualized_rate",
+                    "premium_index",
+                    "mark_price",
+                    "index_price",
+                    "next_funding_time",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_snapshot[key] = value
+
+            if flat_snapshot:
+                snapshot = flat_snapshot
+
+        if statistics is None:
+            flat_statistics: dict[str, Any] = {}
+            for key in (
+                    "mean",
+                    "median",
+                    "std",
+                    "zscore",
+                    "z_score",
+                    "percentile",
+                    "min",
+                    "max",
+                    "window",
+                    "lookback",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_statistics[key] = value
+
+            if flat_statistics:
+                statistics = flat_statistics
+
+        # Flat signal/setup section only when analytics explicitly produced
+        # signal/setup context.
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "confirmed",
+                "generated",
+            )
+        )
+        explicit_signal = bool(
+            signal_like_topic
+            or value_for("signal_type", "setup_type", "signal_bias", default=None)
+            is not None
+            or to_bool(value_for("signal_detected", "setup_detected", default=False))
+        )
+
+        if signal is None and explicit_signal:
+            signal = {
+                "type": value_for("signal_type", "setup_type", default=None),
+                "bias": value_for("bias", "direction", "signal_bias", default=None),
+                "score": value_for("signal_score", "score", default=0.0),
+                "confidence": value_for(
+                    "signal_confidence",
+                    "confidence",
+                    default=0.0,
+                ),
+                "origin": value_for("origin", "signal_origin", default="funding"),
+                "detected": True,
+            }
+
+        # Event-specific flat sections only when explicitly indicated by analytics.
+        if extreme is None and (
+                "extreme" in topic
+                or value_for("extreme_type", "extreme_severity", default=None) is not None
+                or to_bool(value_for("extreme_detected", default=False))
         ):
-            domain_data["signal"] = dict(payload)
+            extreme = {
+                "type": value_for("extreme_type", "type", default=None),
+                "severity": value_for(
+                    "extreme_severity",
+                    "severity",
+                    "score",
+                    default=0.0,
+                ),
+                "mean_reversion_probability": value_for(
+                    "mean_reversion_probability",
+                    "reversion_probability",
+                    default=0.0,
+                ),
+                "squeeze_probability": value_for(
+                    "squeeze_probability",
+                    default=0.0,
+                ),
+                "detected": True,
+            }
 
-        if "snapshot" not in domain_data:
-            domain_data["snapshot"] = dict(payload)
+        if divergence is None and (
+                "divergence" in topic
+                or value_for("divergence_type", "divergence_score", default=None) is not None
+                or to_bool(value_for("divergence_detected", default=False))
+        ):
+            divergence = {
+                "type": value_for("divergence_type", "type", default=None),
+                "score": value_for("divergence_score", "score", default=0.0),
+                "confidence": value_for(
+                    "divergence_confidence",
+                    "confidence",
+                    default=0.0,
+                ),
+                "bias": value_for("bias", "direction", default=None),
+                "detected": True,
+            }
+
+        if flip is None and (
+                "flip" in topic
+                or value_for("flip_type", "flip_confidence", default=None) is not None
+                or to_bool(value_for("flip_detected", default=False))
+        ):
+            flip = {
+                "type": value_for("flip_type", "type", default=None),
+                "confidence": value_for(
+                    "flip_confidence",
+                    "confidence",
+                    default=0.0,
+                ),
+                "bias": value_for("bias", "direction", default=None),
+                "detected": True,
+            }
+
+        set_aliases("analysis", ("funding_analysis", "result"), analysis)
+        set_aliases("snapshot", ("funding_snapshot",), snapshot)
+        set_aliases("statistics", ("stats", "funding_statistics"), statistics)
+        set_aliases("regime", ("regime_state", "funding_regime"), regime)
+        set_aliases("pressure", ("pressure_state", "funding_pressure"), pressure)
+
+        if section_detected(extreme):
+            set_aliases(
+                "extreme",
+                ("extreme_event", "funding_extreme"),
+                extreme,
+            )
+
+        if section_detected(divergence):
+            set_aliases(
+                "divergence",
+                ("divergence_event", "funding_divergence"),
+                divergence,
+            )
+
+        if section_detected(flip):
+            set_aliases(
+                "flip",
+                ("flip_event", "funding_flip"),
+                flip,
+            )
+
+        if section_detected(signal):
+            set_aliases(
+                "signal",
+                ("funding_signal", "setup"),
+                signal,
+            )
 
     def _augment_orderflow_domain_data(
             self,
@@ -521,31 +886,518 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
-        composite = payload.get("composite") or payload.get("snapshot") or payload.get("orderflow")
-        cvd = payload.get("cvd") or payload.get("cvd_stats")
-        volume_delta = payload.get("volume_delta") or payload.get("volume_delta_stats")
-        aggressive = payload.get("aggressive_trades") or payload.get("aggressive")
-        imbalance = payload.get("orderbook_imbalance") or payload.get("imbalance")
+        """
+        Normalize analytics.orderflow.* payloads into a stable orderflow contract.
 
-        if isinstance(composite, dict):
-            domain_data.setdefault("composite", composite)
-            domain_data.setdefault("snapshot", composite)
+        OI-style contract adapter:
+        - exposes canonical sections: composite, cvd, volume_delta,
+          aggressive_trades, orderbook_imbalance, signal;
+        - preserves analytics-provided nested sections and typed-like objects;
+        - enriches flat payload into sections only when meaningful;
+        - does not synthesize trade setup sections.
+        """
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
 
-        if isinstance(cvd, dict):
-            domain_data.setdefault("cvd", cvd)
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-        if isinstance(volume_delta, dict):
-            domain_data.setdefault("volume_delta", volume_delta)
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
-        if isinstance(aggressive, dict):
-            domain_data.setdefault("aggressive_trades", aggressive)
+            return None
 
-        if isinstance(imbalance, dict):
-            domain_data.setdefault("orderbook_imbalance", imbalance)
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
 
-        # Якщо analytics дає flat aggregate payload, нехай він теж буде composite.
-        if "composite" not in domain_data:
-            domain_data["composite"] = dict(payload)
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+
+            for container in (
+                    composite,
+                    cvd,
+                    volume_delta,
+                    aggressive_trades,
+                    orderbook_imbalance,
+                    signal,
+            ):
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
+            return default
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: Any | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "active",
+                    "valid",
+                    "confirmed",
+                    "detected",
+                    "triggered",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "inactive",
+                    "invalid",
+                    "expired",
+                    "none",
+                    "not_detected",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_present(value: Any | None) -> bool:
+            if value is None:
+                return False
+
+            mapping = as_mapping(value)
+            if mapping is None:
+                return True
+
+            if not mapping:
+                return False
+
+            detected = (
+                mapping.get("detected")
+                if "detected" in mapping
+                else mapping.get("active", mapping.get("valid", None))
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        analysis = mapping_or_object_for(
+            "analysis",
+            "orderflow_analysis",
+            "result",
+        )
+        composite = mapping_or_object_for(
+            "composite",
+            "snapshot",
+            "orderflow_snapshot",
+            "composite_snapshot",
+            "orderflow_composite",
+        )
+        cvd = mapping_or_object_for(
+            "cvd",
+            "cvd_snapshot",
+            "cvd_metrics",
+            "cumulative_volume_delta",
+        )
+        volume_delta = mapping_or_object_for(
+            "volume_delta",
+            "volume_delta_snapshot",
+            "delta",
+            "delta_metrics",
+        )
+        aggressive_trades = mapping_or_object_for(
+            "aggressive_trades",
+            "aggressive",
+            "aggressive_flow",
+            "aggressive_trades_snapshot",
+        )
+        orderbook_imbalance = mapping_or_object_for(
+            "orderbook_imbalance",
+            "orderbook",
+            "orderbook_snapshot",
+            "imbalance",
+        )
+        signal = mapping_or_object_for(
+            "signal",
+            "orderflow_signal",
+            "analytics_signal",
+            "setup",
+        )
+
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "orderflow_analysis",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            nested_composite = (
+                    container_map.get("composite")
+                    or container_map.get("snapshot")
+                    or container_map.get("orderflow_snapshot")
+                    or container_map.get("composite_snapshot")
+            )
+            nested_cvd = (
+                    container_map.get("cvd")
+                    or container_map.get("cvd_snapshot")
+                    or container_map.get("cvd_metrics")
+            )
+            nested_volume_delta = (
+                    container_map.get("volume_delta")
+                    or container_map.get("delta")
+                    or container_map.get("delta_metrics")
+            )
+            nested_aggressive = (
+                    container_map.get("aggressive_trades")
+                    or container_map.get("aggressive")
+                    or container_map.get("aggressive_flow")
+            )
+            nested_orderbook = (
+                    container_map.get("orderbook_imbalance")
+                    or container_map.get("orderbook")
+                    or container_map.get("imbalance")
+            )
+            nested_signal = (
+                    container_map.get("signal")
+                    or container_map.get("orderflow_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+
+            if composite is None and nested_composite is not None:
+                composite = nested_composite
+            if cvd is None and nested_cvd is not None:
+                cvd = nested_cvd
+            if volume_delta is None and nested_volume_delta is not None:
+                volume_delta = nested_volume_delta
+            if aggressive_trades is None and nested_aggressive is not None:
+                aggressive_trades = nested_aggressive
+            if orderbook_imbalance is None and nested_orderbook is not None:
+                orderbook_imbalance = nested_orderbook
+            if signal is None and nested_signal is not None:
+                signal = nested_signal
+
+        if composite is not None:
+            composite_map = as_mapping(composite)
+
+            if cvd is None:
+                nested = get_item(composite, "cvd", None)
+                if nested is not None:
+                    cvd = nested
+
+            if volume_delta is None:
+                nested = get_item(composite, "volume_delta", None)
+                if nested is not None:
+                    volume_delta = nested
+
+            if aggressive_trades is None:
+                nested = get_item(composite, "aggressive_trades", None)
+                if nested is not None:
+                    aggressive_trades = nested
+
+            if orderbook_imbalance is None:
+                nested = get_item(composite, "orderbook_imbalance", None)
+                if nested is not None:
+                    orderbook_imbalance = nested
+
+            if composite_map is not None:
+                metadata = composite_map.get("metadata")
+                if isinstance(metadata, dict):
+                    for key in (
+                            "exchange",
+                            "market_type",
+                            "symbol",
+                            "exchange_symbol",
+                            "timeframe",
+                    ):
+                        if key in metadata:
+                            domain_data.setdefault(key, metadata[key])
+
+        if cvd is None:
+            flat_cvd: dict[str, Any] = {}
+            for key in (
+                    "cvd_value",
+                    "value",
+                    "cvd_delta_ratio",
+                    "delta_ratio",
+                    "cvd_change_pct",
+                    "cvd_slope",
+                    "price_change_pct",
+                    "cvd_buy_ratio",
+                    "cvd_sell_ratio",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_cvd[key] = value
+
+            if flat_cvd:
+                cvd = flat_cvd
+
+        if volume_delta is None:
+            flat_volume_delta: dict[str, Any] = {}
+            for key in (
+                    "volume_delta",
+                    "notional_delta",
+                    "volume_delta_ratio",
+                    "delta_ratio",
+                    "cumulative_volume_delta",
+                    "cumulative_notional_delta",
+                    "buy_volume",
+                    "sell_volume",
+                    "buy_notional",
+                    "sell_notional",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_volume_delta[key] = value
+
+            if flat_volume_delta:
+                volume_delta = flat_volume_delta
+
+        if aggressive_trades is None:
+            flat_aggressive: dict[str, Any] = {}
+            for key in (
+                    "aggressive_buy_ratio",
+                    "aggressive_sell_ratio",
+                    "aggressive_burst_score",
+                    "aggressive_net_volume_delta",
+                    "aggressive_net_notional_delta",
+                    "large_buy_trades",
+                    "large_sell_trades",
+                    "aggressive_buy_count",
+                    "aggressive_sell_count",
+                    "aggressive_buy_volume",
+                    "aggressive_sell_volume",
+                    "aggressive_buy_notional",
+                    "aggressive_sell_notional",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_aggressive[key] = value
+
+            if flat_aggressive:
+                aggressive_trades = flat_aggressive
+
+        if orderbook_imbalance is None:
+            flat_orderbook: dict[str, Any] = {}
+            for key in (
+                    "orderbook_imbalance_ratio",
+                    "orderbook_imbalance_diff",
+                    "ratio",
+                    "diff",
+                    "bid_volume",
+                    "ask_volume",
+                    "best_bid",
+                    "best_ask",
+                    "spread",
+                    "mid_price",
+                    "depth_levels_used",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_orderbook[key] = value
+
+            if flat_orderbook:
+                orderbook_imbalance = flat_orderbook
+
+        # Composite is context, so it may be composed from the real sections.
+        # This is not a strategy setup; it is the stable orderflow data container.
+        if composite is None and any(
+                section is not None
+                for section in (cvd, volume_delta, aggressive_trades, orderbook_imbalance)
+        ):
+            composite = {
+                "cvd": cvd or {},
+                "volume_delta": volume_delta or {},
+                "aggressive_trades": aggressive_trades or {},
+                "orderbook_imbalance": orderbook_imbalance or {},
+            }
+
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+                    "last_price",
+                    "price",
+                    "price_change",
+                    "price_change_pct",
+                    "window_seconds",
+                    "trades_count",
+                    "total_volume",
+                    "total_notional",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    composite[key] = value
+
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "continuation",
+                "reversal",
+                "divergence",
+                "confirmed",
+                "generated",
+            )
+        )
+        explicit_signal = bool(
+            signal_like_topic
+            or payload.get("signal_type") is not None
+            or payload.get("setup_type") is not None
+            or payload.get("signal_side") is not None
+            or to_bool(payload.get("signal_detected", False))
+            or to_bool(payload.get("setup_detected", False))
+        )
+
+        if signal is None and explicit_signal:
+            signal = {
+                "detected": True,
+                "type": payload.get("signal_type") or payload.get("setup_type"),
+                "side": (
+                        payload.get("signal_side")
+                        or payload.get("side")
+                        or payload.get("direction")
+                        or payload.get("bias")
+                ),
+                "score": payload.get("signal_score", payload.get("score", 0.0)),
+                "confidence": payload.get(
+                    "signal_confidence",
+                    payload.get("confidence", 0.0),
+                ),
+                "origin": payload.get("origin", "orderflow"),
+            }
+
+        set_aliases(
+            "analysis",
+            ("orderflow_analysis", "result"),
+            analysis,
+            override=False,
+        )
+
+        if composite is not None:
+            set_aliases(
+                "composite",
+                ("snapshot", "orderflow_snapshot", "composite_snapshot"),
+                composite,
+            )
+
+        if cvd is not None:
+            set_aliases(
+                "cvd",
+                ("cvd_snapshot", "cvd_metrics"),
+                cvd,
+            )
+
+        if volume_delta is not None:
+            set_aliases(
+                "volume_delta",
+                ("delta", "delta_metrics", "volume_delta_snapshot"),
+                volume_delta,
+            )
+
+        if aggressive_trades is not None:
+            set_aliases(
+                "aggressive_trades",
+                ("aggressive", "aggressive_flow", "aggressive_trades_snapshot"),
+                aggressive_trades,
+            )
+
+        if orderbook_imbalance is not None:
+            set_aliases(
+                "orderbook_imbalance",
+                ("orderbook", "imbalance", "orderbook_snapshot"),
+                orderbook_imbalance,
+            )
+
+        if section_present(signal):
+            set_aliases(
+                "signal",
+                ("orderflow_signal", "analytics_signal", "setup"),
+                signal,
+            )
+
+        for key in (
+                "exchange",
+                "market_type",
+                "symbol",
+                "exchange_symbol",
+                "timeframe",
+                "timestamp",
+                "last_price",
+                "price_change_pct",
+                "trades_count",
+                "total_volume",
+                "total_notional",
+        ):
+            value = value_for(key, default=None)
+            if value is not None:
+                domain_data.setdefault(key, value)
 
     def _augment_open_interest_domain_data(
             self,
@@ -1067,13 +1919,23 @@ class SignalNormalizer(BaseStrategyComponent):
 
         domain_data.setdefault("raw", dict(payload))
 
-
     def _augment_liquidations_domain_data(
             self,
             *,
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.liquidations.* payloads into the stable liquidations
+        StrategyContext contract.
+
+        OI-style contract adapter only:
+        - exposes analytics-provided sections under stable canonical aliases;
+        - extracts nested analysis/result sections;
+        - enriches flat cluster/snapshot-like context only when safe;
+        - does NOT synthesize cascade/exhaustion/squeeze/signal sections unless
+          analytics explicitly supplied a detected/actionable context.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -1082,83 +1944,481 @@ class SignalNormalizer(BaseStrategyComponent):
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
             return None
 
-        for target, aliases in {
-            "cascade": (
-                    "cascade",
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "detected",
+                    "active",
+                    "confirmed",
+                    "triggered",
+                    "valid",
+                }:
+                    return True
+
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "none",
+                    "not_detected",
+                    "inactive",
+                    "rejected",
+                    "invalid",
+                    "expired",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_detected(section: dict[str, Any] | None) -> bool:
+            if not section:
+                return False
+
+            detected = section.get(
+                "detected",
+                section.get(
+                    "is_detected",
+                    section.get(
+                        "active",
+                        section.get(
+                            "confirmed",
+                            section.get("valid", None),
+                        ),
+                    ),
+                ),
+            )
+
+            if detected is None:
+                # Typed nested analytics section without explicit detected flag is
+                # considered analytics-provided/actionable. Empty dicts are rejected.
+                return True
+
+            return to_bool(detected, default=False)
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: dict[str, Any] | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            # Canonical sections override raw/flat fields already copied into
+            # domain_data. This mirrors the OI contract behavior.
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        analysis = mapping_for(
+            "analysis",
+            "liquidations_analysis",
+            "liquidation_analysis",
+        )
+        result = mapping_for(
+            "result",
+            "liquidations_result",
+            "liquidation_result",
+        )
+        cascade = mapping_for(
+            "cascade",
+            "cascade_result",
+            "cascade_detection",
+            "cascade_detected",
+            "liquidation_cascade",
+        )
+        exhaustion = mapping_for(
+            "exhaustion",
+            "exhaustion_result",
+            "exhaustion_detection",
+            "exhaustion_detected",
+            "reversal_context",
+            "liquidation_exhaustion",
+        )
+        squeeze = mapping_for(
+            "squeeze",
+            "squeeze_result",
+            "squeeze_reversal",
+            "squeeze_context",
+            "pending_confirmation",
+            "liquidation_squeeze",
+        )
+        cluster = mapping_for(
+            "cluster",
+            "liquidation_cluster",
+            "cluster_stats",
+            "liquidations_cluster",
+        )
+        signal = mapping_for(
+            "signal",
+            "liquidation_signal",
+            "liquidations_signal",
+            "analytics_signal",
+            "setup",
+        )
+
+        # Some analytics modules publish the primary result under generic "result".
+        # Resolve it by topic/shape, but do not blindly expose result as cascade.
+        if result is not None:
+            result_kind = (
+                str(
+                    result.get("kind")
+                    or result.get("type")
+                    or result.get("result_type")
+                    or result.get("setup_type")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
+
+            if cascade is None and (
+                    "cascade" in topic
+                    or "cascade" in result_kind
+                    or "continuation_bias" in result
+                    or "intensity_score" in result
+            ):
+                cascade = dict(result)
+
+            if exhaustion is None and (
+                    "exhaustion" in topic
+                    or "reversal" in topic
+                    or "exhaustion" in result_kind
+                    or "exhaustion_bias" in result
+                    or "bias_delta" in result
+            ):
+                exhaustion = dict(result)
+
+            if squeeze is None and (
+                    "squeeze" in topic
+                    or "squeeze" in result_kind
+                    or "squeeze_score" in result
+                    or "squeeze_direction" in result
+            ):
+                squeeze = dict(result)
+
+        # Nested analysis/result extraction.
+        for container in (analysis, result):
+            if container is None:
+                continue
+
+            nested_cascade = (
+                    container.get("cascade")
+                    or container.get("cascade_result")
+                    or container.get("cascade_detection")
+                    or container.get("liquidation_cascade")
+            )
+            nested_exhaustion = (
+                    container.get("exhaustion")
+                    or container.get("exhaustion_result")
+                    or container.get("exhaustion_detection")
+                    or container.get("reversal_context")
+            )
+            nested_squeeze = (
+                    container.get("squeeze")
+                    or container.get("squeeze_result")
+                    or container.get("squeeze_reversal")
+                    or container.get("squeeze_context")
+            )
+            nested_cluster = (
+                    container.get("cluster")
+                    or container.get("liquidation_cluster")
+                    or container.get("cluster_stats")
+            )
+            nested_signal = (
+                    container.get("signal")
+                    or container.get("liquidation_signal")
+                    or container.get("analytics_signal")
+                    or container.get("setup")
+            )
+
+            if isinstance(nested_cascade, dict) and cascade is None:
+                cascade = dict(nested_cascade)
+            if isinstance(nested_exhaustion, dict) and exhaustion is None:
+                exhaustion = dict(nested_exhaustion)
+            if isinstance(nested_squeeze, dict) and squeeze is None:
+                squeeze = dict(nested_squeeze)
+            if isinstance(nested_cluster, dict) and cluster is None:
+                cluster = dict(nested_cluster)
+            if isinstance(nested_signal, dict) and signal is None:
+                signal = dict(nested_signal)
+
+        # Safe flat enrichment for cluster only. Cluster is context, not a setup.
+        if cluster is None:
+            flat_cluster: dict[str, Any] = {}
+            for key in (
+                    "duration_seconds",
+                    "avg_notional_per_event",
+                    "side_imbalance_ratio",
+                    "event_imbalance_ratio",
+                    "acceleration_ratio",
+                    "event_count",
+                    "total_notional_usd",
+                    "price_range_pct",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    flat_cluster[key] = value
+
+            if flat_cluster:
+                cluster = flat_cluster
+
+        # Flat cascade only when analytics explicitly indicates cascade context.
+        if cascade is None and (
+                "cascade" in topic
+                or value_for("cascade_detected", default=None) is not None
+                or value_for("cascade_direction", "continuation_bias", default=None) is not None
+        ):
+            cascade = {
+                "detected": to_bool(value_for("cascade_detected", default=True), True),
+                "confirmed": to_bool(value_for("confirmed", default=True), True),
+                "confidence": value_for("confidence", "cascade_confidence", default=0.0),
+                "intensity_score": value_for(
+                    "intensity_score",
+                    "intensity",
+                    default=0.0,
+                ),
+                "direction": value_for(
+                    "direction",
+                    "cascade_direction",
+                    "side",
+                    default=None,
+                ),
+                "severity": value_for(
+                    "severity",
+                    "severity_label",
+                    default=None,
+                ),
+                "continuation_bias": value_for(
+                    "continuation_bias",
+                    default=0.0,
+                ),
+                "exhaustion_bias": value_for(
+                    "exhaustion_bias",
+                    default=0.0,
+                ),
+                "total_notional_usd": value_for(
+                    "total_notional_usd",
+                    "notional_usd",
+                    default=0.0,
+                ),
+                "event_count": value_for("event_count", default=0),
+                "price_range_pct": value_for("price_range_pct", default=None),
+            }
+
+        # Flat exhaustion only when analytics explicitly indicates exhaustion.
+        if exhaustion is None and (
+                "exhaustion" in topic
+                or "reversal" in topic
+                or value_for("exhaustion_detected", default=None) is not None
+                or value_for("exhaustion_bias", "bias_delta", default=None) is not None
+        ):
+            exhaustion = {
+                "detected": to_bool(value_for("exhaustion_detected", default=True), True),
+                "confirmed": to_bool(
+                    value_for("exhaustion_confirmed", "confirmed", default=True),
+                    True,
+                ),
+                "confidence": value_for(
+                    "confidence",
+                    "exhaustion_confidence",
+                    default=0.0,
+                ),
+                "intensity_score": value_for(
+                    "intensity_score",
+                    "intensity",
+                    default=0.0,
+                ),
+                "direction": value_for(
+                    "direction",
+                    "cascade_direction",
+                    "side",
+                    default=None,
+                ),
+                "severity": value_for(
+                    "severity",
+                    "severity_label",
+                    default=None,
+                ),
+                "exhaustion_bias": value_for("exhaustion_bias", default=0.0),
+                "bias_delta": value_for("bias_delta", default=0.0),
+                "continuation_bias": value_for("continuation_bias", default=0.0),
+                "total_notional_usd": value_for(
+                    "total_notional_usd",
+                    "notional_usd",
+                    default=0.0,
+                ),
+                "event_count": value_for("event_count", default=0),
+                "price_range_pct": value_for("price_range_pct", default=None),
+            }
+
+        # Flat squeeze only when analytics explicitly indicates squeeze context.
+        if squeeze is None and (
+                "squeeze" in topic
+                or value_for("squeeze_confirmed", "squeeze_score", default=None) is not None
+        ):
+            squeeze = {
+                "detected": to_bool(value_for("squeeze_detected", default=True), True),
+                "confirmed": to_bool(
+                    value_for("squeeze_confirmed", "confirmed", default=True),
+                    True,
+                ),
+                "score": value_for("squeeze_score", "score", default=0.0),
+                "direction": value_for(
+                    "squeeze_direction",
+                    "direction",
+                    "side",
+                    default=None,
+                ),
+                "confidence": value_for(
+                    "squeeze_confidence",
+                    "confidence",
+                    default=0.0,
+                ),
+            }
+
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "confirmed",
+                "generated",
+            )
+        )
+        explicit_signal = bool(
+            signal_like_topic
+            or value_for("signal_type", "setup_type", "signal_side", default=None)
+            is not None
+            or to_bool(value_for("signal_detected", "setup_detected", default=False))
+        )
+
+        if signal is None and explicit_signal:
+            signal = {
+                "detected": True,
+                "type": value_for("signal_type", "setup_type", default=None),
+                "side": value_for(
+                    "signal_side",
+                    "side",
+                    "direction",
+                    default=None,
+                ),
+                "score": value_for("signal_score", "score", default=0.0),
+                "confidence": value_for(
+                    "signal_confidence",
+                    "confidence",
+                    default=0.0,
+                ),
+                "origin": value_for(
+                    "origin",
+                    "signal_origin",
+                    default="liquidations",
+                ),
+            }
+
+        set_aliases("analysis", ("liquidations_analysis",), analysis)
+        set_aliases("cluster", ("liquidation_cluster", "cluster_stats"), cluster)
+
+        if section_detected(cascade):
+            set_aliases(
+                "cascade",
+                (
                     "cascade_result",
                     "cascade_detection",
                     "cascade_detected",
+                    "liquidation_cascade",
                     "result",
-            ),
-            "exhaustion": (
-                    "exhaustion",
+                ),
+                cascade,
+            )
+
+        if section_detected(exhaustion):
+            set_aliases(
+                "exhaustion",
+                (
                     "exhaustion_result",
                     "exhaustion_detection",
                     "exhaustion_detected",
                     "reversal_context",
-            ),
-            "squeeze": (
-                    "squeeze",
+                ),
+                exhaustion,
+            )
+
+        if section_detected(squeeze):
+            set_aliases(
+                "squeeze",
+                (
                     "squeeze_result",
                     "squeeze_reversal",
                     "squeeze_context",
                     "pending_confirmation",
-            ),
-            "cluster": (
-                    "cluster",
-                    "liquidation_cluster",
-                    "cluster_stats",
-            ),
-            "signal": (
-                    "signal",
+                ),
+                squeeze,
+            )
+
+        if section_detected(signal):
+            set_aliases(
+                "signal",
+                (
                     "liquidation_signal",
+                    "liquidations_signal",
                     "analytics_signal",
-            ),
-        }.items():
-            value = mapping_for(*aliases)
-            if value is not None:
-                domain_data.setdefault(target, value)
-                for alias in aliases:
-                    domain_data.setdefault(alias, value)
-
-        # analytics.liquidations.cascade_detected often arrives as flat payload.
-        if "cascade" not in domain_data and (
-                "direction" in payload
-                or "cascade_direction" in payload
-                or "intensity_score" in payload
-                or "total_notional_usd" in payload
-                or "event_count" in payload
-        ):
-            domain_data["cascade"] = dict(payload)
-            domain_data.setdefault("result", domain_data["cascade"])
-
-        # analytics.liquidations.exhaustion_detected may also be flat.
-        if "exhaustion" not in domain_data and (
-                "exhaustion_bias" in payload
-                or "bias_delta" in payload
-                or "reversal_side" in payload
-        ):
-            domain_data["exhaustion"] = dict(payload)
-            domain_data.setdefault("exhaustion_result", domain_data["exhaustion"])
-
-        # Squeeze reversal context may be flat.
-        if "squeeze" not in domain_data and (
-                "squeeze_score" in payload
-                or "squeeze_confirmed" in payload
-                or "squeeze_direction" in payload
-        ):
-            domain_data["squeeze"] = dict(payload)
-            domain_data.setdefault("squeeze_result", domain_data["squeeze"])
-
-        domain_data.setdefault("raw", dict(payload))
+                    "setup",
+                ),
+                signal,
+            )
 
     def _augment_liquidity_domain_data(
             self,
@@ -1166,103 +2426,395 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.liquidity.* payloads into the stable liquidity
+        StrategyContext contract.
+
+        OI-style contract adapter only:
+        - exposes analytics-provided liquidity map snapshot under stable aliases;
+        - preserves typed LiquidityMapSnapshot objects if analytics provided them;
+        - exposes levels / clusters / zones / signal under canonical sections;
+        - enriches context scores only when they are present;
+        - does NOT fabricate a liquidity snapshot from a generic flat payload.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
             return None
 
-        for target, aliases in {
-            "snapshot": (
-                    "snapshot",
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+
+            snapshot = domain_data.get("snapshot")
+            for key in keys:
+                value = get_item(snapshot, key, default=None)
+                if value is not None:
+                    return value
+
+            signal = domain_data.get("signal")
+            for key in keys:
+                value = get_item(signal, key, default=None)
+                if value is not None:
+                    return value
+
+            return default
+
+        def set_aliases(
+                target: str,
+                aliases: tuple[str, ...],
+                value: Any | None,
+                *,
+                override: bool = True,
+        ) -> None:
+            if value is None:
+                return
+
+            if override:
+                domain_data[target] = value
+            else:
+                domain_data.setdefault(target, value)
+
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "active",
+                    "valid",
+                    "confirmed",
+                    "detected",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "inactive",
+                    "invalid",
+                    "expired",
+                    "none",
+                    "not_detected",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_present(value: Any | None) -> bool:
+            if value is None:
+                return False
+
+            mapping = as_mapping(value)
+            if mapping is None:
+                return True
+
+            if not mapping:
+                return False
+
+            detected = (
+                mapping.get("detected")
+                if "detected" in mapping
+                else mapping.get("active", mapping.get("valid", None))
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        analysis = mapping_or_object_for(
+            "analysis",
+            "liquidity_analysis",
+            "result",
+        )
+
+        snapshot = mapping_or_object_for(
+            "snapshot",
+            "liquidity_map_snapshot",
+            "map_snapshot",
+            "last_snapshot",
+            "liquidity_snapshot",
+        )
+
+        # Some analytics envelopes publish {"result": {"snapshot": ...}} or
+        # {"liquidity": {"snapshot": ...}}. Preserve the nested typed object.
+        for container_key in (
+                "result",
+                "liquidity",
+                "data",
+                "payload",
+                "analysis",
+                "liquidity_analysis",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            nested_snapshot = (
+                    container_map.get("snapshot")
+                    or container_map.get("liquidity_map_snapshot")
+                    or container_map.get("map_snapshot")
+                    or container_map.get("last_snapshot")
+            )
+            if nested_snapshot is not None and snapshot is None:
+                snapshot = nested_snapshot
+
+        signal = mapping_or_object_for(
+            "signal",
+            "liquidity_signal",
+            "analytics_signal",
+            "setup",
+        )
+
+        levels = mapping_or_object_for(
+            "levels",
+            "active_levels",
+            "liquidity_levels",
+        )
+        clusters = mapping_or_object_for(
+            "clusters",
+            "stop_clusters",
+            "liquidity_clusters",
+        )
+        zones = mapping_or_object_for(
+            "zones",
+            "liquidity_zones",
+        )
+        equal_levels = mapping_or_object_for(
+            "equal_levels",
+            "equal_highs_lows",
+        )
+
+        if snapshot is not None:
+            snapshot_map = as_mapping(snapshot)
+
+            nested_levels = get_item(snapshot, "levels", None)
+            nested_active_levels = get_item(snapshot, "active_levels", None)
+            nested_equal_levels = get_item(snapshot, "equal_levels", None)
+            nested_clusters = get_item(snapshot, "stop_clusters", None)
+            nested_zones = get_item(snapshot, "zones", None)
+
+            if levels is None and nested_levels is not None:
+                levels = nested_levels
+            if levels is None and nested_active_levels is not None:
+                levels = nested_active_levels
+            if equal_levels is None and nested_equal_levels is not None:
+                equal_levels = nested_equal_levels
+            if clusters is None and nested_clusters is not None:
+                clusters = nested_clusters
+            if zones is None and nested_zones is not None:
+                zones = nested_zones
+
+            # Preserve scope-like fields in liquidity domain for metadata/scope.
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "current_price",
+                    "price",
+                    "mark_price",
+                    "last_price",
+            ):
+                value = get_item(snapshot, key, None)
+                if value is not None:
+                    domain_data.setdefault(key, value)
+
+            if snapshot_map is not None:
+                metadata = snapshot_map.get("metadata")
+                if isinstance(metadata, dict):
+                    for key in (
+                            "exchange",
+                            "market_type",
+                            "symbol",
+                            "exchange_symbol",
+                            "timeframe",
+                            "current_price",
+                            "price",
+                            "mark_price",
+                    ):
+                        if key in metadata:
+                            domain_data.setdefault(key, metadata[key])
+
+        # Only expose a signal/setup if analytics explicitly supplied one.
+        signal_like_topic = any(
+            token in topic
+            for token in (
+                "signal",
+                "setup",
+                "bias",
+                "sweep",
+                "stop_hunt",
+                "equal",
+            )
+        )
+        explicit_signal = bool(
+            signal_like_topic
+            or payload.get("signal_type") is not None
+            or payload.get("setup_type") is not None
+            or payload.get("signal_side") is not None
+            or to_bool(payload.get("signal_detected", False))
+            or to_bool(payload.get("setup_detected", False))
+        )
+
+        if signal is None and explicit_signal:
+            signal = {
+                "detected": True,
+                "type": payload.get("signal_type") or payload.get("setup_type"),
+                "side": (
+                        payload.get("signal_side")
+                        or payload.get("side")
+                        or payload.get("direction")
+                        or payload.get("bias")
+                ),
+                "score": payload.get("signal_score", payload.get("score", 0.0)),
+                "confidence": payload.get(
+                    "signal_confidence",
+                    payload.get("confidence", 0.0),
+                ),
+                "origin": payload.get("origin", "liquidity"),
+            }
+
+        set_aliases(
+            "analysis",
+            ("liquidity_analysis", "result"),
+            analysis,
+            override=False,
+        )
+
+        # Critical: do not set snapshot to raw payload. Concrete liquidity strategies
+        # require an unwrap-able LiquidityMapSnapshot / snapshot wrapper.
+        if snapshot is not None:
+            set_aliases(
+                "snapshot",
+                (
                     "liquidity_map_snapshot",
                     "map_snapshot",
                     "last_snapshot",
-                    "liquidity",
-                    "result",
-            ),
-            "signal": (
-                    "signal",
-                    "liquidity_signal",
-                    "analytics_signal",
-            ),
-            "levels": (
-                    "levels",
-                    "active_levels",
-                    "liquidity_levels",
-            ),
-            "clusters": (
-                    "clusters",
-                    "stop_clusters",
-                    "liquidity_clusters",
-            ),
-            "zones": (
-                    "zones",
-                    "liquidity_zones",
-            ),
-            "sweep_risk": (
-                    "sweep_risk",
-                    "sweep_risks",
-            ),
-            "magnet": (
-                    "magnet",
-                    "magnets",
-                    "liquidity_magnets",
-            ),
-        }.items():
-            value = mapping_for(*aliases)
-            if value is not None:
-                domain_data.setdefault(target, value)
-                for alias in aliases:
-                    domain_data.setdefault(alias, value)
+                    "liquidity_snapshot",
+                ),
+                snapshot,
+            )
 
-        # Flat liquidity map update fallback.
-        if "snapshot" not in domain_data and (
-                "above_liquidity_score" in payload
-                or "below_liquidity_score" in payload
-                or "liquidity_pressure_score" in payload
-                or "bias" in payload
-                or "active_levels" in payload
-                or "stop_clusters" in payload
-                or "zones" in payload
-        ):
-            domain_data["snapshot"] = dict(payload)
-            domain_data.setdefault("map_snapshot", domain_data["snapshot"])
-            domain_data.setdefault("liquidity_map_snapshot", domain_data["snapshot"])
+        if levels is not None:
+            set_aliases(
+                "levels",
+                ("active_levels", "liquidity_levels"),
+                levels,
+            )
 
-        if "signal" not in domain_data and (
-                "bias" in payload
-                or "score" in payload
-                or "confidence" in payload
-                or "above_liquidity_score" in payload
-                or "below_liquidity_score" in payload
-        ):
-            domain_data["signal"] = dict(payload)
+        if equal_levels is not None:
+            set_aliases(
+                "equal_levels",
+                ("equal_highs_lows",),
+                equal_levels,
+            )
 
-        current_price = None
-        for key in ("current_price", "price", "mark_price", "last_price", "close"):
-            if key in payload:
-                current_price = payload[key]
-                break
-            if key in feature_map:
-                current_price = feature_map[key]
-                break
+        if clusters is not None:
+            set_aliases(
+                "clusters",
+                ("stop_clusters", "liquidity_clusters"),
+                clusters,
+            )
 
+        if zones is not None:
+            set_aliases(
+                "zones",
+                ("liquidity_zones",),
+                zones,
+            )
+
+        if section_present(signal):
+            set_aliases(
+                "signal",
+                ("liquidity_signal", "analytics_signal", "setup"),
+                signal,
+            )
+
+        current_price = value_for(
+            "current_price",
+            "price",
+            "mark_price",
+            "last_price",
+            "close",
+            default=None,
+        )
         if current_price is not None:
             domain_data.setdefault("current_price", current_price)
-            domain_data.setdefault("price", current_price)
 
-        domain_data.setdefault("raw", dict(payload))
+        for key, aliases in {
+            "above_liquidity_score": ("above_score",),
+            "below_liquidity_score": ("below_score",),
+            "liquidity_pressure_score": ("pressure_score", "liquidity_pressure"),
+            "bias": ("liquidity_bias", "direction"),
+            "upside_sweep_risk": ("sweep_risk_up", "sweep_risk.up"),
+            "downside_sweep_risk": ("sweep_risk_down", "sweep_risk.down"),
+            "upside_magnet_score": ("magnet_up", "magnet.up"),
+            "downside_magnet_score": ("magnet_down", "magnet.down"),
+            "nearest_above_level": ("nearest_above",),
+            "nearest_below_level": ("nearest_below",),
+            "strongest_cluster_above": ("strongest_above",),
+            "strongest_cluster_below": ("strongest_below",),
+        }.items():
+            value = value_for(key, *aliases, default=None)
+            if value is not None:
+                domain_data.setdefault(key, value)
 
     def _augment_price_action_domain_data(
             self,
@@ -4615,37 +6167,37 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
+
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
             for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
-                    return value
-
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return value
-
-            return {}
-
-        snapshot = mapping_for(
-            "snapshot",
-            "liquidity_map_snapshot",
-            "map_snapshot",
-            "last_snapshot",
-            "liquidity",
-            "result",
-        )
-        signal = mapping_for(
-            "signal",
-            "liquidity_signal",
-            "analytics_signal",
-        )
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -4653,19 +6205,37 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if key in snapshot:
-                    return snapshot[key]
-                if key in signal:
-                    return signal[key]
+
+            for container in (snapshot, signal):
+                for key in keys:
+                    value = get_item(container, key, None)
+                    if value is not None:
+                        return value
+
+            snapshot_metadata = get_item(snapshot, "metadata", None)
+            if isinstance(snapshot_metadata, dict):
+                for key in keys:
+                    if key in snapshot_metadata:
+                        return snapshot_metadata[key]
+
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        def nested_value(value: Any, *keys: str, default: Any = None) -> Any:
             for key in keys:
-                if key in mapping:
-                    return mapping[key]
+                item = get_item(value, key, None)
+                if item is not None:
+                    return item
             return default
 
-        def add(name: str, value: Any) -> None:
+        def add(
+                name: str,
+                value: Any,
+                *,
+                section: str | None = None,
+        ) -> None:
+            if value is None:
+                return
+
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.LIQUIDITY,
@@ -4677,9 +6247,70 @@ class SignalNormalizer(BaseStrategyComponent):
                     metadata={
                         "origin": "contract_feature",
                         "contract": "liquidity",
+                        **({"section": section} if section else {}),
                     },
                 )
             )
+
+        snapshot = mapping_or_object_for(
+            "snapshot",
+            "liquidity_map_snapshot",
+            "map_snapshot",
+            "last_snapshot",
+            "liquidity_snapshot",
+        )
+
+        for container_key in (
+                "result",
+                "liquidity",
+                "data",
+                "payload",
+                "analysis",
+                "liquidity_analysis",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            nested_snapshot = (
+                    container_map.get("snapshot")
+                    or container_map.get("liquidity_map_snapshot")
+                    or container_map.get("map_snapshot")
+                    or container_map.get("last_snapshot")
+            )
+            if nested_snapshot is not None and snapshot is None:
+                snapshot = nested_snapshot
+
+        signal = mapping_or_object_for(
+            "signal",
+            "liquidity_signal",
+            "analytics_signal",
+            "setup",
+        )
+
+        levels = (
+                mapping_or_object_for("levels", "active_levels", "liquidity_levels")
+                or nested_value(snapshot, "levels", "active_levels", default=None)
+        )
+        equal_levels = (
+                mapping_or_object_for("equal_levels", "equal_highs_lows")
+                or nested_value(snapshot, "equal_levels", default=None)
+        )
+        clusters = (
+                mapping_or_object_for("clusters", "stop_clusters", "liquidity_clusters")
+                or nested_value(snapshot, "stop_clusters", "clusters", default=None)
+        )
+        zones = (
+                mapping_or_object_for("zones", "liquidity_zones")
+                or nested_value(snapshot, "zones", default=None)
+        )
+
+        # Critical: only add liquidity.snapshot when analytics supplied an
+        # actual snapshot object/wrapper. Do not use raw payload fallback here.
+        if snapshot is not None:
+            add("liquidity.snapshot", snapshot, section="snapshot")
+            add("liquidity.map.snapshot", snapshot, section="snapshot")
 
         current_price = value_for(
             "current_price",
@@ -4687,19 +6318,27 @@ class SignalNormalizer(BaseStrategyComponent):
             "mark_price",
             "last_price",
             "close",
+            default=None,
         )
-
-        add("liquidity.snapshot", snapshot or payload)
-        add("liquidity.map.snapshot", snapshot or payload)
-        add("liquidity.current_price", current_price)
+        add("liquidity.current_price", current_price, section="snapshot")
 
         add(
             "liquidity.above_liquidity_score",
-            value_for("above_liquidity_score", "above_score", default=0.0),
+            value_for(
+                "above_liquidity_score",
+                "above_score",
+                default=None,
+            ),
+            section="snapshot",
         )
         add(
             "liquidity.below_liquidity_score",
-            value_for("below_liquidity_score", "below_score", default=0.0),
+            value_for(
+                "below_liquidity_score",
+                "below_score",
+                default=None,
+            ),
+            section="snapshot",
         )
         add(
             "liquidity.pressure_score",
@@ -4707,16 +6346,23 @@ class SignalNormalizer(BaseStrategyComponent):
                 "liquidity_pressure_score",
                 "pressure_score",
                 "liquidity_pressure",
-                default=0.0,
+                default=None,
             ),
+            section="snapshot",
         )
         add(
             "liquidity.bias",
-            value_for("bias", "liquidity_bias", "direction", default=None),
+            value_for(
+                "bias",
+                "liquidity_bias",
+                "direction",
+                default=None,
+            ),
+            section="snapshot",
         )
 
-        sweep_risk = mapping_for("sweep_risk", "sweep_risks")
-        magnet = mapping_for("magnet", "magnets", "liquidity_magnets")
+        sweep_risk = mapping_or_object_for("sweep_risk", "sweep_risks")
+        magnet = mapping_or_object_for("magnet", "magnets", "liquidity_magnets")
 
         add(
             "liquidity.sweep_risk.up",
@@ -4725,8 +6371,13 @@ class SignalNormalizer(BaseStrategyComponent):
                 "up",
                 "upside",
                 "above",
-                default=value_for("sweep_risk_up", "upside_sweep_risk", default=0.0),
+                default=value_for(
+                    "sweep_risk_up",
+                    "upside_sweep_risk",
+                    default=None,
+                ),
             ),
+            section="sweep_risk",
         )
         add(
             "liquidity.sweep_risk.down",
@@ -4735,8 +6386,13 @@ class SignalNormalizer(BaseStrategyComponent):
                 "down",
                 "downside",
                 "below",
-                default=value_for("sweep_risk_down", "downside_sweep_risk", default=0.0),
+                default=value_for(
+                    "sweep_risk_down",
+                    "downside_sweep_risk",
+                    default=None,
+                ),
             ),
+            section="sweep_risk",
         )
         add(
             "liquidity.magnet.up",
@@ -4745,8 +6401,14 @@ class SignalNormalizer(BaseStrategyComponent):
                 "up",
                 "upside",
                 "above",
-                default=value_for("magnet_up", "upside_magnet", default=0.0),
+                default=value_for(
+                    "magnet_up",
+                    "upside_magnet",
+                    "upside_magnet_score",
+                    default=None,
+                ),
             ),
+            section="magnet",
         )
         add(
             "liquidity.magnet.down",
@@ -4755,48 +6417,114 @@ class SignalNormalizer(BaseStrategyComponent):
                 "down",
                 "downside",
                 "below",
-                default=value_for("magnet_down", "downside_magnet", default=0.0),
+                default=value_for(
+                    "magnet_down",
+                    "downside_magnet",
+                    "downside_magnet_score",
+                    default=None,
+                ),
             ),
+            section="magnet",
         )
 
         add(
             "liquidity.nearest_above_level",
-            value_for("nearest_above_level", "nearest_liquidity_above"),
+            value_for(
+                "nearest_above_level",
+                "nearest_above",
+                default=nested_value(snapshot, "nearest_above_level", default=None),
+            ),
+            section="levels",
         )
         add(
             "liquidity.nearest_below_level",
-            value_for("nearest_below_level", "nearest_liquidity_below"),
+            value_for(
+                "nearest_below_level",
+                "nearest_below",
+                default=nested_value(snapshot, "nearest_below_level", default=None),
+            ),
+            section="levels",
         )
         add(
             "liquidity.strongest_cluster_above",
-            value_for("strongest_cluster_above"),
+            value_for(
+                "strongest_cluster_above",
+                "strongest_above",
+                default=nested_value(snapshot, "strongest_cluster_above", default=None),
+            ),
+            section="clusters",
         )
         add(
             "liquidity.strongest_cluster_below",
-            value_for("strongest_cluster_below"),
+            value_for(
+                "strongest_cluster_below",
+                "strongest_below",
+                default=nested_value(snapshot, "strongest_cluster_below", default=None),
+            ),
+            section="clusters",
         )
 
-        add(
-            "liquidity.equal_levels",
-            value_for("equal_levels", default=[]),
-        )
-        add(
-            "liquidity.active_levels",
-            value_for("active_levels", "levels", "liquidity_levels", default=[]),
-        )
-        add(
-            "liquidity.stop_clusters",
-            value_for("stop_clusters", "clusters", "liquidity_clusters", default=[]),
-        )
-        add(
-            "liquidity.zones",
-            value_for("zones", "liquidity_zones", default=[]),
-        )
+        if equal_levels is not None:
+            add("liquidity.equal_levels", equal_levels, section="equal_levels")
 
-        if signal:
-            add("liquidity.signal", signal)
+        if levels is not None:
+            add("liquidity.active_levels", levels, section="levels")
+
+        if clusters is not None:
+            add("liquidity.stop_clusters", clusters, section="clusters")
+
+        if zones is not None:
+            add("liquidity.zones", zones, section="zones")
+
+        if signal is not None:
+            add("liquidity.signal", signal, section="signal")
+            add(
+                "liquidity.signal.type",
+                nested_value(
+                    signal,
+                    "type",
+                    "signal_type",
+                    "setup_type",
+                    default=value_for("signal_type", "setup_type", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "liquidity.signal.score",
+                nested_value(
+                    signal,
+                    "score",
+                    default=value_for("signal_score", "score", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "liquidity.signal.confidence",
+                nested_value(
+                    signal,
+                    "confidence",
+                    default=value_for(
+                        "signal_confidence",
+                        "confidence",
+                        default=None,
+                    ),
+                ),
+                section="signal",
+            )
+            add(
+                "liquidity.signal.side",
+                nested_value(
+                    signal,
+                    "side",
+                    "direction",
+                    "bias",
+                    default=value_for("signal_side", "side", "direction", default=None),
+                ),
+                section="signal",
+            )
 
         return result
+
     def _build_liquidations_contract_features(
             self,
             *,
@@ -4805,55 +6533,23 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
-            return {}
-
-        cascade = mapping_for(
-            "cascade",
-            "cascade_result",
-            "cascade_detection",
-            "cascade_detected",
-            "result",
-        )
-        exhaustion = mapping_for(
-            "exhaustion",
-            "exhaustion_result",
-            "exhaustion_detection",
-            "exhaustion_detected",
-            "reversal_context",
-        )
-        squeeze = mapping_for(
-            "squeeze",
-            "squeeze_result",
-            "squeeze_reversal",
-            "squeeze_context",
-            "pending_confirmation",
-        )
-        cluster = mapping_for(
-            "cluster",
-            "liquidation_cluster",
-            "cluster_stats",
-        )
-        signal = mapping_for(
-            "signal",
-            "liquidation_signal",
-            "analytics_signal",
-        )
+            return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -4863,13 +6559,90 @@ class SignalNormalizer(BaseStrategyComponent):
                     return feature_map[key]
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        def nested_value(
+                mapping: dict[str, Any] | None,
+                *keys: str,
+                default: Any = None,
+        ) -> Any:
+            if not isinstance(mapping, dict):
+                return default
+
             for key in keys:
                 if key in mapping:
                     return mapping[key]
+
+            metadata = mapping.get("metadata")
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
+
             return default
 
-        def add(name: str, value: Any) -> None:
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "detected",
+                    "active",
+                    "confirmed",
+                    "triggered",
+                    "valid",
+                }:
+                    return True
+
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "none",
+                    "not_detected",
+                    "inactive",
+                    "rejected",
+                    "invalid",
+                    "expired",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_detected(section: dict[str, Any] | None) -> bool:
+            if not section:
+                return False
+
+            detected = section.get(
+                "detected",
+                section.get(
+                    "is_detected",
+                    section.get(
+                        "active",
+                        section.get(
+                            "confirmed",
+                            section.get("valid", None),
+                        ),
+                    ),
+                ),
+            )
+
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.LIQUIDATIONS,
@@ -4881,85 +6654,264 @@ class SignalNormalizer(BaseStrategyComponent):
                     metadata={
                         "origin": "contract_feature",
                         "contract": "liquidations",
+                        **({"section": section} if section else {}),
                     },
                 )
             )
 
-        # Cascade
-        add("liquidations.cascade", cascade or payload)
-        add(
-            "liquidations.cascade.confidence",
-            nested_value(cascade, "confidence", default=value_for("confidence", default=0.0)),
+        analysis = mapping_for(
+            "analysis",
+            "liquidations_analysis",
+            "liquidation_analysis",
         )
-        add(
-            "liquidations.cascade.intensity_score",
-            nested_value(
-                cascade,
-                "intensity_score",
-                "intensity",
-                default=value_for("intensity_score", default=0.0),
-            ),
+        result_section = mapping_for(
+            "result",
+            "liquidations_result",
+            "liquidation_result",
         )
-        add(
-            "liquidations.cascade.direction",
-            nested_value(
-                cascade,
-                "direction",
-                "cascade_direction",
-                "side",
-                default=value_for("direction", "cascade_direction", "side"),
-            ),
+        cascade = mapping_for(
+            "cascade",
+            "cascade_result",
+            "cascade_detection",
+            "cascade_detected",
+            "liquidation_cascade",
         )
-        add(
-            "liquidations.cascade.severity",
-            nested_value(
-                cascade,
-                "severity",
-                "severity_label",
-                default=value_for("severity", "severity_label"),
-            ),
+        exhaustion = mapping_for(
+            "exhaustion",
+            "exhaustion_result",
+            "exhaustion_detection",
+            "exhaustion_detected",
+            "reversal_context",
+            "liquidation_exhaustion",
         )
-        add(
-            "liquidations.cascade.continuation_bias",
-            nested_value(
-                cascade,
-                "continuation_bias",
-                default=value_for("continuation_bias", default=0.0),
-            ),
+        squeeze = mapping_for(
+            "squeeze",
+            "squeeze_result",
+            "squeeze_reversal",
+            "squeeze_context",
+            "pending_confirmation",
+            "liquidation_squeeze",
         )
-        add(
-            "liquidations.cascade.exhaustion_bias",
-            nested_value(
-                cascade,
-                "exhaustion_bias",
-                default=value_for("exhaustion_bias", default=0.0),
-            ),
+        cluster = mapping_for(
+            "cluster",
+            "liquidation_cluster",
+            "cluster_stats",
+            "liquidations_cluster",
         )
-        add(
-            "liquidations.cascade.total_notional_usd",
-            nested_value(
-                cascade,
-                "total_notional_usd",
-                "notional_usd",
-                default=value_for("total_notional_usd", "notional_usd", default=0.0),
-            ),
-        )
-        add(
-            "liquidations.cascade.event_count",
-            nested_value(
-                cascade,
-                "event_count",
-                "events_count",
-                default=value_for("event_count", "events_count", default=0),
-            ),
+        signal = mapping_for(
+            "signal",
+            "liquidation_signal",
+            "liquidations_signal",
+            "analytics_signal",
+            "setup",
         )
 
-        # Exhaustion
-        if exhaustion:
-            add("liquidations.exhaustion", exhaustion)
+        for container in (analysis, result_section):
+            if container is None:
+                continue
+
+            cascade = cascade or nested_value(
+                container,
+                "cascade",
+                "cascade_result",
+                "cascade_detection",
+                "liquidation_cascade",
+            )
+            exhaustion = exhaustion or nested_value(
+                container,
+                "exhaustion",
+                "exhaustion_result",
+                "exhaustion_detection",
+                "reversal_context",
+            )
+            squeeze = squeeze or nested_value(
+                container,
+                "squeeze",
+                "squeeze_result",
+                "squeeze_reversal",
+                "squeeze_context",
+            )
+            cluster = cluster or nested_value(
+                container,
+                "cluster",
+                "liquidation_cluster",
+                "cluster_stats",
+            )
+            signal = signal or nested_value(
+                container,
+                "signal",
+                "liquidation_signal",
+                "analytics_signal",
+                "setup",
+            )
+
+        if not isinstance(cluster, dict):
+            cluster = {}
+            for key in (
+                    "duration_seconds",
+                    "avg_notional_per_event",
+                    "side_imbalance_ratio",
+                    "event_imbalance_ratio",
+                    "acceleration_ratio",
+                    "event_count",
+                    "total_notional_usd",
+                    "price_range_pct",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    cluster[key] = value
+
+        if cluster:
+            add("liquidations.cluster", cluster, section="cluster")
+            add(
+                "liquidations.cluster.duration_seconds",
+                nested_value(
+                    cluster,
+                    "duration_seconds",
+                    default=value_for("duration_seconds", default=0.0),
+                ),
+                section="cluster",
+            )
+            add(
+                "liquidations.cluster.avg_notional_per_event",
+                nested_value(
+                    cluster,
+                    "avg_notional_per_event",
+                    default=value_for("avg_notional_per_event", default=0.0),
+                ),
+                section="cluster",
+            )
+            add(
+                "liquidations.cluster.side_imbalance_ratio",
+                nested_value(
+                    cluster,
+                    "side_imbalance_ratio",
+                    default=value_for("side_imbalance_ratio", default=0.0),
+                ),
+                section="cluster",
+            )
+            add(
+                "liquidations.cluster.event_imbalance_ratio",
+                nested_value(
+                    cluster,
+                    "event_imbalance_ratio",
+                    default=value_for("event_imbalance_ratio", default=0.0),
+                ),
+                section="cluster",
+            )
+            add(
+                "liquidations.cluster.acceleration_ratio",
+                nested_value(
+                    cluster,
+                    "acceleration_ratio",
+                    default=value_for("acceleration_ratio", default=0.0),
+                ),
+                section="cluster",
+            )
+
+        if section_detected(cascade):
+            add("liquidations.cascade", cascade, section="cascade")
+            add(
+                "liquidations.cascade.confidence",
+                nested_value(
+                    cascade,
+                    "confidence",
+                    default=value_for("cascade_confidence", "confidence", default=0.0),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.intensity_score",
+                nested_value(
+                    cascade,
+                    "intensity_score",
+                    "intensity",
+                    default=value_for("intensity_score", default=0.0),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.direction",
+                nested_value(
+                    cascade,
+                    "direction",
+                    "cascade_direction",
+                    "side",
+                    default=value_for(
+                        "direction",
+                        "cascade_direction",
+                        "side",
+                        default=None,
+                    ),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.severity",
+                nested_value(
+                    cascade,
+                    "severity",
+                    "severity_label",
+                    default=value_for("severity", "severity_label", default=None),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.continuation_bias",
+                nested_value(
+                    cascade,
+                    "continuation_bias",
+                    default=value_for("continuation_bias", default=0.0),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.exhaustion_bias",
+                nested_value(
+                    cascade,
+                    "exhaustion_bias",
+                    default=value_for("exhaustion_bias", default=0.0),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.total_notional_usd",
+                nested_value(
+                    cascade,
+                    "total_notional_usd",
+                    "notional_usd",
+                    default=value_for(
+                        "total_notional_usd",
+                        "notional_usd",
+                        default=0.0,
+                    ),
+                ),
+                section="cascade",
+            )
+            add(
+                "liquidations.cascade.event_count",
+                nested_value(
+                    cascade,
+                    "event_count",
+                    default=value_for("event_count", default=0),
+                ),
+                section="cascade",
+            )
+
+        if section_detected(exhaustion):
+            add("liquidations.exhaustion", exhaustion, section="exhaustion")
             add(
                 "liquidations.exhaustion.confidence",
-                nested_value(exhaustion, "confidence", default=value_for("confidence", default=0.0)),
+                nested_value(
+                    exhaustion,
+                    "confidence",
+                    default=value_for(
+                        "exhaustion_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                ),
+                section="exhaustion",
             )
             add(
                 "liquidations.exhaustion.exhaustion_bias",
@@ -4968,6 +6920,7 @@ class SignalNormalizer(BaseStrategyComponent):
                     "exhaustion_bias",
                     default=value_for("exhaustion_bias", default=0.0),
                 ),
+                section="exhaustion",
             )
             add(
                 "liquidations.exhaustion.bias_delta",
@@ -4976,6 +6929,7 @@ class SignalNormalizer(BaseStrategyComponent):
                     "bias_delta",
                     default=value_for("bias_delta", default=0.0),
                 ),
+                section="exhaustion",
             )
             add(
                 "liquidations.exhaustion.confirmed",
@@ -4983,85 +6937,109 @@ class SignalNormalizer(BaseStrategyComponent):
                     exhaustion,
                     "confirmed",
                     "is_confirmed",
-                    default=value_for("confirmed", "is_confirmed", default=False),
+                    "status",
+                    default=value_for(
+                        "exhaustion_confirmed",
+                        "confirmed",
+                        default=False,
+                    ),
                 ),
+                section="exhaustion",
             )
 
-        # Squeeze
-        if squeeze:
-            add("liquidations.squeeze", squeeze)
+        if section_detected(squeeze):
+            add("liquidations.squeeze", squeeze, section="squeeze")
             add(
                 "liquidations.squeeze.confirmed",
                 nested_value(
                     squeeze,
                     "confirmed",
                     "is_confirmed",
-                    default=value_for("squeeze_confirmed", default=False),
+                    "status",
+                    default=value_for(
+                        "squeeze_confirmed",
+                        "confirmed",
+                        default=False,
+                    ),
                 ),
+                section="squeeze",
             )
             add(
                 "liquidations.squeeze.score",
                 nested_value(
                     squeeze,
                     "score",
+                    "squeeze_score",
                     default=value_for("squeeze_score", "score", default=0.0),
                 ),
+                section="squeeze",
             )
             add(
                 "liquidations.squeeze.direction",
                 nested_value(
                     squeeze,
                     "direction",
-                    "reversal_side",
+                    "squeeze_direction",
                     "side",
-                    default=value_for("squeeze_direction", "reversal_side", "side"),
+                    default=value_for(
+                        "squeeze_direction",
+                        "direction",
+                        "side",
+                        default=None,
+                    ),
                 ),
+                section="squeeze",
             )
 
-        # Cluster
-        if cluster:
-            add("liquidations.cluster", cluster)
+        if section_detected(signal):
+            add("liquidations.signal", signal, section="signal")
             add(
-                "liquidations.cluster.duration_seconds",
-                nested_value(cluster, "duration_seconds", default=value_for("duration_seconds")),
-            )
-            add(
-                "liquidations.cluster.avg_notional_per_event",
+                "liquidations.signal.type",
                 nested_value(
-                    cluster,
-                    "avg_notional_per_event",
-                    default=value_for("avg_notional_per_event"),
+                    signal,
+                    "type",
+                    "signal_type",
+                    "setup_type",
+                    default=value_for("signal_type", "setup_type", default=None),
                 ),
+                section="signal",
             )
             add(
-                "liquidations.cluster.side_imbalance_ratio",
+                "liquidations.signal.score",
                 nested_value(
-                    cluster,
-                    "side_imbalance_ratio",
-                    default=value_for("side_imbalance_ratio"),
+                    signal,
+                    "score",
+                    default=value_for("signal_score", "score", default=0.0),
                 ),
+                section="signal",
             )
             add(
-                "liquidations.cluster.event_imbalance_ratio",
+                "liquidations.signal.confidence",
                 nested_value(
-                    cluster,
-                    "event_imbalance_ratio",
-                    default=value_for("event_imbalance_ratio"),
+                    signal,
+                    "confidence",
+                    default=value_for(
+                        "signal_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
                 ),
+                section="signal",
             )
             add(
-                "liquidations.cluster.acceleration_ratio",
+                "liquidations.signal.side",
                 nested_value(
-                    cluster,
-                    "acceleration_ratio",
-                    default=value_for("acceleration_ratio"),
+                    signal,
+                    "side",
+                    "direction",
+                    "bias",
+                    default=value_for("signal_side", "side", "direction", default=None),
                 ),
+                section="signal",
             )
-
-        if signal:
-            add("liquidations.signal", signal)
 
         return result
+
     def _build_orderflow_contract_features(
             self,
             *,
@@ -5070,37 +7048,51 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        composite = payload.get("composite") or payload.get("snapshot") or payload.get("orderflow")
-        if not isinstance(composite, dict):
-            composite = {}
+        def as_mapping(value: Any) -> dict[str, Any] | None:
+            if isinstance(value, dict):
+                return value
 
-        cvd = payload.get("cvd") or payload.get("cvd_stats") or composite.get("cvd")
-        volume_delta = (
-                payload.get("volume_delta")
-                or payload.get("volume_delta_stats")
-                or composite.get("volume_delta")
-        )
-        aggressive = (
-                payload.get("aggressive_trades")
-                or payload.get("aggressive")
-                or composite.get("aggressive_trades")
-        )
-        imbalance = (
-                payload.get("orderbook_imbalance")
-                or payload.get("imbalance")
-                or composite.get("orderbook_imbalance")
-        )
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                converted = to_dict()
+                if isinstance(converted, dict):
+                    return converted
 
-        cvd = cvd if isinstance(cvd, dict) else {}
-        volume_delta = volume_delta if isinstance(volume_delta, dict) else {}
-        aggressive = aggressive if isinstance(aggressive, dict) else {}
-        imbalance = imbalance if isinstance(imbalance, dict) else {}
+            return None
+
+        def get_item(value: Any, key: str, default: Any = None) -> Any:
+            mapping = as_mapping(value)
+            if mapping is not None:
+                return mapping.get(key, default)
+            return getattr(value, key, default)
+
+        def mapping_or_object_for(*keys: str) -> Any | None:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+                if key in feature_map and feature_map[key] is not None:
+                    return feature_map[key]
+            return None
+
+        def nested_value(value: Any, *keys: str, default: Any = None) -> Any:
+            for key in keys:
+                item = get_item(value, key, None)
+                if item is not None:
+                    return item
+
+            metadata = get_item(value, "metadata", None)
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
+
+            return default
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -5108,118 +7100,546 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if key in composite:
-                    return composite[key]
+
+            for container in (
+                    composite,
+                    cvd,
+                    volume_delta,
+                    aggressive_trades,
+                    orderbook_imbalance,
+                    signal,
+            ):
+                value = nested_value(container, *keys, default=None)
+                if value is not None:
+                    return value
+
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in mapping:
-                    return mapping[key]
-            return default
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
+            if value is None:
+                return
 
-        def add(name: str, value: Any) -> None:
-            snapshot = self._snapshot_from_raw_value(
-                source=FeatureSource.ORDERFLOW,
-                symbol=symbol,
-                name=name,
-                value=value,
-                timestamp=timestamp,
-                confidence=confidence,
-                metadata={
-                    "origin": "contract_feature",
-                    "contract": "orderflow",
-                },
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.ORDERFLOW,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "orderflow",
+                        **({"section": section} if section else {}),
+                    },
+                )
             )
-            result.append(snapshot)
 
-        cvd_delta_ratio = value_for(
-            "cvd_delta_ratio",
-            "delta_ratio",
-            default=nested_value(cvd, "delta_ratio", "cvd_delta_ratio", default=0.0),
+        composite = mapping_or_object_for(
+            "composite",
+            "snapshot",
+            "orderflow_snapshot",
+            "composite_snapshot",
+            "orderflow_composite",
         )
-        cvd_change_pct = value_for(
-            "cvd_change_pct",
-            default=nested_value(cvd, "cvd_change_pct", "change_pct", default=0.0),
+        cvd = mapping_or_object_for(
+            "cvd",
+            "cvd_snapshot",
+            "cvd_metrics",
+            "cumulative_volume_delta",
         )
-        cvd_slope = value_for(
-            "cvd_slope",
-            default=nested_value(cvd, "cvd_slope", "slope", default=0.0),
-        )
-        price_change_pct = value_for(
-            "price_change_pct",
-            default=nested_value(cvd, "price_change_pct", default=0.0),
-        )
-
-        volume_delta_ratio = value_for(
-            "volume_delta_ratio",
-            default=nested_value(volume_delta, "delta_ratio", "volume_delta_ratio", default=0.0),
-        )
-        volume_delta_value = value_for(
+        volume_delta = mapping_or_object_for(
             "volume_delta",
-            default=nested_value(volume_delta, "volume_delta", "delta", default=0.0),
+            "volume_delta_snapshot",
+            "delta",
+            "delta_metrics",
+        )
+        aggressive_trades = mapping_or_object_for(
+            "aggressive_trades",
+            "aggressive",
+            "aggressive_flow",
+            "aggressive_trades_snapshot",
+        )
+        orderbook_imbalance = mapping_or_object_for(
+            "orderbook_imbalance",
+            "orderbook",
+            "orderbook_snapshot",
+            "imbalance",
+        )
+        signal = mapping_or_object_for(
+            "signal",
+            "orderflow_signal",
+            "analytics_signal",
+            "setup",
         )
 
-        aggressive_buy_ratio = value_for(
-            "aggressive_buy_ratio",
-            "buy_ratio",
-            default=nested_value(aggressive, "buy_ratio", "aggressive_buy_ratio", default=0.0),
+        for container_key in (
+                "result",
+                "payload",
+                "data",
+                "analysis",
+                "orderflow_analysis",
+        ):
+            container = mapping_or_object_for(container_key)
+            container_map = as_mapping(container)
+            if container_map is None:
+                continue
+
+            composite = (
+                    composite
+                    or container_map.get("composite")
+                    or container_map.get("snapshot")
+                    or container_map.get("orderflow_snapshot")
+                    or container_map.get("composite_snapshot")
+            )
+            cvd = (
+                    cvd
+                    or container_map.get("cvd")
+                    or container_map.get("cvd_snapshot")
+                    or container_map.get("cvd_metrics")
+            )
+            volume_delta = (
+                    volume_delta
+                    or container_map.get("volume_delta")
+                    or container_map.get("delta")
+                    or container_map.get("delta_metrics")
+            )
+            aggressive_trades = (
+                    aggressive_trades
+                    or container_map.get("aggressive_trades")
+                    or container_map.get("aggressive")
+                    or container_map.get("aggressive_flow")
+            )
+            orderbook_imbalance = (
+                    orderbook_imbalance
+                    or container_map.get("orderbook_imbalance")
+                    or container_map.get("orderbook")
+                    or container_map.get("imbalance")
+            )
+            signal = (
+                    signal
+                    or container_map.get("signal")
+                    or container_map.get("orderflow_signal")
+                    or container_map.get("analytics_signal")
+                    or container_map.get("setup")
+            )
+
+        if composite is not None:
+            cvd = cvd or nested_value(composite, "cvd", default=None)
+            volume_delta = volume_delta or nested_value(
+                composite,
+                "volume_delta",
+                default=None,
+            )
+            aggressive_trades = aggressive_trades or nested_value(
+                composite,
+                "aggressive_trades",
+                default=None,
+            )
+            orderbook_imbalance = orderbook_imbalance or nested_value(
+                composite,
+                "orderbook_imbalance",
+                default=None,
+            )
+
+        if cvd is None:
+            flat_cvd = {
+                key: value_for(key, default=None)
+                for key in (
+                    "cvd_value",
+                    "value",
+                    "cvd_delta_ratio",
+                    "delta_ratio",
+                    "cvd_change_pct",
+                    "cvd_slope",
+                    "price_change_pct",
+                    "cvd_buy_ratio",
+                    "cvd_sell_ratio",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_cvd:
+                cvd = flat_cvd
+
+        if volume_delta is None:
+            flat_volume_delta = {
+                key: value_for(key, default=None)
+                for key in (
+                    "volume_delta",
+                    "notional_delta",
+                    "volume_delta_ratio",
+                    "delta_ratio",
+                    "cumulative_volume_delta",
+                    "cumulative_notional_delta",
+                    "buy_volume",
+                    "sell_volume",
+                    "buy_notional",
+                    "sell_notional",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_volume_delta:
+                volume_delta = flat_volume_delta
+
+        if aggressive_trades is None:
+            flat_aggressive = {
+                key: value_for(key, default=None)
+                for key in (
+                    "aggressive_buy_ratio",
+                    "aggressive_sell_ratio",
+                    "aggressive_burst_score",
+                    "aggressive_net_volume_delta",
+                    "aggressive_net_notional_delta",
+                    "large_buy_trades",
+                    "large_sell_trades",
+                    "aggressive_buy_count",
+                    "aggressive_sell_count",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_aggressive:
+                aggressive_trades = flat_aggressive
+
+        if orderbook_imbalance is None:
+            flat_orderbook = {
+                key: value_for(key, default=None)
+                for key in (
+                    "orderbook_imbalance_ratio",
+                    "orderbook_imbalance_diff",
+                    "ratio",
+                    "diff",
+                    "bid_volume",
+                    "ask_volume",
+                    "best_bid",
+                    "best_ask",
+                    "spread",
+                    "mid_price",
+                    "depth_levels_used",
+                )
+                if value_for(key, default=None) is not None
+            }
+            if flat_orderbook:
+                orderbook_imbalance = flat_orderbook
+
+        if composite is None and any(
+                item is not None
+                for item in (cvd, volume_delta, aggressive_trades, orderbook_imbalance)
+        ):
+            composite = {
+                "cvd": cvd or {},
+                "volume_delta": volume_delta or {},
+                "aggressive_trades": aggressive_trades or {},
+                "orderbook_imbalance": orderbook_imbalance or {},
+            }
+
+            for key in (
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+                    "last_price",
+                    "price",
+                    "price_change",
+                    "price_change_pct",
+                    "window_seconds",
+                    "trades_count",
+                    "total_volume",
+                    "total_notional",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    composite[key] = value
+
+        if composite is not None:
+            add("orderflow.composite", composite, section="composite")
+
+        if cvd is not None:
+            add("orderflow.cvd", cvd, section="cvd")
+            add(
+                "orderflow.cvd.value",
+                nested_value(
+                    cvd,
+                    "cvd_value",
+                    "value",
+                    default=value_for("cvd_value", "value", default=None),
+                ),
+                section="cvd",
+            )
+            add(
+                "orderflow.cvd.delta_ratio",
+                nested_value(
+                    cvd,
+                    "cvd_delta_ratio",
+                    "delta_ratio",
+                    default=value_for("cvd_delta_ratio", "delta_ratio", default=None),
+                ),
+                section="cvd",
+            )
+            add(
+                "orderflow.cvd.cvd_change_pct",
+                nested_value(
+                    cvd,
+                    "cvd_change_pct",
+                    default=value_for("cvd_change_pct", default=None),
+                ),
+                section="cvd",
+            )
+            add(
+                "orderflow.cvd.cvd_slope",
+                nested_value(
+                    cvd,
+                    "cvd_slope",
+                    default=value_for("cvd_slope", default=None),
+                ),
+                section="cvd",
+            )
+            add(
+                "orderflow.cvd.price_change_pct",
+                nested_value(
+                    cvd,
+                    "price_change_pct",
+                    default=value_for("price_change_pct", default=None),
+                ),
+                section="cvd",
+            )
+
+        if volume_delta is not None:
+            add("orderflow.volume_delta", volume_delta, section="volume_delta")
+            add(
+                "orderflow.volume_delta.volume_delta",
+                nested_value(
+                    volume_delta,
+                    "volume_delta",
+                    default=value_for("volume_delta", default=None),
+                ),
+                section="volume_delta",
+            )
+            add(
+                "orderflow.volume_delta.delta_ratio",
+                nested_value(
+                    volume_delta,
+                    "volume_delta_ratio",
+                    "delta_ratio",
+                    default=value_for(
+                        "volume_delta_ratio",
+                        "delta_ratio",
+                        default=None,
+                    ),
+                ),
+                section="volume_delta",
+            )
+            add(
+                "orderflow.volume_delta.cumulative_volume_delta",
+                nested_value(
+                    volume_delta,
+                    "cumulative_volume_delta",
+                    default=value_for("cumulative_volume_delta", default=None),
+                ),
+                section="volume_delta",
+            )
+            add(
+                "orderflow.volume_delta.notional_delta",
+                nested_value(
+                    volume_delta,
+                    "notional_delta",
+                    default=value_for("notional_delta", default=None),
+                ),
+                section="volume_delta",
+            )
+            add(
+                "orderflow.volume_delta.cumulative_notional_delta",
+                nested_value(
+                    volume_delta,
+                    "cumulative_notional_delta",
+                    default=value_for("cumulative_notional_delta", default=None),
+                ),
+                section="volume_delta",
+            )
+
+        if aggressive_trades is not None:
+            add("orderflow.aggressive_trades", aggressive_trades, section="aggressive")
+            add(
+                "orderflow.aggressive_trades.buy_ratio",
+                nested_value(
+                    aggressive_trades,
+                    "aggressive_buy_ratio",
+                    "buy_ratio",
+                    default=value_for("aggressive_buy_ratio", "buy_ratio", default=None),
+                ),
+                section="aggressive",
+            )
+            add(
+                "orderflow.aggressive_trades.sell_ratio",
+                nested_value(
+                    aggressive_trades,
+                    "aggressive_sell_ratio",
+                    "sell_ratio",
+                    default=value_for("aggressive_sell_ratio", "sell_ratio", default=None),
+                ),
+                section="aggressive",
+            )
+            add(
+                "orderflow.aggressive_trades.burst_score",
+                nested_value(
+                    aggressive_trades,
+                    "aggressive_burst_score",
+                    "burst_score",
+                    default=value_for("aggressive_burst_score", "burst_score", default=None),
+                ),
+                section="aggressive",
+            )
+            add(
+                "orderflow.aggressive_trades.net_volume_delta",
+                nested_value(
+                    aggressive_trades,
+                    "aggressive_net_volume_delta",
+                    "net_volume_delta",
+                    default=value_for(
+                        "aggressive_net_volume_delta",
+                        "net_volume_delta",
+                        default=None,
+                    ),
+                ),
+                section="aggressive",
+            )
+            add(
+                "orderflow.aggressive_trades.net_notional_delta",
+                nested_value(
+                    aggressive_trades,
+                    "aggressive_net_notional_delta",
+                    "net_notional_delta",
+                    default=value_for(
+                        "aggressive_net_notional_delta",
+                        "net_notional_delta",
+                        default=None,
+                    ),
+                ),
+                section="aggressive",
+            )
+            add(
+                "orderflow.aggressive_trades.large_buy_trades",
+                nested_value(
+                    aggressive_trades,
+                    "large_buy_trades",
+                    default=value_for("large_buy_trades", default=None),
+                ),
+                section="aggressive",
+            )
+            add(
+                "orderflow.aggressive_trades.large_sell_trades",
+                nested_value(
+                    aggressive_trades,
+                    "large_sell_trades",
+                    default=value_for("large_sell_trades", default=None),
+                ),
+                section="aggressive",
+            )
+
+        if orderbook_imbalance is not None:
+            add(
+                "orderflow.orderbook_imbalance",
+                orderbook_imbalance,
+                section="orderbook",
+            )
+            add(
+                "orderflow.orderbook_imbalance.ratio",
+                nested_value(
+                    orderbook_imbalance,
+                    "orderbook_imbalance_ratio",
+                    "ratio",
+                    default=value_for(
+                        "orderbook_imbalance_ratio",
+                        "ratio",
+                        default=None,
+                    ),
+                ),
+                section="orderbook",
+            )
+            add(
+                "orderflow.orderbook_imbalance.diff",
+                nested_value(
+                    orderbook_imbalance,
+                    "orderbook_imbalance_diff",
+                    "diff",
+                    default=value_for(
+                        "orderbook_imbalance_diff",
+                        "diff",
+                        default=None,
+                    ),
+                ),
+                section="orderbook",
+            )
+
+        add(
+            "orderflow.trades_count",
+            value_for("trades_count", default=None),
+            section="composite",
         )
-        aggressive_sell_ratio = value_for(
-            "aggressive_sell_ratio",
-            "sell_ratio",
-            default=nested_value(aggressive, "sell_ratio", "aggressive_sell_ratio", default=0.0),
+        add(
+            "orderflow.total_volume",
+            value_for("total_volume", default=None),
+            section="composite",
+        )
+        add(
+            "orderflow.total_notional",
+            value_for("total_notional", default=None),
+            section="composite",
+        )
+        add(
+            "orderflow.last_price",
+            value_for("last_price", "price", default=None),
+            section="composite",
+        )
+        add(
+            "orderflow.price_change_pct",
+            value_for("price_change_pct", default=None),
+            section="composite",
         )
 
-        imbalance_ratio = value_for(
-            "orderbook_imbalance_ratio",
-            "imbalance_ratio",
-            default=nested_value(imbalance, "ratio", "imbalance_ratio", default=0.0),
-        )
-        imbalance_diff = value_for(
-            "orderbook_imbalance_diff",
-            "imbalance_diff",
-            default=nested_value(imbalance, "diff", "imbalance_diff", default=0.0),
-        )
-
-        add("orderflow.composite", composite or payload)
-        add("orderflow.cvd", cvd or {
-            "delta_ratio": cvd_delta_ratio,
-            "cvd_change_pct": cvd_change_pct,
-            "cvd_slope": cvd_slope,
-            "price_change_pct": price_change_pct,
-        })
-        add("orderflow.cvd.delta_ratio", cvd_delta_ratio)
-        add("orderflow.cvd.cvd_change_pct", cvd_change_pct)
-        add("orderflow.cvd.cvd_slope", cvd_slope)
-        add("orderflow.cvd.price_change_pct", price_change_pct)
-
-        add("orderflow.volume_delta", volume_delta or {
-            "delta_ratio": volume_delta_ratio,
-            "volume_delta": volume_delta_value,
-        })
-        add("orderflow.volume_delta.delta_ratio", volume_delta_ratio)
-        add("orderflow.volume_delta.volume_delta", volume_delta_value)
-
-        add("orderflow.aggressive_trades", aggressive or {
-            "buy_ratio": aggressive_buy_ratio,
-            "sell_ratio": aggressive_sell_ratio,
-        })
-        add("orderflow.aggressive_trades.buy_ratio", aggressive_buy_ratio)
-        add("orderflow.aggressive_trades.sell_ratio", aggressive_sell_ratio)
-
-        add("orderflow.orderbook_imbalance", imbalance or {
-            "ratio": imbalance_ratio,
-            "diff": imbalance_diff,
-        })
-        add("orderflow.orderbook_imbalance.ratio", imbalance_ratio)
-        add("orderflow.orderbook_imbalance.diff", imbalance_diff)
-
-        add("orderflow.trades_count", value_for("trades_count", default=0))
-        add("orderflow.total_volume", value_for("total_volume", default=0.0))
-        add("orderflow.total_notional", value_for("total_notional", default=0.0))
-        add("orderflow.last_price", value_for("last_price", "price", default=None))
-        add("orderflow.price_change_pct", price_change_pct)
+        if signal is not None:
+            add("orderflow.signal", signal, section="signal")
+            add(
+                "orderflow.signal.type",
+                nested_value(
+                    signal,
+                    "type",
+                    "signal_type",
+                    "setup_type",
+                    default=value_for("signal_type", "setup_type", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "orderflow.signal.score",
+                nested_value(
+                    signal,
+                    "score",
+                    default=value_for("signal_score", "score", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "orderflow.signal.confidence",
+                nested_value(
+                    signal,
+                    "confidence",
+                    default=value_for("signal_confidence", "confidence", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "orderflow.signal.side",
+                nested_value(
+                    signal,
+                    "side",
+                    "direction",
+                    "bias",
+                    default=value_for("signal_side", "side", "direction", default=None),
+                ),
+                section="signal",
+            )
 
         return result
 
@@ -5654,7 +8074,6 @@ class SignalNormalizer(BaseStrategyComponent):
 
         return result
 
-
     def _build_funding_contract_features(
             self,
             *,
@@ -5663,32 +8082,23 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
         result: list[FeatureSnapshot] = []
-        confidence = payload.get("confidence", 0.0)
 
+        confidence = payload.get("confidence", 0.0)
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
-            return {}
-
-        snapshot = mapping_for("snapshot", "funding_snapshot")
-        statistics = mapping_for("statistics", "stats", "funding_statistics")
-        regime = mapping_for("regime", "regime_state", "funding_regime")
-        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
-        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
-        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
-        flip = mapping_for("flip", "flip_event", "funding_flip")
-        signal = mapping_for("signal", "funding_signal")
+            return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -5698,114 +8108,382 @@ class SignalNormalizer(BaseStrategyComponent):
                     return feature_map[key]
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        def nested_value(
+                mapping: dict[str, Any] | None,
+                *keys: str,
+                default: Any = None,
+        ) -> Any:
+            if not isinstance(mapping, dict):
+                return default
+
             for key in keys:
                 if key in mapping:
                     return mapping[key]
+
+            metadata = mapping.get("metadata")
+            if isinstance(metadata, dict):
+                for key in keys:
+                    if key in metadata:
+                        return metadata[key]
+
             return default
 
-        def add(name: str, value: Any) -> None:
-            snapshot_obj = self._snapshot_from_raw_value(
-                source=FeatureSource.FUNDING,
-                symbol=symbol,
-                name=name,
-                value=value,
-                timestamp=timestamp,
-                confidence=confidence,
-                metadata={
-                    "origin": "contract_feature",
-                    "contract": "funding",
-                },
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                    "detected",
+                    "active",
+                    "confirmed",
+                    "triggered",
+                }:
+                    return True
+                if normalized in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "none",
+                    "not_detected",
+                    "inactive",
+                }:
+                    return False
+
+            if isinstance(value, (int, float)):
+                return bool(value)
+
+            return default
+
+        def section_detected(section: dict[str, Any] | None) -> bool:
+            if not section:
+                return False
+
+            detected = section.get(
+                "detected",
+                section.get(
+                    "is_detected",
+                    section.get(
+                        "active",
+                        section.get("confirmed", None),
+                    ),
+                ),
             )
-            result.append(snapshot_obj)
 
-        add("funding.snapshot", snapshot or payload)
-        add("funding.statistics", statistics)
+            if detected is None:
+                return True
 
-        add("funding.regime", regime)
-        add(
-            "funding.regime.confidence",
-            nested_value(regime, "confidence", default=value_for("regime_confidence", default=0.0)),
-        )
+            return to_bool(detected, default=False)
 
-        add("funding.pressure", pressure)
-        add(
-            "funding.pressure.score",
-            nested_value(pressure, "score", "pressure_score", default=value_for("pressure_score", default=0.0)),
-        )
-        add(
-            "funding.pressure.level",
-            nested_value(pressure, "level", "pressure_level", default=value_for("pressure_level", default=None)),
-        )
-        add(
-            "funding.pressure.direction",
-            nested_value(pressure, "direction", "bias", default=value_for("pressure_direction", default=None)),
-        )
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
+            result.append(
+                self._snapshot_from_raw_value(
+                    source=FeatureSource.FUNDING,
+                    symbol=symbol,
+                    name=name,
+                    value=value,
+                    timestamp=timestamp,
+                    confidence=confidence,
+                    metadata={
+                        "origin": "contract_feature",
+                        "contract": "funding",
+                        **({"section": section} if section else {}),
+                    },
+                )
+            )
 
-        add("funding.extreme", extreme)
-        add(
-            "funding.extreme.type",
-            nested_value(extreme, "type", "extreme_type", default=value_for("extreme_type", default=None)),
-        )
-        add(
-            "funding.extreme.severity",
-            nested_value(extreme, "severity", "score", default=value_for("extreme_severity", default=0.0)),
-        )
-        add(
-            "funding.extreme.mean_reversion_probability",
-            nested_value(
-                extreme,
-                "mean_reversion_probability",
-                "reversion_probability",
-                default=value_for("mean_reversion_probability", default=0.0),
-            ),
-        )
-        add(
-            "funding.extreme.squeeze_probability",
-            nested_value(extreme, "squeeze_probability", default=value_for("squeeze_probability", default=0.0)),
+        analysis = mapping_for(
+            "analysis",
+            "result",
+            "funding_analysis",
+            "funding_result",
         )
 
-        add("funding.divergence", divergence)
-        add(
-            "funding.divergence.type",
-            nested_value(divergence, "type", "divergence_type", default=value_for("divergence_type", default=None)),
+        snapshot = mapping_for("snapshot", "funding_snapshot")
+        statistics = mapping_for("statistics", "stats", "funding_statistics")
+        regime = mapping_for("regime", "regime_state", "funding_regime")
+        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
+        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
+        divergence = mapping_for(
+            "divergence",
+            "divergence_event",
+            "funding_divergence",
         )
-        add(
-            "funding.divergence.confidence",
-            nested_value(divergence, "confidence", default=value_for("divergence_confidence", default=0.0)),
-        )
-        add(
-            "funding.divergence.score",
-            nested_value(divergence, "score", default=value_for("divergence_score", default=0.0)),
-        )
+        flip = mapping_for("flip", "flip_event", "funding_flip")
+        signal = mapping_for("signal", "funding_signal", "setup")
 
-        add("funding.flip", flip)
-        add(
-            "funding.flip.type",
-            nested_value(flip, "type", "flip_type", default=value_for("flip_type", default=None)),
-        )
-        add(
-            "funding.flip.confidence",
-            nested_value(flip, "confidence", default=value_for("flip_confidence", default=0.0)),
-        )
+        if analysis is not None:
+            nested = nested_value
 
-        add("funding.signal", signal)
-        add(
-            "funding.signal.type",
-            nested_value(signal, "type", "signal_type", default=value_for("signal_type", default=None)),
-        )
-        add(
-            "funding.signal.score",
-            nested_value(signal, "score", default=value_for("signal_score", "score", default=0.0)),
-        )
-        add(
-            "funding.signal.confidence",
-            nested_value(signal, "confidence", default=value_for("signal_confidence", "confidence", default=0.0)),
-        )
-        add(
-            "funding.signal.bias",
-            nested_value(signal, "bias", "direction", default=value_for("bias", "direction", default=None)),
-        )
+            snapshot = snapshot or nested(
+                analysis,
+                "snapshot",
+                "funding_snapshot",
+            )
+            statistics = statistics or nested(
+                analysis,
+                "statistics",
+                "stats",
+                "funding_statistics",
+            )
+            regime = regime or nested(
+                analysis,
+                "regime",
+                "regime_state",
+                "funding_regime",
+            )
+            pressure = pressure or nested(
+                analysis,
+                "pressure",
+                "pressure_state",
+                "funding_pressure",
+            )
+            extreme = extreme or nested(
+                analysis,
+                "extreme",
+                "extreme_event",
+                "funding_extreme",
+            )
+            divergence = divergence or nested(
+                analysis,
+                "divergence",
+                "divergence_event",
+                "funding_divergence",
+            )
+            flip = flip or nested(
+                analysis,
+                "flip",
+                "flip_event",
+                "funding_flip",
+            )
+            signal = signal or nested(
+                analysis,
+                "signal",
+                "funding_signal",
+                "setup",
+            )
+
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+            for key in (
+                    "funding_rate",
+                    "current_rate",
+                    "next_funding_rate",
+                    "predicted_rate",
+                    "annualized_rate",
+                    "premium_index",
+                    "mark_price",
+                    "index_price",
+                    "next_funding_time",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+            ):
+                value = value_for(key, default=None)
+                if value is not None:
+                    snapshot[key] = value
+
+        if snapshot:
+            add("funding.snapshot", snapshot, section="snapshot")
+
+        if statistics:
+            add("funding.statistics", statistics, section="statistics")
+
+        if regime:
+            add("funding.regime", regime, section="regime")
+            add(
+                "funding.regime.confidence",
+                nested_value(
+                    regime,
+                    "confidence",
+                    default=value_for("regime_confidence", default=0.0),
+                ),
+                section="regime",
+            )
+
+        if pressure:
+            add("funding.pressure", pressure, section="pressure")
+            add(
+                "funding.pressure.score",
+                nested_value(
+                    pressure,
+                    "score",
+                    "pressure_score",
+                    default=value_for("pressure_score", default=0.0),
+                ),
+                section="pressure",
+            )
+            add(
+                "funding.pressure.level",
+                nested_value(
+                    pressure,
+                    "level",
+                    "pressure_level",
+                    default=value_for("pressure_level", default=None),
+                ),
+                section="pressure",
+            )
+            add(
+                "funding.pressure.direction",
+                nested_value(
+                    pressure,
+                    "direction",
+                    "bias",
+                    default=value_for("pressure_direction", default=None),
+                ),
+                section="pressure",
+            )
+
+        if section_detected(extreme):
+            add("funding.extreme", extreme, section="extreme")
+            add(
+                "funding.extreme.type",
+                nested_value(
+                    extreme,
+                    "type",
+                    "extreme_type",
+                    default=value_for("extreme_type", default=None),
+                ),
+                section="extreme",
+            )
+            add(
+                "funding.extreme.severity",
+                nested_value(
+                    extreme,
+                    "severity",
+                    "score",
+                    default=value_for("extreme_severity", default=0.0),
+                ),
+                section="extreme",
+            )
+            add(
+                "funding.extreme.mean_reversion_probability",
+                nested_value(
+                    extreme,
+                    "mean_reversion_probability",
+                    "reversion_probability",
+                    default=value_for("mean_reversion_probability", default=0.0),
+                ),
+                section="extreme",
+            )
+            add(
+                "funding.extreme.squeeze_probability",
+                nested_value(
+                    extreme,
+                    "squeeze_probability",
+                    default=value_for("squeeze_probability", default=0.0),
+                ),
+                section="extreme",
+            )
+
+        if section_detected(divergence):
+            add("funding.divergence", divergence, section="divergence")
+            add(
+                "funding.divergence.type",
+                nested_value(
+                    divergence,
+                    "type",
+                    "divergence_type",
+                    default=value_for("divergence_type", default=None),
+                ),
+                section="divergence",
+            )
+            add(
+                "funding.divergence.confidence",
+                nested_value(
+                    divergence,
+                    "confidence",
+                    default=value_for("divergence_confidence", default=0.0),
+                ),
+                section="divergence",
+            )
+            add(
+                "funding.divergence.score",
+                nested_value(
+                    divergence,
+                    "score",
+                    default=value_for("divergence_score", default=0.0),
+                ),
+                section="divergence",
+            )
+
+        if section_detected(flip):
+            add("funding.flip", flip, section="flip")
+            add(
+                "funding.flip.type",
+                nested_value(
+                    flip,
+                    "type",
+                    "flip_type",
+                    default=value_for("flip_type", default=None),
+                ),
+                section="flip",
+            )
+            add(
+                "funding.flip.confidence",
+                nested_value(
+                    flip,
+                    "confidence",
+                    default=value_for("flip_confidence", default=0.0),
+                ),
+                section="flip",
+            )
+
+        if section_detected(signal):
+            add("funding.signal", signal, section="signal")
+            add(
+                "funding.signal.type",
+                nested_value(
+                    signal,
+                    "type",
+                    "signal_type",
+                    default=value_for("signal_type", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "funding.signal.score",
+                nested_value(
+                    signal,
+                    "score",
+                    default=value_for("signal_score", "score", default=0.0),
+                ),
+                section="signal",
+            )
+            add(
+                "funding.signal.confidence",
+                nested_value(
+                    signal,
+                    "confidence",
+                    default=value_for(
+                        "signal_confidence",
+                        "confidence",
+                        default=0.0,
+                    ),
+                ),
+                section="signal",
+            )
+            add(
+                "funding.signal.bias",
+                nested_value(
+                    signal,
+                    "bias",
+                    "direction",
+                    default=value_for("bias", "direction", default=None),
+                ),
+                section="signal",
+            )
 
         return result
 

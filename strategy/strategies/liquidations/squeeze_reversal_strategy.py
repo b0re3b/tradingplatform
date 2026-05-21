@@ -302,24 +302,36 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         )
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         exhaustion = self._resolve_exhaustion_context(context)
         if exhaustion is None:
+            self.remember_no_signal(
+                "missing_liquidations_squeeze_or_exhaustion_contract",
+                liquidations_domain_keys=sorted(self.liquidations_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         event_time = extract_event_time(exhaustion)
         if (
-            self.squeeze_config.require_fresh_exhaustion
-            and is_stale(
-                event_time=event_time,
-                now=context.timestamp,
-                stale_after_seconds=self.squeeze_config.stale_feature_max_age_seconds,
-            )
+                self.squeeze_config.require_fresh_exhaustion
+                and is_stale(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.squeeze_config.stale_feature_max_age_seconds,
+        )
         ):
+            self.remember_no_signal(
+                "stale_liquidations_exhaustion",
+                event_time=event_time.isoformat() if event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
+                stale_after_seconds=self.squeeze_config.stale_feature_max_age_seconds,
+                exhaustion=serialize_for_metadata(exhaustion),
+            )
             return None
 
         common_rejection = quality_filter_reason(
@@ -333,13 +345,69 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
             require_actionable_direction=self.squeeze_config.require_actionable_direction,
         )
         if common_rejection is not None:
+            self.remember_no_signal(
+                "liquidations_squeeze_quality_filter_failed",
+                filter_reason=common_rejection,
+                exhaustion=serialize_for_metadata(exhaustion),
+                confidence=extract_confidence(exhaustion),
+                score=extract_score(exhaustion),
+                intensity_score=extract_intensity_score(exhaustion),
+                total_notional_usd=str(extract_notional_usd(exhaustion)),
+                event_count=extract_event_count(exhaustion),
+                min_confidence=self.squeeze_config.min_confidence,
+                min_intensity_score=self.squeeze_config.min_intensity_score,
+                min_total_notional_usd=str(self.squeeze_config.min_total_notional_usd),
+                min_event_count=self.squeeze_config.min_event_count,
+            )
             return None
 
         if not self._passes_squeeze_filters(exhaustion):
+            self.remember_no_signal(
+                "liquidations_squeeze_strategy_filters_failed",
+                exhaustion=serialize_for_metadata(exhaustion),
+                confirmed_context=is_confirmed_status(exhaustion),
+                require_confirmed_exhaustion_context=(
+                    self.squeeze_config.require_confirmed_exhaustion_context
+                ),
+                severity=self._severity(exhaustion),
+                allowed_severities=list(self.squeeze_config.allowed_severities),
+                exhaustion_bias=extract_exhaustion_bias(exhaustion),
+                min_exhaustion_bias=self.squeeze_config.min_exhaustion_bias,
+                bias_delta=extract_bias_delta(exhaustion),
+                min_bias_delta=self.squeeze_config.min_bias_delta,
+                continuation_bias=extract_continuation_bias(exhaustion),
+                max_continuation_bias_after_exhaustion=(
+                    self.squeeze_config.max_continuation_bias_after_exhaustion
+                ),
+                side_imbalance_ratio=extract_side_imbalance_ratio(exhaustion),
+                min_side_imbalance_ratio=self.squeeze_config.min_side_imbalance_ratio,
+                event_imbalance_ratio=extract_event_imbalance_ratio(exhaustion),
+                min_event_imbalance_ratio=self.squeeze_config.min_event_imbalance_ratio,
+                acceleration_ratio=extract_acceleration_ratio(exhaustion),
+                min_climax_acceleration_ratio=(
+                    self.squeeze_config.min_climax_acceleration_ratio
+                ),
+                cluster_duration_seconds=extract_cluster_duration_seconds(exhaustion),
+                max_cluster_duration_seconds=self.squeeze_config.max_cluster_duration_seconds,
+                cluster_avg_notional_per_event=str(
+                    extract_cluster_avg_notional_per_event(exhaustion)
+                ),
+                min_avg_notional_per_event=(
+                    str(self.squeeze_config.min_avg_notional_per_event)
+                    if self.squeeze_config.min_avg_notional_per_event is not None
+                    else None
+                ),
+            )
             return None
 
         side = self._derive_reversal_side(exhaustion)
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "liquidations_squeeze_side_not_directional",
+                exhaustion=serialize_for_metadata(exhaustion),
+                cascade_direction=serialize_for_metadata(extract_direction(exhaustion)),
+                reversal_side=serialize_for_metadata(extract_reversal_side(exhaustion)),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -348,9 +416,23 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         )
 
         if breakdown.score < self.squeeze_config.min_signal_score:
+            self.remember_no_signal(
+                "liquidations_squeeze_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.squeeze_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.squeeze_config.min_signal_confidence:
+            self.remember_no_signal(
+                "liquidations_squeeze_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.squeeze_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(exhaustion)
@@ -370,6 +452,8 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         metadata = {
             "liquidations_setup_family": "liquidation_squeeze_reversal",
             "liquidations_strategy_version": "2.0.0",
+            "contract": "liquidations",
+            "primary_section": "exhaustion",
             "score_breakdown": breakdown.to_dict(),
             "exhaustion": serialize_for_metadata(exhaustion),
             "event_time": event_time.isoformat() if event_time else None,

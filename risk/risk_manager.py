@@ -1163,12 +1163,12 @@ class RiskManager:
         await self.on_position_updated(
             symbol,
             position_id=payload.get("position_id"),
-            size=self._to_float_or_none(payload.get("size")),
-            mark_price=self._to_float_or_none(payload.get("mark_price")),
-            notional_value=self._to_float_or_none(payload.get("notional_value")),
-            leverage=self._to_float_or_none(payload.get("leverage")),
-            margin_used=self._to_float_or_none(payload.get("margin_used")),
-            risk_amount=self._to_float_or_none(payload.get("risk_amount")),
+            size=self._to_float_or_none(payload.get("size") or payload.get("quantity") or payload.get("filled_quantity")),
+            mark_price=self._to_float_or_none(payload.get("mark_price") or payload.get("fill_price") or payload.get("average_fill_price")),
+            notional_value=self._to_float_or_none(payload.get("notional_value") or payload.get("notional") or payload.get("fill_notional")),
+            leverage=self._to_float_or_none(payload.get("leverage") or payload.get("final_leverage")),
+            margin_used=self._to_float_or_none(payload.get("margin_used") or payload.get("margin") or payload.get("final_margin")),
+            risk_amount=self._to_float_or_none(payload.get("risk_amount") or payload.get("final_risk_amount") or payload.get("open_risk")),
             stop_loss=self._to_float_or_none(payload.get("stop_loss")),
             take_profit=self._to_float_or_none(payload.get("take_profit")),
             unrealized_pnl=self._to_float_or_none(payload.get("unrealized_pnl")),
@@ -1225,7 +1225,12 @@ class RiskManager:
         # metrics confirm the reservation and register the opened position in one
         # path. If the fill event does not contain enough position data, release
         # the reservation fail-safe so projected risk is not stuck forever.
-        if payload.get("symbol") and payload.get("side") and payload.get("size") is not None:
+        if payload.get("symbol") and payload.get("side") and (
+            payload.get("size") is not None
+            or payload.get("quantity") is not None
+            or payload.get("filled_quantity") is not None
+            or payload.get("fill_quantity") is not None
+        ):
             try:
                 position = self._position_from_payload(payload)
             except ValueError as exc:
@@ -1923,7 +1928,16 @@ class RiskManager:
             "allowed": decision.allowed,
             "decision": decision.decision.value,
             "risk_mode": decision.risk_mode.value,
+            "entry_price": request.entry_price,
+            "stop_loss": request.stop_loss,
+            "take_profit": request.take_profit,
+            "order_intent": request.order_intent.value,
+            "margin_mode": request.margin_mode.value,
+            "requested_leverage": request.requested_leverage,
+            "requested_size": request.requested_size,
+            "requested_margin": request.requested_margin,
             "final_tier": decision.final_tier.value if decision.final_tier else None,
+            "tier": decision.final_tier.value if decision.final_tier else None,
             "final_size": decision.final_size,
             "final_leverage": decision.final_leverage,
             "final_risk_amount": decision.final_risk_amount,
@@ -2034,10 +2048,32 @@ class RiskManager:
 
     @staticmethod
     def _position_from_payload(payload: dict[str, Any]) -> PortfolioPosition:
-        symbol = payload.get("symbol")
-        side_raw = payload.get("side")
-        size = RiskManager._to_float_or_none(payload.get("size"))
-        entry_price = RiskManager._to_float_or_none(payload.get("entry_price"))
+        metadata = dict(payload.get("metadata", {}) or {})
+
+        def first_value(*keys: str) -> Any:
+            for key in keys:
+                value = payload.get(key)
+                if value is not None:
+                    return value
+            for key in keys:
+                value = metadata.get(key)
+                if value is not None:
+                    return value
+            nested_payload = metadata.get("payload")
+            if isinstance(nested_payload, dict):
+                for key in keys:
+                    value = nested_payload.get(key)
+                    if value is not None:
+                        return value
+            return None
+
+        def first_float(*keys: str) -> float | None:
+            return RiskManager._to_float_or_none(first_value(*keys))
+
+        symbol = first_value("symbol")
+        side_raw = first_value("side", "position_side")
+        size = first_float("size", "quantity", "filled_quantity", "fill_quantity", "final_size")
+        entry_price = first_float("entry_price", "fill_price", "average_fill_price", "price")
 
         if not symbol:
             raise ValueError("symbol is required")
@@ -2048,16 +2084,25 @@ class RiskManager:
         if entry_price is None:
             raise ValueError("entry_price is required")
 
-        mark_price = RiskManager._to_float_or_none(payload.get("mark_price")) or entry_price
-        notional_value = (
-                RiskManager._to_float_or_none(payload.get("notional_value"))
-                or abs(size * entry_price)
-        )
+        mark_price = first_float("mark_price", "fill_price", "average_fill_price", "price") or entry_price
+        notional_value = first_float("notional_value", "notional", "fill_notional", "final_notional") or abs(size * entry_price)
+        margin_used = first_float("margin_used", "margin", "final_margin") or 0.0
+        risk_amount = first_float("risk_amount", "open_risk", "final_risk_amount") or 0.0
+        tier = RiskManager._optional_enum_from_value(TradeTier, first_value("tier", "final_tier"))
 
-        tier = RiskManager._optional_enum_from_value(TradeTier, payload.get("tier"))
-        metadata = dict(payload.get("metadata", {}))
-        if payload.get("reservation_id") is not None:
-            metadata["reservation_id"] = payload.get("reservation_id")
+        reservation_id = first_value("reservation_id")
+        if reservation_id is not None:
+            metadata["reservation_id"] = reservation_id
+
+        opened_at = first_float("opened_at")
+        if opened_at is None:
+            opened_at_ms = first_float("opened_at_ms", "timestamp_ms", "filled_at_ms")
+            opened_at = (opened_at_ms / 1000.0) if opened_at_ms and opened_at_ms > 10_000_000_000 else opened_at_ms
+
+        updated_at = first_float("updated_at")
+        if updated_at is None:
+            updated_at_ms = first_float("updated_at_ms", "timestamp_ms", "filled_at_ms")
+            updated_at = (updated_at_ms / 1000.0) if updated_at_ms and updated_at_ms > 10_000_000_000 else updated_at_ms
 
         return PortfolioPosition(
             symbol=str(symbol),
@@ -2066,19 +2111,19 @@ class RiskManager:
             entry_price=entry_price,
             mark_price=mark_price,
             notional_value=notional_value,
-            leverage=RiskManager._to_float_or_none(payload.get("leverage")),
-            margin_used=RiskManager._to_float_or_none(payload.get("margin_used")) or 0.0,
-            risk_amount=RiskManager._to_float_or_none(payload.get("risk_amount")) or 0.0,
-            stop_loss=RiskManager._to_float_or_none(payload.get("stop_loss")),
-            take_profit=RiskManager._to_float_or_none(payload.get("take_profit")),
+            leverage=first_float("leverage", "final_leverage"),
+            margin_used=margin_used,
+            risk_amount=risk_amount,
+            stop_loss=first_float("stop_loss"),
+            take_profit=first_float("take_profit"),
             tier=tier,
-            strategy_name=payload.get("strategy_name"),
-            signal_id=payload.get("signal_id"),
-            position_id=payload.get("position_id"),
-            realized_pnl=RiskManager._to_float_or_none(payload.get("realized_pnl")) or 0.0,
-            unrealized_pnl=RiskManager._to_float_or_none(payload.get("unrealized_pnl")) or 0.0,
-            opened_at=RiskManager._to_float_or_none(payload.get("opened_at")) or time.time(),
-            updated_at=RiskManager._to_float_or_none(payload.get("updated_at")),
+            strategy_name=first_value("strategy_name"),
+            signal_id=first_value("signal_id"),
+            position_id=first_value("position_id"),
+            realized_pnl=first_float("realized_pnl", "net_realized_pnl") or 0.0,
+            unrealized_pnl=first_float("unrealized_pnl") or 0.0,
+            opened_at=opened_at or time.time(),
+            updated_at=updated_at,
             metadata=metadata,
         )
 

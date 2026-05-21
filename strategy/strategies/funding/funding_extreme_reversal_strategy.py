@@ -418,6 +418,45 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
                 score_breakdown=breakdown.to_dict(),
             )
             return None
+        source_features = [
+            FUNDING_FEATURES.EXTREME,
+            FUNDING_FEATURES.EXTREME_TYPE,
+            FUNDING_FEATURES.EXTREME_SEVERITY,
+            FUNDING_FEATURES.EXTREME_MEAN_REVERSION_PROBABILITY,
+            FUNDING_FEATURES.EXTREME_SQUEEZE_PROBABILITY,
+            FUNDING_FEATURES.PRESSURE_SCORE,
+            FUNDING_FEATURES.PRESSURE_DIRECTION,
+            FUNDING_FEATURES.REGIME_CONFIDENCE,
+            FUNDING_FEATURES.DIVERGENCE_CONFIDENCE,
+            FUNDING_FEATURES.FLIP_CONFIDENCE,
+            FUNDING_FEATURES.SIGNAL_CONFIDENCE,
+        ]
+
+        metadata = {
+            "contract": "funding",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "extreme",
+            "score_breakdown": breakdown.to_dict(),
+            "extreme": serialize_for_metadata(extreme),
+            "pressure": serialize_for_metadata(pressure),
+            "regime": serialize_for_metadata(regime),
+            "divergence": serialize_for_metadata(divergence),
+            "flip": serialize_for_metadata(flip),
+            "funding_signal": serialize_for_metadata(funding_signal),
+        }
+
+        return self.build_funding_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=self.extreme_config.default_setup_type,
+            reasons=list(breakdown.reasons),
+            confirmations=list(breakdown.confirmations),
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.extreme_config.default_priority,
+        )
 
 
 

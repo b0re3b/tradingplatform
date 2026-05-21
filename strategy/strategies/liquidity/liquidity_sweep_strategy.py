@@ -244,20 +244,36 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         return set(base_required).union(self.sweep_config.required_liquidity_features)
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
         if snapshot is None:
+            self.remember_no_signal(
+                "missing_liquidity_snapshot_contract",
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if not self.base_context_is_valid(context=context, snapshot=snapshot):
+            self.remember_no_signal(
+                "invalid_liquidity_base_context",
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+                snapshot=serialize_for_metadata(snapshot),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         current_price = self.current_price(context=context, snapshot=snapshot)
         if current_price is None or current_price <= 0:
+            self.remember_no_signal(
+                "invalid_liquidity_current_price",
+                current_price=current_price,
+                liquidity_domain_keys=sorted(self.liquidity_domain(context).keys()),
+            )
             return None
 
         filters = self._run_pre_filters(
@@ -265,11 +281,32 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
             snapshot=snapshot,
             current_price=current_price,
         )
-        if any(item.blocked for item in filters):
+        blocked_filters = [item for item in filters if item.blocked]
+        if blocked_filters:
+            self.remember_no_signal(
+                "liquidity_sweep_pre_filters_blocked",
+                filters=[item.to_dict() for item in filters],
+                blocked_filters=[item.name for item in blocked_filters],
+                current_price=current_price,
+                up_edge=sweep_edge_up(snapshot),
+                down_edge=sweep_edge_down(snapshot),
+                edge_delta=sweep_edge_up(snapshot) - sweep_edge_down(snapshot),
+            )
             return None
 
         side = self._infer_side(snapshot)
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "liquidity_sweep_side_not_directional",
+                side=serialize_for_metadata(side),
+                up_edge=sweep_edge_up(snapshot),
+                down_edge=sweep_edge_down(snapshot),
+                edge_delta=sweep_edge_up(snapshot) - sweep_edge_down(snapshot),
+                bias=serialize_for_metadata(getattr(snapshot, "bias", None)),
+                liquidity_pressure_score=signed_score(
+                    getattr(snapshot, "liquidity_pressure_score", 0.0)
+                ),
+            )
             return None
 
         target = self._target_for_side(
@@ -278,6 +315,12 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
             side=side,
         )
         if target is None and self.sweep_config.require_directional_target:
+            self.remember_no_signal(
+                "liquidity_sweep_directional_target_required_but_missing",
+                side=side.value,
+                current_price=current_price,
+                require_directional_target=self.sweep_config.require_directional_target,
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -289,9 +332,23 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         )
 
         if breakdown.score < self.sweep_config.min_signal_score:
+            self.remember_no_signal(
+                "liquidity_sweep_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.sweep_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.sweep_config.min_signal_confidence:
+            self.remember_no_signal(
+                "liquidity_sweep_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.sweep_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         stop_loss = self._resolve_stop_price(
@@ -329,6 +386,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         metadata = {
             "liquidity_setup_family": "liquidity_sweep_continuation",
             "liquidity_strategy_version": "2.0.0",
+            "contract": "liquidity",
+            "primary_section": "snapshot",
+            "strategy_contract_role": "decision_module",
             "score_breakdown": breakdown.to_dict(),
             "tags": self._tags(side=side, target=target, snapshot=snapshot),
             "side": side.value,

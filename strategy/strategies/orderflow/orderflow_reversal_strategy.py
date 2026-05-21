@@ -429,35 +429,51 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         )
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
-        if not self.has_any_orderflow_data(
-            context,
-            tuple(self.reversal_config.required_orderflow_features),
-        ):
+        required_features = tuple(self.reversal_config.required_orderflow_features)
+
+        if not self.has_any_orderflow_data(context, required_features):
+            self.remember_no_signal(
+                "missing_orderflow_reversal_contract",
+                orderflow_domain_keys=sorted(self.orderflow_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
-        if self.has_stale_orderflow_features(
-            context,
-            tuple(self.reversal_config.required_orderflow_features),
-        ):
+        if self.has_stale_orderflow_features(context, required_features):
+            self.remember_no_signal(
+                "stale_orderflow_reversal_features",
+                required_features=sorted(required_features),
+            )
             return None
 
         payload = self._extract_payload(context)
         if payload is None:
+            self.remember_no_signal(
+                "orderflow_reversal_payload_not_resolved",
+                orderflow_domain=self.orderflow_domain(context),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if (
-            self.reversal_config.require_fresh_snapshot
-            and is_stale(
-                event_time=payload.event_time,
-                now=context.timestamp,
+                self.reversal_config.require_fresh_snapshot
+                and is_stale(
+            event_time=payload.event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.reversal_config.stale_feature_max_age_seconds,
+        )
+        ):
+            self.remember_no_signal(
+                "stale_orderflow_reversal_snapshot",
+                event_time=payload.event_time.isoformat() if payload.event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
                 stale_after_seconds=self.reversal_config.stale_feature_max_age_seconds,
             )
-        ):
             return None
 
         common_rejection = reversal_filter_reason(
@@ -481,10 +497,31 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
             ),
         )
         if common_rejection is not None:
+            self.remember_no_signal(
+                "orderflow_reversal_quality_filter_failed",
+                filter_reason=common_rejection,
+                snapshot=serialize_for_metadata(payload.snapshot.to_dict()),
+                trades_count=payload.trades_count,
+                total_volume=payload.total_volume,
+                total_notional=payload.total_notional,
+                price_change_pct=payload.price_change_pct,
+                cvd_delta_ratio=payload.cvd_delta_ratio,
+                volume_delta_ratio=payload.volume_delta_ratio,
+                notional_delta=payload.notional_delta,
+                aggressive_net_notional_delta=payload.aggressive_net_notional_delta,
+            )
             return None
 
         side = payload.side
-        if self.reversal_config.require_actionable_side and not is_directional_side(side):
+        if (
+                self.reversal_config.require_actionable_side
+                and not is_directional_side(side)
+        ):
+            self.remember_no_signal(
+                "orderflow_reversal_side_not_directional",
+                side=serialize_for_metadata(side),
+                snapshot=serialize_for_metadata(payload.snapshot.to_dict()),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -497,6 +534,13 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
             self.reversal_config.min_score_for_signal,
         )
         if breakdown.score < min_score:
+            self.remember_no_signal(
+                "orderflow_reversal_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_score=min_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         min_confidence = max(
@@ -504,6 +548,13 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
             self.reversal_config.min_confidence_for_signal,
         )
         if breakdown.confidence < min_confidence:
+            self.remember_no_signal(
+                "orderflow_reversal_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_confidence=min_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(payload)
@@ -524,6 +575,11 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         metadata = {
             "orderflow_setup_family": "orderflow_reversal",
             "orderflow_strategy_version": "2.0.0",
+            "contract": "orderflow",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "composite",
+            "strategy_contract_role": "decision_module",
+            "risk_ready_payload_owner": "SignalProcessor",
             "score_breakdown": breakdown.to_dict(),
             "snapshot": serialize_for_metadata(payload.snapshot.to_dict()),
             "raw": serialize_for_metadata(payload.raw),

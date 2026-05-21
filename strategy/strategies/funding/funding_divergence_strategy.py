@@ -402,8 +402,46 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
                 score_breakdown=breakdown.to_dict(),
             )
             return None
+        source_features = [
+            FUNDING_FEATURES.DIVERGENCE,
+            FUNDING_FEATURES.DIVERGENCE_TYPE,
+            FUNDING_FEATURES.DIVERGENCE_CONFIDENCE,
+            FUNDING_FEATURES.DIVERGENCE_SCORE,
+            FUNDING_FEATURES.PRESSURE_SCORE,
+            FUNDING_FEATURES.PRESSURE_DIRECTION,
+            FUNDING_FEATURES.REGIME_CONFIDENCE,
+            FUNDING_FEATURES.EXTREME_SEVERITY,
+            FUNDING_FEATURES.FLIP_CONFIDENCE,
+            FUNDING_FEATURES.SIGNAL_CONFIDENCE,
+        ]
 
-       
+        metadata = {
+            "contract": "funding",
+            "contract_version": "strategy-domain-v1",
+            "primary_section": "divergence",
+            "score_breakdown": breakdown.to_dict(),
+            "divergence": serialize_for_metadata(divergence),
+            "pressure": serialize_for_metadata(pressure),
+            "regime": serialize_for_metadata(regime),
+            "extreme": serialize_for_metadata(extreme),
+            "flip": serialize_for_metadata(flip),
+            "funding_signal": serialize_for_metadata(funding_signal),
+        }
+
+        return self.build_funding_signal(
+            context=context,
+            side=side,
+            confidence=breakdown.confidence,
+            score=breakdown.score,
+            setup_type=self.divergence_config.default_setup_type,
+            reasons=list(breakdown.reasons),
+            confirmations=list(breakdown.confirmations),
+            source_features=source_features,
+            metadata=metadata,
+            priority=self.divergence_config.default_priority,
+        )
+
+
 
     # ------------------------------------------------------------------
     # Filters
