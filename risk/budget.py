@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable, Iterator, Mapping
 
 from core.logger import get_logger
 from risk.config import RiskBudgetConfig, StrategyRiskConfig, SymbolRiskConfig
@@ -839,7 +839,9 @@ class StrategyRiskGuard:
         )
 
     @staticmethod
-    def _resolve_rolling_expectancy(strategy_state: StrategyRiskState) -> float | None:
+    def _resolve_rolling_expectancy(
+            strategy_state: StrategyRiskState,
+    ) -> float | None:
         """Return finite rolling expectancy from state or rolling PnL history.
 
         Some state implementations expose rolling_expectancy as a cached field
@@ -847,23 +849,21 @@ class StrategyRiskGuard:
         still be able to make a safe decision from rolling_pnls that are already
         present in StrategyRiskState.
         """
-        expectancy = getattr(strategy_state, "rolling_expectancy", None)
-        if expectancy is not None:
-            try:
-                expectancy_float = float(expectancy)
-            except (TypeError, ValueError):
-                return None
-            return expectancy_float if is_finite_number(expectancy_float) else None
+        expectancy = strategy_state.rolling_expectancy
 
-        rolling_pnls = list(getattr(strategy_state, "rolling_pnls", []) or [])
+        if expectancy is not None:
+            if not is_finite_number(expectancy):
+                return None
+
+            return float(expectancy)
+
         finite_pnls: list[float] = []
-        for pnl in rolling_pnls:
-            try:
-                pnl_float = float(pnl)
-            except (TypeError, ValueError):
+
+        for pnl in strategy_state.rolling_pnls:
+            if not is_finite_number(pnl):
                 continue
-            if is_finite_number(pnl_float):
-                finite_pnls.append(pnl_float)
+
+            finite_pnls.append(float(pnl))
 
         if not finite_pnls:
             return None
@@ -932,21 +932,40 @@ def _iter_pending_reservations(
     *,
     symbol: str | None = None,
     strategy_name: str | None = None,
-):
+) -> Iterator[Any]:
     iterator = getattr(state, "_iter_pending_reservations", None)
+
     if callable(iterator):
-        yield from iterator(symbol=symbol, strategy_name=strategy_name)
+        result: object = iterator(
+            symbol=symbol,
+            strategy_name=strategy_name,
+        )
+
+        if isinstance(result, Iterable):
+            yield from result
+
         return
 
-    reservations = getattr(state, "pending_reservations", {})
-    for reservation in reservations.values():
+    reservations_raw: object = getattr(state, "pending_reservations", {})
+
+    if not isinstance(reservations_raw, Mapping):
+        return
+
+    for reservation in reservations_raw.values():
         if symbol is not None and getattr(reservation, "symbol", None) != symbol:
             continue
-        if strategy_name is not None and getattr(reservation, "strategy_name", None) != strategy_name:
+
+        if (
+            strategy_name is not None
+            and getattr(reservation, "strategy_name", None) != strategy_name
+        ):
             continue
+
         is_expired = getattr(reservation, "is_expired", None)
+
         if callable(is_expired) and is_expired():
             continue
+
         yield reservation
 
 

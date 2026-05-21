@@ -802,22 +802,22 @@ class RiskReadySignalPayload:
 
     @classmethod
     def from_signal(
-        cls,
-        signal: StrategySignal,
-        *,
-        tier: StrategyTradeTier = StrategyTradeTier.T2,
-        order_intent: StrategyOrderIntent = StrategyOrderIntent.OPEN,
-        liquidity_class: StrategyLiquidityClass = StrategyLiquidityClass.NORMAL,
-        execution_quality: StrategyExecutionQuality = StrategyExecutionQuality.ACCEPTABLE,
-        priority_score: float | None = None,
-        expected_reward: float | None = None,
-        expected_loss: float | None = None,
-        expected_win_probability: float | None = None,
-        expected_cost: float | None = None,
-        execution_cost: ExecutionCostPayload | None = None,
-        exchange: str | None = None,
-        market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES,
-        margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED,
+            cls,
+            signal: StrategySignal,
+            *,
+            tier: StrategyTradeTier = StrategyTradeTier.T2,
+            order_intent: StrategyOrderIntent = StrategyOrderIntent.OPEN,
+            liquidity_class: StrategyLiquidityClass = StrategyLiquidityClass.NORMAL,
+            execution_quality: StrategyExecutionQuality = StrategyExecutionQuality.ACCEPTABLE,
+            priority_score: float | None = None,
+            expected_reward: float | None = None,
+            expected_loss: float | None = None,
+            expected_win_probability: float | None = None,
+            expected_cost: float | None = None,
+            execution_cost: ExecutionCostPayload | None = None,
+            exchange: str | None = None,
+            market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES,
+            margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED,
     ) -> "RiskReadySignalPayload":
         signal.validate()
 
@@ -825,8 +825,27 @@ class RiskReadySignalPayload:
         stop_loss = signal.primary_stop_loss
         take_profit = signal.primary_take_profit
 
+        if entry_price is None or entry_price <= 0:
+            raise ValueError(
+                f"{signal.strategy_name}: signal.primary_entry_price is required "
+                "to build RiskReadySignalPayload"
+            )
+
+        if stop_loss is None or stop_loss <= 0:
+            raise ValueError(
+                f"{signal.strategy_name}: signal.primary_stop_loss is required "
+                "to build RiskReadySignalPayload"
+            )
+
+        if take_profit is None or take_profit <= 0:
+            raise ValueError(
+                f"{signal.strategy_name}: signal.primary_take_profit is required "
+                "to build RiskReadySignalPayload"
+            )
+
         requested_leverage = None
         reduce_only = False
+
         if signal.execution_plan is not None:
             requested_leverage = signal.execution_plan.leverage
             reduce_only = signal.execution_plan.reduce_only

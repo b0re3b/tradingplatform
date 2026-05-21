@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from core.logger import get_logger
 
@@ -613,11 +613,15 @@ class ExposureControl:
             return exposure_snapshot.margin_used
         return open_risk_snapshot.used_margin
 
+
+
     @staticmethod
     def _pending_reservations_count(state: RiskState) -> int:
-        reservations = getattr(state, "pending_reservations", None)
-        if reservations is None:
+        reservations: object = getattr(state, "pending_reservations", None)
+
+        if not isinstance(reservations, Mapping):
             return 0
+
         return len(reservations)
 
     @staticmethod

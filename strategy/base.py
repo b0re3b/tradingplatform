@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable
 from datetime import datetime
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from core.event_bus import Event, EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
-
 from strategy.config import StrategyConfig, StrategyDefinitionConfig, StrategyRuntimeConfig
 from strategy.enums import (
     MarketRegime,
@@ -34,7 +34,6 @@ from strategy.models import (
     ensure_aware_utc,
     utcnow,
 )
-
 
 EventHandler = Callable[..., Awaitable[None]] | Callable[..., None]
 
@@ -123,6 +122,9 @@ class BaseStrategyComponent(ABC):
         validate = getattr(self.config, "validate", None)
         if callable(validate):
             validate()
+
+    async def _await_best_effort(awaitable: Awaitable[Any]) -> None:
+        await awaitable
 
     def register(self) -> None:
         """
@@ -382,10 +384,10 @@ class BaseStrategyComponent(ABC):
         )
 
     def _complete_best_effort_publish(
-        self,
-        result: Any,
-        *,
-        topic: str,
+            self,
+            result: Any,
+            *,
+            topic: str,
     ) -> None:
         """
         Complete/schedule a best-effort EventBus publish result.
@@ -398,11 +400,16 @@ class BaseStrategyComponent(ABC):
         if not inspect.isawaitable(result):
             return
 
+        awaitable: Awaitable[Any] = result
+
+        async def _runner() -> None:
+            await awaitable
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             try:
-                asyncio.run(result)
+                asyncio.run(_runner())
             except Exception:
                 self.log_exception(
                     "Best-effort async event publish failed",
@@ -410,9 +417,9 @@ class BaseStrategyComponent(ABC):
                 )
             return
 
-        task = loop.create_task(result)
+        task = loop.create_task(_runner())
 
-        def _log_task_error(done_task: asyncio.Task[Any]) -> None:
+        def _log_task_error(done_task: asyncio.Task[None]) -> None:
             try:
                 done_task.result()
             except asyncio.CancelledError:
@@ -665,23 +672,52 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
             return self._definition_override
 
         getter = getattr(self.config, "get_strategy", None)
+
         if callable(getter):
             definition = getter(self.__class__.__name__)
+
             if definition is not None:
+                if not isinstance(definition, StrategyDefinitionConfig):
+                    raise StrategyConfigError(
+                        f"{self.strategy_name}: get_strategy({self.__class__.__name__!r}) "
+                        f"must return StrategyDefinitionConfig | None, "
+                        f"got {type(definition).__name__}"
+                    )
                 return definition
 
-            definition = getter(self.strategy_name) if self.strategy_name != self.__class__.__name__ else None
-            if definition is not None:
-                return definition
+            if self.strategy_name != self.__class__.__name__:
+                definition = getter(self.strategy_name)
+
+                if definition is not None:
+                    if not isinstance(definition, StrategyDefinitionConfig):
+                        raise StrategyConfigError(
+                            f"{self.strategy_name}: get_strategy({self.strategy_name!r}) "
+                            f"must return StrategyDefinitionConfig | None, "
+                            f"got {type(definition).__name__}"
+                        )
+                    return definition
 
         strategies = getattr(self.config, "strategies", None)
+
         if isinstance(strategies, dict):
             definition = strategies.get(self.__class__.__name__)
+
             if definition is not None:
+                if not isinstance(definition, StrategyDefinitionConfig):
+                    raise StrategyConfigError(
+                        f"{self.strategy_name}: strategies[{self.__class__.__name__!r}] "
+                        f"must be StrategyDefinitionConfig, got {type(definition).__name__}"
+                    )
                 return definition
 
             definition = strategies.get(self.strategy_name)
+
             if definition is not None:
+                if not isinstance(definition, StrategyDefinitionConfig):
+                    raise StrategyConfigError(
+                        f"{self.strategy_name}: strategies[{self.strategy_name!r}] "
+                        f"must be StrategyDefinitionConfig, got {type(definition).__name__}"
+                    )
                 return definition
 
         return None
@@ -692,9 +728,16 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
             return definition.runtime
 
         runtime = getattr(self.config, "runtime", None)
+
         if runtime is None:
             raise StrategyConfigError(
                 f"{self.strategy_name}: StrategyConfig.runtime is required"
+            )
+
+        if not isinstance(runtime, StrategyRuntimeConfig):
+            raise StrategyConfigError(
+                f"{self.strategy_name}: StrategyConfig.runtime must be StrategyRuntimeConfig, "
+                f"got {type(runtime).__name__}"
             )
 
         return runtime

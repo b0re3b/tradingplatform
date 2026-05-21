@@ -672,22 +672,22 @@ class RiskState:
         self.updated_at = time.time()
 
     def reserve_risk(
-        self,
-        *,
-        symbol: str,
-        side: PositionSide,
-        signal_id: str | None = None,
-        strategy_name: str | None = None,
-        tier: TradeTier | None = None,
-        position_id: str | None = None,
-        size: float = 0.0,
-        open_risk: float = 0.0,
-        margin: float = 0.0,
-        notional: float = 0.0,
-        ttl_seconds: float | None = 30.0,
-        reservation_id: str | None = None,
-        now_ts: float | None = None,
-        metadata: dict[str, Any] | None = None,
+            self,
+            *,
+            symbol: str,
+            side: PositionSide,
+            signal_id: str | None = None,
+            strategy_name: str | None = None,
+            tier: TradeTier | None = None,
+            position_id: str | None = None,
+            size: float = 0.0,
+            open_risk: float = 0.0,
+            margin: float = 0.0,
+            notional: float = 0.0,
+            ttl_seconds: float | None = 30.0,
+            reservation_id: str | None = None,
+            now_ts: float | None = None,
+            metadata: dict[str, Any] | None = None,
     ) -> PendingRiskReservation:
         """
         Reserve candidate risk between risk approval and execution confirmation.
@@ -696,9 +696,11 @@ class RiskState:
         or confirmed when a real position is opened. This prevents multiple
         approved signals from temporarily exceeding open-risk/exposure budgets.
         """
-        now_ts = now_ts or time.time()
+        resolved_now_ts = now_ts if now_ts is not None else time.time()
+        resolved_reservation_id = reservation_id or self._reservation_id(symbol, signal_id)
+
         reservation = PendingRiskReservation(
-            reservation_id=reservation_id or self._reservation_id(symbol, signal_id),
+            reservation_id=resolved_reservation_id,
             signal_id=signal_id,
             symbol=symbol,
             side=side,
@@ -709,11 +711,16 @@ class RiskState:
             open_risk=max(0.0, open_risk),
             margin=max(0.0, margin),
             notional=abs(notional),
-            created_at=now_ts,
-            expires_at=(now_ts + max(0.0, ttl_seconds)) if ttl_seconds is not None else None,
+            created_at=resolved_now_ts,
+            expires_at=(
+                resolved_now_ts + max(0.0, ttl_seconds)
+                if ttl_seconds is not None
+                else None
+            ),
             metadata=dict(metadata or {}),
         )
-        self.pending_reservations[reservation.reservation_id] = reservation
+
+        self.pending_reservations[resolved_reservation_id] = reservation
         self.updated_at = time.time()
         return reservation
 
@@ -1232,6 +1239,16 @@ class RiskState:
         actual_notional = 0.0
 
         for position in self.positions.values():
+            symbol = position.symbol
+
+            if not isinstance(symbol, str) or not symbol:
+                continue
+
+            side = position.side
+
+            if not isinstance(side, PositionSide):
+                continue
+
             notional = abs(position.notional_value)
 
             gross_exposure += notional
@@ -1239,10 +1256,8 @@ class RiskState:
             net_exposure += position.signed_notional
             margin_used += max(0.0, position.margin_used)
 
-            symbol_exposure[position.symbol] = (
-                symbol_exposure.get(position.symbol, 0.0) + notional
-            )
-            side_exposure[position.side.value] += notional
+            symbol_exposure[symbol] = symbol_exposure.get(symbol, 0.0) + notional
+            side_exposure[side.value] = side_exposure.get(side.value, 0.0) + notional
 
             if position.leverage is not None:
                 leverage_weighted_exposure += notional * position.leverage
@@ -1256,30 +1271,48 @@ class RiskState:
         }
 
         for reservation in self._iter_pending_reservations():
+            symbol = reservation.symbol
+
+            if not isinstance(symbol, str) or not symbol:
+                continue
+
+            side = reservation.side
+
+            if not isinstance(side, PositionSide):
+                continue
+
             pending_notional = abs(reservation.notional)
             total_pending_notional += pending_notional
             gross_exposure += pending_notional
 
-            if reservation.side is PositionSide.LONG:
+            if side is PositionSide.LONG:
                 net_exposure += pending_notional
-            elif reservation.side is PositionSide.SHORT:
+            elif side is PositionSide.SHORT:
                 net_exposure -= pending_notional
 
             pending_margin += max(0.0, reservation.margin)
-            symbol_exposure[reservation.symbol] = (
-                symbol_exposure.get(reservation.symbol, 0.0) + pending_notional
-            )
-            pending_symbol_exposure[reservation.symbol] = (
-                pending_symbol_exposure.get(reservation.symbol, 0.0) + pending_notional
-            )
-            side_exposure[reservation.side.value] = (
-                side_exposure.get(reservation.side.value, 0.0) + pending_notional
-            )
-            pending_side_exposure[reservation.side.value] = (
-                pending_side_exposure.get(reservation.side.value, 0.0) + pending_notional
+
+            symbol_exposure[symbol] = (
+                    symbol_exposure.get(symbol, 0.0) + pending_notional
             )
 
-        effective_margin_used = (margin_used if margin_used > 0 else self.used_margin) + pending_margin
+            pending_symbol_exposure[symbol] = (
+                    pending_symbol_exposure.get(symbol, 0.0) + pending_notional
+            )
+
+            side_key = str(side.value)
+
+            side_exposure[side_key] = (
+                    side_exposure.get(side_key, 0.0) + pending_notional
+            )
+
+            pending_side_exposure[side_key] = (
+                    pending_side_exposure.get(side_key, 0.0) + pending_notional
+            )
+
+        effective_margin_used = (
+                                    margin_used if margin_used > 0 else self.used_margin
+                                ) + pending_margin
 
         return ExposureSnapshot(
             total_notional=gross_exposure,

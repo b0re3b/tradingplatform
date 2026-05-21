@@ -174,9 +174,13 @@ class RiskUnitCalculator:
         )
 
     @staticmethod
-    def _require_finite_runtime_number(value: float | int | None, field_name: str) -> float:
-        if not is_finite_number(value):
+    def _require_finite_runtime_number(
+            value: float | int | None,
+            field_name: str,
+    ) -> float:
+        if value is None or not is_finite_number(value):
             raise InvalidRiskRequestError(f"{field_name} must be finite")
+
         return float(value)
 
     def _validate_state_and_inputs(
@@ -793,15 +797,23 @@ class PositionSizer:
         return max_notional / float(entry_price)
 
     @staticmethod
-    def _require_finite_request_number(value: float | int | None, field_name: str) -> float:
-        if not is_finite_number(value):
+    def _require_finite_request_number(
+            value: float | int | None,
+            field_name: str,
+    ) -> float:
+        if value is None or not is_finite_number(value):
             raise InvalidRiskRequestError(f"{field_name} must be finite")
+
         return float(value)
 
     @staticmethod
-    def _require_finite_constraint_number(value: float | int | None, field_name: str) -> float:
-        if not is_finite_number(value):
+    def _require_finite_constraint_number(
+            value: float | int | None,
+            field_name: str,
+    ) -> float:
+        if value is None or not is_finite_number(value):
             raise InvalidPositionSizeError(f"{field_name} must be finite")
+
         return float(value)
 
     @classmethod

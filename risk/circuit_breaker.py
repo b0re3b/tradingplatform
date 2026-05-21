@@ -355,7 +355,8 @@ class CircuitBreaker:
             if cooldown_seconds is None
             else cooldown_seconds
         )
-        if not _is_finite_non_negative(effective_cooldown):
+
+        if effective_cooldown is None or not _is_finite_non_negative(effective_cooldown):
             effective_cooldown = 0.0
 
         cooldown_until = None

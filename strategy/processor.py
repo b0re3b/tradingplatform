@@ -2870,15 +2870,6 @@ class SignalNormalizer(BaseStrategyComponent):
             for alias in aliases:
                 domain_data.setdefault(alias, value)
 
-        def score_from(mapping: dict[str, Any] | None, default: float = 0.0) -> float:
-            raw = default
-            if mapping is not None:
-                raw = mapping.get("score", mapping.get("confidence", default))
-            try:
-                return max(0.0, min(1.0, float(raw)))
-            except (TypeError, ValueError):
-                return default
-
         def trend_direction_for_strategy(value: Any) -> str | None:
             raw = str(value or "").strip().lower()
             if raw in {"long", "buy", "up", "uptrend", "bull", "bullish"}:
@@ -10205,10 +10196,10 @@ class SignalBuilder(BaseStrategyComponent):
         return entry
 
     def _resolve_invalidation(
-        self,
-        signal: StrategySignal,
-        *,
-        entry: EntryPlan,
+            self,
+            signal: StrategySignal,
+            *,
+            entry: EntryPlan,
     ) -> InvalidationPlan:
         if signal.invalidation_plan is not None:
             signal.invalidation_plan.validate()
@@ -10220,7 +10211,12 @@ class SignalBuilder(BaseStrategyComponent):
             stop = _to_float(signal.exit_plan.stop_loss)
 
         if stop is None:
-            stop = self._infer_stop_loss(signal, entry_price=entry.price)
+            entry_price = entry.price
+
+            if entry_price is None or entry_price <= 0:
+                raise BuilderError("entry.price is required to infer stop_loss")
+
+            stop = self._infer_stop_loss(signal, entry_price=entry_price)
 
         if stop is None or stop <= 0:
             raise BuilderError("unable to resolve stop_loss/invalidation price")
@@ -10235,11 +10231,11 @@ class SignalBuilder(BaseStrategyComponent):
         return invalidation
 
     def _resolve_targets(
-        self,
-        signal: StrategySignal,
-        *,
-        entry: EntryPlan,
-        invalidation: InvalidationPlan,
+            self,
+            signal: StrategySignal,
+            *,
+            entry: EntryPlan,
+            invalidation: InvalidationPlan,
     ) -> list[TargetPlan]:
         if signal.exit_plan is not None and signal.exit_plan.take_profit_levels:
             for target in signal.exit_plan.take_profit_levels:
@@ -10279,11 +10275,21 @@ class SignalBuilder(BaseStrategyComponent):
             return targets
 
         take_profit = _to_float(signal.metadata.get("take_profit"))
+
         if take_profit is None:
+            entry_price = entry.price
+            stop_loss = invalidation.price
+
+            if entry_price is None or entry_price <= 0:
+                raise BuilderError("entry.price is required to infer take_profit")
+
+            if stop_loss is None or stop_loss <= 0:
+                raise BuilderError("invalidation.price is required to infer_take_profit")
+
             take_profit = self._infer_take_profit(
                 signal,
-                entry_price=entry.price,
-                stop_loss=invalidation.price,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
             )
 
         if take_profit is not None and take_profit > 0:
@@ -10296,7 +10302,6 @@ class SignalBuilder(BaseStrategyComponent):
             targets.append(target)
 
         return targets
-
     def _resolve_exit_plan(
         self,
         signal: StrategySignal,

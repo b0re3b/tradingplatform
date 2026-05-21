@@ -1367,14 +1367,22 @@ def _definition_from_catalog(
 
     tags = _dedupe_str([*entry.tags, *(extra_tags or [])])
 
+    entry_metadata: dict[str, object] = (
+        dict(entry.metadata) if entry.metadata is not None else {}
+    )
+
+    extra_metadata: dict[str, object] = (
+        dict(metadata) if metadata is not None else {}
+    )
+
     definition_metadata: dict[str, object] = {
         "preset_catalog": True,
         "feature_hints": list(entry.feature_hints),
         "default_timeframes": [
             timeframe.value for timeframe in entry.default_timeframes
         ],
-        **dict(entry.metadata),
-        **dict(metadata or {}),
+        **entry_metadata,
+        **extra_metadata,
     }
 
     definition = StrategyDefinitionConfig(

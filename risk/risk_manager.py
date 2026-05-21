@@ -412,8 +412,9 @@ class RiskManager:
 
         checks: dict[str, RiskCheckResult] = {}
 
-        def finalize(decision: RiskDecision) -> tuple[
-            RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
+        def finalize(
+                decision: RiskDecision,
+        ) -> tuple[RiskDecision, list[tuple[str, dict[str, Any], EventPriority | None]]]:
             events.extend(
                 self._finalize_decision_locked(
                     request,
@@ -425,6 +426,7 @@ class RiskManager:
 
         request_validation = self._finite_request_validation(request)
         checks["request_validation"] = request_validation
+
         if not request_validation.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -447,6 +449,7 @@ class RiskManager:
 
         cb_result = self._circuit_breaker.check(self._state)
         checks["circuit_breaker"] = cb_result
+
         if not cb_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -488,6 +491,7 @@ class RiskManager:
             mode=self._state.risk_mode,
         )
         checks["tier"] = tier_result
+
         if not tier_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -500,6 +504,7 @@ class RiskManager:
             return finalize(decision)
 
         tier_profile = self._extract_tier_profile(tier_result)
+
         if tier_profile is None:
             tier_profile = self._tier_guard.resolve_profile(
                 request,
@@ -511,13 +516,13 @@ class RiskManager:
         checks["risk_reward"] = rr_result
 
         ev_snapshot: ExpectedValueSnapshot | None = None
+
         try:
             ev_snapshot = self._extract_ev_snapshot(rr_result)
         except ValueError:
             ev_snapshot = None
 
         if not rr_result.passed:
-
             if ev_snapshot is not None:
                 execution_cost_result = self._execution_cost_guard.check(
                     request,
@@ -565,6 +570,7 @@ class RiskManager:
             mode=self._state.risk_mode,
         )
         checks["execution_cost"] = execution_cost_result
+
         if not execution_cost_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -584,6 +590,7 @@ class RiskManager:
             mode=self._state.risk_mode,
         )
         checks["leverage"] = leverage_result
+
         if not leverage_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -616,6 +623,7 @@ class RiskManager:
                 candidate_open_risk=0.0,
             )
             checks["strategy"] = strategy_result
+
             if not strategy_result.passed:
                 decision = self._build_terminal_decision(
                     request=request,
@@ -682,6 +690,7 @@ class RiskManager:
 
         size_result = self._position_sizer.check(size_request, self._state)
         checks["position_sizing"] = size_result
+
         if not size_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -726,6 +735,7 @@ class RiskManager:
             candidate_open_risk=candidate_open_risk,
         )
         checks["strategy"] = strategy_result
+
         if not strategy_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -746,6 +756,7 @@ class RiskManager:
             candidate_open_risk=candidate_open_risk,
         )
         checks["symbol"] = symbol_result
+
         if not symbol_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -770,6 +781,7 @@ class RiskManager:
             mode=self._state.risk_mode,
         )
         checks["exposure"] = exposure_result
+
         if not exposure_result.passed:
             decision = self._build_terminal_decision(
                 request=request,
@@ -785,15 +797,21 @@ class RiskManager:
 
         decision_type = self._resolve_success_decision(checks)
 
-        decision_type = self._resolve_success_decision(checks)
+        sizing_metadata: dict[str, Any] = dict(size_result.metadata or {})
+        exposure_metadata: dict[str, Any] = dict(exposure_result.metadata or {})
 
-        sizing_metadata = size_result.metadata or {}
-        exposure_metadata = exposure_result.metadata or {}
+        final_notional: float | None = None
+
+        raw_sizing_notional: object = sizing_metadata.get("notional_value")
 
         final_notional: float | None = None
 
         raw_sizing_notional = sizing_metadata.get("notional_value")
-        if raw_sizing_notional is not None:
+
+        if isinstance(raw_sizing_notional, bool):
+            raw_sizing_notional = None
+
+        if isinstance(raw_sizing_notional, int | float | str | bytes | bytearray):
             try:
                 parsed_notional = float(raw_sizing_notional)
             except (TypeError, ValueError):
@@ -804,7 +822,11 @@ class RiskManager:
 
         if final_notional is None:
             raw_exposure_notional = exposure_metadata.get("candidate_notional")
-            if raw_exposure_notional is not None:
+
+            if isinstance(raw_exposure_notional, bool):
+                raw_exposure_notional = None
+
+            if isinstance(raw_exposure_notional, int | float | str | bytes | bytearray):
                 try:
                     parsed_notional = float(raw_exposure_notional)
                 except (TypeError, ValueError):
@@ -1156,19 +1178,49 @@ class RiskManager:
 
     async def _handle_position_updated(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
-        symbol = payload.get("symbol")
-        if not symbol:
+
+        if not isinstance(payload, dict):
             return
+
+        raw_symbol = payload.get("symbol")
+
+        if not isinstance(raw_symbol, str) or not raw_symbol:
+            return
+
+        symbol = raw_symbol
 
         await self.on_position_updated(
             symbol,
             position_id=payload.get("position_id"),
-            size=self._to_float_or_none(payload.get("size") or payload.get("quantity") or payload.get("filled_quantity")),
-            mark_price=self._to_float_or_none(payload.get("mark_price") or payload.get("fill_price") or payload.get("average_fill_price")),
-            notional_value=self._to_float_or_none(payload.get("notional_value") or payload.get("notional") or payload.get("fill_notional")),
-            leverage=self._to_float_or_none(payload.get("leverage") or payload.get("final_leverage")),
-            margin_used=self._to_float_or_none(payload.get("margin_used") or payload.get("margin") or payload.get("final_margin")),
-            risk_amount=self._to_float_or_none(payload.get("risk_amount") or payload.get("final_risk_amount") or payload.get("open_risk")),
+            size=self._to_float_or_none(
+                payload.get("size")
+                or payload.get("quantity")
+                or payload.get("filled_quantity")
+            ),
+            mark_price=self._to_float_or_none(
+                payload.get("mark_price")
+                or payload.get("fill_price")
+                or payload.get("average_fill_price")
+            ),
+            notional_value=self._to_float_or_none(
+                payload.get("notional_value")
+                or payload.get("notional")
+                or payload.get("fill_notional")
+            ),
+            leverage=self._to_float_or_none(
+                payload.get("leverage")
+                or payload.get("final_leverage")
+            ),
+            margin_used=self._to_float_or_none(
+                payload.get("margin_used")
+                or payload.get("margin")
+                or payload.get("final_margin")
+            ),
+            risk_amount=self._to_float_or_none(
+                payload.get("risk_amount")
+                or payload.get("final_risk_amount")
+                or payload.get("open_risk")
+            ),
             stop_loss=self._to_float_or_none(payload.get("stop_loss")),
             take_profit=self._to_float_or_none(payload.get("take_profit")),
             unrealized_pnl=self._to_float_or_none(payload.get("unrealized_pnl")),
@@ -1176,9 +1228,16 @@ class RiskManager:
 
     async def _handle_position_closed(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
-        symbol = payload.get("symbol")
-        if not symbol:
+
+        if not isinstance(payload, dict):
             return
+
+        raw_symbol = payload.get("symbol")
+
+        if not isinstance(raw_symbol, str) or not raw_symbol:
+            return
+
+        symbol = raw_symbol
 
         await self.on_position_closed(
             symbol,
@@ -1517,15 +1576,21 @@ class RiskManager:
 
             if triggered or (not was_active and is_active):
                 self._metrics.register_circuit_breaker_trigger()
+
+                circuit_reason = self._state.circuit_breaker.reason
+
+                if isinstance(circuit_reason, CircuitBreakerReason):
+                    reason_value = circuit_reason.value
+                elif isinstance(circuit_reason, str):
+                    reason_value = circuit_reason
+                else:
+                    reason_value = None
+
                 events.append(
                     (
                         "risk.kill_switch",
                         {
-                            "reason": (
-                                self._state.circuit_breaker.reason.value
-                                if self._state.circuit_breaker.reason
-                                else None
-                            ),
+                            "reason": reason_value,
                             "message": self._state.circuit_breaker.message,
                             "cooldown_until": self._state.circuit_breaker.cooldown_until,
                             "manual_release_required": self._state.circuit_breaker.manual_release_required,
@@ -1686,23 +1751,36 @@ class RiskManager:
         reservation_cfg = self._config.reservation
         pending = list(self._state.pending_reservations.values())
 
-        max_pending = getattr(reservation_cfg, "max_pending_reservations", None)
+        raw_max_pending = getattr(reservation_cfg, "max_pending_reservations", None)
+        max_pending = raw_max_pending if isinstance(raw_max_pending, int) else None
+
         if max_pending is not None and len(pending) >= max_pending:
             raise RuntimeError("maximum pending risk reservations exceeded")
 
-        max_per_symbol = getattr(reservation_cfg, "max_pending_per_symbol", None)
+        raw_max_per_symbol = getattr(reservation_cfg, "max_pending_per_symbol", None)
+        max_per_symbol = raw_max_per_symbol if isinstance(raw_max_per_symbol, int) else None
+
         if max_per_symbol is not None:
             symbol_pending = sum(1 for item in pending if item.symbol == request.symbol)
+
             if symbol_pending >= max_per_symbol:
                 raise RuntimeError("maximum pending risk reservations per symbol exceeded")
 
-        max_per_strategy = getattr(reservation_cfg, "max_pending_per_strategy", None)
+        raw_max_per_strategy = getattr(reservation_cfg, "max_pending_per_strategy", None)
+        max_per_strategy = (
+            raw_max_per_strategy if isinstance(raw_max_per_strategy, int) else None
+        )
+
         if max_per_strategy is not None and request.strategy_name:
             strategy_pending = sum(
                 1 for item in pending if item.strategy_name == request.strategy_name
             )
+
             if strategy_pending >= max_per_strategy:
                 raise RuntimeError("maximum pending risk reservations per strategy exceeded")
+
+        raw_ttl_seconds = getattr(reservation_cfg, "ttl_seconds", 30)
+        ttl_seconds = raw_ttl_seconds if isinstance(raw_ttl_seconds, int) else 30
 
         return self._state.reserve_risk(
             symbol=request.symbol,
@@ -1714,7 +1792,7 @@ class RiskManager:
             open_risk=decision.final_risk_amount or 0.0,
             margin=decision.final_margin or 0.0,
             notional=decision.final_notional or 0.0,
-            ttl_seconds=getattr(reservation_cfg, "ttl_seconds", 30.0),
+            ttl_seconds=ttl_seconds,
             metadata={
                 "decision": decision.decision.value,
                 "risk_mode": decision.risk_mode.value,
@@ -1990,6 +2068,7 @@ class RiskManager:
             },
             "metadata": RiskManager._json_safe(decision.metadata),
         }
+
     @staticmethod
     def _request_from_payload(payload: dict[str, Any]) -> RiskEvaluationRequest:
         symbol = payload.get("symbol")
@@ -2002,6 +2081,15 @@ class RiskManager:
             raise ValueError("side is required")
         if entry_price is None:
             raise ValueError("entry_price is required")
+
+        raw_metadata = payload.get("metadata")
+        metadata: dict[str, Any] = {}
+
+        if isinstance(raw_metadata, dict):
+            metadata = {
+                str(key): value
+                for key, value in raw_metadata.items()
+            }
 
         return RiskEvaluationRequest(
             symbol=str(symbol),
@@ -2036,14 +2124,16 @@ class RiskManager:
             execution_cost=RiskManager._execution_cost_from_payload(payload),
             requested_size=RiskManager._to_float_or_none(payload.get("requested_size")),
             requested_margin=RiskManager._to_float_or_none(payload.get("requested_margin")),
-            requested_leverage=RiskManager._to_float_or_none(payload.get("requested_leverage")),
+            requested_leverage=RiskManager._to_float_or_none(
+                payload.get("requested_leverage")
+            ),
             reduce_only=bool(payload.get("reduce_only", False)),
             margin_mode=RiskManager._enum_from_value(
                 MarginMode,
                 payload.get("margin_mode", MarginMode.ISOLATED.value),
             ),
             timestamp=RiskManager._to_float_or_none(payload.get("timestamp")),
-            metadata=dict(payload.get("metadata", {})),
+            metadata=metadata,
         )
 
     @staticmethod
