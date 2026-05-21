@@ -3,15 +3,13 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Mapping
 from uuid import uuid4
 
 from execution.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from execution.exceptions import ExecutionRejectedError
-
 from risk.enums import MarginMode, OrderIntent, PositionSide
-
 
 _EPSILON: float = 1e-12
 _BPS_DENOMINATOR: float = 10_000.0
@@ -21,6 +19,17 @@ _BPS_DENOMINATOR: float = 10_000.0
 # Time helpers
 # ---------------------------------------------------------------------
 
+from decimal import Decimal, InvalidOperation
+
+
+def _decimal_from_number(value: float | int | str | Decimal) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"Invalid decimal value: {value!r}") from exc
 
 def now_ms() -> int:
     """
@@ -60,11 +69,13 @@ def require_finite_number(value: float | int | None, field_name: str) -> float:
     """
     Return value as float or raise ValueError.
     """
+    if value is None:
+        raise ValueError(f"{field_name} is required")
+
     if not is_finite_number(value):
         raise ValueError(f"{field_name} must be finite")
 
     return float(value)
-
 
 def require_positive_number(value: float | int | None, field_name: str) -> float:
     value_f = require_finite_number(value, field_name)
@@ -235,11 +246,6 @@ def is_supported_execution_market(
 # ---------------------------------------------------------------------
 
 
-def _decimal_from_number(value: float | int | str) -> Decimal:
-    if isinstance(value, Decimal):
-        return value
-
-    return Decimal(str(value))
 
 
 def format_decimal(value: float | int | Decimal, *, normalize: bool = True) -> str:
@@ -526,19 +532,13 @@ def binance_position_side(side: PositionSide | str | None) -> str | None:
     if side is None:
         return None
 
-    if isinstance(side, str):
-        normalized = side.strip().upper()
-        if normalized in {"LONG", "SHORT", "BOTH"}:
-            return normalized
-        raise ValueError(f"Unsupported Binance position side: {side!r}")
+    raw_side = getattr(side, "value", side)
+    normalized = str(raw_side).strip().upper()
 
-    if side is PositionSide.LONG:
-        return "LONG"
+    if normalized in {"LONG", "SHORT", "BOTH"}:
+        return normalized
 
-    if side is PositionSide.SHORT:
-        return "SHORT"
-
-    return "BOTH"
+    raise ValueError(f"Unsupported Binance position side: {side!r}")
 
 
 def binance_margin_type(margin_mode: MarginMode | str | None) -> str | None:
@@ -548,10 +548,8 @@ def binance_margin_type(margin_mode: MarginMode | str | None) -> str | None:
     if margin_mode is None:
         return None
 
-    if isinstance(margin_mode, str):
-        normalized = margin_mode.strip().upper()
-    else:
-        normalized = margin_mode.value.upper()
+    raw_margin_mode = getattr(margin_mode, "value", margin_mode)
+    normalized = str(raw_margin_mode).strip().upper()
 
     aliases = {
         "CROSS": "CROSSED",

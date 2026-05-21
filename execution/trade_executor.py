@@ -330,9 +330,9 @@ class TradeExecutor:
 
         try:
             job = self._scheduler.add_interval_job(
-                self.cleanup_stale_executions,
-                interval=max(5.0, self._config.execution_timeout_seconds),
                 name="execution.trade_executor.cleanup_stale_executions",
+                func=self.cleanup_stale_executions,
+                interval=max(5.0, self._config.execution_timeout_seconds),
                 run_immediately=False,
             )
             self._scheduler_jobs.append(job)
@@ -811,13 +811,30 @@ class TradeExecutor:
                 priority=EventPriority.CRITICAL,
             )
 
-    async def _handle_position_close_requested(self, event: Event | Mapping[str, Any]) -> None:
+    async def _handle_position_close_requested(
+            self,
+            event: Event | Mapping[str, Any],
+    ) -> None:
         payload = self._event_payload(event)
 
         try:
+            raw_symbol = payload.get("symbol")
+            if raw_symbol is None:
+                raise ExecutionError("position close request missing symbol")
+
+            raw_side = payload.get("side") or payload.get("position_side")
+            if raw_side is None:
+                raise ExecutionError("position close request missing side")
+
+            if not isinstance(raw_side, PositionSide | str):
+                raise ExecutionError(
+                    f"position close request side must be PositionSide | str, "
+                    f"got {type(raw_side).__name__}"
+                )
+
             await self.close_position(
-                symbol=str(payload["symbol"]),
-                side=payload.get("side") or payload.get("position_side"),
+                symbol=str(raw_symbol),
+                side=raw_side,
                 size=safe_float(payload.get("size") or payload.get("quantity")),
                 position_id=payload.get("position_id"),
                 signal_id=payload.get("signal_id"),
@@ -842,17 +859,38 @@ class TradeExecutor:
                 priority=EventPriority.CRITICAL,
             )
 
-    async def _handle_position_reduce_requested(self, event: Event | Mapping[str, Any]) -> None:
+    async def _handle_position_reduce_requested(
+            self,
+            event: Event | Mapping[str, Any],
+    ) -> None:
         payload = self._event_payload(event)
 
         try:
-            reduce_size = safe_float(payload.get("reduce_size") or payload.get("size") or payload.get("quantity"))
+            raw_symbol = payload.get("symbol")
+            if raw_symbol is None:
+                raise ExecutionRejectedError("position reduce request missing symbol")
+
+            raw_side = payload.get("side") or payload.get("position_side")
+            if raw_side is None:
+                raise ExecutionRejectedError("position reduce request missing side")
+
+            if not isinstance(raw_side, PositionSide | str):
+                raise ExecutionRejectedError(
+                    f"position reduce request side must be PositionSide | str, "
+                    f"got {type(raw_side).__name__}"
+                )
+
+            reduce_size = safe_float(
+                payload.get("reduce_size")
+                or payload.get("size")
+                or payload.get("quantity")
+            )
             if reduce_size is None:
                 raise ExecutionRejectedError("reduce_size is required")
 
             await self.reduce_position(
-                symbol=str(payload["symbol"]),
-                side=payload.get("side") or payload.get("position_side"),
+                symbol=str(raw_symbol),
+                side=raw_side,
                 reduce_size=reduce_size,
                 position_id=payload.get("position_id"),
                 signal_id=payload.get("signal_id"),
@@ -902,12 +940,17 @@ class TradeExecutor:
             priority=EventPriority.HIGH,
         )
 
-    async def _handle_execution_order_filled(self, event: Event | Mapping[str, Any]) -> None:
+    async def _handle_execution_order_filled(
+            self,
+            event: Event | Mapping[str, Any],
+    ) -> None:
         payload = self._event_payload(event)
-        execution_id = payload.get("execution_id")
+        raw_execution_id = payload.get("execution_id")
 
-        if not execution_id:
+        if not isinstance(raw_execution_id, str) or not raw_execution_id:
             return
+
+        execution_id = raw_execution_id
 
         async with self._lock:
             if execution_id in self._active_executions:
@@ -932,16 +975,18 @@ class TradeExecutor:
         )
 
     async def _mark_execution_terminal_from_order_event(
-        self,
-        event: Event | Mapping[str, Any],
-        *,
-        status: ExecutionStatus,
+            self,
+            event: Event | Mapping[str, Any],
+            *,
+            status: ExecutionStatus,
     ) -> None:
         payload = self._event_payload(event)
-        execution_id = payload.get("execution_id")
+        raw_execution_id = payload.get("execution_id")
 
-        if not execution_id:
+        if not isinstance(raw_execution_id, str) or not raw_execution_id:
             return
+
+        execution_id = raw_execution_id
 
         async with self._lock:
             self._execution_status[execution_id] = status

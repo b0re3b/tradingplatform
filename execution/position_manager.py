@@ -269,9 +269,9 @@ class PositionManager:
         for name, callback, interval_seconds in jobs:
             try:
                 job = self._scheduler.add_interval_job(
-                    callback,
-                    interval=interval_seconds,
                     name=name,
+                    func=callback,
+                    interval=interval_seconds,
                     run_immediately=False,
                 )
                 self._scheduler_jobs.append(job)
@@ -280,7 +280,6 @@ class PositionManager:
                     "Failed to register PositionManager scheduler job | name=%s",
                     name,
                 )
-
     async def apply_fill(self, fill: OrderFill) -> PositionUpdate | None:
         """
         Apply normalized fill to local position state.
@@ -705,15 +704,23 @@ class PositionManager:
         if price is None or price <= 0:
             raise PositionError("Order fill payload missing valid fill price")
 
-        side = payload.get("side")
-        if side is None:
+        raw_side = payload.get("side")
+        if raw_side is None:
             raise PositionError("Order fill payload missing order side")
+
+        if not isinstance(raw_side, OrderSide | str):
+            raise PositionError(
+                f"Order fill payload side must be OrderSide | str, "
+                f"got {type(raw_side).__name__}"
+            )
+
+        order_side = normalize_order_side(raw_side)
 
         position_side = self._position_side_from_raw(payload.get("position_side"))
 
         if position_side is None:
             position_side = self._infer_position_side_from_order_side(
-                order_side=normalize_order_side(side),
+                order_side=order_side,
                 reduce_only=bool(payload.get("reduce_only", False)),
                 close_position=bool(payload.get("close_position", False)),
             )
@@ -740,10 +747,14 @@ class PositionManager:
         )
 
         return OrderFill(
-            exchange=normalize_exchange(payload.get("exchange") or self._config.default_exchange),
-            market_type=normalize_market_type(payload.get("market_type") or self._config.default_market_type),
+            exchange=normalize_exchange(
+                payload.get("exchange") or self._config.default_exchange
+            ),
+            market_type=normalize_market_type(
+                payload.get("market_type") or self._config.default_market_type
+            ),
             symbol=normalize_symbol(str(symbol)),
-            side=normalize_order_side(side),
+            side=order_side,
             quantity=executed_quantity,
             price=price,
             order_id=extract_order_id(payload),
@@ -759,7 +770,11 @@ class PositionManager:
             signal_id=payload.get("signal_id"),
             strategy_name=payload.get("strategy_name"),
             reservation_id=payload.get("reservation_id"),
-            fill_time=payload.get("exchange_time") or payload.get("update_time") or payload.get("timestamp"),
+            fill_time=(
+                    payload.get("exchange_time")
+                    or payload.get("update_time")
+                    or payload.get("timestamp")
+            ),
             metadata=merge_metadata(
                 source_metadata,
                 {

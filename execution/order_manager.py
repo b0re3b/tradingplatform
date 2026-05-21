@@ -347,9 +347,9 @@ class OrderManager:
         for name, callback, interval_seconds in jobs:
             try:
                 job = self._scheduler.add_interval_job(
-                    callback,
-                    interval=interval_seconds,
                     name=name,
+                    func=callback,
+                    interval=interval_seconds,
                     run_immediately=False,
                 )
                 self._scheduler_jobs.append(job)
@@ -1199,14 +1199,41 @@ class OrderManager:
         )
 
     def _order_request_from_payload(self, payload: Mapping[str, Any]) -> OrderRequest:
+        raw_symbol = payload.get("symbol")
+        raw_side = payload.get("side")
+        raw_order_type = payload.get("order_type") or payload.get("type")
+
+        if raw_symbol is None:
+            raise OrderSubmitError("symbol is required")
+
+        if raw_side is None:
+            raise OrderSubmitError("side is required")
+
+        if raw_order_type is None:
+            raise OrderSubmitError("order_type is required")
+
+        if not isinstance(raw_side, OrderSide | str):
+            raise OrderSubmitError(
+                f"side must be OrderSide | str, got {type(raw_side).__name__}"
+            )
+
+        if not isinstance(raw_order_type, OrderType | str):
+            raise OrderSubmitError(
+                f"order_type must be OrderType | str, got {type(raw_order_type).__name__}"
+            )
+
         return OrderRequest(
             execution_id=str(payload.get("execution_id") or "unknown"),
             leg_id=payload.get("leg_id"),
-            exchange=normalize_exchange(payload.get("exchange") or self._config.default_exchange),
-            market_type=normalize_market_type(payload.get("market_type") or self._config.default_market_type),
-            symbol=normalize_symbol(str(payload["symbol"])),
-            side=normalize_order_side(payload["side"]),
-            order_type=normalize_order_type(payload.get("order_type") or payload.get("type")),
+            exchange=normalize_exchange(
+                payload.get("exchange") or self._config.default_exchange
+            ),
+            market_type=normalize_market_type(
+                payload.get("market_type") or self._config.default_market_type
+            ),
+            symbol=normalize_symbol(str(raw_symbol)),
+            side=normalize_order_side(raw_side),
+            order_type=normalize_order_type(raw_order_type),
             quantity=payload.get("quantity"),
             price=payload.get("price"),
             position_side=self._position_side_from_raw(payload.get("position_side")),
@@ -1219,7 +1246,10 @@ class OrderManager:
             callback_rate=payload.get("callback_rate"),
             working_type=self._working_type_from_raw(payload.get("working_type")),
             price_protect=payload.get("price_protect"),
-            new_order_resp_type=payload.get("new_order_resp_type") or self._config.new_order_response_type,
+            new_order_resp_type=(
+                    payload.get("new_order_resp_type")
+                    or self._config.new_order_response_type
+            ),
             signal_id=payload.get("signal_id"),
             strategy_name=payload.get("strategy_name"),
             reservation_id=payload.get("reservation_id"),
