@@ -544,6 +544,8 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
             scheduler=scheduler,
             service_name=service_name or f"strategy.{self.__class__.__name__}",
         )
+        self._last_no_signal_reason: str | None = None
+        self._last_no_signal_metadata: dict[str, Any] = {}
 
     @property
     def strategy_name(self) -> str:
@@ -710,6 +712,32 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
                 f"{self.strategy_name}: missing required features: {missing}"
             )
 
+    def remember_no_signal(self, reason: str, **metadata: Any) -> None:
+        """
+        Store the exact reason why generate_signal() returned None.
+
+        Concrete strategies still return StrategySignal | None, but BaseStrategy
+        can now expose useful debug reasons instead of generic no_signal_generated.
+        """
+        normalized = str(reason or "").strip()
+        if not normalized:
+            normalized = "no_signal_generated"
+
+        self._last_no_signal_reason = normalized
+        self._last_no_signal_metadata = dict(metadata)
+
+    def clear_no_signal_reason(self) -> None:
+        self._last_no_signal_reason = None
+        self._last_no_signal_metadata = {}
+
+    def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
+        reason = self._last_no_signal_reason or "no_signal_generated"
+        metadata = dict(self._last_no_signal_metadata or {})
+
+        self.clear_no_signal_reason()
+
+        return [reason], metadata
+
     def should_evaluate(self, context: StrategyContext) -> bool:
         """
         Fast applicability check.
@@ -753,15 +781,25 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
                     reasons=["strategy_not_applicable"],
                 )
 
+            self.clear_no_signal_reason()
             signal = await self._call_generate_signal(context)
 
             if signal is None:
+                reasons, no_signal_metadata = self.consume_no_signal_reason()
+
                 return self._build_evaluation(
                     context=context,
                     timestamp=timestamp,
                     passed=False,
                     signal=None,
-                    reasons=["no_signal_generated"],
+                    reasons=reasons,
+                    metadata={
+                        "strategy_category": self.category.value,
+                        "strategy_priority": self.priority,
+                        "strategy_weight": self.weight,
+                        "required_features": sorted(self.required_features()),
+                        "no_signal": no_signal_metadata,
+                    },
                 )
 
             self._prepare_signal(signal, context=context)

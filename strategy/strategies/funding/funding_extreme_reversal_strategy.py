@@ -303,31 +303,63 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return set(base_required).union(self.extreme_config.required_funding_features)
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         extreme = funding_item(context, "extreme")
         if extreme is None:
+            self.remember_no_signal(
+                "missing_funding_extreme",
+                funding_domain_keys=sorted(self.funding_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         event_time = extract_event_time(extreme)
         if (
-            self.extreme_config.require_fresh_extreme
-            and is_stale(
-                event_time=event_time,
-                now=context.timestamp,
+                self.extreme_config.require_fresh_extreme
+                and is_stale(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.extreme_config.stale_feature_max_age_seconds,
+        )
+        ):
+            self.remember_no_signal(
+                "stale_funding_extreme",
+                event_time=event_time.isoformat() if event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
                 stale_after_seconds=self.extreme_config.stale_feature_max_age_seconds,
             )
-        ):
             return None
 
         side = self._derive_contrarian_side_from_extreme(extreme)
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "funding_extreme_side_not_directional",
+                extreme=serialize_for_metadata(extreme),
+            )
             return None
 
         if not self._passes_extreme_thresholds(extreme):
+            self.remember_no_signal(
+                "funding_extreme_thresholds_failed",
+                extreme=serialize_for_metadata(extreme),
+                severity=self._extreme_severity(extreme),
+                mean_reversion_probability=self._mean_reversion_probability(extreme),
+                squeeze_probability=self._squeeze_probability(extreme),
+                has_reversal_risk=self._has_reversal_risk(extreme),
+                min_extreme_severity=self.extreme_config.min_extreme_severity,
+                min_mean_reversion_probability=(
+                    self.extreme_config.min_mean_reversion_probability
+                ),
+                min_squeeze_probability=self.extreme_config.min_squeeze_probability,
+                require_reversal_risk=self.extreme_config.require_reversal_risk,
+                require_squeeze_risk_or_reversion_probability=(
+                    self.extreme_config.require_squeeze_risk_or_reversion_probability
+                ),
+            )
             return None
 
         pressure = funding_item(context, "pressure")
@@ -337,9 +369,23 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         funding_signal = funding_item(context, "signal")
 
         if not self._passes_pressure_filter(side=side, pressure=pressure):
+            self.remember_no_signal(
+                "funding_extreme_pressure_filter_failed",
+                side=side.value,
+                pressure=serialize_for_metadata(pressure),
+                pressure_score=self._pressure_score(pressure),
+                pressure_side=self._pressure_side(pressure).value,
+                min_pressure_score=self.extreme_config.min_pressure_score,
+                require_high_pressure_level=self.extreme_config.require_high_pressure_level,
+            )
             return None
 
         if not self._passes_regime_filter(regime):
+            self.remember_no_signal(
+                "funding_extreme_regime_filter_failed",
+                regime=serialize_for_metadata(regime),
+                min_regime_confidence=self.extreme_config.min_regime_confidence,
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -354,69 +400,26 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
         if breakdown.score < self.extreme_config.min_signal_score:
+            self.remember_no_signal(
+                "funding_extreme_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.extreme_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.extreme_config.min_signal_confidence:
+            self.remember_no_signal(
+                "funding_extreme_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.extreme_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
-        setup_label = (
-            self.extreme_config.bullish_setup_label
-            if side is SignalSide.LONG
-            else self.extreme_config.bearish_setup_label
-        )
 
-        source_features = self._source_features(
-            extreme=extreme,
-            pressure=pressure,
-            regime=regime,
-            divergence=divergence,
-            flip=flip,
-            funding_signal=funding_signal,
-        )
-
-        reasons = list(
-            dict.fromkeys(
-                [
-                    setup_label,
-                    *breakdown.reasons,
-                ]
-            )
-        )
-        confirmations = list(dict.fromkeys(breakdown.confirmations))
-
-        metadata = {
-            "funding_setup_label": setup_label,
-            "funding_setup_family": "funding_extreme_reversal",
-            "funding_strategy_version": "2.0.0",
-            "score_breakdown": breakdown.to_dict(),
-            "extreme": serialize_for_metadata(extreme),
-            "pressure": serialize_for_metadata(pressure),
-            "regime": serialize_for_metadata(regime),
-            "divergence": serialize_for_metadata(divergence),
-            "flip": serialize_for_metadata(flip),
-            "funding_signal": serialize_for_metadata(funding_signal),
-            "event_time": event_time.isoformat() if event_time else None,
-            "tags": self._tags(
-                extreme=extreme,
-                pressure=pressure,
-                regime=regime,
-                divergence=divergence,
-                funding_signal=funding_signal,
-            ),
-        }
-
-        return self.build_funding_signal(
-            context=context,
-            side=side,
-            confidence=breakdown.confidence,
-            score=breakdown.score,
-            setup_type=self.extreme_config.default_setup_type,
-            reasons=reasons,
-            confirmations=confirmations,
-            source_features=source_features,
-            metadata=metadata,
-            priority=self.extreme_config.default_priority,
-        )
 
     # ------------------------------------------------------------------
     # Filters

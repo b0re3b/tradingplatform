@@ -93,6 +93,14 @@ def _tf_join(*groups: Timeframe | Sequence[Timeframe]) -> Timeframes:
 
 
 TF_SCALP: Timeframes = _tf(Timeframe.M1, Timeframe.M3, Timeframe.M5)
+TF_SCALP_INTRADAY: Timeframes = _tf(
+    Timeframe.M1,
+    Timeframe.M3,
+    Timeframe.M5,
+    Timeframe.M15,
+    Timeframe.M30,
+    Timeframe.H1,
+)
 TF_INTRADAY: Timeframes = _tf(
     Timeframe.M5,
     Timeframe.M15,
@@ -102,6 +110,7 @@ TF_INTRADAY: Timeframes = _tf(
 TF_SWING: Timeframes = _tf(Timeframe.H1, Timeframe.H4, Timeframe.D1)
 TF_FAST: Timeframes = _tf(Timeframe.M1, Timeframe.M3)
 TF_MID: Timeframes = _tf(Timeframe.M5, Timeframe.M15)
+TF_FUNDING: Timeframes = _tf(Timeframe.H1, Timeframe.H4, Timeframe.D1)
 TF_SPREADS: Timeframes = _tf(
     Timeframe.M5,
     Timeframe.M15,
@@ -173,7 +182,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "cvd_divergence": StrategyCatalogEntry(
         name="cvd_divergence",
         category=StrategyCategory.ORDERFLOW,
-        default_timeframes=_tf_join(TF_SCALP, Timeframe.M15),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.10,
         priority=20,
         tags=("orderflow", "cvd", "divergence", "reversal", "futures"),
@@ -188,7 +197,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "orderflow_continuation": StrategyCatalogEntry(
         name="orderflow_continuation",
         category=StrategyCategory.ORDERFLOW,
-        default_timeframes=_tf_join(TF_MID, Timeframe.M30, Timeframe.H1),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.05,
         priority=35,
         tags=("orderflow", "continuation", "momentum", "futures"),
@@ -202,7 +211,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "orderflow_reversal": StrategyCatalogEntry(
         name="orderflow_reversal",
         category=StrategyCategory.ORDERFLOW,
-        default_timeframes=_tf_join(TF_SCALP, Timeframe.M15),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.08,
         priority=25,
         tags=("orderflow", "reversal", "absorption", "futures"),
@@ -220,7 +229,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "market_structure": StrategyCatalogEntry(
         name="market_structure",
         category=StrategyCategory.PRICE_ACTION,
-        default_timeframes=_tf_join(TF_INTRADAY, Timeframe.H4),
+        default_timeframes=_tf_join(TF_SCALP_INTRADAY, Timeframe.H4),
         weight=0.95,
         priority=45,
         tags=("price_action", "market_structure", "trend", "futures"),
@@ -235,7 +244,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "fvg_reaction": StrategyCatalogEntry(
         name="fvg_reaction",
         category=StrategyCategory.PRICE_ACTION,
-        default_timeframes=_tf_join(TF_MID, Timeframe.M30, Timeframe.H1),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=0.90,
         priority=50,
         tags=("price_action", "fvg", "reaction", "futures"),
@@ -249,7 +258,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "support_resistance_reaction": StrategyCatalogEntry(
         name="support_resistance_reaction",
         category=StrategyCategory.PRICE_ACTION,
-        default_timeframes=TF_INTRADAY,
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=0.92,
         priority=48,
         tags=("price_action", "support_resistance", "reaction", "futures"),
@@ -264,7 +273,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "trend_continuation": StrategyCatalogEntry(
         name="trend_continuation",
         category=StrategyCategory.PRICE_ACTION,
-        default_timeframes=_tf_join(TF_INTRADAY, Timeframe.H4),
+        default_timeframes=_tf_join(TF_SCALP_INTRADAY, Timeframe.H4),
         weight=1.00,
         priority=40,
         tags=("price_action", "trend", "continuation", "futures"),
@@ -296,7 +305,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "oi_breakout_confirmation": StrategyCatalogEntry(
         name="oi_breakout_confirmation",
         category=StrategyCategory.OPEN_INTEREST,
-        default_timeframes=TF_INTRADAY,
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.02,
         priority=38,
         tags=("open_interest", "oi", "breakout", "confirmation", "futures"),
@@ -310,7 +319,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "oi_anomaly": StrategyCatalogEntry(
         name="oi_anomaly",
         category=StrategyCategory.OPEN_INTEREST,
-        default_timeframes=_tf_join(TF_MID, Timeframe.M30),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=0.88,
         priority=58,
         tags=("open_interest", "oi", "anomaly", "futures"),
@@ -333,6 +342,117 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
             "oi_flush",
             "oi_capitulation",
             "long_short_flush",
+        ),
+    ),
+
+
+    # -------------------------------------------------------------------------
+    # liquidity
+    # -------------------------------------------------------------------------
+    "liquidity_sweep": StrategyCatalogEntry(
+        name="liquidity_sweep",
+        category=StrategyCategory.LIQUIDITY,
+        default_timeframes=TF_SCALP_INTRADAY,
+        weight=1.02,
+        priority=24,
+        tags=("liquidity", "sweep", "reversal", "futures"),
+        feature_hints=(
+            "liquidity_sweep",
+            "sweep_score",
+            "stop_run",
+            "liquidity_pool",
+        ),
+    ),
+    "stop_hunt_reversal": StrategyCatalogEntry(
+        name="stop_hunt_reversal",
+        category=StrategyCategory.LIQUIDITY,
+        default_timeframes=TF_SCALP_INTRADAY,
+        weight=1.04,
+        priority=22,
+        tags=("liquidity", "stop_hunt", "reversal", "futures"),
+        feature_hints=(
+            "stop_hunt",
+            "liquidity_sweep",
+            "reversal_confirmation",
+            "false_breakout",
+        ),
+    ),
+    "equal_high_low": StrategyCatalogEntry(
+        name="equal_high_low",
+        category=StrategyCategory.LIQUIDITY,
+        default_timeframes=TF_SCALP_INTRADAY,
+        weight=0.92,
+        priority=48,
+        tags=("liquidity", "equal_high_low", "pool", "futures"),
+        feature_hints=(
+            "equal_high",
+            "equal_low",
+            "liquidity_pool",
+            "resting_liquidity",
+        ),
+    ),
+
+    # -------------------------------------------------------------------------
+    # liquidations
+    # -------------------------------------------------------------------------
+    "liquidation_cascade": StrategyCatalogEntry(
+        name="liquidation_cascade",
+        category=StrategyCategory.LIQUIDATIONS,
+        default_timeframes=TF_SCALP_INTRADAY,
+        weight=1.06,
+        priority=21,
+        tags=("liquidations", "cascade", "momentum", "futures"),
+        feature_hints=(
+            "liquidation_cascade",
+            "forced_flow",
+            "liquidation_volume",
+            "cascade_score",
+        ),
+    ),
+    "squeeze_reversal": StrategyCatalogEntry(
+        name="squeeze_reversal",
+        category=StrategyCategory.LIQUIDATIONS,
+        default_timeframes=_tf_join(TF_MID, Timeframe.M30, Timeframe.H1),
+        weight=1.03,
+        priority=25,
+        tags=("liquidations", "squeeze", "reversal", "futures"),
+        feature_hints=(
+            "squeeze_reversal",
+            "liquidation_squeeze",
+            "forced_flow_exhaustion",
+            "reversal_pressure",
+        ),
+    ),
+
+    # -------------------------------------------------------------------------
+    # funding
+    # -------------------------------------------------------------------------
+    "funding_extreme_reversal": StrategyCatalogEntry(
+        name="funding_extreme_reversal",
+        category=StrategyCategory.FUNDING,
+        default_timeframes=TF_FUNDING,
+        weight=0.96,
+        priority=40,
+        tags=("funding", "extreme", "reversal", "futures"),
+        feature_hints=(
+            "funding_rate",
+            "funding_extreme",
+            "funding_zscore",
+            "funding_pressure",
+        ),
+    ),
+    "funding_divergence": StrategyCatalogEntry(
+        name="funding_divergence",
+        category=StrategyCategory.FUNDING,
+        default_timeframes=TF_FUNDING,
+        weight=0.94,
+        priority=42,
+        tags=("funding", "divergence", "reversal", "futures"),
+        feature_hints=(
+            "funding_rate",
+            "funding_divergence",
+            "funding_bias",
+            "price_funding_divergence",
         ),
     ),
 
@@ -412,7 +532,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "spoofing_absorption_reversal": StrategyCatalogEntry(
         name="spoofing_absorption_reversal",
         category=StrategyCategory.SPOOFING,
-        default_timeframes=_tf_join(TF_FAST, Timeframe.M5, Timeframe.M15),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=0.98,
         priority=24,
         tags=("spoofing", "absorption", "reversal", "futures"),
@@ -426,7 +546,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "composite_spoofing": StrategyCatalogEntry(
         name="composite_spoofing",
         category=StrategyCategory.SPOOFING,
-        default_timeframes=_tf_join(TF_FAST, Timeframe.M5, Timeframe.M15),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.00,
         priority=22,
         tags=("spoofing", "composite", "orderbook", "futures"),
@@ -525,7 +645,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "whale_absorption": StrategyCatalogEntry(
         name="whale_absorption",
         category=StrategyCategory.WHALES,
-        default_timeframes=_tf_join(TF_SCALP, Timeframe.M15),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.00,
         priority=26,
         tags=("whales", "absorption", "reversal", "futures"),
@@ -654,7 +774,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "liquidity_orderflow_reversal": StrategyCatalogEntry(
         name="liquidity_orderflow_reversal",
         category=StrategyCategory.HYBRID,
-        default_timeframes=_tf_join(TF_SCALP, Timeframe.M15),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.18,
         priority=12,
         tags=("hybrid", "liquidity", "orderflow", "reversal", "futures"),
@@ -716,6 +836,22 @@ OPEN_INTEREST_STRATEGIES: StrategyNames = (
     "oi_capitulation",
 )
 
+LIQUIDITY_STRATEGIES: StrategyNames = (
+    "liquidity_sweep",
+    "stop_hunt_reversal",
+    "equal_high_low",
+)
+
+LIQUIDATIONS_STRATEGIES: StrategyNames = (
+    "liquidation_cascade",
+    "squeeze_reversal",
+)
+
+FUNDING_STRATEGIES: StrategyNames = (
+    "funding_extreme_reversal",
+    "funding_divergence",
+)
+
 SPOOFING_STRATEGIES: StrategyNames = (
     "spoofing_reversal",
     "fake_liquidity_trap",
@@ -753,12 +889,16 @@ HYBRID_STRATEGIES: StrategyNames = (
 )
 
 ALL_STRATEGY_NAMES: StrategyNames = tuple(STRATEGY_CATALOG.keys())
+DEFAULT_STRATEGIES: StrategyNames = ALL_STRATEGY_NAMES
 
 
 SCALPING_STRATEGIES: StrategyNames = (
     "cvd_divergence",
     "orderflow_reversal",
     "orderflow_continuation",
+    "liquidity_sweep",
+    "stop_hunt_reversal",
+    "liquidation_cascade",
     "spoofing_reversal",
     "fake_liquidity_trap",
     "order_pull_reversal",
@@ -783,6 +923,13 @@ INTRADAY_STRATEGIES: StrategyNames = (
     "oi_breakout_confirmation",
     "oi_anomaly",
     "oi_capitulation",
+    "liquidity_sweep",
+    "stop_hunt_reversal",
+    "equal_high_low",
+    "liquidation_cascade",
+    "squeeze_reversal",
+    "funding_extreme_reversal",
+    "funding_divergence",
     "whale_accumulation",
     "whale_distribution",
     "whale_breakout",
@@ -800,6 +947,12 @@ SWING_STRATEGIES: StrategyNames = (
     "support_resistance_reaction",
     "oi_breakout_confirmation",
     "oi_divergence",
+    "oi_anomaly",
+    "oi_capitulation",
+    "equal_high_low",
+    "squeeze_reversal",
+    "funding_extreme_reversal",
+    "funding_divergence",
     "whale_accumulation",
     "whale_distribution",
     "funding_adjusted_basis",
@@ -821,6 +974,11 @@ LIQUIDITY_REVERSAL_STRATEGIES: StrategyNames = (
     "composite_spoofing",
     "whale_absorption",
     "whale_liquidation_reversal",
+    "liquidity_sweep",
+    "stop_hunt_reversal",
+    "equal_high_low",
+    "liquidation_cascade",
+    "squeeze_reversal",
     "oi_divergence",
     "oi_capitulation",
     "liquidity_orderflow_reversal",
@@ -830,6 +988,11 @@ LIQUIDITY_REVERSAL_STRATEGIES: StrategyNames = (
 MEAN_REVERSION_STRATEGIES: StrategyNames = (
     "oi_divergence",
     "oi_capitulation",
+    "funding_extreme_reversal",
+    "funding_divergence",
+    "squeeze_reversal",
+    "liquidity_sweep",
+    "stop_hunt_reversal",
     "spread_mean_reversion",
     "funding_adjusted_basis",
     "whale_absorption",
@@ -845,6 +1008,7 @@ TREND_STACK_STRATEGIES: StrategyNames = (
     "market_structure",
     "orderflow_continuation",
     "oi_breakout_confirmation",
+    "liquidation_cascade",
     "whale_breakout",
     "spread_momentum",
     "trend_stack",
@@ -1651,7 +1815,7 @@ def build_scalping_preset(
             "whale flow and hybrid reversals."
         ),
         symbols=symbols,
-        timeframes=timeframes or TF_SCALP,
+        timeframes=timeframes,
         strategy_names=strategy_names or SCALPING_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "scalping", "market_scope": "futures"},
@@ -1771,7 +1935,7 @@ def build_intraday_preset(
             "orderflow, whales, spreads and hybrid stacks."
         ),
         symbols=symbols,
-        timeframes=timeframes or TF_INTRADAY,
+        timeframes=timeframes,
         strategy_names=strategy_names or INTRADAY_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "intraday", "market_scope": "futures"},
@@ -1895,7 +2059,7 @@ def build_swing_preset(
             "whale accumulation/distribution and spread regime."
         ),
         symbols=symbols,
-        timeframes=timeframes or TF_SWING,
+        timeframes=timeframes,
         strategy_names=strategy_names or SWING_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "swing", "market_scope": "futures"},
@@ -2017,12 +2181,7 @@ def build_liquidity_reversal_preset(
             "OI capitulation and whale/liquidation reversals."
         ),
         symbols=symbols,
-        timeframes=timeframes or _tf(
-            Timeframe.M1,
-            Timeframe.M3,
-            Timeframe.M5,
-            Timeframe.M15,
-        ),
+        timeframes=timeframes,
         strategy_names=strategy_names or LIQUIDITY_REVERSAL_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "liquidity_reversal", "market_scope": "futures"},
@@ -2146,12 +2305,7 @@ def build_mean_reversion_preset(
             "spread reversion, absorption and hybrid stacks."
         ),
         symbols=symbols,
-        timeframes=timeframes or _tf(
-            Timeframe.M5,
-            Timeframe.M15,
-            Timeframe.M30,
-            Timeframe.H1,
-        ),
+        timeframes=timeframes,
         strategy_names=strategy_names or MEAN_REVERSION_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "mean_reversion", "market_scope": "futures"},
@@ -2229,7 +2383,7 @@ def build_trend_stack_preset(
             "continuation, OI confirmation, whales and hybrid trend stacks."
         ),
         symbols=symbols,
-        timeframes=timeframes or TF_INTRADAY,
+        timeframes=timeframes,
         strategy_names=strategy_names or TREND_STACK_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "trend_stack", "market_scope": "futures"},
@@ -2308,7 +2462,7 @@ def build_spreads_preset(
             "funding-adjusted basis, spread reversion and spread momentum."
         ),
         symbols=symbols,
-        timeframes=timeframes or TF_SPREADS,
+        timeframes=timeframes,
         strategy_names=strategy_names or SPREADS_PRESET_STRATEGIES,
         use_required_features=use_required_features,
         metadata={"profile": "spreads", "market_scope": "futures"},
@@ -2399,11 +2553,154 @@ def build_default_preset(
     symbols: Sequence[str] | None = None,
     use_required_features: bool = False,
 ) -> StrategyPreset:
-    return build_intraday_preset(
+    """
+    Build the production default preset.
+
+    Unlike profile-specific presets such as scalping/intraday/swing, the default
+    preset intentionally configures every strategy present in STRATEGY_CATALOG.
+    This guarantees that build_default_strategy_config() does not silently skip
+    a strategy just because its factory was added before a profile list was
+    updated.
+    """
+    builder = StrategyPresetBuilder(
+        name="default",
+        mode=PresetMode.INTRADAY,
+        description=(
+            "Full futures strategy preset enabling every catalog strategy. "
+            "Use profile-specific presets only when an explicit subset is wanted."
+        ),
         symbols=symbols,
+        timeframes=None,
+        strategy_names=DEFAULT_STRATEGIES,
         use_required_features=use_required_features,
+        metadata={
+            "profile": "default",
+            "market_scope": "futures",
+            "enabled_scope": "all_catalog_strategies",
+        },
     )
 
+    return (
+        builder
+        .with_runtime_defaults(
+            cooldown_seconds=35,
+            max_signal_age_seconds=90,
+            min_confidence=0.56,
+            min_score=0.18,
+        )
+        .with_routing(
+            _routing_config(
+                stale_feature_threshold_seconds=90,
+                reevaluate_on_any_update=False,
+                route_hybrid_on_domain_signal=True,
+                allow_partial_context=True,
+            )
+        )
+        .with_confluence(
+            ConfluenceConfig(
+                min_total_score=0.24,
+                min_total_confidence=0.56,
+                min_confirmations=1,
+                require_direction_agreement=True,
+                allow_single_high_confidence=True,
+                single_signal_min_confidence=0.72,
+                single_signal_min_score=0.55,
+            )
+        )
+        .with_confidence(
+            ConfidenceConfig(
+                min_confidence=0.56,
+                high_confidence_threshold=0.72,
+                low_confidence_threshold=0.40,
+            )
+        )
+        .with_voting(
+            VotingConfig(
+                min_votes=1,
+                min_primary_votes=1,
+                require_majority=False,
+                allow_tie=False,
+            )
+        )
+        .with_conflict(
+            ConflictConfig(
+                max_conflict_penalty=0.45,
+                opposite_side_penalty=0.25,
+                same_category_penalty=0.10,
+                regime_conflict_penalty=0.12,
+                block_on_strong_opposite_signal=True,
+            )
+        )
+        .with_filters(
+            FilterConfig(
+                enabled=True,
+                min_signal_confidence=0.56,
+                min_signal_score=0.18,
+                min_risk_reward=1.20,
+                max_active_signals_per_symbol=4,
+                max_active_signals_total=25,
+                enable_cooldown_filter=True,
+                enable_regime_filter=True,
+                enable_freshness_filter=True,
+                enable_portfolio_filter=True,
+                enable_funding_filter=True,
+                min_funding_alignment=-0.85,
+            )
+        )
+        .with_builders(
+            BuilderConfig(
+                default_entry_type=EntryType.MARKET,
+                default_stop_bps=45.0,
+                default_take_profit_bps=(70.0, 120.0, 180.0),
+                min_rr=1.20,
+                max_slippage_bps=8.0,
+                max_holding_seconds=7200,
+                partial_exit_enabled=True,
+            )
+        )
+        .with_portfolio(
+            PortfolioCoordinatorConfig(
+                enabled=True,
+                max_signals_per_symbol=4,
+                max_total_signals=25,
+                prefer_highest_score=True,
+                merge_same_side_signals=True,
+                suppress_opposite_side_conflicts=True,
+            )
+        )
+        .with_freshness(
+            FeatureFreshnessConfig(
+                default_ttl_seconds=90,
+                source_ttl_seconds={
+                    "orderflow": 30,
+                    "liquidity": 45,
+                    "liquidations": 45,
+                    "spoofing": 30,
+                    "whales": 60,
+                    "open_interest": 180,
+                    "funding": 300,
+                    "price_action": 120,
+                    "spreads": 120,
+                    "hybrid": 90,
+                },
+            )
+        )
+        .with_category_weights(
+            {
+                StrategyCategory.ORDERFLOW: 1.05,
+                StrategyCategory.LIQUIDITY: 1.05,
+                StrategyCategory.LIQUIDATIONS: 1.02,
+                StrategyCategory.OPEN_INTEREST: 1.00,
+                StrategyCategory.FUNDING: 0.92,
+                StrategyCategory.WHALES: 1.00,
+                StrategyCategory.SPOOFING: 0.92,
+                StrategyCategory.SPREADS: 0.88,
+                StrategyCategory.PRICE_ACTION: 0.96,
+                StrategyCategory.HYBRID: 1.20,
+            }
+        )
+        .build()
+    )
 
 def build_preset_by_name(
     name: str,
@@ -2495,7 +2792,7 @@ def build_preset_by_name(
 def build_default_strategy_config(
     *,
     symbols: Sequence[str] | None = None,
-    preset_name: str = "intraday",
+    preset_name: str = "default",
     use_required_features: bool = False,
 ) -> StrategyConfig:
     return build_preset_by_name(
@@ -2702,14 +2999,26 @@ __all__ = [
     "StrategyPreset",
     "StrategyPresetBuilder",
     "STRATEGY_CATALOG",
+    "TF_SCALP",
+    "TF_SCALP_INTRADAY",
+    "TF_INTRADAY",
+    "TF_SWING",
+    "TF_FAST",
+    "TF_MID",
+    "TF_FUNDING",
+    "TF_SPREADS",
     "ORDERFLOW_STRATEGIES",
     "PRICE_ACTION_STRATEGIES",
     "OPEN_INTEREST_STRATEGIES",
+    "LIQUIDITY_STRATEGIES",
+    "LIQUIDATIONS_STRATEGIES",
+    "FUNDING_STRATEGIES",
     "SPOOFING_STRATEGIES",
     "SPREADS_STRATEGIES",
     "WHALES_STRATEGIES",
     "HYBRID_STRATEGIES",
     "ALL_STRATEGY_NAMES",
+    "DEFAULT_STRATEGIES",
     "SCALPING_STRATEGIES",
     "INTRADAY_STRATEGIES",
     "SWING_STRATEGIES",

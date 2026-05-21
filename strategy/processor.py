@@ -470,6 +470,17 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.funding.* payloads into the stable funding domain
+        contract consumed by strategy/strategies/funding/*.
+
+        Important:
+        - domain sections are populated only when they actually exist;
+        - funding.updated with an extreme event is enriched with the fields that
+          FundingExtremeReversalStrategy expects;
+        - missing divergence is NOT synthesized, because funding_divergence should
+          not be routed/evaluated without a real divergence section.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -478,39 +489,227 @@ class SignalNormalizer(BaseStrategyComponent):
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
             return None
 
-        for target, aliases in {
-            "snapshot": ("snapshot", "funding_snapshot"),
-            "statistics": ("statistics", "stats", "funding_statistics"),
-            "regime": ("regime", "regime_state", "funding_regime"),
-            "pressure": ("pressure", "pressure_state", "funding_pressure"),
-            "extreme": ("extreme", "extreme_event", "funding_extreme"),
-            "divergence": ("divergence", "divergence_event", "funding_divergence"),
-            "flip": ("flip", "flip_event", "funding_flip"),
-            "signal": ("signal", "funding_signal"),
-        }.items():
-            value = mapping_for(*aliases)
-            if value is not None:
-                domain_data.setdefault(target, value)
-                domain_data.setdefault(aliases[0], value)
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
 
-        if "signal" not in domain_data and (
+        def to_float(value: Any, default: float = 0.0) -> float:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return float(value)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value.strip())
+                except ValueError:
+                    return default
+            return default
+
+        def clamp01(value: Any, default: float = 0.0) -> float:
+            parsed = to_float(value, default)
+            return max(0.0, min(1.0, parsed))
+
+        def section_detected(section: dict[str, Any] | None) -> bool:
+            if not section:
+                return False
+
+            detected = section.get("detected", section.get("is_detected", None))
+            if detected is None:
+                return True
+
+            if isinstance(detected, bool):
+                return detected
+
+            if isinstance(detected, str):
+                return detected.strip().lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "none",
+                }
+
+            return bool(detected)
+
+        def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None) -> None:
+            if value is None:
+                return
+
+            domain_data.setdefault(target, value)
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        snapshot = mapping_for("snapshot", "funding_snapshot")
+        statistics = mapping_for("statistics", "stats", "funding_statistics")
+        regime = mapping_for("regime", "regime_state", "funding_regime")
+        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
+        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
+        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
+        flip = mapping_for("flip", "flip_event", "funding_flip")
+        signal = mapping_for("signal", "funding_signal")
+
+        if signal is None and (
                 "signal_type" in payload
                 or "bias" in payload
+                or "side" in payload
+                or "direction" in payload
                 or "score" in payload
                 or "confidence" in payload
         ):
-            domain_data["signal"] = dict(payload)
+            signal = {
+                "type": value_for("signal_type", "type", default=None),
+                "bias": value_for("bias", "side", "direction", default=None),
+                "side": value_for("side", "direction", "bias", default=None),
+                "direction": value_for("direction", "side", "bias", default=None),
+                "score": value_for("signal_score", "score", default=0.0),
+                "confidence": value_for("signal_confidence", "confidence", default=0.0),
+            }
 
-        if "snapshot" not in domain_data:
-            domain_data["snapshot"] = dict(payload)
+        if snapshot is None:
+            snapshot = {
+                "funding_rate": value_for("funding_rate", "rate", default=None),
+                "predicted_rate": value_for("predicted_rate", default=None),
+                "next_funding_time_ms": value_for("next_funding_time_ms", default=None),
+            }
+            snapshot = {k: v for k, v in snapshot.items() if v is not None}
+
+        # Enrich funding extreme section for FundingExtremeReversalStrategy.
+        if extreme is not None:
+            score = clamp01(
+                extreme.get(
+                    "score",
+                    value_for("extreme_score", "score", default=0.0),
+                )
+            )
+            confidence = clamp01(
+                extreme.get(
+                    "confidence",
+                    value_for("extreme_confidence", "confidence", default=score),
+                )
+            )
+
+            severity = clamp01(
+                extreme.get(
+                    "severity",
+                    extreme.get("strength", score),
+                )
+            )
+
+            extreme.setdefault("score", score)
+            extreme.setdefault("confidence", confidence)
+            extreme.setdefault("severity", severity)
+
+            funding_rate = to_float(
+                extreme.get(
+                    "funding_rate",
+                    value_for("funding_rate", default=None),
+                ),
+                default=0.0,
+            )
+
+            if not extreme.get("extreme_type") and not extreme.get("type"):
+                regime_label = str(
+                    (regime or {}).get("regime")
+                    or (regime or {}).get("state")
+                    or ""
+                ).strip().lower()
+
+                if "negative" in regime_label or funding_rate < 0:
+                    extreme.setdefault("extreme_type", "negative_extreme")
+                    extreme.setdefault("type", "negative_extreme")
+                elif "positive" in regime_label or funding_rate > 0:
+                    extreme.setdefault("extreme_type", "positive_extreme")
+                    extreme.setdefault("type", "positive_extreme")
+
+            detected = section_detected(extreme)
+            if detected:
+                # These are contract adapter fields, not new trading logic.
+                # Analytics already declared an extreme; strategy expects these keys.
+                extreme.setdefault(
+                    "mean_reversion_probability",
+                    max(score, confidence, severity),
+                )
+                extreme.setdefault(
+                    "reversion_probability",
+                    extreme["mean_reversion_probability"],
+                )
+                extreme.setdefault(
+                    "reversal_probability",
+                    extreme["mean_reversion_probability"],
+                )
+                extreme.setdefault(
+                    "squeeze_probability",
+                    clamp01(
+                        extreme.get(
+                            "squeeze_probability",
+                            value_for("squeeze_probability", default=0.0),
+                        )
+                    ),
+                )
+                extreme.setdefault(
+                    "reversal_risk",
+                    extreme["mean_reversion_probability"] >= 0.5,
+                )
+                extreme.setdefault(
+                    "mean_reversion_risk",
+                    extreme["mean_reversion_probability"] >= 0.5,
+                )
+
+        if divergence is not None:
+            divergence.setdefault(
+                "score",
+                value_for("divergence_score", "score", default=divergence.get("score", 0.0)),
+            )
+            divergence.setdefault(
+                "confidence",
+                value_for(
+                    "divergence_confidence",
+                    "confidence",
+                    default=divergence.get("confidence", 0.0),
+                ),
+            )
+            divergence.setdefault(
+                "side",
+                value_for("side", "direction", "bias", default=divergence.get("side")),
+            )
+            divergence.setdefault(
+                "direction",
+                value_for("direction", "side", "bias", default=divergence.get("direction")),
+            )
+
+        set_aliases("snapshot", ("funding_snapshot",), snapshot or None)
+        set_aliases("statistics", ("stats", "funding_statistics"), statistics)
+        set_aliases("regime", ("regime_state", "funding_regime"), regime)
+        set_aliases("pressure", ("pressure_state", "funding_pressure"), pressure)
+
+        if section_detected(extreme):
+            set_aliases("extreme", ("extreme_event", "funding_extreme"), extreme)
+
+        if section_detected(divergence):
+            set_aliases("divergence", ("divergence_event", "funding_divergence"), divergence)
+
+        if section_detected(flip):
+            set_aliases("flip", ("flip_event", "funding_flip"), flip)
+
+        if signal:
+            set_aliases("signal", ("funding_signal",), signal)
+
+        domain_data.setdefault("raw", dict(payload))
 
     def _augment_orderflow_domain_data(
             self,
@@ -4820,6 +5019,15 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        """
+        Build stable funding contract features.
+
+        Important:
+        - feature snapshots for setup-specific sections are emitted only when the
+          section exists and is detected;
+        - no synthetic funding.divergence when there is no divergence section;
+        - no synthetic funding.extreme when there is no extreme section.
+        """
         result: list[FeatureSnapshot] = []
         confidence = payload.get("confidence", 0.0)
 
@@ -4827,26 +5035,17 @@ class SignalNormalizer(BaseStrategyComponent):
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
-            return {}
-
-        snapshot = mapping_for("snapshot", "funding_snapshot")
-        statistics = mapping_for("statistics", "stats", "funding_statistics")
-        regime = mapping_for("regime", "regime_state", "funding_regime")
-        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
-        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
-        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
-        flip = mapping_for("flip", "flip_event", "funding_flip")
-        signal = mapping_for("signal", "funding_signal")
+            return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -4856,13 +5055,38 @@ class SignalNormalizer(BaseStrategyComponent):
                     return feature_map[key]
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        def nested_value(mapping: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
+            if not mapping:
+                return default
             for key in keys:
                 if key in mapping:
                     return mapping[key]
             return default
 
-        def add(name: str, value: Any) -> None:
+        def section_detected(mapping: dict[str, Any] | None) -> bool:
+            if not mapping:
+                return False
+
+            detected = mapping.get("detected", mapping.get("is_detected", None))
+            if detected is None:
+                return True
+
+            if isinstance(detected, bool):
+                return detected
+
+            if isinstance(detected, str):
+                return detected.strip().lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                    "n",
+                    "off",
+                    "none",
+                }
+
+            return bool(detected)
+
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
             snapshot_obj = self._snapshot_from_raw_value(
                 source=FeatureSource.FUNDING,
                 symbol=symbol,
@@ -4873,97 +5097,227 @@ class SignalNormalizer(BaseStrategyComponent):
                 metadata={
                     "origin": "contract_feature",
                     "contract": "funding",
+                    **({"section": section} if section else {}),
                 },
             )
             result.append(snapshot_obj)
 
-        add("funding.snapshot", snapshot or payload)
-        add("funding.statistics", statistics)
+        snapshot = mapping_for("snapshot", "funding_snapshot")
+        statistics = mapping_for("statistics", "stats", "funding_statistics")
+        regime = mapping_for("regime", "regime_state", "funding_regime")
+        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
+        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
+        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
+        flip = mapping_for("flip", "flip_event", "funding_flip")
+        funding_signal = mapping_for("signal", "funding_signal")
 
-        add("funding.regime", regime)
-        add(
-            "funding.regime.confidence",
-            nested_value(regime, "confidence", default=value_for("regime_confidence", default=0.0)),
-        )
+        if funding_signal is None and (
+                "signal_type" in payload
+                or "bias" in payload
+                or "side" in payload
+                or "direction" in payload
+                or "score" in payload
+                or "confidence" in payload
+        ):
+            funding_signal = {
+                "type": value_for("signal_type", "type", default=None),
+                "bias": value_for("bias", "side", "direction", default=None),
+                "side": value_for("side", "direction", "bias", default=None),
+                "direction": value_for("direction", "side", "bias", default=None),
+                "score": value_for("signal_score", "score", default=0.0),
+                "confidence": value_for("signal_confidence", "confidence", default=0.0),
+            }
 
-        add("funding.pressure", pressure)
-        add(
-            "funding.pressure.score",
-            nested_value(pressure, "score", "pressure_score", default=value_for("pressure_score", default=0.0)),
-        )
-        add(
-            "funding.pressure.level",
-            nested_value(pressure, "level", "pressure_level", default=value_for("pressure_level", default=None)),
-        )
-        add(
-            "funding.pressure.direction",
-            nested_value(pressure, "direction", "bias", default=value_for("pressure_direction", default=None)),
-        )
+        if snapshot:
+            add("funding.snapshot", snapshot, section="snapshot")
 
-        add("funding.extreme", extreme)
-        add(
-            "funding.extreme.type",
-            nested_value(extreme, "type", "extreme_type", default=value_for("extreme_type", default=None)),
-        )
-        add(
-            "funding.extreme.severity",
-            nested_value(extreme, "severity", "score", default=value_for("extreme_severity", default=0.0)),
-        )
-        add(
-            "funding.extreme.mean_reversion_probability",
-            nested_value(
-                extreme,
-                "mean_reversion_probability",
-                "reversion_probability",
-                default=value_for("mean_reversion_probability", default=0.0),
-            ),
-        )
-        add(
-            "funding.extreme.squeeze_probability",
-            nested_value(extreme, "squeeze_probability", default=value_for("squeeze_probability", default=0.0)),
-        )
+        if statistics:
+            add("funding.statistics", statistics, section="statistics")
 
-        add("funding.divergence", divergence)
-        add(
-            "funding.divergence.type",
-            nested_value(divergence, "type", "divergence_type", default=value_for("divergence_type", default=None)),
-        )
-        add(
-            "funding.divergence.confidence",
-            nested_value(divergence, "confidence", default=value_for("divergence_confidence", default=0.0)),
-        )
-        add(
-            "funding.divergence.score",
-            nested_value(divergence, "score", default=value_for("divergence_score", default=0.0)),
-        )
+        if regime:
+            add("funding.regime", regime, section="regime")
+            add(
+                "funding.regime.confidence",
+                nested_value(
+                    regime,
+                    "confidence",
+                    default=value_for("regime_confidence", default=0.0),
+                ),
+                section="regime",
+            )
 
-        add("funding.flip", flip)
-        add(
-            "funding.flip.type",
-            nested_value(flip, "type", "flip_type", default=value_for("flip_type", default=None)),
-        )
-        add(
-            "funding.flip.confidence",
-            nested_value(flip, "confidence", default=value_for("flip_confidence", default=0.0)),
-        )
+        if pressure:
+            add("funding.pressure", pressure, section="pressure")
+            add(
+                "funding.pressure.score",
+                nested_value(
+                    pressure,
+                    "score",
+                    "pressure_score",
+                    default=value_for("pressure_score", default=0.0),
+                ),
+                section="pressure",
+            )
+            add(
+                "funding.pressure.level",
+                nested_value(
+                    pressure,
+                    "level",
+                    "pressure_level",
+                    default=value_for("pressure_level", default=None),
+                ),
+                section="pressure",
+            )
+            add(
+                "funding.pressure.direction",
+                nested_value(
+                    pressure,
+                    "direction",
+                    "bias",
+                    "side",
+                    default=value_for("pressure_direction", "side", "direction", default=None),
+                ),
+                section="pressure",
+            )
 
-        add("funding.signal", signal)
-        add(
-            "funding.signal.type",
-            nested_value(signal, "type", "signal_type", default=value_for("signal_type", default=None)),
-        )
-        add(
-            "funding.signal.score",
-            nested_value(signal, "score", default=value_for("signal_score", "score", default=0.0)),
-        )
-        add(
-            "funding.signal.confidence",
-            nested_value(signal, "confidence", default=value_for("signal_confidence", "confidence", default=0.0)),
-        )
-        add(
-            "funding.signal.bias",
-            nested_value(signal, "bias", "direction", default=value_for("bias", "direction", default=None)),
-        )
+        if section_detected(extreme):
+            add("funding.extreme", extreme, section="extreme")
+            add(
+                "funding.extreme.type",
+                nested_value(
+                    extreme,
+                    "type",
+                    "extreme_type",
+                    default=value_for("extreme_type", default=None),
+                ),
+                section="extreme",
+            )
+            add(
+                "funding.extreme.severity",
+                nested_value(
+                    extreme,
+                    "severity",
+                    "score",
+                    default=value_for("extreme_severity", "score", default=0.0),
+                ),
+                section="extreme",
+            )
+            add(
+                "funding.extreme.mean_reversion_probability",
+                nested_value(
+                    extreme,
+                    "mean_reversion_probability",
+                    "reversion_probability",
+                    "reversal_probability",
+                    default=value_for("mean_reversion_probability", default=0.0),
+                ),
+                section="extreme",
+            )
+            add(
+                "funding.extreme.squeeze_probability",
+                nested_value(
+                    extreme,
+                    "squeeze_probability",
+                    "squeeze_risk",
+                    default=value_for("squeeze_probability", default=0.0),
+                ),
+                section="extreme",
+            )
+
+        if section_detected(divergence):
+            add("funding.divergence", divergence, section="divergence")
+            add(
+                "funding.divergence.type",
+                nested_value(
+                    divergence,
+                    "type",
+                    "divergence_type",
+                    default=value_for("divergence_type", default=None),
+                ),
+                section="divergence",
+            )
+            add(
+                "funding.divergence.confidence",
+                nested_value(
+                    divergence,
+                    "confidence",
+                    default=value_for("divergence_confidence", default=0.0),
+                ),
+                section="divergence",
+            )
+            add(
+                "funding.divergence.score",
+                nested_value(
+                    divergence,
+                    "score",
+                    default=value_for("divergence_score", default=0.0),
+                ),
+                section="divergence",
+            )
+
+        if section_detected(flip):
+            add("funding.flip", flip, section="flip")
+            add(
+                "funding.flip.type",
+                nested_value(
+                    flip,
+                    "type",
+                    "flip_type",
+                    default=value_for("flip_type", default=None),
+                ),
+                section="flip",
+            )
+            add(
+                "funding.flip.confidence",
+                nested_value(
+                    flip,
+                    "confidence",
+                    default=value_for("flip_confidence", default=0.0),
+                ),
+                section="flip",
+            )
+
+        if funding_signal:
+            add("funding.signal", funding_signal, section="signal")
+            add(
+                "funding.signal.type",
+                nested_value(
+                    funding_signal,
+                    "type",
+                    "signal_type",
+                    default=value_for("signal_type", default=None),
+                ),
+                section="signal",
+            )
+            add(
+                "funding.signal.score",
+                nested_value(
+                    funding_signal,
+                    "score",
+                    default=value_for("signal_score", "score", default=0.0),
+                ),
+                section="signal",
+            )
+            add(
+                "funding.signal.confidence",
+                nested_value(
+                    funding_signal,
+                    "confidence",
+                    default=value_for("signal_confidence", "confidence", default=0.0),
+                ),
+                section="signal",
+            )
+            add(
+                "funding.signal.bias",
+                nested_value(
+                    funding_signal,
+                    "bias",
+                    "side",
+                    "direction",
+                    default=value_for("bias", "side", "direction", default=None),
+                ),
+                section="signal",
+            )
 
         return result
 

@@ -5,21 +5,22 @@ from .base import (
     OpenInterestStrategyScope,
     OpenInterestTradingStrategy,
 )
-from .oi_anomaly_strategy import (
-    OIAnomalyStrategy,
-    OIAnomalyStrategyConfig,
+
+from .oi_divergence_strategy import (
+    OIDivergenceStrategy,
+    OIDivergenceStrategyConfig,
 )
 from .oi_breakout_confirmation_strategy import (
     OIBreakoutConfirmationStrategy,
     OIBreakoutConfirmationStrategyConfig,
 )
+from .oi_anomaly_strategy import (
+    OIAnomalyStrategy,
+    OIAnomalyStrategyConfig,
+)
 from .oi_capitulation_strategy import (
     OICapitulationStrategy,
     OICapitulationStrategyConfig,
-)
-from .oi_divergence_strategy import (
-    OIDivergenceStrategy,
-    OIDivergenceStrategyConfig,
 )
 
 __all__ = [
@@ -28,12 +29,12 @@ __all__ = [
     "OpenInterestStrategyConfig",
     "OpenInterestStrategyScope",
     "OpenInterestTradingStrategy",
-    "OIAnomalyStrategy",
-    "OIAnomalyStrategyConfig",
-    "OIBreakoutConfirmationStrategy",
-    "OIBreakoutConfirmationStrategyConfig",
-    "OICapitulationStrategy",
-    "OICapitulationStrategyConfig",
     "OIDivergenceStrategy",
     "OIDivergenceStrategyConfig",
+    "OIBreakoutConfirmationStrategy",
+    "OIBreakoutConfirmationStrategyConfig",
+    "OIAnomalyStrategy",
+    "OIAnomalyStrategyConfig",
+    "OICapitulationStrategy",
+    "OICapitulationStrategyConfig",
 ]

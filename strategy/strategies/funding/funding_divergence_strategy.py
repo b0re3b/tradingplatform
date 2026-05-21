@@ -283,32 +283,55 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         return set(base_required).union(self.divergence_config.required_funding_features)
 
     async def generate_signal(
-        self,
-        context: StrategyContext,
+            self,
+            context: StrategyContext,
     ) -> StrategySignal | None:
         self.validate_context_requirements(context)
 
         divergence = funding_item(context, "divergence")
         if divergence is None:
+            self.remember_no_signal(
+                "missing_funding_divergence",
+                funding_domain_keys=sorted(self.funding_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         event_time = extract_event_time(divergence)
         if (
-            self.divergence_config.require_fresh_divergence
-            and is_stale(
-                event_time=event_time,
-                now=context.timestamp,
+                self.divergence_config.require_fresh_divergence
+                and is_stale(
+            event_time=event_time,
+            now=context.timestamp,
+            stale_after_seconds=self.divergence_config.stale_feature_max_age_seconds,
+        )
+        ):
+            self.remember_no_signal(
+                "stale_funding_divergence",
+                event_time=event_time.isoformat() if event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
                 stale_after_seconds=self.divergence_config.stale_feature_max_age_seconds,
             )
-        ):
             return None
 
         side = self._derive_side_from_divergence(divergence)
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "funding_divergence_side_not_directional",
+                divergence=serialize_for_metadata(divergence),
+            )
             return None
 
         divergence_confidence = self._divergence_confidence(divergence)
         if divergence_confidence < self.divergence_config.min_divergence_confidence:
+            self.remember_no_signal(
+                "funding_divergence_confidence_below_minimum",
+                divergence=serialize_for_metadata(divergence),
+                divergence_confidence=divergence_confidence,
+                min_divergence_confidence=(
+                    self.divergence_config.min_divergence_confidence
+                ),
+            )
             return None
 
         pressure = funding_item(context, "pressure")
@@ -318,12 +341,35 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         funding_signal = funding_item(context, "signal")
 
         if self.divergence_config.require_pressure_present and pressure is None:
+            self.remember_no_signal(
+                "funding_divergence_missing_required_pressure",
+                funding_domain_keys=sorted(self.funding_domain(context).keys()),
+            )
             return None
 
         if not self._passes_regime_filter(regime):
+            self.remember_no_signal(
+                "funding_divergence_regime_filter_failed",
+                regime=serialize_for_metadata(regime),
+                min_regime_confidence=self.divergence_config.min_regime_confidence,
+                require_non_neutral_regime=(
+                    self.divergence_config.require_non_neutral_regime
+                ),
+            )
             return None
 
         if not self._passes_pressure_filter(side=side, pressure=pressure):
+            self.remember_no_signal(
+                "funding_divergence_pressure_filter_failed",
+                side=side.value,
+                pressure=serialize_for_metadata(pressure),
+                pressure_score=self._pressure_score(pressure),
+                pressure_side=self._pressure_side(pressure).value,
+                min_pressure_score=self.divergence_config.min_pressure_score,
+                require_pressure_alignment=(
+                    self.divergence_config.require_pressure_alignment
+                ),
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -338,66 +384,26 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         )
 
         if breakdown.score < self.divergence_config.min_signal_score:
+            self.remember_no_signal(
+                "funding_divergence_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.divergence_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.divergence_config.min_signal_confidence:
+            self.remember_no_signal(
+                "funding_divergence_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.divergence_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
-        setup_label = (
-            self.divergence_config.bullish_setup_label
-            if side is SignalSide.LONG
-            else self.divergence_config.bearish_setup_label
-        )
-
-        source_features = self._source_features(
-            divergence=divergence,
-            pressure=pressure,
-            regime=regime,
-            extreme=extreme,
-            flip=flip,
-            funding_signal=funding_signal,
-        )
-
-        reasons = list(dict.fromkeys([
-            setup_label,
-            *breakdown.reasons,
-        ]))
-
-        confirmations = list(dict.fromkeys(breakdown.confirmations))
-
-        metadata = {
-            "funding_setup_label": setup_label,
-            "funding_setup_family": "funding_divergence",
-            "funding_strategy_version": "2.0.0",
-            "score_breakdown": breakdown.to_dict(),
-            "divergence": serialize_for_metadata(divergence),
-            "pressure": serialize_for_metadata(pressure),
-            "regime": serialize_for_metadata(regime),
-            "extreme": serialize_for_metadata(extreme),
-            "flip": serialize_for_metadata(flip),
-            "funding_signal": serialize_for_metadata(funding_signal),
-            "event_time": event_time.isoformat() if event_time else None,
-            "tags": self._tags(
-                divergence=divergence,
-                pressure=pressure,
-                regime=regime,
-                extreme=extreme,
-                funding_signal=funding_signal,
-            ),
-        }
-
-        return self.build_funding_signal(
-            context=context,
-            side=side,
-            confidence=breakdown.confidence,
-            score=breakdown.score,
-            setup_type=self.divergence_config.default_setup_type,
-            reasons=reasons,
-            confirmations=confirmations,
-            source_features=source_features,
-            metadata=metadata,
-            priority=self.divergence_config.default_priority,
-        )
+       
 
     # ------------------------------------------------------------------
     # Filters
