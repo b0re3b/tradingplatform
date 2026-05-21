@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -290,39 +291,41 @@ class BaseStrategyComponent(ABC):
 
         # 1) New/full EventBus contract:
         # publish_nowait_best_effort(topic, payload, priority=..., source=...)
-        try:
-            publish_nowait(
-                topic,
-                enriched_payload,
-                priority=priority,
-                source=event_source,
-                **kwargs,
-            )
+        if self._try_publish_nowait_best_effort(
+            publish_nowait,
+            topic,
+            topic,
+            enriched_payload,
+            priority=priority,
+            source=event_source,
+            **kwargs,
+        ):
             return
-        except TypeError as exc:
-            first_error = exc
 
         # 2) Simpler EventBus contract:
         # publish_nowait_best_effort(topic, payload)
-        try:
-            publish_nowait(topic, enriched_payload)
+        if self._try_publish_nowait_best_effort(
+            publish_nowait,
+            topic,
+            topic,
+            enriched_payload,
+        ):
             return
-        except TypeError:
-            pass
 
         # 3) Current core contract in your project:
         # publish_nowait_best_effort(Event(...))
-        try:
-            event = Event(
-                topic=topic,
-                payload=enriched_payload,
-                priority=priority,
-                source=event_source,
-            )
-            publish_nowait(event)
+        event = Event(
+            topic=topic,
+            payload=enriched_payload,
+            priority=priority,
+            source=event_source,
+        )
+        if self._try_publish_nowait_best_effort(
+            publish_nowait,
+            topic,
+            event,
+        ):
             return
-        except TypeError:
-            pass
 
         # 4) Compatibility for Event dataclass variants that use name/event_name
         # instead of topic/source.
@@ -363,16 +366,90 @@ class BaseStrategyComponent(ABC):
         ):
             try:
                 event = Event(**event_kwargs)
-                publish_nowait(event)
-                return
             except TypeError:
                 continue
+
+            if self._try_publish_nowait_best_effort(
+                publish_nowait,
+                topic,
+                event,
+            ):
+                return
 
         self.log_warning(
             "Failed to emit best-effort event due to incompatible EventBus contract",
             topic=topic,
-            error=str(first_error),
         )
+
+    def _complete_best_effort_publish(
+        self,
+        result: Any,
+        *,
+        topic: str,
+    ) -> None:
+        """
+        Complete/schedule a best-effort EventBus publish result.
+
+        Some EventBus implementations expose publish_nowait_best_effort as a
+        normal synchronous method. Others expose it as async coroutine. This
+        helper prevents "coroutine was never awaited" warnings and ensures the
+        event is actually submitted.
+        """
+        if not inspect.isawaitable(result):
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(result)
+            except Exception:
+                self.log_exception(
+                    "Best-effort async event publish failed",
+                    topic=topic,
+                )
+            return
+
+        task = loop.create_task(result)
+
+        def _log_task_error(done_task: asyncio.Task[Any]) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                self.log_debug(
+                    "Best-effort async event publish cancelled",
+                    topic=topic,
+                )
+            except Exception:
+                self.log_exception(
+                    "Best-effort async event publish failed",
+                    topic=topic,
+                )
+
+        task.add_done_callback(_log_task_error)
+
+    def _try_publish_nowait_best_effort(
+        self,
+        publish_nowait: Callable[..., Any],
+        topic: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """
+        Try one EventBus publish_nowait_best_effort call shape.
+
+        Returns:
+        - True when the call shape was accepted and the result was completed or
+          scheduled;
+        - False when only the call signature was incompatible.
+        """
+        try:
+            result = publish_nowait(*args, **kwargs)
+        except TypeError:
+            return False
+
+        self._complete_best_effort_publish(result, topic=topic)
+        return True
 
     def subscribe_event(
         self,

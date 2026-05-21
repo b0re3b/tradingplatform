@@ -418,26 +418,31 @@ def print_result_summary(result: BacktestResult) -> None:
     print("============================\n")
 
 
-def _safe_public_value(value: Any) -> Any:
+def _safe_public_value(value: Any, _depth: int = 0) -> Any:
     """
     Convert a debug value into something printable and reasonably compact.
+    Beyond depth 1 everything collapses to str() to avoid multi-KB dumps.
     """
 
     if value is None:
         return None
+
+    # Collapse deep nesting immediately — prevents datetime/defaultdict walls
+    if _depth > 1:
+        return str(value)
 
     if isinstance(value, (str, int, float, bool)):
         return value
 
     if isinstance(value, dict):
         return {
-            str(key): _safe_public_value(item)
+            str(key): _safe_public_value(item, _depth + 1)
             for key, item in list(value.items())[:80]
         }
 
     if isinstance(value, (list, tuple, set)):
         items = list(value)
-        return [_safe_public_value(item) for item in items[:80]]
+        return [_safe_public_value(item, _depth + 1) for item in items[:80]]
 
     if hasattr(value, "value"):
         try:
@@ -447,14 +452,14 @@ def _safe_public_value(value: Any) -> Any:
 
     if hasattr(value, "to_dict"):
         try:
-            return _safe_public_value(value.to_dict())
+            return _safe_public_value(value.to_dict(), _depth + 1)
         except (TypeError, ValueError, AttributeError, RuntimeError):
             pass
 
     if hasattr(value, "__dict__"):
         try:
             return {
-                key: _safe_public_value(item)
+                key: _safe_public_value(item, _depth + 1)
                 for key, item in vars(value).items()
                 if not key.startswith("_")
             }
@@ -489,6 +494,63 @@ def _print_mapping(title: str, mapping: dict[str, Any]) -> None:
 
     for key, value in mapping.items():
         print(f"- {key}: {_safe_public_value(value)}")
+
+
+# ---------------------------------------------------------------------------
+# Compact stats helper — replaces the raw stats dump in engine/processor
+# ---------------------------------------------------------------------------
+
+_STATS_COUNTER_KEYS = (
+    "events_received",
+    "events_processed",
+    "events_failed",
+    "events_rejected",
+    "signals_generated",
+    "signals_rejected",
+    "signals_emitted",
+    "signals_built",
+    "signals_filtered",
+    "batches_processed",
+)
+
+_STATS_TIME_KEYS = (
+    "started_at",
+    "updated_at",
+)
+
+
+def _compact_stats(stats: Any) -> dict[str, Any]:
+    """
+    Extract only numeric counters and timestamps from a stats object.
+    Deliberately ignores per-strategy dicts, defaultdicts, and last_*_at maps
+    to keep the output to one short line.
+    """
+    result: dict[str, Any] = {}
+
+    for key in _STATS_COUNTER_KEYS:
+        v = _read_attr(stats, key, None)
+        if v is not None:
+            result[key] = v
+
+    for key in _STATS_TIME_KEYS:
+        v = _read_attr(stats, key, None)
+        if v is not None:
+            result[key] = str(v)
+
+    # Fallback: try summary/snapshot but only keep scalar values from them
+    if not result:
+        for method_name in ("summary", "snapshot", "to_dict"):
+            raw = _call_noarg(stats, method_name)
+            if isinstance(raw, dict):
+                result = {
+                    k: v
+                    for k, v in raw.items()
+                    if isinstance(v, (int, float, bool, str))
+                }
+                if result:
+                    break
+
+    return result
 
 
 def _debug_strategy_config(
@@ -604,6 +666,7 @@ def _debug_strategy_registry(registry: Any) -> None:
 def _debug_strategy_engine(engine: Any) -> None:
     print("\nStrategyEngine:")
 
+    # --- Compact stats: counters + timestamps only, no per-strategy dicts ---
     stats_candidates = [
         _read_attr(engine, "stats", None),
         _read_attr(engine, "stats_state", None),
@@ -612,22 +675,11 @@ def _debug_strategy_engine(engine: Any) -> None:
     for stats in stats_candidates:
         if stats is None:
             continue
-
-        summary = _call_noarg(stats, "summary")
-        snapshot = _call_noarg(stats, "snapshot")
-        to_dict = _call_noarg(stats, "to_dict")
-
-        if summary is not None:
-            print(f"- stats.summary: {_safe_public_value(summary)}")
-            break
-        if snapshot is not None:
-            print(f"- stats.snapshot: {_safe_public_value(snapshot)}")
-            break
-        if to_dict is not None:
-            print(f"- stats.to_dict: {_safe_public_value(to_dict)}")
-            break
-
-        print(f"- stats: {_safe_public_value(stats)}")
+        compact = _compact_stats(stats)
+        if compact:
+            print(f"- stats: {compact}")
+        else:
+            print(f"- stats: {stats.__class__.__name__} (no scalar fields found)")
         break
     else:
         print("- stats: <missing>")
@@ -681,6 +733,7 @@ def _debug_strategy_engine(engine: Any) -> None:
 def _debug_signal_processor(processor: Any) -> None:
     print("\nSignalProcessor:")
 
+    # --- Compact stats: counters + timestamps only, no per-strategy dicts ---
     stats_candidates = [
         _read_attr(processor, "stats", None),
         _read_attr(processor, "stats_state", None),
@@ -689,22 +742,11 @@ def _debug_signal_processor(processor: Any) -> None:
     for stats in stats_candidates:
         if stats is None:
             continue
-
-        summary = _call_noarg(stats, "summary")
-        snapshot = _call_noarg(stats, "snapshot")
-        to_dict = _call_noarg(stats, "to_dict")
-
-        if summary is not None:
-            print(f"- stats.summary: {_safe_public_value(summary)}")
-            break
-        if snapshot is not None:
-            print(f"- stats.snapshot: {_safe_public_value(snapshot)}")
-            break
-        if to_dict is not None:
-            print(f"- stats.to_dict: {_safe_public_value(to_dict)}")
-            break
-
-        print(f"- stats: {_safe_public_value(stats)}")
+        compact = _compact_stats(stats)
+        if compact:
+            print(f"- stats: {compact}")
+        else:
+            print(f"- stats: {stats.__class__.__name__} (no scalar fields found)")
         break
     else:
         print("- stats: <missing>")
@@ -744,24 +786,27 @@ def _debug_runtime_state(runtime_state: Any) -> None:
         print("- <missing>")
         return
 
-    snapshot = _call_noarg(runtime_state, "snapshot")
-    to_dict = _call_noarg(runtime_state, "to_dict")
-    stats = _call_noarg(runtime_state, "stats")
-
-    if snapshot is not None:
-        print(f"- snapshot: {_safe_public_value(snapshot)}")
-    elif to_dict is not None:
-        print(f"- to_dict: {_safe_public_value(to_dict)}")
-    elif stats is not None:
-        print(f"- stats: {_safe_public_value(stats)}")
-    else:
-        print(f"- value: {_safe_public_value(runtime_state)}")
-
+    # Only show scalar summary — skip snapshot/to_dict to avoid large dumps
     for attr in ("signal_state", "context_store", "cooldown_state", "metrics_state"):
         value = _read_attr(runtime_state, attr, None)
         if value is not None:
-            compact = _call_noarg(value, "summary") or _call_noarg(value, "snapshot") or _call_noarg(value, "to_dict") or value
-            print(f"- {attr}: {_safe_public_value(compact)}")
+            class_name = value.__class__.__name__
+            # Try to get a single compact count/length instead of full dump
+            size: Any = None
+            for size_attr in ("count", "size", "__len__"):
+                if size_attr == "__len__":
+                    try:
+                        size = len(value)
+                    except TypeError:
+                        pass
+                else:
+                    size = _read_attr(value, size_attr, None)
+                if size is not None:
+                    break
+            if size is not None:
+                print(f"- {attr}: {class_name}(len={size})")
+            else:
+                print(f"- {attr}: {class_name}")
 
 
 def print_strategy_internal_debug(pipeline: Any, result: BacktestResult | None = None) -> None:

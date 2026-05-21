@@ -1735,6 +1735,11 @@ class SignalNormalizer(BaseStrategyComponent):
 
         result["external"] = external_layer
         result["internal"] = internal_layer
+        result.setdefault("last_price", event.get("price") or event.get("last_price") or event.get("close"))
+        result.setdefault("symbol", event.get("symbol"))
+        result.setdefault("timeframe", event.get("timeframe"))
+        result.setdefault("updated_at", event.get("timestamp") or event.get("updated_at"))
+        result.setdefault("last_update", event.get("timestamp") or event.get("last_update"))
         result["primary_layer"] = external_layer
         result["secondary_layer"] = internal_layer
         result.setdefault("last_break_event", event)
@@ -1844,8 +1849,23 @@ class SignalNormalizer(BaseStrategyComponent):
                 "confidence": confidence,
                 "score": score,
                 "trend_strength": result.get("trend_strength", result.get("strength", score)),
-                "momentum_score": result.get("momentum_score", result.get("momentum", score)),
-                "slope_score": result.get("slope_score", result.get("slope", score)),
+                "momentum_score": result.get(
+                    "momentum_score",
+                    result.get("momentum", result.get("directional_momentum", score)),
+                ),
+                "slope_score": result.get(
+                    "slope_score",
+                    result.get("slope", result.get("trend_slope", score)),
+                ),
+                "directional_momentum": result.get(
+                    "directional_momentum",
+                    result.get("momentum_score", result.get("momentum", score)),
+                ),
+                "trend_slope": result.get(
+                    "trend_slope",
+                    result.get("slope_score", result.get("slope", score)),
+                ),
+                "strength": result.get("strength", result.get("trend_strength", score)),
                 "continuation_probability": continuation_probability,
                 "reversal_risk": result.get("reversal_risk", 0.0),
                 "exhaustion_score": result.get("exhaustion_score", result.get("exhaustion", 0.0)),
@@ -1866,6 +1886,11 @@ class SignalNormalizer(BaseStrategyComponent):
 
         result["external"] = external_layer
         result["internal"] = internal_layer
+        result.setdefault("last_price", event.get("price") or event.get("last_price") or event.get("close"))
+        result.setdefault("symbol", event.get("symbol"))
+        result.setdefault("timeframe", event.get("timeframe"))
+        result.setdefault("updated_at", event.get("timestamp") or event.get("updated_at"))
+        result.setdefault("last_update", event.get("timestamp") or event.get("last_update"))
         result["primary_layer"] = external_layer
         result["secondary_layer"] = internal_layer
         result.setdefault("last_signal", event)
@@ -7231,15 +7256,59 @@ class SignalBuilder(BaseStrategyComponent):
             signal.entry_plan.validate()
             return signal.entry_plan
 
-        price = _to_float(signal.metadata.get("entry_price"))
+        price = (
+            _to_float(signal.metadata.get("entry_price"))
+            or _to_float(signal.metadata.get("price"))
+            or _to_float(signal.metadata.get("last_price"))
+            or _to_float(signal.metadata.get("current_price"))
+            or _to_float(signal.metadata.get("close"))
+        )
 
+        # In production/backtest analytics events the StrategySignal may not
+        # carry an explicit EntryPlan yet.  In that case the builder must be
+        # able to use the canonical StrategyContext price snapshot produced by
+        # SignalNormalizer.apply_to_context().  PriceSnapshot in strategy.models
+        # uses last_price; older compatibility code checked only last/close/price,
+        # so valid replay events could still fail with
+        # "build_failed:unable to resolve entry price".
         if price is None and context.price is not None:
             price = (
-                _to_float(getattr(context.price, "last", None))
+                _to_float(getattr(context.price, "last_price", None))
+                or _to_float(getattr(context.price, "last", None))
                 or _to_float(getattr(context.price, "close", None))
                 or _to_float(getattr(context.price, "mark_price", None))
+                or _to_float(getattr(context.price, "index_price", None))
                 or _to_float(getattr(context.price, "price", None))
             )
+
+        # Final fallback: read the active source-domain contract and generic
+        # feature snapshots.  This keeps concrete strategies clean while making
+        # SignalBuilder robust for merged/confluence signals whose metadata was
+        # stripped during merging.
+        if price is None:
+            source_domain = context.domain_dict(signal.category.to_feature_source())
+            for key in ("entry_price", "current_price", "last_price", "price", "close", "mark_price"):
+                price = _to_float(source_domain.get(key))
+                if price is not None and price > 0:
+                    break
+
+        if price is None:
+            for feature_name in (
+                "entry_price",
+                "price",
+                "last_price",
+                "current_price",
+                f"{signal.category.value}.entry_price",
+                f"{signal.category.value}.price",
+                f"{signal.category.value}.last_price",
+                f"{signal.category.value}.current_price",
+            ):
+                snapshot = context.get_feature(feature_name)
+                if snapshot is None:
+                    continue
+                price = _to_float(getattr(snapshot, "value", None))
+                if price is not None and price > 0:
+                    break
 
         if price is None or price <= 0:
             raise BuilderError("unable to resolve entry price")
@@ -7411,25 +7480,79 @@ class SignalBuilder(BaseStrategyComponent):
         execution_plan.validate()
         return execution_plan
 
-    @staticmethod
     def _infer_stop_loss(
+        self,
         signal: StrategySignal,
         *,
         entry_price: float,
     ) -> float | None:
+        """
+        Infer a protective invalidation price when a concrete strategy produced
+        a valid directional signal but did not attach an explicit ExitPlan.
+
+        Concrete strategies should still provide their own invalidation when
+        they have domain-specific structure levels.  This fallback exists for
+        analytics-driven/backtest payloads where the strategy intentionally
+        returns only the decision and leaves plan completion to SignalBuilder.
+        """
         stop_distance = _to_float(signal.metadata.get("stop_distance"))
 
         if stop_distance is None:
             atr = _to_float(signal.metadata.get("atr"))
             multiplier = _to_float(signal.metadata.get("atr_stop_multiplier"), 1.5) or 1.5
-            if atr is not None:
+            if atr is not None and atr > 0:
                 stop_distance = atr * multiplier
+
+        if stop_distance is None:
+            stop_bps = (
+                _to_float(signal.metadata.get("stop_loss_bps"))
+                or _to_float(signal.metadata.get("stop_bps"))
+                or _to_float(signal.metadata.get("invalidation_bps"))
+                or _to_float(getattr(self.builder_config, "default_stop_loss_bps", None))
+                or _to_float(getattr(self.builder_config, "default_stop_bps", None))
+                or _to_float(getattr(self.builder_config, "default_invalidation_bps", None))
+            )
+            if stop_bps is not None and stop_bps > 0:
+                stop_distance = entry_price * (stop_bps / 10_000.0)
+
+        if stop_distance is None:
+            stop_pct = (
+                _to_float(signal.metadata.get("stop_loss_pct"))
+                or _to_float(signal.metadata.get("stop_pct"))
+                or _to_float(signal.metadata.get("invalidation_pct"))
+                or _to_float(getattr(self.builder_config, "default_stop_loss_pct", None))
+                or _to_float(getattr(self.builder_config, "default_stop_pct", None))
+                or _to_float(getattr(self.builder_config, "default_invalidation_pct", None))
+            )
+            if stop_pct is not None and stop_pct > 0:
+                # Accept either fraction form (0.003 = 0.3%) or percent form
+                # (0.3 = 0.3%, 1.0 = 1%). Values above 1 are treated as
+                # percentages too, e.g. 2.5 -> 2.5%.
+                pct_fraction = stop_pct if stop_pct < 0.05 else stop_pct / 100.0
+                stop_distance = entry_price * pct_fraction
+
+        if stop_distance is None:
+            # Last-resort deterministic fallback for backtesting/simple
+            # analytics signals.  It is deliberately conservative and only
+            # used when no strategy/config metadata provides a stop.  Without
+            # this, a valid StrategySignal cannot become risk-ready although
+            # the builder has enough information to create a basic protective
+            # plan.
+            fallback_bps = (
+                _to_float(getattr(self.builder_config, "fallback_stop_loss_bps", None))
+                or _to_float(getattr(self.builder_config, "fallback_stop_bps", None))
+                or 30.0
+            )
+            stop_distance = entry_price * (fallback_bps / 10_000.0)
+            signal.metadata.setdefault("invalidation_source", "builder_fallback_stop_bps")
+            signal.metadata.setdefault("fallback_stop_loss_bps", fallback_bps)
 
         if stop_distance is None or stop_distance <= 0:
             return None
 
         if signal.side is SignalSide.LONG:
-            return entry_price - stop_distance
+            stop = entry_price - stop_distance
+            return stop if stop > 0 else None
 
         if signal.side is SignalSide.SHORT:
             return entry_price + stop_distance
@@ -7564,7 +7687,22 @@ class PortfolioCoordinator(BaseStrategyComponent):
                 accepted.append(signal)
                 continue
 
-            delta = (ensure_aware_utc(now) - previous.timestamp).total_seconds()
+            previous_ts = ensure_aware_utc(previous.timestamp)
+            current_ts = ensure_aware_utc(now)
+            delta = (current_ts - previous_ts).total_seconds()
+
+            # Replay/backtest safety: identical or non-monotonic timestamps should
+            # not be treated as a newer repeated live signal. In the backtesting
+            # harness the same historical analytics event may be processed more
+            # than once (EventBus path + direct debug path, or overlapping
+            # subscriptions). Suppressing equal-timestamp signals prevents any
+            # signal.generated from being emitted even though the signal is valid.
+            # Live repeated-signal suppression still applies only to strictly
+            # newer signals within the configured window.
+            if delta <= 0:
+                accepted.append(signal)
+                continue
+
             if delta <= window and (
                 previous.strategy_name == signal.strategy_name
                 or previous.setup_type == signal.setup_type
@@ -7867,6 +8005,15 @@ class SignalProcessor(BaseStrategyComponent):
         batch.final_signals = list(coordinated.final_signals)
 
         if not coordinated.accepted or not batch.final_signals:
+            batch.metadata["coordination_rejected"] = {
+                "reasons": list(coordinated.reasons),
+                "rejected_signals": dict(coordinated.rejected_signals),
+                "throttled_signals": dict(coordinated.throttled_signals),
+                "suppressed_signals": dict(coordinated.suppressed_signals),
+                "raw_signal_count": len(coordinated.raw_signals),
+                "accepted_signal_count": len(coordinated.accepted_signals),
+                "merged_signal_count": len(coordinated.merged_signals),
+            }
             batch.reasons.append("portfolio_coordination_rejected")
             await self._emit_rejected_batch(batch, reason="portfolio_coordination_rejected")
             return batch
