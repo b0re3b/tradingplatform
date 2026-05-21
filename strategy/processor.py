@@ -1,5 +1,3 @@
-# trading_system/strategy/processor.py
-
 from __future__ import annotations
 
 import inspect

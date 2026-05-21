@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Awaitable, Callable
 
-from core.event_bus import EventBus, EventPriority
+from core.event_bus import Event, EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
@@ -232,20 +232,28 @@ class BaseStrategyComponent(ABC):
         )
 
     def emit_event_nowait_best_effort(
-        self,
-        topic: str,
-        payload: dict[str, Any],
-        *,
-        priority: EventPriority = EventPriority.NORMAL,
-        source: str | None = None,
-        **kwargs: Any,
+            self,
+            topic: str,
+            payload: dict[str, Any],
+            *,
+            priority: EventPriority = EventPriority.NORMAL,
+            source: str | None = None,
+            **kwargs: Any,
     ) -> None:
         """
         Best-effort EventBus emit for sync code paths.
 
-        Використовувати обережно: для важливих signal/risk подій краще await
-        emit_event().
+        Supports multiple EventBus contracts:
+        - publish_nowait_best_effort(topic, payload, priority=..., source=...)
+        - publish_nowait_best_effort(topic, payload)
+        - publish_nowait_best_effort(Event(...))
         """
+        if not topic.strip():
+            raise ValueError("topic cannot be empty")
+
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+
         if self.event_bus is None:
             self.log_debug(
                 "Best-effort event skipped because event_bus is not configured",
@@ -254,19 +262,116 @@ class BaseStrategyComponent(ABC):
             return
 
         publish_nowait = getattr(self.event_bus, "publish_nowait_best_effort", None)
-        if callable(publish_nowait):
-            publish_nowait(
-                topic,
-                payload,
-                priority=priority,
-                source=source or self.component_name,
-                **kwargs,
+        if not callable(publish_nowait):
+            self.log_warning(
+                "EventBus does not support publish_nowait_best_effort",
+                topic=topic,
             )
             return
 
+        event_source = source or self.component_name
+
+        enriched_payload = dict(payload)
+        metadata = enriched_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        metadata.setdefault("source", event_source)
+        metadata.setdefault(
+            "priority",
+            priority.value if hasattr(priority, "value") else str(priority),
+        )
+        metadata.setdefault("best_effort", True)
+
+        if kwargs:
+            metadata.setdefault("event_kwargs", dict(kwargs))
+
+        enriched_payload["metadata"] = metadata
+
+        # 1) New/full EventBus contract:
+        # publish_nowait_best_effort(topic, payload, priority=..., source=...)
+        try:
+            publish_nowait(
+                topic,
+                enriched_payload,
+                priority=priority,
+                source=event_source,
+                **kwargs,
+            )
+            return
+        except TypeError as exc:
+            first_error = exc
+
+        # 2) Simpler EventBus contract:
+        # publish_nowait_best_effort(topic, payload)
+        try:
+            publish_nowait(topic, enriched_payload)
+            return
+        except TypeError:
+            pass
+
+        # 3) Current core contract in your project:
+        # publish_nowait_best_effort(Event(...))
+        try:
+            event = Event(
+                topic=topic,
+                payload=enriched_payload,
+                priority=priority,
+                source=event_source,
+            )
+            publish_nowait(event)
+            return
+        except TypeError:
+            pass
+
+        # 4) Compatibility for Event dataclass variants that use name/event_name
+        # instead of topic/source.
+        for event_kwargs in (
+                {
+                    "name": topic,
+                    "payload": enriched_payload,
+                    "priority": priority,
+                    "source": event_source,
+                },
+                {
+                    "event_name": topic,
+                    "payload": enriched_payload,
+                    "priority": priority,
+                    "source": event_source,
+                },
+                {
+                    "type": topic,
+                    "payload": enriched_payload,
+                    "priority": priority,
+                    "source": event_source,
+                },
+                {
+                    "topic": topic,
+                    "payload": enriched_payload,
+                    "priority": priority,
+                },
+                {
+                    "name": topic,
+                    "payload": enriched_payload,
+                    "priority": priority,
+                },
+                {
+                    "event_name": topic,
+                    "payload": enriched_payload,
+                    "priority": priority,
+                },
+        ):
+            try:
+                event = Event(**event_kwargs)
+                publish_nowait(event)
+                return
+            except TypeError:
+                continue
+
         self.log_warning(
-            "EventBus does not support publish_nowait_best_effort",
+            "Failed to emit best-effort event due to incompatible EventBus contract",
             topic=topic,
+            error=str(first_error),
         )
 
     def subscribe_event(

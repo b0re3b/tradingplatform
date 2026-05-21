@@ -274,7 +274,7 @@ class ConfluenceConfig:
     enabled: bool = True
     min_agreement_count: int = 2
     min_confidence: float = 0.6
-    min_score: float = 1.0
+    min_score: float = 0.65
     conflict_penalty: float = 0.15
     confirmation_bonus: float = 0.10
     max_strategies_per_side: int = 10
