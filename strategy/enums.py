@@ -171,6 +171,10 @@ class StrategyCategory(StrEnum):
     OPEN_INTEREST = "open_interest"
     HYBRID = "hybrid"
 
+    def to_feature_source(self) -> "FeatureSource":
+        """Return the canonical FeatureSource for this strategy category."""
+        return FeatureSource.from_strategy_category(self)
+
 
 class FeatureSource(StrEnum):
     """

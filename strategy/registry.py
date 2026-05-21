@@ -222,14 +222,23 @@ class StrategyRegistry(BaseStrategyComponent):
     def is_empty(self) -> bool:
         return not self._strategies
 
-    def list_all(self) -> list[BaseStrategy]:
+    def list_all(self, *, include_disabled: bool = False) -> list[BaseStrategy]:
+        strategies = [
+            strategy
+            for strategy in self._strategies.values()
+            if include_disabled or strategy.is_enabled()
+        ]
+
         return sorted(
-            self._strategies.values(),
+            strategies,
             key=lambda strategy: (strategy.priority, strategy.strategy_name),
         )
 
-    def list_names(self) -> list[str]:
-        return [strategy.strategy_name for strategy in self.list_all()]
+    def list_names(self, *, include_disabled: bool = False) -> list[str]:
+        return [
+            strategy.strategy_name
+            for strategy in self.list_all(include_disabled=include_disabled)
+        ]
 
     def list_by_category(
         self,
@@ -357,6 +366,11 @@ class StrategyRegistry(BaseStrategyComponent):
         return {
             "total": len(self._strategies),
             "strategies": self.list_names(),
+            "disabled_strategies": sorted(
+                name
+                for name, strategy in self._strategies.items()
+                if not strategy.is_enabled()
+            ),
             "by_category": {
                 category.value: sorted(names)
                 for category, names in self._by_category.items()

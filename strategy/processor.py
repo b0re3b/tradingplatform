@@ -17,6 +17,7 @@ from strategy.config import (
     StrategyConfig,
 )
 from strategy.enums import (
+    ConfidenceGrade,
     ConflictType,
     EntryType,
     ExitType,
@@ -25,6 +26,7 @@ from strategy.enums import (
     MarketRegime,
     SignalOrigin,
     SignalSide,
+    SignalStrength,
     StrategyCategory,
     StrategyExecutionQuality,
     StrategyLiquidityClass,
@@ -373,6 +375,7 @@ class ProcessedSignalBatch:
     emitted: bool = False
     reasons: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    debug: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.timestamp = ensure_aware_utc(self.timestamp)
@@ -6434,8 +6437,8 @@ class SignalScorer(BaseStrategyComponent):
 
         signal.score = clamp(max(signal.score, priority_score), 0.0, 1.0)
         signal.confidence = clamp(signal.confidence, 0.0, 1.0)
-        signal.confidence_grade = confidence_to_grade(signal.confidence)
-        signal.strength = confidence_to_strength(signal.confidence)
+        signal.confidence_grade = self._confidence_grade(signal.confidence)
+        signal.strength = self._confidence_strength(signal.confidence)
 
         signal.validate()
         return signal
@@ -6665,8 +6668,8 @@ class SignalScorer(BaseStrategyComponent):
             side=vote_summary.dominant_side,
             score=adjusted_score,
             confidence=adjusted_confidence,
-            confidence_grade=confidence_to_grade(adjusted_confidence),
-            strength=confidence_to_strength(adjusted_confidence),
+            confidence_grade=self._confidence_grade(adjusted_confidence),
+            strength=self._confidence_strength(adjusted_confidence),
             strategy_names=[item.signal.strategy_name for item in weighted_signals],
             reasons=reasons,
             confirmations=[
@@ -6686,6 +6689,32 @@ class SignalScorer(BaseStrategyComponent):
                 "conflict_penalty": conflict_summary.total_penalty,
             },
         )
+
+    def _confidence_grade(self, confidence: float) -> ConfidenceGrade:
+        value = clamp(confidence, 0.0, 1.0)
+        very_low, low, medium, high = self.config.confidence.grade_bounds()
+
+        if value >= high:
+            return ConfidenceGrade.VERY_HIGH
+        if value >= medium:
+            return ConfidenceGrade.HIGH
+        if value >= low:
+            return ConfidenceGrade.MEDIUM
+        if value >= very_low:
+            return ConfidenceGrade.LOW
+        return ConfidenceGrade.VERY_LOW
+
+    def _confidence_strength(self, confidence: float) -> SignalStrength:
+        value = clamp(confidence, 0.0, 1.0)
+        _, low, medium, high = self.config.confidence.grade_bounds()
+
+        if value >= high:
+            return SignalStrength.EXTREME
+        if value >= medium:
+            return SignalStrength.STRONG
+        if value >= low:
+            return SignalStrength.MODERATE
+        return SignalStrength.WEAK
 
     @staticmethod
     def _tier_from_priority_score(value: float) -> StrategyTradeTier:
@@ -6915,9 +6944,9 @@ class ConfluenceEngine(BaseStrategyComponent):
 
     @staticmethod
     def _merge(
-        *,
-        result: ConfluenceResult,
-        signals: list[StrategySignal],
+            *,
+            result: ConfluenceResult,
+            signals: list[StrategySignal],
     ) -> StrategySignal | None:
         if not signals:
             return None
@@ -7012,12 +7041,38 @@ class SignalFilterChain(BaseStrategyComponent):
             timestamp=context.timestamp,
         )
 
+        # Hard safety filters are always enforced. Optional filters are governed
+        # by FilterConfig so preset-level settings are not silently ignored.
         self._filter_symbol_match(evaluation, context)
         self._filter_directional(evaluation)
+
+        filters = self.config.filters
+        if not filters.enabled:
+            return evaluation
+
         self._filter_confidence(evaluation)
         self._filter_score(evaluation)
+        self._filter_risk_reward(evaluation)
         self._filter_age(evaluation, context)
-        self._filter_freshness(evaluation, context)
+
+        if filters.enable_freshness_filter:
+            self._filter_freshness(evaluation, context)
+
+        if filters.enable_regime_filter:
+            self._filter_regime(evaluation, context)
+
+        if filters.enable_volatility_filter:
+            self._filter_volatility(evaluation, context)
+
+        if filters.enable_liquidity_filter:
+            self._filter_liquidity(evaluation, context)
+
+        if filters.enable_spread_filter:
+            self._filter_spread(evaluation, context)
+
+        if filters.enable_funding_filter:
+            self._filter_funding(evaluation, context)
+
         self._filter_execution_quality(evaluation)
 
         return evaluation
@@ -7048,7 +7103,8 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_confidence(self, evaluation: FilterEvaluation) -> None:
-        threshold = self.config.runtime.min_confidence
+        configured = self.config.filters.min_signal_confidence
+        threshold = self.config.runtime.min_confidence if configured is None else configured
 
         if evaluation.signal.confidence < threshold:
             evaluation.add_result(
@@ -7061,7 +7117,8 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_score(self, evaluation: FilterEvaluation) -> None:
-        threshold = self.config.runtime.min_score
+        configured = self.config.filters.min_signal_score
+        threshold = self.config.runtime.min_score if configured is None else configured
 
         if evaluation.signal.score < threshold:
             evaluation.add_result(
@@ -7094,6 +7151,153 @@ class SignalFilterChain(BaseStrategyComponent):
                     metadata={"age_seconds": age, "max_age_seconds": max_age},
                 )
             )
+
+    def _filter_risk_reward(self, evaluation: FilterEvaluation) -> None:
+        threshold = self.config.filters.min_risk_reward
+        if threshold <= 0:
+            return
+
+        rr = _to_float(evaluation.signal.metadata.get("rr"))
+        if rr is None:
+            entry = evaluation.signal.primary_entry_price
+            stop = evaluation.signal.primary_stop_loss
+            target = evaluation.signal.primary_take_profit
+            if entry is not None and stop is not None and target is not None:
+                risk = abs(entry - stop)
+                reward = abs(target - entry)
+                if risk > 0:
+                    rr = reward / risk
+
+        if rr is not None and rr < threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="min_risk_reward",
+                    decision=FilterDecision.BLOCK,
+                    reason="risk_reward_below_filter_threshold",
+                    metadata={"rr": rr, "threshold": threshold},
+                )
+            )
+
+    def _filter_regime(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        allowed = self.config.runtime.allowed_regimes
+        if not allowed or MarketRegime.UNKNOWN in allowed:
+            return
+
+        regime = context.current_regime
+        if regime not in allowed:
+            evaluation.add_result(
+                FilterResult(
+                    name="regime",
+                    decision=FilterDecision.BLOCK,
+                    reason="regime_not_allowed_by_runtime_config",
+                    metadata={"regime": regime.value, "allowed": [item.value for item in allowed]},
+                )
+            )
+
+    def _filter_volatility(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        value = self._context_float(
+            context,
+            "volatility_zscore",
+            "volatility_z_score",
+            "volatility.zscore",
+            "volatility.z_score",
+        )
+        if value is None:
+            return
+
+        threshold = self.config.filters.max_volatility_zscore
+        if abs(value) > threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="volatility",
+                    decision=FilterDecision.BLOCK,
+                    reason="volatility_zscore_above_filter_threshold",
+                    metadata={"volatility_zscore": value, "threshold": threshold},
+                )
+            )
+
+    def _filter_liquidity(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        value = self._context_float(
+            context,
+            "liquidity_score",
+            "market_liquidity_score",
+            "depth_score",
+            "liquidity.score",
+        )
+        if value is None:
+            return
+
+        threshold = self.config.filters.min_liquidity_score
+        if value < threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="liquidity",
+                    decision=FilterDecision.BLOCK,
+                    reason="liquidity_score_below_filter_threshold",
+                    metadata={"liquidity_score": value, "threshold": threshold},
+                )
+            )
+
+    def _filter_spread(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        value = self._context_float(
+            context,
+            "spread_bps",
+            "market_spread_bps",
+            "bid_ask_spread_bps",
+            "spreads.spread_bps",
+        )
+        if value is None:
+            return
+
+        threshold = self.config.filters.max_spread_bps
+        if value > threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="spread",
+                    decision=FilterDecision.BLOCK,
+                    reason="spread_bps_above_filter_threshold",
+                    metadata={"spread_bps": value, "threshold": threshold},
+                )
+            )
+
+    def _filter_funding(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        value = self._context_float(
+            context,
+            "funding_alignment",
+            "funding.bias_alignment",
+            "funding.alignment",
+        )
+        if value is None:
+            return
+
+        threshold = self.config.filters.min_funding_alignment
+        if value < threshold:
+            evaluation.add_result(
+                FilterResult(
+                    name="funding",
+                    decision=FilterDecision.BLOCK,
+                    reason="funding_alignment_below_filter_threshold",
+                    metadata={"funding_alignment": value, "threshold": threshold},
+                )
+            )
+
+    @staticmethod
+    def _context_float(context: StrategyContext, *names: str) -> float | None:
+        for name in names:
+            value = context.get_feature(name, None)
+            parsed = _to_float(value)
+            if parsed is not None:
+                return parsed
+
+            if "." in name:
+                domain_name, key = name.split(".", 1)
+                domain = getattr(context, domain_name, None)
+                if isinstance(domain, dict):
+                    parsed = _to_float(domain.get(key))
+                    if parsed is not None:
+                        return parsed
+
+        return None
 
     @staticmethod
     def _filter_freshness(
@@ -7286,7 +7490,7 @@ class SignalBuilder(BaseStrategyComponent):
         # SignalBuilder robust for merged/confluence signals whose metadata was
         # stripped during merging.
         if price is None:
-            source_domain = context.domain_dict(signal.category.to_feature_source())
+            source_domain = context.domain_dict(FeatureSource.from_strategy_category(signal.category))
             for key in ("entry_price", "current_price", "last_price", "price", "close", "mark_price"):
                 price = _to_float(source_domain.get(key))
                 if price is not None and price > 0:
@@ -7568,7 +7772,7 @@ class SignalBuilder(BaseStrategyComponent):
     ) -> float | None:
         rr = _to_float(signal.metadata.get("rr"))
         if rr is None:
-            rr = _to_float(getattr(self.builder_config, "default_rr", None), 2.0) or 2.0
+            rr = _to_float(getattr(self.builder_config, "default_rr_ratio", None), 2.0) or 2.0
 
         if rr <= 0:
             return None
@@ -7940,11 +8144,33 @@ class SignalProcessor(BaseStrategyComponent):
             normalized=normalized,
             context=context,
             route=route,
+            metadata={
+                "event_name": event_name,
+                "source_topic": event_name,
+                "source": normalized.source.value,
+                "timeframe": normalized.timeframe.value,
+                "normalized": dict(normalized.metadata),
+            },
+        )
+
+        self._update_batch_debug(
+            batch,
+            failure_stage="routing",
+            reason="initial",
+            payload=payload,
         )
 
         if route.is_empty:
             batch.reasons.append("no_strategies_routed")
             self.state.metrics.record_applicability_skip()
+            self._update_batch_debug(
+                batch,
+                failure_stage="routing",
+                reason="no_strategies_routed",
+                payload=payload,
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="no_strategies_routed")
             return batch
 
         evaluations = await self.evaluate_strategies(
@@ -7962,7 +8188,14 @@ class SignalProcessor(BaseStrategyComponent):
 
         if not raw_signals:
             batch.reasons.append("no_passed_strategy_signals")
-            await self._emit_rejected_batch(batch, reason="no_passed_strategy_signals")
+            self._update_batch_debug(
+                batch,
+                failure_stage="strategy_evaluation",
+                reason="no_passed_strategy_signals",
+                payload=payload,
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="no_passed_strategy_signals")
             return batch
 
         scored = self.scorer.score_many(signals=raw_signals, context=context)
@@ -7972,7 +8205,15 @@ class SignalProcessor(BaseStrategyComponent):
 
         if not filtered:
             batch.reasons.append("all_signals_filtered")
-            await self._emit_rejected_batch(batch, reason="all_signals_filtered")
+            self._update_batch_debug(
+                batch,
+                failure_stage="filters",
+                reason="all_signals_filtered",
+                payload=payload,
+                extra={"raw_signals": self._signals_debug(raw_signals)},
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="all_signals_filtered")
             return batch
 
         confluence = self.confluence.evaluate(signals=filtered, context=context)
@@ -7981,7 +8222,19 @@ class SignalProcessor(BaseStrategyComponent):
         confluence_signals = self._signals_after_confluence(confluence, filtered)
         if not confluence_signals:
             batch.reasons.append("confluence_rejected")
-            await self._emit_rejected_batch(batch, reason="confluence_rejected")
+            self._update_batch_debug(
+                batch,
+                failure_stage="confluence",
+                reason="confluence_rejected",
+                payload=payload,
+                extra={
+                    "raw_signals": self._signals_debug(raw_signals),
+                    "filtered_signals": self._signals_debug(filtered),
+                    "confluence": self._confluence_debug(confluence),
+                },
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="confluence_rejected")
             return batch
 
         built_signals, build_rejected = self.builder.build_many(
@@ -7994,7 +8247,20 @@ class SignalProcessor(BaseStrategyComponent):
 
         if not built_signals:
             batch.reasons.append("all_signals_failed_builder")
-            await self._emit_rejected_batch(batch, reason="all_signals_failed_builder")
+            self._update_batch_debug(
+                batch,
+                failure_stage="signal_builder",
+                reason="all_signals_failed_builder",
+                payload=payload,
+                extra={
+                    "raw_signals": self._signals_debug(raw_signals),
+                    "filtered_signals": self._signals_debug(filtered),
+                    "confluence_signals": self._signals_debug(confluence_signals),
+                    "build_rejected": build_rejected,
+                },
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="all_signals_failed_builder")
             return batch
 
         coordinated = self.portfolio.coordinate(
@@ -8015,22 +8281,67 @@ class SignalProcessor(BaseStrategyComponent):
                 "merged_signal_count": len(coordinated.merged_signals),
             }
             batch.reasons.append("portfolio_coordination_rejected")
-            await self._emit_rejected_batch(batch, reason="portfolio_coordination_rejected")
+            self._update_batch_debug(
+                batch,
+                failure_stage="portfolio_coordination",
+                reason="portfolio_coordination_rejected",
+                payload=payload,
+                extra={
+                    "built_signals": self._signals_debug(built_signals),
+                    "coordination": self._coordination_debug(coordinated),
+                },
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="portfolio_coordination_rejected")
             return batch
 
         risk_payloads: list[RiskReadySignalPayload] = []
 
-        for signal in batch.final_signals:
-            self.builder.assert_risk_ready(signal)
+        try:
+            for signal in batch.final_signals:
+                self.builder.assert_risk_ready(signal)
 
-            risk_payload = self.to_risk_payload(
-                signal=signal,
-                context=context,
+                risk_payload = self.to_risk_payload(
+                    signal=signal,
+                    context=context,
+                )
+                risk_payloads.append(risk_payload)
+        except (SignalRoutingError, BuilderError, ValueError, TypeError, AttributeError) as exc:
+            batch.reasons.append("risk_payload_build_failed")
+            batch.metadata["risk_payload_error"] = {
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            }
+            self._update_batch_debug(
+                batch,
+                failure_stage="risk_payload_builder",
+                reason="risk_payload_build_failed",
+                payload=payload,
+                extra={
+                    "final_signals": self._signals_debug(batch.final_signals),
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
             )
-            risk_payloads.append(risk_payload)
+            if emit:
+                await self._emit_rejected_batch(batch, reason="risk_payload_build_failed")
+            return batch
 
         batch.risk_payloads = risk_payloads
         batch.accepted = bool(risk_payloads)
+
+        if not batch.accepted:
+            batch.reasons.append("no_risk_payloads_built")
+            self._update_batch_debug(
+                batch,
+                failure_stage="risk_payload_builder",
+                reason="no_risk_payloads_built",
+                payload=payload,
+                extra={"final_signals": self._signals_debug(batch.final_signals)},
+            )
+            if emit:
+                await self._emit_rejected_batch(batch, reason="no_risk_payloads_built")
+            return batch
 
         if emit:
             for risk_payload in risk_payloads:
@@ -8205,6 +8516,222 @@ class SignalProcessor(BaseStrategyComponent):
         payload.validate()
         return payload
 
+    @staticmethod
+    def _enum_value(value: Any) -> Any:
+        if hasattr(value, "value"):
+            return value.value
+        return value
+
+    @staticmethod
+    def _safe_iso(value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return ensure_aware_utc(value).isoformat()
+        return None
+
+    def _evaluation_debug(
+        self,
+        evaluations: list[StrategyEvaluation],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+
+        for evaluation in evaluations:
+            signal = getattr(evaluation, "signal", None)
+            signal_side = getattr(signal, "side", None) if signal is not None else None
+
+            result.append(
+                {
+                    "strategy_name": getattr(evaluation, "strategy_name", None),
+                    "symbol": getattr(evaluation, "symbol", None),
+                    "passed": getattr(evaluation, "passed", None),
+                    "score": getattr(evaluation, "score", None),
+                    "confidence": getattr(evaluation, "confidence", None),
+                    "reasons": list(getattr(evaluation, "reasons", []) or []),
+                    "metadata": dict(getattr(evaluation, "metadata", {}) or {}),
+                    "signal_id": getattr(signal, "signal_id", None) if signal is not None else None,
+                    "signal_strategy_name": getattr(signal, "strategy_name", None) if signal is not None else None,
+                    "signal_side": self._enum_value(signal_side),
+                    "signal_score": getattr(signal, "score", None) if signal is not None else None,
+                    "signal_confidence": getattr(signal, "confidence", None) if signal is not None else None,
+                }
+            )
+
+        return result
+
+    def _route_debug(self, route: RouteDecision | None) -> dict[str, Any]:
+        if route is None:
+            return {}
+
+        return {
+            "event_name": route.event_name,
+            "symbol": route.symbol,
+            "source": route.source.value if route.source is not None else None,
+            "selected_names": list(route.selected_names),
+            "selected_count": route.total_selected,
+            "categories_used": [
+                item.value if hasattr(item, "value") else str(item)
+                for item in route.categories_used
+            ],
+            "matched_features": list(route.matched_features),
+            "skipped": dict(route.skipped),
+            "metadata": dict(route.metadata),
+        }
+
+    def _context_debug(self, context: StrategyContext | None) -> dict[str, Any]:
+        if context is None:
+            return {}
+
+        raw_features = list(getattr(context, "features", []) or [])
+        domain_data = getattr(context, "domain_data", {}) or {}
+
+        feature_names: list[str] = []
+        for feature in raw_features[:200]:
+            feature_names.append(str(getattr(feature, "name", feature)))
+
+        domain_keys: dict[str, list[str]] = {}
+        if isinstance(domain_data, dict):
+            for source, value in domain_data.items():
+                source_key = source.value if hasattr(source, "value") else str(source)
+                if isinstance(value, dict):
+                    domain_keys[source_key] = sorted(str(key) for key in value.keys())
+                else:
+                    domain_keys[source_key] = []
+
+        return {
+            "symbol": getattr(context, "symbol", None),
+            "timeframe": (
+                context.timeframe.value
+                if hasattr(getattr(context, "timeframe", None), "value")
+                else str(getattr(context, "timeframe", None))
+            ),
+            "timestamp": self._safe_iso(getattr(context, "timestamp", None)),
+            "feature_count": len(raw_features),
+            "feature_names": feature_names,
+            "domain_sources": sorted(domain_keys.keys()),
+            "domain_keys": domain_keys,
+        }
+
+    def _normalized_debug(self, normalized: NormalizedPayload | None) -> dict[str, Any]:
+        if normalized is None:
+            return {}
+
+        return {
+            "source": normalized.source.value,
+            "symbol": normalized.symbol,
+            "timeframe": normalized.timeframe.value,
+            "timestamp": normalized.timestamp.isoformat(),
+            "domain_keys": sorted(normalized.domain_data.keys()),
+            "extra_domain_sources": sorted(
+                source.value if hasattr(source, "value") else str(source)
+                for source in normalized.extra_domain_data.keys()
+            ),
+            "feature_names": [feature.name for feature in normalized.features[:200]],
+            "feature_count": len(normalized.features),
+            "metadata": dict(normalized.metadata),
+        }
+
+    def _signals_debug(self, signals: list[StrategySignal]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+
+        for signal in signals:
+            result.append(
+                {
+                    "signal_id": getattr(signal, "signal_id", None),
+                    "strategy_name": getattr(signal, "strategy_name", None),
+                    "symbol": getattr(signal, "symbol", None),
+                    "side": self._enum_value(getattr(signal, "side", None)),
+                    "setup_type": self._enum_value(getattr(signal, "setup_type", None)),
+                    "score": getattr(signal, "score", None),
+                    "confidence": getattr(signal, "confidence", None),
+                    "status": self._enum_value(getattr(signal, "status", None)),
+                    "reasons": list(getattr(signal, "reasons", []) or []),
+                    "confirmations": list(getattr(signal, "confirmations", []) or []),
+                    "metadata": dict(getattr(signal, "metadata", {}) or {}),
+                    "entry": getattr(signal, "primary_entry_price", None),
+                    "stop_loss": getattr(signal, "primary_stop_loss", None),
+                    "take_profit": getattr(signal, "primary_take_profit", None),
+                }
+            )
+
+        return result
+
+    def _confluence_debug(self, confluence: ConfluenceEvaluation | None) -> dict[str, Any]:
+        if confluence is None:
+            return {}
+
+        return {
+            "accepted": confluence.accepted,
+            "selected_strategy_names": confluence.selected_strategy_names,
+            "raw_signal_count": len(confluence.raw_signals),
+            "eligible_signal_count": len(confluence.eligible_signals),
+            "accepted_signal_count": len(confluence.accepted_signals),
+            "rejected_signals": dict(confluence.rejected_signals),
+            "reasons": list(confluence.reasons),
+            "metadata": dict(confluence.metadata),
+            "result": confluence.result.to_dict() if getattr(confluence.result, "to_dict", None) else None,
+            "merged_signal": self._signals_debug([confluence.merged_signal]) if confluence.merged_signal else [],
+        }
+
+    def _coordination_debug(self, coordinated: CoordinationDecision | None) -> dict[str, Any]:
+        if coordinated is None:
+            return {}
+
+        return {
+            "accepted": coordinated.accepted,
+            "selected_names": coordinated.selected_names,
+            "raw_signal_count": len(coordinated.raw_signals),
+            "accepted_signal_count": len(coordinated.accepted_signals),
+            "merged_signal_count": len(coordinated.merged_signals),
+            "final_signal_count": len(coordinated.final_signals),
+            "rejected_signals": dict(coordinated.rejected_signals),
+            "throttled_signals": dict(coordinated.throttled_signals),
+            "suppressed_signals": dict(coordinated.suppressed_signals),
+            "reasons": list(coordinated.reasons),
+            "metadata": dict(coordinated.metadata),
+        }
+
+    def _update_batch_debug(
+        self,
+        batch: ProcessedSignalBatch,
+        *,
+        failure_stage: str,
+        reason: str,
+        payload: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        batch.debug.update(
+            {
+                "failure_stage": failure_stage,
+                "reason": reason,
+                "source_topic": batch.metadata.get("source_topic") or batch.metadata.get("event_name"),
+                "event_name": batch.metadata.get("event_name"),
+                "timeframe": (
+                    batch.normalized.timeframe.value
+                    if batch.normalized is not None
+                    else None
+                ),
+                "symbol": batch.symbol,
+                "timestamp": batch.timestamp.isoformat(),
+                "timestamp_ms": int(batch.timestamp.timestamp() * 1000),
+                "payload_keys": sorted((payload or {}).keys()),
+                "normalized": self._normalized_debug(batch.normalized),
+                "route": self._route_debug(batch.route),
+                "context": self._context_debug(batch.context),
+                "evaluations": self._evaluation_debug(batch.evaluations),
+                "raw_signals": self._signals_debug(batch.raw_signals),
+                "filtered_signals": self._signals_debug(batch.filtered_signals),
+                "final_signals": self._signals_debug(batch.final_signals),
+            }
+        )
+
+        if batch.confluence is not None:
+            batch.debug["confluence"] = self._confluence_debug(batch.confluence)
+
+        if batch.coordinated is not None:
+            batch.debug["coordination"] = self._coordination_debug(batch.coordinated)
+
+        if extra:
+            batch.debug.update(extra)
+
     def _resolve_context(self, normalized: NormalizedPayload) -> StrategyContext:
         existing = self.state.contexts.get_context(normalized.symbol)
         if existing is not None:
@@ -8246,15 +8773,43 @@ class SignalProcessor(BaseStrategyComponent):
         if self.event_bus is None:
             return
 
+        normalized = batch.normalized
+        route = batch.route
+
+        payload = {
+            "signal_id": None,
+            "symbol": batch.symbol,
+            "strategy_name": None,
+            "reason": reason,
+            "reasons": list(batch.reasons),
+            "timestamp": batch.timestamp.isoformat(),
+            "timestamp_ms": int(batch.timestamp.timestamp() * 1000),
+            "received_at_ms": int(utcnow().timestamp() * 1000),
+            "timeframe": normalized.timeframe.value if normalized is not None else None,
+            "source": normalized.source.value if normalized is not None else None,
+            "source_topic": batch.metadata.get("source_topic") or batch.metadata.get("event_name"),
+            "route": route.selected_names if route is not None else [],
+            "selected_strategies": route.selected_names if route is not None else [],
+            "route_skipped": dict(route.skipped) if route is not None else {},
+            "evaluation_reasons": [
+                {
+                    "strategy_name": getattr(evaluation, "strategy_name", None),
+                    "passed": getattr(evaluation, "passed", None),
+                    "score": getattr(evaluation, "score", None),
+                    "confidence": getattr(evaluation, "confidence", None),
+                    "reasons": list(getattr(evaluation, "reasons", []) or []),
+                    "metadata": dict(getattr(evaluation, "metadata", {}) or {}),
+                    "signal_id": getattr(getattr(evaluation, "signal", None), "signal_id", None),
+                }
+                for evaluation in batch.evaluations
+            ],
+            "debug": dict(batch.debug),
+            "metadata": dict(batch.metadata),
+        }
+
         await self.emit_event(
             "signal.rejected",
-            {
-                "symbol": batch.symbol,
-                "reason": reason,
-                "route": batch.route.selected_names if batch.route else [],
-                "reasons": list(batch.reasons),
-                "metadata": dict(batch.metadata),
-            },
+            payload,
             priority=EventPriority.LOW,
             source=self.component_name,
         )
@@ -8300,6 +8855,32 @@ class SignalProcessor(BaseStrategyComponent):
             return payload
 
         raise SignalRoutingError("execution_cost metadata must be dict or ExecutionCostPayload")
+
+    def _confidence_grade(self, confidence: float) -> ConfidenceGrade:
+        value = clamp(confidence, 0.0, 1.0)
+        very_low, low, medium, high = self.config.confidence.grade_bounds()
+
+        if value >= high:
+            return ConfidenceGrade.VERY_HIGH
+        if value >= medium:
+            return ConfidenceGrade.HIGH
+        if value >= low:
+            return ConfidenceGrade.MEDIUM
+        if value >= very_low:
+            return ConfidenceGrade.LOW
+        return ConfidenceGrade.VERY_LOW
+
+    def _confidence_strength(self, confidence: float) -> SignalStrength:
+        value = clamp(confidence, 0.0, 1.0)
+        _, low, medium, high = self.config.confidence.grade_bounds()
+
+        if value >= high:
+            return SignalStrength.EXTREME
+        if value >= medium:
+            return SignalStrength.STRONG
+        if value >= low:
+            return SignalStrength.MODERATE
+        return SignalStrength.WEAK
 
     @staticmethod
     def _tier_from_priority_score(value: float) -> StrategyTradeTier:

@@ -808,7 +808,7 @@ class StrategyContextStore:
             "features_symbols": len(self.features),
             "features_total": sum(len(items) for items in self.features.values()),
             "regimes": len(self.regimes),
-            "portfolio_updated_at": getattr(self.portfolio, "timestamp", None),
+            "portfolio_updated_at": self.updated_at,
             "updated_at": self.updated_at,
         }
 

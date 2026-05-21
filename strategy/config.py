@@ -274,7 +274,7 @@ class ConfluenceConfig:
     enabled: bool = True
     min_agreement_count: int = 2
     min_confidence: float = 0.6
-    min_score: float = 0.65
+    min_score: float = 0.50
     conflict_penalty: float = 0.15
     confirmation_bonus: float = 0.10
     max_strategies_per_side: int = 10
@@ -430,6 +430,18 @@ class ConflictConfig:
 
 @dataclass(slots=True)
 class FilterConfig:
+    enabled: bool = True
+
+    # Runtime-level gates. None means: use StrategyRuntimeConfig fallback.
+    min_signal_confidence: float | None = None
+    min_signal_score: float | None = None
+    min_risk_reward: float = 0.0
+
+    # Optional filter groups. Safety filters such as symbol and directional side
+    # remain enforced even when optional filters are disabled.
+    enable_cooldown_filter: bool = True
+    enable_freshness_filter: bool = True
+    enable_portfolio_filter: bool = True
     enable_regime_filter: bool = True
     enable_volatility_filter: bool = True
     enable_liquidity_filter: bool = True
@@ -444,6 +456,21 @@ class FilterConfig:
     min_funding_alignment: float = -1.0
 
     def validate(self) -> None:
+        if self.min_signal_confidence is not None and not 0.0 <= self.min_signal_confidence <= 1.0:
+            raise StrategyConfigError(
+                "FilterConfig.min_signal_confidence must be between 0.0 and 1.0"
+            )
+
+        if self.min_signal_score is not None and self.min_signal_score < 0:
+            raise StrategyConfigError(
+                "FilterConfig.min_signal_score must be >= 0"
+            )
+
+        if self.min_risk_reward < 0:
+            raise StrategyConfigError(
+                "FilterConfig.min_risk_reward must be >= 0"
+            )
+
         if self.max_spread_bps < 0:
             raise StrategyConfigError(
                 "FilterConfig.max_spread_bps must be >= 0"
@@ -742,12 +769,16 @@ class StrategyConfig:
     def remove_strategy(self, name: str) -> StrategyDefinitionConfig | None:
         return self.strategies.pop(name, None)
 
-    def enabled_strategy_names(self) -> list[str]:
+    def get_enabled_strategy_names(self) -> list[str]:
         return [
             name
             for name, strategy in self.strategies.items()
             if strategy.runtime.enabled and self.preset.is_strategy_allowed(name)
         ]
+
+    def enabled_strategy_names(self) -> list[str]:
+        """Backward-compatible method alias. Prefer get_enabled_strategy_names()."""
+        return self.get_enabled_strategy_names()
 
     def strategies_by_category(
         self,

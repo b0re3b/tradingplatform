@@ -420,12 +420,7 @@ class StrategyValidationMixin(StrategyMixinSupport):
                 f"{self._strategy_name_for_errors}: context.price is required"
             )
 
-        value = (
-            getattr(price, "last", None)
-            or getattr(price, "close", None)
-            or getattr(price, "mark_price", None)
-            or getattr(price, "price", None)
-        )
+        value = self._extract_price_value(price)
 
         if value is None:
             raise StrategyEvaluationError(
@@ -439,6 +434,55 @@ class StrategyValidationMixin(StrategyMixinSupport):
             )
 
         return value_f
+
+    @staticmethod
+    def _extract_price_value(price: Any) -> float | None:
+        if isinstance(price, dict):
+            candidates = (
+                "last_price",
+                "last",
+                "close",
+                "mark_price",
+                "index_price",
+                "price",
+                "mid",
+                "mid_price",
+            )
+            for key in candidates:
+                value = price.get(key)
+                if value is None:
+                    continue
+                try:
+                    value_f = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if value_f > 0:
+                    return value_f
+            return None
+
+        for attr in (
+                "last_price",
+                "last",
+                "close",
+                "mark_price",
+                "index_price",
+                "price",
+                "mid",
+                "mid_price",
+        ):
+            value = getattr(price, attr, None)
+            if value is None:
+                continue
+
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if value_f > 0:
+                return value_f
+
+        return None
 
     def has_any_feature(
         self,
@@ -808,10 +852,84 @@ class TradingStrategy(
     ) -> float:
         value = self.optional_feature(context, feature_name, default)
 
+        # StrategyContext.get_feature() returns FeatureSnapshot in the current
+        # strategy model.  Older helper code tried float(snapshot), which always
+        # failed and silently returned default=0.0.  That can make concrete
+        # strategies score every setup as zero and return no passed signals.
+        raw_value = self._feature_snapshot_numeric_value(value, default=default)
+
         try:
-            return clamp(float(value), 0.0, 1.0)
+            return clamp(float(raw_value), 0.0, 1.0)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _feature_snapshot_numeric_value(value: Any, *, default: float = 0.0) -> Any:
+        """
+        Extract a numeric value from FeatureSnapshot-like objects.
+
+        Preference:
+        1. normalized_value because it is already scaled to the strategy domain;
+        2. value for raw FeatureSnapshot payloads;
+        3. the value itself for primitive floats/ints/strings.
+        """
+        if value is None:
+            return default
+
+        normalized_value = getattr(value, "normalized_value", None)
+        if normalized_value is not None:
+            return normalized_value
+
+        snapshot_value = getattr(value, "value", None)
+        if snapshot_value is not None:
+            return snapshot_value
+
+        return value
+
+    @staticmethod
+    def _extract_price_value(price: Any) -> float | int | str | None:
+        """
+        Extract a usable last/current price from PriceSnapshot-like objects.
+
+        PriceSnapshot in strategy.models uses last_price.  The previous helper
+        checked only last/close/mark_price/price, so valid StrategyContext.price
+        objects built by SignalNormalizer/StrategyContextBuilder could be
+        rejected as unusable.
+        """
+        if price is None:
+            return None
+
+        if isinstance(price, dict):
+            for key in (
+                "last_price",
+                "last",
+                "close",
+                "mark_price",
+                "index_price",
+                "price",
+                "mid",
+                "mid_price",
+            ):
+                value = price.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        for attr in (
+            "last_price",
+            "last",
+            "close",
+            "mark_price",
+            "index_price",
+            "price",
+            "mid",
+            "mid_price",
+        ):
+            value = getattr(price, attr, None)
+            if value is not None:
+                return value
+
+        return None
 
     def build_priority_metadata(
         self,

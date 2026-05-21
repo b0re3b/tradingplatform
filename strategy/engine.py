@@ -22,7 +22,7 @@ from strategy.models import (
     StrategyEvaluation,
     ensure_aware_utc,
     utcnow,
-    clamp
+    clamp,
 )
 from strategy.processor import ProcessedSignalBatch, SignalProcessor
 from strategy.registry import StrategyRegistry
@@ -462,6 +462,17 @@ class StrategyEventHandler(BaseStrategyComponent):
 
     component_namespace = "strategy.event_handler"
 
+    NON_TRADING_ANALYTICS_TOPIC_PARTS: tuple[str, ...] = (
+        ".heartbeat",
+        ".metrics",
+        ".state_cleaned",
+        ".cleanup",
+        ".cleaned",
+        ".stats",
+        ".health",
+        ".diagnostics",
+    )
+
     def __init__(
         self,
         config: StrategyConfig,
@@ -477,9 +488,35 @@ class StrategyEventHandler(BaseStrategyComponent):
         self.engine = engine
         self._subscriptions: list[Any] = []
 
+    @classmethod
+    def is_non_trading_analytics_topic(cls, topic: str) -> bool:
+        """
+        Return True for analytics lifecycle/diagnostic topics that must not
+        enter SignalProcessor.
+
+        Examples:
+        - analytics.funding.analyzer.heartbeat
+        - analytics.oi.metrics
+        - analytics.oi.state_cleaned
+
+        These events are useful for monitoring, but they usually do not contain
+        symbol/timeframe/trading features, тому SignalNormalizer не має їх
+        обробляти як strategy-routable analytics payload.
+        """
+        normalized = str(topic or "").strip().lower()
+        if not normalized:
+            return True
+
+        return any(
+            marker in normalized
+            for marker in cls.NON_TRADING_ANALYTICS_TOPIC_PARTS
+        )
+
     def register(self) -> None:
         if self.event_bus is None:
-            self.log_warning("Cannot register StrategyEventHandler: event_bus is not configured")
+            self.log_warning(
+                "Cannot register StrategyEventHandler: event_bus is not configured"
+            )
             self._registered = True
             return
 
@@ -546,6 +583,14 @@ class StrategyEventHandler(BaseStrategyComponent):
 
     async def _handle_analytics_event(self, event: Event | Any) -> None:
         event_name = _event_name_from_event(event)
+
+        if self.is_non_trading_analytics_topic(event_name):
+            self.log_debug(
+                "Skipping non-trading analytics event",
+                topic=event_name,
+            )
+            return
+
         payload = _payload_from_event(event)
 
         await self.engine.process_analytics_event(
@@ -634,7 +679,9 @@ class StrategyEventHandler(BaseStrategyComponent):
                 signal = by_id.get(signal_id)
 
             if signal is None and isinstance(symbol, str):
-                signal = signals_state.get_last_for_symbol(symbol)
+                get_last_for_symbol = getattr(signals_state, "get_last_for_symbol", None)
+                if callable(get_last_for_symbol):
+                    signal = get_last_for_symbol(symbol)
 
         if signal is None:
             return
@@ -649,9 +696,9 @@ class StrategyEventHandler(BaseStrategyComponent):
 
         Important:
         - event_to_categories is a routing map, not a subscription allowlist;
-        - StrategyEngine must always listen to analytics.*;
-        - RoutingConfig.categories_for_event() decides whether a concrete topic is
-          strategy-routable.
+        - StrategyEngine may listen to analytics.*;
+        - non-trading analytics topics are skipped in _handle_analytics_event();
+        - SignalProcessor must not receive heartbeat/metrics/cleanup events.
         """
         configured = getattr(self.config.routing, "event_to_categories", {}) or {}
 
@@ -664,7 +711,6 @@ class StrategyEventHandler(BaseStrategyComponent):
         topics.append("analytics.*")
 
         return list(dict.fromkeys(topics))
-
 
 class StrategyLifecycleManager(BaseStrategyComponent):
     """
@@ -768,6 +814,7 @@ class StrategyLifecycleManager(BaseStrategyComponent):
             job_name=self._cleanup_job_name,
             interval_seconds=cleanup_interval_seconds,
         )
+
     async def _cleanup_state_job(self) -> None:
         removed = self.state.prune(
             max_signal_age_seconds=self.config.runtime.max_signal_age_seconds,
@@ -951,7 +998,34 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         payload: dict[str, Any],
         event: Event | None = None,
     ) -> ProcessedSignalBatch:
+        """
+        Process one analytics event through SignalProcessor.
+
+        Safety guard:
+        - StrategyEventHandler normally filters non-trading analytics topics.
+        - This method also skips them defensively in case it is called directly.
+        """
         self.stats.record_event_received()
+
+        if StrategyEventHandler.is_non_trading_analytics_topic(event_name):
+            batch = ProcessedSignalBatch(
+                symbol=str(payload.get("symbol") or "unknown"),
+                timestamp=_event_timestamp(event) or utcnow(),
+                accepted=False,
+                emitted=False,
+                reasons=[f"skipped_non_trading_analytics_topic:{event_name}"],
+                metadata={
+                    "event_name": event_name,
+                    "skipped": True,
+                    "skip_reason": "non_trading_analytics_topic",
+                },
+            )
+            self.stats.record_processed(False)
+            self.log_debug(
+                "StrategyEngine skipped non-trading analytics event",
+                event_name=event_name,
+            )
+            return batch
 
         try:
             batch = await self.processor.process_event(
@@ -1128,7 +1202,6 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
                 record_error()
         except TypeError:
             record_error()
-
 
 __all__ = [
     "StrategyEngineStats",

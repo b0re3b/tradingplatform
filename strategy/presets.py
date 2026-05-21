@@ -1494,7 +1494,7 @@ class StrategyPresetBuilder:
         self._runtime_defaults: dict[str, int | float] = {
             "cooldown_seconds": 30,
             "max_signal_age_seconds": 45,
-            "min_confidence": 0.58,
+            "min_confidence": 0.5,
             "min_score": 0.20,
         }
 
@@ -1826,14 +1826,14 @@ def build_scalping_preset(
         .with_runtime_defaults(
             cooldown_seconds=10,
             max_signal_age_seconds=20,
-            min_confidence=0.56,
+            min_confidence=0.5,
             min_score=0.20,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=True,
                 min_agreement_count=1,
-                min_confidence=0.56,
+                min_confidence=0.5,
                 min_score=0.20,
                 conflict_penalty=0.12,
                 confirmation_bonus=0.08,
@@ -1946,14 +1946,14 @@ def build_intraday_preset(
         .with_runtime_defaults(
             cooldown_seconds=35,
             max_signal_age_seconds=60,
-            min_confidence=0.60,
+            min_confidence=0.50,
             min_score=0.30,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=True,
                 min_agreement_count=2,
-                min_confidence=0.60,
+                min_confidence=0.50,
                 min_score=0.35,
                 conflict_penalty=0.15,
                 confirmation_bonus=0.10,
@@ -2070,14 +2070,14 @@ def build_swing_preset(
         .with_runtime_defaults(
             cooldown_seconds=300,
             max_signal_age_seconds=600,
-            min_confidence=0.64,
+            min_confidence=0.50,
             min_score=0.40,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=True,
                 min_agreement_count=2,
-                min_confidence=0.64,
+                min_confidence=0.50,
                 min_score=0.45,
                 conflict_penalty=0.18,
                 confirmation_bonus=0.12,
@@ -2192,14 +2192,14 @@ def build_liquidity_reversal_preset(
         .with_runtime_defaults(
             cooldown_seconds=20,
             max_signal_age_seconds=35,
-            min_confidence=0.59,
+            min_confidence=0.50,
             min_score=0.25,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=True,
                 min_agreement_count=1,
-                min_confidence=0.59,
+                min_confidence=0.50,
                 min_score=0.25,
                 conflict_penalty=0.12,
                 confirmation_bonus=0.12,
@@ -2316,14 +2316,14 @@ def build_mean_reversion_preset(
         .with_runtime_defaults(
             cooldown_seconds=45,
             max_signal_age_seconds=90,
-            min_confidence=0.61,
+            min_confidence=0.50,
             min_score=0.32,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=True,
                 min_agreement_count=2,
-                min_confidence=0.61,
+                min_confidence=0.50,
                 min_score=0.35,
                 conflict_penalty=0.14,
                 confirmation_bonus=0.12,
@@ -2394,14 +2394,14 @@ def build_trend_stack_preset(
         .with_runtime_defaults(
             cooldown_seconds=45,
             max_signal_age_seconds=90,
-            min_confidence=0.62,
+            min_confidence=0.50,
             min_score=0.35,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=True,
                 min_agreement_count=2,
-                min_confidence=0.62,
+                min_confidence=0.50,
                 min_score=0.40,
                 conflict_penalty=0.16,
                 confirmation_bonus=0.12,
@@ -2473,14 +2473,14 @@ def build_spreads_preset(
         .with_runtime_defaults(
             cooldown_seconds=60,
             max_signal_age_seconds=90,
-            min_confidence=0.60,
+            min_confidence=0.50,
             min_score=0.30,
         )
         .with_confluence(
             ConfluenceConfig(
                 enabled=False,
                 min_agreement_count=1,
-                min_confidence=0.60,
+                min_confidence=0.50,
                 min_score=0.30,
                 conflict_penalty=0.12,
                 confirmation_bonus=0.08,
@@ -2585,7 +2585,7 @@ def build_default_preset(
         .with_runtime_defaults(
             cooldown_seconds=35,
             max_signal_age_seconds=90,
-            min_confidence=0.56,
+            min_confidence=0.50,
             min_score=0.18,
         )
         .with_routing(
@@ -2598,37 +2598,36 @@ def build_default_preset(
         )
         .with_confluence(
             ConfluenceConfig(
-                min_total_score=0.24,
-                min_total_confidence=0.56,
-                min_confirmations=1,
-                require_direction_agreement=True,
-                allow_single_high_confidence=True,
-                single_signal_min_confidence=0.72,
-                single_signal_min_score=0.55,
+                enabled=True,
+                min_agreement_count=1,
+                min_confidence=0.50,
+                min_score=0.24,
+                conflict_penalty=0.15,
+                confirmation_bonus=0.10,
+                max_strategies_per_side=10,
             )
         )
         .with_confidence(
             ConfidenceConfig(
-                min_confidence=0.56,
-                high_confidence_threshold=0.72,
-                low_confidence_threshold=0.40,
+                very_low_threshold=0.35,
+                low_threshold=0.40,
+                medium_threshold=0.56,
+                high_threshold=0.72,
             )
         )
         .with_voting(
             VotingConfig(
-                min_votes=1,
-                min_primary_votes=1,
-                require_majority=False,
-                allow_tie=False,
+                min_confirmations=1,
+                min_total_votes=1,
+                require_primary_trigger=True,
+                allow_single_strategy_confirmation=True,
             )
         )
         .with_conflict(
             ConflictConfig(
-                max_conflict_penalty=0.45,
-                opposite_side_penalty=0.25,
-                same_category_penalty=0.10,
-                regime_conflict_penalty=0.12,
-                block_on_strong_opposite_signal=True,
+                reject_on_side_conflict=False,
+                reject_on_regime_conflict=False,
+                max_total_penalty=0.45,
             )
         )
         .with_filters(
@@ -2637,8 +2636,6 @@ def build_default_preset(
                 min_signal_confidence=0.56,
                 min_signal_score=0.18,
                 min_risk_reward=1.20,
-                max_active_signals_per_symbol=4,
-                max_active_signals_total=25,
                 enable_cooldown_filter=True,
                 enable_regime_filter=True,
                 enable_freshness_filter=True,
@@ -2650,28 +2647,31 @@ def build_default_preset(
         .with_builders(
             BuilderConfig(
                 default_entry_type=EntryType.MARKET,
-                default_stop_bps=45.0,
-                default_take_profit_bps=(70.0, 120.0, 180.0),
-                min_rr=1.20,
-                max_slippage_bps=8.0,
-                max_holding_seconds=7200,
-                partial_exit_enabled=True,
+                default_rr_ratio=1.20,
+                enable_partial_take_profit=True,
+                default_partial_tp_levels=[0.5, 0.3, 0.2],
+                require_invalidation=True,
             )
         )
         .with_portfolio(
             PortfolioCoordinatorConfig(
                 enabled=True,
                 max_signals_per_symbol=4,
-                max_total_signals=25,
-                prefer_highest_score=True,
-                merge_same_side_signals=True,
-                suppress_opposite_side_conflicts=True,
+                deduplicate_by_side=True,
+                merge_similar_signals=True,
+                correlation_guard_enabled=True,
+                symbol_cooldown_seconds=15,
+                side_cooldown_seconds=10,
+                repeated_signal_suppression_seconds=30,
+                volatility_throttle_enabled=True,
+                volatility_throttle_threshold=3.0,
+                high_volatility_max_signals_per_symbol=2,
             )
         )
         .with_freshness(
             FeatureFreshnessConfig(
                 default_ttl_seconds=90,
-                source_ttl_seconds={
+                per_feature_ttl_seconds={
                     "orderflow": 30,
                     "liquidity": 45,
                     "liquidations": 45,

@@ -1073,6 +1073,7 @@ class SignalContext:
     spreads: dict[str, Any] = field(default_factory=dict)
     funding: dict[str, Any] = field(default_factory=dict)
     open_interest: dict[str, Any] = field(default_factory=dict)
+    system: dict[str, Any] = field(default_factory=dict)
 
     feature_map: dict[str, FeatureSnapshot] = field(default_factory=dict)
     freshness_map: dict[str, float] = field(default_factory=dict)
@@ -1210,6 +1211,7 @@ class SignalContext:
             FeatureSource.SPREADS: self.spreads,
             FeatureSource.FUNDING: self.funding,
             FeatureSource.OPEN_INTEREST: self.open_interest,
+            FeatureSource.SYSTEM: self.system,
         }
         return mapping.get(source, {})
 
