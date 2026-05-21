@@ -291,8 +291,15 @@ class BacktestProjectBootstrap:
         """
 
         core_config = self.core_config or self.build_core_config()
-        event_bus = self.event_bus or self.build_event_bus(core_config)
-        scheduler = self.scheduler or self.build_scheduler(event_bus)
+        event_bus = self.require_system_event_bus()
+        scheduler = self.require_system_scheduler()
+
+        # Keep shared system runtime on the bootstrap instance so every later
+        # helper uses the same EventBus/Scheduler. Full-pipeline backtests must
+        # never silently create a local bus/scheduler.
+        self.core_config = core_config
+        self.event_bus = event_bus
+        self.scheduler = scheduler
 
         data_caches = self.build_data_caches(
             core_config=core_config,
@@ -345,23 +352,36 @@ class BacktestProjectBootstrap:
     def build_core_config() -> Config:
         return Config.from_env()
 
+    def require_system_event_bus(self) -> EventBus:
+        if self.event_bus is None:
+            raise BacktestDependencyError(
+                "BacktestProjectBootstrap requires the shared system EventBus. "
+                "Pass event_bus=... from run.py / application runtime; bootstrap "
+                "must not create a local EventBus for full-pipeline backtests."
+            )
+        return self.event_bus
+
+    def require_system_scheduler(self) -> Scheduler:
+        if self.scheduler is None:
+            raise BacktestDependencyError(
+                "BacktestProjectBootstrap requires the shared system Scheduler. "
+                "Pass scheduler=... from run.py / application runtime; bootstrap "
+                "must not create a local Scheduler for full-pipeline backtests."
+            )
+        return self.scheduler
+
     @staticmethod
     def build_event_bus(core_config: Config) -> EventBus:
-        return construct_with_signature(
-            EventBus,
-            {
-                "config": getattr(core_config, "event_bus", None),
-                "event_bus_config": getattr(core_config, "event_bus", None),
-            },
+        raise BacktestDependencyError(
+            "BacktestProjectBootstrap.build_event_bus() is disabled. "
+            "Use the shared system EventBus and pass event_bus=... explicitly."
         )
 
     @staticmethod
     def build_scheduler(event_bus: EventBus) -> Scheduler:
-        return construct_with_signature(
-            Scheduler,
-            {
-                "event_bus": event_bus,
-            },
+        raise BacktestDependencyError(
+            "BacktestProjectBootstrap.build_scheduler() is disabled. "
+            "Use the shared system Scheduler and pass scheduler=... explicitly."
         )
 
     # ------------------------------------------------------------------
@@ -764,7 +784,12 @@ class BacktestProjectBootstrap:
         """
 
         strategy_config = self.build_strategy_config()
-        registry = self.build_strategy_registry(strategy_config)
+        registry = self.build_strategy_registry(
+            strategy_config,
+            event_bus=event_bus,
+            scheduler=scheduler,
+        )
+        self.validate_strategy_registry(registry)
         runtime_state = self.build_strategy_runtime_state(strategy_config)
         signal_processor = self.build_signal_processor(
             strategy_config=strategy_config,
@@ -965,20 +990,529 @@ class BacktestProjectBootstrap:
             "strategy.routing.event_to_categories patched for backtest analytics topics"
         )
 
-    def build_strategy_registry(self, strategy_config: Any) -> Any:
+    def build_strategy_registry(
+        self,
+        strategy_config: Any,
+        *,
+        event_bus: EventBus,
+        scheduler: Scheduler,
+    ) -> Any:
+        """
+        Build production StrategyRegistry with data-aware concrete strategy
+        factories.
+
+        The strategy package owns routing/evaluation/building. This bootstrap
+        only decides which concrete strategy classes are available for the
+        current backtest streams.
+
+        Example:
+        - candles=True -> price_action strategies
+        - funding=True -> funding strategies
+        - open_interest=True -> open_interest strategies
+        - trades=True -> orderflow + whales
+        - orderbook=True -> liquidity + spoofing
+        - liquidations=True -> liquidations
+        - spreads=True -> spreads
+        - hybrid=True only when enough enabled domains exist
+        """
+
         candidates = [
             "strategy.presets.build_default_strategy_registry",
             "strategy.registry.StrategyRegistry",
         ]
 
+        strategy_factories = self.build_strategy_factories(strategy_config)
+
         available = {
             "config": strategy_config,
             "strategy_config": strategy_config,
-            "event_bus": self.event_bus,
-            "scheduler": self.scheduler,
+            "event_bus": event_bus,
+            "scheduler": scheduler,
+            "strategy_factories": strategy_factories,
+            "strict": env_bool("BACKTEST_STRATEGY_STRICT_FACTORIES", False),
+            "replace": True,
+            "emit_events": True,
         }
 
-        return self.instantiate_first_required("strategy registry", candidates, available)
+        registry = self.instantiate_first_required(
+            "strategy registry",
+            candidates,
+            available,
+        )
+
+        total = self.strategy_registry_count(registry)
+        if total <= 0:
+            raise BacktestDependencyError(
+                "Strategy registry is empty after bootstrap. "
+                "No concrete strategies were registered for the enabled streams.\n"
+                f"{self.diagnostics.format()}"
+            )
+
+        self.diagnostics.loaded.append(
+            f"[strategy] StrategyRegistry populated with {total} strategies"
+        )
+        return registry
+
+    def build_strategy_factories(self, strategy_config: Any) -> dict[str, Any]:
+        """
+        Build data-aware strategy factory map.
+
+        This method does not auto-discover arbitrary classes. It uses explicit
+        candidate paths and only enables domains supported by current backtest
+        streams. Missing required-domain factories are kept in diagnostics and
+        later validated by validate_strategy_registry().
+        """
+
+        allowed_names = self.strategy_names_from_config(strategy_config)
+        requested_names = self.filter_strategy_names_for_enabled_streams(allowed_names)
+
+        candidates_by_name = self.strategy_factory_paths()
+        factories: dict[str, Any] = {}
+
+        for name in requested_names:
+            candidates = candidates_by_name.get(name)
+            if not candidates:
+                self.diagnostics.add_failure(
+                    f"strategy_factory:{name}",
+                    "No explicit factory path configured in backtesting bootstrap.",
+                )
+                continue
+
+            factory, path = self.import_first_strategy_candidate(candidates)
+            if factory is None:
+                self.diagnostics.add_failure(
+                    f"strategy_factory:{name}",
+                    "Could not import any candidate: " + ", ".join(candidates),
+                )
+                continue
+
+            factories[name] = factory
+            self.diagnostics.loaded.append(f"[strategy_factory] {name} -> {path}")
+
+        return factories
+
+    def strategy_names_from_config(self, strategy_config: Any) -> list[str]:
+        """
+        Return enabled strategy names from StrategyConfig / PresetConfig.
+
+        Prefer preset.enabled_strategy_names when present because
+        build_default_strategy_registry uses the same rule. Fall back to
+        config.strategies keys.
+        """
+
+        preset = getattr(strategy_config, "preset", None)
+        enabled = getattr(preset, "enabled_strategy_names", None)
+        if enabled:
+            return [str(name).strip() for name in enabled if str(name).strip()]
+
+        strategies = getattr(strategy_config, "strategies", None)
+        if isinstance(strategies, dict):
+            return [str(name).strip() for name in strategies if str(name).strip()]
+
+        return []
+
+    def filter_strategy_names_for_enabled_streams(self, names: Sequence[str]) -> list[str]:
+        domain_map = self.strategy_domain_by_name()
+        enabled_domains = self.enabled_strategy_domains()
+
+        result: list[str] = []
+        skipped: list[str] = []
+
+        for raw_name in names:
+            name = str(raw_name).strip()
+            if not name:
+                continue
+
+            domain = domain_map.get(name)
+            if domain is None:
+                # Unknown catalog entry: do not auto-enable in backtesting.
+                self.diagnostics.add_skipped(
+                    f"strategy_factory:{name}",
+                    "strategy domain is unknown to backtesting bootstrap",
+                )
+                continue
+
+            if domain in enabled_domains:
+                result.append(name)
+            else:
+                skipped.append(name)
+
+        if skipped:
+            self.diagnostics.add_skipped(
+                "strategy_factories",
+                "Skipped strategies not supported by enabled streams: "
+                + ", ".join(sorted(skipped)),
+            )
+
+        return list(dict.fromkeys(result))
+
+    def enabled_strategy_domains(self) -> set[str]:
+        domains: set[str] = set()
+
+        if self.config.enable_candles:
+            domains.add("price_action")
+
+        if self.config.enable_funding:
+            domains.add("funding")
+
+        if self.config.enable_open_interest:
+            domains.add("open_interest")
+
+        if self.config.enable_trades:
+            domains.add("orderflow")
+            domains.add("whales")
+
+        if self.config.enable_orderbook:
+            domains.add("liquidity")
+            domains.add("spoofing")
+
+        if self.config.enable_liquidations:
+            domains.add("liquidations")
+
+        if self.config.enable_spreads:
+            domains.add("spreads")
+
+        # Hybrid strategies are useful only when several analytics domains are
+        # present. This avoids selecting whale/orderflow hybrids on a
+        # candles+funding+OI dataset.
+        enable_hybrid = env_bool("BACKTEST_STRATEGY_ENABLE_HYBRID", True)
+        min_hybrid_domains = env_int("BACKTEST_STRATEGY_MIN_HYBRID_DOMAINS", 3)
+        hybrid_base_domains = {
+            "price_action",
+            "funding",
+            "open_interest",
+            "orderflow",
+            "whales",
+            "liquidity",
+            "liquidations",
+            "spoofing",
+            "spreads",
+        }
+        if enable_hybrid and len(domains.intersection(hybrid_base_domains)) >= min_hybrid_domains:
+            domains.add("hybrid")
+
+        return domains
+
+    @staticmethod
+    def strategy_domain_by_name() -> dict[str, str]:
+        return {
+            # price_action
+            "market_structure": "price_action",
+            "fvg_reaction": "price_action",
+            "support_resistance_reaction": "price_action",
+            "trend_continuation": "price_action",
+
+            # open_interest
+            "oi_divergence": "open_interest",
+            "oi_breakout_confirmation": "open_interest",
+            "oi_anomaly": "open_interest",
+            "oi_capitulation": "open_interest",
+
+            # funding
+            "funding_extreme_reversal": "funding",
+            "funding_divergence": "funding",
+
+            # orderflow
+            "cvd_divergence": "orderflow",
+            "orderflow_continuation": "orderflow",
+            "orderflow_reversal": "orderflow",
+
+            # whales
+            "whale_accumulation": "whales",
+            "whale_distribution": "whales",
+            "whale_breakout": "whales",
+
+            # liquidity
+            "liquidity_sweep": "liquidity",
+            "stop_hunt_reversal": "liquidity",
+            "equal_high_low": "liquidity",
+
+            # liquidations
+            "liquidation_cascade": "liquidations",
+            "squeeze_reversal": "liquidations",
+
+            # spoofing
+            "spoofing_reversal": "spoofing",
+            "fake_liquidity_trap": "spoofing",
+
+            # spreads
+            "cross_exchange_arb": "spreads",
+            "spot_futures_basis": "spreads",
+            "spread_momentum": "spreads",
+            "funding_adjusted_basis": "spreads",
+
+            # hybrid
+            "confluence": "hybrid",
+            "hybrid_confluence": "hybrid",
+            "trend_stack": "hybrid",
+            "mean_reversion_stack": "hybrid",
+            "liquidation_whale": "hybrid",
+            "whale_orderflow_breakout": "hybrid",
+        }
+
+    @staticmethod
+    def strategy_factory_paths() -> dict[str, tuple[str, ...]]:
+        """
+        Known concrete strategy class candidates keyed by StrategyCatalog name.
+
+        Include both current unified strategy paths and a few legacy class-name
+        aliases where harmless. Import failures stay diagnostic, not silent.
+        """
+
+        return {
+            # -----------------------------------------------------------------
+            # price_action
+            # -----------------------------------------------------------------
+            "market_structure": (
+                "strategy.strategies.price_action.market_structure_strategy.MarketStructureStrategy",
+            ),
+            "fvg_reaction": (
+                "strategy.strategies.price_action.fvg_reaction_strategy.FVGReactionStrategy",
+                "strategy.strategies.price_action.fvg_reaction_strategy.FvgReactionStrategy",
+            ),
+            "support_resistance_reaction": (
+                "strategy.strategies.price_action.support_resistance_reaction_strategy.SupportResistanceReactionStrategy",
+            ),
+            "trend_continuation": (
+                "strategy.strategies.price_action.trend_continuation_strategy.TrendContinuationStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # open_interest
+            # -----------------------------------------------------------------
+            "oi_divergence": (
+                "strategy.strategies.open_interest.oi_divergence_strategy.OIDivergenceStrategy",
+                "strategy.strategies.open_interest.OIDivergenceStrategy",
+            ),
+            "oi_breakout_confirmation": (
+                "strategy.strategies.open_interest.oi_breakout_confirmation_strategy.OIBreakoutConfirmationStrategy",
+                "strategy.strategies.open_interest.OIBreakoutConfirmationStrategy",
+            ),
+            "oi_anomaly": (
+                "strategy.strategies.open_interest.oi_anomaly_strategy.OIAnomalyStrategy",
+                "strategy.strategies.open_interest.OIAnomalyStrategy",
+            ),
+            "oi_capitulation": (
+                "strategy.strategies.open_interest.oi_capitulation_strategy.OICapitulationStrategy",
+                "strategy.strategies.open_interest.OICapitulationStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # funding
+            # -----------------------------------------------------------------
+            "funding_extreme_reversal": (
+                "strategy.strategies.funding.funding_extreme_reversal_strategy.FundingExtremeReversalStrategy",
+                "strategy.strategies.funding.FundingExtremeReversalStrategy",
+            ),
+            "funding_divergence": (
+                "strategy.strategies.funding.funding_divergence_strategy.FundingDivergenceStrategy",
+                "strategy.strategies.funding.FundingDivergenceStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # orderflow
+            # -----------------------------------------------------------------
+            "cvd_divergence": (
+                "strategy.strategies.orderflow.cvd_divergence_strategy.CVDDivergenceStrategy",
+                "strategy.strategies.orderflow.cvd_divergence_strategy.CvdDivergenceStrategy",
+            ),
+            "orderflow_continuation": (
+                "strategy.strategies.orderflow.orderflow_continuation_strategy.OrderflowContinuationStrategy",
+                "strategy.strategies.orderflow.orderflow_continuation_strategy.OrderFlowContinuationStrategy",
+            ),
+            "orderflow_reversal": (
+                "strategy.strategies.orderflow.orderflow_reversal_strategy.OrderflowReversalStrategy",
+                "strategy.strategies.orderflow.orderflow_reversal_strategy.OrderFlowReversalStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # whales
+            # -----------------------------------------------------------------
+            "whale_accumulation": (
+                "strategy.strategies.whales.whale_accumulation_strategy.WhaleAccumulationStrategy",
+            ),
+            "whale_distribution": (
+                "strategy.strategies.whales.whale_distribution_strategy.WhaleDistributionStrategy",
+            ),
+            "whale_breakout": (
+                "strategy.strategies.whales.whale_breakout_strategy.WhaleBreakoutStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # liquidity
+            # -----------------------------------------------------------------
+            "liquidity_sweep": (
+                "strategy.strategies.liquidity.liquidity_sweep_strategy.LiquiditySweepStrategy",
+            ),
+            "stop_hunt_reversal": (
+                "strategy.strategies.liquidity.stop_hunt_reversal_strategy.StopHuntReversalStrategy",
+            ),
+            "equal_high_low": (
+                "strategy.strategies.liquidity.equal_high_low_strategy.EqualHighLowStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # liquidations
+            # -----------------------------------------------------------------
+            "liquidation_cascade": (
+                "strategy.strategies.liquidations.liquidation_cascade_strategy.LiquidationCascadeStrategy",
+            ),
+            "squeeze_reversal": (
+                "strategy.strategies.liquidations.squeeze_reversal_strategy.SqueezeReversalStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # spoofing
+            # -----------------------------------------------------------------
+            "spoofing_reversal": (
+                "strategy.strategies.spoofing.spoofing_reversal_strategy.SpoofingReversalStrategy",
+            ),
+            "fake_liquidity_trap": (
+                "strategy.strategies.spoofing.fake_liquidity_trap_strategy.FakeLiquidityTrapStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # spreads
+            # -----------------------------------------------------------------
+            "cross_exchange_arb": (
+                "strategy.strategies.spreads.cross_exchange_arb_strategy.CrossExchangeArbStrategy",
+                "strategy.strategies.spreads.cross_exchange_arb_strategy.CrossExchangeArbitrageStrategy",
+            ),
+            "spot_futures_basis": (
+                "strategy.strategies.spreads.spot_futures_basis_strategy.SpotFuturesBasisStrategy",
+            ),
+            "spread_momentum": (
+                "strategy.strategies.spreads.spread_momentum_strategy.SpreadMomentumStrategy",
+            ),
+            "funding_adjusted_basis": (
+                "strategy.strategies.spreads.funding_adjusted_basis_strategy.FundingAdjustedBasisStrategy",
+            ),
+
+            # -----------------------------------------------------------------
+            # hybrid
+            # -----------------------------------------------------------------
+            "confluence": (
+                "strategy.strategies.hybrid.confluence_strategy.ConfluenceStrategy",
+            ),
+            "hybrid_confluence": (
+                "strategy.strategies.hybrid.confluence_strategy.ConfluenceStrategy",
+            ),
+            "trend_stack": (
+                "strategy.strategies.hybrid.trend_stack_strategy.TrendStackStrategy",
+            ),
+            "mean_reversion_stack": (
+                "strategy.strategies.hybrid.mean_reversion_stack_strategy.MeanReversionStackStrategy",
+            ),
+            "liquidation_whale": (
+                "strategy.strategies.hybrid.liquidation_whale_strategy.LiquidationWhaleStrategy",
+            ),
+            "whale_orderflow_breakout": (
+                "strategy.strategies.hybrid.whale_orderflow_breakout_strategy.WhaleOrderflowBreakoutStrategy",
+            ),
+        }
+
+    @staticmethod
+    def import_first_strategy_candidate(paths: Sequence[str]) -> tuple[Any | None, str | None]:
+        for path in paths:
+            target = import_object_or_none(path)
+            if target is not None:
+                return target, path
+        return None, None
+
+    @staticmethod
+    def strategy_registry_count(registry: Any) -> int:
+        count = getattr(registry, "count", None)
+        if callable(count):
+            try:
+                return int(count())
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        list_all = getattr(registry, "list_all", None)
+        if callable(list_all):
+            try:
+                return len(list_all())
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        raw = getattr(registry, "_strategies", None)
+        if isinstance(raw, dict):
+            return len(raw)
+
+        return 0
+
+    @staticmethod
+    def strategy_registry_categories(registry: Any) -> set[str]:
+        by_category = getattr(registry, "_by_category", None)
+        categories: set[str] = set()
+
+        if isinstance(by_category, dict):
+            for category, values in by_category.items():
+                try:
+                    if len(values) <= 0:
+                        continue
+                except TypeError:
+                    pass
+                categories.add(str(getattr(category, "value", category)))
+            return categories
+
+        list_all = getattr(registry, "list_all", None)
+        if callable(list_all):
+            try:
+                for strategy in list_all():
+                    category = getattr(strategy, "category", None)
+                    if category is not None:
+                        categories.add(str(getattr(category, "value", category)))
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        return categories
+
+    def validate_strategy_registry(self, registry: Any) -> None:
+        """
+        Validate that enabled analytics streams have matching strategy domains.
+        """
+
+        categories = self.strategy_registry_categories(registry)
+        missing: list[str] = []
+
+        if self.config.enable_candles and "price_action" not in categories:
+            missing.append("PRICE_ACTION strategies for candle/price_action analytics")
+
+        if self.config.enable_open_interest and "open_interest" not in categories:
+            missing.append("OPEN_INTEREST strategies for analytics.oi.*")
+
+        if self.config.enable_funding and "funding" not in categories:
+            missing.append("FUNDING strategies for analytics.funding.*")
+
+        if self.config.enable_trades:
+            if "orderflow" not in categories:
+                missing.append("ORDERFLOW strategies for trade/orderflow analytics")
+            if "whales" not in categories:
+                missing.append("WHALES strategies for whale/trades analytics")
+
+        if self.config.enable_orderbook:
+            if "liquidity" not in categories:
+                missing.append("LIQUIDITY strategies for orderbook/liquidity analytics")
+            if "spoofing" not in categories:
+                missing.append("SPOOFING strategies for orderbook/spoofing analytics")
+
+        if self.config.enable_liquidations and "liquidations" not in categories:
+            missing.append("LIQUIDATIONS strategies for liquidation analytics")
+
+        if self.config.enable_spreads and "spreads" not in categories:
+            missing.append("SPREADS strategies for spread analytics")
+
+        if not missing:
+            return
+
+        raise BacktestDependencyError(
+            "BacktestProjectBootstrap registry is missing strategy domains required "
+            "for enabled analytics streams:\n- "
+            + "\n- ".join(missing)
+            + "\n\n"
+            + self.diagnostics.format()
+        )
 
     @staticmethod
     def build_strategy_runtime_state(strategy_config: Any) -> Any:
@@ -1190,6 +1724,28 @@ def env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    normalized = raw.strip().lower()
+    if not normalized:
+        return default
+
+    return normalized in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
 
 
 def env_list(name: str, default: list[str]) -> list[str]:

@@ -967,21 +967,46 @@ class BacktestEventFlowDebugMonitor(SerializableMixin):
 
     @property
     def last_stage(self) -> str:
-        ordered = [
-            "position",
-            "execution",
-            "risk",
-            "signal",
-            "strategy",
-            "analytics",
-            "market.updated",
-            "market.candle.closed",
-            "market.raw",
-        ]
-        for group in ordered:
-            if self.group_counts.get(group, 0) > 0:
-                return group
+        """
+        Return the last *trading-flow* stage reached.
+
+        Lifecycle-only risk/strategy events such as risk.manager.started or
+        strategy.engine.started must not make the flow look healthier than it
+        is. A risk stage is considered reached only after signal.* has appeared
+        or after an explicit trading risk topic is observed.
+        """
+
+        market_updated = (
+            self.group_counts.get("market.updated", 0)
+            + self.group_counts.get("market.candle.closed", 0)
+        )
+
+        if self.group_counts.get("position", 0) > 0:
+            return "position"
+        if self.group_counts.get("execution", 0) > 0:
+            return "execution"
+        if self.group_counts.get("signal", 0) > 0:
+            if self._has_trading_risk_topic():
+                return "risk"
+            return "signal"
+        if self._has_trading_risk_topic():
+            return "risk"
+        if self.group_counts.get("analytics", 0) > 0:
+            return "analytics"
+        if market_updated > 0:
+            return "market.updated"
+        if self.group_counts.get("market.raw", 0) > 0:
+            return "market.raw"
         return "none"
+
+    def _has_trading_risk_topic(self) -> bool:
+        trading_risk_topics = {
+            "signal.confirmed",
+            "risk.position_blocked",
+            "risk.kill_switch",
+            "risk.limit_warning",
+        }
+        return any(self.topic_counts.get(topic, 0) > 0 for topic in trading_risk_topics)
 
     @property
     def suspected_breakpoint(self) -> str:
@@ -1296,6 +1321,13 @@ class StrategyTester:
 
         try:
             await self._run_replay()
+
+            # EventBus may deliver handlers through an internal async queue.
+            # Replay can finish before downstream analytics/strategy/risk
+            # handlers have fully drained, so always wait before diagnostics and
+            # result collection.
+            await self._drain_event_bus(reason="after_replay")
+
             self._attach_replay_debug_stats()
             self._print_debug_checkpoint("after_replay")
             result = await self._collect_result(status=BacktestStatus.COMPLETED)
@@ -1310,6 +1342,8 @@ class StrategyTester:
                     "trades": len(result.trades),
                 },
             )
+            await self._drain_event_bus(reason="after_completed_event")
+            self._attach_result_debug_metadata()
             return result
 
         except (BacktestLifecycleError, BacktestDependencyError, BacktestComponentError, BacktestResultCollectionError) as exc:
@@ -1343,11 +1377,13 @@ class StrategyTester:
             self.stats_state.finished_at = utcnow()
 
         await self._stop_components_reverse_order()
+        await self._drain_event_bus(reason="after_component_stop")
 
         if self.components.collectors is not None:
             self.components.collectors.unregister()
         if self.components.debug_monitor is not None:
             self._attach_replay_debug_stats()
+            self._attach_result_debug_metadata()
             if self.components.debug_monitor.print_summary:
                 print(self.components.debug_monitor.format_summary())
             self.components.debug_monitor.unregister()
@@ -1729,26 +1765,34 @@ class StrategyTester:
     def _components_start_order(self) -> list[Any]:
         result: list[Any] = []
 
+        # Core runtime first. EventBus/Scheduler must be running before any
+        # component registers background jobs or emits lifecycle events.
         if self.components.event_bus is not None:
             result.append(self.components.event_bus)
         if self.components.scheduler is not None:
             result.append(self.components.scheduler)
 
-        result.extend(self.components.data_caches)
-        result.extend(self.components.analytics_components)
-
+        # Downstream listeners before upstream producers. This prevents
+        # analytics.start() or replay-produced analytics.* events from being
+        # emitted before StrategyEventHandler/Risk/Simulators are subscribed.
         for component in (
-            self.components.signal_processor,
-            self.components.strategy_engine,
             self.components.risk_manager,
             self.components.execution_simulator,
             self.components.position_simulator,
+            self.components.signal_processor,
+            self.components.strategy_engine,
         ):
             if component is not None:
                 result.append(component)
 
-        # MarketReplay starts lazily inside replay(), but including it here is
-        # safe because MarketReplay.start() only changes replay lifecycle state.
+        # Data caches must be ready before MarketReplay emits market.*.
+        result.extend(self.components.data_caches)
+
+        # Analytics is intentionally last among production components: it is an
+        # upstream producer of analytics.* events consumed by StrategyEngine.
+        result.extend(self.components.analytics_components)
+
+        # MarketReplay starts lazily inside replay(); do not start it here.
         return self._dedupe_components(result)
 
     def _all_components_for_lifecycle(self, *, include_replay: bool) -> list[Any]:
@@ -1801,6 +1845,69 @@ class StrategyTester:
         ):
             print(f"- {group}: {monitor.group_counts.get(group, 0)}")
         print("===============================================")
+
+    async def _drain_event_bus(self, *, reason: str = "") -> None:
+        """
+        Best-effort wait until queued EventBus handlers have had a chance to run.
+
+        Production EventBus implementations may expose different names for this
+        operation. We try the known public/semipublic shapes first and then fall
+        back to several event-loop yields. This keeps backtest result collection
+        deterministic without depending on a single EventBus implementation.
+        """
+
+        event_bus = self.components.event_bus
+        if event_bus is None:
+            return
+
+        for method_name in (
+            "drain",
+            "flush",
+            "join",
+            "wait_idle",
+            "wait_until_idle",
+            "wait_empty",
+        ):
+            method = getattr(event_bus, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                await maybe_await(method())
+                return
+            except TypeError:
+                try:
+                    await maybe_await(method(timeout=5.0))
+                    return
+                except (RuntimeError, ValueError, TypeError, AttributeError):
+                    continue
+            except (RuntimeError, ValueError, AttributeError):
+                continue
+
+        queue = getattr(event_bus, "_queue", None)
+        join = getattr(queue, "join", None)
+        if callable(join):
+            try:
+                await join()
+                return
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                pass
+
+        # Fallback for EventBus implementations where emit() schedules handler
+        # tasks but exposes no drain API.
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    def _attach_result_debug_metadata(self) -> None:
+        if self.result is None:
+            return
+
+        if self.components.debug_monitor is not None:
+            self.result.metadata["event_flow_debug"] = self.components.debug_monitor.to_dict()
+
+        self.result.metadata["strategy_tester_stats"] = self.stats_state.to_dict()
+        self.result.metadata["market_replay"] = stats_if_supported(self.components.market_replay)
+        self.result.metadata["execution_simulator"] = stats_if_supported(self.components.execution_simulator)
+        self.result.metadata["position_simulator"] = stats_if_supported(self.components.position_simulator)
 
     async def _run_replay(self) -> None:
         if self.components.market_replay is None:
@@ -1884,16 +1991,7 @@ class StrategyTester:
             metadata={"run_id": self.result.run_id},
         )
         self.result.simulation_models = self._build_simulation_snapshot()
-        if self.components.debug_monitor is not None:
-            self.result.metadata["event_flow_debug"] = self.components.debug_monitor.to_dict()
-        self.result.metadata.update(
-            {
-                "strategy_tester_stats": self.stats_state.to_dict(),
-                "market_replay": stats_if_supported(self.components.market_replay),
-                "execution_simulator": stats_if_supported(execution),
-                "position_simulator": stats_if_supported(position),
-            }
-        )
+        self._attach_result_debug_metadata()
 
         if collectors is not None and self.config.save_events:
             self.result.metadata["event_log_count"] = len(collectors.event_log)

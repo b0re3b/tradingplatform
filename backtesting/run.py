@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from core.config import Config
+from core.event_bus import EventBus
 from core.logger import get_logger
+from core.scheduler import Scheduler
 
 from backtesting.bootstrap import (
     BacktestProjectBootstrap,
@@ -113,6 +115,81 @@ def _enabled_data_types_from_runtime(
         data_types.add(BacktestDataType.LIQUIDATIONS)
 
     return data_types
+
+
+# =============================================================================
+# Shared system runtime
+# =============================================================================
+
+
+def _construct_event_bus(core_config: Config) -> EventBus:
+    """
+    Construct the single shared system EventBus used by the entire backtest.
+
+    This is intentionally done in the entrypoint/runtime layer, not inside
+    BacktestProjectBootstrap. Bootstrap receives this object and wires all
+    components to it.
+    """
+
+    event_bus_config = getattr(core_config, "event_bus", None)
+
+    for args, kwargs in (
+        ((), {"config": event_bus_config}),
+        ((), {"event_bus_config": event_bus_config}),
+        ((event_bus_config,), {}),
+        ((), {}),
+    ):
+        try:
+            return EventBus(*args, **kwargs)
+        except TypeError:
+            continue
+
+    raise RuntimeError("Unable to construct shared system EventBus.")
+
+
+def _construct_scheduler(core_config: Config, event_bus: EventBus) -> Scheduler:
+    """
+    Construct the single shared system Scheduler used by the entire backtest.
+
+    The same scheduler instance is passed through bootstrap and StrategyTester,
+    so scheduled jobs from data/analytics/strategy/risk all run on one runtime.
+    """
+
+    scheduler_config = getattr(core_config, "scheduler", None)
+
+    for args, kwargs in (
+        ((), {"config": scheduler_config, "event_bus": event_bus}),
+        ((), {"scheduler_config": scheduler_config, "event_bus": event_bus}),
+        ((), {"event_bus": event_bus, "config": scheduler_config}),
+        ((), {"event_bus": event_bus}),
+        ((scheduler_config,), {}),
+        ((), {}),
+    ):
+        try:
+            return Scheduler(*args, **kwargs)
+        except TypeError:
+            continue
+
+    raise RuntimeError("Unable to construct shared system Scheduler.")
+
+
+def build_shared_system_runtime(core_config: Config) -> tuple[EventBus, Scheduler]:
+    """
+    Build one shared system EventBus/Scheduler pair for the full backtest flow.
+
+    Flow:
+        shared EventBus/Scheduler
+        -> BacktestProjectBootstrap
+        -> data caches / analytics / strategy / risk
+        -> StrategyTester / MarketReplay / simulators
+
+    Do not create EventBus/Scheduler inside bootstrap; it must only receive
+    these shared instances.
+    """
+
+    event_bus = _construct_event_bus(core_config)
+    scheduler = _construct_scheduler(core_config, event_bus)
+    return event_bus, scheduler
 
 
 # =============================================================================
@@ -744,9 +821,25 @@ def print_strategy_internal_debug(pipeline: Any, result: BacktestResult | None =
 
 async def run_full_backtest(
     runtime_config: BacktestProjectBootstrapConfig | None = None,
+    *,
+    event_bus: EventBus | None = None,
+    scheduler: Scheduler | None = None,
 ) -> BacktestResult:
+    """
+    Run a full production-style backtest on one shared system runtime.
+
+    If event_bus/scheduler are not provided by a higher-level application,
+    this entrypoint creates exactly one shared pair and passes it everywhere.
+    BacktestProjectBootstrap must not create its own local runtime.
+    """
+
     core_config = Config.from_env()
     runtime = runtime_config or BacktestProjectBootstrapConfig.from_env()
+
+    if event_bus is None or scheduler is None:
+        shared_event_bus, shared_scheduler = build_shared_system_runtime(core_config)
+        event_bus = event_bus or shared_event_bus
+        scheduler = scheduler or shared_scheduler
 
     backtest_config = build_backtest_config(runtime, core_config=core_config)
     dataset = load_dataset(backtest_config)
@@ -756,6 +849,8 @@ async def run_full_backtest(
     bootstrap = BacktestProjectBootstrap(
         config=runtime,
         core_config=core_config,
+        event_bus=event_bus,
+        scheduler=scheduler,
         backtest_config=backtest_config,
     )
     pipeline = bootstrap.build()
