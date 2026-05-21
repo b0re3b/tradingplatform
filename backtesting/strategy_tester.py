@@ -377,6 +377,8 @@ class BacktestCollectors(SerializableMixin):
         if collect_signal_records:
             self._subscribe("signal.generated", self._record_signal_generated)
             self._subscribe("signal.confirmed", self._record_signal_confirmed)
+            self._subscribe("signal.rejected", self._record_signal_rejected)
+            self._subscribe("signal.updated", self._record_signal_updated)
 
         if collect_risk_records:
             self._subscribe("signal.confirmed", self._record_risk_decision)
@@ -456,6 +458,18 @@ class BacktestCollectors(SerializableMixin):
         # this collection layer because outcome analysis may need lifecycle rows.
         self.signal_records.append(self._build_signal_record(topic=topic, payload=payload, status="confirmed"))
 
+    def _record_signal_rejected(self, topic: str, payload: dict[str, Any], _: Any) -> None:
+        # Rejected signals are critical for diagnosing strategy/filter/confluence
+        # breakpoints. They must be collected even though they never reach risk.
+        self.signal_records.append(self._build_signal_record(topic=topic, payload=payload, status="rejected"))
+
+    def _record_signal_updated(self, topic: str, payload: dict[str, Any], _: Any) -> None:
+        status = str(payload.get("status") or "").strip().lower()
+        if status == "rejected":
+            self._record_signal_rejected(topic, payload, _)
+        elif status == "confirmed":
+            self._record_signal_confirmed(topic, payload, _)
+
     def _record_risk_decision(self, topic: str, payload: dict[str, Any], _: Any) -> None:
         try:
             self.risk_records.append(self._build_risk_record(topic=topic, payload=payload))
@@ -491,12 +505,32 @@ class BacktestCollectors(SerializableMixin):
                 "confidence": self._float_first(payload, "confidence", "score", default=0.0),
                 "generated_at_ms": self._int_first(payload, "timestamp_ms", "created_at_ms", default=timestamp_ms(utcnow())) if status == "generated" else None,
                 "confirmed_at_ms": self._int_first(payload, "timestamp_ms", "created_at_ms", default=timestamp_ms(utcnow())) if status == "confirmed" else None,
-                "outcome": SignalOutcome.CONFIRMED_BY_RISK if status == "confirmed" else SignalOutcome.GENERATED,
+                "outcome": self._signal_outcome_for_status(status),
                 "payload": dict(payload),
                 "metadata": {"source_topic": topic, "run_id": self.run_id},
             },
         )
         return BacktestSignalRecord(**kwargs)
+
+    @staticmethod
+    def _signal_outcome_for_status(status: str) -> SignalOutcome:
+        normalized = str(status).strip().lower()
+
+        if normalized == "confirmed":
+            return SignalOutcome.CONFIRMED_BY_RISK
+
+        if normalized == "rejected":
+            for attr in (
+                "REJECTED",
+                "REJECTED_BY_STRATEGY",
+                "REJECTED_BY_FILTER",
+                "BLOCKED",
+            ):
+                value = getattr(SignalOutcome, attr, None)
+                if value is not None:
+                    return value
+
+        return SignalOutcome.GENERATED
 
     def _build_risk_record(self, *, topic: str, payload: dict[str, Any]) -> BacktestRiskDecisionRecord:
         kwargs = self._accepted_kwargs(
@@ -689,6 +723,8 @@ class BacktestEventFlowDebugMonitor(SerializableMixin):
 
     _event_bus: EventBus | None = field(default=None, init=False, repr=False)
     _enabled: bool = field(default=False, init=False, repr=False)
+    _recent_event_keys: deque[tuple[Any, ...]] = field(default_factory=deque, init=False, repr=False)
+    _recent_event_key_set: set[tuple[Any, ...]] = field(default_factory=set, init=False, repr=False)
 
     TOPIC_PATTERNS: tuple[str, ...] = (
         # Raw market topics emitted by MarketReplay. Keep explicit topics because
@@ -778,6 +814,16 @@ class BacktestEventFlowDebugMonitor(SerializableMixin):
         return _wrapped
 
     def record(self, *, topic: str, payload: dict[str, Any]) -> None:
+        event_key = self._event_key(topic=topic, payload=payload)
+        if event_key in self._recent_event_key_set:
+            return
+
+        self._recent_event_keys.append(event_key)
+        self._recent_event_key_set.add(event_key)
+        while len(self._recent_event_keys) > max(self.max_recent_events * 4, 256):
+            old_key = self._recent_event_keys.popleft()
+            self._recent_event_key_set.discard(old_key)
+
         group = self.group_for_topic(topic)
 
         self.topic_counts[topic] += 1
@@ -827,6 +873,23 @@ class BacktestEventFlowDebugMonitor(SerializableMixin):
         if topic.startswith("system."):
             return "system"
         return "other"
+
+    @staticmethod
+    def _event_key(*, topic: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            topic,
+            payload.get("event_id"),
+            payload.get("signal_id") or payload.get("id"),
+            payload.get("order_id"),
+            payload.get("position_id"),
+            payload.get("symbol"),
+            payload.get("timeframe"),
+            payload.get("timestamp_ms") or payload.get("received_at_ms") or payload.get("created_at_ms"),
+            payload.get("open_time_ms"),
+            payload.get("status"),
+            payload.get("side") or payload.get("direction"),
+            payload.get("price") or payload.get("close"),
+        )
 
     @staticmethod
     def compact_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1266,6 +1329,7 @@ class StrategyTester:
 
             self._assert_required_components()
             self._assert_no_live_execution_components()
+            self._rebind_component_runtime_handles()
             self._prepare_market_replay()
             self._register_components()
 
@@ -1478,6 +1542,12 @@ class StrategyTester:
                 scheduler = Scheduler()
             self.components.scheduler = BacktestSchedulerCompatAdapter(scheduler)
             self.components.owned_components.append(self.components.scheduler)
+            return
+
+        if not isinstance(self.components.scheduler, BacktestSchedulerCompatAdapter):
+            wrap_external = os.getenv("BACKTEST_WRAP_EXTERNAL_SCHEDULER", "1").strip().lower()
+            if wrap_external not in {"0", "false", "no", "off"}:
+                self.components.scheduler = BacktestSchedulerCompatAdapter(self.components.scheduler)
 
     def _build_clock(self) -> None:
         if self.components.clock is not None:
@@ -1815,6 +1885,11 @@ class StrategyTester:
             replay_stats = getattr(self.components.market_replay, "stats_state", None)
             if replay_stats is None:
                 replay_stats = getattr(self.components.market_replay, "stats", None)
+                if callable(replay_stats):
+                    try:
+                        replay_stats = replay_stats()
+                    except (RuntimeError, ValueError, TypeError, AttributeError):
+                        replay_stats = None
 
         dataset_events = len(self.dataset.events) if self.dataset is not None else 0
         monitor.attach_replay_stats(
@@ -1893,9 +1968,21 @@ class StrategyTester:
                 pass
 
         # Fallback for EventBus implementations where emit() schedules handler
-        # tasks but exposes no drain API.
-        for _ in range(10):
-            await asyncio.sleep(0)
+        # tasks but exposes no drain API. Chained market -> analytics -> strategy
+        # -> risk -> execution -> position flows may need more than a few loop
+        # ticks, so keep this configurable for deterministic backtests.
+        try:
+            iterations = int(os.getenv("BACKTEST_EVENT_DRAIN_ITERATIONS", "50"))
+        except ValueError:
+            iterations = 50
+
+        try:
+            sleep_seconds = float(os.getenv("BACKTEST_EVENT_DRAIN_SLEEP_SECONDS", "0"))
+        except ValueError:
+            sleep_seconds = 0.0
+
+        for _ in range(max(1, iterations)):
+            await asyncio.sleep(max(0.0, sleep_seconds))
 
     def _attach_result_debug_metadata(self) -> None:
         if self.result is None:
@@ -2163,6 +2250,14 @@ class StrategyTester:
         if not component_kwargs:
             return
 
+        expanded = dict(component_kwargs)
+
+        for key in ("pipeline", "backtest_pipeline", "built_pipeline"):
+            pipeline = expanded.get(key)
+            if pipeline is not None:
+                self._apply_built_pipeline(pipeline)
+                break
+
         mapping = {
             "event_bus": "event_bus",
             "scheduler": "scheduler",
@@ -2177,9 +2272,90 @@ class StrategyTester:
             "risk_manager": "risk_manager",
         }
 
+        list_attrs = {"data_caches", "analytics_components"}
+
         for key, attr in mapping.items():
-            if key in component_kwargs:
-                setattr(self.components, attr, component_kwargs[key])
+            if key not in expanded:
+                continue
+
+            value = expanded[key]
+            if attr in list_attrs:
+                value = self._as_component_list(value)
+
+            setattr(self.components, attr, value)
+
+    def _apply_built_pipeline(self, pipeline: Any) -> None:
+        """
+        Accept BuiltBacktestPipeline returned by BacktestProjectBootstrap.build().
+
+        This keeps bootstrap.py and StrategyTester compatible: callers can pass
+        component_kwargs={"pipeline": pipeline} instead of manually unpacking
+        every component.
+        """
+
+        event_bus = getattr(pipeline, "event_bus", None)
+        scheduler = getattr(pipeline, "scheduler", None)
+        data_caches = getattr(pipeline, "data_caches", None)
+        analytics_components = getattr(pipeline, "analytics_components", None)
+        risk_manager = getattr(pipeline, "risk_manager", None)
+
+        strategy_pipeline = getattr(pipeline, "strategy_pipeline", None)
+        signal_processor = (
+            getattr(pipeline, "signal_processor", None)
+            or getattr(strategy_pipeline, "signal_processor", None)
+        )
+        strategy_engine = (
+            getattr(pipeline, "strategy_engine", None)
+            or getattr(strategy_pipeline, "strategy_engine", None)
+        )
+
+        if event_bus is not None:
+            self.components.event_bus = event_bus
+        if scheduler is not None:
+            self.components.scheduler = scheduler
+        if data_caches is not None:
+            self.components.data_caches = self._as_component_list(data_caches)
+        if analytics_components is not None:
+            self.components.analytics_components = self._as_component_list(analytics_components)
+        if signal_processor is not None:
+            self.components.signal_processor = signal_processor
+        if strategy_engine is not None:
+            self.components.strategy_engine = strategy_engine
+        if risk_manager is not None:
+            self.components.risk_manager = risk_manager
+
+        diagnostics = getattr(pipeline, "diagnostics", None)
+        if diagnostics is not None and self.result is not None:
+            formatter = getattr(diagnostics, "format", None)
+            if callable(formatter):
+                self.result.metadata["bootstrap_diagnostics"] = formatter()
+
+    def _rebind_component_runtime_handles(self) -> None:
+        """
+        Ensure injected/bootstrap-built components share the tester runtime.
+
+        This is best-effort and intentionally conservative: it only updates
+        common public attributes when they already exist on a component.
+        """
+
+        event_bus = self.components.event_bus
+        scheduler = self.components.scheduler
+
+        for component in self._all_components_for_lifecycle(include_replay=False):
+            if component is None:
+                continue
+
+            if event_bus is not None and hasattr(component, "event_bus"):
+                try:
+                    setattr(component, "event_bus", event_bus)
+                except (RuntimeError, ValueError, TypeError, AttributeError):
+                    pass
+
+            if scheduler is not None and hasattr(component, "scheduler"):
+                try:
+                    setattr(component, "scheduler", scheduler)
+                except (RuntimeError, ValueError, TypeError, AttributeError):
+                    pass
 
     @staticmethod
     def _as_component_list(value: Any) -> list[Any]:
@@ -2262,6 +2438,7 @@ __all__ = [
     "BacktestSchedulerCompatAdapter",
     "StrategyTesterStats",
     "BacktestCollectors",
+    "BacktestEventFlowDebugMonitor",
     "BacktestComponentBundle",
     "StrategyTester",
     "run_strategy_backtest",

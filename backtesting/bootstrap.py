@@ -30,18 +30,15 @@ import inspect
 import os
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
-
-from core.config import Config
-from core.event_bus import EventBus
-from core.logger import get_logger
-from core.scheduler import Scheduler
 
 from backtesting.config import BacktestConfig
 from backtesting.enums import BacktestDataType
 from backtesting.exceptions import BacktestDependencyError
-
+from core.config import Config
+from core.event_bus import EventBus
+from core.logger import get_logger
+from core.scheduler import Scheduler
 
 ComponentFactory = Callable[..., Any]
 
@@ -856,6 +853,7 @@ class BacktestProjectBootstrap:
                         config = target()
 
                 self.patch_strategy_event_routing(config)
+                self.patch_strategy_config_for_backtest(config)
                 return config
 
             except (TypeError, ValueError, AttributeError) as exc:
@@ -864,6 +862,57 @@ class BacktestProjectBootstrap:
         raise BacktestDependencyError(
             "Could not build StrategyConfig.",
             details={"last_error": last_error},
+        )
+
+    def patch_strategy_config_for_backtest(self, strategy_config: Any) -> None:
+        """
+        Apply backtest-safe strategy thresholds without changing production presets.
+
+        Full-pipeline backtests often replay sparse historical domains where one
+        strategy can be the only valid producer for a given analytics event. The
+        production intraday preset requires two agreeing signals, which is valid
+        live but can make every otherwise-valid single-strategy signal end as
+        `confluence_rejected` / `insufficient_agreement_count`.
+
+        Defaults are intentionally controlled by BACKTEST_* env vars and only
+        applied to this in-memory StrategyConfig instance.
+        """
+
+        confluence = getattr(strategy_config, "confluence", None)
+        if confluence is not None:
+            min_agreement = env_int("BACKTEST_STRATEGY_MIN_AGREEMENT_COUNT", 1)
+            if min_agreement >= 1 and hasattr(confluence, "min_agreement_count"):
+                confluence.min_agreement_count = min_agreement
+
+            min_confidence_raw = os.getenv("BACKTEST_STRATEGY_MIN_CONFLUENCE_CONFIDENCE")
+            if min_confidence_raw:
+                value = env_float("BACKTEST_STRATEGY_MIN_CONFLUENCE_CONFIDENCE", None)
+                if value is not None and hasattr(confluence, "min_confidence"):
+                    confluence.min_confidence = max(0.0, min(1.0, value))
+
+            min_score_raw = os.getenv("BACKTEST_STRATEGY_MIN_CONFLUENCE_SCORE")
+            if min_score_raw:
+                value = env_float("BACKTEST_STRATEGY_MIN_CONFLUENCE_SCORE", None)
+                if value is not None and hasattr(confluence, "min_score"):
+                    confluence.min_score = max(0.0, value)
+
+        # Hybrid strategies should not be auto-routed unless explicitly enabled
+        # for the current dataset. This avoids registering whale/orderflow hybrid
+        # strategies on candles+funding+OI-only backtests.
+        routing = getattr(strategy_config, "routing", None)
+        if routing is not None and os.getenv("BACKTEST_STRATEGY_ROUTE_HYBRID") is not None:
+            routing.route_hybrid_on_domain_signal = env_bool(
+                "BACKTEST_STRATEGY_ROUTE_HYBRID",
+                getattr(routing, "route_hybrid_on_domain_signal", True),
+            )
+
+        validate = getattr(strategy_config, "validate", None)
+        if callable(validate):
+            validate()
+
+        self.diagnostics.loaded.append(
+            "strategy config patched for backtest thresholds "
+            f"(min_agreement_count={getattr(confluence, 'min_agreement_count', None)})"
         )
 
     def patch_strategy_event_routing(self, strategy_config: Any) -> None:
@@ -1093,21 +1142,49 @@ class BacktestProjectBootstrap:
 
     def strategy_names_from_config(self, strategy_config: Any) -> list[str]:
         """
-        Return enabled strategy names from StrategyConfig / PresetConfig.
+        Return truly enabled strategy names from StrategyConfig / PresetConfig.
 
-        Prefer preset.enabled_strategy_names when present because
-        build_default_strategy_registry uses the same rule. Fall back to
-        config.strategies keys.
+        Prefer StrategyConfig.get_enabled_strategy_names() because it applies
+        both runtime.enabled and preset allow-list. Fall back to preset names
+        only for older configs that do not expose the helper.
         """
+
+        get_enabled = getattr(strategy_config, "get_enabled_strategy_names", None)
+        if callable(get_enabled):
+            try:
+                return [str(name).strip() for name in get_enabled() if str(name).strip()]
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        legacy_enabled = getattr(strategy_config, "enabled_strategy_names", None)
+        if callable(legacy_enabled):
+            try:
+                return [str(name).strip() for name in legacy_enabled() if str(name).strip()]
+            except (TypeError, ValueError, AttributeError):
+                pass
 
         preset = getattr(strategy_config, "preset", None)
         enabled = getattr(preset, "enabled_strategy_names", None)
         if enabled:
+            strategies = getattr(strategy_config, "strategies", None)
+            if isinstance(strategies, dict):
+                return [
+                    str(name).strip()
+                    for name in enabled
+                    if str(name).strip()
+                    and getattr(strategies.get(str(name).strip()), "runtime", None) is not None
+                    and getattr(strategies[str(name).strip()].runtime, "enabled", True)
+                ]
             return [str(name).strip() for name in enabled if str(name).strip()]
 
         strategies = getattr(strategy_config, "strategies", None)
         if isinstance(strategies, dict):
-            return [str(name).strip() for name in strategies if str(name).strip()]
+            return [
+                str(name).strip()
+                for name, definition in strategies.items()
+                if str(name).strip()
+                and getattr(getattr(definition, "runtime", None), "enabled", True)
+            ]
 
         return []
 
@@ -1132,7 +1209,8 @@ class BacktestProjectBootstrap:
                 )
                 continue
 
-            if domain in enabled_domains:
+            required_domains = self.strategy_required_domains(name, fallback_domain=domain)
+            if required_domains.issubset(enabled_domains):
                 result.append(name)
             else:
                 skipped.append(name)
@@ -1194,6 +1272,37 @@ class BacktestProjectBootstrap:
         return domains
 
     @staticmethod
+    def strategy_required_domains(name: str, *, fallback_domain: str) -> set[str]:
+        """
+        Required data/analytics domains for a concrete strategy.
+
+        This is stricter than the high-level catalog domain for hybrid strategies:
+        a hybrid strategy should not be enabled just because `hybrid` is enabled;
+        its underlying source domains must also exist in the current backtest.
+        """
+
+        dependencies: dict[str, set[str]] = {
+            # Hybrid strategies
+            "confluence": {"price_action", "funding", "open_interest"},
+            "hybrid_confluence": {"price_action", "funding", "open_interest"},
+            "trend_stack": {"price_action", "open_interest"},
+            "mean_reversion_stack": {"price_action", "funding", "open_interest"},
+            "liquidation_whale": {"liquidations", "whales"},
+            "liquidity_orderflow_reversal": {"liquidity", "orderflow"},
+            "oi_funding_squeeze": {"open_interest", "funding"},
+            "whale_orderflow_breakout": {"whales", "orderflow"},
+
+            # Strategies whose names imply a required optional stream.
+            "whale_accumulation": {"whales"},
+            "whale_distribution": {"whales"},
+            "whale_breakout": {"whales"},
+            "whale_absorption": {"whales"},
+            "whale_liquidation_reversal": {"whales", "liquidations"},
+        }
+
+        return set(dependencies.get(name, {fallback_domain}))
+
+    @staticmethod
     def strategy_domain_by_name() -> dict[str, str]:
         return {
             # price_action
@@ -1221,6 +1330,8 @@ class BacktestProjectBootstrap:
             "whale_accumulation": "whales",
             "whale_distribution": "whales",
             "whale_breakout": "whales",
+            "whale_absorption": "whales",
+            "whale_liquidation_reversal": "whales",
 
             # liquidity
             "liquidity_sweep": "liquidity",
@@ -1234,11 +1345,17 @@ class BacktestProjectBootstrap:
             # spoofing
             "spoofing_reversal": "spoofing",
             "fake_liquidity_trap": "spoofing",
+            "order_pull_reversal": "spoofing",
+            "pressure_bluff_reversal": "spoofing",
+            "layering_trap": "spoofing",
+            "spoofing_absorption_reversal": "spoofing",
+            "composite_spoofing": "spoofing",
 
             # spreads
             "cross_exchange_arb": "spreads",
             "spot_futures_basis": "spreads",
             "spread_momentum": "spreads",
+            "spread_mean_reversion": "spreads",
             "funding_adjusted_basis": "spreads",
 
             # hybrid
@@ -1247,6 +1364,8 @@ class BacktestProjectBootstrap:
             "trend_stack": "hybrid",
             "mean_reversion_stack": "hybrid",
             "liquidation_whale": "hybrid",
+            "liquidity_orderflow_reversal": "hybrid",
+            "oi_funding_squeeze": "hybrid",
             "whale_orderflow_breakout": "hybrid",
         }
 
@@ -1337,6 +1456,12 @@ class BacktestProjectBootstrap:
             "whale_breakout": (
                 "strategy.strategies.whales.whale_breakout_strategy.WhaleBreakoutStrategy",
             ),
+            "whale_absorption": (
+                "strategy.strategies.whales.whale_absorption_strategy.WhaleAbsorptionStrategy",
+            ),
+            "whale_liquidation_reversal": (
+                "strategy.strategies.whales.whale_liquidation_reversal_strategy.WhaleLiquidationReversalStrategy",
+            ),
 
             # -----------------------------------------------------------------
             # liquidity
@@ -1370,6 +1495,21 @@ class BacktestProjectBootstrap:
             "fake_liquidity_trap": (
                 "strategy.strategies.spoofing.fake_liquidity_trap_strategy.FakeLiquidityTrapStrategy",
             ),
+            "order_pull_reversal": (
+                "strategy.strategies.spoofing.order_pull_reversal_strategy.OrderPullReversalStrategy",
+            ),
+            "pressure_bluff_reversal": (
+                "strategy.strategies.spoofing.pressure_bluff_reversal_strategy.PressureBluffReversalStrategy",
+            ),
+            "layering_trap": (
+                "strategy.strategies.spoofing.layering_trap_strategy.LayeringTrapStrategy",
+            ),
+            "spoofing_absorption_reversal": (
+                "strategy.strategies.spoofing.spoofing_absorption_reversal_strategy.SpoofingAbsorptionReversalStrategy",
+            ),
+            "composite_spoofing": (
+                "strategy.strategies.spoofing.composite_spoofing_strategy.CompositeSpoofingStrategy",
+            ),
 
             # -----------------------------------------------------------------
             # spreads
@@ -1383,6 +1523,9 @@ class BacktestProjectBootstrap:
             ),
             "spread_momentum": (
                 "strategy.strategies.spreads.spread_momentum_strategy.SpreadMomentumStrategy",
+            ),
+            "spread_mean_reversion": (
+                "strategy.strategies.spreads.spread_mean_reversion_strategy.SpreadMeanReversionStrategy",
             ),
             "funding_adjusted_basis": (
                 "strategy.strategies.spreads.funding_adjusted_basis_strategy.FundingAdjustedBasisStrategy",
@@ -1405,6 +1548,13 @@ class BacktestProjectBootstrap:
             ),
             "liquidation_whale": (
                 "strategy.strategies.hybrid.liquidation_whale_strategy.LiquidationWhaleStrategy",
+            ),
+            "liquidity_orderflow_reversal": (
+                "strategy.strategies.hybrid.liquidity_orderflow_reversal_strategy.LiquidityOrderflowReversalStrategy",
+            ),
+            "oi_funding_squeeze": (
+                "strategy.strategies.hybrid.oi_funding_squeeze_strategy.OIFundingSqueezeStrategy",
+                "strategy.strategies.hybrid.oi_funding_squeeze_strategy.OiFundingSqueezeStrategy",
             ),
             "whale_orderflow_breakout": (
                 "strategy.strategies.hybrid.whale_orderflow_breakout_strategy.WhaleOrderflowBreakoutStrategy",
@@ -1443,9 +1593,25 @@ class BacktestProjectBootstrap:
 
     @staticmethod
     def strategy_registry_categories(registry: Any) -> set[str]:
-        by_category = getattr(registry, "_by_category", None)
         categories: set[str] = set()
 
+        list_all = getattr(registry, "list_all", None)
+        if callable(list_all):
+            try:
+                try:
+                    strategies = list_all(include_disabled=False)
+                except TypeError:
+                    strategies = list_all()
+
+                for strategy in strategies:
+                    category = getattr(strategy, "category", None)
+                    if category is not None:
+                        categories.add(str(getattr(category, "value", category)))
+                return categories
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        by_category = getattr(registry, "_by_category", None)
         if isinstance(by_category, dict):
             for category, values in by_category.items():
                 try:
@@ -1454,17 +1620,6 @@ class BacktestProjectBootstrap:
                 except TypeError:
                     pass
                 categories.add(str(getattr(category, "value", category)))
-            return categories
-
-        list_all = getattr(registry, "list_all", None)
-        if callable(list_all):
-            try:
-                for strategy in list_all():
-                    category = getattr(strategy, "category", None)
-                    if category is not None:
-                        categories.add(str(getattr(category, "value", category)))
-            except (TypeError, ValueError, AttributeError):
-                pass
 
         return categories
 
@@ -1608,23 +1763,89 @@ class BacktestProjectBootstrap:
             },
         )
 
-    @staticmethod
-    def build_risk_config(core_config: Config) -> Any:
+    def patch_risk_config_for_backtest(self, risk_config: Any) -> None:
+        if risk_config is None:
+            return
+
+        initial_balance = 10_000.0
+        if self.backtest_config is not None:
+            initial_balance = float(
+                getattr(self.backtest_config, "initial_balance", initial_balance) or initial_balance)
+
+        # Account/equity/balance aliases.
+        for field_name in (
+                "initial_balance",
+                "account_balance",
+                "account_equity",
+                "equity",
+                "balance",
+                "starting_balance",
+                "portfolio_equity",
+        ):
+            if hasattr(risk_config, field_name):
+                current = getattr(risk_config, field_name, None)
+                try:
+                    current_float = float(current)
+                except (TypeError, ValueError):
+                    current_float = 0.0
+
+                if current_float <= 0:
+                    setattr(risk_config, field_name, initial_balance)
+
+        # Risk per trade aliases.
+        for field_name in (
+                "risk_per_trade_pct",
+                "max_risk_per_trade_pct",
+                "default_risk_per_trade_pct",
+        ):
+            if hasattr(risk_config, field_name):
+                current = getattr(risk_config, field_name, None)
+                try:
+                    current_float = float(current)
+                except (TypeError, ValueError):
+                    current_float = 0.0
+
+                if current_float <= 0:
+                    setattr(risk_config, field_name, 0.01)
+
+        # Fixed risk aliases.
+        for field_name in (
+                "fixed_risk_amount",
+                "default_risk_amount",
+                "min_risk_amount",
+        ):
+            if hasattr(risk_config, field_name):
+                current = getattr(risk_config, field_name, None)
+                try:
+                    current_float = float(current)
+                except (TypeError, ValueError):
+                    current_float = 0.0
+
+                if current_float <= 0:
+                    setattr(risk_config, field_name, max(1.0, initial_balance * 0.001))
+
+        validate = getattr(risk_config, "validate", None)
+        if callable(validate):
+            validate()
+    def build_risk_config(self, core_config: Config) -> Any:
         risk_config_cls = import_object_or_none("risk.config.RiskConfig")
         if risk_config_cls is None:
-            return getattr(core_config, "risk", None)
+            risk_config = getattr(core_config, "risk", None)
+        else:
+            existing = getattr(core_config, "risk", None)
+            if isinstance(existing, risk_config_cls):
+                risk_config = existing
+            else:
+                risk_config = construct_with_signature(
+                    risk_config_cls,
+                    {
+                        "core_config": core_config,
+                        "app_config": core_config,
+                    },
+                )
 
-        existing = getattr(core_config, "risk", None)
-        if isinstance(existing, risk_config_cls):
-            return existing
-
-        return construct_with_signature(
-            risk_config_cls,
-            {
-                "core_config": core_config,
-                "app_config": core_config,
-            },
-        )
+        self.patch_risk_config_for_backtest(risk_config)
+        return risk_config
 
     # ------------------------------------------------------------------
     # Generic component helpers
@@ -1744,6 +1965,16 @@ def env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float | None) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
     except ValueError:
         return default
 

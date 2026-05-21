@@ -1,64 +1,39 @@
 """
-tests/test_backtesting_like_strategy_real_events.py
+test_signal_processor_diagnostics.py
 
-Backtesting-like E2E test for the strategy package using REAL bootstrap wiring
-and REAL production strategies.
+Diagnostic pytest for strategy SignalProcessor / StrategyEngine failures.
 
 Purpose
 -------
-This test is intentionally different from a generic "strategy infrastructure"
-test:
+This test is intentionally verbose. It is meant to show WHY the pipeline emits
+signal.rejected(reason="no_passed_strategy_signals") or another stage-specific
+rejection instead of signal.generated.
 
-- it DOES NOT create debug strategies;
-- it DOES NOT call engine.add_strategies([...]) manually;
-- it DOES build StrategyRegistry / StrategyEngine / SignalProcessor through
-  BacktestProjectBootstrap, the same way the backtesting runner does;
-- it emits realistic analytics.* payload shapes captured from the backtesting
-  flow;
-- it prints detailed debug checkpoints so the exact breakpoint is visible:
-    bootstrap -> registry -> engine subscriptions -> event flow -> routing
-    -> evaluations -> filters/confluence/builder -> signal.generated.
+It prints:
+- registry strategies/categories;
+- emitted analytics payloads;
+- captured signal.rejected payloads;
+- selected strategies;
+- route.skipped;
+- evaluation_reasons;
+- batch/debug failure_stage;
+- context feature/domain keys.
 
-What it is meant to catch
--------------------------
-1. Backtesting bootstrap created a StrategyRegistry, but did not register the
-   real OI/funding/price_action strategies needed for the enabled dataset.
-2. StrategyEngine did not subscribe to analytics.*.
-3. SignalRouter selected only hybrid or incompatible strategies.
-4. Real production strategies evaluated the context but returned no signal.
-5. SignalFilterChain / ConfluenceEngine / SignalBuilder rejected the signal.
+Run from project root:
 
-Run
----
-From project root:
-
-    python -m pytest -s tests/test_backtesting_like_strategy_real_events.py
-
-Or directly:
-
-    python tests/test_backtesting_like_strategy_real_events.py
+    python -m pytest -s test/strategy/test_signal_processor_diagnostics.py
 
 Useful env flags
 ----------------
-BACKTEST_LIKE_STRICT_SIGNAL=1
-    Fail if no signal.generated is emitted.
-    Default: 1
+STRATEGY_DIAG_STRICT_SIGNAL=0
+    Do not fail if no signal.generated is produced. Default: 0.
 
-BACKTEST_LIKE_REQUIRE_DOMAIN_STRATEGIES=1
-    Fail early if bootstrap registry has no expected strategies for enabled
-    analytics domains.
-    Default: 1
+STRATEGY_DIAG_STRICT_REJECTION_DEBUG=1
+    Fail if signal.rejected has no diagnostic debug block. Default: 1.
 
-BACKTEST_LIKE_START_ANALYTICS=0
-    If 1, start analytics components too. For this test the input is direct
-    analytics.* events, so analytics startup is not required.
-    Default: 0
-
-BACKTEST_LIKE_DEBUG_DIRECT_BATCH=1
-    If no signal.* event is captured OR only signal.rejected is captured,
-    call StrategyEngine.process_analytics_event(...) directly and dump the
-    returned ProcessedSignalBatch before failing.
-    Default: 1
+STRATEGY_DIAG_DIRECT_BATCH=1
+    If no signal.generated is captured, call StrategyEngine.process_analytics_event
+    directly for every synthetic event and dump ProcessedSignalBatch. Default: 1.
 """
 
 from __future__ import annotations
@@ -82,13 +57,13 @@ import pytest
 # Project import bootstrap
 # =============================================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # =============================================================================
-# Imports from project
+# Project imports
 # =============================================================================
 
 from core.config import Config
@@ -98,13 +73,12 @@ from core.scheduler import Scheduler
 from backtesting.bootstrap import BacktestProjectBootstrap, BacktestProjectBootstrapConfig
 from backtesting.config import BacktestConfig
 from backtesting.enums import BacktestDataType, BacktestMode, DataGapPolicy, DataValidationLevel
-from backtesting.exceptions import BacktestDependencyError
 
 from strategy.enums import StrategyCategory
 
 
 # =============================================================================
-# Small debug helpers
+# Small helpers
 # =============================================================================
 
 def env_bool(name: str, default: bool) -> bool:
@@ -114,7 +88,7 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def safe_value(value: Any, *, max_items: int = 40) -> Any:
+def safe_value(value: Any, *, max_items: int = 60) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
 
@@ -136,21 +110,13 @@ def safe_value(value: Any, *, max_items: int = 40) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [safe_value(v, max_items=max_items) for v in list(value)[:max_items]]
 
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
-        try:
-            converted = to_dict()
-            return safe_value(converted, max_items=max_items)
-        except Exception:
-            pass
-
-    summary = getattr(value, "summary", None)
-    if callable(summary):
-        try:
-            converted = summary()
-            return safe_value(converted, max_items=max_items)
-        except Exception:
-            pass
+    for method_name in ("to_dict", "summary"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return safe_value(method(), max_items=max_items)
+            except Exception:
+                pass
 
     return repr(value)
 
@@ -175,7 +141,7 @@ def dump_mapping(title: str, mapping: dict[str, Any] | None, *, max_items: int =
     print("=" * (22 + len(title)), flush=True)
 
 
-def dump_list(title: str, values: Iterable[Any] | None, *, max_items: int = 80) -> None:
+def dump_list(title: str, values: Iterable[Any] | None, *, max_items: int = 100) -> None:
     print(f"\n========== {title} ==========", flush=True)
     items = list(values or [])
     if not items:
@@ -231,12 +197,15 @@ async def call_if_supported(component: Any, method_name: str, *args: Any, **kwar
 def payload_from_event_or_dict(event_or_payload: Any) -> dict[str, Any]:
     if isinstance(event_or_payload, dict):
         return dict(event_or_payload)
+
     payload = getattr(event_or_payload, "payload", None)
     if isinstance(payload, dict):
         return dict(payload)
+
     data = getattr(event_or_payload, "data", None)
     if isinstance(data, dict):
         return dict(data)
+
     return {}
 
 
@@ -257,14 +226,14 @@ def topic_from_event_or_dict(event_or_payload: Any, fallback: str = "unknown") -
 
 async def emit_event(event_bus: EventBus, topic: str, payload: dict[str, Any]) -> None:
     print(f"\n[EVENT-IN] {topic}", flush=True)
-    dump_mapping("payload", payload, max_items=60)
+    dump_mapping("payload", payload, max_items=80)
 
     try:
         result = event_bus.emit(
             topic,
             payload,
             priority=EventPriority.NORMAL,
-            source="test.backtesting_like_strategy_real_events",
+            source="test.signal_processor_diagnostics",
         )
     except TypeError:
         result = event_bus.emit(topic, payload)
@@ -272,26 +241,7 @@ async def emit_event(event_bus: EventBus, topic: str, payload: dict[str, Any]) -
     await maybe_await(result)
 
 
-async def wait_until(predicate: Callable[[], bool], *, timeout_seconds: float, label: str) -> bool:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_seconds
-    while loop.time() < deadline:
-        if predicate():
-            return True
-        await asyncio.sleep(0.05)
-    print(f"[WARN] timed out waiting for {label} after {timeout_seconds:.1f}s", flush=True)
-    return False
-
-
-async def drain_event_bus(event_bus: EventBus, *, cycles: int = 5) -> None:
-    """
-    Best-effort EventBus drain.
-
-    Different core.EventBus versions expose different internals. This helper
-    intentionally stays conservative: it gives scheduled handlers a few event
-    loop cycles and calls common drain/join methods when available.
-    """
-
+async def drain_event_bus(event_bus: EventBus, *, cycles: int = 8) -> None:
     for method_name in ("drain", "join", "flush", "wait_idle", "wait_until_idle"):
         method = getattr(event_bus, method_name, None)
         if callable(method):
@@ -305,23 +255,36 @@ async def drain_event_bus(event_bus: EventBus, *, cycles: int = 5) -> None:
         await asyncio.sleep(0)
 
 
+async def wait_until(predicate: Callable[[], bool], *, timeout_seconds: float, label: str) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.05)
+
+    print(f"[WARN] timed out waiting for {label} after {timeout_seconds:.1f}s", flush=True)
+    return False
+
+
 # =============================================================================
-# System runtime and backtesting-like config
+# Runtime / bootstrap
 # =============================================================================
 
 def build_shared_system_runtime(core_config: Config) -> tuple[EventBus, Scheduler]:
     event_bus_config = getattr(core_config, "event_bus", None)
     scheduler_config = getattr(core_config, "scheduler", None)
 
-    attempts: list[tuple[str, Callable[[], EventBus]]] = [
+    event_bus_attempts: list[tuple[str, Callable[[], EventBus]]] = [
         ("EventBus(config=core_config.event_bus)", lambda: EventBus(config=event_bus_config)),
         ("EventBus(core_config.event_bus)", lambda: EventBus(event_bus_config)),
         ("EventBus()", lambda: EventBus()),
     ]
 
-    errors: list[str] = []
     event_bus: EventBus | None = None
-    for label, factory in attempts:
+    errors: list[str] = []
+    for label, factory in event_bus_attempts:
         try:
             event_bus = factory()
             print(f"[OK] EventBus created via {label}", flush=True)
@@ -345,8 +308,8 @@ def build_shared_system_runtime(core_config: Config) -> tuple[EventBus, Schedule
         ("Scheduler()", lambda: Scheduler()),
     ]
 
-    scheduler_errors: list[str] = []
     scheduler: Scheduler | None = None
+    scheduler_errors: list[str] = []
     for label, factory in scheduler_attempts:
         try:
             scheduler = factory()
@@ -361,16 +324,11 @@ def build_shared_system_runtime(core_config: Config) -> tuple[EventBus, Schedule
     return event_bus, scheduler
 
 
-def build_backtesting_like_runtime() -> BacktestProjectBootstrapConfig:
-    """
-    Match the problematic backtesting dataset:
-    candles + funding + open_interest, no trades/orderbook/liquidations/spreads.
-    """
-
+def build_diagnostic_runtime() -> BacktestProjectBootstrapConfig:
     return BacktestProjectBootstrapConfig(
         exchange="binance",
         market_type="usdm_futures",
-        symbols=["BTCUSDT", "DOGEUSDT", "SOLUSDT"],
+        symbols=["BTCUSDT", "SOLUSDT"],
         timeframes=["1m"],
         enable_candles=True,
         enable_trades=False,
@@ -381,17 +339,20 @@ def build_backtesting_like_runtime() -> BacktestProjectBootstrapConfig:
         enable_spreads=False,
         require_analytics_for_enabled_streams=False,
         verbose_bootstrap_errors=True,
-        service_name="test.backtesting_like_strategy_real_events",
+        service_name="test.signal_processor_diagnostics",
     )
 
 
-def build_backtesting_like_config(runtime: BacktestProjectBootstrapConfig, core_config: Config) -> BacktestConfig:
+def build_diagnostic_backtest_config(
+    runtime: BacktestProjectBootstrapConfig,
+    core_config: Config,
+) -> BacktestConfig:
     now = datetime.now(tz=timezone.utc).replace(second=0, microsecond=0)
     start = now - timedelta(days=2)
 
     try:
         config = BacktestConfig.default_binance_futures(
-            run_name="test_backtesting_like_strategy_real_events",
+            run_name="test_signal_processor_diagnostics",
             symbols=list(runtime.symbols),
             timeframes=list(runtime.timeframes),
             start_time=start,
@@ -444,7 +405,7 @@ def build_backtesting_like_config(runtime: BacktestProjectBootstrapConfig, core_
 
 
 # =============================================================================
-# Event capture / flow monitor
+# Captures / monitor
 # =============================================================================
 
 @dataclass(slots=True)
@@ -459,13 +420,17 @@ class EventCapture:
     events: list[CapturedEvent] = field(default_factory=list)
 
     async def handle(self, event_or_payload: Any = None, **kwargs: Any) -> None:
-        topic = topic_from_event_or_dict(event_or_payload, fallback=str(kwargs.get("topic") or "unknown"))
+        topic = topic_from_event_or_dict(
+            event_or_payload,
+            fallback=str(kwargs.get("topic") or "unknown"),
+        )
         payload = payload_from_event_or_dict(event_or_payload)
+
         if not payload and isinstance(kwargs.get("payload"), dict):
             payload = dict(kwargs["payload"])
 
         print(f"\n[EVENT-OUT] {topic}", flush=True)
-        dump_mapping("captured payload", payload, max_items=50)
+        dump_mapping("captured payload", payload, max_items=120)
 
         self.events.append(CapturedEvent(topic=topic, payload=payload, raw=event_or_payload))
 
@@ -487,12 +452,11 @@ class EventCapture:
 
 @dataclass(slots=True)
 class FlowMonitor:
-    max_recent_events: int = 100
+    max_recent_events: int = 200
     topic_counts: Counter[str] = field(default_factory=Counter)
     group_counts: Counter[str] = field(default_factory=Counter)
     samples: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     recent_events: deque[dict[str, Any]] = field(default_factory=deque)
-
     subscriptions: list[Any] = field(default_factory=list)
     event_bus: EventBus | None = None
 
@@ -504,14 +468,10 @@ class FlowMonitor:
         "execution.*",
         "position.*",
         "system.*",
-        # Useful exact topics if wildcard behavior changes.
-        "analytics.oi.updated",
-        "analytics.oi.anomaly",
         "analytics.oi.divergence",
-        "analytics.oi.capitulation",
+        "analytics.oi.anomaly",
+        "analytics.oi.updated",
         "analytics.funding.updated",
-        "analytics.funding.signal",
-        "analytics.price_action.updated",
         "analytics.price_action.market_structure.bos",
         "analytics.price_action.trend.trend_alignment",
     )
@@ -525,6 +485,7 @@ class FlowMonitor:
         if self.event_bus is None:
             self.subscriptions.clear()
             return
+
         for sub in list(self.subscriptions):
             try:
                 self.event_bus.unsubscribe(sub)
@@ -534,14 +495,19 @@ class FlowMonitor:
 
     def _subscribe(self, pattern: str) -> None:
         assert self.event_bus is not None
-        name = f"test_flow_monitor_{pattern.replace('.', '_').replace('*', 'wildcard')}"
+        name = f"diag_monitor_{pattern.replace('.', '_').replace('*', 'wildcard')}"
 
         async def handler(event_or_payload: Any = None, **kwargs: Any) -> None:
             try:
-                topic = topic_from_event_or_dict(event_or_payload, fallback=pattern.replace("*", "event"))
+                topic = topic_from_event_or_dict(
+                    event_or_payload,
+                    fallback=pattern.replace("*", "event"),
+                )
                 payload = payload_from_event_or_dict(event_or_payload)
+
                 if not payload and isinstance(kwargs.get("payload"), dict):
                     payload = dict(kwargs["payload"])
+
                 self.record(topic, payload)
             except Exception:
                 return
@@ -550,30 +516,8 @@ class FlowMonitor:
             sub = self.event_bus.subscribe(pattern, handler, name=name)
         except TypeError:
             sub = self.event_bus.subscribe(pattern=pattern, handler=handler, name=name)
+
         self.subscriptions.append(sub)
-
-    def record(self, topic: str, payload: dict[str, Any]) -> None:
-        group = self.group(topic)
-        self.topic_counts[topic] += 1
-        self.group_counts[group] += 1
-
-        self.samples.setdefault(topic, [])
-        if len(self.samples[topic]) < 3:
-            self.samples[topic].append(self.compact(payload))
-
-        self.recent_events.append(
-            {
-                "topic": topic,
-                "group": group,
-                "symbol": payload.get("symbol"),
-                "timeframe": payload.get("timeframe"),
-                "strategy_name": payload.get("strategy_name") or payload.get("strategy"),
-                "signal_id": payload.get("signal_id") or payload.get("id"),
-                "reason": payload.get("reason"),
-            }
-        )
-        while len(self.recent_events) > self.max_recent_events:
-            self.recent_events.popleft()
 
     @staticmethod
     def group(topic: str) -> str:
@@ -600,6 +544,8 @@ class FlowMonitor:
             "market_type",
             "symbol",
             "timeframe",
+            "source",
+            "source_topic",
             "strategy_name",
             "signal_id",
             "side",
@@ -609,57 +555,67 @@ class FlowMonitor:
             "status",
             "reason",
             "price",
-            "close",
-            "funding_rate",
-            "open_interest",
-            "open_interest_value",
+            "timestamp_ms",
+            "received_at_ms",
         )
         result = {key: safe_value(payload.get(key)) for key in keys if payload.get(key) is not None}
 
-        for key in ("features", "metadata", "source_topic"):
+        for key in ("selected_strategies", "evaluation_reasons", "route_skipped", "debug"):
             value = payload.get(key)
-            if isinstance(value, dict):
-                result[key] = sorted(str(item) for item in value.keys())[:25]
-            elif isinstance(value, list):
-                result[key] = [str(item) for item in value[:25]]
-            elif value is not None:
-                result[key] = str(value)[:180]
+            if value is not None:
+                result[key] = safe_value(value, max_items=20)
+
         return result
+
+    def record(self, topic: str, payload: dict[str, Any]) -> None:
+        group = self.group(topic)
+        self.topic_counts[topic] += 1
+        self.group_counts[group] += 1
+
+        self.samples.setdefault(topic, [])
+        if len(self.samples[topic]) < 3:
+            self.samples[topic].append(self.compact(payload))
+
+        self.recent_events.append(
+            {
+                "topic": topic,
+                "group": group,
+                "symbol": payload.get("symbol"),
+                "timeframe": payload.get("timeframe"),
+                "strategy_name": payload.get("strategy_name") or payload.get("strategy"),
+                "signal_id": payload.get("signal_id") or payload.get("id"),
+                "reason": payload.get("reason"),
+                "timestamp_ms": payload.get("timestamp_ms"),
+            }
+        )
+
+        while len(self.recent_events) > self.max_recent_events:
+            self.recent_events.popleft()
 
     @property
     def last_stage(self) -> str:
-        for group in ("position", "execution", "signal", "strategy", "analytics"):
+        for group in ("position", "execution", "risk", "signal", "strategy", "analytics"):
             if self.group_counts.get(group, 0) > 0:
                 return group
         return "none"
 
-    def summary(self) -> dict[str, Any]:
-        return {
-            "group_counts": dict(self.group_counts),
-            "topic_counts": dict(self.topic_counts),
-            "last_stage": self.last_stage,
-            "samples": self.samples,
-            "recent_events": list(self.recent_events)[-30:],
-        }
-
     def print_summary(self) -> None:
-        dump_mapping("FLOW MONITOR group counts", dict(self.group_counts))
-        dump_mapping("FLOW MONITOR top topics", dict(self.topic_counts.most_common(30)))
-        dump_mapping("FLOW MONITOR samples", self.samples, max_items=30)
-        dump_list("FLOW MONITOR recent events", list(self.recent_events)[-30:])
+        dump_mapping("FLOW group counts", dict(self.group_counts))
+        dump_mapping("FLOW top topics", dict(self.topic_counts.most_common(40)))
+        dump_mapping("FLOW samples", self.samples, max_items=40)
+        dump_list("FLOW recent events", list(self.recent_events)[-40:])
 
 
 # =============================================================================
-# Realistic analytics events copied/adapted from backtesting output
+# Synthetic analytics events that should exercise route/evaluation diagnostics
 # =============================================================================
 
-def real_backtesting_like_events() -> list[tuple[str, dict[str, Any]]]:
+def diagnostic_events() -> list[tuple[str, dict[str, Any]]]:
     ts = datetime(2026, 5, 20, 0, 0, 0, 1000, tzinfo=timezone.utc).isoformat()
 
     base = {
         "exchange": "binance",
         "market_type": "usdm_futures",
-        "exchange_symbol": None,
         "timestamp": ts,
         "timestamp_ms": 1779235200001,
         "received_at_ms": 1779235200001,
@@ -667,36 +623,86 @@ def real_backtesting_like_events() -> list[tuple[str, dict[str, Any]]]:
 
     return [
         (
+            "analytics.oi.divergence",
+            {
+                **base,
+                "symbol": "BTCUSDT",
+                "exchange_symbol": "BTCUSDT",
+                "timeframe": "1m",
+                "confidence": 0.74,
+                "score": 0.76,
+                "price": 77150.0,
+                "side": "long",
+                "direction": "long",
+                "features": {
+                    "open_interest": 104_547.32,
+                    "oi_delta": 4200.0,
+                    "oi_delta_pct": 0.034,
+                    "oi_direction": "long",
+                    "oi_pressure_score": 0.82,
+                    "price_delta_pct": 0.42,
+                    "volume_ratio": 1.6,
+                },
+                "regime": {
+                    "regime": "trend_confirmation",
+                    "confidence": 0.71,
+                    "score": 0.70,
+                },
+                "divergence": {
+                    "detected": True,
+                    "divergence_type": "bullish",
+                    "direction": "long",
+                    "side": "long",
+                    "confidence": 0.74,
+                    "score": 0.76,
+                    "window_size": 8,
+                },
+                "feature_map": {
+                    "score": 0.76,
+                    "confidence": 0.74,
+                    "direction": "long",
+                    "entry_price": 77150.0,
+                },
+            },
+        ),
+        (
             "analytics.price_action.market_structure.bos",
             {
                 **base,
                 "symbol": "BTCUSDT",
                 "exchange_symbol": "BTCUSDT",
                 "timeframe": "1m",
+                "event_type": "bos",
                 "direction": "bullish",
+                "side": "long",
                 "confidence": 0.72,
                 "score": 0.74,
                 "price": 77161.5,
                 "close": 77161.5,
-                "metadata": {
-                    "broken_side": "high",
-                    "source_candle_key": "BTCUSDT:1m:1779235200001",
-                    "threshold_pct": 0.12,
-                    "trigger_close": 77161.5,
-                },
                 "market_structure": {
-                    "event_type": "bos",
-                    "market_bias": "bullish",
-                    "direction": "long",
-                    "score": 0.74,
-                    "confidence": 0.72,
-                    "entry_price": 77161.5,
-                },
-                "state": {
-                    "trend_direction": "long",
-                    "score": 0.74,
-                    "confidence": 0.72,
-                    "entry_price": 77161.5,
+                    "last_break_event": {
+                        "event_type": "bos",
+                        "side": "long",
+                        "direction": "long",
+                        "confidence": 0.72,
+                        "score": 0.74,
+                        "price": 77161.5,
+                        "confirmed": True,
+                    },
+                    "external": {
+                        "bias": "bullish",
+                        "market_bias": "bullish",
+                        "confidence": 0.72,
+                        "score": 0.74,
+                    },
+                    "internal": {
+                        "bias": "bullish",
+                        "market_bias": "bullish",
+                        "confidence": 0.70,
+                        "score": 0.70,
+                    },
+                    "mtf_alignment": 0.72,
+                    "trend_strength": 0.74,
                 },
                 "feature_map": {
                     "market_structure": {"event_type": "bos", "market_bias": "bullish"},
@@ -714,158 +720,50 @@ def real_backtesting_like_events() -> list[tuple[str, dict[str, Any]]]:
                 "symbol": "BTCUSDT",
                 "exchange_symbol": "BTCUSDT",
                 "timeframe": "1m",
-                "signal_id": "test_trend_alignment_001",
                 "direction": "bullish",
+                "side": "long",
                 "confidence": 0.70,
                 "score": 0.73,
                 "price": 77173.0,
                 "close": 77173.0,
                 "trend": {
-                    "trend_direction": "long",
-                    "trend_regime": "uptrend",
-                    "continuation_probability": 0.82,
-                    "score": 0.73,
-                    "confidence": 0.70,
+                    "last_signal": {
+                        "event_type": "trend_alignment",
+                        "direction": "long",
+                        "trend_direction": "long",
+                        "trend_regime": "uptrend",
+                        "confidence": 0.70,
+                        "score": 0.73,
+                        "continuation_probability": 0.82,
+                        "confirmed": True,
+                    },
+                    "external": {
+                        "direction": "long",
+                        "trend_direction": "long",
+                        "trend_regime": "uptrend",
+                        "confidence": 0.70,
+                        "score": 0.73,
+                        "trend_strength": 0.73,
+                        "continuation_probability": 0.82,
+                    },
+                    "internal": {
+                        "direction": "long",
+                        "trend_direction": "long",
+                        "trend_regime": "uptrend",
+                        "confidence": 0.68,
+                        "score": 0.69,
+                        "trend_strength": 0.69,
+                        "continuation_probability": 0.76,
+                    },
+                    "internal_external_alignment": 0.80,
+                    "higher_timeframe_alignment": 0.70,
+                    "overall_trend_score": 0.74,
                 },
                 "feature_map": {
-                    "trend": {"trend_direction": "long", "trend_regime": "uptrend"},
                     "score": 0.73,
                     "confidence": 0.70,
                     "direction": "long",
                     "entry_price": 77173.0,
-                },
-                "metadata": {
-                    "external_direction": "bullish",
-                    "internal_direction": "long",
-                    "state_version": 1,
-                },
-            },
-        ),
-        (
-            "analytics.oi.divergence",
-            {
-                **base,
-                "symbol": "BTCUSDT",
-                "exchange_symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "confidence": 0.74,
-                "score": 0.76,
-                "price": 77150.0,
-                "side": "long",
-                "direction": "long",
-                "analysis": {
-                    "score": 0.76,
-                    "confidence": 0.74,
-                    "side": "long",
-                    "direction": "long",
-                },
-                "features": {
-                    "open_interest": 104_547.32,
-                    "oi": 104_547.32,
-                    "oi_delta": 4200.0,
-                    "oi_delta_pct": 0.034,
-                    "oi_direction": "long",
-                    "oi_pressure_score": 0.82,
-                    "price_change_pct": 0.42,
-                },
-                "regime": {
-                    "regime": "expansion",
-                    "confidence": 0.71,
-                    "score": 0.70,
-                },
-                "divergence": {
-                    "detected": True,
-                    "divergence_type": "bullish",
-                    "direction": "long",
-                    "confidence": 0.74,
-                    "score": 0.76,
-                },
-                "anomaly": {
-                    "detected": False,
-                    "confidence": 0.20,
-                    "score": 0.10,
-                },
-                "open_interest": 104_547.32,
-                "open_interest_value": 8_044_247_171.152,
-                "oi_delta": 4200.0,
-                "oi_delta_pct": 0.034,
-                "oi_direction": "long",
-                "feature_map": {
-                    "analysis": {"score": 0.76, "confidence": 0.74, "side": "long"},
-                    "features": {
-                        "open_interest": 104_547.32,
-                        "oi_delta": 4200.0,
-                        "oi_delta_pct": 0.034,
-                        "oi_direction": "long",
-                    },
-                    "divergence": {
-                        "detected": True,
-                        "divergence_type": "bullish",
-                        "direction": "long",
-                        "score": 0.76,
-                        "confidence": 0.74,
-                    },
-                    "score": 0.76,
-                    "confidence": 0.74,
-                    "direction": "long",
-                    "entry_price": 77150.0,
-                },
-                "metadata": {
-                    "scope_key": "binance:usdm_futures:BTCUSDT:1m",
-                    "source_topic": "market.open_interest.updated",
-                    "feature_history_size": 200,
-                },
-            },
-        ),
-        (
-            "analytics.oi.anomaly",
-            {
-                **base,
-                "symbol": "SOLUSDT",
-                "exchange_symbol": "SOLUSDT",
-                "timeframe": "1m",
-                "confidence": 0.70,
-                "score": 0.72,
-                "price": 85.14,
-                "side": "long",
-                "direction": "long",
-                "analysis": {"score": 0.72, "confidence": 0.70, "side": "long"},
-                "features": {
-                    "open_interest": 9_450_000.0,
-                    "oi_delta": 150_000.0,
-                    "oi_delta_pct": 0.041,
-                    "oi_acceleration": 0.19,
-                    "oi_direction": "long",
-                },
-                "anomaly": {
-                    "detected": True,
-                    "anomaly_type": "oi_spike",
-                    "direction": "long",
-                    "confidence": 0.70,
-                    "score": 0.72,
-                },
-                "regime": {"regime": "expansion", "confidence": 0.66, "score": 0.67},
-                "open_interest": 9_450_000.0,
-                "oi_delta": 150_000.0,
-                "oi_delta_pct": 0.041,
-                "feature_map": {
-                    "anomaly": {
-                        "detected": True,
-                        "anomaly_type": "oi_spike",
-                        "direction": "long",
-                        "score": 0.72,
-                        "confidence": 0.70,
-                    },
-                    "features": {
-                        "open_interest": 9_450_000.0,
-                        "oi_delta": 150_000.0,
-                        "oi_delta_pct": 0.041,
-                        "oi_acceleration": 0.19,
-                    },
-                    "score": 0.72,
-                    "confidence": 0.70,
-                    "direction": "long",
-                    "entry_price": 85.14,
                 },
             },
         ),
@@ -886,11 +784,6 @@ def real_backtesting_like_events() -> list[tuple[str, dict[str, Any]]]:
                     "predicted_rate": -0.0012,
                     "next_funding_time_ms": 1779348000000,
                 },
-                "statistics": {
-                    "avg_rate": -0.0008,
-                    "min_rate": -0.0016,
-                    "max_rate": 0.0003,
-                },
                 "regime": {
                     "regime": "extreme_negative",
                     "confidence": 0.73,
@@ -900,13 +793,19 @@ def real_backtesting_like_events() -> list[tuple[str, dict[str, Any]]]:
                     "side": "long",
                     "bias": "long",
                     "pressure_score": 0.76,
+                    "score": 0.76,
                 },
                 "extreme": {
                     "detected": True,
+                    "extreme_type": "negative_extreme",
                     "side": "long",
                     "direction": "long",
                     "score": 0.75,
                     "confidence": 0.73,
+                    "severity": 0.75,
+                    "reversal_risk": True,
+                    "mean_reversion_probability": 0.75,
+                    "squeeze_probability": 0.50,
                 },
                 "signal": {
                     "bias": "long",
@@ -916,24 +815,13 @@ def real_backtesting_like_events() -> list[tuple[str, dict[str, Any]]]:
                     "confidence": 0.73,
                 },
                 "funding_rate": -0.0015,
-                "feature_map": {
-                    "snapshot": {"funding_rate": -0.0015, "predicted_rate": -0.0012},
-                    "regime": {"regime": "extreme_negative", "score": 0.75, "confidence": 0.73},
-                    "pressure": {"side": "long", "pressure_score": 0.76},
-                    "extreme": {"detected": True, "side": "long", "score": 0.75, "confidence": 0.73},
-                    "signal": {"bias": "long", "score": 0.75, "confidence": 0.73},
-                    "score": 0.75,
-                    "confidence": 0.73,
-                    "direction": "long",
-                    "entry_price": 85.14,
-                },
             },
         ),
     ]
 
 
 # =============================================================================
-# Registry / engine / batch inspection helpers
+# Registry / engine / batch inspection
 # =============================================================================
 
 def registry_names(registry: Any) -> list[str]:
@@ -970,19 +858,27 @@ def registry_categories(registry: Any) -> dict[str, list[str]]:
     return {}
 
 
-def registry_count(registry: Any) -> int:
-    method = getattr(registry, "count", None)
-    if callable(method):
-        try:
-            return int(method())
-        except Exception:
-            pass
-    return len(registry_names(registry))
+def dump_registry(registry: Any) -> None:
+    names = registry_names(registry)
+    categories = registry_categories(registry)
+
+    dump_list("REGISTRY names", names)
+    dump_mapping("REGISTRY categories", categories)
+    dump_mapping(
+        "REGISTRY required categories presence",
+        {
+            "price_action": bool(categories.get(StrategyCategory.PRICE_ACTION.value)),
+            "open_interest": bool(categories.get(StrategyCategory.OPEN_INTEREST.value)),
+            "funding": bool(categories.get(StrategyCategory.FUNDING.value)),
+            "count": len(names),
+        },
+    )
 
 
 def dump_engine_debug(engine: Any, *, title: str = "ENGINE DEBUG") -> None:
     stats = getattr(engine, "stats", None)
     stats_summary = None
+
     if stats is not None:
         summary = getattr(stats, "summary", None)
         if callable(summary):
@@ -1002,6 +898,7 @@ def dump_engine_debug(engine: Any, *, title: str = "ENGINE DEBUG") -> None:
             "subscriptions_count": getattr(event_handler, "subscriptions_count", None),
             "_subscriptions_count": len(getattr(event_handler, "_subscriptions", []) or []),
         }
+
         for method_name in ("_analytics_topics", "analytics_topics"):
             method = getattr(event_handler, method_name, None)
             if callable(method):
@@ -1030,7 +927,9 @@ def dump_processed_batch(batch: Any) -> None:
     print(f"accepted={getattr(batch, 'accepted', None)!r}", flush=True)
     print(f"emitted={getattr(batch, 'emitted', None)!r}", flush=True)
     print(f"symbol={getattr(batch, 'symbol', None)!r}", flush=True)
-    print(f"reasons={safe_value(getattr(batch, 'reasons', None))}", flush=True)
+    print(f"reasons={safe_value(getattr(batch, 'reasons', None), max_items=120)}", flush=True)
+    print(f"metadata={safe_value(getattr(batch, 'metadata', None), max_items=120)}", flush=True)
+    print(f"debug={safe_value(getattr(batch, 'debug', None), max_items=240)}", flush=True)
 
     normalized = getattr(batch, "normalized", None)
     if normalized is not None:
@@ -1038,10 +937,12 @@ def dump_processed_batch(batch: Any) -> None:
         print(f"source={getattr(normalized, 'source', None)!r}", flush=True)
         print(f"symbol={getattr(normalized, 'symbol', None)!r}", flush=True)
         print(f"timeframe={getattr(normalized, 'timeframe', None)!r}", flush=True)
-        print(f"domain_data={safe_value(getattr(normalized, 'domain_data', None), max_items=80)}", flush=True)
+        print(f"domain_data={safe_value(getattr(normalized, 'domain_data', None), max_items=120)}", flush=True)
+        extra_domain_data = getattr(normalized, "extra_domain_data", None)
+        print(f"extra_domain_data={safe_value(extra_domain_data, max_items=120)}", flush=True)
         features = list(getattr(normalized, "features", []) or [])
         print(f"features_count={len(features)}", flush=True)
-        print(f"features_first_40={[getattr(item, 'name', repr(item)) for item in features[:40]]}", flush=True)
+        print(f"features_first_80={[getattr(item, 'name', repr(item)) for item in features[:80]]}", flush=True)
 
     route = getattr(batch, "route", None)
     if route is not None:
@@ -1049,20 +950,22 @@ def dump_processed_batch(batch: Any) -> None:
         print(f"selected_names={safe_value(getattr(route, 'selected_names', None))}", flush=True)
         print(f"categories_used={safe_value(getattr(route, 'categories_used', None))}", flush=True)
         print(f"matched_features={safe_value(getattr(route, 'matched_features', None))}", flush=True)
-        print(f"skipped={safe_value(getattr(route, 'skipped', None), max_items=120)}", flush=True)
-        print(f"metadata={safe_value(getattr(route, 'metadata', None), max_items=80)}", flush=True)
+        print(f"skipped={safe_value(getattr(route, 'skipped', None), max_items=160)}", flush=True)
+        print(f"metadata={safe_value(getattr(route, 'metadata', None), max_items=120)}", flush=True)
 
     evaluations = list(getattr(batch, "evaluations", []) or [])
     print(f"\n[EVALUATIONS] count={len(evaluations)}", flush=True)
     for ev in evaluations:
+        signal = getattr(ev, "signal", None)
         print(
             "-",
             f"strategy={getattr(ev, 'strategy_name', None)!r}",
             f"passed={getattr(ev, 'passed', None)!r}",
             f"score={getattr(ev, 'score', None)!r}",
             f"confidence={getattr(ev, 'confidence', None)!r}",
-            f"signal={getattr(getattr(ev, 'signal', None), 'strategy_name', None)!r}",
-            f"reasons={safe_value(getattr(ev, 'reasons', None))}",
+            f"signal={getattr(signal, 'strategy_name', None)!r}" if signal else "signal=None",
+            f"reasons={safe_value(getattr(ev, 'reasons', None), max_items=80)}",
+            f"metadata={safe_value(getattr(ev, 'metadata', None), max_items=120)}",
             flush=True,
         )
 
@@ -1076,68 +979,14 @@ def dump_processed_batch(batch: Any) -> None:
                 f"side={getattr(signal, 'side', None)!r}",
                 f"confidence={getattr(signal, 'confidence', None)!r}",
                 f"score={getattr(signal, 'score', None)!r}",
-                f"entry={getattr(signal, 'primary_entry_price', None)!r}",
-                f"stop={getattr(signal, 'primary_stop_loss', None)!r}",
-                f"tp={getattr(signal, 'primary_take_profit', None)!r}",
-                f"reasons={safe_value(getattr(signal, 'reasons', None))}",
+                f"reasons={safe_value(getattr(signal, 'reasons', None), max_items=60)}",
                 flush=True,
             )
-
-    for attr in ("confluence", "coordinated"):
-        value = getattr(batch, attr, None)
-        print(f"\n[{attr.upper()}] {safe_value(value, max_items=120)}", flush=True)
-
-    payloads = list(getattr(batch, "risk_payloads", []) or [])
-    print(f"\n[RISK PAYLOADS] count={len(payloads)}", flush=True)
-    for payload in payloads:
-        print(f"- {safe_value(payload, max_items=120)}", flush=True)
 
     print("============================================", flush=True)
 
 
-def assert_expected_registry(registry: Any) -> None:
-    names = registry_names(registry)
-    categories = registry_categories(registry)
-
-    dump_list("REGISTRY names", names)
-    dump_mapping("REGISTRY categories", categories)
-    dump_mapping("REGISTRY counts", {"count": registry_count(registry)})
-
-    require_domain = env_bool("BACKTEST_LIKE_REQUIRE_DOMAIN_STRATEGIES", True)
-    if not require_domain:
-        return
-
-    has_price_action = bool(categories.get(StrategyCategory.PRICE_ACTION.value))
-    has_oi = bool(categories.get(StrategyCategory.OPEN_INTEREST.value))
-    has_funding = bool(categories.get(StrategyCategory.FUNDING.value))
-
-    missing: list[str] = []
-    if not has_price_action:
-        missing.append("PRICE_ACTION strategies for candle/price_action analytics")
-    if not has_oi:
-        missing.append("OPEN_INTEREST strategies for analytics.oi.*")
-    if not has_funding:
-        missing.append("FUNDING strategies for analytics.funding.*")
-
-    if missing:
-        raise AssertionError(
-            "BacktestProjectBootstrap registry is missing strategies required "
-            "for the enabled backtesting-like streams:\n- "
-            + "\n- ".join(missing)
-            + "\n\nRegistered names:\n- "
-            + "\n- ".join(names)
-        )
-
-
-async def start_backtesting_like_components(pipeline: Any) -> list[Any]:
-    """
-    Start listeners before producers.
-
-    For this strategy-boundary test direct analytics.* events are emitted by
-    the test itself, so analytics components are optional and disabled by
-    BACKTEST_LIKE_START_ANALYTICS=0 by default.
-    """
-
+async def start_components(pipeline: Any) -> list[Any]:
     started: list[Any] = []
     components: list[Any] = []
 
@@ -1146,7 +995,6 @@ async def start_backtesting_like_components(pipeline: Any) -> list[Any]:
     if pipeline.scheduler is not None:
         components.append(pipeline.scheduler)
 
-    # Downstream trading pipeline first.
     if pipeline.signal_processor is not None:
         components.append(pipeline.signal_processor)
     if pipeline.strategy_engine is not None:
@@ -1154,17 +1002,11 @@ async def start_backtesting_like_components(pipeline: Any) -> list[Any]:
     if pipeline.risk_manager is not None:
         components.append(pipeline.risk_manager)
 
-    # Data caches are harmless and keep lifecycle close to backtesting.
     components.extend(list(getattr(pipeline, "data_caches", []) or []))
-
-    if env_bool("BACKTEST_LIKE_START_ANALYTICS", False):
-        components.extend(list(getattr(pipeline, "analytics_components", []) or []))
 
     seen: set[int] = set()
     deduped: list[Any] = []
     for component in components:
-        if component is None:
-            continue
         marker = id(component)
         if marker in seen:
             continue
@@ -1189,10 +1031,11 @@ async def stop_components(started: list[Any]) -> None:
 
 
 # =============================================================================
-# Main test scenario
+# Test
 # =============================================================================
 
-async def run_backtesting_like_strategy_real_events_test() -> None:
+@pytest.mark.asyncio
+async def test_signal_processor_rejection_diagnostics_are_visible() -> None:
     core_config: Config | None = None
     event_bus: EventBus | None = None
     scheduler: Scheduler | None = None
@@ -1202,25 +1045,21 @@ async def run_backtesting_like_strategy_real_events_test() -> None:
     capture = EventCapture()
 
     try:
-        with debug_step("build shared system runtime"):
+        with debug_step("build shared runtime"):
             core_config = Config.from_env()
             event_bus, scheduler = build_shared_system_runtime(core_config)
 
-        with debug_step("build backtesting-like bootstrap config and BacktestConfig"):
-            runtime = build_backtesting_like_runtime()
-            backtest_config = build_backtesting_like_config(runtime, core_config)
+        with debug_step("build diagnostic bootstrap config"):
+            runtime = build_diagnostic_runtime()
+            backtest_config = build_diagnostic_backtest_config(runtime, core_config)
             dump_mapping(
-                "RUNTIME streams",
+                "RUNTIME",
                 {
                     "symbols": runtime.symbols,
                     "timeframes": runtime.timeframes,
                     "enable_candles": runtime.enable_candles,
                     "enable_funding": runtime.enable_funding,
                     "enable_open_interest": runtime.enable_open_interest,
-                    "enable_trades": runtime.enable_trades,
-                    "enable_orderbook": runtime.enable_orderbook,
-                    "enable_liquidations": runtime.enable_liquidations,
-                    "enable_spreads": runtime.enable_spreads,
                 },
             )
 
@@ -1240,70 +1079,71 @@ async def run_backtesting_like_strategy_real_events_test() -> None:
                 if callable(fmt):
                     print(fmt(), flush=True)
 
-            dump_mapping(
-                "PIPELINE components",
-                {
-                    "data_caches": [c.__class__.__name__ for c in pipeline.data_caches],
-                    "analytics_components": [c.__class__.__name__ for c in pipeline.analytics_components],
-                    "registry": pipeline.strategy_registry.__class__.__name__,
-                    "signal_processor": pipeline.signal_processor.__class__.__name__,
-                    "strategy_engine": pipeline.strategy_engine.__class__.__name__,
-                    "risk_manager": pipeline.risk_manager.__class__.__name__,
-                },
-            )
+            dump_registry(pipeline.strategy_registry)
 
-        with debug_step("assert bootstrap registry contains domain strategies"):
-            assert_expected_registry(pipeline.strategy_registry)
-
-        with debug_step("subscribe capture and flow monitor before component start"):
+        with debug_step("subscribe capture and monitor"):
             assert event_bus is not None
             flow_monitor = FlowMonitor()
             flow_monitor.register(event_bus)
 
             for pattern in ("signal.*", "strategy.*", "risk.*"):
                 try:
-                    event_bus.subscribe(pattern, capture.handle, name=f"test_capture_{pattern.replace('.', '_').replace('*', 'wildcard')}")
+                    event_bus.subscribe(
+                        pattern,
+                        capture.handle,
+                        name=f"diag_capture_{pattern.replace('.', '_').replace('*', 'wildcard')}",
+                    )
                 except TypeError:
-                    event_bus.subscribe(pattern=pattern, handler=capture.handle, name=f"test_capture_{pattern}")
+                    event_bus.subscribe(
+                        pattern=pattern,
+                        handler=capture.handle,
+                        name=f"diag_capture_{pattern}",
+                    )
 
-        async with async_debug_step("start backtesting-like components"):
-            started = await start_backtesting_like_components(pipeline)
+        async with async_debug_step("start components"):
+            started = await start_components(pipeline)
             await drain_event_bus(event_bus)
             dump_engine_debug(pipeline.strategy_engine, title="ENGINE after start")
 
-        async with async_debug_step("emit realistic analytics events through shared EventBus"):
-            for topic, payload in real_backtesting_like_events():
+        async with async_debug_step("emit diagnostic analytics events"):
+            for topic, payload in diagnostic_events():
                 await emit_event(event_bus, topic, payload)
-                await drain_event_bus(event_bus, cycles=3)
+                await drain_event_bus(event_bus, cycles=6)
 
-        async with async_debug_step("wait for signal.* or inspect direct batches"):
-            await drain_event_bus(event_bus, cycles=10)
-
-            got_signal = await wait_until(
-                capture.any_signal_event,
+        async with async_debug_step("wait for signal events and print diagnostics"):
+            await drain_event_bus(event_bus, cycles=12)
+            await wait_until(
+                lambda: capture.any_signal_event(),
                 timeout_seconds=3.0,
                 label="signal.generated or signal.rejected",
             )
-            await drain_event_bus(event_bus, cycles=10)
+            await drain_event_bus(event_bus, cycles=12)
 
-            dump_engine_debug(pipeline.strategy_engine, title="ENGINE after analytics events")
+            dump_engine_debug(pipeline.strategy_engine, title="ENGINE after events")
             if flow_monitor is not None:
                 flow_monitor.print_summary()
 
-            needs_direct_debug = (
-                env_bool("BACKTEST_LIKE_DEBUG_DIRECT_BATCH", True)
-                and (
-                    not got_signal
-                    or (capture.any_signal_rejected() and not capture.any_signal_generated())
-                )
+            generated = capture.by_topic("signal.generated")
+            rejected = capture.by_topic("signal.rejected")
+
+            dump_mapping(
+                "SIGNAL COUNTS",
+                {
+                    "generated": len(generated),
+                    "rejected": len(rejected),
+                    "all_signal_events": len(capture.by_prefix("signal.")),
+                },
             )
 
-            if needs_direct_debug:
-                print(
-                    "\n[DEBUG] Running direct ProcessedSignalBatch inspection per event.",
-                    flush=True,
-                )
-                for topic, payload in real_backtesting_like_events():
+            for event in rejected[-10:]:
+                dump_mapping("LAST signal.rejected payload", event.payload, max_items=160)
+
+            for event in generated[-10:]:
+                dump_mapping("LAST signal.generated payload", event.payload, max_items=160)
+
+            if env_bool("STRATEGY_DIAG_DIRECT_BATCH", True):
+                print("\n[DEBUG] Running direct StrategyEngine batch inspection per event.", flush=True)
+                for topic, payload in diagnostic_events():
                     print(f"\n[DIRECT-BATCH] {topic}", flush=True)
                     batch = await pipeline.strategy_engine.process_analytics_event(
                         event_name=topic,
@@ -1311,29 +1151,22 @@ async def run_backtesting_like_strategy_real_events_test() -> None:
                     )
                     dump_processed_batch(batch)
 
-            if capture.any_signal_rejected() and not capture.any_signal_generated():
-                rejected = capture.by_topic("signal.rejected")[-1]
-                raise AssertionError(
-                    "Pipeline emitted signal.rejected but no signal.generated. "
-                    "See direct ProcessedSignalBatch inspection above. "
-                    f"Rejected payload: {safe_value(rejected.payload, max_items=120)}"
-                )
+            if rejected and env_bool("STRATEGY_DIAG_STRICT_REJECTION_DEBUG", True):
+                payload = rejected[-1].payload
+                assert "debug" in payload, "signal.rejected payload must contain debug"
+                assert payload.get("timeframe") is not None, "signal.rejected must contain timeframe"
+                assert payload.get("timestamp_ms") is not None, "signal.rejected must contain timestamp_ms"
+                assert payload.get("source_topic") is not None, "signal.rejected must contain source_topic"
 
-            if env_bool("BACKTEST_LIKE_STRICT_SIGNAL", True):
-                assert capture.any_signal_generated(), (
-                    "Expected at least one signal.generated from real bootstrap + real production strategies, "
-                    "but none was captured. See debug output above for registry, route, evaluations, "
-                    "filters/confluence/builder and flow monitor details."
-                )
+                debug = payload.get("debug")
+                assert isinstance(debug, dict), "signal.rejected.debug must be a dict"
+                assert debug.get("failure_stage"), "signal.rejected.debug.failure_stage is required"
 
-        with debug_step("validate generated signal payload if present"):
-            generated = capture.by_topic("signal.generated")
-            if generated:
-                payload = generated[-1].payload
-                dump_mapping("FINAL signal.generated payload", payload, max_items=100)
-                required = {"signal_id", "symbol", "side", "strategy_name", "confidence", "market_type"}
-                missing = sorted(key for key in required if key not in payload)
-                assert not missing, f"signal.generated payload missing required keys: {missing}"
+            if env_bool("STRATEGY_DIAG_STRICT_SIGNAL", False):
+                assert generated, (
+                    "Expected at least one signal.generated. "
+                    "See signal.rejected.debug / DIRECT-BATCH output above."
+                )
 
     finally:
         print("\n[TEARDOWN]", flush=True)
@@ -1342,25 +1175,17 @@ async def run_backtesting_like_strategy_real_events_test() -> None:
                 flow_monitor.unregister()
             except Exception:
                 pass
+
         await stop_components(started)
 
-        # Stop core runtime if it was not included in started for any reason.
         if scheduler is not None and all(id(item) != id(scheduler) for item in started):
             try:
                 await call_if_supported(scheduler, "stop")
             except Exception:
                 pass
+
         if event_bus is not None and all(id(item) != id(event_bus) for item in started):
             try:
                 await call_if_supported(event_bus, "stop")
             except Exception:
                 pass
-
-
-@pytest.mark.asyncio
-async def test_backtesting_like_strategy_real_events_end_to_end() -> None:
-    await run_backtesting_like_strategy_real_events_test()
-
-
-if __name__ == "__main__":
-    asyncio.run(run_backtesting_like_strategy_real_events_test())

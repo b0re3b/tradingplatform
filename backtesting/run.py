@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,13 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or not raw.strip():
         return default
     return int(raw.strip())
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -440,6 +448,9 @@ def _safe_public_value(value: Any, _depth: int = 0) -> Any:
             for key, item in list(value.items())[:80]
         }
 
+    if isinstance(value, Counter):
+        return dict(value.most_common(80))
+
     if isinstance(value, (list, tuple, set)):
         items = list(value)
         return [_safe_public_value(item, _depth + 1) for item in items[:80]]
@@ -497,7 +508,7 @@ def _print_mapping(title: str, mapping: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Compact stats helper — replaces the raw stats dump in engine/processor
+# Compact stats helper — replaces raw stats dumps in engine/processor
 # ---------------------------------------------------------------------------
 
 _STATS_COUNTER_KEYS = (
@@ -511,19 +522,38 @@ _STATS_COUNTER_KEYS = (
     "signals_built",
     "signals_filtered",
     "batches_processed",
+    "signal_confirmed_events",
+    "close_requested_events",
+    "reduce_requested_events",
+    "kill_switch_events",
+    "orders_created",
+    "orders_submitted",
+    "orders_accepted",
+    "orders_rejected",
+    "orders_failed",
+    "orders_cancelled",
+    "orders_filled",
+    "orders_partially_filled",
+    "fills_created",
+    "fills_processed",
+    "positions_opened",
+    "positions_updated",
+    "positions_closed",
+    "positions_liquidated",
 )
 
 _STATS_TIME_KEYS = (
     "started_at",
     "updated_at",
+    "stopped_at",
 )
 
 
 def _compact_stats(stats: Any) -> dict[str, Any]:
     """
-    Extract only numeric counters and timestamps from a stats object.
+    Extract only scalar counters and timestamps from a stats object.
     Deliberately ignores per-strategy dicts, defaultdicts, and last_*_at maps
-    to keep the output to one short line.
+    to keep the output concise.
     """
     result: dict[str, Any] = {}
 
@@ -537,7 +567,15 @@ def _compact_stats(stats: Any) -> dict[str, Any]:
         if v is not None:
             result[key] = str(v)
 
-    # Fallback: try summary/snapshot but only keep scalar values from them
+    status = _read_attr(stats, "status", None)
+    if status is not None:
+        result["status"] = _safe_public_value(status)
+
+    last_error = _read_attr(stats, "last_error", None)
+    if last_error:
+        result["last_error"] = str(last_error)
+
+    # Fallback: try summary/snapshot/to_dict but only keep scalar values.
     if not result:
         for method_name in ("summary", "snapshot", "to_dict"):
             raw = _call_noarg(stats, method_name)
@@ -551,6 +589,444 @@ def _compact_stats(stats: Any) -> dict[str, Any]:
                     break
 
     return result
+
+
+# =============================================================================
+# Post-run event flow diagnostics
+# =============================================================================
+
+TRADING_SIGNAL_TOPICS = (
+    "signal.generated",
+    "signal.updated",
+    "signal.confirmed",
+    "signal.rejected",
+)
+
+TRADING_RISK_TOPICS = (
+    "signal.confirmed",
+    "risk.position_blocked",
+    "risk.position_close_requested",
+    "risk.position_reduce_requested",
+    "risk.kill_switch",
+    "risk.limit_warning",
+)
+
+RISK_LIFECYCLE_TOPICS = (
+    "risk.manager.started",
+    "risk.manager.stopped",
+    "risk.manager.registered",
+    "risk.manager.unregistered",
+)
+
+EXECUTION_TOPICS = (
+    "execution.order_submitted",
+    "execution.order_accepted",
+    "execution.order_rejected",
+    "execution.order_failed",
+    "execution.order_cancelled",
+    "execution.order_partially_filled",
+    "execution.order_filled",
+)
+
+POSITION_TOPICS = (
+    "position.opened",
+    "position.updated",
+    "position.closed",
+    "position.liquidated",
+)
+
+ANALYTICS_NON_TRADE_SUFFIXES = (
+    ".heartbeat",
+    ".metrics",
+    ".state_cleaned",
+    ".started",
+    ".stopped",
+)
+
+
+def _metadata_dict(result: BacktestResult | None) -> dict[str, Any]:
+    if result is None:
+        return {}
+    metadata = getattr(result, "metadata", None)
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _event_flow_debug(result: BacktestResult | None) -> dict[str, Any]:
+    metadata = _metadata_dict(result)
+    debug_payload = metadata.get("event_flow_debug")
+    return debug_payload if isinstance(debug_payload, dict) else {}
+
+
+def _topic_counts_from_result(result: BacktestResult | None) -> Counter[str]:
+    debug = _event_flow_debug(result)
+    raw = debug.get("topic_counts")
+    if isinstance(raw, Counter):
+        return Counter({str(k): int(v) for k, v in raw.items()})
+    if isinstance(raw, dict):
+        counts: Counter[str] = Counter()
+        for key, value in raw.items():
+            try:
+                counts[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return counts
+    return Counter()
+
+
+def _group_counts_from_result(result: BacktestResult | None) -> dict[str, int]:
+    debug = _event_flow_debug(result)
+    raw = debug.get("group_counts")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _samples_from_result(result: BacktestResult | None) -> dict[str, list[Any]]:
+    debug = _event_flow_debug(result)
+    raw = debug.get("samples")
+    if isinstance(raw, dict):
+        return {
+            str(key): list(value if isinstance(value, list) else [value])[:5]
+            for key, value in raw.items()
+        }
+    return {}
+
+
+def _recent_events_from_result(result: BacktestResult | None) -> list[Any]:
+    debug = _event_flow_debug(result)
+    raw = debug.get("recent_events")
+    if isinstance(raw, list):
+        return raw[-30:]
+    return []
+
+
+def _count_prefix(topic_counts: Counter[str], prefix: str) -> int:
+    return sum(count for topic, count in topic_counts.items() if topic.startswith(prefix))
+
+
+def _count_exact(topic_counts: Counter[str], topics: tuple[str, ...]) -> int:
+    return sum(topic_counts.get(topic, 0) for topic in topics)
+
+
+def _analytics_non_trade_topics(topic_counts: Counter[str]) -> dict[str, int]:
+    return {
+        topic: count
+        for topic, count in topic_counts.items()
+        if topic.startswith("analytics.") and topic.endswith(ANALYTICS_NON_TRADE_SUFFIXES)
+    }
+
+
+def _verdict_from_event_flow(
+    topic_counts: Counter[str],
+    group_counts: dict[str, int],
+) -> str:
+    signal_generated = topic_counts.get("signal.generated", 0)
+    signal_rejected = topic_counts.get("signal.rejected", 0)
+    signal_confirmed = topic_counts.get("signal.confirmed", 0)
+    risk_blocked = topic_counts.get("risk.position_blocked", 0)
+    close_requested = topic_counts.get("risk.position_close_requested", 0)
+    reduce_requested = topic_counts.get("risk.position_reduce_requested", 0)
+    execution_events = _count_prefix(topic_counts, "execution.")
+    position_events = _count_prefix(topic_counts, "position.")
+    trading_risk_events = _count_exact(topic_counts, TRADING_RISK_TOPICS)
+    lifecycle_risk_events = _count_exact(topic_counts, RISK_LIFECYCLE_TOPICS)
+
+    if execution_events > 0 and position_events > 0:
+        return "OK: execution.* і position.* є, pipeline дійшов до симульованих угод."
+
+    if execution_events > 0 and position_events <= 0:
+        return "Breakpoint: execution.* є, але position.* немає — перевір PositionSimulator subscriptions/fill payload."
+
+    if signal_confirmed > 0 or close_requested > 0 or reduce_requested > 0:
+        return (
+            "Breakpoint: є signal.confirmed / risk close-reduce request, але execution.* = 0 — "
+            "перевір ExecutionSimulator register/start/config/listen_signal_confirmed та payload validation."
+        )
+
+    if risk_blocked > 0:
+        return "Breakpoint: RiskManager блокує позиції — дивись risk.position_blocked samples/reasons."
+
+    if signal_rejected > 0 and signal_generated <= 0 and signal_confirmed <= 0:
+        return (
+            "Breakpoint: Strategy/SignalProcessor емітив signal.rejected, але не було signal.generated/signal.confirmed. "
+            "ExecutionSimulator тут не винен — до нього не дійшов risk-approved intent."
+        )
+
+    if signal_generated > 0 and trading_risk_events <= lifecycle_risk_events:
+        return (
+            "Breakpoint: signal.generated є, але немає торгового risk response — перевір RiskManager subscriptions "
+            "на signal.generated і schema risk-ready payload."
+        )
+
+    if group_counts.get("strategy", 0) > 0 and group_counts.get("signal", 0) <= 0:
+        return "Breakpoint: StrategyEngine обробляє events, але SignalProcessor не емітить signal.*."
+
+    if group_counts.get("analytics", 0) > 0 and group_counts.get("strategy", 0) <= 0:
+        return "Breakpoint: analytics.* є, але StrategyEngine не отримує/не обробляє їх."
+
+    if group_counts.get("market.updated", 0) > 0 and group_counts.get("analytics", 0) <= 0:
+        return "Breakpoint: market.*.updated є, але analytics не публікує analytics.*."
+
+    if group_counts.get("market.raw", 0) > 0 and group_counts.get("market.updated", 0) <= 0:
+        return "Breakpoint: MarketReplay емітить raw market.*, але data caches не публікують market.*.updated."
+
+    return "Недостатньо даних для точного breakpoint; дивись topic matrix нижче."
+
+
+def _extract_reason_from_payload(payload: Any) -> str | None:
+    if payload is None:
+        return None
+
+    if isinstance(payload, str):
+        # Samples may already be stringified dicts; keep only compact strings.
+        return payload[:240]
+
+    if not isinstance(payload, dict):
+        to_dict = getattr(payload, "to_dict", None)
+        if callable(to_dict):
+            try:
+                payload = to_dict()
+            except Exception:
+                return str(payload)[:240]
+        else:
+            return str(payload)[:240]
+
+    candidates = (
+        "reason",
+        "reject_reason",
+        "rejection_reason",
+        "error",
+        "message",
+        "status_reason",
+    )
+    for key in candidates:
+        value = payload.get(key)
+        if value:
+            return str(value)[:240]
+
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        for key in candidates:
+            value = metadata.get(key)
+            if value:
+                return str(value)[:240]
+
+    errors = payload.get("errors") or payload.get("reasons")
+    if errors:
+        return str(errors)[:240]
+
+    return None
+
+
+def _extract_reason_from_record(record: Any) -> str | None:
+    for attr in (
+        "reason",
+        "reject_reason",
+        "rejection_reason",
+        "error",
+        "message",
+        "outcome",
+        "status",
+    ):
+        value = _read_attr(record, attr, None)
+        if value:
+            return str(_safe_public_value(value))[:240]
+
+    payload = _read_attr(record, "payload", None)
+    reason = _extract_reason_from_payload(payload)
+    if reason:
+        return reason
+
+    metadata = _read_attr(record, "metadata", None)
+    if isinstance(metadata, dict):
+        reason = _extract_reason_from_payload(metadata)
+        if reason:
+            return reason
+
+    return None
+
+
+def _signal_reason_counts(result: BacktestResult | None, samples: dict[str, list[Any]]) -> Counter[str]:
+    reasons: Counter[str] = Counter()
+
+    if result is not None:
+        for record in list(getattr(result, "signals", []) or []):
+            reason = _extract_reason_from_record(record)
+            if reason:
+                reasons[reason] += 1
+
+    for sample in samples.get("signal.rejected", []):
+        reason = _extract_reason_from_payload(sample)
+        if reason:
+            reasons[reason] += 1
+
+    return reasons
+
+
+def _print_topic_matrix(title: str, topic_counts: Counter[str], topics: tuple[str, ...]) -> None:
+    print(title)
+    for topic in topics:
+        print(f"- {topic}: {topic_counts.get(topic, 0)}")
+
+
+def _component_stats(component: Any) -> dict[str, Any]:
+    if component is None:
+        return {}
+
+    for attr in ("stats_state", "stats", "_stats"):
+        stats = _read_attr(component, attr, None)
+        if stats is not None:
+            compact = _compact_stats(stats)
+            if compact:
+                return compact
+
+    stats_method = getattr(component, "stats", None)
+    if callable(stats_method):
+        try:
+            value = stats_method()
+            if isinstance(value, dict):
+                return {
+                    str(k): _safe_public_value(v)
+                    for k, v in value.items()
+                    if isinstance(v, (int, float, bool, str)) or k in {"status", "last_error"}
+                }
+            compact = _compact_stats(value)
+            if compact:
+                return compact
+        except Exception as exc:
+            return {"stats_error": str(exc)}
+
+    return {}
+
+
+def print_event_flow_diagnostics(result: BacktestResult | None, tester: StrategyTester | None = None) -> None:
+    """
+    More precise event-flow diagnostics than StrategyTester.suspected_breakpoint.
+
+    Key fix:
+    risk.* lifecycle events are separated from trading risk events. Therefore
+    risk.manager.stopped no longer makes the report blame ExecutionSimulator.
+    """
+
+    enabled = _env_bool("BACKTEST_DEBUG_EVENT_FLOW", True)
+    if not enabled:
+        return
+
+    topic_counts = _topic_counts_from_result(result)
+    group_counts = _group_counts_from_result(result)
+    samples = _samples_from_result(result)
+    recent_events = _recent_events_from_result(result)
+
+    print("\n========== PRECISE EVENT FLOW DIAGNOSTICS ==========")
+    if group_counts:
+        print("Group counts:")
+        for key in (
+            "market.raw",
+            "market.updated",
+            "market.candle.closed",
+            "analytics",
+            "strategy",
+            "signal",
+            "risk",
+            "execution",
+            "position",
+            "system",
+        ):
+            print(f"- {key}: {group_counts.get(key, 0)}")
+
+    debug = _event_flow_debug(result)
+    if debug:
+        print("\nOriginal monitor:")
+        print(f"- last_stage: {debug.get('last_stage')}")
+        print(f"- suspected_breakpoint: {debug.get('suspected_breakpoint')}")
+
+    print("\nCorrected verdict:")
+    print(f"- {_verdict_from_event_flow(topic_counts, group_counts)}")
+
+    print("\nTrading signal topics:")
+    _print_topic_matrix("", topic_counts, TRADING_SIGNAL_TOPICS)
+
+    print("\nRisk topics split:")
+    _print_topic_matrix("Trading risk topics:", topic_counts, TRADING_RISK_TOPICS)
+    _print_topic_matrix("Lifecycle/system risk topics:", topic_counts, RISK_LIFECYCLE_TOPICS)
+
+    print("\nExecution topics:")
+    _print_topic_matrix("", topic_counts, EXECUTION_TOPICS)
+
+    print("\nPosition topics:")
+    _print_topic_matrix("", topic_counts, POSITION_TOPICS)
+
+    non_trade_analytics = _analytics_non_trade_topics(topic_counts)
+    if non_trade_analytics:
+        print("\nAnalytics non-trade topics observed by monitor:")
+        for topic, count in sorted(non_trade_analytics.items(), key=lambda item: item[0])[:40]:
+            print(f"- {topic}: {count}")
+        print("Hint: ці topics не мають потрапляти в SignalNormalizer як tradeable analytics payload.")
+
+    reasons = _signal_reason_counts(result, samples)
+    if reasons:
+        print("\nTop signal reject/status reasons:")
+        for reason, count in reasons.most_common(15):
+            print(f"- {count}x {reason}")
+
+    interesting_samples = [
+        "signal.rejected",
+        "signal.generated",
+        "signal.confirmed",
+        "risk.position_blocked",
+        "execution.order_rejected",
+        "execution.order_failed",
+        "execution.order_filled",
+    ]
+    print("\nImportant payload samples:")
+    printed_any = False
+    for topic in interesting_samples:
+        topic_samples = samples.get(topic, [])
+        if not topic_samples:
+            continue
+        printed_any = True
+        print(f"- {topic}:")
+        for sample in topic_samples[:3]:
+            print(f"  {_safe_public_value(sample)}")
+    if not printed_any:
+        print("- <none>")
+
+    if tester is not None:
+        components = getattr(tester, "components", None)
+        if components is not None:
+            print("\nBacktesting simulator stats:")
+            execution_simulator = _read_attr(components, "execution_simulator", None)
+            position_simulator = _read_attr(components, "position_simulator", None)
+            market_replay = _read_attr(components, "market_replay", None)
+            collectors = _read_attr(components, "collectors", None)
+
+            print(f"- MarketReplay: {_component_stats(market_replay) or '<missing>'}")
+            print(f"- ExecutionSimulator: {_component_stats(execution_simulator) or '<missing>'}")
+            print(f"- PositionSimulator: {_component_stats(position_simulator) or '<missing>'}")
+            print(f"- Collectors: {_component_stats(collectors) or '<missing>'}")
+
+    if recent_events:
+        print("\nRecent events:")
+        for event in recent_events[-15:]:
+            print(f"- {_safe_public_value(event)}")
+
+    if topic_counts:
+        print("\nTop topics:")
+        for topic, count in topic_counts.most_common(30):
+            print(f"- {topic}: {count}")
+
+    print("====================================================\n")
+
+
+# =============================================================================
+# Strategy internal diagnostics
+# =============================================================================
 
 
 def _debug_strategy_config(
@@ -590,10 +1066,18 @@ def _debug_strategy_config(
                 if topic not in configured_set and "analytics.*" not in configured_set
             ]
 
+            non_trade_observed = [
+                topic
+                for topic in observed_analytics_topics
+                if topic.endswith(ANALYTICS_NON_TRADE_SUFFIXES)
+            ]
+
             print(f"- observed_analytics_topics.count: {len(observed_analytics_topics)}")
             print(f"- observed_analytics_topics.first_50: {observed_analytics_topics[:50]}")
             print(f"- observed_analytics_not_in_routing.count: {len(unmatched_observed)}")
             print(f"- observed_analytics_not_in_routing.first_50: {unmatched_observed[:50]}")
+            print(f"- observed_non_trade_analytics.count: {len(non_trade_observed)}")
+            print(f"- observed_non_trade_analytics.first_30: {non_trade_observed[:30]}")
         else:
             print(f"- routing.event_to_categories: {_safe_public_value(event_to_categories)}")
 
@@ -666,7 +1150,6 @@ def _debug_strategy_registry(registry: Any) -> None:
 def _debug_strategy_engine(engine: Any) -> None:
     print("\nStrategyEngine:")
 
-    # --- Compact stats: counters + timestamps only, no per-strategy dicts ---
     stats_candidates = [
         _read_attr(engine, "stats", None),
         _read_attr(engine, "stats_state", None),
@@ -726,14 +1209,14 @@ def _debug_strategy_engine(engine: Any) -> None:
         if analytics_topics is None:
             analytics_topics = _call_noarg(event_handler, "analytics_topics")
         if analytics_topics is not None:
-            print(f"  - analytics_topics.count: {len(analytics_topics) if hasattr(analytics_topics, '__len__') else '<unknown>'}")
-            print(f"  - analytics_topics.first_50: {_safe_public_value(list(analytics_topics)[:50]) if not isinstance(analytics_topics, str) else analytics_topics}")
+            topic_list = list(analytics_topics) if not isinstance(analytics_topics, str) else [analytics_topics]
+            print(f"  - analytics_topics.count: {len(topic_list)}")
+            print(f"  - analytics_topics.first_50: {_safe_public_value(topic_list[:50])}")
 
 
 def _debug_signal_processor(processor: Any) -> None:
     print("\nSignalProcessor:")
 
-    # --- Compact stats: counters + timestamps only, no per-strategy dicts ---
     stats_candidates = [
         _read_attr(processor, "stats", None),
         _read_attr(processor, "stats_state", None),
@@ -786,12 +1269,11 @@ def _debug_runtime_state(runtime_state: Any) -> None:
         print("- <missing>")
         return
 
-    # Only show scalar summary — skip snapshot/to_dict to avoid large dumps
+    # Only show scalar summary — skip snapshot/to_dict to avoid large dumps.
     for attr in ("signal_state", "context_store", "cooldown_state", "metrics_state"):
         value = _read_attr(runtime_state, attr, None)
         if value is not None:
             class_name = value.__class__.__name__
-            # Try to get a single compact count/length instead of full dump
             size: Any = None
             for size_attr in ("count", "size", "__len__"):
                 if size_attr == "__len__":
@@ -831,20 +1313,21 @@ def print_strategy_internal_debug(pipeline: Any, result: BacktestResult | None =
     observed_analytics_topics: list[str] = []
 
     if result is not None:
-        debug_payload = result.metadata.get("event_flow_debug") if isinstance(result.metadata, dict) else None
+        debug_payload = _event_flow_debug(result)
         if isinstance(debug_payload, dict):
             print("EventFlow summary:")
             print(f"- last_stage: {debug_payload.get('last_stage')}")
-            print(f"- suspected_breakpoint: {debug_payload.get('suspected_breakpoint')}")
-            print(f"- group_counts: {_safe_public_value(debug_payload.get('group_counts'))}")
+            print(f"- original_suspected_breakpoint: {debug_payload.get('suspected_breakpoint')}")
+            topic_counts = _topic_counts_from_result(result)
+            group_counts = _group_counts_from_result(result)
+            print(f"- corrected_breakpoint: {_verdict_from_event_flow(topic_counts, group_counts)}")
+            print(f"- group_counts: {_safe_public_value(group_counts)}")
 
-            topic_counts = debug_payload.get("topic_counts")
-            if isinstance(topic_counts, dict):
-                observed_analytics_topics = sorted(
-                    str(topic)
-                    for topic in topic_counts.keys()
-                    if str(topic).startswith("analytics.")
-                )
+            observed_analytics_topics = sorted(
+                str(topic)
+                for topic in topic_counts.keys()
+                if str(topic).startswith("analytics.")
+            )
 
     _debug_strategy_config(
         _read_attr(strategy_pipeline, "strategy_config", None)
@@ -915,6 +1398,10 @@ async def run_full_backtest(
     )
 
     result = await tester.run(dataset=dataset)
+
+    # Print precise event-flow diagnostics before strategy internals so the
+    # root breakpoint is visible immediately.
+    print_event_flow_diagnostics(result, tester)
     print_strategy_internal_debug(pipeline, result)
     print_result_summary(result)
     return result
