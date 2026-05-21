@@ -503,6 +503,33 @@ class PriceActionTradingStrategy(TradingStrategy):
         self.price_action_config.validate()
 
     # ------------------------------------------------------------------
+    # No-signal diagnostics
+    # ------------------------------------------------------------------
+
+    def remember_no_signal(self, reason: str, **metadata: Any) -> None:
+        """
+        Store the exact reason why generate_signal() returned None.
+
+        BaseStrategy.evaluate() should consume these fields when building a
+        failed StrategyEvaluation. Keeping the helper here also makes
+        price-action strategies safe in deployments where the root BaseStrategy
+        patch has not been applied yet.
+        """
+        normalized = str(reason or "").strip() or "no_signal_generated"
+        self._last_no_signal_reason = normalized
+        self._last_no_signal_metadata = dict(metadata)
+
+    def clear_no_signal_reason(self) -> None:
+        self._last_no_signal_reason = None
+        self._last_no_signal_metadata = {}
+
+    def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
+        reason = getattr(self, "_last_no_signal_reason", None) or "no_signal_generated"
+        metadata = dict(getattr(self, "_last_no_signal_metadata", {}) or {})
+        self.clear_no_signal_reason()
+        return [reason], metadata
+
+    # ------------------------------------------------------------------
     # Context / domain access
     # ------------------------------------------------------------------
 

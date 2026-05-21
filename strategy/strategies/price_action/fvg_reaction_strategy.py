@@ -641,16 +641,42 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
             context,
             tuple(self.fvg_config.required_price_action_features),
         ):
+            self.remember_no_signal(
+                "missing_price_action_fvg_context",
+                price_action_domain_keys=sorted(self.price_action_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if self.has_stale_price_action_features(
             context,
             tuple(self.fvg_config.required_price_action_features),
         ):
+            self.remember_no_signal(
+                "stale_price_action_fvg_features",
+                required_features=sorted(self.fvg_config.required_price_action_features),
+            )
             return None
 
         view = self._extract_view(context)
-        if view is None or view.reaction_gap is None:
+        if view is None:
+            self.remember_no_signal(
+                "fvg_view_not_resolved",
+                fair_value_gap=serialize_for_metadata(
+                    self.price_action_item(context, "fair_value_gap")
+                ),
+                price_action_domain_keys=sorted(self.price_action_domain(context).keys()),
+            )
+            return None
+
+        if view.reaction_gap is None:
+            self.remember_no_signal(
+                "missing_fvg_reaction_gap",
+                fair_value_gap=serialize_for_metadata(
+                    self.price_action_item(context, "fair_value_gap")
+                ),
+                last_event=serialize_for_metadata(view.last_event),
+            )
             return None
 
         if (
@@ -661,6 +687,12 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
                 stale_after_seconds=self.fvg_config.stale_feature_max_age_seconds,
             )
         ):
+            self.remember_no_signal(
+                "stale_fvg_event",
+                event_time=view.event_time.isoformat() if view.event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
+                stale_after_seconds=self.fvg_config.stale_feature_max_age_seconds,
+            )
             return None
 
         common_rejection = quality_filter_reason(
@@ -671,15 +703,38 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
             now=context.timestamp,
         )
         if common_rejection is not None and self.fvg_config.require_primary_layer_eligible:
+            self.remember_no_signal(
+                "fvg_primary_layer_rejected",
+                rejection=common_rejection,
+                primary_layer=serialize_for_metadata(view.primary_layer),
+                min_layer_confidence=self.fvg_config.min_layer_confidence,
+                min_gap_strength=self.fvg_config.min_gap_strength,
+            )
             return None
 
         side = self._infer_side(view)
         if self.fvg_config.require_directional_gap and not is_directional_side(side):
+            self.remember_no_signal(
+                "fvg_side_not_directional",
+                reaction_gap=serialize_for_metadata(view.reaction_gap),
+                last_event=serialize_for_metadata(view.last_event),
+            )
             return None
 
         setup_type = self._infer_setup_type(view)
 
         if not self._passes_filters(view=view, side=side, setup_type=setup_type):
+            self.remember_no_signal(
+                "fvg_filters_failed",
+                side=side.value,
+                setup_type=setup_type.value,
+                reaction_gap=serialize_for_metadata(view.reaction_gap),
+                last_event=serialize_for_metadata(view.last_event),
+                proximity_score=view.proximity_score,
+                fill_quality_score=view.fill_quality_score,
+                layer_confidence=view.layer_confidence,
+                layer_strength=view.layer_strength,
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -690,9 +745,23 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         )
 
         if breakdown.score < self.fvg_config.min_signal_score:
+            self.remember_no_signal(
+                "fvg_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.fvg_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.fvg_config.min_signal_confidence:
+            self.remember_no_signal(
+                "fvg_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.fvg_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(view)

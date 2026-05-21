@@ -426,16 +426,30 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
             context,
             tuple(self.capitulation_config.required_open_interest_features),
         ):
+            self.remember_no_signal(
+                "missing_open_interest_capitulation_contract",
+                open_interest_domain_keys=sorted(self.open_interest_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if self.has_stale_open_interest_features(
             context,
             tuple(self.capitulation_config.required_open_interest_features),
         ):
+            self.remember_no_signal(
+                "stale_open_interest_capitulation_features",
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         payload = self._extract_payload(context)
         if payload is None:
+            self.remember_no_signal(
+                "open_interest_capitulation_payload_not_resolved",
+                open_interest_domain=self.open_interest_domain(context),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         event_time = self._event_time(payload)
@@ -447,20 +461,58 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
                 stale_after_seconds=self.capitulation_config.stale_feature_max_age_seconds,
             )
         ):
+            self.remember_no_signal(
+                "stale_open_interest_capitulation",
+                event_time=event_time.isoformat() if event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
+                stale_after_seconds=self.capitulation_config.stale_feature_max_age_seconds,
+            )
             return None
 
         if self.capitulation_config.require_detected_context and not payload.detected:
+            self.remember_no_signal(
+                "open_interest_capitulation_not_detected",
+                regime=serialize_for_metadata(payload.regime),
+                anomaly=serialize_for_metadata(payload.anomaly),
+            )
             return None
 
         if not self._passes_capitulation_thresholds(payload):
+            self.remember_no_signal(
+                "open_interest_capitulation_thresholds_failed",
+                regime=serialize_for_metadata(payload.regime),
+                anomaly=serialize_for_metadata(payload.anomaly),
+                confidence=payload.confidence,
+                score=payload.score,
+                min_capitulation_confidence=self.capitulation_config.min_capitulation_confidence,
+                min_capitulation_score=self.capitulation_config.min_capitulation_score,
+                min_regime_confidence=self.capitulation_config.min_regime_confidence,
+                min_anomaly_confidence=self.capitulation_config.min_anomaly_confidence,
+            )
             return None
 
         side = self._map_capitulation_to_side(payload)
         if self.capitulation_config.require_actionable_side and not is_directional_side(side):
+            self.remember_no_signal(
+                "open_interest_capitulation_side_not_directional",
+                regime=serialize_for_metadata(payload.regime),
+                anomaly=serialize_for_metadata(payload.anomaly),
+                features=serialize_for_metadata(payload.features),
+                divergence=serialize_for_metadata(payload.divergence),
+            )
             return None
 
         blocked_reason = self._block_reason(payload=payload, side=side)
         if blocked_reason is not None:
+            self.remember_no_signal(
+                "open_interest_capitulation_blocked",
+                blocked_reason=blocked_reason,
+                side=side.value,
+                regime=serialize_for_metadata(payload.regime),
+                anomaly=serialize_for_metadata(payload.anomaly),
+                features=serialize_for_metadata(payload.features),
+                divergence=serialize_for_metadata(payload.divergence),
+            )
             return None
 
         setup_type = self._map_setup_type(payload)
@@ -473,9 +525,23 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         )
 
         if breakdown.score < self.capitulation_config.min_signal_score:
+            self.remember_no_signal(
+                "open_interest_capitulation_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.capitulation_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.capitulation_config.min_signal_confidence:
+            self.remember_no_signal(
+                "open_interest_capitulation_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.capitulation_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(payload)

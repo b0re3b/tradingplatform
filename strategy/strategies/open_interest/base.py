@@ -679,6 +679,46 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self.open_interest_config.validate()
 
     # ------------------------------------------------------------------
+    # No-signal diagnostics
+    # ------------------------------------------------------------------
+
+    def remember_no_signal(self, reason: str, **metadata: Any) -> None:
+        """
+        Store an exact no-signal reason for BaseStrategy.evaluate().
+
+        This keeps concrete strategies in the StrategySignal | None contract,
+        while allowing direct-batch / E2E diagnostics to show the exact gate
+        that rejected the context instead of a generic no_signal_generated.
+        """
+        parent = getattr(super(), "remember_no_signal", None)
+        if callable(parent):
+            parent(reason, **metadata)
+            return
+
+        normalized = str(reason or "").strip() or "no_signal_generated"
+        self._last_no_signal_reason = normalized
+        self._last_no_signal_metadata = dict(metadata)
+
+    def clear_no_signal_reason(self) -> None:
+        parent = getattr(super(), "clear_no_signal_reason", None)
+        if callable(parent):
+            parent()
+            return
+
+        self._last_no_signal_reason = None
+        self._last_no_signal_metadata = {}
+
+    def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
+        parent = getattr(super(), "consume_no_signal_reason", None)
+        if callable(parent):
+            return parent()
+
+        reason = getattr(self, "_last_no_signal_reason", None) or "no_signal_generated"
+        metadata = dict(getattr(self, "_last_no_signal_metadata", {}) or {})
+        self.clear_no_signal_reason()
+        return [reason], metadata
+
+    # ------------------------------------------------------------------
     # Context / domain access
     # ------------------------------------------------------------------
 

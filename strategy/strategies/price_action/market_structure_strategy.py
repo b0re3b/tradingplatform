@@ -539,16 +539,32 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
             context,
             tuple(self.structure_config.required_price_action_features),
         ):
+            self.remember_no_signal(
+                "missing_price_action_market_structure_context",
+                price_action_domain_keys=sorted(self.price_action_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if self.has_stale_price_action_features(
             context,
             tuple(self.structure_config.required_price_action_features),
         ):
+            self.remember_no_signal(
+                "stale_price_action_market_structure_features",
+                required_features=sorted(self.structure_config.required_price_action_features),
+            )
             return None
 
         view = self._extract_view(context)
         if view is None:
+            self.remember_no_signal(
+                "market_structure_view_not_resolved",
+                market_structure=serialize_for_metadata(
+                    self.price_action_item(context, "market_structure")
+                ),
+                price_action_domain_keys=sorted(self.price_action_domain(context).keys()),
+            )
             return None
 
         if (
@@ -559,6 +575,12 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
                 stale_after_seconds=self.structure_config.stale_feature_max_age_seconds,
             )
         ):
+            self.remember_no_signal(
+                "stale_market_structure_event",
+                event_time=view.event_time.isoformat() if view.event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
+                stale_after_seconds=self.structure_config.stale_feature_max_age_seconds,
+            )
             return None
 
         common_rejection = quality_filter_reason(
@@ -569,15 +591,39 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
             now=context.timestamp,
         )
         if common_rejection is not None and self.structure_config.require_primary_layer_eligible:
+            self.remember_no_signal(
+                "market_structure_primary_layer_rejected",
+                rejection=common_rejection,
+                primary_layer=serialize_for_metadata(view.primary_layer),
+                min_layer_confidence=self.structure_config.min_layer_confidence,
+                min_layer_strength=self.structure_config.min_layer_strength,
+            )
             return None
 
         side = self._infer_side(view)
         if not is_directional_side(side):
+            self.remember_no_signal(
+                "market_structure_side_not_directional",
+                last_event=serialize_for_metadata(view.last_event),
+                bias=normalize_label(view.bias),
+                secondary_bias=normalize_label(view.secondary_bias),
+            )
             return None
 
         setup_type = self._infer_setup_type(view)
 
         if not self._passes_filters(view=view, side=side, setup_type=setup_type):
+            self.remember_no_signal(
+                "market_structure_filters_failed",
+                side=side.value,
+                setup_type=setup_type.value,
+                last_event=serialize_for_metadata(view.last_event),
+                mtf_alignment_score=view.mtf_alignment_score,
+                swing_progression_score=view.swing_progression_score,
+                trend_strength=view.trend_strength,
+                layer_confidence=view.layer_confidence,
+                layer_strength=view.layer_strength,
+            )
             return None
 
         breakdown = self._build_score_breakdown(
@@ -588,9 +634,23 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         )
 
         if breakdown.score < self.structure_config.min_signal_score:
+            self.remember_no_signal(
+                "market_structure_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.structure_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.structure_config.min_signal_confidence:
+            self.remember_no_signal(
+                "market_structure_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.structure_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(view)

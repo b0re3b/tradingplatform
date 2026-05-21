@@ -291,7 +291,7 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     "oi_divergence": StrategyCatalogEntry(
         name="oi_divergence",
         category=StrategyCategory.OPEN_INTEREST,
-        default_timeframes=_tf_join(TF_MID, Timeframe.M30, Timeframe.H1),
+        default_timeframes=TF_SCALP_INTRADAY,
         weight=1.00,
         priority=36,
         tags=("open_interest", "oi", "divergence", "reversal", "futures"),

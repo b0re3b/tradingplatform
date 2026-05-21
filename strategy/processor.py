@@ -52,6 +52,7 @@ from strategy.models import (
     ExitPlan,
     FeatureSnapshot,
     FilterResult,
+    PriceSnapshot,
     InvalidationPlan,
     RiskReadySignalPayload,
     StrategyContext,
@@ -159,6 +160,7 @@ class NormalizedPayload:
     timestamp: datetime
     timeframe: Timeframe = Timeframe.M1
     domain_data: dict[str, Any] = field(default_factory=dict)
+    extra_domain_data: dict[FeatureSource, dict[str, Any]] = field(default_factory=dict)
     features: list[FeatureSnapshot] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -470,17 +472,6 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
-        """
-        Normalize analytics.funding.* payloads into the stable funding domain
-        contract consumed by strategy/strategies/funding/*.
-
-        Important:
-        - domain sections are populated only when they actually exist;
-        - funding.updated with an extreme event is enriched with the fields that
-          FundingExtremeReversalStrategy expects;
-        - missing divergence is NOT synthesized, because funding_divergence should
-          not be routed/evaluated without a real divergence section.
-        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -489,227 +480,39 @@ class SignalNormalizer(BaseStrategyComponent):
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return dict(value)
+                    return value
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return dict(value)
+                    return value
 
             return None
 
-        def value_for(*keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in payload:
-                    return payload[key]
-                if key in feature_map:
-                    return feature_map[key]
-            return default
+        for target, aliases in {
+            "snapshot": ("snapshot", "funding_snapshot"),
+            "statistics": ("statistics", "stats", "funding_statistics"),
+            "regime": ("regime", "regime_state", "funding_regime"),
+            "pressure": ("pressure", "pressure_state", "funding_pressure"),
+            "extreme": ("extreme", "extreme_event", "funding_extreme"),
+            "divergence": ("divergence", "divergence_event", "funding_divergence"),
+            "flip": ("flip", "flip_event", "funding_flip"),
+            "signal": ("signal", "funding_signal"),
+        }.items():
+            value = mapping_for(*aliases)
+            if value is not None:
+                domain_data.setdefault(target, value)
+                domain_data.setdefault(aliases[0], value)
 
-        def to_float(value: Any, default: float = 0.0) -> float:
-            if value is None:
-                return default
-            if isinstance(value, bool):
-                return float(value)
-            if isinstance(value, (int, float)):
-                return float(value)
-            if isinstance(value, str):
-                try:
-                    return float(value.strip())
-                except ValueError:
-                    return default
-            return default
-
-        def clamp01(value: Any, default: float = 0.0) -> float:
-            parsed = to_float(value, default)
-            return max(0.0, min(1.0, parsed))
-
-        def section_detected(section: dict[str, Any] | None) -> bool:
-            if not section:
-                return False
-
-            detected = section.get("detected", section.get("is_detected", None))
-            if detected is None:
-                return True
-
-            if isinstance(detected, bool):
-                return detected
-
-            if isinstance(detected, str):
-                return detected.strip().lower() not in {
-                    "0",
-                    "false",
-                    "no",
-                    "n",
-                    "off",
-                    "none",
-                }
-
-            return bool(detected)
-
-        def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None) -> None:
-            if value is None:
-                return
-
-            domain_data.setdefault(target, value)
-            for alias in aliases:
-                domain_data.setdefault(alias, value)
-
-        snapshot = mapping_for("snapshot", "funding_snapshot")
-        statistics = mapping_for("statistics", "stats", "funding_statistics")
-        regime = mapping_for("regime", "regime_state", "funding_regime")
-        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
-        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
-        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
-        flip = mapping_for("flip", "flip_event", "funding_flip")
-        signal = mapping_for("signal", "funding_signal")
-
-        if signal is None and (
+        if "signal" not in domain_data and (
                 "signal_type" in payload
                 or "bias" in payload
-                or "side" in payload
-                or "direction" in payload
                 or "score" in payload
                 or "confidence" in payload
         ):
-            signal = {
-                "type": value_for("signal_type", "type", default=None),
-                "bias": value_for("bias", "side", "direction", default=None),
-                "side": value_for("side", "direction", "bias", default=None),
-                "direction": value_for("direction", "side", "bias", default=None),
-                "score": value_for("signal_score", "score", default=0.0),
-                "confidence": value_for("signal_confidence", "confidence", default=0.0),
-            }
+            domain_data["signal"] = dict(payload)
 
-        if snapshot is None:
-            snapshot = {
-                "funding_rate": value_for("funding_rate", "rate", default=None),
-                "predicted_rate": value_for("predicted_rate", default=None),
-                "next_funding_time_ms": value_for("next_funding_time_ms", default=None),
-            }
-            snapshot = {k: v for k, v in snapshot.items() if v is not None}
-
-        # Enrich funding extreme section for FundingExtremeReversalStrategy.
-        if extreme is not None:
-            score = clamp01(
-                extreme.get(
-                    "score",
-                    value_for("extreme_score", "score", default=0.0),
-                )
-            )
-            confidence = clamp01(
-                extreme.get(
-                    "confidence",
-                    value_for("extreme_confidence", "confidence", default=score),
-                )
-            )
-
-            severity = clamp01(
-                extreme.get(
-                    "severity",
-                    extreme.get("strength", score),
-                )
-            )
-
-            extreme.setdefault("score", score)
-            extreme.setdefault("confidence", confidence)
-            extreme.setdefault("severity", severity)
-
-            funding_rate = to_float(
-                extreme.get(
-                    "funding_rate",
-                    value_for("funding_rate", default=None),
-                ),
-                default=0.0,
-            )
-
-            if not extreme.get("extreme_type") and not extreme.get("type"):
-                regime_label = str(
-                    (regime or {}).get("regime")
-                    or (regime or {}).get("state")
-                    or ""
-                ).strip().lower()
-
-                if "negative" in regime_label or funding_rate < 0:
-                    extreme.setdefault("extreme_type", "negative_extreme")
-                    extreme.setdefault("type", "negative_extreme")
-                elif "positive" in regime_label or funding_rate > 0:
-                    extreme.setdefault("extreme_type", "positive_extreme")
-                    extreme.setdefault("type", "positive_extreme")
-
-            detected = section_detected(extreme)
-            if detected:
-                # These are contract adapter fields, not new trading logic.
-                # Analytics already declared an extreme; strategy expects these keys.
-                extreme.setdefault(
-                    "mean_reversion_probability",
-                    max(score, confidence, severity),
-                )
-                extreme.setdefault(
-                    "reversion_probability",
-                    extreme["mean_reversion_probability"],
-                )
-                extreme.setdefault(
-                    "reversal_probability",
-                    extreme["mean_reversion_probability"],
-                )
-                extreme.setdefault(
-                    "squeeze_probability",
-                    clamp01(
-                        extreme.get(
-                            "squeeze_probability",
-                            value_for("squeeze_probability", default=0.0),
-                        )
-                    ),
-                )
-                extreme.setdefault(
-                    "reversal_risk",
-                    extreme["mean_reversion_probability"] >= 0.5,
-                )
-                extreme.setdefault(
-                    "mean_reversion_risk",
-                    extreme["mean_reversion_probability"] >= 0.5,
-                )
-
-        if divergence is not None:
-            divergence.setdefault(
-                "score",
-                value_for("divergence_score", "score", default=divergence.get("score", 0.0)),
-            )
-            divergence.setdefault(
-                "confidence",
-                value_for(
-                    "divergence_confidence",
-                    "confidence",
-                    default=divergence.get("confidence", 0.0),
-                ),
-            )
-            divergence.setdefault(
-                "side",
-                value_for("side", "direction", "bias", default=divergence.get("side")),
-            )
-            divergence.setdefault(
-                "direction",
-                value_for("direction", "side", "bias", default=divergence.get("direction")),
-            )
-
-        set_aliases("snapshot", ("funding_snapshot",), snapshot or None)
-        set_aliases("statistics", ("stats", "funding_statistics"), statistics)
-        set_aliases("regime", ("regime_state", "funding_regime"), regime)
-        set_aliases("pressure", ("pressure_state", "funding_pressure"), pressure)
-
-        if section_detected(extreme):
-            set_aliases("extreme", ("extreme_event", "funding_extreme"), extreme)
-
-        if section_detected(divergence):
-            set_aliases("divergence", ("divergence_event", "funding_divergence"), divergence)
-
-        if section_detected(flip):
-            set_aliases("flip", ("flip_event", "funding_flip"), flip)
-
-        if signal:
-            set_aliases("signal", ("funding_signal",), signal)
-
-        domain_data.setdefault("raw", dict(payload))
+        if "snapshot" not in domain_data:
+            domain_data["snapshot"] = dict(payload)
 
     def _augment_orderflow_domain_data(
             self,
@@ -750,26 +553,14 @@ class SignalNormalizer(BaseStrategyComponent):
             domain_data: dict[str, Any],
     ) -> None:
         """
-        Add stable open-interest domain aliases expected by
-        strategy/strategies/open_interest/*.
+        Normalize analytics.oi/open_interest payloads into the stable
+        open-interest StrategyContext contract.
 
-        This method does not detect OI regimes/anomalies/divergences by itself.
-        It only adapts analytics.oi.* payload shapes into the StrategyContext
-        contract consumed by OpenInterestTradingStrategy:
-
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["analysis"]
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["features"]
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["regime"]
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["divergence"]
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["anomaly"]
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["snapshot"]
-            context.domain_dict(FeatureSource.OPEN_INTEREST)["market_context"]
-
-        Supported input shapes:
-            - full analytics payload with analysis/features/regime/divergence/anomaly
-            - event-specific payload with regime_result/divergence_result/anomaly_result
-            - flat payload with oi_delta_pct, anomaly_type, divergence_type, etc.
-            - payload["feature_map"] carrying the same flat/nested data
+        This is a contract adapter only:
+        - it exposes analytics-provided sections under stable aliases;
+        - it enriches flat OI payloads into the "features" section;
+        - it does NOT synthesize anomaly/divergence sections unless analytics
+          actually supplied a detected anomaly/divergence context.
         """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
@@ -779,11 +570,11 @@ class SignalNormalizer(BaseStrategyComponent):
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
             return None
 
@@ -795,11 +586,50 @@ class SignalNormalizer(BaseStrategyComponent):
                     return feature_map[key]
             return default
 
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "y", "on", "detected", "active", "confirmed"}:
+                    return True
+                if normalized in {"0", "false", "no", "n", "off", "none", "not_detected"}:
+                    return False
+            if isinstance(value, (int, float)):
+                return bool(value)
+            return default
+
+        def section_detected(section: dict[str, Any] | None) -> bool:
+            if not section:
+                return False
+
+            detected = section.get("detected", section.get("is_detected", None))
+            if detected is None:
+                # A typed nested section without explicit detected flag is
+                # considered present/actionable by the strategy-specific parser.
+                return True
+
+            return to_bool(detected, default=False)
+
         def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None) -> None:
             if value is None:
                 return
 
-            domain_data.setdefault(target, value)
+            # Canonical OI sections must override raw/flat fields already
+            # copied from analytics payload. Otherwise concrete OI strategies
+            # read lower-case / partial raw sections and fail payload resolution.
+            domain_data[target] = value
             for alias in aliases:
                 domain_data.setdefault(alias, value)
 
@@ -845,82 +675,44 @@ class SignalNormalizer(BaseStrategyComponent):
             "open_interest_anomaly",
         )
 
-        # If a full analysis object is present, expose its nested pieces too.
         if analysis is not None:
             nested_snapshot = analysis.get("snapshot")
             nested_context = (
-                    analysis.get("context")
-                    or analysis.get("market_context")
-                    or analysis.get("oi_context")
+                analysis.get("context")
+                or analysis.get("market_context")
+                or analysis.get("oi_context")
             )
             nested_features = analysis.get("features")
             nested_regime = (
-                    analysis.get("regime")
-                    or analysis.get("regime_result")
-                    or analysis.get("oi_regime")
+                analysis.get("regime")
+                or analysis.get("regime_result")
+                or analysis.get("oi_regime")
             )
             nested_divergence = (
-                    analysis.get("divergence")
-                    or analysis.get("divergence_result")
-                    or analysis.get("oi_divergence")
+                analysis.get("divergence")
+                or analysis.get("divergence_result")
+                or analysis.get("oi_divergence")
             )
             nested_anomaly = (
-                    analysis.get("anomaly")
-                    or analysis.get("anomaly_result")
-                    or analysis.get("oi_anomaly")
+                analysis.get("anomaly")
+                or analysis.get("anomaly_result")
+                or analysis.get("oi_anomaly")
             )
 
             if isinstance(nested_snapshot, dict) and snapshot is None:
-                snapshot = nested_snapshot
+                snapshot = dict(nested_snapshot)
             if isinstance(nested_context, dict) and market_context is None:
-                market_context = nested_context
+                market_context = dict(nested_context)
             if isinstance(nested_features, dict) and features is None:
-                features = nested_features
+                features = dict(nested_features)
             if isinstance(nested_regime, dict) and regime is None:
-                regime = nested_regime
+                regime = dict(nested_regime)
             if isinstance(nested_divergence, dict) and divergence is None:
-                divergence = nested_divergence
+                divergence = dict(nested_divergence)
             if isinstance(nested_anomaly, dict) and anomaly is None:
-                anomaly = nested_anomaly
+                anomaly = dict(nested_anomaly)
 
-        set_aliases(
-            "analysis",
-            ("oi_analysis", "open_interest_analysis", "result"),
-            analysis,
-        )
-        set_aliases(
-            "snapshot",
-            ("oi_snapshot", "open_interest_snapshot"),
-            snapshot,
-        )
-        set_aliases(
-            "market_context",
-            ("context", "oi_context", "open_interest_context"),
-            market_context,
-        )
-        set_aliases(
-            "features",
-            ("oi_features", "open_interest_features"),
-            features,
-        )
-        set_aliases(
-            "regime",
-            ("regime_result", "oi_regime", "open_interest_regime", "new_regime"),
-            regime,
-        )
-        set_aliases(
-            "divergence",
-            ("divergence_result", "oi_divergence", "open_interest_divergence"),
-            divergence,
-        )
-        set_aliases(
-            "anomaly",
-            ("anomaly_result", "oi_anomaly", "open_interest_anomaly"),
-            anomaly,
-        )
-
-        # Build strategy-friendly fallback features from flat analytics payload.
-        if "features" not in domain_data:
+        if features is None:
             has_feature_like_values = any(
                 key in payload or key in feature_map
                 for key in (
@@ -944,132 +736,336 @@ class SignalNormalizer(BaseStrategyComponent):
             )
 
             if has_feature_like_values:
-                domain_data["features"] = {
-                    "oi": value_for("oi", "open_interest"),
-                    "open_interest": value_for("open_interest", "oi"),
-                    "open_interest_value": value_for("open_interest_value"),
-                    "oi_delta": value_for("oi_delta"),
-                    "oi_delta_pct": value_for("oi_delta_pct"),
-                    "oi_direction": value_for("oi_direction"),
-                    "oi_acceleration": value_for("oi_acceleration"),
-                    "price_delta_pct": value_for("price_delta_pct"),
-                    "volume_ratio": value_for("volume_ratio"),
-                    "oi_zscore": value_for("oi_zscore"),
-                    "oi_pressure_score": value_for("oi_pressure_score"),
-                    "funding_rate": value_for("funding_rate"),
+                features = {
+                    "oi": value_for("oi", "open_interest", default=None),
+                    "open_interest": value_for("open_interest", "oi", default=None),
+                    "open_interest_value": value_for("open_interest_value", default=None),
+                    "oi_delta": value_for("oi_delta", default=None),
+                    "oi_delta_pct": value_for("oi_delta_pct", default=None),
+                    "oi_direction": value_for("oi_direction", default=None),
+                    "oi_acceleration": value_for("oi_acceleration", default=None),
+                    "price_delta_pct": value_for("price_delta_pct", default=None),
+                    "volume_ratio": value_for("volume_ratio", default=None),
+                    "oi_zscore": value_for("oi_zscore", default=None),
+                    "oi_pressure_score": value_for("oi_pressure_score", default=None),
+                    "funding_rate": value_for("funding_rate", default=None),
                     "liquidation_pressure": value_for(
                         "liquidation_pressure",
                         "liquidation_imbalance",
+                        default=None,
                     ),
                     "liquidation_imbalance": value_for(
                         "liquidation_imbalance",
                         "liquidation_pressure",
+                        default=None,
                     ),
                     "aggressive_flow_imbalance": value_for(
                         "aggressive_flow_imbalance",
+                        default=None,
                     ),
-                    "oi_price_efficiency": value_for("oi_price_efficiency"),
+                    "oi_price_efficiency": value_for(
+                        "oi_price_efficiency",
+                        default=None,
+                    ),
                 }
+                features = {key: value for key, value in features.items() if value is not None}
 
-        if "regime" not in domain_data:
+        if regime is None:
             regime_value = value_for(
                 "regime",
                 "oi_regime",
                 "market_regime",
                 "new_regime",
+                "regime_type",
+                default=None,
             )
             if regime_value is not None:
-                domain_data["regime"] = {
+                regime = {
                     "regime": regime_value,
-                    "confidence": value_for(
-                        "regime_confidence",
-                        "confidence",
-                        default=0.0,
-                    ),
+                    "confidence": value_for("regime_confidence", "confidence", default=0.0),
                     "score": value_for("regime_score", "score", default=0.0),
                     "reasons": value_for("regime_reasons", "reasons", default=[]),
                 }
 
-        if "divergence" not in domain_data:
+        # Only synthesize divergence/anomaly from flat fields when analytics
+        # clearly marked this event as the corresponding setup.
+        if divergence is None:
             divergence_type = value_for(
                 "divergence_type",
                 "price_oi_divergence",
+                default=None,
             )
             divergence_detected = value_for(
                 "divergence_detected",
                 "is_divergence",
-                "divergence",
                 default=None,
             )
-
-            if divergence_type is not None or divergence_detected is not None:
-                domain_data["divergence"] = {
-                    "detected": bool(
-                        True if divergence_detected is None else divergence_detected
-                    ),
+            is_divergence_topic = (
+                ".divergence" in topic
+                or topic.endswith("divergence")
+                or topic.endswith("oi.divergence")
+                or topic.endswith("open_interest.divergence")
+            )
+            if divergence_type is None and is_divergence_topic:
+                raw_side = str(value_for("side", "direction", "bias", default="")).strip().lower()
+                if raw_side in {"long", "bullish", "buy", "up"}:
+                    divergence_type = "bullish"
+                elif raw_side in {"short", "bearish", "sell", "down"}:
+                    divergence_type = "bearish"
+                else:
+                    divergence_type = "bullish" if float(value_for("score", default=0.0) or 0.0) >= 0 else "bearish"
+            if divergence_type is not None or to_bool(divergence_detected, default=False) or is_divergence_topic:
+                divergence = {
+                    "detected": to_bool(divergence_detected, default=True),
                     "divergence_type": divergence_type,
-                    "confidence": value_for(
-                        "divergence_confidence",
-                        "confidence",
-                        default=0.0,
+                    "price_oi_divergence": value_for(
+                        "price_oi_divergence",
+                        default=divergence_type,
                     ),
+                    "side": value_for("side", "direction", "bias", default=None),
+                    "direction": value_for("direction", "side", "bias", default=None),
+                    "confidence": value_for("divergence_confidence", "confidence", default=0.0),
                     "score": value_for("divergence_score", "score", default=0.0),
-                    "window_size": value_for("divergence_window_size", "window_size"),
-                    "reasons": value_for(
-                        "divergence_reasons",
-                        "reasons",
-                        default=[],
-                    ),
+                    "window_size": value_for("divergence_window_size", "window_size", default=None),
+                    "reasons": value_for("divergence_reasons", "reasons", default=[]),
                 }
 
-        if "anomaly" not in domain_data:
-            anomaly_type = value_for("anomaly_type")
+        if anomaly is None:
+            anomaly_type = value_for("anomaly_type", default=None)
             anomaly_detected = value_for(
                 "anomaly_detected",
                 "is_anomaly",
-                "anomaly",
-                "capitulation",
-                "squeeze_setup",
                 default=None,
             )
-
-            if anomaly_type is not None or anomaly_detected is not None:
-                domain_data["anomaly"] = {
-                    "detected": bool(
-                        True if anomaly_detected is None else anomaly_detected
+            capitulation = value_for("capitulation", default=None)
+            squeeze_setup = value_for("squeeze_setup", default=None)
+            if (
+                anomaly_type is not None
+                or to_bool(anomaly_detected, default=False)
+                or to_bool(capitulation, default=False)
+                or to_bool(squeeze_setup, default=False)
+            ):
+                anomaly = {
+                    "detected": to_bool(
+                        anomaly_detected,
+                        default=anomaly_type is not None
+                        or to_bool(capitulation, default=False)
+                        or to_bool(squeeze_setup, default=False),
                     ),
                     "anomaly_type": anomaly_type,
-                    "confidence": value_for(
-                        "anomaly_confidence",
-                        "confidence",
-                        default=0.0,
-                    ),
+                    "confidence": value_for("anomaly_confidence", "confidence", default=0.0),
                     "score": value_for("anomaly_score", "score", default=0.0),
-                    "strength": value_for(
-                        "anomaly_strength",
-                        "strength",
-                        default=value_for("score", default=0.0),
-                    ),
-                    "capitulation": bool(value_for("capitulation", default=False)),
-                    "capitulation_score": value_for(
-                        "capitulation_score",
-                        default=value_for("score", default=0.0),
-                    ),
-                    "squeeze_setup": bool(value_for("squeeze_setup", default=False)),
-                    "squeeze_score": value_for(
-                        "squeeze_score",
-                        default=value_for("score", default=0.0),
-                    ),
+                    "strength": value_for("anomaly_strength", "strength", default=value_for("score", default=0.0)),
+                    "capitulation": capitulation,
+                    "capitulation_score": value_for("capitulation_score", default=None),
+                    "squeeze_setup": squeeze_setup,
+                    "squeeze_score": value_for("squeeze_score", default=None),
                     "liquidation_imbalance": value_for(
                         "liquidation_imbalance",
                         "liquidation_pressure",
+                        default=None,
                     ),
                     "reasons": value_for("anomaly_reasons", "reasons", default=[]),
                 }
 
-        # Keep a full raw fallback for debugging / metadata, but do not overwrite
-        # canonical nested contracts above.
+
+        if isinstance(divergence, dict):
+            divergence_type = (
+                divergence.get("divergence_type")
+                or divergence.get("type")
+                or divergence.get("price_oi_divergence")
+            )
+            if divergence_type is not None:
+                divergence.setdefault("divergence_type", divergence_type)
+                divergence.setdefault("type", divergence_type)
+            divergence.setdefault("detected", True)
+            divergence.setdefault("is_detected", divergence.get("detected", True))
+            divergence.setdefault("confidence", value_for("divergence_confidence", "confidence", default=0.0))
+            divergence.setdefault("score", value_for("divergence_score", "score", default=divergence.get("confidence", 0.0)))
+            divergence.setdefault("reasons", value_for("divergence_reasons", "reasons", default=[]))
+
+        if isinstance(anomaly, dict):
+            anomaly_type = (
+                anomaly.get("anomaly_type")
+                or anomaly.get("type")
+            )
+            if anomaly_type is not None:
+                anomaly.setdefault("anomaly_type", anomaly_type)
+                anomaly.setdefault("type", anomaly_type)
+            anomaly.setdefault("is_detected", anomaly.get("detected", False))
+            anomaly.setdefault("confidence", value_for("anomaly_confidence", "confidence", default=0.0))
+            anomaly.setdefault("score", value_for("anomaly_score", "score", default=anomaly.get("confidence", 0.0)))
+            anomaly.setdefault("reasons", value_for("anomaly_reasons", "reasons", default=[]))
+
+
+
+        def enum_label(value: Any) -> str | None:
+            if value is None:
+                return None
+            raw = getattr(value, "value", value)
+            text = str(raw).strip()
+            if not text:
+                return None
+            return text.upper().replace("-", "_").replace(" ", "_")
+
+        def normalize_oi_direction(value: Any) -> str | None:
+            text = enum_label(value)
+            if text in {"LONG", "BUY", "BULL", "BULLISH", "UP", "UPTREND"}:
+                return "UP"
+            if text in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN", "DOWNTREND"}:
+                return "DOWN"
+            if text in {"FLAT", "SIDEWAYS", "NEUTRAL"}:
+                return "FLAT"
+            return text
+
+        def normalize_divergence_type(value: Any, *, fallback_side: Any = None) -> str:
+            text = enum_label(value)
+            if text in {None, "", "NONE", "UNKNOWN"}:
+                side_text = enum_label(fallback_side)
+                if side_text in {"LONG", "BUY", "BULL", "BULLISH", "UP"}:
+                    return "BULLISH"
+                if side_text in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN"}:
+                    return "BEARISH"
+                return "NONE"
+            if text in {"LONG", "BUY", "BULL", "UP"}:
+                return "BULLISH"
+            if text in {"SHORT", "SELL", "BEAR", "DOWN"}:
+                return "BEARISH"
+            return text
+
+        def normalize_anomaly_type(value: Any) -> str:
+            text = enum_label(value)
+            if text in {None, "", "NONE", "UNKNOWN"}:
+                return "NONE"
+            if text in {"SPIKE", "OI_SPIKE", "OPEN_INTEREST_SPIKE"}:
+                return "OI_SPIKE"
+            if text in {"COLLAPSE", "OI_COLLAPSE", "OPEN_INTEREST_COLLAPSE"}:
+                return "OI_COLLAPSE"
+            return text
+
+        def normalize_regime(value: Any) -> str:
+            text = enum_label(value)
+            if text in {None, "", "UNKNOWN"}:
+                return "NEUTRAL"
+            mapping = {
+                "EXPANSION": "TREND_CONFIRMATION",
+                "OI_EXPANSION": "TREND_CONFIRMATION",
+                "TRENDING": "TREND_CONFIRMATION",
+                "BUILDUP": "LONG_BUILDUP",
+                "LONG": "LONG_BUILDUP",
+                "SHORT": "SHORT_BUILDUP",
+                "CONTRACTION": "NEUTRAL",
+                "RANGE": "NEUTRAL",
+                "RANGING": "NEUTRAL",
+                "EXTREME_NEGATIVE": "CAPITULATION",
+                "EXTREME_POSITIVE": "OVERHEATED",
+            }
+            return mapping.get(text, text)
+
+        def normalize_oi_section(section: dict[str, Any] | None, kind: str) -> dict[str, Any] | None:
+            if section is None:
+                return None
+
+            result = dict(section)
+            if kind == "divergence":
+                result["detected"] = to_bool(
+                    result.get("detected", result.get("is_detected", True)),
+                    default=True,
+                )
+                result["divergence_type"] = normalize_divergence_type(
+                    result.get("divergence_type")
+                    or result.get("type")
+                    or result.get("price_oi_divergence"),
+                    fallback_side=result.get("side") or result.get("direction") or payload.get("side") or payload.get("direction"),
+                )
+                result.setdefault("type", result["divergence_type"])
+                result.setdefault("is_detected", result["detected"])
+                result.setdefault("confidence", value_for("divergence_confidence", "confidence", default=0.0))
+                result.setdefault("score", value_for("divergence_score", "score", default=result.get("confidence", 0.0)))
+                result.setdefault("window_size", value_for("divergence_window_size", "window_size", default=None))
+                result.setdefault("reasons", value_for("divergence_reasons", "reasons", default=[]))
+
+            elif kind == "anomaly":
+                result["detected"] = to_bool(
+                    result.get("detected", result.get("is_detected", True)),
+                    default=True,
+                )
+                result["anomaly_type"] = normalize_anomaly_type(
+                    result.get("anomaly_type") or result.get("type")
+                )
+                result.setdefault("type", result["anomaly_type"])
+                result.setdefault("is_detected", result["detected"])
+                result.setdefault("strength", enum_label(result.get("strength")) or "MEDIUM")
+                result.setdefault("confidence", value_for("anomaly_confidence", "confidence", default=0.0))
+                result.setdefault("score", value_for("anomaly_score", "score", default=result.get("confidence", 0.0)))
+                result.setdefault("reasons", value_for("anomaly_reasons", "reasons", default=[]))
+
+            elif kind == "regime":
+                result["regime"] = normalize_regime(
+                    result.get("regime")
+                    or result.get("regime_type")
+                    or result.get("type")
+                    or result.get("state")
+                )
+                result.setdefault("confidence", value_for("regime_confidence", "confidence", default=0.0))
+                result.setdefault("score", value_for("regime_score", "score", default=result.get("confidence", 0.0)))
+                result.setdefault("reasons", value_for("regime_reasons", "reasons", default=[]))
+
+            elif kind == "features":
+                result.setdefault("oi", value_for("oi", "open_interest", default=result.get("open_interest")))
+                result.setdefault("open_interest", value_for("open_interest", "oi", default=result.get("oi")))
+                result.setdefault("oi_direction", normalize_oi_direction(result.get("oi_direction") or payload.get("oi_direction") or payload.get("direction")))
+                result.setdefault("price_direction", normalize_oi_direction(result.get("price_direction") or payload.get("price_direction")))
+
+            return result
+
+        divergence = normalize_oi_section(divergence, "divergence")
+        anomaly = normalize_oi_section(anomaly, "anomaly")
+        regime = normalize_oi_section(regime, "regime")
+        features = normalize_oi_section(features, "features")
+
+        set_aliases(
+            "analysis",
+            ("oi_analysis", "open_interest_analysis", "result"),
+            analysis,
+        )
+        set_aliases(
+            "snapshot",
+            ("oi_snapshot", "open_interest_snapshot"),
+            snapshot,
+        )
+        set_aliases(
+            "market_context",
+            ("context", "oi_context", "open_interest_context"),
+            market_context,
+        )
+        set_aliases(
+            "features",
+            ("oi_features", "open_interest_features"),
+            features if features else None,
+        )
+        set_aliases(
+            "regime",
+            ("regime_result", "oi_regime", "open_interest_regime", "new_regime"),
+            regime,
+        )
+
+        if section_detected(divergence):
+            set_aliases(
+                "divergence",
+                ("divergence_result", "oi_divergence", "open_interest_divergence"),
+                divergence,
+            )
+
+        if section_detected(anomaly):
+            set_aliases(
+                "anomaly",
+                ("anomaly_result", "oi_anomaly", "open_interest_anomaly"),
+                anomaly,
+            )
+
         domain_data.setdefault("raw", dict(payload))
+
 
     def _augment_liquidations_domain_data(
             self,
@@ -1273,6 +1269,19 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Normalize analytics.price_action.* payloads into the stable
+        price-action domain contract consumed by concrete strategies.
+
+        Important:
+        - module sections are populated only when the payload actually belongs
+          to that module;
+        - event-specific payloads are wrapped into the shape expected by
+          concrete strategies, e.g. market_structure.last_break_event,
+          trend.last_signal, fair_value_gap.last_event;
+        - missing FVG/SR/Trend/MarketStructure sections are not synthesized,
+          preventing registry from routing incompatible strategies.
+        """
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -1281,11 +1290,11 @@ class SignalNormalizer(BaseStrategyComponent):
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
             return None
 
@@ -1297,175 +1306,576 @@ class SignalNormalizer(BaseStrategyComponent):
                     return feature_map[key]
             return default
 
-        state = mapping_for(
-            "state",
-            "composite",
-            "price_action",
-            "snapshot",
-            "result",
+        def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None) -> None:
+            if value is None:
+                return
+
+            # Canonical module keys must override the raw flat payload copied
+            # into domain_data earlier. Concrete strategies read these primary
+            # keys first, so setdefault() leaves stale flat views in place.
+            domain_data[target] = value
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def score_from(mapping: dict[str, Any] | None, default: float = 0.0) -> float:
+            raw = default
+            if mapping is not None:
+                raw = mapping.get("score", mapping.get("confidence", default))
+            try:
+                return max(0.0, min(1.0, float(raw)))
+            except (TypeError, ValueError):
+                return default
+
+        def trend_direction_for_strategy(value: Any) -> str | None:
+            raw = str(value or "").strip().lower()
+            if raw in {"long", "buy", "up", "uptrend", "bull", "bullish"}:
+                return "bullish"
+            if raw in {"short", "sell", "down", "downtrend", "bear", "bearish"}:
+                return "bearish"
+            if raw in {"neutral", "flat", "range", "ranging"}:
+                return "neutral"
+            return raw or None
+
+        def trend_regime_for_strategy(value: Any) -> str | None:
+            raw = str(value or "").strip().lower()
+            if raw in {"uptrend", "downtrend", "trend", "trending_up", "trending_down", "bullish", "bearish"}:
+                return "trending"
+            if raw in {"pullback", "retracement"}:
+                return "pullback"
+            if raw in {"consolidation", "consolidating", "range", "ranging"}:
+                return "consolidating"
+            if raw in {"reversal", "reversing"}:
+                return "reversing"
+            if raw in {"exhausted", "exhaustion"}:
+                return "exhausted"
+            return raw or None
+
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
         )
 
+        state = mapping_for("state", "composite", "price_action", "snapshot", "result")
         if state is not None:
             domain_data.setdefault("state", state)
             domain_data.setdefault("composite", state)
             domain_data.setdefault("price_action", state)
             domain_data.setdefault("snapshot", state)
 
-        for target, aliases in {
-            "market_structure": (
-                    "market_structure",
-                    "structure",
-                    "ms",
-            ),
-            "support_resistance": (
-                    "support_resistance",
-                    "sr",
-                    "levels",
-            ),
-            "fair_value_gap": (
-                    "fair_value_gap",
-                    "fvg",
-                    "fair_value_gaps",
-            ),
-            "trend": (
-                    "trend",
-                    "trend_state",
-            ),
-            "liquidity_levels": (
-                    "liquidity_levels",
-                    "liquidity",
-            ),
-        }.items():
-            value = mapping_for(*aliases)
+        market_structure = mapping_for("market_structure", "structure", "ms")
+        support_resistance = mapping_for("support_resistance", "sr", "levels")
+        fair_value_gap = mapping_for("fair_value_gap", "fvg", "fair_value_gaps")
+        trend = mapping_for("trend", "trend_state")
+        liquidity_levels = mapping_for("liquidity_levels", "liquidity")
 
-            if value is None and isinstance(state, dict):
-                for alias in aliases:
-                    nested = state.get(alias)
+        if isinstance(state, dict):
+            if market_structure is None:
+                market_structure = mapping_for("state.market_structure")
+                for key in ("market_structure", "structure", "ms"):
+                    nested = state.get(key)
                     if isinstance(nested, dict):
-                        value = nested
+                        market_structure = dict(nested)
+                        break
+            if support_resistance is None:
+                for key in ("support_resistance", "sr", "levels"):
+                    nested = state.get(key)
+                    if isinstance(nested, dict):
+                        support_resistance = dict(nested)
+                        break
+            if fair_value_gap is None:
+                for key in ("fair_value_gap", "fvg", "fair_value_gaps"):
+                    nested = state.get(key)
+                    if isinstance(nested, dict):
+                        fair_value_gap = dict(nested)
+                        break
+            if trend is None:
+                for key in ("trend", "trend_state"):
+                    nested = state.get(key)
+                    if isinstance(nested, dict):
+                        trend = dict(nested)
+                        break
+            if liquidity_levels is None:
+                for key in ("liquidity_levels", "liquidity"):
+                    nested = state.get(key)
+                    if isinstance(nested, dict):
+                        liquidity_levels = dict(nested)
                         break
 
-            if value is not None:
-                domain_data.setdefault(target, value)
-                for alias in aliases:
-                    domain_data.setdefault(alias, value)
-
-        # Event-specific fallbacks for analytics.price_action.<module>.<event>
         event_payload = dict(payload)
+        event_payload.setdefault("timestamp", value_for("timestamp", "event_time", default=None))
+        event_payload.setdefault("price", value_for("price", "current_price", "last_price", "close", default=None))
+        event_payload.setdefault("confidence", value_for("confidence", default=0.0))
+        event_payload.setdefault("score", value_for("score", default=event_payload.get("confidence", 0.0)))
 
-        topic = (
-            str(payload.get("event_name") or payload.get("topic") or "")
-            .strip()
-            .lower()
-        )
-
-        if "market_structure" not in domain_data and (
-                "market_structure" in topic
-                or any(
-            key in payload
-            for key in (
+        # Event-specific fallback: market structure events.
+        is_market_structure_event = (
+            "market_structure" in topic
+            or ".structure" in topic
+            or any(
+                key in payload
+                for key in (
                     "swing_type",
-                    "event_type",
                     "break_distance_pct",
                     "market_bias",
-                    "bias",
+                    "broken_side",
                     "mtf_alignment",
+                )
             )
         )
-        ):
-            domain_data["market_structure"] = event_payload
-            domain_data.setdefault("structure", event_payload)
+        if market_structure is None and is_market_structure_event:
+            event_type = value_for("event_type", "type", "kind", default=None)
+            if event_type is None:
+                if ".bos" in topic or topic.endswith("bos"):
+                    event_type = "bos"
+                elif ".choch" in topic:
+                    event_type = "choch"
+                elif ".mss" in topic:
+                    event_type = "mss"
+            side = value_for("side", "direction", "bias", default=None)
+            bias = value_for("market_bias", "bias", "direction", default=side)
+            event_payload.setdefault("event_type", event_type)
+            event_payload.setdefault("side", side)
+            event_payload.setdefault("direction", side)
+            event_payload.setdefault("market_bias", bias)
+            event_payload.setdefault("confirmed", True)
+            market_structure = {
+                "last_break_event": event_payload,
+                "last_event": event_payload,
+                "event": event_payload,
+                "external": {
+                    "last_break_event": event_payload,
+                    "last_event": event_payload,
+                    "bias": bias,
+                    "market_bias": bias,
+                    "confidence": event_payload.get("confidence", 0.0),
+                    "score": event_payload.get("score", 0.0),
+                    "strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                    "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                },
+                "internal": {
+                    "bias": bias,
+                    "market_bias": bias,
+                    "confidence": event_payload.get("confidence", 0.0),
+                    "score": event_payload.get("score", 0.0),
+                },
+                "mtf_alignment": value_for("mtf_alignment", "alignment", default=event_payload.get("score", 0.0)),
+                "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
+            }
 
-        if "support_resistance" not in domain_data and (
-                "support_resistance" in topic
-                or any(
-            key in payload
-            for key in (
+        # Event-specific fallback: support/resistance reactions.
+        is_sr_event = (
+            "support_resistance" in topic
+            or topic.endswith(".sr")
+            or ".sr." in topic
+            or any(
+                key in payload
+                for key in (
                     "level_type",
                     "level_status",
                     "level_price",
                     "touch_count",
                     "reaction_count",
                     "break_count",
+                )
             )
         )
-        ):
-            domain_data["support_resistance"] = event_payload
-            domain_data.setdefault("sr", event_payload)
+        if support_resistance is None and is_sr_event:
+            event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="reaction"))
+            event_payload.setdefault("confirmed", True)
+            level = {
+                **event_payload,
+                "price": value_for("level_price", "level", "price", "current_price", "close", default=None),
+                "level_type": value_for("level_type", "type", default=None),
+                "strength": value_for("strength", "score", "confidence", default=0.0),
+                "confidence": event_payload.get("confidence", 0.0),
+                "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                "touch_count": value_for("touch_count", "touches", default=1),
+                "is_active": True,
+            }
+            support_resistance = {
+                "last_event": event_payload,
+                "event": event_payload,
+                "nearest_support": level if str(level.get("level_type", "")).lower() == "support" else None,
+                "nearest_resistance": level if str(level.get("level_type", "")).lower() == "resistance" else None,
+                "external": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
+                "internal": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
+            }
 
-        if "fair_value_gap" not in domain_data and (
-                "fair_value_gap" in topic
-                or ".fvg_" in topic
-                or "fvg" in topic
-                or any(
-            key in payload
-            for key in (
+        # Event-specific fallback: FVG reactions.
+        is_fvg_event = (
+            "fair_value_gap" in topic
+            or "fvg" in topic
+            or any(
+                key in payload
+                for key in (
                     "fvg_direction",
                     "gap_size_pct",
                     "fill_pct",
                     "upper_price",
                     "lower_price",
                     "mid_price",
+                )
             )
         )
-        ):
-            domain_data["fair_value_gap"] = event_payload
-            domain_data.setdefault("fvg", event_payload)
+        if fair_value_gap is None and is_fvg_event:
+            event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="retest"))
+            event_payload.setdefault("confirmed", True)
+            gap = {
+                **event_payload,
+                "direction": value_for("direction", "fvg_direction", "side", default=None),
+                "status": value_for("status", "fvg_status", default="active"),
+                "upper_price": value_for("upper_price", "upper", "high", default=None),
+                "lower_price": value_for("lower_price", "lower", "low", default=None),
+                "mid_price": value_for("mid_price", "mid", default=None),
+                "strength": value_for("strength", "score", "confidence", default=0.0),
+                "confidence": event_payload.get("confidence", 0.0),
+                "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                "is_valid": True,
+            }
+            direction_label = str(gap.get("direction") or "").lower()
+            fair_value_gap = {
+                "last_event": event_payload,
+                "event": event_payload,
+                "nearest_bullish_gap": gap if "bull" in direction_label or direction_label == "long" else None,
+                "nearest_bearish_gap": gap if "bear" in direction_label or direction_label == "short" else None,
+                "external": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
+                "internal": {"last_event": event_payload, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
+            }
 
-        if "trend" not in domain_data and (
-                "trend" in topic
-                or any(
-            key in payload
-            for key in (
+        # Event-specific fallback: trend continuation/state events.
+        is_trend_event = (
+            "trend" in topic
+            or any(
+                key in payload
+                for key in (
                     "trend_direction",
                     "trend_regime",
                     "continuation_probability",
                     "reversal_risk",
                     "exhaustion_score",
                     "overall_trend_score",
+                )
             )
         )
-        ):
-            domain_data["trend"] = event_payload
+        if trend is None and is_trend_event:
+            event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="trend_alignment"))
+            raw_trend_direction = value_for("trend_direction", "direction", "side", default=None)
+            raw_trend_regime = value_for("trend_regime", "regime", "state", default=None)
+            normalized_trend_direction = trend_direction_for_strategy(raw_trend_direction)
+            normalized_trend_regime = trend_regime_for_strategy(raw_trend_regime or normalized_trend_direction)
+            event_payload["direction"] = normalized_trend_direction or event_payload.get("direction")
+            event_payload["trend_direction"] = normalized_trend_direction or event_payload.get("trend_direction")
+            event_payload["trend_regime"] = normalized_trend_regime or event_payload.get("trend_regime")
+            event_payload["regime"] = normalized_trend_regime or event_payload.get("regime")
+            event_payload.setdefault("continuation_probability", value_for("continuation_probability", "continuation_prob", "probability", default=event_payload.get("score", 0.0)))
+            event_payload.setdefault("confirmed", True)
+            layer = {
+                **event_payload,
+                "direction": trend_direction_for_strategy(event_payload.get("trend_direction") or event_payload.get("direction")),
+                "trend_direction": trend_direction_for_strategy(event_payload.get("trend_direction") or event_payload.get("direction")),
+                "regime": trend_regime_for_strategy(event_payload.get("trend_regime") or event_payload.get("regime")),
+                "trend_regime": trend_regime_for_strategy(event_payload.get("trend_regime") or event_payload.get("regime")),
+                "trend_strength": value_for("trend_strength", "strength", "score", default=event_payload.get("score", 0.0)),
+                "momentum_score": value_for("momentum_score", "momentum", default=event_payload.get("score", 0.0)),
+                "slope_score": value_for("slope_score", "slope", default=event_payload.get("score", 0.0)),
+                "continuation_probability": event_payload.get("continuation_probability"),
+                "confidence": event_payload.get("confidence", 0.0),
+                "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
+            }
+            trend = {
+                "last_signal": event_payload,
+                "last_event": event_payload,
+                "event": event_payload,
+                "external": layer,
+                "internal": layer,
+                "internal_external_alignment": value_for("internal_external_alignment", "alignment", default=event_payload.get("score", 0.0)),
+                "higher_timeframe_alignment": value_for("higher_timeframe_alignment", "htf_alignment", default=event_payload.get("score", 0.0)),
+                "overall_trend_score": value_for("overall_trend_score", "score", default=event_payload.get("score", 0.0)),
+            }
 
-        if "liquidity_levels" not in domain_data and (
-                "liquidity_levels" in topic
-                or any(
-            key in payload
-            for key in (
-                    "liquidity_touched",
-                    "liquidity_swept",
-                    "liquidity_reclaimed",
-                    "stop_run",
-                    "failed_breakout",
+
+        # Compatibility shape for concrete price_action strategies:
+        # Direct analytics event payloads often provide a flat module dict, while
+        # concrete strategies expect a module with external/internal layer views.
+        # Keep this in SignalNormalizer, not in concrete strategies.
+        if isinstance(market_structure, dict):
+            market_structure = self._ensure_price_action_market_structure_view(
+                module=market_structure,
+                event_payload=event_payload,
+                fallback_topic=topic,
             )
-        )
-        ):
-            domain_data["liquidity_levels"] = event_payload
+        if isinstance(trend, dict):
+            trend = self._ensure_price_action_trend_view(
+                module=trend,
+                event_payload=event_payload,
+                fallback_topic=topic,
+            )
 
-        current_price = value_for(
-            "current_price",
-            "price",
-            "last_price",
-            "close",
-            default=None,
-        )
+        set_aliases("market_structure", ("structure", "ms"), market_structure)
+        set_aliases("support_resistance", ("sr", "levels"), support_resistance)
+        set_aliases("fair_value_gap", ("fvg", "fair_value_gaps"), fair_value_gap)
+        set_aliases("trend", ("trend_state",), trend)
+        set_aliases("liquidity_levels", ("liquidity",), liquidity_levels)
+
+        current_price = value_for("current_price", "price", "last_price", "close", default=None)
         if current_price is not None:
             domain_data.setdefault("current_price", current_price)
             domain_data.setdefault("last_price", current_price)
             domain_data.setdefault("price", current_price)
 
-        timestamp_value = value_for(
-            "timestamp",
-            "event_time",
-            "updated_at",
-            "created_at",
-            default=None,
-        )
+        timestamp_value = value_for("timestamp", "event_time", "updated_at", "created_at", default=None)
         if timestamp_value is not None:
             domain_data.setdefault("timestamp", timestamp_value)
 
         domain_data.setdefault("raw", dict(payload))
+
+
+    @staticmethod
+    def _direction_to_long_short(value: Any) -> str | None:
+        text = str(value or "").strip().lower()
+        if text in {"long", "buy", "bull", "bullish", "up", "uptrend"}:
+            return "long"
+        if text in {"short", "sell", "bear", "bearish", "down", "downtrend"}:
+            return "short"
+        return None
+
+    def _ensure_price_action_market_structure_view(
+            self,
+            *,
+            module: dict[str, Any],
+            event_payload: dict[str, Any],
+            fallback_topic: str,
+    ) -> dict[str, Any]:
+        """
+        Convert a direct analytics.price_action.market_structure event into the
+        module/layer shape consumed by MarketStructureStrategy._extract_view().
+
+        The strategy expects select_primary_layer(module) to find an external or
+        internal layer and then read last_break_event / last_event from it.
+        Backtests often emit a flat event payload, so the adapter must wrap it.
+        """
+        result = dict(module)
+
+        event = dict(event_payload)
+        event.update({key: value for key, value in module.items() if key not in event})
+
+        event_type = (
+            event.get("event_type")
+            or event.get("type")
+            or event.get("kind")
+        )
+        if event_type is None:
+            topic = fallback_topic.lower()
+            if ".bos" in topic or topic.endswith("bos"):
+                event_type = "bos"
+            elif ".choch" in topic or topic.endswith("choch"):
+                event_type = "choch"
+            elif ".mss" in topic or topic.endswith("mss"):
+                event_type = "mss"
+        if event_type is not None:
+            event.setdefault("event_type", event_type)
+            result.setdefault("event_type", event_type)
+
+        side = (
+            self._direction_to_long_short(event.get("side"))
+            or self._direction_to_long_short(event.get("direction"))
+            or self._direction_to_long_short(event.get("market_bias"))
+            or self._direction_to_long_short(event.get("bias"))
+        )
+        if side is not None:
+            event.setdefault("side", side)
+            event.setdefault("direction", side)
+            result.setdefault("direction", side)
+
+        market_bias = event.get("market_bias") or event.get("bias") or side
+        if market_bias is not None:
+            event.setdefault("market_bias", market_bias)
+            event.setdefault("bias", market_bias)
+            result.setdefault("market_bias", market_bias)
+            result.setdefault("bias", market_bias)
+
+        confidence = event.get("confidence", result.get("confidence", 0.0))
+        score = event.get("score", result.get("score", confidence))
+        event.setdefault("confidence", confidence)
+        event.setdefault("score", score)
+        event.setdefault("confirmed", True)
+
+        layer = dict(result)
+        layer.update(
+            {
+                "bias": market_bias,
+                "market_bias": market_bias,
+                "direction": side or market_bias,
+                "confidence": confidence,
+                "score": score,
+                "strength": result.get("strength", score),
+                "trend_strength": result.get("trend_strength", score),
+                "alignment_score": result.get(
+                    "alignment_score",
+                    result.get("mtf_alignment_score", score),
+                ),
+                "last_break_event": result.get("last_break_event") or event,
+                "last_event": result.get("last_event") or event,
+            }
+        )
+
+        external_layer = dict(layer)
+        external_layer.setdefault("layer", "external")
+        external_layer.setdefault("structure_layer", "external")
+
+        internal_layer = dict(layer)
+        internal_layer.setdefault("layer", "internal")
+        internal_layer.setdefault("structure_layer", "internal")
+
+        result["external"] = external_layer
+        result["internal"] = internal_layer
+        result["primary_layer"] = external_layer
+        result["secondary_layer"] = internal_layer
+        result.setdefault("last_break_event", event)
+        result.setdefault("last_event", event)
+        result.setdefault("event", event)
+        result.setdefault("mtf_alignment_score", result.get("mtf_alignment_score", score))
+        result.setdefault("alignment_score", result.get("alignment_score", score))
+        result.setdefault("swing_progression_score", result.get("swing_progression_score", score))
+        result.setdefault("trend_strength", result.get("trend_strength", score))
+        return result
+
+    def _ensure_price_action_trend_view(
+            self,
+            *,
+            module: dict[str, Any],
+            event_payload: dict[str, Any],
+            fallback_topic: str,
+    ) -> dict[str, Any]:
+        """
+        Convert a direct analytics.price_action.trend event into the
+        external/internal layer shape consumed by TrendContinuationStrategy.
+        """
+        result = dict(module)
+
+        event = dict(event_payload)
+        event.update({key: value for key, value in module.items() if key not in event})
+
+        def normalize_trend_direction(value: Any) -> str | None:
+            text = str(value or "").strip().lower()
+            if text in {"long", "buy", "bull", "bullish", "up", "uptrend", "trending_up"}:
+                return "bullish"
+            if text in {"short", "sell", "bear", "bearish", "down", "downtrend", "trending_down"}:
+                return "bearish"
+            if text in {"neutral", "flat", "range", "ranging"}:
+                return "neutral"
+            return text or None
+
+        def normalize_trend_regime(value: Any, *, fallback_direction: str | None = None) -> str | None:
+            text = str(value or "").strip().lower()
+            if text in {"uptrend", "downtrend", "trend", "trending", "trending_up", "trending_down", "bullish", "bearish"}:
+                return "trending"
+            if text in {"pullback", "retracement"}:
+                return "pullback"
+            if text in {"consolidation", "consolidating", "range", "ranging"}:
+                return "consolidating"
+            if text in {"reversal", "reversing"}:
+                return "reversing"
+            if text in {"exhausted", "exhaustion"}:
+                return "exhausted"
+            if not text and fallback_direction in {"bullish", "bearish"}:
+                return "trending"
+            return text or None
+
+        direction = (
+            normalize_trend_direction(event.get("trend_direction"))
+            or normalize_trend_direction(event.get("direction"))
+            or normalize_trend_direction(event.get("side"))
+        )
+        if direction is not None:
+            # Use analytics.price_action TrendDirection enum values, not strategy sides.
+            event["direction"] = direction
+            event["trend_direction"] = direction
+            result["direction"] = direction
+            result["trend_direction"] = direction
+
+        regime = normalize_trend_regime(
+            event.get("trend_regime") or event.get("regime") or event.get("state"),
+            fallback_direction=direction,
+        )
+        if regime is not None:
+            # Use analytics.price_action TrendRegime enum values.
+            event["trend_regime"] = regime
+            event["regime"] = regime
+            result["trend_regime"] = regime
+            result["regime"] = regime
+
+        confidence = event.get("confidence", result.get("confidence", 0.0))
+        score = event.get("score", result.get("score", confidence))
+        continuation_probability = event.get(
+            "continuation_probability",
+            result.get("continuation_probability", result.get("continuation_prob", score)),
+        )
+        event.setdefault("confidence", confidence)
+        event.setdefault("score", score)
+        event.setdefault("continuation_probability", continuation_probability)
+        event.setdefault("confirmed", True)
+
+        topic = fallback_topic.lower()
+        event_type = event.get("event_type") or event.get("type") or event.get("kind")
+        if event_type is None:
+            if "alignment" in topic:
+                event_type = "trend_alignment"
+            elif "started" in topic:
+                event_type = "trend_started"
+            elif "reversal" in topic:
+                event_type = "trend_reversal"
+        if event_type is not None:
+            event.setdefault("event_type", event_type)
+
+        layer = dict(result)
+        layer.update(
+            {
+                "direction": direction,
+                "trend_direction": direction,
+                "regime": regime,
+                "trend_regime": regime,
+                "confidence": confidence,
+                "score": score,
+                "trend_strength": result.get("trend_strength", result.get("strength", score)),
+                "momentum_score": result.get("momentum_score", result.get("momentum", score)),
+                "slope_score": result.get("slope_score", result.get("slope", score)),
+                "continuation_probability": continuation_probability,
+                "reversal_risk": result.get("reversal_risk", 0.0),
+                "exhaustion_score": result.get("exhaustion_score", result.get("exhaustion", 0.0)),
+                "pullback_quality": result.get("pullback_quality", result.get("pullback_score", 0.0)),
+                "structure_score": result.get("structure_score", result.get("market_structure_score", score)),
+                "last_signal": result.get("last_signal") or event,
+                "last_event": result.get("last_event") or event,
+            }
+        )
+
+        external_layer = dict(layer)
+        external_layer.setdefault("layer", "external")
+        external_layer.setdefault("structure_layer", "external")
+
+        internal_layer = dict(layer)
+        internal_layer.setdefault("layer", "internal")
+        internal_layer.setdefault("structure_layer", "internal")
+
+        result["external"] = external_layer
+        result["internal"] = internal_layer
+        result["primary_layer"] = external_layer
+        result["secondary_layer"] = internal_layer
+        result.setdefault("last_signal", event)
+        result.setdefault("last_event", event)
+        result.setdefault("event", event)
+        result.setdefault("internal_external_alignment", result.get("internal_external_alignment", score))
+        result.setdefault("higher_timeframe_alignment", result.get("higher_timeframe_alignment", score))
+        result.setdefault("overall_trend_score", result.get("overall_trend_score", score))
+        return result
+
 
     def _augment_spoofing_domain_data(
             self,
@@ -2080,7 +2490,193 @@ class SignalNormalizer(BaseStrategyComponent):
                 domain_data=domain_data,
             )
 
+        self._ensure_common_domain_contract(
+            source=source,
+            payload=payload,
+            domain_data=domain_data,
+        )
         return domain_data
+
+    def _ensure_common_domain_contract(
+            self,
+            *,
+            source: FeatureSource,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        """
+        Add stable fields every concrete strategy can rely on.
+
+        Domain-specific adapters still own trading semantics. This method only
+        guarantees basic contract metadata and the original analytics payload
+        for diagnostics / fallback-free debugging.
+        """
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+            return default
+
+        contract = domain_data.setdefault("contract", {})
+        if isinstance(contract, dict):
+            contract.setdefault("version", "strategy-domain-v1")
+            contract.setdefault("source", source.value)
+            contract.setdefault("event_name", value_for("event_name", "topic", "source_topic"))
+
+        scope = domain_data.setdefault("scope", {})
+        if isinstance(scope, dict):
+            scope.setdefault("symbol", value_for("symbol", "instrument", "market"))
+            scope.setdefault("exchange", value_for("exchange", default="unknown"))
+            scope.setdefault("market_type", value_for("market_type", default="usdm_futures"))
+            scope.setdefault("timeframe", value_for("timeframe"))
+            scope.setdefault("exchange_symbol", value_for("exchange_symbol", "symbol", "instrument"))
+
+        domain_data.setdefault("raw", dict(payload))
+
+    def _build_cross_domain_contracts(
+            self,
+            *,
+            source: FeatureSource,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> dict[FeatureSource, dict[str, Any]]:
+        """Build non-primary StrategyContext domain contracts.
+
+        FeatureSource currently has no HYBRID member, so the canonical hybrid
+        view is stored under FeatureSource.SYSTEM using the stable key
+        ``hybrid``. Hybrid concrete strategies should read
+        ``context.domain_dict(FeatureSource.SYSTEM)["hybrid"]`` and native
+        source domains, never raw analytics payloads.
+        """
+        if source not in {
+            FeatureSource.OPEN_INTEREST,
+            FeatureSource.FUNDING,
+            FeatureSource.ORDERFLOW,
+            FeatureSource.LIQUIDITY,
+            FeatureSource.LIQUIDATIONS,
+            FeatureSource.WHALES,
+            FeatureSource.PRICE_ACTION,
+            FeatureSource.SPOOFING,
+            FeatureSource.SPREADS,
+        }:
+            return {}
+
+        hybrid = self._build_hybrid_domain_data(
+            source=source,
+            payload=payload,
+            domain_data=domain_data,
+        )
+        return {
+            FeatureSource.SYSTEM: {
+                "hybrid": hybrid,
+                "hybrid_contract": hybrid,
+                "hybrid.summary": hybrid.get("summary", {}),
+                "hybrid.votes": hybrid.get("votes", {}),
+                "hybrid.domains": hybrid.get("domains", {}),
+            }
+        }
+
+    def _build_hybrid_domain_data(
+            self,
+            *,
+            source: FeatureSource,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            for key in keys:
+                if key in payload:
+                    return payload[key]
+                if key in feature_map:
+                    return feature_map[key]
+                if key in domain_data:
+                    return domain_data[key]
+            return default
+
+        def flag_for(domain: str, expected: FeatureSource) -> bool:
+            explicit = value_for(f"hybrid.{domain}", domain, default=None)
+            if explicit is not None:
+                return _to_bool(explicit, default=False)
+            return source is expected
+
+        dominant_side = value_for(
+            "hybrid.dominant_side", "dominant_side", "side", "bias", "direction",
+            default="unknown",
+        )
+        alignment_score = _to_float(
+            value_for("hybrid.alignment_score", "alignment_score", "alignment", default=0.0),
+            0.0,
+        )
+        conflict_score = _to_float(
+            value_for("hybrid.conflict_score", "conflict_score", "conflict", default=0.0),
+            0.0,
+        )
+        confluence_score = _to_float(
+            value_for("hybrid.confluence_score", "confluence_score", "score", default=0.0),
+            0.0,
+        )
+        confidence = _to_float(
+            value_for("hybrid.confidence", "confidence", default=0.0),
+            0.0,
+        )
+
+        votes = value_for("hybrid.votes", "votes", default=None)
+        if not isinstance(votes, dict):
+            votes = {
+                "long": _to_int(value_for("long_votes", "bullish_votes", default=0), 0),
+                "short": _to_int(value_for("short_votes", "bearish_votes", default=0), 0),
+                "flat": _to_int(value_for("flat_votes", "neutral_votes", default=0), 0),
+                "total": _to_int(value_for("total_votes", default=0), 0),
+            }
+
+        domains = {
+            "orderflow": flag_for("orderflow", FeatureSource.ORDERFLOW),
+            "liquidity": flag_for("liquidity", FeatureSource.LIQUIDITY),
+            "liquidations": flag_for("liquidations", FeatureSource.LIQUIDATIONS),
+            "whales": flag_for("whales", FeatureSource.WHALES),
+            "open_interest": flag_for("open_interest", FeatureSource.OPEN_INTEREST),
+            "funding": flag_for("funding", FeatureSource.FUNDING),
+            "price_action": flag_for("price_action", FeatureSource.PRICE_ACTION),
+            "spoofing": flag_for("spoofing", FeatureSource.SPOOFING),
+            "spreads": flag_for("spreads", FeatureSource.SPREADS),
+        }
+
+        summary = {
+            "dominant_side": dominant_side,
+            "alignment_score": alignment_score,
+            "conflict_score": conflict_score,
+            "confluence_score": confluence_score,
+            "confidence": confidence,
+            "trigger_source": source.value,
+        }
+
+        return {
+            "contract": {
+                "version": "strategy-hybrid-v1",
+                "storage_source": FeatureSource.SYSTEM.value,
+                "trigger_source": source.value,
+            },
+            "summary": summary,
+            "dominant_side": dominant_side,
+            "alignment_score": alignment_score,
+            "conflict_score": conflict_score,
+            "confluence_score": confluence_score,
+            "confidence": confidence,
+            "votes": votes,
+            "domains": domains,
+            "source_domain": {source.value: dict(domain_data)},
+            "raw": dict(payload),
+        }
 
     def _build_hybrid_contract_features(
             self,
@@ -2214,16 +2810,30 @@ class SignalNormalizer(BaseStrategyComponent):
         ts = self._extract_timestamp(payload, timestamp)
         timeframe = self._extract_timeframe(payload)
 
-        domain_data = self._extract_domain_data(payload)
+        # Contract adapters need the EventBus topic to build the right
+        # canonical domain view. Many analytics payloads do not carry
+        # event_name/topic/source_topic inside payload, so inject it here
+        # without mutating the caller-owned payload.
+        payload_for_contract = dict(payload)
+        payload_for_contract.setdefault("event_name", event_name)
+        payload_for_contract.setdefault("topic", event_name)
+        payload_for_contract.setdefault("source_topic", event_name)
+
+        domain_data = self._extract_domain_data(payload_for_contract)
         domain_data = self._augment_domain_data_contracts(
             source=source,
-            payload=payload,
+            payload=payload_for_contract,
+            domain_data=domain_data,
+        )
+        extra_domain_data = self._build_cross_domain_contracts(
+            source=source,
+            payload=payload_for_contract,
             domain_data=domain_data,
         )
         features = self._extract_features(
             source=source,
             symbol=symbol,
-            payload=payload,
+            payload=payload_for_contract,
             timestamp=ts,
         )
 
@@ -2233,11 +2843,13 @@ class SignalNormalizer(BaseStrategyComponent):
             timestamp=ts,
             timeframe=timeframe,
             domain_data=domain_data,
+            extra_domain_data=extra_domain_data,
             features=features,
             metadata={
                 "event_name": event_name,
                 "raw_payload_keys": sorted(payload.keys()),
                 "features_count": len(features),
+                "extra_domain_sources": sorted(source.value for source in extra_domain_data),
                 "timeframe": timeframe.value,
             },
         )
@@ -2271,10 +2883,52 @@ class SignalNormalizer(BaseStrategyComponent):
         for key, value in normalized.domain_data.items():
             context.put_domain_feature(normalized.source, key, value)
 
+        for extra_source, values in normalized.extra_domain_data.items():
+            for key, value in values.items():
+                context.put_domain_feature(extra_source, key, value)
+
         for snapshot in normalized.features:
             context.put_feature(snapshot)
             if snapshot.freshness_seconds is not None:
                 context.freshness_map[snapshot.name] = snapshot.freshness_seconds
+
+        price_value = (
+            _to_float(normalized.domain_data.get("current_price"))
+            or _to_float(normalized.domain_data.get("last_price"))
+            or _to_float(normalized.domain_data.get("price"))
+            or _to_float(normalized.domain_data.get("close"))
+            or _to_float(normalized.metadata.get("price"))
+        )
+        if price_value is not None and price_value > 0:
+            bid = _to_float(normalized.domain_data.get("bid"))
+            ask = _to_float(normalized.domain_data.get("ask"))
+            mark_price = _to_float(normalized.domain_data.get("mark_price"))
+            index_price = _to_float(normalized.domain_data.get("index_price"))
+            spread_bps = _to_float(normalized.domain_data.get("spread_bps"))
+            try:
+                price_snapshot = PriceSnapshot(
+                    symbol=normalized.symbol,
+                    last_price=price_value,
+                    bid=bid,
+                    ask=ask,
+                    mark_price=mark_price,
+                    index_price=index_price,
+                    spread_bps=spread_bps,
+                    timestamp=normalized.timestamp,
+                    metadata={
+                        "source": self.component_name,
+                        "event_name": normalized.metadata.get("event_name"),
+                    },
+                )
+                price_snapshot.validate()
+                context.price = price_snapshot
+            except Exception as exc:
+                self.log_debug(
+                    "PriceSnapshot skipped during normalization",
+                    symbol=normalized.symbol,
+                    price=price_value,
+                    error=str(exc),
+                )
 
         context.metadata.setdefault("updated_by", self.component_name)
         context.metadata["last_source"] = normalized.source.value
@@ -3679,6 +4333,14 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        """
+        Build stable price-action contract features.
+
+        Unlike the old broad fallback, module-level features are emitted only
+        when a compatible section/event exists. This avoids routing FVG/SR/Trend
+        strategies from a pure market-structure event and then getting generic
+        no_signal_generated responses.
+        """
         result: list[FeatureSnapshot] = []
         confidence = payload.get("confidence", 0.0)
 
@@ -3686,84 +4348,17 @@ class SignalNormalizer(BaseStrategyComponent):
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
-            return {}
-
-        state = mapping_for(
-            "state",
-            "composite",
-            "price_action",
-            "snapshot",
-            "result",
-        )
-        market_structure = mapping_for(
-            "market_structure",
-            "structure",
-            "ms",
-        )
-        support_resistance = mapping_for(
-            "support_resistance",
-            "sr",
-            "levels",
-        )
-        fair_value_gap = mapping_for(
-            "fair_value_gap",
-            "fvg",
-            "fair_value_gaps",
-        )
-        trend = mapping_for(
-            "trend",
-            "trend_state",
-        )
-        liquidity_levels = mapping_for(
-            "liquidity_levels",
-            "liquidity",
-        )
-
-        if state:
-            if not market_structure:
-                for key in ("market_structure", "structure", "ms"):
-                    value = state.get(key)
-                    if isinstance(value, dict):
-                        market_structure = value
-                        break
-
-            if not support_resistance:
-                for key in ("support_resistance", "sr", "levels"):
-                    value = state.get(key)
-                    if isinstance(value, dict):
-                        support_resistance = value
-                        break
-
-            if not fair_value_gap:
-                for key in ("fair_value_gap", "fvg", "fair_value_gaps"):
-                    value = state.get(key)
-                    if isinstance(value, dict):
-                        fair_value_gap = value
-                        break
-
-            if not trend:
-                for key in ("trend", "trend_state"):
-                    value = state.get(key)
-                    if isinstance(value, dict):
-                        trend = value
-                        break
-
-            if not liquidity_levels:
-                for key in ("liquidity_levels", "liquidity"):
-                    value = state.get(key)
-                    if isinstance(value, dict):
-                        liquidity_levels = value
-                        break
+            return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -3771,17 +4366,21 @@ class SignalNormalizer(BaseStrategyComponent):
                     return payload[key]
                 if key in feature_map:
                     return feature_map[key]
-                if key in state:
+                if isinstance(state, dict) and key in state:
                     return state[key]
             return default
 
-        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        def nested_value(mapping: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
+            if not mapping:
+                return default
             for key in keys:
                 if key in mapping:
                     return mapping[key]
             return default
 
-        def add(name: str, value: Any) -> None:
+        def add(name: str, value: Any, *, section: str | None = None) -> None:
+            if value is None:
+                return
             result.append(
                 self._snapshot_from_raw_value(
                     source=FeatureSource.PRICE_ACTION,
@@ -3793,235 +4392,194 @@ class SignalNormalizer(BaseStrategyComponent):
                     metadata={
                         "origin": "contract_feature",
                         "contract": "price_action",
+                        **({"section": section} if section else {}),
                     },
                 )
             )
 
-        current_price = value_for(
-            "current_price",
-            "price",
-            "last_price",
-            "close",
-            default=None,
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
         )
 
-        # Composite / global
-        add("price_action.composite", state or payload)
-        add("price_action.current_price", current_price)
-        add(
-            "price_action.last_price",
-            value_for(
-                "last_price",
-                "price",
-                "close",
-                default=current_price,
-            ),
+        state = mapping_for("state", "composite", "price_action", "snapshot", "result")
+        market_structure = mapping_for("market_structure", "structure", "ms")
+        support_resistance = mapping_for("support_resistance", "sr", "levels")
+        fair_value_gap = mapping_for("fair_value_gap", "fvg", "fair_value_gaps")
+        trend = mapping_for("trend", "trend_state")
+        liquidity_levels = mapping_for("liquidity_levels", "liquidity")
+
+        if isinstance(state, dict):
+            for target_name, current, aliases in (
+                ("market_structure", market_structure, ("market_structure", "structure", "ms")),
+                ("support_resistance", support_resistance, ("support_resistance", "sr", "levels")),
+                ("fair_value_gap", fair_value_gap, ("fair_value_gap", "fvg", "fair_value_gaps")),
+                ("trend", trend, ("trend", "trend_state")),
+                ("liquidity_levels", liquidity_levels, ("liquidity_levels", "liquidity")),
+            ):
+                if current is not None:
+                    continue
+                for alias in aliases:
+                    nested = state.get(alias)
+                    if isinstance(nested, dict):
+                        if target_name == "market_structure":
+                            market_structure = dict(nested)
+                        elif target_name == "support_resistance":
+                            support_resistance = dict(nested)
+                        elif target_name == "fair_value_gap":
+                            fair_value_gap = dict(nested)
+                        elif target_name == "trend":
+                            trend = dict(nested)
+                        elif target_name == "liquidity_levels":
+                            liquidity_levels = dict(nested)
+                        break
+
+        event_payload = dict(payload)
+        current_price = value_for("current_price", "price", "last_price", "close", default=None)
+        if current_price is not None:
+            event_payload.setdefault("price", current_price)
+            event_payload.setdefault("current_price", current_price)
+        event_payload.setdefault("timestamp", value_for("timestamp", "event_time", default=timestamp))
+        event_payload.setdefault("confidence", value_for("confidence", default=0.0))
+        event_payload.setdefault("score", value_for("score", default=event_payload.get("confidence", 0.0)))
+
+        is_market_structure_event = (
+            market_structure is not None
+            or "market_structure" in topic
+            or ".structure" in topic
+            or any(key in payload for key in ("swing_type", "break_distance_pct", "market_bias", "broken_side", "mtf_alignment"))
         )
-        add(
-            "price_action.timestamp",
-            value_for(
-                "timestamp",
-                "event_time",
-                default=timestamp,
-            ),
+        is_sr_event = (
+            support_resistance is not None
+            or "support_resistance" in topic
+            or ".sr." in topic
+            or any(key in payload for key in ("level_type", "level_status", "level_price", "touch_count", "reaction_count", "break_count"))
+        )
+        is_fvg_event = (
+            fair_value_gap is not None
+            or "fair_value_gap" in topic
+            or "fvg" in topic
+            or any(key in payload for key in ("fvg_direction", "gap_size_pct", "fill_pct", "upper_price", "lower_price", "mid_price"))
+        )
+        is_trend_event = (
+            trend is not None
+            or "trend" in topic
+            or any(key in payload for key in ("trend_direction", "trend_regime", "continuation_probability", "reversal_risk", "exhaustion_score", "overall_trend_score"))
         )
 
-        # Market structure
-        add("price_action.market_structure", market_structure or payload)
-        add(
-            "price_action.market_structure.internal",
-            nested_value(
-                market_structure,
-                "internal",
-                default={},
-            ),
-        )
-        add(
-            "price_action.market_structure.external",
-            nested_value(
-                market_structure,
-                "external",
-                default={},
-            ),
-        )
-        add(
-            "price_action.market_structure.last_break_event",
-            nested_value(
-                market_structure,
-                "last_break_event",
-                "last_event",
-                "event",
-                default=value_for("last_break_event", "event", default=None),
-            ),
-        )
-        add(
-            "price_action.market_structure.mtf_alignment",
-            nested_value(
-                market_structure,
-                "mtf_alignment",
-                "multi_timeframe_alignment",
-                default=value_for("mtf_alignment", default=0.0),
-            ),
-        )
+        # Composite / global features are safe for all price-action payloads.
+        if state is not None or any((is_market_structure_event, is_sr_event, is_fvg_event, is_trend_event, liquidity_levels is not None)):
+            add("price_action.composite", state or payload, section="composite")
+        add("price_action.current_price", current_price, section="price")
+        add("price_action.last_price", value_for("last_price", "price", "close", default=current_price), section="price")
+        add("price_action.timestamp", value_for("timestamp", "event_time", default=timestamp), section="time")
 
-        # Support / resistance
-        add("price_action.support_resistance", support_resistance or payload)
-        add(
-            "price_action.support_resistance.internal",
-            nested_value(
-                support_resistance,
-                "internal",
-                default={},
-            ),
-        )
-        add(
-            "price_action.support_resistance.external",
-            nested_value(
-                support_resistance,
-                "external",
-                default={},
-            ),
-        )
-        add(
-            "price_action.support_resistance.last_event",
-            nested_value(
-                support_resistance,
-                "last_event",
-                "event",
-                default=value_for("last_event", "event", default=None),
-            ),
-        )
-        add(
-            "price_action.support_resistance.nearest_support",
-            nested_value(
-                support_resistance,
-                "nearest_support",
-                "support",
-                default=value_for("nearest_support", default=None),
-            ),
-        )
-        add(
-            "price_action.support_resistance.nearest_resistance",
-            nested_value(
-                support_resistance,
-                "nearest_resistance",
-                "resistance",
-                default=value_for("nearest_resistance", default=None),
-            ),
-        )
+        if is_market_structure_event:
+            if market_structure is None:
+                event_type = value_for("event_type", "type", "kind", default=None)
+                if event_type is None:
+                    if ".bos" in topic or topic.endswith("bos"):
+                        event_type = "bos"
+                    elif ".choch" in topic:
+                        event_type = "choch"
+                    elif ".mss" in topic:
+                        event_type = "mss"
+                side = value_for("side", "direction", "bias", default=None)
+                bias = value_for("market_bias", "bias", "direction", default=side)
+                event_payload.setdefault("event_type", event_type)
+                event_payload.setdefault("side", side)
+                event_payload.setdefault("direction", side)
+                event_payload.setdefault("market_bias", bias)
+                event_payload.setdefault("confirmed", True)
+                market_structure = {
+                    "last_break_event": event_payload,
+                    "last_event": event_payload,
+                    "event": event_payload,
+                    "external": {
+                        "last_break_event": event_payload,
+                        "last_event": event_payload,
+                        "bias": bias,
+                        "market_bias": bias,
+                        "confidence": event_payload.get("confidence", 0.0),
+                        "score": event_payload.get("score", 0.0),
+                        "strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                        "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                    },
+                    "internal": {"bias": bias, "market_bias": bias, "confidence": event_payload.get("confidence", 0.0), "score": event_payload.get("score", 0.0)},
+                    "mtf_alignment": value_for("mtf_alignment", "alignment", default=event_payload.get("score", 0.0)),
+                    "trend_strength": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                }
 
-        # Fair value gap / FVG
-        add("price_action.fair_value_gap", fair_value_gap or payload)
-        add("price_action.fvg", fair_value_gap or payload)
-        add(
-            "price_action.fair_value_gap.internal",
-            nested_value(
-                fair_value_gap,
-                "internal",
-                default={},
-            ),
-        )
-        add(
-            "price_action.fair_value_gap.external",
-            nested_value(
-                fair_value_gap,
-                "external",
-                default={},
-            ),
-        )
-        add(
-            "price_action.fair_value_gap.last_event",
-            nested_value(
-                fair_value_gap,
-                "last_event",
-                "event",
-                default=value_for("last_event", "event", default=None),
-            ),
-        )
-        add(
-            "price_action.fair_value_gap.nearest_bullish_gap",
-            nested_value(
-                fair_value_gap,
-                "nearest_bullish_gap",
-                "bullish_gap",
-                default=value_for("nearest_bullish_gap", default=None),
-            ),
-        )
-        add(
-            "price_action.fair_value_gap.nearest_bearish_gap",
-            nested_value(
-                fair_value_gap,
-                "nearest_bearish_gap",
-                "bearish_gap",
-                default=value_for("nearest_bearish_gap", default=None),
-            ),
-        )
+            add("price_action.market_structure", market_structure, section="market_structure")
+            add("price_action.market_structure.internal", nested_value(market_structure, "internal", default={}), section="market_structure")
+            add("price_action.market_structure.external", nested_value(market_structure, "external", default={}), section="market_structure")
+            add("price_action.market_structure.last_break_event", nested_value(market_structure, "last_break_event", "last_event", "event", default=event_payload), section="market_structure")
+            add("price_action.market_structure.mtf_alignment", nested_value(market_structure, "mtf_alignment", "multi_timeframe_alignment", default=value_for("mtf_alignment", default=0.0)), section="market_structure")
 
-        # Trend
-        add("price_action.trend", trend or payload)
-        add(
-            "price_action.trend.internal",
-            nested_value(
-                trend,
-                "internal",
-                default={},
-            ),
-        )
-        add(
-            "price_action.trend.external",
-            nested_value(
-                trend,
-                "external",
-                default={},
-            ),
-        )
-        add(
-            "price_action.trend.last_signal",
-            nested_value(
-                trend,
-                "last_signal",
-                "last_event",
-                "event",
-                default=value_for("last_signal", "last_event", default=None),
-            ),
-        )
-        add(
-            "price_action.trend.internal_external_alignment",
-            nested_value(
-                trend,
-                "internal_external_alignment",
-                default=value_for("internal_external_alignment", default=0.0),
-            ),
-        )
-        add(
-            "price_action.trend.higher_timeframe_alignment",
-            nested_value(
-                trend,
-                "higher_timeframe_alignment",
-                "htf_alignment",
-                default=value_for(
-                    "higher_timeframe_alignment",
-                    "htf_alignment",
-                    default=0.0,
-                ),
-            ),
-        )
-        add(
-            "price_action.trend.overall_trend_score",
-            nested_value(
-                trend,
-                "overall_trend_score",
-                "score",
-                default=value_for("overall_trend_score", "score", default=0.0),
-            ),
-        )
+        if is_sr_event:
+            add("price_action.support_resistance", support_resistance or event_payload, section="support_resistance")
+            add("price_action.support_resistance.internal", nested_value(support_resistance, "internal", default={}), section="support_resistance")
+            add("price_action.support_resistance.external", nested_value(support_resistance, "external", default={}), section="support_resistance")
+            add("price_action.support_resistance.last_event", nested_value(support_resistance, "last_event", "event", default=event_payload), section="support_resistance")
+            add("price_action.support_resistance.nearest_support", nested_value(support_resistance, "nearest_support", "support", default=value_for("nearest_support", default=None)), section="support_resistance")
+            add("price_action.support_resistance.nearest_resistance", nested_value(support_resistance, "nearest_resistance", "resistance", default=value_for("nearest_resistance", default=None)), section="support_resistance")
 
-        # Price-action liquidity levels
-        add("price_action.liquidity_levels", liquidity_levels)
+        if is_fvg_event:
+            add("price_action.fair_value_gap", fair_value_gap or event_payload, section="fair_value_gap")
+            add("price_action.fvg", fair_value_gap or event_payload, section="fair_value_gap")
+            add("price_action.fair_value_gap.internal", nested_value(fair_value_gap, "internal", default={}), section="fair_value_gap")
+            add("price_action.fair_value_gap.external", nested_value(fair_value_gap, "external", default={}), section="fair_value_gap")
+            add("price_action.fair_value_gap.last_event", nested_value(fair_value_gap, "last_event", "event", default=event_payload), section="fair_value_gap")
+            add("price_action.fair_value_gap.nearest_bullish_gap", nested_value(fair_value_gap, "nearest_bullish_gap", "bullish_gap", default=value_for("nearest_bullish_gap", default=None)), section="fair_value_gap")
+            add("price_action.fair_value_gap.nearest_bearish_gap", nested_value(fair_value_gap, "nearest_bearish_gap", "bearish_gap", default=value_for("nearest_bearish_gap", default=None)), section="fair_value_gap")
+
+        if is_trend_event:
+            if trend is None:
+                event_payload.setdefault("event_type", value_for("event_type", "type", "kind", default="trend_alignment"))
+                event_payload.setdefault("trend_direction", value_for("trend_direction", "direction", "side", default=None))
+                event_payload.setdefault("trend_regime", value_for("trend_regime", "regime", "state", default=None))
+                event_payload.setdefault("continuation_probability", value_for("continuation_probability", "continuation_prob", "probability", default=event_payload.get("score", 0.0)))
+                layer = {
+                    **event_payload,
+                    "direction": event_payload.get("trend_direction") or event_payload.get("direction"),
+                    "trend_direction": event_payload.get("trend_direction") or event_payload.get("direction"),
+                    "regime": event_payload.get("trend_regime"),
+                    "trend_regime": event_payload.get("trend_regime"),
+                    "trend_strength": value_for("trend_strength", "strength", "score", default=event_payload.get("score", 0.0)),
+                    "momentum_score": value_for("momentum_score", "momentum", default=event_payload.get("score", 0.0)),
+                    "slope_score": value_for("slope_score", "slope", default=event_payload.get("score", 0.0)),
+                    "continuation_probability": event_payload.get("continuation_probability"),
+                    "confidence": event_payload.get("confidence", 0.0),
+                    "score": event_payload.get("score", event_payload.get("confidence", 0.0)),
+                }
+                trend = {
+                    "last_signal": event_payload,
+                    "last_event": event_payload,
+                    "event": event_payload,
+                    "external": layer,
+                    "internal": layer,
+                    "internal_external_alignment": value_for("internal_external_alignment", "alignment", default=event_payload.get("score", 0.0)),
+                    "higher_timeframe_alignment": value_for("higher_timeframe_alignment", "htf_alignment", default=event_payload.get("score", 0.0)),
+                    "overall_trend_score": value_for("overall_trend_score", "score", default=event_payload.get("score", 0.0)),
+                }
+            add("price_action.trend", trend, section="trend")
+            add("price_action.trend.internal", nested_value(trend, "internal", default={}), section="trend")
+            add("price_action.trend.external", nested_value(trend, "external", default={}), section="trend")
+            add("price_action.trend.last_signal", nested_value(trend, "last_signal", "last_event", "event", default=event_payload), section="trend")
+            add("price_action.trend.internal_external_alignment", nested_value(trend, "internal_external_alignment", default=value_for("internal_external_alignment", default=0.0)), section="trend")
+            add("price_action.trend.higher_timeframe_alignment", nested_value(trend, "higher_timeframe_alignment", "htf_alignment", default=value_for("higher_timeframe_alignment", "htf_alignment", default=0.0)), section="trend")
+            add("price_action.trend.overall_trend_score", nested_value(trend, "overall_trend_score", "score", default=value_for("overall_trend_score", "score", default=0.0)), section="trend")
+
+        if liquidity_levels is not None:
+            add("price_action.liquidity_levels", liquidity_levels, section="liquidity_levels")
 
         return result
-
-
 
     def _build_liquidity_contract_features(
             self,
@@ -4646,6 +5204,13 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        """
+        Build stable open-interest contract features.
+
+        Setup-specific features are emitted only when the corresponding section
+        is actually present/detected. This prevents the registry from routing
+        OI divergence/anomaly/capitulation strategies on generic OI updates.
+        """
         result: list[FeatureSnapshot] = []
         confidence = payload.get("confidence", 0.0)
 
@@ -4653,17 +5218,28 @@ class SignalNormalizer(BaseStrategyComponent):
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any]:
+        topic = (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+        def mapping_for(*keys: str) -> dict[str, Any] | None:
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return value
+                    return dict(value)
 
-            return {}
+            return None
 
         analysis = mapping_for(
             "analysis",
@@ -4692,6 +5268,7 @@ class SignalNormalizer(BaseStrategyComponent):
             "regime_result",
             "oi_regime",
             "open_interest_regime",
+            "new_regime",
         )
         anomaly = mapping_for(
             "anomaly",
@@ -4710,80 +5287,91 @@ class SignalNormalizer(BaseStrategyComponent):
             if not features:
                 value = analysis.get("features")
                 if isinstance(value, dict):
-                    features = value
+                    features = dict(value)
 
             if not snapshot:
                 value = analysis.get("snapshot")
                 if isinstance(value, dict):
-                    snapshot = value
+                    snapshot = dict(value)
 
             if not market_context:
                 for key in ("context", "market_context", "oi_context"):
                     value = analysis.get(key)
                     if isinstance(value, dict):
-                        market_context = value
+                        market_context = dict(value)
                         break
 
             if not regime:
                 for key in ("regime", "regime_result", "oi_regime"):
                     value = analysis.get(key)
                     if isinstance(value, dict):
-                        regime = value
+                        regime = dict(value)
                         break
 
             if not anomaly:
                 for key in ("anomaly", "anomaly_result", "oi_anomaly"):
                     value = analysis.get(key)
                     if isinstance(value, dict):
-                        anomaly = value
+                        anomaly = dict(value)
                         break
 
             if not divergence:
                 for key in ("divergence", "divergence_result", "oi_divergence"):
                     value = analysis.get(key)
                     if isinstance(value, dict):
-                        divergence = value
+                        divergence = dict(value)
                         break
 
-        def has_any(*keys: str) -> bool:
-            for key in keys:
-                if key in payload:
+        def to_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "y", "on", "detected", "active", "confirmed"}:
                     return True
-                if key in feature_map:
-                    return True
-                if key in features:
-                    return True
-                if key in regime:
-                    return True
-                if key in anomaly:
-                    return True
-                if key in divergence:
-                    return True
-                if key in analysis:
-                    return True
-
-            return False
-
-        def value_for(*keys: str, default: Any = None) -> Any:
-            for key in keys:
-                if key in payload:
-                    return payload[key]
-                if key in feature_map:
-                    return feature_map[key]
-                if key in features:
-                    return features[key]
-                if key in regime:
-                    return regime[key]
-                if key in anomaly:
-                    return anomaly[key]
-                if key in divergence:
-                    return divergence[key]
-                if key in analysis:
-                    return analysis[key]
-
+                if normalized in {"0", "false", "no", "n", "off", "none", "not_detected"}:
+                    return False
+            if isinstance(value, (int, float)):
+                return bool(value)
             return default
 
-        def add(name: str, value: Any = True) -> None:
+        def section_detected(mapping: dict[str, Any] | None) -> bool:
+            if not mapping:
+                return False
+
+            detected = mapping.get("detected", mapping.get("is_detected", None))
+            if detected is None:
+                return True
+
+            return to_bool(detected, default=False)
+
+        def has_any(*keys: str) -> bool:
+            containers: tuple[dict[str, Any], ...] = tuple(
+                item for item in (payload, feature_map, features or {}, regime or {}, analysis or {})
+                if isinstance(item, dict)
+            )
+            return any(key in container for key in keys for container in containers)
+
+        def value_for(*keys: str, default: Any = None) -> Any:
+            containers: tuple[dict[str, Any], ...] = tuple(
+                item for item in (
+                    payload,
+                    feature_map,
+                    features or {},
+                    regime or {},
+                    anomaly or {},
+                    divergence or {},
+                    analysis or {},
+                )
+                if isinstance(item, dict)
+            )
+            for key in keys:
+                for container in containers:
+                    if key in container:
+                        return container[key]
+            return default
+
+        def add(name: str, value: Any = True, *, section: str | None = None) -> None:
             snapshot_obj = self._snapshot_from_raw_value(
                 source=FeatureSource.OPEN_INTEREST,
                 symbol=symbol,
@@ -4794,21 +5382,21 @@ class SignalNormalizer(BaseStrategyComponent):
                 metadata={
                     "origin": "contract_feature",
                     "contract": "open_interest",
+                    **({"section": section} if section else {}),
                 },
             )
             result.append(snapshot_obj)
 
-        # Main OI contract sections
         if analysis:
-            add("open_interest.analysis", analysis)
+            add("open_interest.analysis", analysis, section="analysis")
 
         if snapshot:
-            add("open_interest.snapshot", snapshot)
+            add("open_interest.snapshot", snapshot, section="snapshot")
 
         if market_context:
-            add("open_interest.market_context", market_context)
+            add("open_interest.context", market_context, section="market_context")
 
-        if features or has_any(
+        if features is None and has_any(
                 "oi",
                 "open_interest",
                 "open_interest_value",
@@ -4826,191 +5414,220 @@ class SignalNormalizer(BaseStrategyComponent):
                 "aggressive_flow_imbalance",
                 "oi_price_efficiency",
         ):
-            add(
-                "open_interest.features",
-                features or {
-                    "oi": value_for("oi", "open_interest", default=None),
-                    "open_interest": value_for("open_interest", "oi", default=None),
-                    "open_interest_value": value_for("open_interest_value", default=None),
-                    "oi_delta": value_for("oi_delta", default=None),
-                    "oi_delta_pct": value_for("oi_delta_pct", default=None),
-                    "oi_direction": value_for("oi_direction", default=None),
-                    "oi_acceleration": value_for("oi_acceleration", default=None),
-                    "price_delta_pct": value_for("price_delta_pct", default=None),
-                    "volume_ratio": value_for("volume_ratio", default=None),
-                    "oi_zscore": value_for("oi_zscore", default=None),
-                    "oi_pressure_score": value_for("oi_pressure_score", default=None),
-                    "funding_rate": value_for("funding_rate", default=None),
-                    "liquidation_pressure": value_for(
-                        "liquidation_pressure",
-                        "liquidation_imbalance",
-                        default=None,
-                    ),
-                    "liquidation_imbalance": value_for(
-                        "liquidation_imbalance",
-                        "liquidation_pressure",
-                        default=None,
-                    ),
-                    "aggressive_flow_imbalance": value_for(
-                        "aggressive_flow_imbalance",
-                        default=None,
-                    ),
-                    "oi_price_efficiency": value_for(
-                        "oi_price_efficiency",
-                        default=None,
-                    ),
-                },
-            )
+            features = {
+                "oi": value_for("oi", "open_interest", default=None),
+                "open_interest": value_for("open_interest", "oi", default=None),
+                "open_interest_value": value_for("open_interest_value", default=None),
+                "oi_delta": value_for("oi_delta", default=None),
+                "oi_delta_pct": value_for("oi_delta_pct", default=None),
+                "oi_direction": value_for("oi_direction", default=None),
+                "oi_acceleration": value_for("oi_acceleration", default=None),
+                "price_delta_pct": value_for("price_delta_pct", default=None),
+                "volume_ratio": value_for("volume_ratio", default=None),
+                "oi_zscore": value_for("oi_zscore", default=None),
+                "oi_pressure_score": value_for("oi_pressure_score", default=None),
+                "funding_rate": value_for("funding_rate", default=None),
+                "liquidation_pressure": value_for(
+                    "liquidation_pressure",
+                    "liquidation_imbalance",
+                    default=None,
+                ),
+                "liquidation_imbalance": value_for(
+                    "liquidation_imbalance",
+                    "liquidation_pressure",
+                    default=None,
+                ),
+                "aggressive_flow_imbalance": value_for(
+                    "aggressive_flow_imbalance",
+                    default=None,
+                ),
+                "oi_price_efficiency": value_for(
+                    "oi_price_efficiency",
+                    default=None,
+                ),
+            }
+            features = {key: value for key, value in features.items() if value is not None}
 
-        if regime or has_any(
+        if features:
+            add("open_interest.features", features, section="features")
+            for feature_name, aliases in {
+                "open_interest.features.oi_delta_pct": ("oi_delta_pct",),
+                "open_interest.features.price_delta_pct": ("price_delta_pct",),
+                "open_interest.features.oi_pressure_score": ("oi_pressure_score",),
+                "open_interest.features.aggressive_flow_imbalance": ("aggressive_flow_imbalance",),
+                "open_interest.features.funding_rate": ("funding_rate",),
+                "open_interest.features.liquidation_pressure": ("liquidation_pressure", "liquidation_imbalance"),
+            }.items():
+                value = value_for(*aliases, default=None)
+                if value is not None:
+                    add(feature_name, value, section="features")
+
+        if regime is None:
+            regime_value = value_for(
                 "regime",
                 "oi_regime",
                 "market_regime",
                 "new_regime",
-        ):
+                "regime_type",
+                default=None,
+            )
+            if regime_value is not None:
+                regime = {
+                    "regime": regime_value,
+                    "confidence": value_for("regime_confidence", "confidence", default=0.0),
+                    "score": value_for("regime_score", "score", default=0.0),
+                    "reasons": value_for("regime_reasons", "reasons", default=[]),
+                }
+
+        if regime:
+            add("open_interest.regime", regime, section="regime")
             add(
-                "open_interest.regime",
-                regime or {
-                    "regime": value_for(
-                        "regime",
-                        "oi_regime",
-                        "market_regime",
-                        "new_regime",
-                        default=None,
-                    ),
-                    "confidence": value_for(
-                        "regime_confidence",
-                        "confidence",
-                        default=0.0,
-                    ),
-                    "score": value_for(
-                        "regime_score",
-                        "score",
-                        default=0.0,
-                    ),
-                    "reasons": value_for(
-                        "regime_reasons",
-                        "reasons",
-                        default=[],
-                    ),
-                },
+                "open_interest.regime.type",
+                value_for("regime", "oi_regime", "market_regime", "new_regime", "regime_type", default=regime.get("regime") or regime.get("type")),
+                section="regime",
+            )
+            add(
+                "open_interest.regime.confidence",
+                value_for("regime_confidence", "confidence", default=regime.get("confidence", 0.0)),
+                section="regime",
+            )
+            add(
+                "open_interest.regime.score",
+                value_for("regime_score", "score", default=regime.get("score", 0.0)),
+                section="regime",
             )
 
-        if anomaly or has_any(
-                "anomaly",
-                "anomaly_type",
-                "capitulation",
-                "capitulation_score",
-                "squeeze_setup",
-                "squeeze_score",
-                "liquidation_imbalance",
-                "anomaly_detected",
-                "is_anomaly",
-        ):
-            add(
-                "open_interest.anomaly",
-                anomaly or {
-                    "detected": value_for(
-                        "anomaly_detected",
-                        "is_anomaly",
-                        "anomaly",
-                        "capitulation",
-                        "squeeze_setup",
-                        default=True,
-                    ),
-                    "anomaly_type": value_for("anomaly_type", default=None),
-                    "confidence": value_for(
-                        "anomaly_confidence",
-                        "confidence",
-                        default=0.0,
-                    ),
-                    "score": value_for(
-                        "anomaly_score",
-                        "score",
-                        default=0.0,
-                    ),
-                    "strength": value_for(
-                        "anomaly_strength",
-                        "strength",
-                        default=value_for("score", default=0.0),
-                    ),
-                    "capitulation": value_for("capitulation", default=None),
-                    "capitulation_score": value_for(
-                        "capitulation_score",
-                        default=None,
-                    ),
-                    "squeeze_setup": value_for("squeeze_setup", default=None),
-                    "squeeze_score": value_for(
-                        "squeeze_score",
-                        default=None,
-                    ),
-                    "liquidation_imbalance": value_for(
-                        "liquidation_imbalance",
-                        "liquidation_pressure",
-                        default=None,
-                    ),
-                    "reasons": value_for(
-                        "anomaly_reasons",
-                        "reasons",
-                        default=[],
-                    ),
-                },
-            )
-
-        if divergence or has_any(
-                "divergence",
+        if divergence is None:
+            divergence_type = value_for(
                 "divergence_type",
                 "price_oi_divergence",
-                "cvd_delta",
-                "funding_rate",
+                default=None,
+            )
+            divergence_detected = value_for(
                 "divergence_detected",
                 "is_divergence",
-        ):
+                default=None,
+            )
+            is_divergence_topic = (
+                ".divergence" in topic
+                or topic.endswith("divergence")
+                or topic.endswith("oi.divergence")
+                or topic.endswith("open_interest.divergence")
+            )
+            if divergence_type is None and is_divergence_topic:
+                raw_side = str(value_for("side", "direction", "bias", default="")).strip().lower()
+                if raw_side in {"long", "bullish", "buy", "up"}:
+                    divergence_type = "bullish"
+                elif raw_side in {"short", "bearish", "sell", "down"}:
+                    divergence_type = "bearish"
+                else:
+                    divergence_type = "bullish"
+            if divergence_type is not None or to_bool(divergence_detected, default=False) or is_divergence_topic:
+                divergence = {
+                    "detected": to_bool(divergence_detected, default=True),
+                    "divergence_type": divergence_type,
+                    "price_oi_divergence": value_for("price_oi_divergence", default=divergence_type),
+                    "side": value_for("side", "direction", "bias", default=None),
+                    "direction": value_for("direction", "side", "bias", default=None),
+                    "confidence": value_for("divergence_confidence", "confidence", default=0.0),
+                    "score": value_for("divergence_score", "score", default=0.0),
+                    "window_size": value_for("divergence_window_size", "window_size", default=None),
+                    "reasons": value_for("divergence_reasons", "reasons", default=[]),
+                }
+
+        if section_detected(divergence):
+            add("open_interest.divergence", divergence, section="divergence")
             add(
-                "open_interest.divergence",
-                divergence or {
-                    "detected": value_for(
-                        "divergence_detected",
-                        "is_divergence",
-                        "divergence",
-                        default=True,
+                "open_interest.divergence.detected",
+                value_for("divergence_detected", "is_divergence", "detected", default=divergence.get("detected", True)),
+                section="divergence",
+            )
+            add(
+                "open_interest.divergence.type",
+                value_for("divergence_type", "price_oi_divergence", default=divergence.get("divergence_type") or divergence.get("type")),
+                section="divergence",
+            )
+            add(
+                "open_interest.divergence.confidence",
+                value_for("divergence_confidence", "confidence", default=divergence.get("confidence", 0.0)),
+                section="divergence",
+            )
+            add(
+                "open_interest.divergence.score",
+                value_for("divergence_score", "score", default=divergence.get("score", 0.0)),
+                section="divergence",
+            )
+            if value_for("divergence_window_size", "window_size", default=divergence.get("window_size")) is not None:
+                add(
+                    "open_interest.divergence.window_size",
+                    value_for("divergence_window_size", "window_size", default=divergence.get("window_size")),
+                    section="divergence",
+                )
+
+        if anomaly is None:
+            anomaly_type = value_for("anomaly_type", default=None)
+            anomaly_detected = value_for(
+                "anomaly_detected",
+                "is_anomaly",
+                default=None,
+            )
+            capitulation = value_for("capitulation", default=None)
+            squeeze_setup = value_for("squeeze_setup", default=None)
+            if (
+                anomaly_type is not None
+                or to_bool(anomaly_detected, default=False)
+                or to_bool(capitulation, default=False)
+                or to_bool(squeeze_setup, default=False)
+            ):
+                anomaly = {
+                    "detected": to_bool(
+                        anomaly_detected,
+                        default=anomaly_type is not None
+                        or to_bool(capitulation, default=False)
+                        or to_bool(squeeze_setup, default=False),
                     ),
-                    "divergence_type": value_for(
-                        "divergence_type",
-                        "price_oi_divergence",
-                        default=None,
-                    ),
-                    "price_oi_divergence": value_for(
-                        "price_oi_divergence",
-                        "divergence_type",
-                        default=None,
-                    ),
-                    "confidence": value_for(
-                        "divergence_confidence",
-                        "confidence",
-                        default=0.0,
-                    ),
-                    "score": value_for(
-                        "divergence_score",
-                        "score",
-                        default=0.0,
-                    ),
-                    "window_size": value_for(
-                        "divergence_window_size",
-                        "window_size",
-                        default=None,
-                    ),
-                    "cvd_delta": value_for("cvd_delta", default=None),
-                    "funding_rate": value_for("funding_rate", default=None),
-                    "reasons": value_for(
-                        "divergence_reasons",
-                        "reasons",
-                        default=[],
-                    ),
-                },
+                    "anomaly_type": anomaly_type,
+                    "confidence": value_for("anomaly_confidence", "confidence", default=0.0),
+                    "score": value_for("anomaly_score", "score", default=0.0),
+                    "strength": value_for("anomaly_strength", "strength", default=value_for("score", default=0.0)),
+                    "capitulation": capitulation,
+                    "capitulation_score": value_for("capitulation_score", default=None),
+                    "squeeze_setup": squeeze_setup,
+                    "squeeze_score": value_for("squeeze_score", default=None),
+                    "liquidation_imbalance": value_for("liquidation_imbalance", "liquidation_pressure", default=None),
+                    "reasons": value_for("anomaly_reasons", "reasons", default=[]),
+                }
+
+        if section_detected(anomaly):
+            add("open_interest.anomaly", anomaly, section="anomaly")
+            add(
+                "open_interest.anomaly.detected",
+                value_for("anomaly_detected", "is_anomaly", "detected", default=anomaly.get("detected", True)),
+                section="anomaly",
+            )
+            add(
+                "open_interest.anomaly.type",
+                value_for("anomaly_type", default=anomaly.get("anomaly_type") or anomaly.get("type")),
+                section="anomaly",
+            )
+            add(
+                "open_interest.anomaly.confidence",
+                value_for("anomaly_confidence", "confidence", default=anomaly.get("confidence", 0.0)),
+                section="anomaly",
+            )
+            add(
+                "open_interest.anomaly.score",
+                value_for("anomaly_score", "score", default=anomaly.get("score", 0.0)),
+                section="anomaly",
+            )
+            add(
+                "open_interest.anomaly.strength",
+                value_for("anomaly_strength", "strength", default=anomaly.get("strength", anomaly.get("score", 0.0))),
+                section="anomaly",
             )
 
         return result
+
 
     def _build_funding_contract_features(
             self,
@@ -5019,15 +5636,6 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
-        """
-        Build stable funding contract features.
-
-        Important:
-        - feature snapshots for setup-specific sections are emitted only when the
-          section exists and is detected;
-        - no synthetic funding.divergence when there is no divergence section;
-        - no synthetic funding.extreme when there is no extreme section.
-        """
         result: list[FeatureSnapshot] = []
         confidence = payload.get("confidence", 0.0)
 
@@ -5035,17 +5643,26 @@ class SignalNormalizer(BaseStrategyComponent):
         if not isinstance(feature_map, dict):
             feature_map = {}
 
-        def mapping_for(*keys: str) -> dict[str, Any] | None:
+        def mapping_for(*keys: str) -> dict[str, Any]:
             for key in keys:
                 value = payload.get(key)
                 if isinstance(value, dict):
-                    return dict(value)
+                    return value
 
                 value = feature_map.get(key)
                 if isinstance(value, dict):
-                    return dict(value)
+                    return value
 
-            return None
+            return {}
+
+        snapshot = mapping_for("snapshot", "funding_snapshot")
+        statistics = mapping_for("statistics", "stats", "funding_statistics")
+        regime = mapping_for("regime", "regime_state", "funding_regime")
+        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
+        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
+        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
+        flip = mapping_for("flip", "flip_event", "funding_flip")
+        signal = mapping_for("signal", "funding_signal")
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
@@ -5055,38 +5672,13 @@ class SignalNormalizer(BaseStrategyComponent):
                     return feature_map[key]
             return default
 
-        def nested_value(mapping: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
-            if not mapping:
-                return default
+        def nested_value(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
             for key in keys:
                 if key in mapping:
                     return mapping[key]
             return default
 
-        def section_detected(mapping: dict[str, Any] | None) -> bool:
-            if not mapping:
-                return False
-
-            detected = mapping.get("detected", mapping.get("is_detected", None))
-            if detected is None:
-                return True
-
-            if isinstance(detected, bool):
-                return detected
-
-            if isinstance(detected, str):
-                return detected.strip().lower() not in {
-                    "0",
-                    "false",
-                    "no",
-                    "n",
-                    "off",
-                    "none",
-                }
-
-            return bool(detected)
-
-        def add(name: str, value: Any, *, section: str | None = None) -> None:
+        def add(name: str, value: Any) -> None:
             snapshot_obj = self._snapshot_from_raw_value(
                 source=FeatureSource.FUNDING,
                 symbol=symbol,
@@ -5097,227 +5689,97 @@ class SignalNormalizer(BaseStrategyComponent):
                 metadata={
                     "origin": "contract_feature",
                     "contract": "funding",
-                    **({"section": section} if section else {}),
                 },
             )
             result.append(snapshot_obj)
 
-        snapshot = mapping_for("snapshot", "funding_snapshot")
-        statistics = mapping_for("statistics", "stats", "funding_statistics")
-        regime = mapping_for("regime", "regime_state", "funding_regime")
-        pressure = mapping_for("pressure", "pressure_state", "funding_pressure")
-        extreme = mapping_for("extreme", "extreme_event", "funding_extreme")
-        divergence = mapping_for("divergence", "divergence_event", "funding_divergence")
-        flip = mapping_for("flip", "flip_event", "funding_flip")
-        funding_signal = mapping_for("signal", "funding_signal")
+        add("funding.snapshot", snapshot or payload)
+        add("funding.statistics", statistics)
 
-        if funding_signal is None and (
-                "signal_type" in payload
-                or "bias" in payload
-                or "side" in payload
-                or "direction" in payload
-                or "score" in payload
-                or "confidence" in payload
-        ):
-            funding_signal = {
-                "type": value_for("signal_type", "type", default=None),
-                "bias": value_for("bias", "side", "direction", default=None),
-                "side": value_for("side", "direction", "bias", default=None),
-                "direction": value_for("direction", "side", "bias", default=None),
-                "score": value_for("signal_score", "score", default=0.0),
-                "confidence": value_for("signal_confidence", "confidence", default=0.0),
-            }
+        add("funding.regime", regime)
+        add(
+            "funding.regime.confidence",
+            nested_value(regime, "confidence", default=value_for("regime_confidence", default=0.0)),
+        )
 
-        if snapshot:
-            add("funding.snapshot", snapshot, section="snapshot")
+        add("funding.pressure", pressure)
+        add(
+            "funding.pressure.score",
+            nested_value(pressure, "score", "pressure_score", default=value_for("pressure_score", default=0.0)),
+        )
+        add(
+            "funding.pressure.level",
+            nested_value(pressure, "level", "pressure_level", default=value_for("pressure_level", default=None)),
+        )
+        add(
+            "funding.pressure.direction",
+            nested_value(pressure, "direction", "bias", default=value_for("pressure_direction", default=None)),
+        )
 
-        if statistics:
-            add("funding.statistics", statistics, section="statistics")
+        add("funding.extreme", extreme)
+        add(
+            "funding.extreme.type",
+            nested_value(extreme, "type", "extreme_type", default=value_for("extreme_type", default=None)),
+        )
+        add(
+            "funding.extreme.severity",
+            nested_value(extreme, "severity", "score", default=value_for("extreme_severity", default=0.0)),
+        )
+        add(
+            "funding.extreme.mean_reversion_probability",
+            nested_value(
+                extreme,
+                "mean_reversion_probability",
+                "reversion_probability",
+                default=value_for("mean_reversion_probability", default=0.0),
+            ),
+        )
+        add(
+            "funding.extreme.squeeze_probability",
+            nested_value(extreme, "squeeze_probability", default=value_for("squeeze_probability", default=0.0)),
+        )
 
-        if regime:
-            add("funding.regime", regime, section="regime")
-            add(
-                "funding.regime.confidence",
-                nested_value(
-                    regime,
-                    "confidence",
-                    default=value_for("regime_confidence", default=0.0),
-                ),
-                section="regime",
-            )
+        add("funding.divergence", divergence)
+        add(
+            "funding.divergence.type",
+            nested_value(divergence, "type", "divergence_type", default=value_for("divergence_type", default=None)),
+        )
+        add(
+            "funding.divergence.confidence",
+            nested_value(divergence, "confidence", default=value_for("divergence_confidence", default=0.0)),
+        )
+        add(
+            "funding.divergence.score",
+            nested_value(divergence, "score", default=value_for("divergence_score", default=0.0)),
+        )
 
-        if pressure:
-            add("funding.pressure", pressure, section="pressure")
-            add(
-                "funding.pressure.score",
-                nested_value(
-                    pressure,
-                    "score",
-                    "pressure_score",
-                    default=value_for("pressure_score", default=0.0),
-                ),
-                section="pressure",
-            )
-            add(
-                "funding.pressure.level",
-                nested_value(
-                    pressure,
-                    "level",
-                    "pressure_level",
-                    default=value_for("pressure_level", default=None),
-                ),
-                section="pressure",
-            )
-            add(
-                "funding.pressure.direction",
-                nested_value(
-                    pressure,
-                    "direction",
-                    "bias",
-                    "side",
-                    default=value_for("pressure_direction", "side", "direction", default=None),
-                ),
-                section="pressure",
-            )
+        add("funding.flip", flip)
+        add(
+            "funding.flip.type",
+            nested_value(flip, "type", "flip_type", default=value_for("flip_type", default=None)),
+        )
+        add(
+            "funding.flip.confidence",
+            nested_value(flip, "confidence", default=value_for("flip_confidence", default=0.0)),
+        )
 
-        if section_detected(extreme):
-            add("funding.extreme", extreme, section="extreme")
-            add(
-                "funding.extreme.type",
-                nested_value(
-                    extreme,
-                    "type",
-                    "extreme_type",
-                    default=value_for("extreme_type", default=None),
-                ),
-                section="extreme",
-            )
-            add(
-                "funding.extreme.severity",
-                nested_value(
-                    extreme,
-                    "severity",
-                    "score",
-                    default=value_for("extreme_severity", "score", default=0.0),
-                ),
-                section="extreme",
-            )
-            add(
-                "funding.extreme.mean_reversion_probability",
-                nested_value(
-                    extreme,
-                    "mean_reversion_probability",
-                    "reversion_probability",
-                    "reversal_probability",
-                    default=value_for("mean_reversion_probability", default=0.0),
-                ),
-                section="extreme",
-            )
-            add(
-                "funding.extreme.squeeze_probability",
-                nested_value(
-                    extreme,
-                    "squeeze_probability",
-                    "squeeze_risk",
-                    default=value_for("squeeze_probability", default=0.0),
-                ),
-                section="extreme",
-            )
-
-        if section_detected(divergence):
-            add("funding.divergence", divergence, section="divergence")
-            add(
-                "funding.divergence.type",
-                nested_value(
-                    divergence,
-                    "type",
-                    "divergence_type",
-                    default=value_for("divergence_type", default=None),
-                ),
-                section="divergence",
-            )
-            add(
-                "funding.divergence.confidence",
-                nested_value(
-                    divergence,
-                    "confidence",
-                    default=value_for("divergence_confidence", default=0.0),
-                ),
-                section="divergence",
-            )
-            add(
-                "funding.divergence.score",
-                nested_value(
-                    divergence,
-                    "score",
-                    default=value_for("divergence_score", default=0.0),
-                ),
-                section="divergence",
-            )
-
-        if section_detected(flip):
-            add("funding.flip", flip, section="flip")
-            add(
-                "funding.flip.type",
-                nested_value(
-                    flip,
-                    "type",
-                    "flip_type",
-                    default=value_for("flip_type", default=None),
-                ),
-                section="flip",
-            )
-            add(
-                "funding.flip.confidence",
-                nested_value(
-                    flip,
-                    "confidence",
-                    default=value_for("flip_confidence", default=0.0),
-                ),
-                section="flip",
-            )
-
-        if funding_signal:
-            add("funding.signal", funding_signal, section="signal")
-            add(
-                "funding.signal.type",
-                nested_value(
-                    funding_signal,
-                    "type",
-                    "signal_type",
-                    default=value_for("signal_type", default=None),
-                ),
-                section="signal",
-            )
-            add(
-                "funding.signal.score",
-                nested_value(
-                    funding_signal,
-                    "score",
-                    default=value_for("signal_score", "score", default=0.0),
-                ),
-                section="signal",
-            )
-            add(
-                "funding.signal.confidence",
-                nested_value(
-                    funding_signal,
-                    "confidence",
-                    default=value_for("signal_confidence", "confidence", default=0.0),
-                ),
-                section="signal",
-            )
-            add(
-                "funding.signal.bias",
-                nested_value(
-                    funding_signal,
-                    "bias",
-                    "side",
-                    "direction",
-                    default=value_for("bias", "side", "direction", default=None),
-                ),
-                section="signal",
-            )
+        add("funding.signal", signal)
+        add(
+            "funding.signal.type",
+            nested_value(signal, "type", "signal_type", default=value_for("signal_type", default=None)),
+        )
+        add(
+            "funding.signal.score",
+            nested_value(signal, "score", default=value_for("signal_score", "score", default=0.0)),
+        )
+        add(
+            "funding.signal.confidence",
+            nested_value(signal, "confidence", default=value_for("signal_confidence", "confidence", default=0.0)),
+        )
+        add(
+            "funding.signal.bias",
+            nested_value(signal, "bias", "direction", default=value_for("bias", "direction", default=None)),
+        )
 
         return result
 
@@ -6529,7 +6991,7 @@ class SignalFilterChain(BaseStrategyComponent):
         self._filter_directional(evaluation)
         self._filter_confidence(evaluation)
         self._filter_score(evaluation)
-        self._filter_age(evaluation)
+        self._filter_age(evaluation, context)
         self._filter_freshness(evaluation, context)
         self._filter_execution_quality(evaluation)
 
@@ -6586,9 +7048,17 @@ class SignalFilterChain(BaseStrategyComponent):
                 )
             )
 
-    def _filter_age(self, evaluation: FilterEvaluation) -> None:
+    def _filter_age(
+        self,
+        evaluation: FilterEvaluation,
+        context: StrategyContext,
+    ) -> None:
         max_age = self.config.runtime.max_signal_age_seconds
-        age = (utcnow() - evaluation.signal.timestamp).total_seconds()
+        reference_time = ensure_aware_utc(context.timestamp)
+        signal_time = ensure_aware_utc(evaluation.signal.timestamp)
+        age = (reference_time - signal_time).total_seconds()
+        if age < 0:
+            age = 0.0
 
         if age > max_age:
             evaluation.add_result(

@@ -399,16 +399,30 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
             context,
             tuple(self.divergence_config.required_open_interest_features),
         ):
+            self.remember_no_signal(
+                "missing_open_interest_divergence_contract",
+                open_interest_domain_keys=sorted(self.open_interest_domain(context).keys()),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         if self.has_stale_open_interest_features(
             context,
             tuple(self.divergence_config.required_open_interest_features),
         ):
+            self.remember_no_signal(
+                "stale_open_interest_divergence_features",
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         payload = self._extract_payload(context)
         if payload is None:
+            self.remember_no_signal(
+                "open_interest_divergence_payload_not_resolved",
+                open_interest_domain=self.open_interest_domain(context),
+                required_features=sorted(self.required_features()),
+            )
             return None
 
         event_time = extract_event_time(payload.divergence)
@@ -420,6 +434,12 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
                 stale_after_seconds=self.divergence_config.stale_feature_max_age_seconds,
             )
         ):
+            self.remember_no_signal(
+                "stale_open_interest_divergence",
+                event_time=event_time.isoformat() if event_time else None,
+                context_timestamp=context.timestamp.isoformat(),
+                stale_after_seconds=self.divergence_config.stale_feature_max_age_seconds,
+            )
             return None
 
         common_rejection = divergence_filter_reason(
@@ -430,14 +450,35 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
             require_directional=False,
         )
         if common_rejection is not None:
+            self.remember_no_signal(
+                "open_interest_divergence_filter_failed",
+                filter_reason=common_rejection,
+                divergence=serialize_for_metadata(payload.divergence),
+                min_divergence_confidence=self.divergence_config.min_divergence_confidence,
+                min_divergence_score=self.divergence_config.min_divergence_score,
+            )
             return None
 
         side = self._map_divergence_to_side(payload)
         if self.divergence_config.require_actionable_side and not is_directional_side(side):
+            self.remember_no_signal(
+                "open_interest_divergence_side_not_directional",
+                divergence=serialize_for_metadata(payload.divergence),
+                features=serialize_for_metadata(payload.features),
+                regime=serialize_for_metadata(payload.regime),
+                anomaly=serialize_for_metadata(payload.anomaly),
+            )
             return None
 
         blocked_reason = self._risk_block_reason(payload=payload, side=side)
         if blocked_reason is not None:
+            self.remember_no_signal(
+                "open_interest_divergence_risk_blocked",
+                blocked_reason=blocked_reason,
+                side=side.value,
+                divergence=serialize_for_metadata(payload.divergence),
+                anomaly=serialize_for_metadata(payload.anomaly),
+            )
             return None
 
         setup_type = self._map_divergence_to_setup_type(payload)
@@ -450,9 +491,23 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         )
 
         if breakdown.score < self.divergence_config.min_signal_score:
+            self.remember_no_signal(
+                "open_interest_divergence_score_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_score=self.divergence_config.min_signal_score,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         if breakdown.confidence < self.divergence_config.min_signal_confidence:
+            self.remember_no_signal(
+                "open_interest_divergence_confidence_below_minimum",
+                score=breakdown.score,
+                confidence=breakdown.confidence,
+                min_signal_confidence=self.divergence_config.min_signal_confidence,
+                score_breakdown=breakdown.to_dict(),
+            )
             return None
 
         source_features = self._source_features(payload)

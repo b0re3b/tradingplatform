@@ -544,8 +544,11 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
             scheduler=scheduler,
             service_name=service_name or f"strategy.{self.__class__.__name__}",
         )
+
         self._last_no_signal_reason: str | None = None
         self._last_no_signal_metadata: dict[str, Any] = {}
+        self._last_not_applicable_reason: str | None = None
+        self._last_not_applicable_metadata: dict[str, Any] = {}
 
     @property
     def strategy_name(self) -> str:
@@ -716,13 +719,11 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         """
         Store the exact reason why generate_signal() returned None.
 
-        Concrete strategies still return StrategySignal | None, but BaseStrategy
-        can now expose useful debug reasons instead of generic no_signal_generated.
+        Concrete strategies still return StrategySignal | None, but failed
+        StrategyEvaluation objects can now expose actionable diagnostics instead
+        of the generic no_signal_generated reason.
         """
-        normalized = str(reason or "").strip()
-        if not normalized:
-            normalized = "no_signal_generated"
-
+        normalized = str(reason or "").strip() or "no_signal_generated"
         self._last_no_signal_reason = normalized
         self._last_no_signal_metadata = dict(metadata)
 
@@ -733,9 +734,22 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
     def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
         reason = self._last_no_signal_reason or "no_signal_generated"
         metadata = dict(self._last_no_signal_metadata or {})
-
         self.clear_no_signal_reason()
+        return [reason], metadata
 
+    def remember_not_applicable(self, reason: str, **metadata: Any) -> None:
+        normalized = str(reason or "").strip() or "strategy_not_applicable"
+        self._last_not_applicable_reason = normalized
+        self._last_not_applicable_metadata = dict(metadata)
+
+    def clear_not_applicable_reason(self) -> None:
+        self._last_not_applicable_reason = None
+        self._last_not_applicable_metadata = {}
+
+    def consume_not_applicable_reason(self) -> tuple[list[str], dict[str, Any]]:
+        reason = self._last_not_applicable_reason or "strategy_not_applicable"
+        metadata = dict(self._last_not_applicable_metadata or {})
+        self.clear_not_applicable_reason()
         return [reason], metadata
 
     def should_evaluate(self, context: StrategyContext) -> bool:
@@ -744,12 +758,37 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
         Не кидає exception для normal negative cases.
         """
+        self.clear_not_applicable_reason()
+
         if not self.is_enabled():
+            self.remember_not_applicable("strategy_disabled")
             return False
 
         try:
             self.validate_context_requirements(context)
-        except StrategyEvaluationError:
+        except StrategyEvaluationError as exc:
+            detail = str(exc)
+            reason = "strategy_not_applicable"
+            if "missing required features" in detail:
+                reason = "missing_required_features"
+            elif "timeframe" in detail and "not supported" in detail:
+                reason = "unsupported_timeframe"
+            elif "symbol" in detail and "not allowed" in detail:
+                reason = "unsupported_symbol"
+            elif "regime" in detail and "not supported" in detail:
+                reason = "unsupported_regime"
+
+            self.remember_not_applicable(
+                reason,
+                detail=detail,
+                required_features=sorted(self.required_features()),
+                context_symbol=getattr(context, "symbol", None),
+                context_timeframe=(
+                    context.timeframe.value
+                    if hasattr(getattr(context, "timeframe", None), "value")
+                    else str(getattr(context, "timeframe", None))
+                ),
+            )
             return False
 
         return True
@@ -773,12 +812,20 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
             self.validate_context(context)
 
             if not self.should_evaluate(context):
+                reasons, not_applicable_metadata = self.consume_not_applicable_reason()
                 return self._build_evaluation(
                     context=context,
                     timestamp=timestamp,
                     passed=False,
                     signal=None,
-                    reasons=["strategy_not_applicable"],
+                    reasons=reasons,
+                    metadata={
+                        "strategy_category": self.category.value,
+                        "strategy_priority": self.priority,
+                        "strategy_weight": self.weight,
+                        "required_features": sorted(self.required_features()),
+                        "not_applicable": not_applicable_metadata,
+                    },
                 )
 
             self.clear_no_signal_reason()
@@ -786,7 +833,6 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
             if signal is None:
                 reasons, no_signal_metadata = self.consume_no_signal_reason()
-
                 return self._build_evaluation(
                     context=context,
                     timestamp=timestamp,
