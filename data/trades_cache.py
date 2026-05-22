@@ -68,6 +68,7 @@ class TradesCache:
         cleanup_interval_seconds: float = 60.0,
         max_trades_per_book: int = 5000,
         retention_ms: int = 15 * 60 * 1000,
+        trades_updated_emit_min_interval_ms: int = 500,
         service_name: str = "trades_cache",
     ) -> None:
         self.config = config
@@ -77,6 +78,7 @@ class TradesCache:
         self._cleanup_job_id: str | None = None
         self.max_trades_per_book = max_trades_per_book
         self.retention_ms = retention_ms
+        self.trades_updated_emit_min_interval_ms = max(0, int(trades_updated_emit_min_interval_ms))
         self._service_name = service_name
 
         self._logger = get_logger(
@@ -87,6 +89,13 @@ class TradesCache:
 
         self._states: dict[str, TradesState] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+        # market.trades.updated is a downstream analytics trigger. Emitting it for
+        # every raw trade can saturate the shared EventBus. Keep only the latest
+        # update per symbol and flush it at a bounded cadence.
+        self._last_trades_updated_emit_ms: dict[str, int] = {}
+        self._pending_trades_updated: dict[str, dict[str, Any]] = {}
+        self._pending_trades_updated_tasks: dict[str, asyncio.Task[None]] = {}
 
         self._metrics: dict[str, int | float] = {
             "states_created": 0,
@@ -121,6 +130,16 @@ class TradesCache:
         if self.scheduler is not None and self._cleanup_job_id is not None:
             self.scheduler.remove_job(self._cleanup_job_id)
             self._cleanup_job_id = None
+
+        pending_tasks = list(self._pending_trades_updated_tasks.values())
+        self._pending_trades_updated_tasks.clear()
+        self._pending_trades_updated.clear()
+
+        for task in pending_tasks:
+            task.cancel()
+
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     async def _on_market_trade(self, event: Any) -> None:
         await self.update(self._normalize_inbound_payload(self._extract_payload(event)))
@@ -188,6 +207,7 @@ class TradesCache:
         """
         state_key = self._build_state_key_from_event(event)
         lock = self._get_lock(state_key)
+        updated_payload: dict[str, Any] | None = None
 
         async with lock:
             state = self._get_or_create_state(event)
@@ -200,52 +220,58 @@ class TradesCache:
                 state.last_error = "invalid_trade_event"
                 self._metrics["invalid_trades"] += 1
 
-                await self._emit_event(
-                    "system.trades_cache.invalid_trade",
-                    {
-                        "exchange": event.get("exchange"),
-                        "symbol": event.get("symbol"),
-                        "market_type": event.get("market_type", "perpetual"),
-                    },
-                )
-                return
+                invalid_payload = {
+                    "exchange": event.get("exchange"),
+                    "symbol": event.get("symbol"),
+                    "market_type": event.get("market_type", "perpetual"),
+                }
+                # Do not await EventBus while holding the state lock.
+                updated_payload = None
+                emit_invalid = True
+            else:
+                emit_invalid = False
+                invalid_payload = None
 
-            if self._is_duplicate_trade(state, record):
-                state.duplicate_trade_ids += 1
-                self._metrics["duplicate_trade_ids"] += 1
+                if self._is_duplicate_trade(state, record):
+                    state.duplicate_trade_ids += 1
+                    self._metrics["duplicate_trade_ids"] += 1
 
-                self._logger.warning(
-                    "Duplicate trade detected | exchange=%s symbol=%s trade_id=%s",
-                    record.exchange,
-                    record.symbol,
-                    record.trade_id,
-                )
-                return
+                    self._logger.warning(
+                        "Duplicate trade detected | exchange=%s symbol=%s trade_id=%s",
+                        record.exchange,
+                        record.symbol,
+                        record.trade_id,
+                    )
+                    return
 
-            state.trades.append(record)
-            state.last_trade_ts_ms = record.timestamp_ms
-            state.last_received_at_ms = record.received_at_ms
-            state.last_trade_id = record.trade_id
-            state.last_error = None
+                state.trades.append(record)
+                state.last_trade_ts_ms = record.timestamp_ms
+                state.last_received_at_ms = record.received_at_ms
+                state.last_trade_id = record.trade_id
+                state.last_error = None
 
-            self._metrics["trades_stored"] += 1
+                self._metrics["trades_stored"] += 1
 
-            removed = self._trim_state(state)
-            if removed > 0:
-                state.trims_count += 1
-                state.total_dropped += removed
-                self._metrics["trades_dropped"] += removed
+                removed = self._trim_state(state)
+                if removed > 0:
+                    state.trims_count += 1
+                    state.total_dropped += removed
+                    self._metrics["trades_dropped"] += removed
 
-            await self._emit_event(
-                "market.trades.updated",
-                {
+                updated_payload = {
                     "exchange": record.exchange,
                     "symbol": record.symbol,
                     "market_type": record.market_type,
                     "trade": self._serialize_trade(record),
                     "last_trade_ts_ms": record.timestamp_ms,
-                },
-            )
+                }
+
+        if emit_invalid and invalid_payload is not None:
+            await self._emit_event("system.trades_cache.invalid_trade", invalid_payload)
+            return
+
+        if updated_payload is not None:
+            await self._emit_trades_updated_throttled(state_key, updated_payload)
 
     async def get_recent_trades(
         self,
@@ -620,6 +646,69 @@ class TradesCache:
             removed += 1
 
         return removed
+
+    async def _emit_trades_updated_throttled(
+        self,
+        state_key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """
+        Emit market.trades.updated at a bounded cadence per exchange/market/symbol.
+
+        Raw trade streams can be very hot. Downstream analytics usually need the
+        latest trade/window trigger, not every single raw trade as an EventBus
+        event. This keeps the most recent payload and flushes it after the
+        configured interval.
+        """
+        interval_ms = self.trades_updated_emit_min_interval_ms
+        if interval_ms <= 0:
+            await self._emit_event("market.trades.updated", payload)
+            return
+
+        now_ms = self._now_ms()
+        last_emit_ms = self._last_trades_updated_emit_ms.get(state_key)
+
+        if last_emit_ms is None or now_ms - last_emit_ms >= interval_ms:
+            self._last_trades_updated_emit_ms[state_key] = now_ms
+            await self._emit_event("market.trades.updated", payload)
+            return
+
+        self._pending_trades_updated[state_key] = payload
+
+        task = self._pending_trades_updated_tasks.get(state_key)
+        if task is None or task.done():
+            delay = max(0.0, (interval_ms - (now_ms - last_emit_ms)) / 1000.0)
+            self._pending_trades_updated_tasks[state_key] = asyncio.create_task(
+                self._flush_pending_trades_updated_after_delay(state_key, delay),
+                name=f"trades-cache-flush-{state_key}",
+            )
+
+    async def _flush_pending_trades_updated_after_delay(
+        self,
+        state_key: str,
+        delay_seconds: float,
+    ) -> None:
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            payload = self._pending_trades_updated.pop(state_key, None)
+            if payload is None:
+                return
+
+            self._last_trades_updated_emit_ms[state_key] = self._now_ms()
+            await self._emit_event("market.trades.updated", payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "Failed to flush throttled trades update | state_key=%s",
+                state_key,
+            )
+        finally:
+            current_task = asyncio.current_task()
+            if self._pending_trades_updated_tasks.get(state_key) is current_task:
+                self._pending_trades_updated_tasks.pop(state_key, None)
 
     async def _emit_event(self, topic: str, payload: dict[str, Any]) -> None:
         if self.event_bus is None:

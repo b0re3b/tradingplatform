@@ -56,6 +56,20 @@ def _get_env(key: str, default: str | None = None) -> str | None:
     return os.getenv(key, default)
 
 
+def _first_env(*keys: str, default: str | None = None) -> str | None:
+    """
+    Return the first non-empty environment variable among aliases.
+
+    This keeps canonical EXCHANGE_* keys while supporting exchange-specific
+    aliases such as BINANCE_* for existing .env files.
+    """
+    for key in keys:
+        value = os.getenv(key)
+        if value is not None and value.strip() != "":
+            return value
+    return default
+
+
 def _load_env_file(env_file: str | Path = ".env") -> None:
     """
     Мінімальний .env loader без сторонніх залежностей.
@@ -282,18 +296,54 @@ class Config:
                 pool_max_size=_to_int(_get_env("POSTGRES_POOL_MAX_SIZE"), 10),
             ),
             exchange=ExchangeConfig(
-                enabled=_to_bool(_get_env("EXCHANGE_ENABLED"), True),
-                name=_get_env("EXCHANGE_NAME", "binance") or "binance",
-                ws_url=_to_optional_str(_get_env("EXCHANGE_WS_URL")),
-                rest_url=_to_optional_str(_get_env("EXCHANGE_REST_URL")),
-                timeout_seconds=_to_float(_get_env("EXCHANGE_TIMEOUT_SECONDS"), 10.0),
-                reconnect_delay=_to_float(_get_env("EXCHANGE_RECONNECT_DELAY"), 5.0),
-                max_reconnect_attempts=_to_int(_get_env("EXCHANGE_MAX_RECONNECT_ATTEMPTS"), 20),
+                enabled=_to_bool(_first_env("EXCHANGE_ENABLED", "BINANCE_ENABLED"), True),
+                name=_first_env("EXCHANGE_NAME", default="binance") or "binance",
+                ws_url=_to_optional_str(
+                    _first_env(
+                        "EXCHANGE_WS_URL",
+                        "BINANCE_WS_URL",
+                        "BINANCE_FUTURES_WS_URL",
+                    )
+                ),
+                rest_url=_to_optional_str(
+                    _first_env(
+                        "EXCHANGE_REST_URL",
+                        "BINANCE_REST_URL",
+                        "BINANCE_FUTURES_REST_URL",
+                    )
+                ),
+                timeout_seconds=_to_float(_first_env("EXCHANGE_TIMEOUT_SECONDS", "BINANCE_TIMEOUT_SECONDS"), 10.0),
+                reconnect_delay=_to_float(_first_env("EXCHANGE_RECONNECT_DELAY", "BINANCE_RECONNECT_DELAY"), 5.0),
+                max_reconnect_attempts=_to_int(
+                    _first_env("EXCHANGE_MAX_RECONNECT_ATTEMPTS", "BINANCE_MAX_RECONNECT_ATTEMPTS"),
+                    20,
+                ),
                 credentials=ExchangeCredentials(
-                    api_key=_to_optional_str(_get_env("EXCHANGE_API_KEY")),
-                    api_secret=_to_optional_str(_get_env("EXCHANGE_API_SECRET")),
-                    passphrase=_to_optional_str(_get_env("EXCHANGE_PASSPHRASE")),
-                    testnet=_to_bool(_get_env("EXCHANGE_TESTNET"), False),
+                    api_key=_to_optional_str(
+                        _first_env(
+                            "EXCHANGE_API_KEY",
+                            "BINANCE_API_KEY",
+                            "BINANCE_FUTURES_API_KEY",
+                        )
+                    ),
+                    api_secret=_to_optional_str(
+                        _first_env(
+                            "EXCHANGE_API_SECRET",
+                            "BINANCE_API_SECRET",
+                            "BINANCE_FUTURES_API_SECRET",
+                        )
+                    ),
+                    passphrase=_to_optional_str(
+                        _first_env(
+                            "EXCHANGE_PASSPHRASE",
+                            "BINANCE_PASSPHRASE",
+                            "BINANCE_API_PASSPHRASE",
+                        )
+                    ),
+                    testnet=_to_bool(
+                        _first_env("EXCHANGE_TESTNET", "BINANCE_TESTNET", "BINANCE_FUTURES_TESTNET"),
+                        False,
+                    ),
                 ),
             ),
             risk=RiskConfig(

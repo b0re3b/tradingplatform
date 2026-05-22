@@ -124,6 +124,7 @@ class NewsAIService:
         self.scorer = scorer or NewsScorer(config)
 
         self._registered = False
+        self._collect_job_id: str | None = None
         self._running = False
         self._run_lock = asyncio.Lock()
 
@@ -166,7 +167,7 @@ class NewsAIService:
             self._registered = True
             return
 
-        self.scheduler.add_interval_job(
+        self._collect_job_id = self.scheduler.add_interval_job(
             name=f"{self.config.service_name}.collect",
             interval=self.config.collect_interval_seconds,
             func=self.collect_once,
@@ -187,6 +188,59 @@ class NewsAIService:
                 "source_count": self.collector.source_count,
                 "enabled_source_count": self.collector.enabled_source_count,
             },
+        )
+
+    async def start(self) -> None:
+        """
+        Start NewsAIService by registering its scheduled collection job.
+
+        app.runtime.start_component() calls start(), not register(), for most
+        runtime services. Without this method the news module is constructed
+        but never schedules collection, so no news.* events reach Telegram.
+        """
+
+        self.register()
+
+        await self._emit(
+            "system.news_ai_service.started",
+            {
+                "service_name": self.config.service_name,
+                "enabled": self.config.enabled,
+                "collect_interval_seconds": self.config.collect_interval_seconds,
+                "startup_collect_enabled": self.config.startup_collect_enabled,
+                "source_count": self.collector.source_count,
+                "enabled_source_count": self.collector.enabled_source_count,
+                "collect_job_id": self._collect_job_id,
+            },
+            priority=EventPriority.LOW,
+        )
+
+    async def stop(self) -> None:
+        """Stop NewsAIService and remove its scheduler job."""
+
+        if self._collect_job_id is not None:
+            try:
+                self.scheduler.remove_job(self._collect_job_id)
+            except KeyError:
+                pass
+            self._collect_job_id = None
+
+        self._registered = False
+        self._running = False
+
+        await self._emit(
+            "system.news_ai_service.stopped",
+            {
+                "service_name": self.config.service_name,
+                "enabled": self.config.enabled,
+                "total_runs": self._total_runs,
+                "successful_runs": self._successful_runs,
+                "failed_runs": self._failed_runs,
+                "total_collected": self._total_collected,
+                "total_scored": self._total_scored,
+                "total_high_impact": self._total_high_impact,
+            },
+            priority=EventPriority.LOW,
         )
 
     async def collect_once(self) -> NewsServiceRunResult:
@@ -518,6 +572,7 @@ class NewsAIService:
             "enabled": self.config.enabled,
             "registered": self._registered,
             "running": self._running,
+            "collect_job_id": self._collect_job_id,
             "total_runs": self._total_runs,
             "successful_runs": self._successful_runs,
             "failed_runs": self._failed_runs,

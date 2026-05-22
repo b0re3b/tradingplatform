@@ -199,10 +199,10 @@ class TelegramBotConfig:
         """
 
         return {
-            TelegramTopic.ORDERFLOW:     10,
+            TelegramTopic.ORDERFLOW:     9,
             TelegramTopic.LIQUIDITY:     21,
             TelegramTopic.PRICE_ACTION:  12,
-            TelegramTopic.LIQUIDATIONS:  20,
+            TelegramTopic.LIQUIDATIONS:  10,
             TelegramTopic.WHALES:        24,
             TelegramTopic.SPOOFING:      22,
             TelegramTopic.SPREADS:       23,

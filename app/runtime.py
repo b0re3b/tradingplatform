@@ -105,8 +105,8 @@ class RuntimeSettings:
     quote_asset: str = "USDT"
     timeframes: list[str] = field(default_factory=lambda: ["1m", "15m"])
     execution_exchange: str = "binance"
-    execution_mode: str = "paper"
-    live_trading_enabled: bool = False
+    execution_mode: str = "live"
+    live_trading_enabled: bool = True
     enable_market_data: bool = True
     enable_analytics: bool = True
     enable_strategy: bool = True

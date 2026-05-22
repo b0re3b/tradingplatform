@@ -38,6 +38,7 @@ class MexcWebSocketClientConfig:
     symbols: list[str] = field(default_factory=list)
     streams: list[str] = field(default_factory=lambda: ["deal", "depth", "kline"])
     kline_interval: str = "Min1"
+    orderbook_emit_min_interval_ms: int = 250
 
     enable_private_stream: bool = False
     disable_default_private_pushes: bool = False
@@ -54,6 +55,7 @@ class MexcWebSocketClientConfig:
         ping_interval_seconds: float = 15.0,
         recv_window_ms: int = 10_000,
         disable_default_private_pushes: bool = False,
+        orderbook_emit_min_interval_ms: int = 250,
     ) -> "MexcWebSocketClientConfig":
         defaults = cls()
 
@@ -71,6 +73,7 @@ class MexcWebSocketClientConfig:
             kline_interval=kline_interval,
             enable_private_stream=enable_private_stream,
             disable_default_private_pushes=disable_default_private_pushes,
+            orderbook_emit_min_interval_ms=orderbook_emit_min_interval_ms,
         )
 
 
@@ -125,6 +128,7 @@ class MexcWebSocketClient:
         ping_interval: float = 15.0,
         recv_window_ms: int = 10_000,
         disable_default_private_pushes: bool = False,
+        orderbook_emit_min_interval_ms: int = 250,
     ) -> None:
         resolved_config = ws_config or MexcWebSocketClientConfig.from_core_config(
             config=config,
@@ -135,6 +139,7 @@ class MexcWebSocketClient:
             ping_interval_seconds=ping_interval,
             recv_window_ms=recv_window_ms,
             disable_default_private_pushes=disable_default_private_pushes,
+            orderbook_emit_min_interval_ms=orderbook_emit_min_interval_ms,
         )
 
         self._config = config
@@ -168,6 +173,11 @@ class MexcWebSocketClient:
 
         self._running = False
         self._started = False
+
+        self._last_orderbook_emit_ms: dict[str, int] = {}
+        self._pending_orderbook_payloads: dict[str, dict[str, Any]] = {}
+        self._orderbook_flush_tasks: dict[str, asyncio.Task] = {}
+        self._orderbook_throttled_updates: dict[str, int] = {}
 
         self._validate_config()
 
@@ -250,6 +260,8 @@ class MexcWebSocketClient:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        await self._cancel_orderbook_flush_tasks()
 
         self._public_task = None
         self._private_task = None
@@ -734,6 +746,81 @@ class MexcWebSocketClient:
             )
             raise
 
+    async def _cancel_orderbook_flush_tasks(self) -> None:
+        tasks = [task for task in self._orderbook_flush_tasks.values() if task is not None and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._orderbook_flush_tasks.clear()
+        self._pending_orderbook_payloads.clear()
+
+    async def _emit_orderbook_event_throttled(
+        self,
+        *,
+        key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """
+        Emits market.orderbook at most once per configured interval per symbol.
+
+        Intermediate updates are coalesced: only the latest payload is kept and
+        flushed after the remaining interval. This protects the shared EventBus
+        from high-frequency orderbook bursts while preserving the freshest state.
+        """
+        interval_ms = max(0, int(getattr(self._ws_config, "orderbook_emit_min_interval_ms", 0) or 0))
+        if interval_ms <= 0:
+            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+            return
+
+        normalized_key = key or str(payload.get("symbol") or "unknown")
+        now_ms = int(time.time() * 1000)
+        last_emit_ms = self._last_orderbook_emit_ms.get(normalized_key, 0)
+        elapsed_ms = now_ms - last_emit_ms
+
+        if last_emit_ms <= 0 or elapsed_ms >= interval_ms:
+            self._last_orderbook_emit_ms[normalized_key] = now_ms
+            self._pending_orderbook_payloads.pop(normalized_key, None)
+            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+            return
+
+        self._pending_orderbook_payloads[normalized_key] = payload
+        self._orderbook_throttled_updates[normalized_key] = self._orderbook_throttled_updates.get(normalized_key, 0) + 1
+
+        existing_task = self._orderbook_flush_tasks.get(normalized_key)
+        if existing_task is not None and not existing_task.done():
+            return
+
+        delay_seconds = max((interval_ms - elapsed_ms) / 1000.0, 0.0)
+        self._orderbook_flush_tasks[normalized_key] = asyncio.create_task(
+            self._flush_pending_orderbook_event(normalized_key, delay_seconds)
+        )
+
+    async def _flush_pending_orderbook_event(self, key: str, delay_seconds: float) -> None:
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            payload = self._pending_orderbook_payloads.pop(key, None)
+            if payload is None:
+                return
+
+            self._last_orderbook_emit_ms[key] = int(time.time() * 1000)
+            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "Failed to flush throttled orderbook event | exchange=%s key=%s",
+                self.EXCHANGE,
+                key,
+            )
+        finally:
+            task = self._orderbook_flush_tasks.get(key)
+            if task is asyncio.current_task():
+                self._orderbook_flush_tasks.pop(key, None)
+
     # ------------------------------------------------------------------
     # Event publishers: public market data
     # ------------------------------------------------------------------
@@ -791,10 +878,9 @@ class MexcWebSocketClient:
             "event_time": message.get("ts"),
         }
 
-        await self._emit_event(
-            "market.orderbook",
-            payload,
-            priority=EventPriority.LOW,
+        await self._emit_orderbook_event_throttled(
+            key=str(payload.get("symbol") or payload.get("channel") or "unknown").upper(),
+            payload=payload,
         )
 
     async def _publish_kline_event(self, message: dict[str, Any]) -> None:

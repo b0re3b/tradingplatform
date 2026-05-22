@@ -240,15 +240,68 @@ class TelegramFormatter:
         payload = self._sanitize_payload(event.payload)
         template = get_template_for_message_type(TelegramMessageType.NEWS_ALERT)
 
+        # NewsAIService publishes nested payloads:
+        # {"item": {...}, "score": {...}, "features": {...}, ...}.
+        # Keep backward compatibility with older flat news payloads.
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        score = payload.get("score") if isinstance(payload.get("score"), dict) else {}
+        features = payload.get("features") if isinstance(payload.get("features"), dict) else {}
+
+        symbols = (
+            payload.get("symbols")
+            or item.get("symbols")
+            or features.get("symbols")
+            or features.get("mentioned_symbols")
+        )
+
+        source = (
+            payload.get("source")
+            or payload.get("source_name")
+            or item.get("source_name")
+            or item.get("source")
+        )
+
+        impact = (
+            payload.get("impact")
+            or payload.get("importance")
+            or score.get("impact_level")
+            or score.get("impact_score")
+        )
+
+        sentiment = (
+            payload.get("sentiment")
+            or score.get("sentiment")
+            or score.get("market_bias")
+        )
+
+        headline = (
+            payload.get("headline")
+            or payload.get("title")
+            or item.get("headline")
+            or item.get("title")
+            or "n/a"
+        )
+
+        summary = (
+            payload.get("summary")
+            or payload.get("description")
+            or score.get("summary")
+            or score.get("explanation")
+            or item.get("summary")
+            or item.get("description")
+            or item.get("body")
+            or "n/a"
+        )
+
         values = self._base_values(event=event, route=route)
         values.update(
             {
-                "source": self._safe(payload.get("source")),
-                "impact": self._safe(payload.get("impact", payload.get("importance", "n/a"))),
-                "sentiment": self._safe(payload.get("sentiment")),
-                "symbols": self._format_list(payload.get("symbols")),
-                "headline": self._multiline(payload.get("headline", payload.get("title", "n/a"))),
-                "summary": self._multiline(payload.get("summary", payload.get("description", "n/a"))),
+                "source": self._safe(source),
+                "impact": self._safe(impact),
+                "sentiment": self._safe(sentiment),
+                "symbols": self._format_list(symbols),
+                "headline": self._multiline(headline),
+                "summary": self._multiline(summary),
             }
         )
 

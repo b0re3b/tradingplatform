@@ -34,6 +34,12 @@ class BinanceFuturesRestClientConfig:
     emit_success_events: bool = False
     emit_error_events: bool = True
 
+    # In paper/dev mode the execution layer may still ask for read-only private
+    # snapshots such as open orders or positions. Without API credentials Binance
+    # cannot serve those endpoints. Returning an empty snapshot prevents noisy
+    # sync failures while keeping all trading/write endpoints strictly protected.
+    allow_private_read_without_credentials: bool = True
+
     @classmethod
     def from_core_config(cls, config: Config) -> "BinanceFuturesRestClientConfig":
         defaults = cls()
@@ -570,6 +576,22 @@ class BinanceRestClient:
     # ------------------------------------------------------------------
 
     async def get_balance(self, *, recv_window: int | None = None) -> list[dict[str, Any]]:
+        if self._should_skip_private_read_without_credentials("get_balance"):
+            await self._emit_event(
+                "exchange.account.balance.snapshot",
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "balances": [],
+                    "count": 0,
+                    "snapshot_time": self._current_timestamp_ms(),
+                    "skipped": True,
+                    "skip_reason": "missing_credentials",
+                },
+                priority=EventPriority.LOW,
+            )
+            return []
+
         payload = await self._request(
             method="GET",
             path="/fapi/v2/balance",
@@ -611,6 +633,41 @@ class BinanceRestClient:
         return normalized
 
     async def get_account_info(self, *, recv_window: int | None = None) -> dict[str, Any]:
+        if self._should_skip_private_read_without_credentials("get_account_info"):
+            normalized = {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "fee_tier": None,
+                "can_trade": False,
+                "can_deposit": None,
+                "can_withdraw": None,
+                "update_time": None,
+                "total_initial_margin": None,
+                "total_maint_margin": None,
+                "total_wallet_balance": None,
+                "total_unrealized_profit": None,
+                "total_margin_balance": None,
+                "total_position_initial_margin": None,
+                "total_open_order_initial_margin": None,
+                "total_cross_wallet_balance": None,
+                "total_cross_unrealized_pnl": None,
+                "available_balance": None,
+                "max_withdraw_amount": None,
+                "assets": [],
+                "positions": [],
+                "snapshot_time": self._current_timestamp_ms(),
+                "skipped": True,
+                "skip_reason": "missing_credentials",
+            }
+
+            await self._emit_event(
+                "exchange.account.updated",
+                normalized,
+                priority=EventPriority.LOW,
+            )
+
+            return normalized
+
         payload = await self._request(
             method="GET",
             path="/fapi/v2/account",
@@ -657,6 +714,23 @@ class BinanceRestClient:
         symbol: str | None = None,
         recv_window: int | None = None,
     ) -> list[dict[str, Any]]:
+        if self._should_skip_private_read_without_credentials("get_positions"):
+            await self._emit_event(
+                "exchange.positions.snapshot",
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "symbol": symbol.upper() if symbol else None,
+                    "positions": [],
+                    "count": 0,
+                    "snapshot_time": self._current_timestamp_ms(),
+                    "skipped": True,
+                    "skip_reason": "missing_credentials",
+                },
+                priority=EventPriority.LOW,
+            )
+            return []
+
         params: dict[str, Any] = {
             "recvWindow": recv_window or self._rest_config.recv_window,
         }
@@ -703,6 +777,23 @@ class BinanceRestClient:
         symbol: str | None = None,
         recv_window: int | None = None,
     ) -> list[dict[str, Any]]:
+        if self._should_skip_private_read_without_credentials("get_open_orders"):
+            await self._emit_event(
+                "exchange.open_orders.snapshot",
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "symbol": symbol.upper() if symbol else None,
+                    "orders": [],
+                    "count": 0,
+                    "snapshot_time": self._current_timestamp_ms(),
+                    "skipped": True,
+                    "skip_reason": "missing_credentials",
+                },
+                priority=EventPriority.LOW,
+            )
+            return []
+
         params: dict[str, Any] = {
             "recvWindow": recv_window or self._rest_config.recv_window,
         }
@@ -791,6 +882,23 @@ class BinanceRestClient:
         recv_window: int | None = None,
     ) -> list[dict[str, Any]]:
         symbol = symbol.upper()
+
+        if self._should_skip_private_read_without_credentials("get_user_trades"):
+            await self._emit_event(
+                "exchange.trades.snapshot",
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "symbol": symbol,
+                    "trades": [],
+                    "count": 0,
+                    "snapshot_time": self._current_timestamp_ms(),
+                    "skipped": True,
+                    "skip_reason": "missing_credentials",
+                },
+                priority=EventPriority.LOW,
+            )
+            return []
 
         params: dict[str, Any] = {
             "symbol": symbol,
@@ -1366,8 +1474,24 @@ class BinanceRestClient:
     # Auth / signing helpers
     # ------------------------------------------------------------------
 
+    def has_credentials(self) -> bool:
+        return bool(self._api_key and self._api_secret)
+
+    def _should_skip_private_read_without_credentials(self, operation: str) -> bool:
+        if self.has_credentials():
+            return False
+
+        if not self._rest_config.allow_private_read_without_credentials:
+            return False
+
+        self._logger.warning(
+            "Skipping Binance Futures private read without credentials | operation=%s",
+            operation,
+        )
+        return True
+
     def _require_credentials(self) -> None:
-        if not self._api_key or not self._api_secret:
+        if not self.has_credentials():
             raise RuntimeError(
                 "Binance Futures API credentials are required for this endpoint"
             )

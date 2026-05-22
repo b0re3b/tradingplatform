@@ -80,6 +80,121 @@ class TelegramRouter:
     Router не знає про Telegram HTTP API і не викликає client.send_message().
     """
 
+    # Analytics events are high-volume and include many lifecycle/cache updates.
+    # Telegram should receive only actionable trading-style analytics events.
+    _ACTIONABLE_ANALYTICS_EVENTS: frozenset[str] = frozenset(
+        {
+            # Orderflow
+            "analytics.orderflow.cvd.signal",
+            "analytics.orderflow.volume_delta.signal",
+            "analytics.orderflow.aggressive_trades.signal",
+            "analytics.orderflow.orderbook_imbalance.signal",
+
+            # Liquidity
+            "analytics.liquidity.signal.updated",
+            "analytics.liquidity.level.swept",
+            "analytics.liquidity.stop_cluster.detected",
+
+            # Liquidations
+            "analytics.liquidations.cascade_detected",
+            "analytics.liquidations.exhaustion_detected",
+
+            # Whales
+            "analytics.whales.whale_pressure",
+            "analytics.whales.whale_liquidation_context",
+            "analytics.whales.whale_cluster_exhaustion",
+
+            # Spoofing
+            "analytics.spoofing.detected",
+
+            # Spreads
+            "analytics.spreads.signal.generated",
+            "analytics.spreads.arbitrage.opportunity",
+
+            # Funding
+            "analytics.funding.signal",
+            "analytics.funding.extreme",
+            "analytics.funding.flip",
+            "analytics.funding.divergence",
+            "analytics.funding.pressure",
+
+            # Open Interest: current package may emit analytics.oi.*
+            "analytics.oi.divergence",
+            "analytics.oi.anomaly",
+            "analytics.oi.squeeze_setup",
+            "analytics.oi.capitulation",
+            "analytics.oi.regime.changed",
+            "analytics.open_interest.divergence",
+            "analytics.open_interest.anomaly",
+            "analytics.open_interest.squeeze_setup",
+            "analytics.open_interest.capitulation",
+            "analytics.open_interest.regime.changed",
+        }
+    )
+
+    _ACTIONABLE_ANALYTICS_PATTERNS: tuple[str, ...] = (
+        "analytics.*.signal",
+        "analytics.*.*.signal",
+        "analytics.*.signal.generated",
+        "analytics.*.setup",
+        "analytics.*.*.setup",
+        "analytics.*.detected",
+        "analytics.*.*.detected",
+        "analytics.*.opportunity",
+        "analytics.*.*.opportunity",
+        "analytics.*.divergence",
+        "analytics.*.anomaly",
+        "analytics.*.capitulation",
+        "analytics.*.squeeze_setup",
+        "analytics.*.extreme",
+        "analytics.*.flip",
+        "analytics.*.pressure",
+        "analytics.*.cascade_detected",
+        "analytics.*.exhaustion_detected",
+    )
+
+    _NON_ACTIONABLE_ANALYTICS_SUFFIXES: tuple[str, ...] = (
+        ".started",
+        ".stopped",
+        ".heartbeat",
+        ".health",
+        ".healthcheck",
+        ".metrics",
+        ".snapshot",
+        ".updated",
+        ".cleanup",
+        ".error",
+        ".failed",
+        ".warning",
+        ".lifecycle",
+    )
+
+    _NON_ACTIONABLE_ANALYTICS_CONTAINS: tuple[str, ...] = (
+        ".analyzer.",
+        ".service.",
+        ".scheduler.",
+        ".persistence.",
+        ".state.",
+        ".cache.",
+    )
+
+    _DIAGNOSTIC_SIGNAL_REJECT_REASONS: frozenset[str] = frozenset(
+        {
+            "no_strategies_routed",
+            "no_strategy_routed",
+            "no_matching_strategy",
+            "no_route",
+            "not_routed",
+            "no_raw_signals",
+            "no_signals",
+            "no_signal",
+            "no_signal_generated",
+            "no_strategy_signal",
+            "no_candidate_signals",
+            "empty_signal_batch",
+        }
+    )
+
     def __init__(
         self,
         config: TelegramBotConfig,
@@ -173,6 +288,15 @@ class TelegramRouter:
             ),
             TelegramRoutingRule(
                 pattern="analytics.open_interest.*",
+                topic=TelegramTopic.OPEN_INTEREST,
+                message_type=TelegramMessageType.ANALYTICS_ALERT,
+                category=TelegramEventCategory.ANALYTICS,
+                priority=TelegramPriority.NORMAL,
+                level=TelegramNotificationLevel.INFO,
+                reason="open interest analytics event",
+            ),
+            TelegramRoutingRule(
+                pattern="analytics.oi.*",
                 topic=TelegramTopic.OPEN_INTEREST,
                 message_type=TelegramMessageType.ANALYTICS_ALERT,
                 category=TelegramEventCategory.ANALYTICS,
@@ -443,6 +567,18 @@ class TelegramRouter:
                 reason="telegram feature disabled by config",
             )
 
+        if self._should_skip_non_actionable_analytics(event_name):
+            return self._skipped_route(
+                event=event,
+                reason=f"non-actionable analytics event skipped: {event_name}",
+            )
+
+        if self._should_skip_diagnostic_signal_reject(event):
+            return self._skipped_route(
+                event=event,
+                reason="diagnostic signal.rejected skipped",
+            )
+
         rule = self._find_rule(event_name)
 
         if rule is None:
@@ -515,6 +651,7 @@ class TelegramRouter:
             "spreads": TelegramTopic.SPREADS,
             "funding": TelegramTopic.FUNDING,
             "open_interest": TelegramTopic.OPEN_INTEREST,
+            "oi": TelegramTopic.OPEN_INTEREST,
         }
 
         return mapping.get(normalized, TelegramTopic.SYSTEM)
@@ -541,6 +678,58 @@ class TelegramRouter:
         }
 
         return mapping.get(namespace, TelegramEventCategory.UNKNOWN)
+
+    def _should_skip_non_actionable_analytics(self, event_name: str) -> bool:
+        normalized = event_name.strip().lower()
+
+        if not normalized.startswith("analytics."):
+            return False
+
+        if normalized in self._ACTIONABLE_ANALYTICS_EVENTS:
+            return False
+
+        if any(part in normalized for part in self._NON_ACTIONABLE_ANALYTICS_CONTAINS):
+            return True
+
+        if normalized.endswith(self._NON_ACTIONABLE_ANALYTICS_SUFFIXES):
+            return True
+
+        if any(fnmatch(normalized, pattern) for pattern in self._ACTIONABLE_ANALYTICS_PATTERNS):
+            return False
+
+        return True
+
+    def _should_skip_diagnostic_signal_reject(self, event: TelegramEventPayload) -> bool:
+        event_name = event.metadata.event_name.strip().lower()
+        if event_name != "signal.rejected":
+            return False
+
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        reason = str(payload.get("reason") or payload.get("reject_reason") or "").strip().lower()
+        if reason in self._DIAGNOSTIC_SIGNAL_REJECT_REASONS:
+            return True
+
+        source_event_name = str(
+            payload.get("event_name")
+            or payload.get("source_event_name")
+            or payload.get("source_topic")
+            or ""
+        ).strip().lower()
+
+        if not source_event_name and isinstance(payload.get("route"), dict):
+            source_event_name = str(payload["route"].get("event_name") or "").strip().lower()
+
+        raw_signals = payload.get("raw_signals")
+        has_raw_signals = isinstance(raw_signals, list) and len(raw_signals) > 0
+
+        if (
+            source_event_name.startswith("analytics.")
+            and self._should_skip_non_actionable_analytics(source_event_name)
+            and not has_raw_signals
+        ):
+            return True
+
+        return False
 
     def _find_rule(self, event_name: str) -> TelegramRoutingRule | None:
         for rule in self._rules:
