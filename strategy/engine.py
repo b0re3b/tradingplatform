@@ -463,6 +463,10 @@ class StrategyEventHandler(BaseStrategyComponent):
     component_namespace = "strategy.event_handler"
 
     NON_TRADING_ANALYTICS_TOPIC_PARTS: tuple[str, ...] = (
+        ".started",
+        ".stopped",
+        ".registered",
+        ".unregistered",
         ".heartbeat",
         ".metrics",
         ".state_cleaned",
