@@ -22,7 +22,7 @@ from .models import (
     normalize_symbol,
     normalize_timeframe,
 )
-from .state import LiquidationState, SymbolLiquidationState
+from .state import LiquidationState, SymbolLiquidationState, get_shared_liquidation_state
 from .utils import (
     build_cluster_from_events_for_key,
     clamp_float,
@@ -75,7 +75,7 @@ class CascadeDetector:
         *,
         event_bus: EventBus,
         config: CascadeDetectorConfig,
-        state: LiquidationState,
+        state: LiquidationState | None = None,
         scheduler: Scheduler | None = None,
         metrics: LiquidationMetrics | None = None,
         service_name: str = "cascade_detector",
@@ -86,7 +86,7 @@ class CascadeDetector:
         self.config.validate()
         self.config.assert_input_topic_allowed()
 
-        self.state = state
+        self.state = state or get_shared_liquidation_state()
         self.metrics = metrics or LiquidationMetrics()
         self.service_name = service_name
 

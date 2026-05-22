@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from .cascade_detector import CascadeDetector
 from .config import (
     CascadeDetectorConfig,
@@ -47,6 +49,8 @@ from .models import (
 from .state import (
     LiquidationState,
     SymbolLiquidationState,
+    get_shared_liquidation_state,
+    reset_shared_liquidation_state,
 )
 from .utils import (
     build_cluster_from_events,
@@ -85,11 +89,75 @@ from .utils import (
 )
 
 
+def build_liquidation_stream_and_cascade_detector(
+    *,
+    event_bus: Any,
+    scheduler: Any | None = None,
+    stream_config: LiquidationStreamConfig | None = None,
+    cascade_config: CascadeDetectorConfig | None = None,
+    state: LiquidationState | None = None,
+    metrics: LiquidationMetrics | None = None,
+    history_store: LiquidationHistoryStoreProtocol | None = None,
+) -> tuple[LiquidationStream, CascadeDetector]:
+    """Build LiquidationStream and CascadeDetector with one shared state.
+
+    Kept directly in package __init__ to avoid adding a separate pipeline.py
+    while still giving app/factories.py a safe production helper.
+    """
+    resolved_stream_config = stream_config or LiquidationStreamConfig()
+    resolved_state = state or get_shared_liquidation_state(
+        max_events_per_symbol=resolved_stream_config.max_buffer_size_per_symbol,
+    )
+    resolved_metrics = metrics or LiquidationMetrics()
+
+    stream = LiquidationStream(
+        event_bus=event_bus,
+        scheduler=scheduler,
+        config=resolved_stream_config,
+        state=resolved_state,
+        metrics=resolved_metrics,
+        history_store=history_store,
+    )
+    detector = CascadeDetector(
+        event_bus=event_bus,
+        scheduler=scheduler,
+        config=cascade_config or CascadeDetectorConfig(),
+        state=resolved_state,
+        metrics=resolved_metrics,
+    )
+    return stream, detector
+
+
+def build_liquidations_components(
+    *,
+    event_bus: Any,
+    scheduler: Any | None = None,
+    stream_config: LiquidationStreamConfig | None = None,
+    cascade_config: CascadeDetectorConfig | None = None,
+    state: LiquidationState | None = None,
+    metrics: LiquidationMetrics | None = None,
+    history_store: LiquidationHistoryStoreProtocol | None = None,
+) -> list[Any]:
+    """Return liquidation analytics components using one shared state."""
+    stream, detector = build_liquidation_stream_and_cascade_detector(
+        event_bus=event_bus,
+        scheduler=scheduler,
+        stream_config=stream_config,
+        cascade_config=cascade_config,
+        state=state,
+        metrics=metrics,
+        history_store=history_store,
+    )
+    return [stream, detector]
+
+
 __all__ = [
     # Runtime classes
     "LiquidationStream",
     "LiquidationHistoryStoreProtocol",
     "CascadeDetector",
+    "build_liquidation_stream_and_cascade_detector",
+    "build_liquidations_components",
 
     # Configs
     "LiquidationsConfig",
@@ -116,6 +184,8 @@ __all__ = [
     # State
     "LiquidationState",
     "SymbolLiquidationState",
+    "get_shared_liquidation_state",
+    "reset_shared_liquidation_state",
 
     # Metrics
     "LatencyHistogram",

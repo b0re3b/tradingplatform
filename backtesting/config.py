@@ -18,8 +18,8 @@ class BacktestConfig:
 
     exchange: str = "binance"
     market_type: str = "usdm_futures"
-    symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "RIVERUSDT")
-    timeframes: tuple[str, ...] = ("1m", "15m")
+    symbols: tuple[str, ...] = ("BTCUSDT")
+    timeframes: tuple[str, ...] = ("1h", "15m", "4h")
     lookback_days: int = 7
 
     initial_balance_usd: Decimal = Decimal("1000")
@@ -54,6 +54,8 @@ class BacktestConfig:
     low_queue_size_threshold: int = 100
 
     historical_cache_dir: Path = Path("data/historical/binance/usdm_futures")
+    historical_cache_mode: Literal["cache_first", "cache_only", "refresh_missing", "refresh_all"] = "cache_first"
+    historical_cache_coverage_tolerance_ms: int = 0
     reports_dir: Path = Path("reports/backtests")
 
     backtest_id: str | None = None
@@ -109,6 +111,14 @@ class BacktestConfig:
         for timeframe in self.timeframes:
             if timeframe not in allowed_timeframes:
                 raise BacktestConfigurationError(f"Unsupported timeframe: {timeframe}")
+
+        if self.historical_cache_mode not in {"cache_first", "cache_only", "refresh_missing", "refresh_all"}:
+            raise BacktestConfigurationError(
+                "historical_cache_mode must be one of: cache_first, cache_only, refresh_missing, refresh_all."
+            )
+
+        if self.historical_cache_coverage_tolerance_ms < 0:
+            raise BacktestConfigurationError("historical_cache_coverage_tolerance_ms must be >= 0.")
 
         if self.initial_balance_usd <= 0:
             raise BacktestConfigurationError("initial_balance_usd must be positive.")

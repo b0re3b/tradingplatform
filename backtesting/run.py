@@ -64,6 +64,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run production Scheduler loop during backtest. Disabled by default for deterministic replay.",
     )
+    parser.add_argument(
+        "--cache-mode",
+        choices=["cache_first", "cache_only", "refresh_missing", "refresh_all"],
+        default="cache_first",
+        help="Historical loader cache behavior. cache_first reads local CSV cache and fetches only missing ranges.",
+    )
+    parser.add_argument(
+        "--cache-coverage-tolerance-ms",
+        type=int,
+        default=0,
+        help="Optional cache coverage tolerance. 0 uses sensible per-data-type defaults.",
+    )
     parser.add_argument("--request-delay", type=float, default=0.25)
     parser.add_argument("--request-retries", type=int, default=5)
     parser.add_argument("--request-retry-delay", type=float, default=2.0)
@@ -94,6 +106,8 @@ async def amain() -> None:
         enable_mark_price=not args.disable_mark_price,
         enable_agg_trades=args.enable_agg_trades,
         disable_scheduler_loop=not args.enable_scheduler_loop,
+        historical_cache_mode=args.cache_mode,
+        historical_cache_coverage_tolerance_ms=args.cache_coverage_tolerance_ms,
         request_delay_seconds=args.request_delay,
         request_retries=args.request_retries,
         request_retry_delay_seconds=args.request_retry_delay,

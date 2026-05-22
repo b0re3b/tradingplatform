@@ -383,33 +383,131 @@ class BinanceHistoryLoader:
         row_mapper: Any,
         next_cursor: Any,
     ) -> list[dict[str, Any]]:
+        """
+        Cache-first historical loading.
+
+        The backtest should not repeatedly download the same candles/history on every
+        run. This method treats CSV cache as the primary source and fetches only the
+        missing gaps/tail unless historical_cache_mode='refresh_all'.
+
+        Modes:
+        - cache_first: return full cache coverage; fetch only missing gaps.
+        - cache_only: never use REST; fail if cache does not cover the requested range.
+        - refresh_missing: alias for cache_first.
+        - refresh_all: ignore cache and re-download the requested range.
+        """
         cache_file = self._cache_file(symbol=symbol, category=category, timeframe=timeframe)
-        cached = self._read_cached_rows(
-            cache_file,
+        cache_mode = str(getattr(self._config, "historical_cache_mode", "cache_first")).lower()
+        tolerance_ms = self._coverage_tolerance_ms(timeframe=timeframe, category=category)
+
+        full_cached = [] if cache_mode == "refresh_all" else self._read_all_cached_rows(cache_file)
+        requested_cached = self._filter_rows_by_range(
+            full_cached,
             start_time_ms,
             end_time_ms,
             timestamp_key=timestamp_key,
         )
 
-        if cached:
-            # Cache coverage can be imperfect near "now"; still return cached rows and
-            # append missing rows instead of assuming perfect coverage.
-            first = min(int(row[timestamp_key]) for row in cached if row.get(timestamp_key))
-            last = max(int(row[timestamp_key]) for row in cached if row.get(timestamp_key))
-            if first <= start_time_ms and last >= end_time_ms:
-                return sorted(cached, key=lambda row: int(row[timestamp_key]))
+        if requested_cached and self._covers_range(
+            requested_cached,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            timestamp_key=timestamp_key,
+            tolerance_ms=tolerance_ms,
+        ):
+            self._logger.info(
+                "Historical cache hit | category=%s symbol=%s timeframe=%s rows=%s file=%s",
+                category,
+                symbol,
+                timeframe,
+                len(requested_cached),
+                cache_file,
+            )
+            return sorted(requested_cached, key=lambda row: int(row[timestamp_key]))
 
+        if cache_mode == "cache_only":
+            raise BacktestDataError(
+                f"Historical cache does not cover requested range | "
+                f"category={category} symbol={symbol} timeframe={timeframe} "
+                f"start={start_time_ms} end={end_time_ms} file={cache_file}"
+            )
+
+        missing_ranges = self._missing_ranges(
+            requested_cached,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            timestamp_key=timestamp_key,
+            timeframe=timeframe,
+            category=category,
+        )
+
+        fetched_rows: list[dict[str, Any]] = []
+        for missing_start_ms, missing_end_ms in missing_ranges:
+            fetched_rows.extend(
+                await self._fetch_paginated_range(
+                    fetcher=fetcher,
+                    row_mapper=row_mapper,
+                    next_cursor=next_cursor,
+                    timestamp_key=timestamp_key,
+                    start_time_ms=missing_start_ms,
+                    end_time_ms=missing_end_ms,
+                )
+            )
+
+        if fetched_rows:
+            merged_all = self._merge_rows(full_cached, fetched_rows, unique_key=unique_key)
+            self._write_cached_rows(cache_file, merged_all)
+            self._logger.info(
+                "Historical cache updated | category=%s symbol=%s timeframe=%s fetched=%s cached_total=%s file=%s",
+                category,
+                symbol,
+                timeframe,
+                len(fetched_rows),
+                len(merged_all),
+                cache_file,
+            )
+        else:
+            merged_all = full_cached
+            self._logger.info(
+                "Historical cache reused with no fetch | category=%s symbol=%s timeframe=%s rows=%s file=%s",
+                category,
+                symbol,
+                timeframe,
+                len(requested_cached),
+                cache_file,
+            )
+
+        result = self._filter_rows_by_range(
+            merged_all,
+            start_time_ms,
+            end_time_ms,
+            timestamp_key=timestamp_key,
+        )
+
+        return sorted(result, key=lambda row: int(row[timestamp_key]))
+
+    async def _fetch_paginated_range(
+        self,
+        *,
+        fetcher: Any,
+        row_mapper: Any,
+        next_cursor: Any,
+        timestamp_key: str,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         cursor = start_time_ms
 
-        while cursor < end_time_ms:
+        while cursor <= end_time_ms:
             data = await fetcher(cursor)
             if not data:
                 break
 
             for item in data:
                 row = row_mapper(item)
-                if int(row[timestamp_key]) <= end_time_ms:
+                row_ts = int(row[timestamp_key])
+                if start_time_ms <= row_ts <= end_time_ms:
                     rows.append(row)
 
             candidate = int(next_cursor(data, cursor))
@@ -417,15 +515,94 @@ class BinanceHistoryLoader:
                 break
             cursor = candidate
 
-        merged = self._merge_rows(cached, rows, unique_key=unique_key)
-        self._write_cached_rows(cache_file, merged)
+        return rows
 
-        return [
-            row
-            for row in merged
-            if row.get(timestamp_key)
-            and start_time_ms <= int(row[timestamp_key]) <= end_time_ms
-        ]
+    def _coverage_tolerance_ms(self, *, timeframe: str, category: str) -> int:
+        configured = int(getattr(self._config, "historical_cache_coverage_tolerance_ms", 0) or 0)
+        if configured > 0:
+            return configured
+
+        if category in {"klines", "mark_price_klines", "open_interest"}:
+            try:
+                return timeframe_to_ms(timeframe)
+            except Exception:
+                return 60_000
+
+        if category == "funding":
+            return 8 * 60 * 60 * 1000
+
+        if category == "agg_trades":
+            return 1_000
+
+        return 0
+
+    def _covers_range(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+        timestamp_key: str,
+        tolerance_ms: int,
+    ) -> bool:
+        if not rows:
+            return False
+
+        timestamps = sorted(int(row[timestamp_key]) for row in rows if row.get(timestamp_key))
+        if not timestamps:
+            return False
+
+        return (
+            timestamps[0] <= start_time_ms + tolerance_ms
+            and timestamps[-1] >= end_time_ms - tolerance_ms
+        )
+
+    def _missing_ranges(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+        timestamp_key: str,
+        timeframe: str,
+        category: str,
+    ) -> list[tuple[int, int]]:
+        if not rows:
+            return [(start_time_ms, end_time_ms)]
+
+        timestamps = sorted({int(row[timestamp_key]) for row in rows if row.get(timestamp_key)})
+        if not timestamps:
+            return [(start_time_ms, end_time_ms)]
+
+        step_ms = self._expected_step_ms(timeframe=timeframe, category=category)
+        tolerance_ms = self._coverage_tolerance_ms(timeframe=timeframe, category=category)
+        ranges: list[tuple[int, int]] = []
+
+        first = timestamps[0]
+        if first > start_time_ms + tolerance_ms:
+            ranges.append((start_time_ms, first - 1))
+
+        previous = first
+        for current in timestamps[1:]:
+            if step_ms > 0 and current - previous > step_ms * 2:
+                ranges.append((previous + 1, current - 1))
+            previous = current
+
+        last = timestamps[-1]
+        if last < end_time_ms - tolerance_ms:
+            ranges.append((last + 1, end_time_ms))
+
+        return [(start, end) for start, end in ranges if start <= end]
+
+    def _expected_step_ms(self, *, timeframe: str, category: str) -> int:
+        if category in {"klines", "mark_price_klines", "open_interest"}:
+            try:
+                return timeframe_to_ms(timeframe)
+            except Exception:
+                return 0
+        if category == "funding":
+            return 8 * 60 * 60 * 1000
+        return 0
 
     async def _request(self, path: str, params: dict[str, Any]) -> Any:
         if self._session is None:
@@ -487,6 +664,28 @@ class BinanceHistoryLoader:
     def _cache_file(self, *, symbol: str, category: str, timeframe: str) -> Path:
         return ensure_dir(self._config.historical_cache_dir / symbol / timeframe) / f"{category}.csv"
 
+    def _read_all_cached_rows(self, path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+
+        with path.open("r", encoding="utf-8", newline="") as file:
+            return list(csv.DictReader(file))
+
+    def _filter_rows_by_range(
+        self,
+        rows: list[dict[str, Any]],
+        start_time_ms: int,
+        end_time_ms: int,
+        *,
+        timestamp_key: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            row
+            for row in rows
+            if row.get(timestamp_key)
+            and start_time_ms <= int(row[timestamp_key]) <= end_time_ms
+        ]
+
     def _read_cached_rows(
         self,
         path: Path,
@@ -495,16 +694,12 @@ class BinanceHistoryLoader:
         *,
         timestamp_key: str,
     ) -> list[dict[str, Any]]:
-        if not path.exists():
-            return []
-
-        with path.open("r", encoding="utf-8", newline="") as file:
-            return [
-                row
-                for row in csv.DictReader(file)
-                if row.get(timestamp_key)
-                and start_time_ms <= int(row[timestamp_key]) <= end_time_ms
-            ]
+        return self._filter_rows_by_range(
+            self._read_all_cached_rows(path),
+            start_time_ms,
+            end_time_ms,
+            timestamp_key=timestamp_key,
+        )
 
     def _write_cached_rows(self, path: Path, rows: list[dict[str, Any]]) -> None:
         ensure_dir(path.parent)

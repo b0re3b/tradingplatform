@@ -108,6 +108,74 @@ def _parse_instrument_type(value: InstrumentType | str | None) -> InstrumentType
     return InstrumentType.UNKNOWN
 
 
+def _infer_instrument_type_from_payload(payload: Mapping[str, Any]) -> InstrumentType:
+    """
+    Infer spread instrument type from production market-data payloads.
+
+    OrderBookCache / market.orderbook.updated may not carry an explicit
+    `instrument_type`, while futures/perpetual exchange adapters usually carry
+    `market_type` values such as `usdm_futures`, `linear`, `swap`, `contract`,
+    or exchange-specific futures symbols. QuoteSnapshot must not receive
+    InstrumentType.UNKNOWN, so this helper provides a safe futures-first
+    inference without changing the strict QuoteSnapshot validation.
+
+    Explicit instrument fields always win. For ambiguous missing metadata we
+    default to PERPETUAL because this runtime uses futures/perpetual market-data
+    adapters.
+    """
+    explicit = _parse_instrument_type(
+        _first_present(payload, "instrument_type", "instrument", "type")
+    )
+    if explicit != InstrumentType.UNKNOWN:
+        return explicit
+
+    market_type = _first_present(
+        payload,
+        "market_type",
+        "market",
+        "contract_type",
+        "category",
+        "inst_type",
+        "instrument_kind",
+    )
+    raw_market = str(market_type or "").strip().lower()
+
+    if raw_market:
+        if raw_market in {"spot", "cash"}:
+            return InstrumentType.SPOT
+
+        if any(
+            token in raw_market
+            for token in (
+                "perp",
+                "perpetual",
+                "swap",
+                "linear",
+                "inverse",
+                "usdm",
+                "usd-m",
+                "coinm",
+                "coin-m",
+                "contract",
+            )
+        ):
+            return InstrumentType.PERPETUAL
+
+        if "future" in raw_market or "futures" in raw_market:
+            return InstrumentType.FUTURES
+
+    exchange_symbol = str(
+        _first_present(payload, "exchange_symbol", "raw_symbol", "symbol") or ""
+    ).strip().upper()
+
+    if exchange_symbol.endswith("-SWAP") or "_PERP" in exchange_symbol or "PERP" in exchange_symbol:
+        return InstrumentType.PERPETUAL
+
+    # Futures-first runtime fallback. This prevents production orderbook events
+    # without explicit instrument metadata from being dropped by spread analyzers.
+    return InstrumentType.PERPETUAL
+
+
 def _validate_non_empty(name: str, value: str) -> None:
     if not value or not value.strip():
         raise ValueError(f"{name} must not be empty")
@@ -448,15 +516,17 @@ def quote_snapshot_from_orderbook_payload(
     bid, bid_size = _extract_best_bid(payload)
     ask, ask_size = _extract_best_ask(payload)
 
-    instrument_type = _parse_instrument_type(
-        _first_present(payload, "instrument_type", "instrument", "type")
-    )
+    instrument_type = _infer_instrument_type_from_payload(payload)
+    market_type = _first_present(payload, "market_type", "market", "contract_type")
+
+    if market_type is None:
+        market_type = _normalize_market_type(instrument_type=instrument_type)
 
     return QuoteSnapshot(
         exchange=str(payload["exchange"]),
         symbol=str(payload["symbol"]),
         instrument_type=instrument_type,
-        market_type=_first_present(payload, "market_type", "market", "contract_type"),
+        market_type=market_type,
         timeframe=str(_first_present(payload, "timeframe", "interval") or DEFAULT_TIMEFRAME),
         exchange_symbol=_first_present(payload, "exchange_symbol", "raw_symbol"),
         bid=bid,

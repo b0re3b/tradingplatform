@@ -46,6 +46,8 @@ class BacktestRecorder:
         "position.closed",
         "portfolio.updated",
         "risk.kill_switch",
+        "signal.rejected",
+        "strategy.engine.batch_processed",
     )
 
     def __init__(self, *, event_bus: EventBus) -> None:
@@ -64,6 +66,10 @@ class BacktestRecorder:
         self.positions: list[dict[str, Any]] = []
         self.portfolio: list[dict[str, Any]] = []
         self.analytics_events: list[dict[str, Any]] = []
+        self.rejected_by_reason: dict[str, int] = {}
+        self.rejected_by_stage: dict[str, int] = {}
+        self.batch_reasons: dict[str, int] = {}
+        self.selected_strategies: dict[str, int] = {}
 
     def register(self) -> None:
         if self._subscriptions:

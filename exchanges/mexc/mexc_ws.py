@@ -55,8 +55,12 @@ class MexcWebSocketClientConfig:
         recv_window_ms: int = 10_000,
         disable_default_private_pushes: bool = False,
     ) -> "MexcWebSocketClientConfig":
+        defaults = cls()
+
         return cls(
-            ws_url=config.exchange.ws_url or cls.ws_url,
+            # Do not use cls.ws_url here: with dataclass(slots=True) it is a slot descriptor,
+            # not the default string value.
+            ws_url=config.exchange.ws_url or defaults.ws_url,
             timeout_seconds=config.exchange.timeout_seconds,
             reconnect_delay_seconds=config.exchange.reconnect_delay,
             max_reconnect_attempts=config.exchange.max_reconnect_attempts,
@@ -1094,6 +1098,14 @@ class MexcWebSocketClient:
     def _validate_config(self) -> None:
         if not self._symbols:
             raise ValueError("At least one MEXC symbol must be configured")
+
+        ws_url = self._ws_config.ws_url
+        if not isinstance(ws_url, str) or not ws_url.startswith(("ws://", "wss://")):
+            raise ValueError(
+                f"Invalid MEXC WS URL: {ws_url!r}. "
+                "Expected a real ws:// or wss:// URL. "
+                "Check MexcWebSocketClientConfig.from_core_config()."
+            )
 
         unsupported = set(self._streams) - self.SUPPORTED_STREAMS
         if unsupported:

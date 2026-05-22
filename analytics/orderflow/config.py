@@ -345,6 +345,7 @@ def _base_kwargs_from_section(
     update_topic: str,
     signal_topic: str,
     default_min_signal_interval_sec: float = 0.75,
+    default_min_update_interval_sec: float = 2.0,
 ) -> dict[str, Any]:
     return {
         "enabled": _get_bool(section, "enabled", True),
@@ -354,6 +355,11 @@ def _base_kwargs_from_section(
             section,
             "min_signal_interval_sec",
             default_min_signal_interval_sec,
+        ),
+        "min_update_interval_sec": _get_float(
+            section,
+            "min_update_interval_sec",
+            default_min_update_interval_sec,
         ),
         "health_log_interval_sec": _get_float(section, "health_log_interval_sec", 30.0),
         "cleanup_interval_sec": _get_float(section, "cleanup_interval_sec", 15.0),
@@ -410,6 +416,11 @@ class BaseOrderFlowSubConfig:
     emit_signals: bool = True
 
     min_signal_interval_sec: float = 0.75
+    # Throttle noisy *.updated events per analyzer scope/key.
+    # Signals keep using min_signal_interval_sec; this setting is only for
+    # high-frequency state updates such as aggressive_trades.updated,
+    # volume_delta.updated and cvd.updated.
+    min_update_interval_sec: float = 2.0
 
     health_log_interval_sec: float = 30.0
     cleanup_interval_sec: float = 15.0
@@ -528,6 +539,9 @@ class BaseOrderFlowSubConfig:
         if self.min_signal_interval_sec < 0:
             errors.append("min_signal_interval_sec must be >= 0")
 
+        if self.min_update_interval_sec < 0:
+            errors.append("min_update_interval_sec must be >= 0")
+
         if self.health_log_interval_sec <= 0:
             errors.append("health_log_interval_sec must be > 0")
 
@@ -573,6 +587,7 @@ class BaseOrderFlowSubConfig:
             "emit_updates": self.emit_updates,
             "emit_signals": self.emit_signals,
             "min_signal_interval_sec": self.min_signal_interval_sec,
+            "min_update_interval_sec": self.min_update_interval_sec,
             "health_log_interval_sec": self.health_log_interval_sec,
             "cleanup_interval_sec": self.cleanup_interval_sec,
             "scheduler_job_timeout_sec": self.scheduler_job_timeout_sec,

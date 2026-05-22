@@ -467,6 +467,387 @@ class SignalNormalizer(BaseStrategyComponent):
         "d1": Timeframe.D1,
     }
 
+
+    # ------------------------------------------------------------------
+    # Topic-aware contract helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_mapping_or_none(value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            return value
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            converted = to_dict()
+            if isinstance(converted, dict):
+                return converted
+
+        return None
+
+    @staticmethod
+    def _topic_from_payload(payload: dict[str, Any]) -> str:
+        return (
+            str(
+                payload.get("event_name")
+                or payload.get("topic")
+                or payload.get("source_topic")
+                or payload.get("event_type")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+
+    def _direct_payload_value(
+            self,
+            payload: dict[str, Any],
+            *,
+            feature_map: dict[str, Any] | None = None,
+    ) -> Any | None:
+        """
+        Return the real direct-event object from analytics payloads.
+
+        Many analytics events use the same shape regardless of domain:
+        {"state": ...}, {"snapshot": ...}, {"result": ...}, {"event": ...},
+        {"signal": ...}.  The old adapters often treated payload["state"] as a
+        composite object, which broke direct module events such as
+        analytics.price_action.market_structure.updated.  This helper lets the
+        topic decide the canonical section while preserving typed objects.
+        """
+        feature_map = feature_map if isinstance(feature_map, dict) else {}
+        for key in (
+                "state",
+                "snapshot",
+                "result",
+                "event",
+                "setup",
+                "signal",
+                "data",
+                "payload",
+        ):
+            if payload.get(key) is not None:
+                return payload[key]
+            if feature_map.get(key) is not None:
+                return feature_map[key]
+        return None
+
+    def _direct_topic_section(
+            self,
+            source: FeatureSource,
+            payload: dict[str, Any],
+    ) -> str | None:
+        """Infer canonical domain section from the analytics topic."""
+        topic = self._topic_from_payload(payload)
+        if not topic:
+            return None
+
+        # Price action modules.
+        if source is FeatureSource.PRICE_ACTION:
+            if "market_structure" in topic:
+                return "market_structure"
+            if "support_resistance" in topic or ".sr" in topic:
+                return "support_resistance"
+            if "fair_value_gap" in topic or ".fvg" in topic:
+                return "fair_value_gap"
+            if "liquidity_levels" in topic:
+                return "liquidity_levels"
+            if ".trend" in topic or topic.endswith("trend.updated"):
+                return "trend"
+            if topic.endswith("price_action.updated"):
+                return "composite"
+            return None
+
+        if source is FeatureSource.ORDERFLOW:
+            if ".cvd" in topic or "cumulative_delta" in topic:
+                return "cvd"
+            if "volume_delta" in topic or "delta" in topic:
+                return "volume_delta"
+            if "aggressive_trades" in topic or "aggression" in topic:
+                return "aggressive_trades"
+            if "orderbook_imbalance" in topic or "book_imbalance" in topic:
+                return "orderbook_imbalance"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            if topic.endswith("orderflow.updated"):
+                return "composite"
+            return None
+
+        if source is FeatureSource.OPEN_INTEREST:
+            if "regime" in topic:
+                return "regime"
+            if "divergence" in topic:
+                return "divergence"
+            if "anomaly" in topic:
+                return "anomaly"
+            if "features" in topic:
+                return "features"
+            if "context" in topic:
+                return "context"
+            if topic.endswith("open_interest.updated") or topic.endswith("oi.updated"):
+                return "snapshot"
+            return None
+
+        if source is FeatureSource.FUNDING:
+            if "statistics" in topic or "stats" in topic:
+                return "statistics"
+            if "regime" in topic:
+                return "regime"
+            if "pressure" in topic:
+                return "pressure"
+            if "extreme" in topic:
+                return "extreme"
+            if "divergence" in topic:
+                return "divergence"
+            if "flip" in topic:
+                return "flip"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            if topic.endswith("funding.updated") or topic.endswith("market.funding.updated"):
+                return "snapshot"
+            return None
+
+        if source is FeatureSource.LIQUIDATIONS:
+            if "cascade" in topic:
+                return "cascade"
+            if "exhaustion" in topic:
+                return "exhaustion"
+            if "squeeze" in topic:
+                return "squeeze"
+            if "cluster" in topic:
+                return "cluster"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            if "liquidation" in topic:
+                return "analysis"
+            return None
+
+        if source is FeatureSource.LIQUIDITY:
+            if "map" in topic or "snapshot" in topic or topic.endswith("liquidity.updated"):
+                return "snapshot"
+            if "level" in topic:
+                return "active_levels"
+            if "cluster" in topic:
+                return "stop_clusters"
+            if "zone" in topic:
+                return "liquidity_zones"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            return None
+
+        if source is FeatureSource.SPOOFING:
+            if "layering" in topic:
+                return "layering"
+            if "fake_liquidity" in topic or "fake" in topic:
+                return "fake_liquidity"
+            if "order_pull" in topic or "pull" in topic:
+                return "order_pull"
+            if "absorption" in topic:
+                return "absorption"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            if "spoof" in topic:
+                return "analysis"
+            return None
+
+        if source is FeatureSource.SPREADS:
+            if "basis" in topic and "funding" in topic:
+                return "funding_adjusted_spread"
+            if "basis" in topic:
+                return "basis"
+            if "cross_exchange" in topic or "cross" in topic:
+                return "cross_exchange"
+            if "mean_reversion" in topic:
+                return "mean_reversion"
+            if "momentum" in topic:
+                return "momentum"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            if "spread" in topic:
+                return "analysis"
+            return None
+
+        if source is FeatureSource.WHALES:
+            if "absorption" in topic:
+                return "absorption"
+            if "breakout" in topic:
+                return "breakout"
+            if "accumulation" in topic:
+                return "accumulation"
+            if "distribution" in topic:
+                return "distribution"
+            if "liquidation" in topic:
+                return "liquidation_context"
+            if "cluster" in topic:
+                return "cluster"
+            if "signal" in topic or "setup" in topic:
+                return "signal"
+            if "whale" in topic:
+                return "analysis"
+            return None
+
+        return None
+
+    def _apply_direct_topic_section_alias(
+            self,
+            *,
+            source: FeatureSource,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        """Expose direct analytics event payload under its canonical section."""
+        section = self._direct_topic_section(source, payload)
+        if not section:
+            return
+
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        value = self._direct_payload_value(payload, feature_map=feature_map)
+        if value is None:
+            return
+
+        domain_data.setdefault(section, value)
+
+        aliases_by_source: dict[FeatureSource, dict[str, tuple[str, ...]]] = {
+            FeatureSource.PRICE_ACTION: {
+                "market_structure": ("structure", "market_structure_state"),
+                "support_resistance": ("sr", "support_resistance_state"),
+                "fair_value_gap": ("fvg", "fair_value_gap_state", "fvg_state"),
+                "liquidity_levels": ("liquidity", "levels"),
+                "trend": ("trend_state",),
+                "composite": ("state", "snapshot", "price_action", "price_action_state"),
+            },
+            FeatureSource.ORDERFLOW: {
+                "composite": ("snapshot", "orderflow_snapshot", "composite_snapshot"),
+                "cvd": ("cumulative_delta", "cvd_state"),
+                "volume_delta": ("delta", "volume_delta_state"),
+                "aggressive_trades": ("aggression", "aggressive_trades_state"),
+                "orderbook_imbalance": ("orderbook", "order_book_imbalance"),
+                "signal": ("orderflow_signal", "analytics_signal", "setup"),
+            },
+            FeatureSource.OPEN_INTEREST: {
+                "snapshot": ("oi_snapshot", "open_interest_snapshot"),
+                "context": ("oi_context", "open_interest_context"),
+                "features": ("oi_features", "open_interest_features"),
+                "regime": ("regime_result", "oi_regime", "open_interest_regime"),
+                "divergence": ("divergence_result", "oi_divergence", "open_interest_divergence"),
+                "anomaly": ("anomaly_result", "oi_anomaly", "open_interest_anomaly"),
+            },
+            FeatureSource.FUNDING: {
+                "snapshot": ("funding_snapshot",),
+                "statistics": ("stats", "funding_statistics"),
+                "regime": ("regime_state", "funding_regime"),
+                "pressure": ("pressure_state", "funding_pressure"),
+                "extreme": ("extreme_event", "funding_extreme"),
+                "divergence": ("divergence_event", "funding_divergence"),
+                "flip": ("flip_event", "funding_flip"),
+                "signal": ("funding_signal", "analytics_signal", "setup"),
+            },
+            FeatureSource.LIQUIDATIONS: {
+                "analysis": ("liquidations_analysis", "liquidation_analysis", "result"),
+                "cascade": ("liquidation_cascade",),
+                "exhaustion": ("liquidation_exhaustion",),
+                "squeeze": ("liquidation_squeeze",),
+                "cluster": ("liquidation_cluster", "cluster_stats"),
+                "signal": ("liquidation_signal", "liquidations_signal", "setup"),
+            },
+            FeatureSource.LIQUIDITY: {
+                "snapshot": ("liquidity_map_snapshot", "liquidity_snapshot"),
+                "active_levels": ("liquidity_levels",),
+                "stop_clusters": ("liquidity_clusters",),
+                "liquidity_zones": ("zones",),
+                "signal": ("liquidity_signal", "analytics_signal", "setup"),
+            },
+            FeatureSource.SPOOFING: {
+                "analysis": ("spoofing_analysis", "result"),
+                "layering": ("layering_signal",),
+                "fake_liquidity": ("fake_liquidity_signal",),
+                "order_pull": ("order_pull_signal",),
+                "absorption": ("absorption_signal",),
+                "signal": ("spoofing_signal", "analytics_signal", "setup"),
+            },
+            FeatureSource.SPREADS: {
+                "analysis": ("spread_analysis", "spreads_analysis", "result"),
+                "basis": ("spot_futures_basis", "basis_signal"),
+                "funding_adjusted_spread": ("funding_adjusted_basis", "funding_edge"),
+                "cross_exchange": ("cross_exchange_spread", "cross_exchange_arb"),
+                "mean_reversion": ("spread_mean_reversion",),
+                "momentum": ("spread_momentum",),
+                "signal": ("spread_signal", "analytics_signal", "setup"),
+            },
+            FeatureSource.WHALES: {
+                "analysis": ("whale_analysis", "whales_analysis", "result"),
+                "absorption": ("whale_absorption",),
+                "breakout": ("whale_breakout",),
+                "accumulation": ("whale_accumulation",),
+                "distribution": ("whale_distribution",),
+                "liquidation_context": ("whale_liquidation_context",),
+                "cluster": ("whale_cluster",),
+                "signal": ("whale_signal", "analytics_signal", "setup"),
+            },
+        }
+
+        for alias in aliases_by_source.get(source, {}).get(section, ()):
+            domain_data.setdefault(alias, value)
+
+    def _wrap_price_action_module_view(
+            self,
+            *,
+            module: Any,
+            event_payload: dict[str, Any],
+            fallback_topic: str,
+            section: str,
+    ) -> Any:
+        """Wrap flat price-action module events into internal/external layer views."""
+        module_map = self._as_mapping_or_none(module)
+        if module_map is None:
+            return module
+
+        if any(key in module_map for key in ("internal", "external", "last_event", "last_signal")):
+            return module
+
+        event = dict(event_payload)
+        event.update({key: value for key, value in module_map.items() if key not in event})
+        event.setdefault("event_type", event.get("type") or event.get("kind") or fallback_topic.split(".")[-1])
+        event.setdefault("source_topic", fallback_topic)
+
+        confidence = (
+            event.get("confidence")
+            or event.get("score")
+            or module_map.get("confidence")
+            or module_map.get("score")
+            or 0.0
+        )
+        strength = (
+            event.get("strength")
+            or event.get("score")
+            or module_map.get("strength")
+            or module_map.get("score")
+            or confidence
+        )
+
+        layer = dict(module_map)
+        layer.setdefault("last_event", event)
+        if section == "trend":
+            layer.setdefault("last_signal", event)
+        layer.setdefault("confidence", confidence)
+        layer.setdefault("strength", strength)
+        layer.setdefault("score", module_map.get("score", confidence))
+        layer.setdefault("updated_at", event.get("timestamp") or event.get("time"))
+
+        result = dict(module_map)
+        result.setdefault("external", layer)
+        result.setdefault("internal", layer)
+        result.setdefault("last_event", event)
+        if section == "trend":
+            result.setdefault("last_signal", event)
+        result.setdefault("confidence", confidence)
+        result.setdefault("strength", strength)
+        result.setdefault("updated_at", event.get("timestamp") or event.get("time"))
+        return result
+
     def _augment_funding_domain_data(
             self,
             *,
@@ -3031,6 +3412,35 @@ class SignalNormalizer(BaseStrategyComponent):
             "setup",
         )
 
+        # Direct price-action module events usually arrive as {"state": ...}
+        # and the topic determines whether that state is market_structure,
+        # trend, fvg, support/resistance, liquidity, or a composite snapshot.
+        direct_section = self._direct_topic_section(FeatureSource.PRICE_ACTION, payload)
+        direct_value = self._direct_payload_value(payload, feature_map=feature_map)
+        if direct_section and direct_value is not None:
+            if direct_section == "market_structure" and market_structure is None:
+                market_structure = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "support_resistance" and support_resistance is None:
+                support_resistance = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "fair_value_gap" and fair_value_gap is None:
+                fair_value_gap = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "trend" and trend is None:
+                trend = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "liquidity_levels" and liquidity_levels is None:
+                liquidity_levels = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "composite" and composite is None:
+                composite = direct_value
+
         for container_key in (
                 "result",
                 "payload",
@@ -3225,6 +3635,40 @@ class SignalNormalizer(BaseStrategyComponent):
                 ),
                 "origin": payload.get("origin", "price_action"),
             }
+
+        if market_structure is not None:
+            market_structure = self._ensure_price_action_market_structure_view(
+                module=self._as_mapping_or_none(market_structure) or {"value": market_structure},
+                event_payload=payload,
+                fallback_topic=topic,
+            )
+        if trend is not None:
+            trend = self._ensure_price_action_trend_view(
+                module=self._as_mapping_or_none(trend) or {"value": trend},
+                event_payload=payload,
+                fallback_topic=topic,
+            )
+        if support_resistance is not None:
+            support_resistance = self._wrap_price_action_module_view(
+                module=support_resistance,
+                event_payload=payload,
+                fallback_topic=topic,
+                section="support_resistance",
+            )
+        if fair_value_gap is not None:
+            fair_value_gap = self._wrap_price_action_module_view(
+                module=fair_value_gap,
+                event_payload=payload,
+                fallback_topic=topic,
+                section="fair_value_gap",
+            )
+        if liquidity_levels is not None:
+            liquidity_levels = self._wrap_price_action_module_view(
+                module=liquidity_levels,
+                event_payload=payload,
+                fallback_topic=topic,
+                section="liquidity_levels",
+            )
 
         set_aliases(
             "analysis",
@@ -5138,6 +5582,16 @@ class SignalNormalizer(BaseStrategyComponent):
                 domain_data=domain_data,
             )
 
+        # Final topic-aware safety net for direct analytics events such as
+        # analytics.<domain>.<section>.updated with payload["state"].
+        # Domain-specific adapters above keep richer logic; this only ensures
+        # canonical section aliases exist for routing/required_features.
+        self._apply_direct_topic_section_alias(
+            source=source,
+            payload=payload,
+            domain_data=domain_data,
+        )
+
         self._ensure_common_domain_contract(
             source=source,
             payload=payload,
@@ -5851,6 +6305,23 @@ class SignalNormalizer(BaseStrategyComponent):
             payload=payload_for_contract,
             timestamp=ts,
         )
+
+        # Build a second pass of contract features from the already-augmented
+        # canonical domain contract. This makes routing robust when the raw
+        # analytics event is a direct module event, e.g.
+        # {topic=analytics.price_action.trend.updated, state=<TrendState>}.
+        # Keep first-pass explicit features authoritative.
+        known_feature_names = {snapshot.name for snapshot in features}
+        augmented_contract_payload = {**payload_for_contract, **domain_data}
+        for snapshot in self._build_contract_features(
+                source=source,
+                symbol=symbol,
+                payload=augmented_contract_payload,
+                timestamp=ts,
+        ):
+            if snapshot.name not in known_feature_names:
+                features.append(snapshot)
+                known_feature_names.add(snapshot.name)
 
         normalized = NormalizedPayload(
             source=source,
@@ -7782,6 +8253,32 @@ class SignalNormalizer(BaseStrategyComponent):
             "setup",
         )
 
+        direct_section = self._direct_topic_section(FeatureSource.PRICE_ACTION, payload)
+        direct_value = self._direct_payload_value(payload, feature_map=feature_map)
+        if direct_section and direct_value is not None:
+            if direct_section == "market_structure" and market_structure is None:
+                market_structure = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "support_resistance" and support_resistance is None:
+                support_resistance = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "fair_value_gap" and fair_value_gap is None:
+                fair_value_gap = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "trend" and trend is None:
+                trend = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "liquidity_levels" and liquidity_levels is None:
+                liquidity_levels = direct_value
+                if composite is direct_value:
+                    composite = None
+            elif direct_section == "composite" and composite is None:
+                composite = direct_value
+
         for container_key in (
                 "result",
                 "payload",
@@ -7868,6 +8365,40 @@ class SignalNormalizer(BaseStrategyComponent):
                 "liquidity_levels",
                 "liquidity",
                 default=None,
+            )
+
+        if market_structure is not None:
+            market_structure = self._ensure_price_action_market_structure_view(
+                module=self._as_mapping_or_none(market_structure) or {"value": market_structure},
+                event_payload=payload,
+                fallback_topic=self._topic_from_payload(payload),
+            )
+        if trend is not None:
+            trend = self._ensure_price_action_trend_view(
+                module=self._as_mapping_or_none(trend) or {"value": trend},
+                event_payload=payload,
+                fallback_topic=self._topic_from_payload(payload),
+            )
+        if support_resistance is not None:
+            support_resistance = self._wrap_price_action_module_view(
+                module=support_resistance,
+                event_payload=payload,
+                fallback_topic=self._topic_from_payload(payload),
+                section="support_resistance",
+            )
+        if fair_value_gap is not None:
+            fair_value_gap = self._wrap_price_action_module_view(
+                module=fair_value_gap,
+                event_payload=payload,
+                fallback_topic=self._topic_from_payload(payload),
+                section="fair_value_gap",
+            )
+        if liquidity_levels is not None:
+            liquidity_levels = self._wrap_price_action_module_view(
+                module=liquidity_levels,
+                event_payload=payload,
+                fallback_topic=self._topic_from_payload(payload),
+                section="liquidity_levels",
             )
 
         if composite is None and any(

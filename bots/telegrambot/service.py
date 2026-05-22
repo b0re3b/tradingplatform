@@ -375,56 +375,56 @@ class TelegramBotService:
         subscriptions: list[Subscription] = []
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+             self.event_bus.subscribe(
                 "analytics.*",
                 self.handlers.handle_analytics_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "news.*",
                 self.handlers.handle_news_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "ai.*",
                 self.handlers.handle_ai_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "signal.*",
                 self.handlers.handle_signal_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "execution.*",
                 self.handlers.handle_execution_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "position.*",
                 self.handlers.handle_position_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "risk.*",
                 self.handlers.handle_risk_event,
             )
         )
 
         subscriptions.append(
-            await self.event_bus.subscribe(
+            self.event_bus.subscribe(
                 "system.*",
                 self.handlers.handle_system_event,
             )
@@ -445,7 +445,7 @@ class TelegramBotService:
         if self._healthcheck_job_id is not None:
             return
 
-        job = await self.scheduler.add_interval_job(
+        job = self.scheduler.add_interval_job(
             name=self.HEALTHCHECK_JOB_NAME,
             func=self.health_check,
             interval=self.config.healthcheck_interval_sec,
@@ -475,9 +475,9 @@ class TelegramBotService:
 
         try:
             if hasattr(self.scheduler, "remove_job"):
-                await self.scheduler.remove_job(self._healthcheck_job_id)
+                self.scheduler.remove_job(self._healthcheck_job_id)
             elif hasattr(self.scheduler, "disable_job"):
-                await self.scheduler.disable_job(self._healthcheck_job_id)
+               self.scheduler.disable_job(self._healthcheck_job_id)
         finally:
             self._healthcheck_job_id = None
 

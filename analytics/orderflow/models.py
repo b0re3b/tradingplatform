@@ -1165,7 +1165,7 @@ class CvdStats(BaseOrderFlowStats):
     price_change_pct: float | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseOrderFlowStats.__post_init__(self)
         self.window_seconds = float(self.window_seconds)
         self.trades_count = int(self.trades_count)
         self.last_price = safe_float(self.last_price)
@@ -1199,7 +1199,7 @@ class VolumeDeltaStats(BaseOrderFlowStats):
     last_price: float | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseOrderFlowStats.__post_init__(self)
         self.window_seconds = float(self.window_seconds)
         self.trades_count = int(self.trades_count)
         self.last_price = safe_float(self.last_price)
@@ -1235,7 +1235,7 @@ class AggressiveTradesStats(BaseOrderFlowStats):
     last_price: float | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseOrderFlowStats.__post_init__(self)
         self.window_seconds = float(self.window_seconds)
         self.trades_count = int(self.trades_count)
         self.aggressive_buy_count = int(self.aggressive_buy_count)
@@ -1262,7 +1262,7 @@ class OrderbookImbalanceStats(BaseOrderFlowStats):
     depth_levels_used: int = 0
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseOrderFlowStats.__post_init__(self)
         self.best_bid = safe_float(self.best_bid)
         self.best_ask = safe_float(self.best_ask)
         self.spread = safe_float(self.spread)

@@ -97,8 +97,8 @@ class EventBus:
     def __init__(
         self,
         *,
-        max_queue_size: int = 20000,
-        worker_count: int = 6,
+        max_queue_size: int = 100000,
+        worker_count: int = 12,
         queue_full_policy: QueueFullPolicy = QueueFullPolicy.DROP_OLDEST,
         max_retries: int = 1,
         retry_delay: float = 0.02,

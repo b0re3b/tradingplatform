@@ -676,7 +676,44 @@ class LiquidationState:
         )
 
 
+_SHARED_LIQUIDATION_STATE: LiquidationState | None = None
+
+
+def get_shared_liquidation_state(
+    *,
+    max_events_per_symbol: int = 5000,
+    reset: bool = False,
+) -> LiquidationState:
+    """Return the package-level shared liquidation state.
+
+    This keeps LiquidationStream and CascadeDetector on the same in-memory
+    buffers without adding a separate pipeline module. Factory/bootstrap code can
+    still pass an explicit LiquidationState when it wants full ownership.
+    """
+    global _SHARED_LIQUIDATION_STATE
+
+    if reset or _SHARED_LIQUIDATION_STATE is None:
+        _SHARED_LIQUIDATION_STATE = LiquidationState(
+            max_events_per_symbol=max_events_per_symbol,
+        )
+
+    return _SHARED_LIQUIDATION_STATE
+
+
+def reset_shared_liquidation_state(
+    *,
+    max_events_per_symbol: int = 5000,
+) -> LiquidationState:
+    """Replace and return the package-level shared liquidation state."""
+    return get_shared_liquidation_state(
+        max_events_per_symbol=max_events_per_symbol,
+        reset=True,
+    )
+
+
 __all__ = [
     "SymbolLiquidationState",
     "LiquidationState",
+    "get_shared_liquidation_state",
+    "reset_shared_liquidation_state",
 ]

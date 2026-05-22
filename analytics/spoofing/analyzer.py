@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Protocol
@@ -469,7 +470,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 metadata=metadata,
             )
 
-        snapshots = self._load_snapshots_from_orderbook_cache(key)
+        snapshots = await self._load_snapshots_from_orderbook_cache(key)
         if not snapshots:
             return self._empty_output(
                 key=key,
@@ -516,7 +517,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         )
 
         if not snapshots and self.orderbook_cache is not None:
-            snapshots = self._load_snapshots_from_orderbook_cache(resolved_key)
+            snapshots = await self._load_snapshots_from_orderbook_cache(resolved_key)
 
         return await self.process_snapshots(
             snapshots=snapshots,
@@ -1239,7 +1240,102 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
 
         return snapshots
 
-    def _load_snapshots_from_orderbook_cache(
+    async def _call_orderbook_cache_get_book(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        depth: int | None,
+    ) -> Any:
+        """
+        Compatibility wrapper for sync/async OrderBookCache.get_book variants.
+
+        Some cache implementations expose async get_book(...), while older ones
+        are synchronous and may not accept market_type or depth. This helper
+        tries the known signatures and awaits coroutine results when needed.
+        """
+        if self.orderbook_cache is None:
+            return None
+
+        method = getattr(self.orderbook_cache, "get_book", None)
+        if method is None:
+            raise AttributeError("OrderBookCache does not expose get_book()")
+
+        call_variants: list[dict[str, Any]] = [
+            {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "depth": depth,
+            },
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+                "depth": depth,
+            },
+            {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+            },
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+            },
+            {
+                "symbol": symbol,
+                "depth": depth,
+            },
+            {
+                "symbol": symbol,
+            },
+        ]
+
+        last_type_error: TypeError | None = None
+
+        for kwargs in call_variants:
+            clean_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if value is not None
+            }
+
+            try:
+                result = method(**clean_kwargs)
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+
+            if inspect.isawaitable(result):
+                result = await result
+
+            return result
+
+        positional_variants: list[tuple[Any, ...]] = [
+            (exchange, market_type, symbol),
+            (exchange, symbol),
+            (symbol,),
+        ]
+
+        for args in positional_variants:
+            try:
+                result = method(*args)
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+
+            if inspect.isawaitable(result):
+                result = await result
+
+            return result
+
+        if last_type_error is not None:
+            raise last_type_error
+
+        raise RuntimeError("Unable to call OrderBookCache.get_book()")
+
+    async def _load_snapshots_from_orderbook_cache(
         self,
         key: SpoofingKey,
     ) -> list[OrderbookLevelSnapshot]:
@@ -1253,25 +1349,12 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         scope = spoofing_key_to_dict(key)
 
         try:
-            book = self.orderbook_cache.get_book(
+            book = await self._call_orderbook_cache_get_book(
                 exchange=scope["exchange"],
                 market_type=scope["market_type"],
                 symbol=scope["symbol"],
                 depth=self.config.wall_detection.max_levels_to_scan,
             )
-        except TypeError:
-            try:
-                book = self.orderbook_cache.get_book(
-                    exchange=scope["exchange"],
-                    symbol=scope["symbol"],
-                    depth=self.config.wall_detection.max_levels_to_scan,
-                )
-            except Exception:
-                self.log_exception(
-                    "Failed to read orderbook cache",
-                    key=scope,
-                )
-                return []
         except Exception:
             self.log_exception(
                 "Failed to read orderbook cache",

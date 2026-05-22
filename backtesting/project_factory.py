@@ -113,7 +113,7 @@ class ProductionBacktestFactory:
             from analytics.price_action.price_action_analyzer import PriceActionAnalyzer
 
             for symbol in ("BTCUSDT", "ETHUSDT", "RIVERUSDT"):
-                for timeframe in ("1m", "15m"):
+                for timeframe in ("1h", "15m"):
                     services.append(
                         PriceActionAnalyzer(
                             symbol=symbol,

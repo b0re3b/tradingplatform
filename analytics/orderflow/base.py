@@ -124,6 +124,7 @@ class BaseOrderFlowAnalyzer(ABC):
         self._cleanup_job_id: str | None = None
 
         self._last_signal_ts_by_key: dict[OrderFlowKey, float] = {}
+        self._last_update_ts_by_key: dict[OrderFlowKey, float] = {}
         self._metrics: dict[str, Any] = self._build_initial_metrics()
 
         self._validate_config()
@@ -351,6 +352,10 @@ class BaseOrderFlowAnalyzer(ABC):
             self._inc_metric("skipped", stats.key)
             return
 
+        if not self._can_emit_update(stats.key):
+            self._inc_metric("updates_throttled", stats.key)
+            return
+
         update = OrderFlowUpdate.from_stats(stats)
         payload = update_to_dict(update)
 
@@ -363,6 +368,7 @@ class BaseOrderFlowAnalyzer(ABC):
         )
 
         if emitted:
+            self._last_update_ts_by_key[stats.key] = time.time()
             self._inc_metric("updates_emitted", stats.key)
 
     async def emit_signal(self, signal: OrderFlowSignal) -> None:
@@ -1068,6 +1074,15 @@ class BaseOrderFlowAnalyzer(ABC):
             return OrderFlowSide.SELL if bool(is_buyer_maker) else OrderFlowSide.BUY
 
         return OrderFlowSide.UNKNOWN
+
+    def _can_emit_update(self, key: OrderFlowKey) -> bool:
+        interval = float(getattr(self._config, "min_update_interval_sec", 0.0) or 0.0)
+        if interval <= 0:
+            return True
+
+        now = time.time()
+        last_ts = self._last_update_ts_by_key.get(key, 0.0)
+        return (now - last_ts) >= interval
 
     def _can_emit_signal(self, key: OrderFlowKey) -> bool:
         now = time.time()

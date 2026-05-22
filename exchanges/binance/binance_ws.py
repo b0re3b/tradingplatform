@@ -22,9 +22,9 @@ class BinanceWebSocketClientConfig:
     This dataclass contains only Binance WS adapter-specific settings.
     """
 
-    public_ws_url: str = "wss://stream.binance.com:9443/stream"
-    private_ws_base_url: str = "wss://stream.binance.com:9443/ws"
-    rest_url: str = "https://api.binance.com"
+    public_ws_url: str = "wss://fstream.binance.com/stream"
+    private_ws_base_url: str = "wss://fstream.binance.com/ws"
+    rest_url: str = "https://fapi.binance.com"
 
     timeout_seconds: float = 10.0
     heartbeat_seconds: float = 20.0

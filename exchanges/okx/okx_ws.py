@@ -657,8 +657,9 @@ class OkxWebSocketClient:
         event = message.get("event")
 
         if event == "error":
-            code = message.get("code")
-            msg = message.get("msg")
+            code = str(message.get("code") or "")
+            msg = str(message.get("msg") or "")
+            arg = message.get("arg")
 
             await self._emit_event(
                 "system.exchange.ws.error",
@@ -667,10 +668,27 @@ class OkxWebSocketClient:
                     "channel": channel_type,
                     "code": code,
                     "message": msg,
-                    "arg": message.get("arg"),
+                    "arg": arg,
                 },
                 priority=EventPriority.HIGH,
             )
+
+            # OKX code 60018 means a single requested channel/instId pair is invalid.
+            # Example: candle1m for a specific SWAP instrument can be rejected while
+            # trades/books subscriptions in the same shard are still useful.
+            #
+            # Do not restart the entire WebSocket loop for one bad subscription.
+            # Keep the connection alive and let valid subscriptions continue streaming.
+            if code == "60018":
+                self._logger.warning(
+                    "OKX subscription rejected; keeping WS connection alive | "
+                    "channel_type=%s code=%s msg=%s arg=%s",
+                    channel_type,
+                    code,
+                    msg,
+                    arg,
+                )
+                return
 
             raise RuntimeError(
                 f"OKX WebSocket error | channel={channel_type} code={code} msg={msg}"

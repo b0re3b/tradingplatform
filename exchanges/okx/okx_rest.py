@@ -38,13 +38,14 @@ class OkxRestClientConfig:
 
     @classmethod
     def from_core_config(
-        cls,
-        *,
-        config: Config,
-        use_demo: bool = False,
+            cls,
+            *,
+            config: Config,
+            use_demo: bool = False,
     ) -> "OkxRestClientConfig":
+        defaults = cls()
         return cls(
-            rest_url=config.exchange.rest_url or cls.rest_url,
+            rest_url=defaults.rest_url,
             timeout_seconds=config.exchange.timeout_seconds,
             use_demo=use_demo or config.exchange.credentials.testnet,
         )

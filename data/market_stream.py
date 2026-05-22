@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from core.config import Config
@@ -20,7 +20,7 @@ class MarketDataSubscription:
     exchange: str
     symbol: str
     channels: tuple[str, ...] = ("trade", "orderbook", "candle")
-    market_type: str = "perpetual"
+    market_type: str = "usdm_futures"
     timeframe: str | None = None
     depth: int | None = None
     enabled: bool = True
@@ -89,6 +89,7 @@ class MarketStream:
         )
 
         self._running = False
+        self._registered = False
         self._healthcheck_job_id: str | None = None
         self._states: dict[str, ExchangeRuntimeState] = {
             exchange: ExchangeRuntimeState(exchange=exchange)
@@ -105,32 +106,56 @@ class MarketStream:
         }
 
     def register(self) -> None:
-        """Register all cache components against EventBus."""
-        if not self.stream_config.register_caches_on_start:
+        """
+        Register all cache components against EventBus.
+
+        This method is intentionally idempotent. The app bootstrap may call
+        register_component(market_stream) before start_component(market_stream),
+        while start() also guarantees registration for direct-start use cases.
+        Without this guard, cache handlers are subscribed twice and every
+        market.* event is processed twice.
+        """
+        if self._registered:
+            self._logger.debug("MarketStream already registered")
             return
+
+        if not self.stream_config.register_caches_on_start:
+            self._registered = True
+            return
+
+        registered_count = 0
 
         for cache in self.caches:
             register = getattr(cache, "register", None)
             if register is None:
                 continue
+
             result = register()
             if inspect.isawaitable(result):
                 raise RuntimeError(
                     f"Cache register() must be synchronous for {cache.__class__.__name__}"
                 )
 
-        self._logger.info("MarketStream caches registered | caches=%s", len(self.caches))
+            registered_count += 1
+
+        self._registered = True
+
+        self._logger.info(
+            "MarketStream caches registered | caches=%s",
+            registered_count,
+        )
 
     async def start(self, subscriptions: list[MarketDataSubscription] | None = None) -> None:
         if self._running:
             self._logger.warning("MarketStream already started")
             return
 
+        if not self._registered:
+            self.register()
+
         self._running = True
         self._metrics["started_at"] = time.time()
         self._subscriptions = [sub for sub in subscriptions or [] if sub.enabled]
-
-        self.register()
 
         if self.stream_config.start_clients_on_start:
             await self._start_exchange_clients()

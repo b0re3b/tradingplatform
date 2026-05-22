@@ -330,14 +330,50 @@ class AggressiveTradesAnalyzer(BaseOrderFlowAnalyzer):
     ) -> Any:
         exchange, market_type, symbol, _timeframe = key
 
+        # First try the full, canonical kwargs contract used by the new analytics layer.
         try:
             result = method(**kwargs)
             if asyncio.iscoroutine(result):
                 result = await result
             return result
+        except TypeError as exc:
+            # Backward compatibility: some cache implementations, especially
+            # TradesCache.get_recent_trades(), do not accept all canonical kwargs
+            # such as timeframe or market_type. Retry with progressively narrower
+            # keyword contracts before falling back to positional signatures.
+            retry_kwargs_candidates: tuple[dict[str, Any], ...] = (
+                {k: v for k, v in kwargs.items() if k != "timeframe"},
+                {k: v for k, v in kwargs.items() if k not in {"timeframe", "market_type"}},
+                {k: v for k, v in kwargs.items() if k in {"exchange", "symbol", "limit", "since_ts"}},
+                {k: v for k, v in kwargs.items() if k in {"symbol", "limit", "since_ts"}},
+            )
 
-        except TypeError:
-            # Compatibility fallback for older cache APIs.
+            seen: set[tuple[str, ...]] = set()
+            for retry_kwargs in retry_kwargs_candidates:
+                signature = tuple(sorted(retry_kwargs))
+                if signature in seen or retry_kwargs == kwargs:
+                    continue
+                seen.add(signature)
+
+                try:
+                    result = method(**retry_kwargs)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    return result
+                except TypeError:
+                    continue
+                except Exception:
+                    self._logger.exception(
+                        "Failed to fetch recent trades",
+                        extra={
+                            **orderflow_key_to_dict(key),
+                            "method": method_name,
+                            "kwargs": retry_kwargs,
+                        },
+                    )
+                    return None
+
+            # Compatibility fallback for older positional cache APIs.
             fallback_calls: tuple[tuple[Any, ...], ...] = (
                 (exchange, market_type, symbol),
                 (exchange, symbol),
@@ -363,11 +399,12 @@ class AggressiveTradesAnalyzer(BaseOrderFlowAnalyzer):
                     )
                     return None
 
-            self._logger.exception(
-                "Failed to fetch recent trades: incompatible cache method signature",
+            self._logger.debug(
+                "Skipped incompatible cache method signature",
                 extra={
                     **orderflow_key_to_dict(key),
                     "method": method_name,
+                    "error": str(exc),
                 },
             )
             return None

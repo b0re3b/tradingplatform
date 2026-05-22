@@ -34,8 +34,9 @@ class BybitMarketRestClientConfig:
 
     @classmethod
     def from_core_config(cls, config: Config) -> "BybitMarketRestClientConfig":
+        defaults = cls()
         return cls(
-            rest_url=config.exchange.rest_url or cls.rest_url,
+            rest_url=defaults.rest_url,
             timeout_seconds=config.exchange.timeout_seconds,
         )
 

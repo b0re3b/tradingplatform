@@ -28,7 +28,7 @@ from .models import (
     normalize_symbol,
     normalize_timeframe,
 )
-from .state import LiquidationState
+from .state import LiquidationState, get_shared_liquidation_state
 from .utils import (
     ensure_utc,
     is_stale_event,
@@ -118,7 +118,7 @@ class LiquidationStream:
         self.service_name = service_name
         self.history_store = history_store
 
-        self.state = state or LiquidationState(
+        self.state = state or get_shared_liquidation_state(
             max_events_per_symbol=self.config.max_buffer_size_per_symbol,
         )
         self.metrics = metrics or LiquidationMetrics()
@@ -140,10 +140,8 @@ class LiquidationStream:
         )
 
         if state is None:
-            self.logger.warning(
-                "LiquidationStream initialized without shared LiquidationState. "
-                "For production, pass the same LiquidationState instance to "
-                "LiquidationStream and CascadeDetector."
+            self.logger.info(
+                "LiquidationStream using package-level shared LiquidationState"
             )
 
         self._running = False

@@ -24,7 +24,7 @@ class BinanceFuturesRestClientConfig:
     It uses /fapi/* endpoints, not spot /api/v3/* endpoints.
     """
 
-    rest_url: str = "https://fapi.binance.com"
+    rest_url: str = "https://testnet.binancefuture.com"
     timeout_seconds: float = 10.0
 
     recv_window: int = 5000
@@ -36,8 +36,9 @@ class BinanceFuturesRestClientConfig:
 
     @classmethod
     def from_core_config(cls, config: Config) -> "BinanceFuturesRestClientConfig":
+        defaults = cls()
         return cls(
-            rest_url=config.exchange.rest_url or cls.rest_url,
+            rest_url=config.exchange.rest_url or defaults.rest_url,
             timeout_seconds=config.exchange.timeout_seconds,
         )
 
