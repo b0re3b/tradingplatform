@@ -108,6 +108,42 @@ def _log_env_diagnostics(env_file: Path) -> None:
 # ----------------------------------------------------------------------
 
 
+async def _start_analytics_component(component: Any) -> None:
+    """
+    Універсальний запуск аналітичного компонента.
+
+    Деякі компоненти мають тільки register() без start() (OIAnalyzer,
+    PriceActionAnalyzer, SpoofingAnalyzer). start_component() шукає
+    атрибут .start і якщо його нема — мовчки нічого не робить, через
+    що компонент ніколи не реєструється і не слухає жодних подій.
+
+    Порядок:
+    1. Якщо є start() — викликаємо його. Компоненти що мають обидва методи
+       (FundingAnalyzer, WhaleAnalyzer, SpreadAnalyzer, LiquidationStream,
+       LiquidityService, OrderFlowAnalyzer) самі викликають register()
+       всередині start(), тому окремий виклик register() їм не потрібен.
+    2. Якщо start() відсутній але є register() — викликаємо register()
+       напряму, щоб компонент підписався на EventBus і запустив scheduler
+       jobs.
+    """
+    has_start = callable(getattr(component, "start", None))
+    has_register = callable(getattr(component, "register", None))
+
+    if has_start:
+        await start_component(component)
+    elif has_register:
+        await register_component(component)
+        logger.debug(
+            "Analytics component started via register() (no start() method) | component=%s",
+            component.__class__.__name__,
+        )
+    else:
+        logger.warning(
+            "Analytics component has neither start() nor register() | component=%s",
+            component.__class__.__name__,
+        )
+
+
 class TradingSystemRuntime:
     """
     Production bootstrap for the whole project.
@@ -197,11 +233,16 @@ class TradingSystemRuntime:
                 universe=universe,
             )
             for component in analytics_components:
-                # Analytics components commonly call register() from start().
-                # Avoid explicit register+start here to prevent subscribe/unsubscribe
-                # churn and duplicate scheduler jobs.
+                # Components that have start() call register() internally (e.g.
+                # FundingAnalyzer, WhaleAnalyzer, SpreadAnalyzer, LiquidationStream,
+                # LiquidityService, OrderFlowAnalyzer).
+                # Components that only have register() (e.g. OIAnalyzer,
+                # PriceActionAnalyzer, SpoofingAnalyzer) are handled by
+                # _start_analytics_component() which falls back to register()
+                # so they actually subscribe to EventBus topics and start
+                # scheduler jobs instead of silently doing nothing.
                 self.components.append(component)
-                await start_component(component)
+                await _start_analytics_component(component)
 
             # Orderflow is WebSocket-driven, but Binance USD-M open interest and
             # funding are REST snapshot endpoints. Start the poller only after
