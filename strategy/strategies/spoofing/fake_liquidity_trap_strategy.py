@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/fake_liquidity_trap_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -72,6 +73,7 @@ class FakeLiquidityTrapPayload:
     - fake ASK liquidity removed -> fake resistance disappears -> LONG;
     - fake BID liquidity removed -> fake support disappears -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".FakeLiquidityTrapPayload")
 
     snapshot: SpoofingCompositeSnapshot
     side: SignalSide
@@ -82,34 +84,58 @@ class FakeLiquidityTrapPayload:
 
     @property
     def pull_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.pull_ratio")
         return extract_pull_ratio(self.snapshot.raw_signal)
 
     @property
     def fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.fill_ratio")
         return extract_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def price_reaction_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.price_reaction_bps")
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def lifetime_ms(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.lifetime_ms")
         return extract_lifetime_ms(self.snapshot.raw_signal)
 
     @property
     def wall_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.wall_notional")
         return extract_wall_notional(self.snapshot.raw_signal)
 
     @property
     def pulled_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.pulled_notional")
         return extract_pulled_notional(self.snapshot.raw_signal)
 
     @property
     def cancel_to_fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.cancel_to_fill_ratio")
         return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def distance_from_mid_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapPayload.distance_from_mid_bps")
         return extract_distance_from_mid_bps(self.snapshot.raw_signal)
 
 
@@ -125,6 +151,7 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
     - strategy returns internal StrategySignal only;
     - SignalProcessor owns routing, filters, confluence and risk-ready payload.
     """
+    _logger = logging.getLogger(__name__ + ".FakeLiquidityTrapStrategyConfig")
 
     allow_fake_liquidity_type: bool = True
     allow_fake_absorption_pattern: bool = True
@@ -203,6 +230,9 @@ class FakeLiquidityTrapStrategyConfig(SpoofingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategyConfig.validate")
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
@@ -309,6 +339,7 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".FakeLiquidityTrapStrategy")
 
     component_namespace = "strategy.spoofing.fake_liquidity_trap"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -324,6 +355,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         spoofing_config: FakeLiquidityTrapStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy.__init__")
         resolved_spoofing_config = (
             spoofing_config or FakeLiquidityTrapStrategyConfig()
         )
@@ -342,10 +376,16 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy.strategy_name")
         return "fake_liquidity_trap"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPOOFING,
@@ -388,6 +428,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.trap_config.required_spoofing_features)
 
@@ -395,6 +438,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spoofing_data(
@@ -529,6 +575,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> FakeLiquidityTrapPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._extract_payload")
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -574,6 +623,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._supports_snapshot")
         if self.trap_config.allow_fake_liquidity_type:
             if snapshot.spoofing_type is SpoofingType.FAKE_LIQUIDITY:
                 return True
@@ -598,6 +650,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: FakeLiquidityTrapPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._passes_trap_filters")
         snapshot = payload.snapshot
 
         if self.trap_config.require_fake_liquidity_flag:
@@ -676,6 +731,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         context: StrategyContext,
         payload: FakeLiquidityTrapPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         base_component = average_score(
@@ -805,6 +863,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: FakeLiquidityTrapPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._lifetime_component")
         if payload.lifetime_ms <= 0:
             return 0.0
 
@@ -814,6 +875,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: FakeLiquidityTrapPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._notional_component")
         if payload.wall_notional <= 0:
             return 0.0
 
@@ -827,6 +891,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: FakeLiquidityTrapPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._source_features")
         features = [
             *fake_liquidity_source_features(),
             SPOOFING_FEATURES.SIGNAL,
@@ -853,6 +920,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: FakeLiquidityTrapPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._tags")
         tags = [
             self.trap_config.tag_spoofing,
             self.trap_config.tag_fake_liquidity,
@@ -885,6 +955,9 @@ class FakeLiquidityTrapStrategy(SpoofingTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FakeLiquidityTrapStrategy._trap_execution_hints")
         return {
             "allow_retest_entry": self.trap_config.allow_retest_entry_hint,
             "max_retest_distance_bps": self.trap_config.max_retest_distance_bps_hint,

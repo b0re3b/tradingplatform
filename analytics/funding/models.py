@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
@@ -250,6 +251,27 @@ class FundingScopedModel:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.exchange = normalize_exchange(self.exchange)
         self.market_type = normalize_market_type(self.market_type)
         self.symbol = normalize_symbol(self.symbol)
@@ -264,6 +286,27 @@ class FundingScopedModel:
 
     @property
     def key(self) -> FundingKey:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "key", _analytics_args)
+        except Exception:
+            pass
         return make_funding_key(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -273,6 +316,27 @@ class FundingScopedModel:
 
     @property
     def scope(self) -> dict[str, str]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "scope", _analytics_args)
+        except Exception:
+            pass
         return scoped_metadata(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -282,6 +346,27 @@ class FundingScopedModel:
         )
 
     def _base_payload(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_base_payload", _analytics_args)
+        except Exception:
+            pass
         payload = {
             "symbol": self.symbol,
             "exchange": self.exchange.value,
@@ -324,6 +409,27 @@ class FundingSnapshot(FundingScopedModel):
     received_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.funding_rate = float(self.funding_rate)
@@ -354,12 +460,54 @@ class FundingSnapshot(FundingScopedModel):
         """
         Відносне відхилення mark від index, якщо обидва значення доступні.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "basis", _analytics_args)
+        except Exception:
+            pass
         if self.mark_price is None or self.index_price is None or self.index_price == 0:
             return None
         return (self.mark_price - self.index_price) / self.index_price
 
     @property
     def funding_sign(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "funding_sign", _analytics_args)
+        except Exception:
+            pass
         if self.funding_rate > 0:
             return 1
         if self.funding_rate < 0:
@@ -367,6 +515,27 @@ class FundingSnapshot(FundingScopedModel):
         return 0
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -408,6 +577,27 @@ class FundingStatistics(FundingScopedModel):
     updated_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.current_rate = float(self.current_rate)
@@ -431,6 +621,27 @@ class FundingStatistics(FundingScopedModel):
             self.window_end = ensure_utc(self.window_end)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -472,6 +683,27 @@ class FundingRegimeState(FundingScopedModel):
     event_time: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.current_rate = float(self.current_rate)
@@ -487,6 +719,27 @@ class FundingRegimeState(FundingScopedModel):
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -529,6 +782,27 @@ class FundingExtremeEvent(FundingScopedModel):
     event_time: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.funding_rate = float(self.funding_rate)
@@ -540,6 +814,27 @@ class FundingExtremeEvent(FundingScopedModel):
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -576,6 +871,27 @@ class FundingDivergenceEvent(FundingScopedModel):
     event_time: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.funding_rate = float(self.funding_rate)
@@ -595,6 +911,27 @@ class FundingDivergenceEvent(FundingScopedModel):
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -628,6 +965,27 @@ class FundingFlipEvent(FundingScopedModel):
     event_time: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.previous_rate = float(self.previous_rate)
@@ -637,6 +995,27 @@ class FundingFlipEvent(FundingScopedModel):
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -672,6 +1051,27 @@ class FundingPressureState(FundingScopedModel):
     event_time: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.funding_rate = float(self.funding_rate)
@@ -688,6 +1088,27 @@ class FundingPressureState(FundingScopedModel):
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -729,6 +1150,27 @@ class FundingSignal(FundingScopedModel):
     event_time: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.score = max(-1.0, min(1.0, float(self.score)))
@@ -739,17 +1181,101 @@ class FundingSignal(FundingScopedModel):
 
     @property
     def bullish(self) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "bullish", _analytics_args)
+        except Exception:
+            pass
         return self.score > 0
 
     @property
     def bearish(self) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "bearish", _analytics_args)
+        except Exception:
+            pass
         return self.score < 0
 
     @property
     def neutral(self) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "neutral", _analytics_args)
+        except Exception:
+            pass
         return self.score == 0
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {
@@ -782,12 +1308,54 @@ class FundingAnalyticsEvent(FundingScopedModel):
     source: str = "analytics.funding"
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         FundingScopedModel.__post_init__(self)
 
         self.payload = dict(self.payload or {})
         self.event_time = ensure_utc(self.event_time)
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = self._base_payload()
         payload.update(
             {

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from statistics import mean
 from typing import Iterable
@@ -71,6 +72,27 @@ class LayeringDetector(BaseSpoofingDetector):
         config: SpoofingConfig,
         persistence_tracker: PersistenceTracker,
     ) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__init__", _analytics_args)
+        except Exception:
+            pass
         super().__init__(
             event_bus=event_bus,
             scheduler=scheduler,
@@ -92,6 +114,27 @@ class LayeringDetector(BaseSpoofingDetector):
         Аналіз одного wall не є природним для layering,
         але підтримується через пошук кластера навколо цього рівня.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "analyze", _analytics_args)
+        except Exception:
+            pass
         cluster = self._find_cluster_around_wall(
             wall=wall,
             current_mid_price=current_mid_price,
@@ -120,6 +163,27 @@ class LayeringDetector(BaseSpoofingDetector):
         key:
             exchange + market_type + symbol + timeframe
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "analyze_key", _analytics_args)
+        except Exception:
+            pass
         if not self.config.enabled or not self.config.layering.enabled:
             return []
 
@@ -148,6 +212,27 @@ class LayeringDetector(BaseSpoofingDetector):
         New code should pass key=SpoofingKey.
         Legacy filters exchange/symbol/market_type/timeframe залишені для міграції.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "analyze_many", _analytics_args)
+        except Exception:
+            pass
         if not self.config.enabled or not self.config.layering.enabled:
             return []
 
@@ -202,6 +287,27 @@ class LayeringDetector(BaseSpoofingDetector):
         """
         Аналізує всі tracked walls одного scoped futures market.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "analyze_scope", _analytics_args)
+        except Exception:
+            pass
         key = self.make_key(
             exchange=exchange,
             market_type=market_type,
@@ -230,6 +336,27 @@ class LayeringDetector(BaseSpoofingDetector):
         Якщо market_type/timeframe не передані, аналізує всі scope-и для
         exchange + symbol.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "analyze_symbol", _analytics_args)
+        except Exception:
+            pass
         walls = self.persistence_tracker.get_walls_for_symbol(
             exchange=exchange,
             symbol=symbol,
@@ -255,6 +382,27 @@ class LayeringDetector(BaseSpoofingDetector):
         """
         Boolean helper для швидкої перевірки tracked wall.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_layering_candidate", _analytics_args)
+        except Exception:
+            pass
         return self.analyze(
             wall,
             current_mid_price=current_mid_price,
@@ -273,6 +421,27 @@ class LayeringDetector(BaseSpoofingDetector):
         """
         Будує потенційні layering-кластери для кожного scoped market + side окремо.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_build_clusters", _analytics_args)
+        except Exception:
+            pass
         if not self.config.enabled or not self.config.layering.enabled:
             return []
 
@@ -342,6 +511,27 @@ class LayeringDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None = None,
     ) -> LayeringCluster | None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_find_cluster_around_wall", _analytics_args)
+        except Exception:
+            pass
         if not self.should_process_key(wall.key):
             return None
 
@@ -371,6 +561,27 @@ class LayeringDetector(BaseSpoofingDetector):
         timeframe: str = DEFAULT_TIMEFRAME,
         current_mid_price: float | None = None,
     ) -> LayeringCluster | None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_make_cluster", _analytics_args)
+        except Exception:
+            pass
         if len(walls) < self.config.layering.min_layers:
             return None
 
@@ -442,6 +653,27 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         current_mid_price: float | None = None,
     ) -> LayeringCandidateContext | None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_evaluate_cluster", _analytics_args)
+        except Exception:
+            pass
         if not self.should_process_key(cluster.key):
             return None
 
@@ -475,6 +707,27 @@ class LayeringDetector(BaseSpoofingDetector):
         )
 
     def _passes_cluster_filters(self, cluster: LayeringCluster) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_passes_cluster_filters", _analytics_args)
+        except Exception:
+            pass
         if len(cluster.walls) < self.config.layering.min_layers:
             return False
 
@@ -503,6 +756,27 @@ class LayeringDetector(BaseSpoofingDetector):
         self,
         candidate: LayeringCandidateContext,
     ) -> DetectorResult:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_build_result", _analytics_args)
+        except Exception:
+            pass
         features = self._build_features(candidate)
         cluster = candidate.cluster
 
@@ -535,6 +809,27 @@ class LayeringDetector(BaseSpoofingDetector):
         self,
         candidate: LayeringCandidateContext,
     ) -> SpoofingFeatures:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_build_features", _analytics_args)
+        except Exception:
+            pass
         cluster = candidate.cluster
         repetition_count = self._estimate_cluster_repetition_count(cluster)
 
@@ -595,6 +890,27 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         price_reaction_bps: float,
     ) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_compute_score", _analytics_args)
+        except Exception:
+            pass
         notional_component = self._normalize_total_notional(cluster.total_notional)
         pull_component = self.clamp(cluster.average_pull_ratio, 0.0, 1.0)
         fill_component = 1.0 - self.clamp(cluster.average_fill_ratio, 0.0, 1.0)
@@ -632,6 +948,27 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         price_reaction_bps: float,
     ) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_compute_confidence", _analytics_args)
+        except Exception:
+            pass
         confidence = 0.42
 
         if len(cluster.walls) >= self.config.layering.min_layers + 1:
@@ -668,6 +1005,27 @@ class LayeringDetector(BaseSpoofingDetector):
         """
         Частка рівнів, які ослабли/зникли в близькому часовому вікні.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_estimate_synchronized_pull_ratio", _analytics_args)
+        except Exception:
+            pass
         if not walls:
             return 0.0
 
@@ -699,6 +1057,27 @@ class LayeringDetector(BaseSpoofingDetector):
         self,
         walls: list[TrackedWall],
     ) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_estimate_price_span_bps", _analytics_args)
+        except Exception:
+            pass
         if len(walls) < 2:
             return 0.0
 
@@ -717,6 +1096,27 @@ class LayeringDetector(BaseSpoofingDetector):
         price_span_bps: float,
         current_mid_price: float | None = None,
     ) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_estimate_layering_score", _analytics_args)
+        except Exception:
+            pass
         layers_component = self.clamp(
             len(walls) / max(self.config.layering.min_layers + 2, 1),
             0.0,
@@ -764,6 +1164,27 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         current_mid_price: float | None,
     ) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_estimate_cluster_price_reaction_bps", _analytics_args)
+        except Exception:
+            pass
         if current_mid_price is None or current_mid_price <= 0:
             return 0.0
 
@@ -788,6 +1209,27 @@ class LayeringDetector(BaseSpoofingDetector):
         """
         Груба оцінка cluster-vs-baseline ratio.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_estimate_cluster_wall_size_ratio", _analytics_args)
+        except Exception:
+            pass
         base_notional = max(self.config.wall_detection.min_wall_size_abs, 1e-12)
         return self.clamp(cluster.total_notional / base_notional, 0.0, 1000.0)
 
@@ -805,6 +1247,27 @@ class LayeringDetector(BaseSpoofingDetector):
         market_type: str | None,
         timeframe: str | None,
     ) -> list[TrackedWall]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_filter_walls", _analytics_args)
+        except Exception:
+            pass
         normalized_exchange = (
             self.normalize_exchange(exchange)
             if exchange is not None
@@ -852,6 +1315,27 @@ class LayeringDetector(BaseSpoofingDetector):
         wall: TrackedWall,
         current_mid_price: float | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_is_relevant_wall", _analytics_args)
+        except Exception:
+            pass
         if not self.should_process_key(wall.key):
             return False
 
@@ -878,6 +1362,24 @@ class LayeringDetector(BaseSpoofingDetector):
     def _group_walls_by_market_side(
         walls: Iterable[TrackedWall],
     ) -> dict[tuple[str, str, str, str, SpoofingSide], list[TrackedWall]]:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_group_walls_by_market_side", _analytics_args)
+        except Exception:
+            pass
         groups: dict[tuple[str, str, str, str, SpoofingSide], list[TrackedWall]] = {}
 
         for wall in walls:
@@ -897,6 +1399,24 @@ class LayeringDetector(BaseSpoofingDetector):
         walls: list[TrackedWall],
         side: SpoofingSide,
     ) -> list[TrackedWall]:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_sort_walls_for_side", _analytics_args)
+        except Exception:
+            pass
         if side == SpoofingSide.BID:
             return sorted(walls, key=lambda item: item.price, reverse=True)
         return sorted(walls, key=lambda item: item.price)
@@ -905,6 +1425,24 @@ class LayeringDetector(BaseSpoofingDetector):
     def _resolve_cluster_wall_id(
         walls: list[TrackedWall],
     ) -> str | None:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_resolve_cluster_wall_id", _analytics_args)
+        except Exception:
+            pass
         if not walls:
             return None
 
@@ -915,6 +1453,24 @@ class LayeringDetector(BaseSpoofingDetector):
     def _resolve_cluster_reference_mid(
         cluster: LayeringCluster,
     ) -> float | None:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_resolve_cluster_reference_mid", _analytics_args)
+        except Exception:
+            pass
         mids = [
             wall.mid_price_at_creation
             for wall in cluster.walls
@@ -925,6 +1481,27 @@ class LayeringDetector(BaseSpoofingDetector):
         return mean(mids)
 
     def _normalize_total_notional(self, total_notional: float) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_normalize_total_notional", _analytics_args)
+        except Exception:
+            pass
         base = max(self.config.layering.min_total_layer_notional, 1e-12)
         value = (total_notional - base) / max(base * 2.0, 1e-12)
         return self.clamp(value, 0.0, 1.0)
@@ -933,6 +1510,27 @@ class LayeringDetector(BaseSpoofingDetector):
         self,
         cluster: LayeringCluster,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_cluster_near_best_quote", _analytics_args)
+        except Exception:
+            pass
         return any(
             wall.touch_count > 0 or wall.near_touch_count > 0
             for wall in cluster.walls
@@ -942,12 +1540,54 @@ class LayeringDetector(BaseSpoofingDetector):
         self,
         cluster: LayeringCluster,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_cluster_fast_pull", _analytics_args)
+        except Exception:
+            pass
         return cluster.average_lifetime_ms <= self.config.pull_detection.fast_pull_lifetime_ms
 
     def _estimate_cluster_repetition_count(
         self,
         cluster: LayeringCluster,
     ) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_estimate_cluster_repetition_count", _analytics_args)
+        except Exception:
+            pass
         if not cluster.walls:
             return 0
 
@@ -968,6 +1608,24 @@ class LayeringDetector(BaseSpoofingDetector):
 
     @staticmethod
     def _cluster_key(cluster: LayeringCluster) -> str:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_cluster_key", _analytics_args)
+        except Exception:
+            pass
         wall_ids = sorted(wall.wall_id for wall in cluster.walls)
         scope = spoofing_key_to_dict(cluster.key)
         return (
@@ -977,6 +1635,24 @@ class LayeringDetector(BaseSpoofingDetector):
 
     @staticmethod
     def _candidate_wall_states() -> set[OrderbookWallState]:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_candidate_wall_states", _analytics_args)
+        except Exception:
+            pass
         return {
             OrderbookWallState.ACTIVE,
             OrderbookWallState.WEAKENING,
@@ -987,6 +1663,24 @@ class LayeringDetector(BaseSpoofingDetector):
 
     @staticmethod
     def _removed_or_weakened_states() -> set[OrderbookWallState]:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_removed_or_weakened_states", _analytics_args)
+        except Exception:
+            pass
         return {
             OrderbookWallState.WEAKENING,
             OrderbookWallState.PULLED,
@@ -1000,6 +1694,24 @@ class LayeringDetector(BaseSpoofingDetector):
         pull_ratio: float,
         fill_ratio: float,
     ) -> float:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_compute_cancel_to_fill_ratio", _analytics_args)
+        except Exception:
+            pass
         if fill_ratio > 0:
             return pull_ratio / fill_ratio
         if pull_ratio > 0:
@@ -1007,6 +1719,27 @@ class LayeringDetector(BaseSpoofingDetector):
         return 0.0
 
     def _cluster_max_span_bps(self, cluster: LayeringCluster) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_cluster_max_span_bps", _analytics_args)
+        except Exception:
+            pass
         return self.config.layering.max_price_gap_bps_between_layers * max(
             len(cluster.walls) - 1,
             1,
@@ -1014,6 +1747,24 @@ class LayeringDetector(BaseSpoofingDetector):
 
     @staticmethod
     def _mean_or_zero(values: Iterable[float]) -> float:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_mean_or_zero", _analytics_args)
+        except Exception:
+            pass
         items = [max(value, 0.0) for value in values]
         return mean(items) if items else 0.0
 
@@ -1023,6 +1774,24 @@ class LayeringDetector(BaseSpoofingDetector):
         cluster: LayeringCluster,
         price_reaction_bps: float,
     ) -> str:
+        try:
+            _analytics_class_name = "LayeringDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_build_reason", _analytics_args)
+        except Exception:
+            pass
         return (
             f"layering candidate detected for {cluster.side.value.upper()} side, "
             f"exchange={cluster.exchange}, "

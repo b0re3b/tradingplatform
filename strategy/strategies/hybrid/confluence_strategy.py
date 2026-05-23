@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/confluence_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -51,6 +52,7 @@ class ConfluencePayload:
 
     Це локальний payload конкретної стратегії, не глобальний ConfluenceEngine.
     """
+    _logger = logging.getLogger(__name__ + ".ConfluencePayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -78,6 +80,7 @@ class ConfluenceStrategyConfig(HybridStrategyConfig):
 
     This class is not SignalProcessor.ConfluenceEngine.
     """
+    _logger = logging.getLogger(__name__ + ".ConfluenceStrategyConfig")
 
     min_confluence_strategy_score: float = 0.64
     min_confluence_strategy_confidence: float = 0.58
@@ -167,6 +170,9 @@ class ConfluenceStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -277,6 +283,7 @@ class ConfluenceStrategy(HybridTradingStrategy):
     SignalProcessor owns routing, global confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".ConfluenceStrategy")
 
     component_namespace = "strategy.hybrid.confluence"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -292,6 +299,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         hybrid_config: ConfluenceStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy.__init__")
         resolved_hybrid_config = hybrid_config or ConfluenceStrategyConfig()
         resolved_hybrid_config.validate()
 
@@ -308,10 +318,16 @@ class ConfluenceStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy.strategy_name")
         return "hybrid_confluence"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -351,6 +367,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.confluence_config.required_hybrid_features)
 
@@ -358,6 +377,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -489,6 +511,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._enabled_sources")
         sources: list[FeatureSource] = []
 
         if self.confluence_config.use_orderflow:
@@ -521,6 +546,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.confluence_config.require_orderflow:
@@ -553,6 +581,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._vote_weights")
         return {
             FeatureSource.ORDERFLOW: self.confluence_config.orderflow_vote_weight,
             FeatureSource.LIQUIDITY: self.confluence_config.liquidity_vote_weight,
@@ -570,6 +601,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         context: StrategyContext,
         sources: tuple[FeatureSource, ...],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._has_minimum_available_domains")
         available = available_domain_sources(context, sources)
         return len(available) >= self.confluence_config.min_required_domains
 
@@ -585,6 +619,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> ConfluencePayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._extract_payload")
         if not snapshot.directional:
             return None
 
@@ -635,6 +672,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         self,
         payload: ConfluencePayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._passes_confluence_filters")
         if len(payload.aligned_votes) < self.confluence_config.min_aligned_domains:
             return False
 
@@ -684,6 +724,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: ConfluencePayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         domain_count_component = unit_score(
@@ -813,6 +856,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         self,
         payload: ConfluencePayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._source_features")
         features = [
             *confluence_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -832,6 +878,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         self,
         payload: ConfluencePayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._tags")
         tags = [
             self.confluence_config.tag_hybrid,
             self.confluence_config.tag_confluence,
@@ -864,6 +913,9 @@ class ConfluenceStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceStrategy._execution_hints")
         return {
             "entry_offset_bps": self.confluence_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.confluence_config.execution_stop_buffer_bps_hint,

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from dataclasses import dataclass
 from decimal import Decimal
@@ -36,6 +37,24 @@ class CostSide(str, Enum):
 
     @classmethod
     def from_value(cls, value: str | CostSide) -> CostSide:
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "CostSide"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_value", _analytics_args)
+        except Exception:
+            pass
         if isinstance(value, cls):
             return value
 
@@ -90,6 +109,27 @@ class SpreadCostBreakdown:
     net_edge: Decimal = DECIMAL_ZERO
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.gross_edge = _decimal_or_zero(self.gross_edge)
         self.estimated_fees = _non_negative_decimal(self.estimated_fees)
         self.estimated_slippage = _non_negative_decimal(self.estimated_slippage)
@@ -98,24 +138,129 @@ class SpreadCostBreakdown:
 
     @property
     def total_costs(self) -> Decimal:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "total_costs", _analytics_args)
+        except Exception:
+            pass
         return self.estimated_fees + self.estimated_slippage + self.safety_buffer
 
     @property
     def is_profitable(self) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_profitable", _analytics_args)
+        except Exception:
+            pass
         return self.net_edge > DECIMAL_ZERO
 
     @property
     def cost_to_gross_ratio(self) -> Decimal:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "cost_to_gross_ratio", _analytics_args)
+        except Exception:
+            pass
         ratio = safe_div(self.total_costs, self.gross_edge, default=DECIMAL_ZERO)
         return ratio if ratio is not None else DECIMAL_ZERO
 
     def edge_bps(self, reference_notional: Decimal | None) -> Decimal:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "edge_bps", _analytics_args)
+        except Exception:
+            pass
         return edge_bps_after_costs(
             net_edge=self.net_edge,
             reference_notional=reference_notional,
         )
 
     def to_payload(self) -> dict[str, str | bool]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_payload", _analytics_args)
+        except Exception:
+            pass
         return {
             "gross_edge": str(self.gross_edge),
             "estimated_fees": str(self.estimated_fees),

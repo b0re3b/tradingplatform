@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spreads/spread_mean_reversion_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,6 +69,7 @@ class SpreadMeanReversionPayload:
     - CROSS_EXCHANGE can use generic cross-exchange side/leg semantics;
     - final multi-leg construction still belongs to SignalProcessor/SignalBuilder.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadMeanReversionPayload")
 
     snapshot: SpreadCompositeSnapshot
     side: SignalSide
@@ -93,6 +95,7 @@ class SpreadMeanReversionStrategyConfig(SpreadsStrategyConfig):
     - optional analytics mean-reversion/regime/anomaly signal confirms setup;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadMeanReversionStrategyConfig")
 
     entry_zscore: Decimal = Decimal("2.0")
     stop_zscore: Decimal = Decimal("4.5")
@@ -163,6 +166,9 @@ class SpreadMeanReversionStrategyConfig(SpreadsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategyConfig.validate")
         SpreadsStrategyConfig.validate(self)
 
         if self.entry_zscore <= DECIMAL_ZERO:
@@ -256,6 +262,7 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadMeanReversionStrategy")
 
     component_namespace = "strategy.spreads.mean_reversion"
     category: StrategyCategory = StrategyCategory.SPREADS
@@ -271,6 +278,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         spreads_config: SpreadMeanReversionStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy.__init__")
         resolved_spreads_config = spreads_config or SpreadMeanReversionStrategyConfig()
         resolved_spreads_config.validate()
 
@@ -289,10 +299,16 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy.strategy_name")
         return "spread_mean_reversion"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPREADS,
@@ -334,6 +350,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.mean_reversion_config.required_spreads_features
@@ -343,6 +362,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spreads_data(
@@ -492,6 +514,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> SpreadMeanReversionPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._extract_payload")
         snapshot = self.resolve_spread_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -543,6 +568,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> Decimal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._edge")
         for candidate in (
             snapshot.funding_adjusted_spread,
             snapshot.net_edge,
@@ -558,6 +586,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._side")
         if snapshot.spread_type is SpreadType.CROSS_EXCHANGE:
             return cross_exchange_to_signal_side(
                 snapshot.raw_opportunity or snapshot.to_signal_payload()
@@ -570,6 +601,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         snapshot: SpreadCompositeSnapshot,
         side: SignalSide,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._spread_bias")
         if snapshot.spread_type is SpreadType.CROSS_EXCHANGE:
             if side is SignalSide.LONG:
                 return "LONG_A_SHORT_B"
@@ -588,6 +622,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._passes_spread_type_filters")
         if snapshot.spread_type is None:
             return self.mean_reversion_config.allow_unknown_spread_type
 
@@ -603,6 +640,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMeanReversionPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._passes_mean_reversion_filters")
         snapshot = payload.snapshot
 
         if self.mean_reversion_config.require_valid_quote and not snapshot.is_quote_valid:
@@ -639,6 +679,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMeanReversionPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._passes_confirmation_filters")
         signal = payload.snapshot.raw_signal
 
         if self.mean_reversion_config.require_mean_reversion_signal:
@@ -670,6 +713,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         context: StrategyContext,
         payload: SpreadMeanReversionPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         z_component = zscore_component(
@@ -790,6 +836,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._confirmation_component")
         signal = snapshot.raw_signal
 
         components = {
@@ -820,6 +869,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMeanReversionPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._source_features")
         features = [
             *spread_mean_reversion_source_features(),
             SPREADS_FEATURES.SNAPSHOT,
@@ -848,6 +900,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMeanReversionPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._tags")
         tags = [
             self.mean_reversion_config.tag_spreads,
             self.mean_reversion_config.tag_mean_reversion,
@@ -879,6 +934,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMeanReversionPayload,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._leg_semantics")
         snapshot = payload.snapshot
 
         if snapshot.spread_type is SpreadType.CROSS_EXCHANGE:
@@ -931,6 +989,9 @@ class SpreadMeanReversionStrategy(SpreadsTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMeanReversionStrategy._execution_hints")
         return {
             "entry_offset_bps": self.mean_reversion_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.mean_reversion_config.execution_stop_buffer_bps_hint,

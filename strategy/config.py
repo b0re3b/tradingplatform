@@ -1,6 +1,7 @@
 # trading_system/strategy/config.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 
@@ -16,6 +17,7 @@ from strategy.exceptions import StrategyConfigError
 
 @dataclass(slots=True)
 class StrategyRuntimeConfig:
+    _logger = logging.getLogger(__name__ + ".StrategyRuntimeConfig")
     enabled: bool = True
     symbols: list[str] = field(default_factory=list)
     timeframes: list[Timeframe] = field(default_factory=lambda: [Timeframe.M1])
@@ -28,6 +30,9 @@ class StrategyRuntimeConfig:
     min_score: float = 0.0
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeConfig.validate")
         if not 0.0 <= self.min_confidence <= 1.0:
             raise StrategyConfigError(
                 "StrategyRuntimeConfig.min_confidence must be between 0.0 and 1.0"
@@ -62,14 +67,23 @@ class StrategyRuntimeConfig:
             )
 
     def allows_symbol(self, symbol: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeConfig.allows_symbol")
         if not self.symbols:
             return True
         return symbol in self.symbols
 
     def allows_timeframe(self, timeframe: Timeframe) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeConfig.allows_timeframe")
         return timeframe in self.timeframes
 
     def allows_regime(self, regime: MarketRegime) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeConfig.allows_regime")
         if MarketRegime.UNKNOWN in self.allowed_regimes:
             return True
         return regime in self.allowed_regimes
@@ -77,6 +91,7 @@ class StrategyRuntimeConfig:
 
 @dataclass(slots=True)
 class StrategyDefinitionConfig:
+    _logger = logging.getLogger(__name__ + ".StrategyDefinitionConfig")
     name: str
     category: StrategyCategory
     runtime: StrategyRuntimeConfig = field(default_factory=StrategyRuntimeConfig)
@@ -87,6 +102,9 @@ class StrategyDefinitionConfig:
     metadata: dict[str, object] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyDefinitionConfig.validate")
         if not self.name.strip():
             raise StrategyConfigError(
                 "StrategyDefinitionConfig.name cannot be empty"
@@ -157,6 +175,7 @@ DEFAULT_ANALYTICS_EVENT_CATEGORY_PREFIXES: tuple[
 )
 @dataclass(slots=True)
 class RoutingConfig:
+    _logger = logging.getLogger(__name__ + ".RoutingConfig")
     reevaluate_on_any_update: bool = False
     route_hybrid_on_domain_signal: bool = True
     allow_partial_context: bool = True
@@ -164,6 +183,9 @@ class RoutingConfig:
     event_to_categories: dict[str, list[StrategyCategory]] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RoutingConfig.validate")
         if self.stale_feature_threshold_seconds <= 0:
             raise StrategyConfigError(
                 "RoutingConfig.stale_feature_threshold_seconds must be > 0"
@@ -190,6 +212,9 @@ class RoutingConfig:
         3. default production analytics-prefix match;
         4. empty list if event is not routable to strategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RoutingConfig.categories_for_event")
         normalized = self._normalize_event_name(event_name)
         if not normalized:
             return []
@@ -210,6 +235,9 @@ class RoutingConfig:
 
     @staticmethod
     def _normalize_event_name(event_name: object) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".RoutingConfig._normalize_event_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RoutingConfig._normalize_event_name")
         if not isinstance(event_name, str):
             return ""
         return event_name.strip().lower()
@@ -218,6 +246,9 @@ class RoutingConfig:
             self,
             event_name: str,
     ) -> list[StrategyCategory]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RoutingConfig._categories_from_configured_prefix")
         matches: list[tuple[int, list[StrategyCategory]]] = []
 
         for configured_event, categories in self.event_to_categories.items():
@@ -240,6 +271,9 @@ class RoutingConfig:
             self,
             event_name: str,
     ) -> list[StrategyCategory]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RoutingConfig._categories_from_default_prefix")
         for prefix, categories in DEFAULT_ANALYTICS_EVENT_CATEGORY_PREFIXES:
             if event_name.startswith(prefix):
                 return self._normalize_categories(categories)
@@ -250,6 +284,9 @@ class RoutingConfig:
             self,
             categories: list[StrategyCategory] | tuple[StrategyCategory, ...],
     ) -> list[StrategyCategory]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RoutingConfig._normalize_categories")
         result: list[StrategyCategory] = []
 
         for category in categories:
@@ -271,6 +308,7 @@ class RoutingConfig:
 
 @dataclass(slots=True)
 class ConfluenceConfig:
+    _logger = logging.getLogger(__name__ + ".ConfluenceConfig")
     enabled: bool = True
     min_agreement_count: int = 2
     min_confidence: float = 0.6
@@ -280,6 +318,9 @@ class ConfluenceConfig:
     max_strategies_per_side: int = 10
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceConfig.validate")
         if self.min_agreement_count < 1:
             raise StrategyConfigError(
                 "ConfluenceConfig.min_agreement_count must be >= 1"
@@ -313,12 +354,16 @@ class ConfluenceConfig:
 
 @dataclass(slots=True)
 class ConfidenceConfig:
+    _logger = logging.getLogger(__name__ + ".ConfidenceConfig")
     very_low_threshold: float = 0.35
     low_threshold: float = 0.55
     medium_threshold: float = 0.75
     high_threshold: float = 0.90
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfidenceConfig.validate")
         values = [
             self.very_low_threshold,
             self.low_threshold,
@@ -337,6 +382,9 @@ class ConfidenceConfig:
             )
 
     def grade_bounds(self) -> tuple[float, float, float, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfidenceConfig.grade_bounds")
         return (
             self.very_low_threshold,
             self.low_threshold,
@@ -347,6 +395,7 @@ class ConfidenceConfig:
 
 @dataclass(slots=True)
 class WeightingConfig:
+    _logger = logging.getLogger(__name__ + ".WeightingConfig")
     category_weights: dict[StrategyCategory, float] = field(
         default_factory=lambda: {
             StrategyCategory.ORDERFLOW: 1.00,
@@ -378,6 +427,9 @@ class WeightingConfig:
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WeightingConfig.validate")
         for category, value in self.category_weights.items():
             if value < 0:
                 raise StrategyConfigError(
@@ -393,12 +445,16 @@ class WeightingConfig:
 
 @dataclass(slots=True)
 class VotingConfig:
+    _logger = logging.getLogger(__name__ + ".VotingConfig")
     min_confirmations: int = 1
     min_total_votes: int = 1
     require_primary_trigger: bool = True
     allow_single_strategy_confirmation: bool = True
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering VotingConfig.validate")
         if self.min_confirmations < 0:
             raise StrategyConfigError(
                 "VotingConfig.min_confirmations must be >= 0"
@@ -417,11 +473,15 @@ class VotingConfig:
 
 @dataclass(slots=True)
 class ConflictConfig:
+    _logger = logging.getLogger(__name__ + ".ConflictConfig")
     reject_on_side_conflict: bool = False
     reject_on_regime_conflict: bool = False
     max_total_penalty: float = 0.5
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConflictConfig.validate")
         if not 0.0 <= self.max_total_penalty <= 10.0:
             raise StrategyConfigError(
                 "ConflictConfig.max_total_penalty must be between 0.0 and 10.0"
@@ -430,6 +490,7 @@ class ConflictConfig:
 
 @dataclass(slots=True)
 class FilterConfig:
+    _logger = logging.getLogger(__name__ + ".FilterConfig")
     enabled: bool = True
 
     # Runtime-level gates. None means: use StrategyRuntimeConfig fallback.
@@ -456,6 +517,9 @@ class FilterConfig:
     min_funding_alignment: float = -1.0
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterConfig.validate")
         if self.min_signal_confidence is not None and not 0.0 <= self.min_signal_confidence <= 1.0:
             raise StrategyConfigError(
                 "FilterConfig.min_signal_confidence must be between 0.0 and 1.0"
@@ -494,6 +558,7 @@ class FilterConfig:
 
 @dataclass(slots=True)
 class BuilderConfig:
+    _logger = logging.getLogger(__name__ + ".BuilderConfig")
     default_entry_type: EntryType = EntryType.MARKET
     default_rr_ratio: float = 2.0
     enable_partial_take_profit: bool = True
@@ -501,6 +566,9 @@ class BuilderConfig:
     require_invalidation: bool = True
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BuilderConfig.validate")
         if self.default_rr_ratio <= 0:
             raise StrategyConfigError(
                 "BuilderConfig.default_rr_ratio must be > 0"
@@ -530,6 +598,7 @@ class BuilderConfig:
 
 @dataclass(slots=True)
 class PortfolioCoordinatorConfig:
+    _logger = logging.getLogger(__name__ + ".PortfolioCoordinatorConfig")
     enabled: bool = True
     max_signals_per_symbol: int = 3
     deduplicate_by_side: bool = True
@@ -550,6 +619,9 @@ class PortfolioCoordinatorConfig:
     enable_correlation_direction_conflict: bool = True
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinatorConfig.validate")
         if self.max_signals_per_symbol < 1:
             raise StrategyConfigError(
                 "PortfolioCoordinatorConfig.max_signals_per_symbol must be >= 1"
@@ -609,10 +681,14 @@ class PortfolioCoordinatorConfig:
 
 @dataclass(slots=True)
 class FeatureFreshnessConfig:
+    _logger = logging.getLogger(__name__ + ".FeatureFreshnessConfig")
     default_ttl_seconds: int = 30
     per_feature_ttl_seconds: dict[str, int] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureFreshnessConfig.validate")
         if self.default_ttl_seconds <= 0:
             raise StrategyConfigError(
                 "FeatureFreshnessConfig.default_ttl_seconds must be > 0"
@@ -630,6 +706,9 @@ class FeatureFreshnessConfig:
                 )
 
     def get_ttl(self, feature_name: str) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureFreshnessConfig.get_ttl")
         return self.per_feature_ttl_seconds.get(
             feature_name,
             self.default_ttl_seconds,
@@ -638,17 +717,24 @@ class FeatureFreshnessConfig:
 
 @dataclass(slots=True)
 class PresetConfig:
+    _logger = logging.getLogger(__name__ + ".PresetConfig")
     mode: PresetMode = PresetMode.INTRADAY
     enabled_strategy_names: list[str] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PresetConfig.validate")
         if any(not name.strip() for name in self.enabled_strategy_names):
             raise StrategyConfigError(
                 "PresetConfig.enabled_strategy_names cannot contain empty strategy names"
             )
 
     def is_strategy_allowed(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PresetConfig.is_strategy_allowed")
         if not self.enabled_strategy_names:
             return True
         return name in self.enabled_strategy_names
@@ -656,6 +742,7 @@ class PresetConfig:
 
 @dataclass(slots=True)
 class StrategyConfig:
+    _logger = logging.getLogger(__name__ + ".StrategyConfig")
     runtime: StrategyRuntimeConfig = field(default_factory=StrategyRuntimeConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     confluence: ConfluenceConfig = field(default_factory=ConfluenceConfig)
@@ -672,6 +759,9 @@ class StrategyConfig:
     strategies: dict[str, StrategyDefinitionConfig] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.validate")
         self.runtime.validate()
         self.routing.validate()
         self.confluence.validate()
@@ -699,60 +789,99 @@ class StrategyConfig:
             strategy_cfg.validate()
 
     def get_strategy(self, name: str) -> StrategyDefinitionConfig | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_strategy")
         return self.strategies.get(name)
 
     def require_strategy(self, name: str) -> StrategyDefinitionConfig:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.require_strategy")
         strategy = self.get_strategy(name)
         if strategy is None:
             raise StrategyConfigError(f"Strategy '{name}' is not configured")
         return strategy
 
     def is_strategy_configured(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.is_strategy_configured")
         return name in self.strategies
 
     def is_strategy_enabled(self, name: str, default: bool = True) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.is_strategy_enabled")
         strategy = self.get_strategy(name)
         if strategy is None:
             return default
         return strategy.runtime.enabled
 
     def is_strategy_allowed_by_preset(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.is_strategy_allowed_by_preset")
         return self.preset.is_strategy_allowed(name)
 
     def get_strategy_runtime(self, name: str) -> StrategyRuntimeConfig:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_strategy_runtime")
         strategy = self.get_strategy(name)
         if strategy is None:
             return self.runtime
         return strategy.runtime
 
     def get_strategy_weight(self, name: str, default: float = 1.0) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_strategy_weight")
         strategy = self.get_strategy(name)
         if strategy is None:
             return default
         return strategy.weight
 
     def get_strategy_priority(self, name: str, default: int = 100) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_strategy_priority")
         strategy = self.get_strategy(name)
         if strategy is None:
             return default
         return strategy.priority
 
     def get_strategy_required_features(self, name: str) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_strategy_required_features")
         strategy = self.get_strategy(name)
         if strategy is None:
             return set()
         return set(strategy.required_features)
 
     def get_category_weight(self, category: StrategyCategory) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_category_weight")
         return self.weighting.category_weights.get(category, 1.0)
 
     def get_regime_adjustment(self, regime: MarketRegime) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_regime_adjustment")
         return self.weighting.regime_adjustments.get(regime, 1.0)
 
     def get_feature_ttl(self, feature_name: str) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_feature_ttl")
         return self.freshness.get_ttl(feature_name)
 
     def add_strategy(self, strategy: StrategyDefinitionConfig) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.add_strategy")
         strategy.validate()
 
         if strategy.name in self.strategies:
@@ -763,13 +892,22 @@ class StrategyConfig:
         self.strategies[strategy.name] = strategy
 
     def upsert_strategy(self, strategy: StrategyDefinitionConfig) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.upsert_strategy")
         strategy.validate()
         self.strategies[strategy.name] = strategy
 
     def remove_strategy(self, name: str) -> StrategyDefinitionConfig | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.remove_strategy")
         return self.strategies.pop(name, None)
 
     def get_enabled_strategy_names(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.get_enabled_strategy_names")
         return [
             name
             for name, strategy in self.strategies.items()
@@ -778,6 +916,9 @@ class StrategyConfig:
 
     def enabled_strategy_names(self) -> list[str]:
         """Backward-compatible method alias. Prefer get_enabled_strategy_names()."""
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.enabled_strategy_names")
         return self.get_enabled_strategy_names()
 
     def strategies_by_category(
@@ -786,6 +927,9 @@ class StrategyConfig:
         *,
         enabled_only: bool = False,
     ) -> list[StrategyDefinitionConfig]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyConfig.strategies_by_category")
         strategies = [
             strategy
             for strategy in self.strategies.values()

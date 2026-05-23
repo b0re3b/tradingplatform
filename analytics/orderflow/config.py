@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -445,6 +446,27 @@ class BaseOrderFlowSubConfig:
     signal_topic: str = ""
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.symbol_allowlist = _normalize_symbol_allowlist(self.symbol_allowlist)
         self.allowed_exchanges = _normalize_exchange_set(self.allowed_exchanges)
         self.allowed_market_types = _normalize_market_type_set(self.allowed_market_types)
@@ -463,6 +485,27 @@ class BaseOrderFlowSubConfig:
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
     ) -> OrderFlowKey:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "make_key", _analytics_args)
+        except Exception:
+            pass
         return make_orderflow_key(
             exchange=exchange,
             market_type=market_type,
@@ -471,6 +514,27 @@ class BaseOrderFlowSubConfig:
         )
 
     def should_process_symbol(self, symbol: str | None) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_symbol", _analytics_args)
+        except Exception:
+            pass
         if not symbol:
             return False
 
@@ -480,6 +544,27 @@ class BaseOrderFlowSubConfig:
         return True
 
     def should_process_key(self, key: OrderFlowKey) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_key", _analytics_args)
+        except Exception:
+            pass
         scope = orderflow_key_to_dict(key)
 
         if self.allowed_exchanges and scope["exchange"] not in self.allowed_exchanges:
@@ -504,6 +589,27 @@ class BaseOrderFlowSubConfig:
         market_type: str = DEFAULT_MARKET_TYPE,
         timeframe: str = DEFAULT_TIMEFRAME,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_scope", _analytics_args)
+        except Exception:
+            pass
         return self.should_process_key(
             self.make_key(
                 exchange=exchange,
@@ -515,6 +621,27 @@ class BaseOrderFlowSubConfig:
 
     @property
     def output_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "output_topics", _analytics_args)
+        except Exception:
+            pass
         topics: list[str] = []
 
         if self.emit_updates:
@@ -527,6 +654,27 @@ class BaseOrderFlowSubConfig:
 
     @property
     def scheduler_job_names(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "scheduler_job_names", _analytics_args)
+        except Exception:
+            pass
         source = self.source_name or self.__class__.__name__
         return (
             f"analytics.orderflow.{source}.health",
@@ -534,6 +682,27 @@ class BaseOrderFlowSubConfig:
         )
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         errors: list[str] = []
 
         if self.min_signal_interval_sec < 0:
@@ -582,6 +751,27 @@ class BaseOrderFlowSubConfig:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         return {
             "enabled": self.enabled,
             "emit_updates": self.emit_updates,
@@ -642,6 +832,24 @@ class CvdConfig(BaseOrderFlowSubConfig):
 
     @classmethod
     def from_app_config(cls, app_config: Any) -> CvdConfig:
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "CvdConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_app_config", _analytics_args)
+        except Exception:
+            pass
         section = _get_nested_config(app_config, "analytics", "orderflow", "cvd")
 
         return cls(
@@ -702,6 +910,27 @@ class CvdConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
@@ -728,6 +957,27 @@ class CvdConfig(BaseOrderFlowSubConfig):
             )
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = BaseOrderFlowSubConfig.to_dict(self)
         payload.update(
             {
@@ -776,6 +1026,24 @@ class VolumeDeltaConfig(BaseOrderFlowSubConfig):
 
     @classmethod
     def from_app_config(cls, app_config: Any) -> VolumeDeltaConfig:
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "VolumeDeltaConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_app_config", _analytics_args)
+        except Exception:
+            pass
         section = _get_nested_config(app_config, "analytics", "orderflow", "volume_delta")
 
         return cls(
@@ -828,6 +1096,27 @@ class VolumeDeltaConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
@@ -851,6 +1140,27 @@ class VolumeDeltaConfig(BaseOrderFlowSubConfig):
             )
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = BaseOrderFlowSubConfig.to_dict(self)
         payload.update(
             {
@@ -896,6 +1206,24 @@ class AggressiveTradesConfig(BaseOrderFlowSubConfig):
 
     @classmethod
     def from_app_config(cls, app_config: Any) -> AggressiveTradesConfig:
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "AggressiveTradesConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_app_config", _analytics_args)
+        except Exception:
+            pass
         section = _get_nested_config(
             app_config,
             "analytics",
@@ -938,6 +1266,27 @@ class AggressiveTradesConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
@@ -979,6 +1328,27 @@ class AggressiveTradesConfig(BaseOrderFlowSubConfig):
             )
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = BaseOrderFlowSubConfig.to_dict(self)
         payload.update(
             {
@@ -1016,6 +1386,24 @@ class OrderbookImbalanceConfig(BaseOrderFlowSubConfig):
 
     @classmethod
     def from_app_config(cls, app_config: Any) -> OrderbookImbalanceConfig:
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "OrderbookImbalanceConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_app_config", _analytics_args)
+        except Exception:
+            pass
         section = _get_nested_config(
             app_config,
             "analytics",
@@ -1044,6 +1432,27 @@ class OrderbookImbalanceConfig(BaseOrderFlowSubConfig):
         )
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         BaseOrderFlowSubConfig.validate(self)
 
         errors: list[str] = []
@@ -1073,6 +1482,27 @@ class OrderbookImbalanceConfig(BaseOrderFlowSubConfig):
             )
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         payload = BaseOrderFlowSubConfig.to_dict(self)
         payload.update(
             {
@@ -1170,6 +1600,27 @@ class OrderFlowConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.default_exchange = normalize_exchange(self.default_exchange)
         self.default_market_type = normalize_market_type(self.default_market_type)
         self.default_timeframe = normalize_timeframe(self.default_timeframe)
@@ -1211,6 +1662,24 @@ class OrderFlowConfig:
 
     @classmethod
     def from_app_config(cls, app_config: Any) -> OrderFlowConfig:
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "OrderFlowConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_app_config", _analytics_args)
+        except Exception:
+            pass
         section = _get_nested_config(app_config, "analytics", "orderflow")
 
         config = cls(
@@ -1278,14 +1747,77 @@ class OrderFlowConfig:
 
     @property
     def trades_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "trades_topics", _analytics_args)
+        except Exception:
+            pass
         return self.trade_input_topics
 
     @property
     def orderbook_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "orderbook_topics", _analytics_args)
+        except Exception:
+            pass
         return self.orderbook_input_topics
 
     @property
     def production_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_input_topics", _analytics_args)
+        except Exception:
+            pass
         topics: list[str] = []
         topics.extend(self.trade_input_topics)
         topics.extend(self.orderbook_input_topics)
@@ -1293,6 +1825,27 @@ class OrderFlowConfig:
 
     @property
     def output_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "output_topics", _analytics_args)
+        except Exception:
+            pass
         topics: list[str] = []
 
         for config in (
@@ -1317,6 +1870,27 @@ class OrderFlowConfig:
 
     @property
     def scheduler_job_names(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "scheduler_job_names", _analytics_args)
+        except Exception:
+            pass
         names: list[str] = []
 
         for config in (
@@ -1341,6 +1915,27 @@ class OrderFlowConfig:
         market_type: str | None = None,
         timeframe: str | None = None,
     ) -> OrderFlowKey:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "make_key", _analytics_args)
+        except Exception:
+            pass
         return make_orderflow_key(
             exchange=exchange or self.default_exchange,
             market_type=market_type or self.default_market_type,
@@ -1349,6 +1944,27 @@ class OrderFlowConfig:
         )
 
     def should_process_key(self, key: OrderFlowKey) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_key", _analytics_args)
+        except Exception:
+            pass
         scope = orderflow_key_to_dict(key)
 
         if self.allowed_exchanges and scope["exchange"] not in self.allowed_exchanges:
@@ -1373,6 +1989,27 @@ class OrderFlowConfig:
         market_type: str | None = None,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_scope", _analytics_args)
+        except Exception:
+            pass
         return self.should_process_key(
             self.make_key(
                 exchange=exchange,
@@ -1383,6 +2020,27 @@ class OrderFlowConfig:
         )
 
     def scoped_mapping_key(self, key: OrderFlowKey) -> str:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "scoped_mapping_key", _analytics_args)
+        except Exception:
+            pass
         return orderflow_key_to_string(key)
 
     # ------------------------------------------------------------------
@@ -1390,9 +2048,51 @@ class OrderFlowConfig:
     # ------------------------------------------------------------------
 
     def is_raw_market_topic(self, topic: str) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_raw_market_topic", _analytics_args)
+        except Exception:
+            pass
         return topic in RAW_ORDERFLOW_MARKET_TOPICS
 
     def assert_input_topic_allowed(self, topic: str) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "assert_input_topic_allowed", _analytics_args)
+        except Exception:
+            pass
         _validate_topic(topic, "orderflow input topic")
 
         if self.is_raw_market_topic(topic) and not self.allow_raw_market_topics:
@@ -1403,6 +2103,27 @@ class OrderFlowConfig:
             )
 
     def assert_production_topics_allowed(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "assert_production_topics_allowed", _analytics_args)
+        except Exception:
+            pass
         for topic in self.production_input_topics:
             self.assert_input_topic_allowed(topic)
 
@@ -1411,6 +2132,27 @@ class OrderFlowConfig:
     # ------------------------------------------------------------------
 
     def enabled_modules(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "enabled_modules", _analytics_args)
+        except Exception:
+            pass
         modules: list[str] = []
 
         if self.cvd.enabled:
@@ -1428,6 +2170,27 @@ class OrderFlowConfig:
         return tuple(modules)
 
     def _propagate_scope_filters_to_subconfigs(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_propagate_scope_filters_to_subconfigs", _analytics_args)
+        except Exception:
+            pass
         for config in (
             self.cvd,
             self.volume_delta,
@@ -1444,6 +2207,27 @@ class OrderFlowConfig:
     # ------------------------------------------------------------------
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         errors: list[str] = []
 
         if not self.default_exchange:
@@ -1495,6 +2279,27 @@ class OrderFlowConfig:
             )
 
     def to_dict(self) -> dict[str, Any]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "to_dict", _analytics_args)
+        except Exception:
+            pass
         return {
             "enabled": self.enabled,
             "scope": "exchange:market_type:symbol:timeframe",

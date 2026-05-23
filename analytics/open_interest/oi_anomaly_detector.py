@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 import math
 from dataclasses import dataclass, field
@@ -129,15 +130,78 @@ class AnomalyCandidate:
     reasons: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.score = _clamp(self.score)
         self.reasons = list(dict.fromkeys(self.reasons or []))
 
     @property
     def priority(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "priority", _analytics_args)
+        except Exception:
+            pass
         return ANOMALY_PRIORITY.get(self.anomaly_type, 0)
 
     @property
     def reasons_count(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "reasons_count", _analytics_args)
+        except Exception:
+            pass
         return len(self.reasons)
 
 
@@ -156,6 +220,27 @@ class OIAnomalyDetector:
     """
 
     def __init__(self, config: OIAnalyzerConfig) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__init__", _analytics_args)
+        except Exception:
+            pass
         self.config = config
         self.thresholds = config.thresholds
 
@@ -168,6 +253,27 @@ class OIAnomalyDetector:
             - OIAnomalyResult(detected=False, ...) when no anomaly passes threshold.
             - OIAnomalyResult(detected=True, ...) for the strongest anomaly.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "detect", _analytics_args)
+        except Exception:
+            pass
         candidates = self._build_candidates(features)
         best = self._select_best_candidate(candidates)
 
@@ -199,6 +305,27 @@ class OIAnomalyDetector:
 
         This method does not log by itself.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "describe_anomaly_context", _analytics_args)
+        except Exception:
+            pass
         reasons: list[str] = []
 
         if features.oi_zscore is not None:
@@ -247,6 +374,27 @@ class OIAnomalyDetector:
         return list(dict.fromkeys(reasons))
 
     def _build_candidates(self, features: OIFeatures) -> list[AnomalyCandidate]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_build_candidates", _analytics_args)
+        except Exception:
+            pass
         return [
             self._detect_oi_spike(features),
             self._detect_oi_collapse(features),
@@ -263,6 +411,27 @@ class OIAnomalyDetector:
         self,
         candidates: list[AnomalyCandidate],
     ) -> AnomalyCandidate | None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_select_best_candidate", _analytics_args)
+        except Exception:
+            pass
         if not candidates:
             return None
 
@@ -286,6 +455,27 @@ class OIAnomalyDetector:
         )
 
     def _score_to_confidence(self, score: float) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_score_to_confidence", _analytics_args)
+        except Exception:
+            pass
         score = _clamp(score)
 
         if score <= 0:
@@ -298,6 +488,24 @@ class OIAnomalyDetector:
 
     @staticmethod
     def _score_to_strength(score: float) -> OISignalStrength:
+        try:
+            _analytics_class_name = "OIAnomalyDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_score_to_strength", _analytics_args)
+        except Exception:
+            pass
         score = _clamp(score)
 
         if score >= 0.90:
@@ -316,18 +524,81 @@ class OIAnomalyDetector:
     # ------------------------------------------------------------------
 
     def _is_positive_oi_extreme(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_is_positive_oi_extreme", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_zscore is not None
             and features.oi_zscore >= self.thresholds.anomaly_zscore_threshold
         )
 
     def _is_negative_oi_extreme(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_is_negative_oi_extreme", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_zscore is not None
             and features.oi_zscore <= -self.thresholds.anomaly_zscore_threshold
         )
 
     def _is_extreme_oi_extreme(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_is_extreme_oi_extreme", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_zscore is not None
             and abs(features.oi_zscore) >= self.thresholds.extreme_anomaly_zscore_threshold
@@ -335,6 +606,24 @@ class OIAnomalyDetector:
 
     @staticmethod
     def _fast_oi_above_slow_oi(features: OIFeatures) -> bool:
+        try:
+            _analytics_class_name = "OIAnomalyDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_fast_oi_above_slow_oi", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_ma_fast is not None
             and features.oi_ma_slow is not None
@@ -343,6 +632,24 @@ class OIAnomalyDetector:
 
     @staticmethod
     def _fast_oi_below_slow_oi(features: OIFeatures) -> bool:
+        try:
+            _analytics_class_name = "OIAnomalyDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_fast_oi_below_slow_oi", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_ma_fast is not None
             and features.oi_ma_slow is not None
@@ -350,30 +657,135 @@ class OIAnomalyDetector:
         )
 
     def _has_volume_confirmation(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_volume_confirmation", _analytics_args)
+        except Exception:
+            pass
         return (
             features.volume_ratio is not None
             and features.volume_ratio >= self.thresholds.volume_confirmation_ratio
         )
 
     def _has_elevated_volume(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_elevated_volume", _analytics_args)
+        except Exception:
+            pass
         return (
             features.volume_ratio is not None
             and features.volume_ratio >= ELEVATED_VOLUME_RATIO
         )
 
     def _has_high_volume(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_high_volume", _analytics_args)
+        except Exception:
+            pass
         return (
             features.volume_ratio is not None
             and features.volume_ratio >= HIGH_VOLUME_RATIO
         )
 
     def _has_weak_volume(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_weak_volume", _analytics_args)
+        except Exception:
+            pass
         return (
             features.volume_ratio is not None
             and features.volume_ratio < WEAK_VOLUME_RATIO
         )
 
     def _has_elevated_pressure(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_elevated_pressure", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_pressure_score is not None
             and abs(features.oi_pressure_score)
@@ -381,6 +793,27 @@ class OIAnomalyDetector:
         )
 
     def _has_extreme_pressure(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_extreme_pressure", _analytics_args)
+        except Exception:
+            pass
         return (
             features.oi_pressure_score is not None
             and abs(features.oi_pressure_score)
@@ -388,6 +821,27 @@ class OIAnomalyDetector:
         )
 
     def _has_extreme_funding(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_extreme_funding", _analytics_args)
+        except Exception:
+            pass
         return (
             features.funding_rate is not None
             and abs(features.funding_rate)
@@ -395,12 +849,54 @@ class OIAnomalyDetector:
         )
 
     def _has_positive_extreme_funding(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_positive_extreme_funding", _analytics_args)
+        except Exception:
+            pass
         return (
             features.funding_rate is not None
             and features.funding_rate >= self.thresholds.squeeze_funding_abs_threshold
         )
 
     def _has_negative_extreme_funding(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_negative_extreme_funding", _analytics_args)
+        except Exception:
+            pass
         return (
             features.funding_rate is not None
             and features.funding_rate <= -self.thresholds.squeeze_funding_abs_threshold
@@ -408,6 +904,24 @@ class OIAnomalyDetector:
 
     @staticmethod
     def _has_large_liquidation_component(features: OIFeatures) -> bool:
+        try:
+            _analytics_class_name = "OIAnomalyDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_large_liquidation_component", _analytics_args)
+        except Exception:
+            pass
         return (
             features.liquidation_imbalance is not None
             and abs(features.liquidation_imbalance) >= LIQUIDATION_COMPONENT_ABS
@@ -415,6 +929,24 @@ class OIAnomalyDetector:
 
     @staticmethod
     def _has_strong_liquidation_imbalance(features: OIFeatures) -> bool:
+        try:
+            _analytics_class_name = "OIAnomalyDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_strong_liquidation_imbalance", _analytics_args)
+        except Exception:
+            pass
         return (
             features.liquidation_imbalance is not None
             and abs(features.liquidation_imbalance) >= STRONG_LIQUIDATION_IMBALANCE_ABS
@@ -422,15 +954,75 @@ class OIAnomalyDetector:
 
     @staticmethod
     def _has_extreme_aggressive_flow(features: OIFeatures) -> bool:
+        try:
+            _analytics_class_name = "OIAnomalyDetector"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_has_extreme_aggressive_flow", _analytics_args)
+        except Exception:
+            pass
         return (
             features.aggressive_flow_imbalance is not None
             and abs(features.aggressive_flow_imbalance) >= AGGRESSIVE_FLOW_EXTREME_ABS
         )
 
     def _is_positive_oi_shift(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_is_positive_oi_shift", _analytics_args)
+        except Exception:
+            pass
         return features.oi_delta_pct >= self.thresholds.squeeze_oi_build_pct
 
     def _is_negative_oi_drop(self, features: OIFeatures) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_is_negative_oi_drop", _analytics_args)
+        except Exception:
+            pass
         return features.oi_delta_pct <= -self.thresholds.deleveraging_oi_drop_pct
 
     # ------------------------------------------------------------------
@@ -445,6 +1037,27 @@ class OIAnomalyDetector:
         the snapshot better matches structural volume dislocation, extreme
         crowding, or funding imbalance.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_oi_spike", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -505,6 +1118,27 @@ class OIAnomalyDetector:
         Risk-critical liquidation/deleveraging rules receive selector bonuses,
         so this rule remains a broad fallback.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_oi_collapse", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -561,6 +1195,27 @@ class OIAnomalyDetector:
         Without a meaningful price move this rule must not trigger. Otherwise
         low-context noise can be misclassified as OI_PRICE_DISLOCATION.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_oi_price_dislocation", _analytics_args)
+        except Exception:
+            pass
         if (
             features.price_delta_pct is None
             or abs(features.price_delta_pct) < self.thresholds.min_price_change_pct
@@ -632,6 +1287,27 @@ class OIAnomalyDetector:
         This should beat broad OI_SPIKE when the setup is structural rather
         than simply momentum-driven.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_oi_volume_dislocation", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -686,6 +1362,27 @@ class OIAnomalyDetector:
         """
         OI drop driven by liquidation pressure.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_liquidation_driven_oi_drop", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -733,6 +1430,27 @@ class OIAnomalyDetector:
         FUNDING_OI_IMBALANCE can win. If funding + pressure + liquidation are
         all extreme, this rule is penalized so EXTREME_CROWDING can win.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_overheated_buildup", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -798,6 +1516,27 @@ class OIAnomalyDetector:
         """
         Sudden market-wide deleveraging signature.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_sudden_deleveraging", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -857,6 +1596,27 @@ class OIAnomalyDetector:
         This anomaly is hard-gated by extreme funding. Without extreme funding,
         compressed price + weak OI response must not produce a funding anomaly.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_funding_oi_imbalance", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 
@@ -938,6 +1698,27 @@ class OIAnomalyDetector:
         liquidation/flow context are all extreme. It should not steal obvious
         negative deleveraging events.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_detect_extreme_crowding", _analytics_args)
+        except Exception:
+            pass
         score = 0.0
         reasons: list[str] = []
 

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
@@ -91,6 +92,7 @@ class HybridFeatureNames:
     These feature names are optional normalized summary outputs that
     StrategyContextBuilder / SignalNormalizer may also provide.
     """
+    _logger = logging.getLogger(__name__ + ".HybridFeatureNames")
 
     ORDERFLOW: str = "hybrid.orderflow"
     LIQUIDITY: str = "hybrid.liquidity"
@@ -120,6 +122,9 @@ class HybridFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".HybridFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -139,6 +144,7 @@ HYBRID_FEATURES = HybridFeatureNames()
 
 @dataclass(frozen=True, slots=True)
 class HybridStrategyScope:
+    _logger = logging.getLogger(__name__ + ".HybridStrategyScope")
     exchange: str
     market_type: str
     symbol: str
@@ -146,6 +152,9 @@ class HybridStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridStrategyScope.__post_init__")
         exchange = normalize_exchange(self.exchange) or "unknown"
         market_type = normalize_market_type(self.market_type) or "unknown"
         symbol = normalize_symbol(self.symbol)
@@ -163,6 +172,9 @@ class HybridStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridStrategyScope.key")
         return (
             f"{self.exchange}:"
             f"{self.market_type}:"
@@ -172,9 +184,15 @@ class HybridStrategyScope:
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridStrategyScope.legacy_key")
         return f"{self.exchange}:{self.symbol}"
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -202,6 +220,7 @@ class HybridStrategyConfig:
     They must not duplicate SignalProcessor / ConfluenceEngine /
     PortfolioCoordinator / SignalBuilder.
     """
+    _logger = logging.getLogger(__name__ + ".HybridStrategyConfig")
 
     min_score: float = 0.62
     min_confidence: float = 0.58
@@ -251,6 +270,9 @@ class HybridStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridStrategyConfig.validate")
         bounded = {
             "min_score": self.min_score,
             "min_confidence": self.min_confidence,
@@ -314,6 +336,7 @@ class HybridCompositeSnapshot:
     This DTO is local to hybrid strategies. It does not replace SignalProcessor's
     global ConfluenceEngine.
     """
+    _logger = logging.getLogger(__name__ + ".HybridCompositeSnapshot")
 
     symbol: str
     exchange: str = "unknown"
@@ -344,6 +367,9 @@ class HybridCompositeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.__post_init__")
         self.symbol = normalize_symbol(self.symbol)
         self.exchange = normalize_exchange(self.exchange) or "unknown"
         self.market_type = normalize_market_type(self.market_type) or "unknown"
@@ -372,6 +398,9 @@ class HybridCompositeSnapshot:
 
     @property
     def scope(self) -> HybridStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.scope")
         return HybridStrategyScope(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -382,14 +411,23 @@ class HybridCompositeSnapshot:
 
     @property
     def scope_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.scope_key")
         return self.scope.key
 
     @property
     def directional(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.directional")
         return is_directional_side(self.dominant_side)
 
     @property
     def available_domains(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.available_domains")
         return [
             source.value
             for source, payload in self.payloads().items()
@@ -398,21 +436,33 @@ class HybridCompositeSnapshot:
 
     @property
     def domain_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.domain_count")
         return len(self.available_domains)
 
     @property
     def aligned_domains(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.aligned_domains")
         if not self.directional:
             return []
         return aligned_source_names(self.votes, self.dominant_side)
 
     @property
     def conflicting_domains(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.conflicting_domains")
         if not self.directional:
             return []
         return conflicting_source_names(self.votes, self.dominant_side)
 
     def payloads(self) -> dict[FeatureSource, dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.payloads")
         return {
             FeatureSource.ORDERFLOW: self.orderflow,
             FeatureSource.LIQUIDITY: self.liquidity,
@@ -426,9 +476,15 @@ class HybridCompositeSnapshot:
         }
 
     def has_domain(self, source: FeatureSource) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.has_domain")
         return bool(self.payloads().get(source))
 
     def has_any_domain(self, sources: Sequence[FeatureSource]) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.has_any_domain")
         return any(self.has_domain(source) for source in sources)
 
     def has_all_domains(
@@ -437,13 +493,22 @@ class HybridCompositeSnapshot:
         *,
         allow_missing: int = 0,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.has_all_domains")
         missing = sum(1 for source in sources if not self.has_domain(source))
         return missing <= max(0, allow_missing)
 
     def has_minimum_data(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.has_minimum_data")
         return self.domain_count > 0 or bool(self.votes) or self.confidence > 0.0
 
     def to_signal_payload(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.to_signal_payload")
         return {
             "symbol": self.symbol,
             "exchange": self.exchange,
@@ -463,6 +528,9 @@ class HybridCompositeSnapshot:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridCompositeSnapshot.to_dict")
         return {
             "symbol": self.symbol,
             "exchange": self.exchange,
@@ -517,6 +585,7 @@ class HybridTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".HybridTradingStrategy")
 
     component_namespace = "strategy.hybrid"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -535,6 +604,9 @@ class HybridTradingStrategy(TradingStrategy):
         hybrid_config: HybridStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.__init__")
         self.hybrid_config = hybrid_config or HybridStrategyConfig()
         self.hybrid_config.validate()
 
@@ -547,6 +619,9 @@ class HybridTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.validate_config")
         super().validate_config()
         self.hybrid_config.validate()
 
@@ -555,6 +630,9 @@ class HybridTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def hybrid_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.hybrid_domain")
         self.validate_context(context)
         return dict(context.domain_dict(FeatureSource.EXTERNAL))
 
@@ -563,6 +641,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         source: FeatureSource,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_dict")
         self.validate_context(context)
         return domain_dict(context, source)
 
@@ -573,6 +654,9 @@ class HybridTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -588,6 +672,9 @@ class HybridTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_float")
         return to_float(self.domain_path(context, source, path, default), default)
 
     def domain_int(
@@ -598,6 +685,9 @@ class HybridTradingStrategy(TradingStrategy):
         *,
         default: int | None = None,
     ) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_int")
         return to_int(self.domain_path(context, source, path, default), default)
 
     def domain_bool(
@@ -608,6 +698,9 @@ class HybridTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_bool")
         return to_bool(self.domain_path(context, source, path, default), default)
 
     def domain_str(
@@ -618,6 +711,9 @@ class HybridTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_str")
         return to_str(self.domain_path(context, source, path, default), default)
 
     def domain_feature_snapshot(
@@ -625,6 +721,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -643,6 +742,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_feature_age_seconds")
         snapshot = self.domain_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -655,6 +757,9 @@ class HybridTradingStrategy(TradingStrategy):
         *,
         required_paths: Sequence[str] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.domain_available")
         self.validate_context(context)
         return domain_available(context, source, required_paths=required_paths)
 
@@ -665,6 +770,9 @@ class HybridTradingStrategy(TradingStrategy):
         *,
         allow_missing: int | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.required_domains_available")
         return required_domains_available(
             context,
             sources,
@@ -680,6 +788,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         sources: Sequence[FeatureSource] = DOMAIN_FEATURE_SOURCES,
     ) -> list[FeatureSource]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.available_domain_sources")
         return available_domain_sources(context, sources)
 
     def missing_domain_sources(
@@ -687,6 +798,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         sources: Sequence[FeatureSource],
     ) -> list[FeatureSource]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.missing_domain_sources")
         return missing_domain_sources(context, sources)
 
     def has_stale_domains(
@@ -694,6 +808,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         sources: Sequence[FeatureSource],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.has_stale_domains")
         payloads = self.resolve_domain_payloads(context, sources)
         return any(
             domain_is_stale(
@@ -713,6 +830,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         sources: Sequence[FeatureSource] = DOMAIN_FEATURE_SOURCES,
     ) -> HybridStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.hybrid_scope")
         payloads = self.resolve_domain_payloads(context, sources)
 
         symbol = self._first_non_empty_symbol(payloads) or normalize_symbol(context.symbol)
@@ -744,6 +864,9 @@ class HybridTradingStrategy(TradingStrategy):
         context: StrategyContext,
         sources: Sequence[FeatureSource] = DOMAIN_FEATURE_SOURCES,
     ) -> dict[FeatureSource, dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.resolve_domain_payloads")
         self.validate_context(context)
         return extract_context_domain_payloads(context, sources)
 
@@ -754,6 +877,9 @@ class HybridTradingStrategy(TradingStrategy):
         sources: Sequence[FeatureSource] = DOMAIN_FEATURE_SOURCES,
         vote_weights: Mapping[FeatureSource, float] | None = None,
     ) -> HybridCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.resolve_hybrid_snapshot")
         self.validate_context(context)
 
         payloads = self.resolve_domain_payloads(context, sources)
@@ -840,6 +966,9 @@ class HybridTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> HybridCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._build_snapshot_from_hybrid_features")
         payload = {
             "symbol": self._feature_value(context, HYBRID_FEATURES.SYMBOL),
             "exchange": self._feature_value(context, HYBRID_FEATURES.EXCHANGE),
@@ -928,6 +1057,9 @@ class HybridTradingStrategy(TradingStrategy):
         sources: Sequence[FeatureSource],
         vote_weights: Mapping[FeatureSource, float] | None = None,
     ) -> list[DirectionVote]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.build_direction_votes")
         self.validate_context(context)
         return build_direction_votes(
             context,
@@ -943,6 +1075,9 @@ class HybridTradingStrategy(TradingStrategy):
         weight: float = 1.0,
         reason: str | None = None,
     ) -> DirectionVote:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.build_domain_vote")
         return build_direction_vote(
             source=source,
             payload=payload,
@@ -962,6 +1097,9 @@ class HybridTradingStrategy(TradingStrategy):
         max_conflict_score: float | None = None,
         allow_missing: int | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.accepts_hybrid_snapshot")
         if not snapshot.has_minimum_data():
             return False
 
@@ -1035,6 +1173,9 @@ class HybridTradingStrategy(TradingStrategy):
         reasons: list[str] | None = None,
         confirmations: list[str] | None = None,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.build_hybrid_score_breakdown")
         return build_hybrid_score_breakdown(
             votes=snapshot.votes,
             side=side,
@@ -1068,6 +1209,9 @@ class HybridTradingStrategy(TradingStrategy):
         origin: SignalOrigin = SignalOrigin.SINGLE_STRATEGY,
         status: SignalStatus = SignalStatus.NEW,
     ) -> StrategySignal:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.build_hybrid_signal")
         if not is_directional_side(side):
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: hybrid signal side must be LONG or SHORT"
@@ -1171,6 +1315,9 @@ class HybridTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy.hybrid_context_metadata")
         metadata: dict[str, Any] = {}
 
         snapshot = self.resolve_hybrid_snapshot(context)
@@ -1212,6 +1359,9 @@ class HybridTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".HybridTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._feature_value")
         if not isinstance(feature_name, str) or not feature_name.strip():
             return None
 
@@ -1227,6 +1377,9 @@ class HybridTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _has_any_value(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".HybridTradingStrategy._has_any_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._has_any_value")
         if value is None:
             return False
 
@@ -1248,6 +1401,9 @@ class HybridTradingStrategy(TradingStrategy):
     def _first_non_empty_symbol(
         payloads: Mapping[FeatureSource, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".HybridTradingStrategy._first_non_empty_symbol")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._first_non_empty_symbol")
         for payload in payloads.values():
             symbol = extract_domain_symbol(payload)
             if symbol:
@@ -1258,6 +1414,9 @@ class HybridTradingStrategy(TradingStrategy):
     def _first_non_empty_exchange(
         payloads: Mapping[FeatureSource, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".HybridTradingStrategy._first_non_empty_exchange")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._first_non_empty_exchange")
         for payload in payloads.values():
             exchange = extract_domain_exchange(payload)
             if exchange:
@@ -1268,6 +1427,9 @@ class HybridTradingStrategy(TradingStrategy):
     def _first_non_empty_market_type(
         payloads: Mapping[FeatureSource, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".HybridTradingStrategy._first_non_empty_market_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._first_non_empty_market_type")
         for payload in payloads.values():
             market_type = extract_domain_market_type(payload)
             if market_type:
@@ -1278,6 +1440,9 @@ class HybridTradingStrategy(TradingStrategy):
     def _first_non_empty_timeframe(
         payloads: Mapping[FeatureSource, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".HybridTradingStrategy._first_non_empty_timeframe")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridTradingStrategy._first_non_empty_timeframe")
         for payload in payloads.values():
             timeframe = extract_domain_timeframe(payload, "")
             if timeframe:

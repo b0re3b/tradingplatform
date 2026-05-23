@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/open_interest/oi_anomaly_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -79,6 +80,7 @@ class OIAnomalyStrategyPayload:
         - OIDivergenceResult;
         - full OI analysis confidence через OpenInterestTradingStrategy.
     """
+    _logger = logging.getLogger(__name__ + ".OIAnomalyStrategyPayload")
 
     anomaly: OIAnomalyResult
     features: OIFeatures | None = None
@@ -91,18 +93,30 @@ class OIAnomalyStrategyPayload:
 
     @property
     def anomaly_type(self) -> OIAnomalyType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategyPayload.anomaly_type")
         return self.anomaly.anomaly_type
 
     @property
     def detected(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategyPayload.detected")
         return bool(self.anomaly.detected)
 
     @property
     def confidence(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategyPayload.confidence")
         return unit_score(getattr(self.anomaly, "confidence", 0.0))
 
     @property
     def score(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategyPayload.score")
         return unit_score(getattr(self.anomaly, "score", self.confidence))
 
 
@@ -120,6 +134,7 @@ class OIAnomalyStrategyConfig(OpenInterestStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".OIAnomalyStrategyConfig")
 
     require_detected_result: bool = True
     require_actionable_side: bool = True
@@ -179,6 +194,9 @@ class OIAnomalyStrategyConfig(OpenInterestStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategyConfig.validate")
         OpenInterestStrategyConfig.validate(self)
 
         unit_fields = {
@@ -271,6 +289,7 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".OIAnomalyStrategy")
 
     component_namespace = "strategy.open_interest.anomaly"
     category: StrategyCategory = StrategyCategory.OPEN_INTEREST
@@ -325,6 +344,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         open_interest_config: OIAnomalyStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy.__init__")
         resolved_open_interest_config = (
             open_interest_config or OIAnomalyStrategyConfig()
         )
@@ -343,10 +365,16 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy.strategy_name")
         return "oi_anomaly"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.OPEN_INTEREST,
@@ -393,6 +421,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.anomaly_config.required_open_interest_features
@@ -402,6 +433,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_open_interest_data(
@@ -612,6 +646,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> OIAnomalyStrategyPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._extract_payload")
         anomaly = self.extract_oi_anomaly_result(context)
         if anomaly is None:
             return None
@@ -650,6 +687,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         self,
         payload: OIAnomalyStrategyPayload,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._map_anomaly_to_side")
         anomaly_type = payload.anomaly_type
         features = payload.features
         regime = payload.regime.regime if payload.regime is not None else None
@@ -695,6 +735,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         self,
         payload: OIAnomalyStrategyPayload,
     ) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._map_anomaly_to_setup_type")
         anomaly_type = payload.anomaly_type
         regime = payload.regime.regime if payload.regime is not None else None
 
@@ -735,6 +778,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._block_reason")
         if payload.anomaly_type is OIAnomalyType.NONE:
             return "anomaly_type_none"
 
@@ -763,6 +809,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._hard_risk_flush_supports_side")
         features = payload.features
         if features is None:
             return False
@@ -799,6 +848,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._crowding_supports_reversal")
         features = payload.features
         if features is None:
             return False
@@ -832,6 +884,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         side: SignalSide,
         event_time: datetime | None,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._build_score_breakdown")
         base_score = payload.score if payload.score > 0 else payload.confidence
         anomaly_score = unit_score(base_score)
         features_score = self._feature_context_score(payload=payload, side=side)
@@ -955,6 +1010,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._feature_context_score")
         features = payload.features
         if features is None:
             return 0.0
@@ -999,6 +1057,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._regime_context_score")
         regime = payload.regime
         if regime is None:
             return 0.0
@@ -1024,6 +1085,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._divergence_context_score")
         divergence = payload.divergence
         if divergence is None or not divergence.detected:
             return 0.0
@@ -1048,6 +1112,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._feature_score_adjustment")
         features = payload.features
         if features is None:
             return 0.0
@@ -1097,6 +1164,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._feature_confidence_adjustment")
         features = payload.features
         if features is None:
             return 0.0
@@ -1134,6 +1204,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._divergence_score_adjustment")
         divergence = payload.divergence
         if divergence is None or not divergence.detected:
             return 0.0
@@ -1167,6 +1240,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._regime_aligns_with_side")
         if payload.regime is None:
             return False
 
@@ -1193,6 +1269,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, payload: OIAnomalyStrategyPayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._source_features")
         features = [
             OPEN_INTEREST_FEATURES.ANOMALY,
             OPEN_INTEREST_FEATURES.ANOMALY_TYPE,
@@ -1238,6 +1317,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
         payload: OIAnomalyStrategyPayload,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._tags")
         tags = [
             self.anomaly_config.tag_open_interest,
             self.anomaly_config.tag_oi_anomaly,
@@ -1279,6 +1361,9 @@ class OIAnomalyStrategy(OpenInterestTradingStrategy):
 
     @staticmethod
     def _anomaly_strength(payload: OIAnomalyStrategyPayload) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".OIAnomalyStrategy._anomaly_strength")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIAnomalyStrategy._anomaly_strength")
         strength = getattr(payload.anomaly, "strength", None)
 
         if strength is None:

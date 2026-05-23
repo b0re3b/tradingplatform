@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from dataclasses import dataclass, field
 
@@ -9,6 +10,46 @@ from .models import (
     make_spoofing_key,
     spoofing_key_to_dict,
 )
+from ..liquidity.config import DEFAULT_EXCHANGE
+
+# =============================================================================
+# Project scope defaults
+# =============================================================================
+
+# Market-data exchanges used by the project.
+# Bitget is intentionally excluded.
+PROJECT_EXCHANGES: tuple[str, ...] = (
+    "binance",
+    "bybit",
+    "okx",
+    "mexc",
+)
+
+# Futures/perpetual market types used across supported exchanges.
+# Binance USD-M Futures remains the execution-first default.
+PROJECT_MARKET_TYPES: tuple[str, ...] = (
+    "usdm_futures",
+    "linear",
+    "swap",
+)
+
+# Timeframes currently used by the project pipeline/backtesting flow.
+PROJECT_TIMEFRAMES: tuple[str, ...] = (
+    "1m",
+    "15m",
+)
+
+
+def _default_exchange_allowlist() -> set[str]:
+    return set(PROJECT_EXCHANGES)
+
+
+def _default_market_type_allowlist() -> set[str]:
+    return set(PROJECT_MARKET_TYPES)
+
+
+def _default_timeframe_allowlist() -> set[str]:
+    return set(PROJECT_TIMEFRAMES)
 
 
 # =============================================================================
@@ -162,6 +203,27 @@ class PersistenceTrackerConfig:
 
     def __post_init__(self) -> None:
         # Якщо старий config передає тільки max_walls_per_symbol, не ламаємо його.
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         if self.max_walls_per_key == 500 and self.max_walls_per_symbol != 500:
             self.max_walls_per_key = self.max_walls_per_symbol
         else:
@@ -295,6 +357,27 @@ class CandidateTrackingConfig:
     emit_raw_candidate_events: bool = False
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         if self.max_candidates_per_key == 200 and self.max_candidates_per_symbol != 200:
             self.max_candidates_per_key = self.max_candidates_per_symbol
         else:
@@ -367,6 +450,27 @@ class SpoofingAnalyzerConfig:
     scheduler_cleanup_enabled: bool = True
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         if self.max_tracked_walls_per_key == 500 and self.max_tracked_walls_per_symbol != 500:
             self.max_tracked_walls_per_key = self.max_tracked_walls_per_symbol
         else:
@@ -388,6 +492,27 @@ class SpoofingAnalyzerConfig:
         """
         Усі production source topic patterns для SpoofingAnalyzer.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "source_topic_patterns", _analytics_args)
+        except Exception:
+            pass
         return (
             *self.source_topic_patterns_orderbook,
             *self.source_topic_patterns_trade,
@@ -399,6 +524,27 @@ class SpoofingAnalyzerConfig:
         Legacy/raw topics для міграції або ручних тестів.
         Не підключати в production, якщо allow_legacy_raw_topics=False.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "legacy_raw_topic_patterns", _analytics_args)
+        except Exception:
+            pass
         return (
             self.legacy_raw_orderbook_topic,
             self.legacy_raw_trade_topic,
@@ -434,15 +580,16 @@ class SpoofingConfig:
     enabled: bool = True
 
     # Scoped defaults. Symbol-only processing is unsafe without default_exchange.
-    default_exchange: str | None = None
+    default_exchange: str = DEFAULT_EXCHANGE
     default_market_type: str = DEFAULT_MARKET_TYPE
     default_timeframe: str = DEFAULT_TIMEFRAME
 
-    # Scoped allowlists.
-    exchange_allowlist: set[str] | None = None
-    market_type_allowlist: set[str] | None = None
+    # Scoped allowlists. Defaults are populated with the exchanges, futures
+    # market types and timeframes used by the project.
+    exchange_allowlist: set[str] | None = field(default_factory=_default_exchange_allowlist)
+    market_type_allowlist: set[str] | None = field(default_factory=_default_market_type_allowlist)
     symbol_allowlist: set[str] | None = None
-    timeframe_allowlist: set[str] | None = None
+    timeframe_allowlist: set[str] | None = field(default_factory=_default_timeframe_allowlist)
 
     # Legacy-compatible fields.
     exchange: str | None = None
@@ -459,17 +606,52 @@ class SpoofingConfig:
     analyzer: SpoofingAnalyzerConfig = field(default_factory=SpoofingAnalyzerConfig)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         legacy_exchange = _normalize_exchange(self.exchange)
-        self.default_exchange = _normalize_exchange(self.default_exchange) or legacy_exchange
+        normalized_default_exchange = _normalize_exchange(self.default_exchange)
+
+        # Binance USD-M Futures is the project default for execution-capable
+        # futures scope. If imported DEFAULT_EXCHANGE is empty, fall back to
+        # Binance instead of leaving scope empty and breaking startup.
+        self.default_exchange = normalized_default_exchange or legacy_exchange or "binance"
         self.exchange = self.default_exchange
 
         self.default_market_type = _normalize_market_type(self.default_market_type)
         self.default_timeframe = _normalize_timeframe(self.default_timeframe)
 
-        self.exchange_allowlist = _normalize_exchange_allowlist(self.exchange_allowlist)
-        self.market_type_allowlist = _normalize_market_type_allowlist(self.market_type_allowlist)
+        self.exchange_allowlist = (
+            _normalize_exchange_allowlist(self.exchange_allowlist)
+            or _default_exchange_allowlist()
+        )
+        self.market_type_allowlist = (
+            _normalize_market_type_allowlist(self.market_type_allowlist)
+            or _default_market_type_allowlist()
+        )
         self.symbol_allowlist = _normalize_symbol_allowlist(self.symbol_allowlist)
-        self.timeframe_allowlist = _normalize_timeframe_allowlist(self.timeframe_allowlist)
+        self.timeframe_allowlist = (
+            _normalize_timeframe_allowlist(self.timeframe_allowlist)
+            or _default_timeframe_allowlist()
+        )
 
         legacy_symbols = _normalize_symbol_allowlist(self.symbols)
         if self.symbol_allowlist is None and legacy_symbols is not None:
@@ -489,6 +671,27 @@ class SpoofingConfig:
         config у SpoofingAnalyzer.
         """
 
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         self._validate_scope_defaults()
         self._validate_wall_detection()
         self._validate_persistence()
@@ -501,6 +704,27 @@ class SpoofingConfig:
         self._validate_analyzer()
 
     def _validate_scope_defaults(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_scope_defaults", _analytics_args)
+        except Exception:
+            pass
         if self.default_exchange is not None:
             self._validate_non_empty_string("default_exchange", self.default_exchange)
 
@@ -520,6 +744,27 @@ class SpoofingConfig:
             self._validate_non_empty_string("timeframe_allowlist item", timeframe)
 
     def _validate_wall_detection(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_wall_detection", _analytics_args)
+        except Exception:
+            pass
         self._validate_non_negative(
             "wall_detection.min_wall_size_abs",
             self.wall_detection.min_wall_size_abs,
@@ -552,6 +797,27 @@ class SpoofingConfig:
             )
 
     def _validate_persistence(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_persistence", _analytics_args)
+        except Exception:
+            pass
         self._validate_positive_int(
             "persistence.wall_ttl_ms",
             self.persistence.wall_ttl_ms,
@@ -582,6 +848,27 @@ class SpoofingConfig:
         )
 
     def _validate_pull_detection(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_pull_detection", _analytics_args)
+        except Exception:
+            pass
         self._validate_positive_int(
             "pull_detection.max_pull_lifetime_ms",
             self.pull_detection.max_pull_lifetime_ms,
@@ -614,6 +901,27 @@ class SpoofingConfig:
             )
 
     def _validate_fake_liquidity(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_fake_liquidity", _analytics_args)
+        except Exception:
+            pass
         self._validate_ratio(
             "fake_liquidity.max_fill_ratio",
             self.fake_liquidity.max_fill_ratio,
@@ -632,6 +940,27 @@ class SpoofingConfig:
         )
 
     def _validate_layering(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_layering", _analytics_args)
+        except Exception:
+            pass
         self._validate_positive_int(
             "layering.min_layers",
             self.layering.min_layers,
@@ -650,6 +979,27 @@ class SpoofingConfig:
         )
 
     def _validate_flip_pressure(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_flip_pressure", _analytics_args)
+        except Exception:
+            pass
         self._validate_non_negative(
             "flip_pressure.min_price_reaction_bps",
             self.flip_pressure.min_price_reaction_bps,
@@ -664,6 +1014,27 @@ class SpoofingConfig:
         )
 
     def _validate_scoring(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_scoring", _analytics_args)
+        except Exception:
+            pass
         self._validate_ratio(
             "scoring.detection_threshold",
             self.scoring.detection_threshold,
@@ -709,6 +1080,27 @@ class SpoofingConfig:
             raise ValueError("sum of scoring weights must be > 0")
 
     def _validate_candidate_tracking(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_candidate_tracking", _analytics_args)
+        except Exception:
+            pass
         self._validate_positive_int(
             "candidate_tracking.candidate_ttl_ms",
             self.candidate_tracking.candidate_ttl_ms,
@@ -747,6 +1139,27 @@ class SpoofingConfig:
         )
 
     def _validate_analyzer(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_analyzer", _analytics_args)
+        except Exception:
+            pass
         self._validate_positive_int(
             "analyzer.max_tracked_walls_per_key",
             self.analyzer.max_tracked_walls_per_key,
@@ -795,6 +1208,27 @@ class SpoofingConfig:
     # ------------------------------------------------------------------
 
     def scoring_weights(self) -> list[float]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "scoring_weights", _analytics_args)
+        except Exception:
+            pass
         return [
             self.scoring.weight_wall_size,
             self.scoring.weight_wall_distance,
@@ -808,6 +1242,27 @@ class SpoofingConfig:
 
     @property
     def cleanup_interval_seconds(self) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "cleanup_interval_seconds", _analytics_args)
+        except Exception:
+            pass
         return self.persistence.cleanup_interval_ms / 1000.0
 
     def make_default_key(self, *, symbol: str, timeframe: str | None = None) -> SpoofingKey:
@@ -817,6 +1272,27 @@ class SpoofingConfig:
         У multi-exchange режимі symbol-only небезпечний, тому default_exchange
         обов'язковий.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "make_default_key", _analytics_args)
+        except Exception:
+            pass
         if not self.default_exchange:
             raise ValueError(
                 "make_default_key(symbol) requires default_exchange. "
@@ -838,6 +1314,27 @@ class SpoofingConfig:
         market_type: str | None = None,
         timeframe: str | None = None,
     ) -> SpoofingKey:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "make_key", _analytics_args)
+        except Exception:
+            pass
         return make_spoofing_key(
             exchange=exchange,
             market_type=market_type or self.default_market_type,
@@ -846,6 +1343,27 @@ class SpoofingConfig:
         )
 
     def is_key_allowed(self, key: SpoofingKey) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_key_allowed", _analytics_args)
+        except Exception:
+            pass
         scope = spoofing_key_to_dict(key)
 
         return self.is_scope_allowed(
@@ -863,6 +1381,27 @@ class SpoofingConfig:
         market_type: str | None = None,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_scope_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized_exchange = _normalize_exchange(exchange)
         normalized_market_type = _normalize_market_type(market_type or self.default_market_type)
         normalized_symbol = _normalize_symbol(symbol)
@@ -891,6 +1430,27 @@ class SpoofingConfig:
 
         New code should use is_key_allowed() або is_scope_allowed().
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_symbol_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized_symbol = _normalize_symbol(symbol)
         if normalized_symbol is None:
             return False
@@ -902,6 +1462,27 @@ class SpoofingConfig:
 
     @property
     def production_source_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_source_topics", _analytics_args)
+        except Exception:
+            pass
         return self.analyzer.source_topic_patterns
 
     # ------------------------------------------------------------------
@@ -910,41 +1491,170 @@ class SpoofingConfig:
 
     @staticmethod
     def _validate_ratio(name: str, value: float) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_ratio", _analytics_args)
+        except Exception:
+            pass
         if value < 0 or value > 1:
             raise ValueError(f"{name} must be in [0, 1]")
 
     @staticmethod
     def _validate_positive(name: str, value: float) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_positive", _analytics_args)
+        except Exception:
+            pass
         if value <= 0:
             raise ValueError(f"{name} must be > 0")
 
     @staticmethod
     def _validate_non_negative(name: str, value: float) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_non_negative", _analytics_args)
+        except Exception:
+            pass
         if value < 0:
             raise ValueError(f"{name} must be >= 0")
 
     @staticmethod
     def _validate_positive_int(name: str, value: int) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_positive_int", _analytics_args)
+        except Exception:
+            pass
         if value <= 0:
             raise ValueError(f"{name} must be > 0")
 
     @staticmethod
     def _validate_non_negative_int(name: str, value: int) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_non_negative_int", _analytics_args)
+        except Exception:
+            pass
         if value < 0:
             raise ValueError(f"{name} must be >= 0")
 
     @staticmethod
     def _validate_topic(name: str, value: str) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_topic", _analytics_args)
+        except Exception:
+            pass
         if not value or not value.strip():
             raise ValueError(f"{name} must not be empty")
 
     @staticmethod
     def _validate_non_empty_string(name: str, value: str) -> None:
+        try:
+            _analytics_class_name = "SpoofingConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_non_empty_string", _analytics_args)
+        except Exception:
+            pass
         if not value or not value.strip():
             raise ValueError(f"{name} must not be empty")
 
 
 __all__ = [
+    "PROJECT_EXCHANGES",
+    "PROJECT_MARKET_TYPES",
+    "PROJECT_TIMEFRAMES",
     "WallDetectionConfig",
     "PersistenceTrackerConfig",
     "PullDetectionConfig",

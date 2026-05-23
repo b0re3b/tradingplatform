@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidations/liquidation_cascade_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from decimal import Decimal
@@ -69,6 +70,7 @@ class LiquidationCascadeStrategyConfig(LiquidationsStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidationCascadeStrategyConfig")
 
     require_confirmed_result: bool = True
     require_actionable_direction: bool = True
@@ -121,6 +123,9 @@ class LiquidationCascadeStrategyConfig(LiquidationsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategyConfig.validate")
         LiquidationsStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -240,6 +245,7 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidationCascadeStrategy")
 
     component_namespace = "strategy.liquidations.cascade"
     category: StrategyCategory = StrategyCategory.LIQUIDATIONS
@@ -255,6 +261,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         liquidations_config: LiquidationCascadeStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy.__init__")
         resolved_liquidations_config = (
             liquidations_config or LiquidationCascadeStrategyConfig()
         )
@@ -275,9 +284,15 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy.strategy_name")
         return "liquidation_cascade"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.cascade_config.required_liquidations_features
@@ -287,6 +302,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         cascade = liquidations_item(context, "cascade")
@@ -470,6 +488,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
     # ------------------------------------------------------------------
 
     def _passes_cascade_filters(self, cascade: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._passes_cascade_filters")
         if not self._severity_allowed(cascade):
             return False
 
@@ -516,6 +537,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         return True
 
     def _severity_allowed(self, cascade: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._severity_allowed")
         severity = self._severity(cascade)
         allowed = {
             item.strip().lower()
@@ -530,6 +554,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
     # ------------------------------------------------------------------
 
     def _derive_continuation_side(self, cascade: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._derive_continuation_side")
         return continuation_side_from_direction(extract_direction(cascade))
 
     # ------------------------------------------------------------------
@@ -542,6 +569,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         context: StrategyContext,
         cascade: Any,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._build_score_breakdown")
         confidence_component = extract_confidence(cascade)
         continuation_bias = extract_continuation_bias(cascade)
         intensity_score = extract_intensity_score(cascade)
@@ -656,6 +686,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
 
     @staticmethod
     def _imbalance_score(cascade: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidationCascadeStrategy._imbalance_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._imbalance_score")
         side_imbalance = extract_side_imbalance_ratio(cascade)
         event_imbalance = extract_event_imbalance_ratio(cascade)
 
@@ -669,6 +702,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
 
     @staticmethod
     def _acceleration_score(cascade: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidationCascadeStrategy._acceleration_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._acceleration_score")
         acceleration = extract_acceleration_ratio(cascade)
 
         if acceleration <= 0:
@@ -682,9 +718,15 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
     # ------------------------------------------------------------------
 
     def _severity(self, cascade: Any) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._severity")
         return extract_severity_label(cascade, default="unknown")
 
     def _source_features(self, cascade: Any) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._source_features")
         features = [
             LIQUIDATIONS_FEATURES.CASCADE,
             LIQUIDATIONS_FEATURES.CASCADE_CONFIDENCE,
@@ -715,6 +757,9 @@ class LiquidationCascadeStrategy(LiquidationsTradingStrategy):
         return list(dict.fromkeys(features))
 
     def _tags(self, cascade: Any) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationCascadeStrategy._tags")
         tags = [
             self.cascade_config.tag_liquidations,
             self.cascade_config.tag_cascade,

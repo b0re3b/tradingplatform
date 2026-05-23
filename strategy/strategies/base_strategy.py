@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/base_strategy.py
 
 from __future__ import annotations
+import logging
 
 from abc import ABC
 from typing import Any
@@ -51,12 +52,19 @@ class StrategyMixinSupport:
     These wrappers avoid unresolved attribute warnings without weakening runtime
     behavior.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyMixinSupport")
 
     @property
     def _strategy_name_for_errors(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMixinSupport._strategy_name_for_errors")
         return str(getattr(self, "strategy_name", self.__class__.__name__))
 
     def _validate_context_for_mixin(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMixinSupport._validate_context_for_mixin")
         validator = getattr(self, "validate_context", None)
         if not callable(validator):
             raise StrategyEvaluationError(
@@ -65,6 +73,9 @@ class StrategyMixinSupport:
         validator(context)
 
     def _validate_context_requirements_for_mixin(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMixinSupport._validate_context_requirements_for_mixin")
         validator = getattr(self, "validate_context_requirements", None)
         if not callable(validator):
             raise StrategyEvaluationError(
@@ -82,6 +93,7 @@ class StrategySignalMixin(StrategyMixinSupport):
     SignalRouter converts StrategySignal into RiskReadySignalPayload for
     RiskManager.
     """
+    _logger = logging.getLogger(__name__ + ".StrategySignalMixin")
 
     def build_signal(
         self,
@@ -106,6 +118,9 @@ class StrategySignalMixin(StrategyMixinSupport):
         This is only an internal strategy-layer signal. It may still need
         SignalBuilder to attach entry/exit/execution plans before routing to risk.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignalMixin.build_signal")
         self._validate_context_requirements_for_mixin(context)
 
         confidence_f = self._normalize_unit_interval(confidence, "confidence")
@@ -177,6 +192,9 @@ class StrategySignalMixin(StrategyMixinSupport):
         Final validation that entry/stop/take-profit are risk-ready belongs to
         SignalBuilder / SignalProcessor before signal.generated is emitted.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignalMixin.build_directional_signal")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             raise StrategyEvaluationError(
                 f"{self._strategy_name_for_errors}: directional signal side must be LONG or SHORT"
@@ -243,6 +261,9 @@ class StrategySignalMixin(StrategyMixinSupport):
 
         This is still a draft. RiskManager decides final size/leverage/budget.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignalMixin.attach_basic_trade_plan")
         signal.validate()
 
         entry = EntryPlan(
@@ -300,6 +321,9 @@ class StrategySignalMixin(StrategyMixinSupport):
 
     @staticmethod
     def _normalize_unit_interval(value: float, field_name: str) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategySignalMixin._normalize_unit_interval")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignalMixin._normalize_unit_interval")
         try:
             value_f = float(value)
         except (TypeError, ValueError) as exc:
@@ -312,6 +336,9 @@ class StrategySignalMixin(StrategyMixinSupport):
 
     @staticmethod
     def _normalize_non_negative(value: float, field_name: str) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategySignalMixin._normalize_non_negative")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignalMixin._normalize_non_negative")
         try:
             value_f = float(value)
         except (TypeError, ValueError) as exc:
@@ -324,6 +351,9 @@ class StrategySignalMixin(StrategyMixinSupport):
 
     @staticmethod
     def _context_regime_for_mixin(context: StrategyContext) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategySignalMixin._context_regime_for_mixin")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignalMixin._context_regime_for_mixin")
         current_regime = getattr(context, "current_regime", None)
         if current_regime is not None:
             return current_regime
@@ -346,8 +376,12 @@ class StrategyValidationMixin(StrategyMixinSupport):
     These helpers validate StrategyContext content only. They do not read data
     caches, analytics services, risk state, or execution state directly.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyValidationMixin")
 
     def require_feature(self, context: StrategyContext, name: str) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.require_feature")
         self._validate_context_for_mixin(context)
 
         if not name.strip():
@@ -367,6 +401,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
         name: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.optional_feature")
         self._validate_context_for_mixin(context)
 
         if not name.strip():
@@ -383,6 +420,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
         source: FeatureSource,
         key: str,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.require_domain_value")
         self._validate_context_for_mixin(context)
 
         if not key.strip():
@@ -404,6 +444,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.optional_domain_value")
         self._validate_context_for_mixin(context)
 
         if not key.strip():
@@ -412,6 +455,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
         return context.domain_dict(source).get(key, default)
 
     def require_price(self, context: StrategyContext) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.require_price")
         self._validate_context_for_mixin(context)
 
         price = getattr(context, "price", None)
@@ -437,6 +483,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
 
     @staticmethod
     def _extract_price_value(price: Any) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyValidationMixin._extract_price_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin._extract_price_value")
         if isinstance(price, dict):
             candidates = (
                 "last_price",
@@ -489,6 +538,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
         context: StrategyContext,
         names: set[str] | list[str] | tuple[str, ...],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.has_any_feature")
         self._validate_context_for_mixin(context)
         return any(context.has_feature(name) for name in names)
 
@@ -497,11 +549,17 @@ class StrategyValidationMixin(StrategyMixinSupport):
         context: StrategyContext,
         names: set[str] | list[str] | tuple[str, ...],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.has_all_features")
         self._validate_context_for_mixin(context)
         return all(context.has_feature(name) for name in names)
 
     @staticmethod
     def require_positive(value: float | int | None, field_name: str) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyValidationMixin.require_positive")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.require_positive")
         if value is None:
             raise StrategyEvaluationError(f"{field_name} is required")
 
@@ -517,6 +575,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
 
     @staticmethod
     def require_non_negative(value: float | int | None, field_name: str) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyValidationMixin.require_non_negative")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.require_non_negative")
         if value is None:
             raise StrategyEvaluationError(f"{field_name} is required")
 
@@ -532,6 +593,9 @@ class StrategyValidationMixin(StrategyMixinSupport):
 
     @staticmethod
     def require_unit_interval(value: float | int | None, field_name: str) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyValidationMixin.require_unit_interval")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyValidationMixin.require_unit_interval")
         if value is None:
             raise StrategyEvaluationError(f"{field_name} is required")
 
@@ -554,6 +618,7 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
     strategies produce cleaner StrategySignal metadata before SignalProcessor
     builds the final risk-ready payload.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyRiskRewardMixin")
 
     @staticmethod
     def calculate_stop_distance(
@@ -562,6 +627,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         stop: float,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRiskRewardMixin.calculate_stop_distance")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.calculate_stop_distance")
         entry_f = StrategyValidationMixin.require_positive(entry, "entry")
         stop_f = StrategyValidationMixin.require_positive(stop, "stop")
 
@@ -581,6 +649,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         target: float,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRiskRewardMixin.calculate_reward_distance")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.calculate_reward_distance")
         entry_f = StrategyValidationMixin.require_positive(entry, "entry")
         target_f = StrategyValidationMixin.require_positive(target, "target")
 
@@ -601,6 +672,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         target: float,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.calculate_rr")
         risk = self.calculate_stop_distance(
             entry=entry,
             stop=stop,
@@ -624,6 +698,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         stop: float,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.is_valid_stop")
         return self.calculate_stop_distance(
             entry=entry,
             stop=stop,
@@ -637,6 +714,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         target: float,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.is_valid_target")
         return self.calculate_reward_distance(
             entry=entry,
             target=target,
@@ -652,6 +732,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         side: SignalSide,
         min_rr: float | None = None,
     ) -> dict[str, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.validate_trade_geometry")
         entry_f = StrategyValidationMixin.require_positive(entry, "entry")
         stop_f = StrategyValidationMixin.require_positive(stop, "stop")
 
@@ -710,6 +793,9 @@ class StrategyRiskRewardMixin(StrategyMixinSupport):
         expected_loss: float,
         expected_cost: float = 0.0,
     ) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRiskRewardMixin.estimate_expected_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRiskRewardMixin.estimate_expected_value")
         probability = StrategyValidationMixin.require_unit_interval(
             win_probability,
             "win_probability",
@@ -737,6 +823,7 @@ class StrategyExecutionMixin:
     Execution remains responsible for real order placement. Risk remains
     responsible for final leverage, size and budget approval.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyExecutionMixin")
 
     def build_execution_cost_payload(
         self,
@@ -751,6 +838,9 @@ class StrategyExecutionMixin:
         quality: StrategyExecutionQuality = StrategyExecutionQuality.ACCEPTABLE,
         metadata: dict[str, Any] | None = None,
     ) -> ExecutionCostPayload:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyExecutionMixin.build_execution_cost_payload")
         payload = ExecutionCostPayload(
             spread_cost=max(0.0, float(spread_cost)),
             slippage_cost=max(0.0, float(slippage_cost)),
@@ -769,6 +859,9 @@ class StrategyExecutionMixin:
     def execution_quality_from_cost_to_reward(
         cost_to_reward: float,
     ) -> StrategyExecutionQuality:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyExecutionMixin.execution_quality_from_cost_to_reward")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyExecutionMixin.execution_quality_from_cost_to_reward")
         value = max(0.0, float(cost_to_reward))
 
         if value <= 0.03:
@@ -783,6 +876,9 @@ class StrategyExecutionMixin:
 
     @staticmethod
     def liquidity_class_from_score(score: float) -> StrategyLiquidityClass:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyExecutionMixin.liquidity_class_from_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyExecutionMixin.liquidity_class_from_score")
         value = clamp(float(score), 0.0, 1.0)
 
         if value >= 0.90:
@@ -799,6 +895,9 @@ class StrategyExecutionMixin:
 
     @staticmethod
     def trade_tier_from_priority_score(score: float) -> StrategyTradeTier:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyExecutionMixin.trade_tier_from_priority_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyExecutionMixin.trade_tier_from_priority_score")
         value = clamp(float(score), 0.0, 1.0)
 
         if value >= 0.88:
@@ -838,6 +937,7 @@ class TradingStrategy(
     - no budget/exposure checks;
     - no order placement.
     """
+    _logger = logging.getLogger(__name__ + ".TradingStrategy")
 
     category: StrategyCategory = StrategyCategory.HYBRID
     default_setup_type: SetupType = SetupType.UNKNOWN
@@ -850,6 +950,9 @@ class TradingStrategy(
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradingStrategy.context_feature_score")
         value = self.optional_feature(context, feature_name, default)
 
         # StrategyContext.get_feature() returns FeatureSnapshot in the current
@@ -873,6 +976,9 @@ class TradingStrategy(
         2. value for raw FeatureSnapshot payloads;
         3. the value itself for primitive floats/ints/strings.
         """
+        _strategy_logger = logging.getLogger(__name__ + ".TradingStrategy._feature_snapshot_numeric_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradingStrategy._feature_snapshot_numeric_value")
         if value is None:
             return default
 
@@ -896,6 +1002,9 @@ class TradingStrategy(
         objects built by SignalNormalizer/StrategyContextBuilder could be
         rejected as unusable.
         """
+        _strategy_logger = logging.getLogger(__name__ + ".TradingStrategy._extract_price_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradingStrategy._extract_price_value")
         if price is None:
             return None
 
@@ -949,6 +1058,9 @@ class TradingStrategy(
         SignalScorer may later overwrite/refine this, but concrete strategies
         can provide useful first-pass components.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradingStrategy.build_priority_metadata")
         components = {
             "setup_quality": clamp(float(setup_quality), 0.0, 1.0),
             "confluence_score": clamp(float(confluence_score), 0.0, 1.0),
@@ -1001,6 +1113,9 @@ class TradingStrategy(
         Build metadata that SignalProcessor can later convert into
         RiskReadySignalPayload fields.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradingStrategy.build_trade_metadata")
         metadata: dict[str, Any] = {
             "order_intent": order_intent.value,
             "margin_mode": margin_mode.value,

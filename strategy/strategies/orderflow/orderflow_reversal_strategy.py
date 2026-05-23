@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/orderflow/orderflow_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -86,6 +87,7 @@ class OrderflowReversalPayload:
             price still strong / up, but CVD + volume delta + aggressive
             seller flow already turn negative.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowReversalPayload")
 
     snapshot: OrderflowCompositeSnapshot
     side: SignalSide
@@ -96,46 +98,79 @@ class OrderflowReversalPayload:
 
     @property
     def price_change_pct(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.price_change_pct")
         return extract_price_change_pct(self.snapshot)
 
     @property
     def cvd_delta_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.cvd_delta_ratio")
         return extract_cvd_delta_ratio(self.snapshot)
 
     @property
     def cvd_change_pct(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.cvd_change_pct")
         return extract_cvd_change_pct(self.snapshot)
 
     @property
     def cvd_slope(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.cvd_slope")
         return extract_cvd_slope(self.snapshot)
 
     @property
     def volume_delta_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.volume_delta_ratio")
         return extract_volume_delta_ratio(self.snapshot)
 
     @property
     def volume_delta(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.volume_delta")
         return extract_volume_delta(self.snapshot)
 
     @property
     def notional_delta(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.notional_delta")
         return extract_notional_delta(self.snapshot)
 
     @property
     def aggressive_net_notional_delta(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.aggressive_net_notional_delta")
         return extract_aggressive_net_notional_delta(self.snapshot)
 
     @property
     def trades_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.trades_count")
         return extract_trades_count(self.snapshot)
 
     @property
     def total_volume(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.total_volume")
         return extract_total_volume(self.snapshot)
 
     @property
     def total_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalPayload.total_notional")
         return extract_total_notional(self.snapshot)
 
 
@@ -151,6 +186,7 @@ class OrderflowReversalStrategyConfig(OrderflowStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowReversalStrategyConfig")
 
     require_fresh_snapshot: bool = True
     require_actionable_side: bool = True
@@ -223,6 +259,9 @@ class OrderflowReversalStrategyConfig(OrderflowStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategyConfig.validate")
         OrderflowStrategyConfig.validate(self)
 
         non_negative_fields = {
@@ -339,6 +378,7 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowReversalStrategy")
 
     component_namespace = "strategy.orderflow.reversal"
     category: StrategyCategory = StrategyCategory.ORDERFLOW
@@ -354,6 +394,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         orderflow_config: OrderflowReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy.__init__")
         resolved_orderflow_config = (
             orderflow_config or OrderflowReversalStrategyConfig()
         )
@@ -374,10 +417,16 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy.strategy_name")
         return "orderflow_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.ORDERFLOW,
@@ -423,6 +472,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.reversal_config.required_orderflow_features
@@ -432,6 +484,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         required_features = tuple(self.reversal_config.required_orderflow_features)
@@ -644,6 +699,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         self,
         context: StrategyContext,
     ) -> OrderflowReversalPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._extract_payload")
         snapshot = self.resolve_orderflow_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -716,6 +774,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         context: StrategyContext,
         payload: OrderflowReversalPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         side = payload.side
 
@@ -868,6 +929,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._confirmation_bonus")
         bonus = 0.0
 
         if self._absorption_component(snapshot, side) >= self.reversal_config.strong_absorption_threshold:
@@ -901,6 +965,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         - LONG: price down, but signed delta / notional / aggressive flow turn up.
         - SHORT: price up, but signed delta / notional / aggressive flow turn down.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._absorption_component")
         price = extract_price_change_pct(snapshot)
         cvd_delta = extract_cvd_delta_ratio(snapshot)
         volume_delta = extract_volume_delta_ratio(snapshot)
@@ -950,6 +1017,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._large_trade_component")
         large_buy = extract_large_buy_trades(snapshot)
         large_sell = extract_large_sell_trades(snapshot)
         total = large_buy + large_sell
@@ -970,6 +1040,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._orderbook_component")
         imbalance = extract_orderbook_imbalance_diff(snapshot)
 
         if side is SignalSide.LONG:
@@ -984,6 +1057,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         self,
         snapshot: OrderflowCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._notional_delta_ratio")
         total_notional = max(abs(snapshot.total_notional), 1.0)
         return max(-1.0, min(1.0, extract_notional_delta(snapshot) / total_notional))
 
@@ -992,6 +1068,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._orderbook_supports_side")
         imbalance = extract_orderbook_imbalance_diff(snapshot)
 
         if side is SignalSide.LONG:
@@ -1007,6 +1086,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, payload: OrderflowReversalPayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._source_features")
         features = [
             *reversal_source_features(),
             ORDERFLOW_FEATURES.TRADES_COUNT,
@@ -1040,6 +1122,9 @@ class OrderflowReversalStrategy(OrderflowTradingStrategy):
         return list(dict.fromkeys(features))
 
     def _tags(self, payload: OrderflowReversalPayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowReversalStrategy._tags")
         tags = [
             self.reversal_config.tag_orderflow,
             self.reversal_config.tag_orderflow_reversal,

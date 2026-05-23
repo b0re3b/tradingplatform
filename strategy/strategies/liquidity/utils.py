@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidity/utils.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1409,6 +1410,7 @@ def reclaim_score_from_reference(
 
 @dataclass(slots=True)
 class ScoreBreakdown:
+    _logger = logging.getLogger(__name__ + ".ScoreBreakdown")
     score: float = 0.0
     confidence: float = 0.0
     components: dict[str, float] = field(default_factory=dict)
@@ -1417,6 +1419,9 @@ class ScoreBreakdown:
     confirmations: list[str] = field(default_factory=list)
 
     def normalize(self) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ScoreBreakdown.normalize")
         self.score = unit_score(self.score)
         self.confidence = unit_score(self.confidence)
         self.components = {
@@ -1430,6 +1435,9 @@ class ScoreBreakdown:
         return self
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ScoreBreakdown.to_dict")
         self.normalize()
         return {
             "score": self.score,

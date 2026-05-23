@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spreads/spread_momentum_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -67,6 +68,7 @@ class SpreadMomentumPayload:
     - COMPRESSING means follow spread compression;
     - exact multi-leg construction remains SignalProcessor/SignalBuilder concern.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadMomentumPayload")
 
     snapshot: SpreadCompositeSnapshot
     side: SignalSide
@@ -92,6 +94,7 @@ class SpreadMomentumStrategyConfig(SpreadsStrategyConfig):
     - quote quality and edge remain tradeable;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadMomentumStrategyConfig")
 
     min_momentum_score: float = 0.62
     min_momentum_confidence: float = 0.56
@@ -168,6 +171,9 @@ class SpreadMomentumStrategyConfig(SpreadsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategyConfig.validate")
         SpreadsStrategyConfig.validate(self)
 
         if not 0.0 <= float(self.min_momentum_score) <= 1.0:
@@ -270,6 +276,7 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadMomentumStrategy")
 
     component_namespace = "strategy.spreads.momentum"
     category: StrategyCategory = StrategyCategory.SPREADS
@@ -285,6 +292,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         spreads_config: SpreadMomentumStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy.__init__")
         resolved_spreads_config = spreads_config or SpreadMomentumStrategyConfig()
         resolved_spreads_config.validate()
 
@@ -301,10 +311,16 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy.strategy_name")
         return "spread_momentum"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPREADS,
@@ -346,6 +362,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.momentum_config.required_spreads_features
@@ -355,6 +374,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spreads_data(
@@ -507,6 +529,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> SpreadMomentumPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._extract_payload")
         snapshot = self.resolve_spread_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -558,6 +583,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> Decimal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._edge")
         for candidate in (
             snapshot.net_edge_bps,
             snapshot.net_edge,
@@ -573,6 +601,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._momentum_direction")
         label = normalize_label(snapshot.direction)
 
         if label == "widening":
@@ -595,6 +626,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         snapshot: SpreadCompositeSnapshot,
         direction: str,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._side")
         if snapshot.spread_type is SpreadType.CROSS_EXCHANGE:
             side = cross_exchange_to_signal_side(
                 snapshot.raw_opportunity or snapshot.to_signal_payload()
@@ -623,6 +657,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._passes_spread_type_filters")
         if snapshot.spread_type is None:
             return self.momentum_config.allow_unknown_spread_type
 
@@ -638,6 +675,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._passes_momentum_filters")
         snapshot = payload.snapshot
 
         if self.momentum_config.require_valid_quote and not snapshot.is_quote_valid:
@@ -685,6 +725,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._passes_confirmation_filters")
         snapshot = payload.snapshot
 
         if self.momentum_config.require_momentum_signal:
@@ -725,6 +768,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         context: StrategyContext,
         payload: SpreadMomentumPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         direction_component = self._direction_component(payload)
@@ -847,6 +893,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._direction_component")
         if payload.momentum_direction in {"WIDENING", "COMPRESSING"}:
             return 1.0
         return 0.0
@@ -855,6 +904,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._confirmation_component")
         snapshot = payload.snapshot
 
         widening = 1.0 if is_widening_signal(snapshot.raw_signal) else 0.0
@@ -898,6 +950,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._source_features")
         features = [
             *spread_momentum_source_features(),
             SPREADS_FEATURES.SNAPSHOT,
@@ -926,6 +981,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._tags")
         tags = [
             self.momentum_config.tag_spreads,
             self.momentum_config.tag_momentum,
@@ -957,6 +1015,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         self,
         payload: SpreadMomentumPayload,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._leg_semantics")
         snapshot = payload.snapshot
 
         return {
@@ -984,6 +1045,9 @@ class SpreadMomentumStrategy(SpreadsTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadMomentumStrategy._execution_hints")
         return {
             "entry_offset_bps": self.momentum_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.momentum_config.execution_stop_buffer_bps_hint,

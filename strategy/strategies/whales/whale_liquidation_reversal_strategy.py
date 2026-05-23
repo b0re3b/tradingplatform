@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/whales/whale_liquidation_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +60,7 @@ class WhaleLiquidationReversalPayload:
     - sell liquidations + buy-side whale absorption -> LONG;
     - buy liquidations + sell-side whale absorption -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleLiquidationReversalPayload")
 
     snapshot: WhaleCompositeSnapshot
     side: SignalSide
@@ -83,6 +85,7 @@ class WhaleLiquidationReversalStrategyConfig(WhalesStrategyConfig):
     - reversal side must be opposite to liquidated side;
     - whale pressure/activity/cluster should confirm absorption after forced flow.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleLiquidationReversalStrategyConfig")
 
     min_reversal_score: float = 0.66
     min_reversal_confidence: float = 0.60
@@ -160,6 +163,9 @@ class WhaleLiquidationReversalStrategyConfig(WhalesStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategyConfig.validate")
         WhalesStrategyConfig.validate(self)
 
         unit_fields = {
@@ -265,6 +271,7 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleLiquidationReversalStrategy")
 
     component_namespace = "strategy.whales.liquidation_reversal"
     category: StrategyCategory = StrategyCategory.WHALES
@@ -280,6 +287,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         whales_config: WhaleLiquidationReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy.__init__")
         resolved_whales_config = (
             whales_config or WhaleLiquidationReversalStrategyConfig()
         )
@@ -300,10 +310,16 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy.strategy_name")
         return "whale_liquidation_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.WHALES,
@@ -346,6 +362,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.reversal_config.required_whales_features
@@ -355,6 +374,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_whales_data(
@@ -483,6 +505,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> WhaleLiquidationReversalPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._extract_payload")
         snapshot = self.resolve_whale_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -542,6 +567,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         self,
         snapshot: WhaleCompositeSnapshot,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._resolve_reversal_whale_side")
         for candidate in (
             snapshot.whale_side,
             snapshot.dominant_side,
@@ -572,6 +600,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
     # ------------------------------------------------------------------
 
     def _required_inputs(self) -> tuple[str, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._required_inputs")
         required = []
 
         if self.reversal_config.require_liquidation_context:
@@ -589,6 +620,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleLiquidationReversalPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._passes_liquidation_reversal_filters")
         snapshot = payload.snapshot
 
         if self.reversal_config.require_liquidation_context:
@@ -666,6 +700,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         context: StrategyContext,
         payload: WhaleLiquidationReversalPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         inputs = snapshot.inputs()
 
@@ -845,6 +882,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleLiquidationReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._source_features")
         features = [
             *whale_liquidation_reversal_source_features(),
             WHALES_FEATURES.LIQUIDATION_CONTEXT,
@@ -876,6 +916,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleLiquidationReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._tags")
         tags = [
             self.reversal_config.tag_whales,
             self.reversal_config.tag_liquidation_reversal,
@@ -906,6 +949,9 @@ class WhaleLiquidationReversalStrategy(WhalesTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleLiquidationReversalStrategy._execution_hints")
         return {
             "entry_offset_bps": self.reversal_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.reversal_config.execution_stop_buffer_bps_hint,

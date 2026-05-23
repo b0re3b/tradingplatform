@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidity/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
@@ -325,6 +326,7 @@ class LiquidityFeatureNames:
     Generic SignalNormalizer can create these from analytics.liquidity.* payloads,
     or concrete strategies can read equivalent values from domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityFeatureNames")
 
     SNAPSHOT: str = "liquidity.snapshot"
     MAP_SNAPSHOT: str = "liquidity.map.snapshot"
@@ -352,6 +354,9 @@ class LiquidityFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".LiquidityFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -430,6 +435,7 @@ FUTURES_MARKET_TYPES: frozenset[str] = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class LiquidityStrategyScope:
+    _logger = logging.getLogger(__name__ + ".LiquidityStrategyScope")
     exchange: str
     market_type: str
     symbol: str
@@ -437,6 +443,9 @@ class LiquidityStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityStrategyScope.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -456,13 +465,22 @@ class LiquidityStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityStrategyScope.key")
         return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange}"
 
     def to_dict(self) -> dict[str, str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -483,6 +501,7 @@ class LiquidityStrategyConfig:
     StrategyDefinitionConfig. This config keeps liquidity-specific defaults and
     quality thresholds.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityStrategyConfig")
 
     default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
     default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
@@ -527,6 +546,9 @@ class LiquidityStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityStrategyConfig.validate")
         bounded = {
             "min_context_confidence": self.min_context_confidence,
             "min_signal_confidence": self.min_signal_confidence,
@@ -590,6 +612,7 @@ class LiquidityTradingStrategy(TradingStrategy):
     - no EventBus emit of signal.generated;
     - no evaluate_and_emit() in concrete strategies.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityTradingStrategy")
 
     component_namespace = "strategy.liquidity"
     category: StrategyCategory = StrategyCategory.LIQUIDITY
@@ -608,6 +631,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         liquidity_config: LiquidityStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.__init__")
         self.liquidity_config = liquidity_config or LiquidityStrategyConfig()
         self.liquidity_config.validate()
 
@@ -620,6 +646,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.validate_config")
         super().validate_config()
         self.liquidity_config.validate()
 
@@ -628,6 +657,9 @@ class LiquidityTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def liquidity_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_domain")
         self.validate_context(context)
         domain = context.domain_dict(FeatureSource.LIQUIDITY)
         return dict(domain)
@@ -638,6 +670,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_item")
         domain = self.liquidity_domain(context)
 
         if key in domain:
@@ -656,6 +691,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -687,6 +725,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_float")
         return _to_float(self.liquidity_path(context, path, default), default)
 
     def liquidity_score(
@@ -696,6 +737,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_score")
         return _clamp01(self.liquidity_path(context, path, default), default)
 
     def liquidity_signed_score(
@@ -705,6 +749,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_signed_score")
         return _clamp_signed(self.liquidity_path(context, path, default), default)
 
     def liquidity_snapshot(
@@ -721,6 +768,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         - wrappers: value/data/snapshot/payload;
         - legacy context.liquidity.snapshot-like objects.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_snapshot")
         self.validate_context(context)
 
         domain = self.liquidity_domain(context)
@@ -760,6 +810,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         self,
         candidate: Any,
     ) -> LiquidityMapSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._unwrap_snapshot_candidate")
         if isinstance(candidate, LiquidityMapSnapshot):
             return candidate
 
@@ -789,6 +842,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         context: StrategyContext,
         snapshot: LiquidityMapSnapshot | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.current_price")
         candidates = [
             getattr(context, "current_price", None),
             getattr(context, "price", None),
@@ -828,6 +884,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         context: StrategyContext,
         snapshot: LiquidityMapSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.base_context_is_valid")
         if not self._snapshot_matches_context(context=context, snapshot=snapshot):
             return False
 
@@ -854,6 +913,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         context: StrategyContext,
         snapshot: LiquidityMapSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._snapshot_matches_context")
         context_symbol = str(context.symbol or "").strip().upper()
         snapshot_symbol = str(getattr(snapshot, "symbol", "") or "").strip().upper()
 
@@ -886,6 +948,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         context: StrategyContext,
         snapshot: LiquidityMapSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._snapshot_is_stale")
         threshold = self.liquidity_config.max_snapshot_age_seconds
         if threshold is None:
             return False
@@ -900,15 +965,24 @@ class LiquidityTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _is_futures_market_type(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidityTradingStrategy._is_futures_market_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._is_futures_market_type")
         return _normalize_label(value) in FUTURES_MARKET_TYPES
 
     @staticmethod
     def _timeframe_value(value: Any) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidityTradingStrategy._timeframe_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._timeframe_value")
         if isinstance(value, Enum):
             value = value.value
         return str(value or "").strip().lower()
 
     def _snapshot_confidence(self, snapshot: LiquidityMapSnapshot) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._snapshot_confidence")
         signal = getattr(snapshot, "signal", None)
         if signal is not None:
             return _clamp01(getattr(signal, "confidence", 0.0))
@@ -917,6 +991,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         return _clamp01(_get_path(metadata, "confidence", default=0.0))
 
     def _snapshot_liquidity_strength(self, snapshot: LiquidityMapSnapshot) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._snapshot_liquidity_strength")
         above = _clamp01(getattr(snapshot, "above_liquidity_score", 0.0))
         below = _clamp01(getattr(snapshot, "below_liquidity_score", 0.0))
         pressure = abs(_clamp_signed(getattr(snapshot, "liquidity_pressure_score", 0.0)))
@@ -933,6 +1010,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float | None,
     ) -> list[FilterResult]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.run_common_pre_filters")
         results: list[FilterResult] = []
 
         if self._snapshot_matches_context(context=context, snapshot=snapshot):
@@ -1019,6 +1099,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         context: StrategyContext,
         snapshot: LiquidityMapSnapshot | None = None,
     ) -> LiquidityStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_scope")
         self.validate_context(context)
 
         metadata = dict(context.metadata or {})
@@ -1066,6 +1149,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         source_features: list[str] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.liquidity_context_metadata")
         metadata: dict[str, Any] = {
             "feature_source": FeatureSource.LIQUIDITY.value,
             "strategy_category": StrategyCategory.LIQUIDITY.value,
@@ -1105,6 +1191,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         context: StrategyContext,
         source_features: list[str],
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._selected_feature_values")
         result: dict[str, Any] = {}
 
         for feature in source_features:
@@ -1127,6 +1216,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float | None = None,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy._snapshot_metadata")
         metadata: dict[str, Any] = {
             "exchange": getattr(snapshot, "exchange", None),
             "market_type": getattr(snapshot, "market_type", None),
@@ -1154,6 +1246,9 @@ class LiquidityTradingStrategy(TradingStrategy):
 
     @staticmethod
     def reference_price(item: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidityTradingStrategy.reference_price")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.reference_price")
         for attr in (
             "price",
             "center_price",
@@ -1181,6 +1276,9 @@ class LiquidityTradingStrategy(TradingStrategy):
 
     @staticmethod
     def distance_pct(price: float, current_price: float) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidityTradingStrategy.distance_pct")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.distance_pct")
         if price <= 0 or current_price <= 0:
             return float("inf")
         return abs(price - current_price) / current_price
@@ -1193,6 +1291,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         max_distance_pct: float,
         min_distance_pct: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.distance_score")
         if current_price <= 0 or price <= 0 or max_distance_pct <= 0:
             return 0.0
 
@@ -1207,15 +1308,24 @@ class LiquidityTradingStrategy(TradingStrategy):
         return _clamp01(1.0 - distance / max_distance_pct)
 
     def is_above_price(self, item: Any, current_price: float) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.is_above_price")
         return self.reference_price(item) > current_price
 
     def is_below_price(self, item: Any, current_price: float) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.is_below_price")
         return self.reference_price(item) < current_price
 
     def dedupe_liquidity_items(
         self,
         items: Sequence[LiquidityLevel | StopCluster | LiquidityZone],
     ) -> list[LiquidityLevel | StopCluster | LiquidityZone]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.dedupe_liquidity_items")
         result: dict[str, LiquidityLevel | StopCluster | LiquidityZone] = {}
 
         for item in items:
@@ -1235,6 +1345,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         return list(result.values())
 
     def item_strength(self, item: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.item_strength")
         candidates = [
             getattr(item, "score", None),
             getattr(item, "strength", None),
@@ -1260,6 +1373,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         return 0.0
 
     def is_terminal_item(self, item: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.is_terminal_item")
         status = _normalize_label(getattr(item, "sweep_status", None))
         if status in {"swept", "partially_swept", "invalidated", "expired"}:
             return True
@@ -1276,6 +1392,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         return False
 
     def is_active_item(self, item: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.is_active_item")
         if self.is_terminal_item(item):
             return False
 
@@ -1293,17 +1412,29 @@ class LiquidityTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def active_levels(self, snapshot: LiquidityMapSnapshot) -> list[LiquidityLevel]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.active_levels")
         levels = list(getattr(snapshot, "active_levels", []) or [])
         return [level for level in levels if self.is_active_item(level)]
 
     def equal_levels(self, snapshot: LiquidityMapSnapshot) -> list[LiquidityLevel]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.equal_levels")
         levels = list(getattr(snapshot, "equal_levels", []) or [])
         return [level for level in levels if self.is_active_item(level)]
 
     def stop_clusters(self, snapshot: LiquidityMapSnapshot) -> list[StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.stop_clusters")
         return list(getattr(snapshot, "stop_clusters", []) or [])
 
     def zones(self, snapshot: LiquidityMapSnapshot) -> list[LiquidityZone]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.zones")
         return list(getattr(snapshot, "zones", []) or [])
 
     def directional_levels(
@@ -1311,6 +1442,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: LiquiditySide,
     ) -> list[LiquidityLevel]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.directional_levels")
         return [
             level
             for level in [*self.active_levels(snapshot), *self.equal_levels(snapshot)]
@@ -1322,6 +1456,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: LiquiditySide,
     ) -> list[StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.directional_clusters")
         return [
             cluster
             for cluster in self.stop_clusters(snapshot)
@@ -1333,6 +1470,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: LiquiditySide,
     ) -> list[LiquidityZone]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.directional_zones")
         return [
             zone
             for zone in self.zones(snapshot)
@@ -1344,6 +1484,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.collect_targets_above")
         candidates: list[LiquidityLevel | StopCluster] = []
 
         nearest = getattr(snapshot, "nearest_above_level", None)
@@ -1372,6 +1515,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.collect_targets_below")
         candidates: list[LiquidityLevel | StopCluster] = []
 
         nearest = getattr(snapshot, "nearest_below_level", None)
@@ -1402,6 +1548,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         side: LiquiditySide,
         current_price: float,
     ) -> LiquidityZone | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.best_zone_for_side")
         candidates = [
             zone
             for zone in self.directional_zones(snapshot, side)
@@ -1422,6 +1571,9 @@ class LiquidityTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def magnet_score_up(self, snapshot: LiquidityMapSnapshot) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.magnet_score_up")
         candidates = [
             getattr(snapshot, "upside_magnet_score", None),
             _get_path(getattr(snapshot, "metadata", None), "upside_magnet_score"),
@@ -1432,6 +1584,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         ) else 0.0
 
     def magnet_score_down(self, snapshot: LiquidityMapSnapshot) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.magnet_score_down")
         candidates = [
             getattr(snapshot, "downside_magnet_score", None),
             _get_path(getattr(snapshot, "metadata", None), "downside_magnet_score"),
@@ -1442,6 +1597,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         ) else 0.0
 
     def sweep_risk_up(self, snapshot: LiquidityMapSnapshot) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.sweep_risk_up")
         candidates = [
             getattr(snapshot, "upside_sweep_risk", None),
             getattr(snapshot, "sweep_risk_up", None),
@@ -1452,6 +1610,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         ) else 0.0
 
     def sweep_risk_down(self, snapshot: LiquidityMapSnapshot) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.sweep_risk_down")
         candidates = [
             getattr(snapshot, "downside_sweep_risk", None),
             getattr(snapshot, "sweep_risk_down", None),
@@ -1466,6 +1627,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: LiquiditySide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.zone_score")
         zones = self.directional_zones(snapshot, side)
         if not zones:
             return 0.0
@@ -1486,6 +1650,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         target_levels: list[TargetPlan] | None = None,
         invalidation_reason: str | None = None,
     ) -> tuple[EntryPlan, ExitPlan, InvalidationPlan]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.build_basic_liquidity_plans")
         self.validate_context(context)
 
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
@@ -1562,6 +1729,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         source_features: list[str] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.build_liquidity_trade_metadata")
         priority = self.build_priority_metadata(
             setup_quality=setup_quality,
             confluence_score=confluence_score,
@@ -1621,6 +1791,9 @@ class LiquidityTradingStrategy(TradingStrategy):
         stop_loss: float | None = None,
         take_profit: float | None = None,
     ) -> StrategySignal:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.build_liquidity_signal")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: liquidity signal side must be LONG or SHORT"
@@ -1672,6 +1845,9 @@ class LiquidityTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def validate_context_requirements(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.validate_context_requirements")
         super().validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
@@ -1688,6 +1864,9 @@ class LiquidityTradingStrategy(TradingStrategy):
             )
 
     def supports_regime(self, regime: MarketRegime) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityTradingStrategy.supports_regime")
         return super().supports_regime(regime)
 
 

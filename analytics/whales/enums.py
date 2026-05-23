@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from enum import Enum
 
@@ -20,6 +21,24 @@ class WhaleTradeSide(str, Enum):
         - b / s
         - boolean maker flag у вигляді рядка
         """
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "WhaleTradeSide"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "normalize", _analytics_args)
+        except Exception:
+            pass
         if value is None:
             return cls.UNKNOWN
 
@@ -42,6 +61,24 @@ class WhaleTradeSide(str, Enum):
         - maker_flag=True означає buyer is maker, отже taker side = sell;
         - maker_flag=False означає seller is maker, отже taker side = buy.
         """
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "WhaleTradeSide"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_maker_flag", _analytics_args)
+        except Exception:
+            pass
         if maker_flag is None:
             return cls.UNKNOWN
 
@@ -58,6 +95,27 @@ class WhaleTradeSide(str, Enum):
 
     @property
     def opposite(self) -> "WhaleTradeSide":
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "opposite", _analytics_args)
+        except Exception:
+            pass
         if self is WhaleTradeSide.BUY:
             return WhaleTradeSide.SELL
         if self is WhaleTradeSide.SELL:
@@ -78,6 +136,24 @@ class LargeTradeTriggerType(str, Enum):
         absolute_triggered: bool,
         relative_triggered: bool,
     ) -> "LargeTradeTriggerType":
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "LargeTradeTriggerType"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_flags", _analytics_args)
+        except Exception:
+            pass
         if absolute_triggered and relative_triggered:
             return cls.ABSOLUTE_AND_RELATIVE
         if absolute_triggered:
@@ -132,6 +208,24 @@ class WhaleBias(str, Enum):
 
     @classmethod
     def from_side(cls, side: WhaleTradeSide | str) -> "WhaleBias":
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "WhaleBias"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_side", _analytics_args)
+        except Exception:
+            pass
         normalized_side = (
             side
             if isinstance(side, WhaleTradeSide)
@@ -160,6 +254,24 @@ class WhaleClusterStateType(str, Enum):
         active_threshold: float = 0.60,
         exhaustion_threshold: float = 0.70,
     ) -> "WhaleClusterStateType":
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "WhaleClusterStateType"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_scores", _analytics_args)
+        except Exception:
+            pass
         if exhaustion_probability >= exhaustion_threshold:
             return cls.EXHAUSTING
         if cluster_score >= active_threshold:
@@ -182,6 +294,24 @@ class WhalePressureType(str, Enum):
         buy_notional: float,
         sell_notional: float,
     ) -> "WhalePressureType":
+        try:
+            _analytics_class_name = cls.__name__ if "cls" in locals() else "WhalePressureType"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "from_notional", _analytics_args)
+        except Exception:
+            pass
         if buy_notional > sell_notional:
             return cls.BUY_PRESSURE
         if sell_notional > buy_notional:

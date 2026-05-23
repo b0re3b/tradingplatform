@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/spoofing_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -76,6 +77,7 @@ class SpoofingReversalPayload:
     - fake ASK pressure / pulled ask wall -> fake resistance removed -> LONG;
     - fake BID pressure / pulled bid wall -> fake support removed -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingReversalPayload")
 
     snapshot: SpoofingCompositeSnapshot
     side: SignalSide
@@ -86,26 +88,44 @@ class SpoofingReversalPayload:
 
     @property
     def pull_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalPayload.pull_ratio")
         return extract_pull_ratio(self.snapshot.raw_signal)
 
     @property
     def fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalPayload.fill_ratio")
         return extract_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def price_reaction_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalPayload.price_reaction_bps")
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def wall_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalPayload.wall_notional")
         return extract_wall_notional(self.snapshot.raw_signal)
 
     @property
     def pulled_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalPayload.pulled_notional")
         return extract_pulled_notional(self.snapshot.raw_signal)
 
     @property
     def cancel_to_fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalPayload.cancel_to_fill_ratio")
         return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
 
 
@@ -118,6 +138,7 @@ class SpoofingReversalStrategyConfig(SpoofingStrategyConfig):
     signals. Narrower strategies can still handle order-pull, pressure-bluff,
     layering and fake-liquidity cases separately.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingReversalStrategyConfig")
 
     allow_order_pull: bool = True
     allow_pressure_bluff: bool = True
@@ -187,6 +208,9 @@ class SpoofingReversalStrategyConfig(SpoofingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategyConfig.validate")
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
@@ -294,6 +318,7 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingReversalStrategy")
 
     component_namespace = "strategy.spoofing.reversal"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -309,6 +334,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         spoofing_config: SpoofingReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy.__init__")
         resolved_spoofing_config = spoofing_config or SpoofingReversalStrategyConfig()
         resolved_spoofing_config.validate()
 
@@ -325,10 +353,16 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy.strategy_name")
         return "spoofing_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPOOFING,
@@ -373,6 +407,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.reversal_config.required_spoofing_features)
 
@@ -380,6 +417,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spoofing_data(
@@ -511,6 +551,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> SpoofingReversalPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._extract_payload")
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -557,6 +600,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._supports_snapshot")
         if self.reversal_config.allow_order_pull and is_order_pull_signal(snapshot.raw_signal):
             return True
 
@@ -575,6 +621,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: SpoofingReversalPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._passes_reversal_filters")
         snapshot = payload.snapshot
 
         if payload.pull_ratio < self.reversal_config.min_pull_ratio:
@@ -641,6 +690,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> SpoofingComponent | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._primary_detector_component")
         if is_order_pull_signal(snapshot.raw_signal):
             return SpoofingComponent.ORDER_PULL_DETECTOR
 
@@ -662,6 +714,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         context: StrategyContext,
         payload: SpoofingReversalPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         base_component = average_score(
@@ -777,6 +832,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._context_component")
         components = {
             "notional": unit_score(
                 snapshot.pulled_notional / max(snapshot.wall_notional, 1.0)
@@ -811,6 +869,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: SpoofingReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._source_features")
         features = [
             *base_spoofing_source_features(),
             SPOOFING_FEATURES.SIGNAL,
@@ -846,6 +907,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: SpoofingReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._tags")
         tags = [
             self.reversal_config.tag_spoofing,
             self.reversal_config.tag_reversal,
@@ -899,6 +963,9 @@ class SpoofingReversalStrategy(SpoofingTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingReversalStrategy._execution_hints")
         return {
             "entry_offset_bps": self.reversal_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.reversal_config.execution_stop_buffer_bps_hint,

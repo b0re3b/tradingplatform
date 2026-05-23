@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/composite_spoofing_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -80,6 +81,7 @@ class CompositeSpoofingPayload:
     Важливо: це не strategy confluence. Цей клас читає лише composite signal,
     який уже сформував analytics.spoofing.
     """
+    _logger = logging.getLogger(__name__ + ".CompositeSpoofingPayload")
 
     snapshot: SpoofingCompositeSnapshot
     side: SignalSide
@@ -90,46 +92,79 @@ class CompositeSpoofingPayload:
 
     @property
     def pull_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.pull_ratio")
         return extract_pull_ratio(self.snapshot.raw_signal)
 
     @property
     def fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.fill_ratio")
         return extract_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def price_reaction_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.price_reaction_bps")
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def lifetime_ms(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.lifetime_ms")
         return extract_lifetime_ms(self.snapshot.raw_signal)
 
     @property
     def wall_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.wall_notional")
         return extract_wall_notional(self.snapshot.raw_signal)
 
     @property
     def pulled_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.pulled_notional")
         return extract_pulled_notional(self.snapshot.raw_signal)
 
     @property
     def cancel_to_fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.cancel_to_fill_ratio")
         return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def distance_from_mid_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.distance_from_mid_bps")
         return extract_distance_from_mid_bps(self.snapshot.raw_signal)
 
     @property
     def layer_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.layer_count")
         return extract_layer_count(self.snapshot.raw_signal)
 
     @property
     def layer_price_span_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.layer_price_span_bps")
         return extract_layer_price_span_bps(self.snapshot.raw_signal)
 
     @property
     def pressure_flip_strength(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingPayload.pressure_flip_strength")
         return extract_pressure_flip_strength(self.snapshot.raw_signal)
 
 
@@ -145,6 +180,7 @@ class CompositeSpoofingStrategyConfig(SpoofingStrategyConfig):
     - SignalProcessor still owns strategy confluence, portfolio coordination,
       filtering and risk-ready conversion.
     """
+    _logger = logging.getLogger(__name__ + ".CompositeSpoofingStrategyConfig")
 
     min_composite_score: float = 0.72
     min_composite_confidence: float = 0.62
@@ -216,6 +252,9 @@ class CompositeSpoofingStrategyConfig(SpoofingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategyConfig.validate")
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
@@ -315,6 +354,7 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
     analytics.spoofing composite signals. SignalProcessor still owns routing,
     filters, confluence, portfolio coordination and risk-ready payloads.
     """
+    _logger = logging.getLogger(__name__ + ".CompositeSpoofingStrategy")
 
     component_namespace = "strategy.spoofing.composite"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -330,6 +370,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         spoofing_config: CompositeSpoofingStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy.__init__")
         resolved_spoofing_config = (
             spoofing_config or CompositeSpoofingStrategyConfig()
         )
@@ -350,10 +393,16 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy.strategy_name")
         return "composite_spoofing"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPOOFING,
@@ -394,6 +443,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.composite_config.required_spoofing_features
@@ -403,6 +455,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spoofing_data(
@@ -558,6 +613,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> CompositeSpoofingPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._extract_payload")
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -611,6 +669,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._supports_snapshot")
         if self.composite_config.require_composite_type_or_pattern:
             return (
                 snapshot.spoofing_type is SpoofingType.COMPOSITE
@@ -624,6 +685,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         payload: CompositeSpoofingPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._passes_composite_filters")
         snapshot = payload.snapshot
 
         if detector_count(snapshot.raw_signal) < self.composite_config.min_composite_detector_count:
@@ -666,6 +730,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._has_allowed_component")
         return any(
             (
                 self.composite_config.allow_order_pull_component
@@ -689,6 +756,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         context: StrategyContext,
         payload: CompositeSpoofingPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         base_component = average_score(
@@ -808,6 +878,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._detector_component")
         detector_scores = [
             detector_agreement_ratio(snapshot.raw_signal),
             detector_average_confidence(snapshot.raw_signal),
@@ -832,6 +905,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         payload: CompositeSpoofingPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._features_component")
         notional_ratio = (
             payload.pulled_notional / max(payload.wall_notional, 1.0)
             if payload.wall_notional > 0
@@ -869,6 +945,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         payload: CompositeSpoofingPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._source_features")
         features = [
             *composite_spoofing_source_features(),
             SPOOFING_FEATURES.SIGNAL,
@@ -900,6 +979,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         payload: CompositeSpoofingPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._tags")
         tags = [
             self.composite_config.tag_spoofing,
             self.composite_config.tag_composite,
@@ -933,6 +1015,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         self,
         payload: CompositeSpoofingPayload,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._component_metadata")
         snapshot = payload.snapshot
 
         return {
@@ -959,6 +1044,9 @@ class CompositeSpoofingStrategy(SpoofingTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CompositeSpoofingStrategy._execution_hints")
         return {
             "entry_offset_bps": self.composite_config.entry_offset_bps_hint,
             "stop_buffer_bps": self.composite_config.stop_buffer_bps_hint,

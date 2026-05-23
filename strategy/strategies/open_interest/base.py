@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/open_interest/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -351,6 +352,7 @@ class OpenInterestFeatureNames:
     Generic SignalNormalizer may create these names from analytics.open_interest.*
     payloads, or strategies can read equivalent values from domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".OpenInterestFeatureNames")
 
     ANALYSIS: str = "open_interest.analysis"
 
@@ -388,6 +390,9 @@ class OpenInterestFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".OpenInterestFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -469,6 +474,7 @@ class OpenInterestStrategyScope:
 
     Concrete strategies still make decisions from StrategyContext.
     """
+    _logger = logging.getLogger(__name__ + ".OpenInterestStrategyScope")
 
     exchange: str
     market_type: str
@@ -477,6 +483,9 @@ class OpenInterestStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestStrategyScope.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -498,13 +507,22 @@ class OpenInterestStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestStrategyScope.key")
         return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange}"
 
     def to_dict(self) -> dict[str, str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -530,6 +548,7 @@ class OpenInterestStrategyConfig:
     StrategyDefinitionConfig. This config keeps OI-specific defaults and
     quality thresholds.
     """
+    _logger = logging.getLogger(__name__ + ".OpenInterestStrategyConfig")
 
     default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
     default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
@@ -574,6 +593,9 @@ class OpenInterestStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestStrategyConfig.validate")
         bounded = {
             "min_context_confidence": self.min_context_confidence,
             "min_signal_confidence": self.min_signal_confidence,
@@ -643,6 +665,7 @@ class OpenInterestTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy")
 
     component_namespace = "strategy.open_interest"
     category: StrategyCategory = StrategyCategory.OPEN_INTEREST
@@ -661,6 +684,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         open_interest_config: OpenInterestStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.__init__")
         self.open_interest_config = (
             open_interest_config or OpenInterestStrategyConfig()
         )
@@ -675,6 +701,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.validate_config")
         super().validate_config()
         self.open_interest_config.validate()
 
@@ -690,6 +719,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         while allowing direct-batch / E2E diagnostics to show the exact gate
         that rejected the context instead of a generic no_signal_generated.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.remember_no_signal")
         parent = getattr(super(), "remember_no_signal", None)
         if callable(parent):
             parent(reason, **metadata)
@@ -700,6 +732,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self._last_no_signal_metadata = dict(metadata)
 
     def clear_no_signal_reason(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.clear_no_signal_reason")
         parent = getattr(super(), "clear_no_signal_reason", None)
         if callable(parent):
             parent()
@@ -709,6 +744,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self._last_no_signal_metadata = {}
 
     def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.consume_no_signal_reason")
         parent = getattr(super(), "consume_no_signal_reason", None)
         if callable(parent):
             return parent()
@@ -729,6 +767,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         Generic SignalNormalizer / StrategyContextBuilder should populate this
         from analytics.open_interest.* payloads.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_domain")
         self.validate_context(context)
         domain = context.domain_dict(FeatureSource.OPEN_INTEREST)
         return dict(domain)
@@ -739,6 +780,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_item")
         domain = self.open_interest_domain(context)
 
         if key in domain:
@@ -766,6 +810,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         3. oi-prefixed legacy feature name;
         4. open-interest domain dotted path.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -814,6 +861,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_float")
         return _to_float(self.open_interest_path(context, path, default), default)
 
     def open_interest_score(
@@ -823,6 +873,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_score")
         value = self.open_interest_float(context, path, default=default)
         return clamp(float(value if value is not None else default), 0.0, 1.0)
 
@@ -833,6 +886,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_signed_score")
         value = self.open_interest_float(context, path, default=default)
         return clamp(float(value if value is not None else default), -1.0, 1.0)
 
@@ -843,6 +899,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_bool")
         return _to_bool(self.open_interest_path(context, path, default), default)
 
     def open_interest_str(
@@ -852,6 +911,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_str")
         return _to_str(self.open_interest_path(context, path, default), default)
 
     def open_interest_datetime(
@@ -861,6 +923,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_datetime")
         return parse_datetime(self.open_interest_path(context, path, default))
 
     def open_interest_feature_snapshot(
@@ -874,6 +939,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         Best-effort helper because StrategyContext may store raw values or
         FeatureSnapshot objects depending on normalization.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -892,6 +960,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_feature_age_seconds")
         snapshot = self.open_interest_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -902,6 +973,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_feature_is_stale")
         max_age = self.open_interest_config.stale_feature_max_age_seconds
         if max_age is None:
             return False
@@ -917,6 +991,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.has_any_open_interest_data")
         self.validate_context(context)
 
         if self.open_interest_domain(context):
@@ -929,6 +1006,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.has_stale_open_interest_features")
         names = feature_names or tuple(self.required_features())
 
         return any(
@@ -941,6 +1021,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def open_interest_scope(self, context: StrategyContext) -> OpenInterestStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_scope")
         domain = self.open_interest_domain(context)
 
         exchange = (
@@ -987,6 +1070,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         Supported fallback:
             domain itself can be OIAnalysisResult.to_dict().
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_analysis")
         raw_analysis = self.open_interest_item(context, "analysis")
 
         if isinstance(raw_analysis, OIAnalysisResult):
@@ -1004,6 +1090,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         return None
 
     def extract_oi_snapshot(self, context: StrategyContext) -> OISnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_snapshot")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.snapshot
@@ -1028,6 +1117,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> OIMarketContext | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_market_context")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.context
@@ -1055,6 +1147,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         2. FeatureSource.OPEN_INTEREST domain["features"];
         3. open_interest.* / oi.* feature-map values.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_features")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.features
@@ -1087,6 +1182,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         - specialized regime_changed payload shape;
         - open_interest.* / oi.* feature names.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_regime_result")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.regime
@@ -1189,6 +1287,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         - specialized divergence payload shape;
         - open_interest.* / oi.* feature names.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_divergence_result")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.divergence
@@ -1273,6 +1374,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         - anomaly/capitulation specialized payload shape;
         - open_interest.* / oi.* feature names.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.extract_oi_anomaly_result")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return analysis.anomaly
@@ -1346,6 +1450,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         return None
 
     def oi_analysis_confidence(self, context: StrategyContext) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.oi_analysis_confidence")
         analysis = self.extract_oi_analysis(context)
         if analysis is not None:
             return _unit_score(getattr(analysis, "confidence", 0.0))
@@ -1363,6 +1470,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
 
     @staticmethod
     def parse_side(value: Any) -> SignalSide:
+        _strategy_logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy.parse_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.parse_side")
         if isinstance(value, SignalSide):
             return value
 
@@ -1397,6 +1507,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
 
     @staticmethod
     def opposite_side(side: SignalSide) -> SignalSide:
+        _strategy_logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy.opposite_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.opposite_side")
         if side is SignalSide.LONG:
             return SignalSide.SHORT
         if side is SignalSide.SHORT:
@@ -1405,6 +1518,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
 
     @staticmethod
     def is_directional_side(side: SignalSide) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy.is_directional_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.is_directional_side")
         return side in {SignalSide.LONG, SignalSide.SHORT}
 
     def regime_to_side_hint(self, regime: OIRegime | Any) -> str:
@@ -1414,6 +1530,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         Returns:
             bullish | bearish | contextual | neutral
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.regime_to_side_hint")
         label = _normalize_label(regime)
 
         if label in {
@@ -1448,6 +1567,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         The exact enum values may evolve in analytics.open_interest, so this
         method is label-based and tolerant.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.divergence_to_side_hint")
         label = _normalize_label(divergence_type)
 
         if not label or label in {"none", "unknown", "neutral"}:
@@ -1465,6 +1587,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         return "neutral"
 
     def anomaly_to_setup_hint(self, anomaly_type: OIAnomalyType | Any) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.anomaly_to_setup_hint")
         label = _normalize_label(anomaly_type)
 
         if label in {
@@ -1492,6 +1617,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         dead_zone: float = 0.0,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.side_from_features")
         if features is None:
             return SignalSide.UNKNOWN
 
@@ -1552,6 +1680,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         Final risk-ready payload conversion belongs to SignalProcessor /
         SignalBuilder, not to this domain strategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.build_open_interest_signal")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: OI signal side must be LONG or SHORT"
@@ -1643,6 +1774,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         """
         Compact serialized OI context for StrategySignal.metadata.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.open_interest_context_metadata")
         metadata: dict[str, Any] = {}
 
         analysis = self.extract_oi_analysis(context)
@@ -1698,6 +1832,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
 
     @staticmethod
     def normalize_reasons(value: Any) -> list[str]:
+        _strategy_logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy.normalize_reasons")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy.normalize_reasons")
         if value is None:
             return []
 
@@ -1720,12 +1857,18 @@ class OpenInterestTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(value: Any, default: Any = None) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._feature_value")
         if isinstance(value, FeatureSnapshot):
             return value.value
         return default if value is None else value
 
     @staticmethod
     def _looks_like_oi_analysis(value: Mapping[str, Any]) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".OpenInterestTradingStrategy._looks_like_oi_analysis")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._looks_like_oi_analysis")
         required = {"symbol", "timestamp", "snapshot", "context", "features", "regime"}
         return required.issubset(set(value.keys()))
 
@@ -1733,6 +1876,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self,
         value: Mapping[str, Any],
     ) -> OIAnalysisResult | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._parse_oi_analysis")
         try:
             return OIAnalysisResult.from_dict(dict(value))
         except Exception as exc:
@@ -1748,6 +1894,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         *,
         context: StrategyContext,
     ) -> OIFeatures | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._parse_oi_features")
         data = dict(value)
 
         try:
@@ -1770,6 +1919,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         This keeps compatibility with old oi.* / open_interest.* feature names
         while new strategies should prefer FeatureSource.OPEN_INTEREST domain data.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._extract_feature_payload")
         candidates = {
             "oi_delta_pct": (
                 "features.oi_delta_pct",
@@ -1828,6 +1980,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._normalize_divergence_payload")
         data = dict(payload)
 
         divergence_type = (
@@ -1853,6 +2008,9 @@ class OpenInterestTradingStrategy(TradingStrategy):
         self,
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OpenInterestTradingStrategy._normalize_anomaly_payload")
         data = dict(payload)
 
         anomaly_type = (

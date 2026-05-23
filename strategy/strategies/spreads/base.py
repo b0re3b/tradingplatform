@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spreads/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -112,6 +113,7 @@ class SpreadsFeatureNames:
     analytics.spreads.* payloads. Concrete strategies may also read equivalent
     values from FeatureSource.SPREADS domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadsFeatureNames")
 
     SNAPSHOT: str = "spreads.snapshot"
     SIGNAL: str = "spreads.signal"
@@ -158,6 +160,9 @@ class SpreadsFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SpreadsFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -182,6 +187,7 @@ class SpreadsStrategyScope:
 
     Concrete strategies still make decisions from StrategyContext.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadsStrategyScope")
 
     spread_type: str
     symbol: str
@@ -194,6 +200,9 @@ class SpreadsStrategyScope:
     exchange_symbol_b: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsStrategyScope.__post_init__")
         spread_type = str(self.spread_type or "unknown").strip().lower()
         symbol = normalize_symbol(self.symbol)
         exchange_a = normalize_exchange(self.exchange_a)
@@ -226,6 +235,9 @@ class SpreadsStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsStrategyScope.key")
         return (
             f"{self.spread_type}:"
             f"{self.exchange_a}:{self.market_type_a or 'na'}:"
@@ -235,9 +247,15 @@ class SpreadsStrategyScope:
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange_a}:{self.exchange_b}"
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsStrategyScope.to_dict")
         return {
             "spread_type": self.spread_type,
             "symbol": self.symbol,
@@ -266,6 +284,7 @@ class SpreadsStrategyConfig:
     No EventBus topics, no local setup lifecycle, no cleanup jobs, no pending/open
     state indexes. Those concerns belong to engine/processor/state layers.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadsStrategyConfig")
 
     min_score: float = 0.60
     min_confidence: float = 0.55
@@ -305,6 +324,9 @@ class SpreadsStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsStrategyConfig.validate")
         bounded = {
             "min_score": self.min_score,
             "min_confidence": self.min_confidence,
@@ -360,6 +382,7 @@ class SpreadCompositeSnapshot:
     projection that lets concrete spread strategies consume snapshot, signal and
     opportunity payloads through one stable contract.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadCompositeSnapshot")
 
     spread_type: SpreadType | None
     symbol: str
@@ -399,6 +422,9 @@ class SpreadCompositeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.__post_init__")
         self.symbol = normalize_symbol(self.symbol)
         self.exchange_a = normalize_exchange(self.exchange_a) or "unknown"
         self.exchange_b = normalize_exchange(self.exchange_b) or "unknown"
@@ -433,10 +459,16 @@ class SpreadCompositeSnapshot:
 
     @property
     def spread_type_label(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.spread_type_label")
         return normalize_label(self.spread_type)
 
     @property
     def scope(self) -> SpreadsStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.scope")
         return SpreadsStrategyScope(
             spread_type=self.spread_type_label or "unknown",
             symbol=self.symbol,
@@ -451,26 +483,44 @@ class SpreadCompositeSnapshot:
 
     @property
     def scope_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.scope_key")
         return self.scope.key
 
     @property
     def basis_bias(self) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.basis_bias")
         return basis_to_bias(self.to_signal_payload())
 
     @property
     def basis_side(self) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.basis_side")
         return basis_to_signal_side(self.to_signal_payload())
 
     @property
     def cross_exchange_side(self) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.cross_exchange_side")
         return cross_exchange_to_signal_side(self.raw_opportunity or self.to_signal_payload())
 
     @property
     def is_quote_valid(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.is_quote_valid")
         return quote_is_valid(self.to_signal_payload())
 
     @property
     def tradeable_edge(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.tradeable_edge")
         if self.has_edge is not None:
             return self.has_edge
 
@@ -487,10 +537,16 @@ class SpreadCompositeSnapshot:
 
     @property
     def abs_zscore(self) -> Decimal:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.abs_zscore")
         return abs(self.zscore) if self.zscore is not None else DECIMAL_ZERO
 
     @property
     def abs_edge(self) -> Decimal:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.abs_edge")
         for value in (
             self.funding_adjusted_spread,
             self.net_edge,
@@ -504,6 +560,9 @@ class SpreadCompositeSnapshot:
 
     @property
     def opportunity_active(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.opportunity_active")
         if self.raw_opportunity:
             return opportunity_is_active(self.raw_opportunity)
 
@@ -515,11 +574,17 @@ class SpreadCompositeSnapshot:
 
     @property
     def opportunity_tradeable(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.opportunity_tradeable")
         if self.raw_opportunity:
             return opportunity_is_tradeable(self.raw_opportunity)
         return self.opportunity_active
 
     def has_minimum_data(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.has_minimum_data")
         return (
             self.spread_type is not None
             or self.spread_bps is not None
@@ -535,6 +600,9 @@ class SpreadCompositeSnapshot:
         )
 
     def to_signal_payload(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.to_signal_payload")
         return {
             "spread_type": self.spread_type,
             "symbol": self.symbol,
@@ -565,6 +633,9 @@ class SpreadCompositeSnapshot:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadCompositeSnapshot.to_dict")
         return {
             "spread_type": self.spread_type.value if self.spread_type else None,
             "symbol": self.symbol,
@@ -641,6 +712,7 @@ class SpreadsTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".SpreadsTradingStrategy")
 
     component_namespace = "strategy.spreads"
     category: StrategyCategory = StrategyCategory.SPREADS
@@ -659,6 +731,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         spreads_config: SpreadsStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.__init__")
         self.spreads_config = spreads_config or SpreadsStrategyConfig()
         self.spreads_config.validate()
 
@@ -671,6 +746,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.validate_config")
         super().validate_config()
         self.spreads_config.validate()
 
@@ -679,6 +757,9 @@ class SpreadsTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def spreads_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_domain")
         self.validate_context(context)
         return spreads_domain(context)
 
@@ -688,6 +769,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_item")
         self.validate_context(context)
         return spreads_item(context, key, default)
 
@@ -697,6 +781,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -711,6 +798,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: Decimal | None = None,
     ) -> Decimal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_decimal")
         return to_decimal(self.spreads_path(context, path, default), default)
 
     def spreads_float(
@@ -720,6 +810,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_float")
         return to_float(self.spreads_path(context, path, default), default)
 
     def spreads_int(
@@ -729,6 +822,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: int | None = None,
     ) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_int")
         return to_int(self.spreads_path(context, path, default), default)
 
     def spreads_score(
@@ -738,6 +834,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_score")
         return unit_score(self.spreads_path(context, path, default), default)
 
     def spreads_bool(
@@ -747,6 +846,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_bool")
         return to_bool(self.spreads_path(context, path, default), default)
 
     def spreads_str(
@@ -756,6 +858,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_str")
         return to_str(self.spreads_path(context, path, default), default)
 
     def spreads_datetime(
@@ -765,6 +870,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_datetime")
         return parse_datetime(self.spreads_path(context, path, default))
 
     def spreads_feature_snapshot(
@@ -772,6 +880,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -790,6 +901,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_feature_age_seconds")
         snapshot = self.spreads_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -800,6 +914,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_feature_is_stale")
         max_age = self.spreads_config.stale_feature_max_age_seconds
         if max_age is None:
             return False
@@ -815,6 +932,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.has_any_spreads_data")
         self.validate_context(context)
 
         if self.spreads_domain(context):
@@ -827,6 +947,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.has_stale_spreads_features")
         names = feature_names or tuple(self.required_features())
 
         return any(
@@ -839,6 +962,9 @@ class SpreadsTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def spreads_scope(self, context: StrategyContext) -> SpreadsStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spreads_scope")
         domain = self.spreads_domain(context)
 
         snapshot_candidate = (
@@ -908,6 +1034,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         Fallback:
             individual spreads.* features.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.resolve_spread_snapshot")
         self.validate_context(context)
 
         scope = self.spreads_scope(context)
@@ -949,6 +1078,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.resolve_spread_signal")
         self.validate_context(context)
 
         candidate = (
@@ -963,6 +1095,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.resolve_arbitrage_opportunity")
         self.validate_context(context)
 
         candidate = (
@@ -989,6 +1124,9 @@ class SpreadsTradingStrategy(TradingStrategy):
 
         Concrete strategies should add spread-type-specific checks.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.accepts_spread_snapshot")
         if not snapshot.has_minimum_data():
             return False
 
@@ -1023,6 +1161,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         scope: SpreadsStrategyScope,
         source: str,
     ) -> SpreadCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy._coerce_spread_snapshot")
         if value is None:
             return None
 
@@ -1051,6 +1192,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: SpreadsStrategyScope,
     ) -> SpreadCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy._build_snapshot_from_domain")
         domain = self.spreads_domain(context)
         if not domain:
             return None
@@ -1080,6 +1224,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: SpreadsStrategyScope,
     ) -> SpreadCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy._build_snapshot_from_features")
         payload = {
             "spread_type": self._feature_value(context, SPREADS_FEATURES.SPREAD_TYPE),
             "symbol": self._feature_value(context, SPREADS_FEATURES.SYMBOL),
@@ -1150,6 +1297,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         scope: SpreadsStrategyScope,
         source: str,
     ) -> SpreadCompositeSnapshot:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy._snapshot_from_payloads")
         snapshot_data = dict(snapshot_payload or {})
         signal_data = dict(signal_payload or {})
         opportunity_data = dict(opportunity_payload or {})
@@ -1251,6 +1401,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         Final risk-ready payload conversion belongs to SignalProcessor /
         SignalBuilder, not to this domain strategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.build_spread_signal")
         if not is_directional_side(side):
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: spread signal side must be LONG or SHORT"
@@ -1354,6 +1507,9 @@ class SpreadsTradingStrategy(TradingStrategy):
         """
         Compact serialized spread context for StrategySignal.metadata.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy.spread_context_metadata")
         metadata: dict[str, Any] = {}
 
         snapshot = self.resolve_spread_snapshot(context)
@@ -1414,6 +1570,9 @@ class SpreadsTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".SpreadsTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy._feature_value")
         if not isinstance(feature_name, str) or not feature_name.strip():
             return None
 
@@ -1429,6 +1588,9 @@ class SpreadsTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _has_any_value(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".SpreadsTradingStrategy._has_any_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpreadsTradingStrategy._has_any_value")
         if value is None:
             return False
 

@@ -1,6 +1,7 @@
 # trading_system/strategy/engine.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,7 +13,11 @@ from core.scheduler import Scheduler
 from strategy.base import BaseStrategy, BaseStrategyComponent
 from strategy.config import StrategyConfig
 from strategy.enums import FeatureSource, SignalStatus, Timeframe, MarketRegime
-from strategy.exceptions import StrategyEvaluationError, StrategyStateError
+from strategy.exceptions import (
+    SignalNormalizationError,
+    StrategyEvaluationError,
+    StrategyStateError,
+)
 from strategy.models import (
     FeatureSnapshot,
     PortfolioSnapshot,
@@ -72,6 +77,7 @@ class StrategyEngineStats:
     Це тільки engine-level лічильники. Детальна signal/scoring/build/routing
     статистика має залишатися в SignalProcessor/StrategyRuntimeState.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyEngineStats")
 
     events_received: int = 0
     events_processed: int = 0
@@ -92,17 +98,29 @@ class StrategyEngineStats:
     errors: list[str] = field(default_factory=list)
 
     def record_start(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineStats.record_start")
         self.started_at = utcnow()
         self.stopped_at = None
 
     def record_stop(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineStats.record_stop")
         self.stopped_at = utcnow()
 
     def record_event_received(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineStats.record_event_received")
         self.events_received += 1
         self.last_event_at = utcnow()
 
     def record_processed(self, accepted: bool) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineStats.record_processed")
         self.events_processed += 1
         self.last_processed_at = utcnow()
 
@@ -112,6 +130,9 @@ class StrategyEngineStats:
             self.batches_rejected += 1
 
     def record_error(self, error: Exception | str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineStats.record_error")
         self.events_failed += 1
         self.last_error_at = utcnow()
 
@@ -122,6 +143,9 @@ class StrategyEngineStats:
             self.errors = self.errors[-100:]
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineStats.summary")
         return {
             "events_received": self.events_received,
             "events_processed": self.events_processed,
@@ -146,6 +170,7 @@ class StrategyContextBuilder(BaseStrategyComponent):
     Це orchestration helper. Він не запускає стратегії, не scoring-ить сигнали
     і не формує risk payload.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyContextBuilder")
 
     component_namespace = "strategy.context_builder"
 
@@ -156,6 +181,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder.__init__")
         super().__init__(
             config=config,
             event_bus=event_bus,
@@ -177,6 +205,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
         metadata: dict[str, Any] | None = None,
         persist: bool = True,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder.build")
         if not symbol.strip():
             raise StrategyStateError("symbol cannot be empty")
 
@@ -216,6 +247,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
         timestamp: datetime | None = None,
         timeframe: Timeframe = Timeframe.M1,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder.get_or_build")
         if not symbol.strip():
             raise StrategyStateError("symbol cannot be empty")
 
@@ -250,6 +284,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
         Основна analytics normalization лишається в SignalProcessor.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder.update_from_payload")
         if not event_name.strip():
             raise StrategyStateError("event_name cannot be empty")
 
@@ -298,11 +335,17 @@ class StrategyContextBuilder(BaseStrategyComponent):
         return context
 
     def persist(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder.persist")
         context.validate()
         self.state.update_context(context)
 
     @staticmethod
     def _extract_symbol(payload: dict[str, Any]) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyContextBuilder._extract_symbol")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder._extract_symbol")
         raw = payload.get("symbol") or payload.get("instrument") or payload.get("market")
         if not isinstance(raw, str) or not raw.strip():
             raise StrategyStateError("payload does not contain valid symbol")
@@ -313,6 +356,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
         payload: dict[str, Any],
         fallback: datetime | None = None,
     ) -> datetime:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyContextBuilder._extract_timestamp")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder._extract_timestamp")
         raw = payload.get("timestamp") or payload.get("ts") or fallback
 
         if raw is None:
@@ -330,6 +376,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
     @staticmethod
     def _extract_timeframe(payload: dict[str, Any]) -> Timeframe:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyContextBuilder._extract_timeframe")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder._extract_timeframe")
         raw = payload.get("timeframe")
 
         if isinstance(raw, Timeframe):
@@ -345,6 +394,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
 
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyContextBuilder._float_or_none")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder._float_or_none")
         if value is None:
             return None
 
@@ -369,6 +421,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime,
     ) -> PriceSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder._extract_price_snapshot")
         price_keys = {
             "last_price",
             "price",
@@ -419,6 +474,9 @@ class StrategyContextBuilder(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> RegimeSnapshot | None:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyContextBuilder._extract_regime_snapshot")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextBuilder._extract_regime_snapshot")
         raw = payload.get("regime") or payload.get("market_regime")
         if raw is None:
             return None
@@ -459,6 +517,7 @@ class StrategyEventHandler(BaseStrategyComponent):
     Він тільки приймає events і делегує в StrategyEngine. Не містить scoring,
     building, confluence, risk-payload або execution logic.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyEventHandler")
 
     component_namespace = "strategy.event_handler"
 
@@ -475,6 +534,13 @@ class StrategyEventHandler(BaseStrategyComponent):
         ".stats",
         ".health",
         ".diagnostics",
+
+        # Runtime snapshots are operational/state dumps, not strategy-routable
+        # analytics signals. Do not use broad ".snapshot", because
+        # analytics.funding.snapshot is a valid trading input.
+        ".stream.snapshot",
+        ".detector.snapshot",
+        ".cascade_detector.snapshot",
     )
 
     def __init__(
@@ -484,6 +550,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler.__init__")
         super().__init__(
             config=config,
             event_bus=event_bus,
@@ -507,6 +576,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         symbol/timeframe/trading features, тому SignalNormalizer не має їх
         обробляти як strategy-routable analytics payload.
         """
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".StrategyEventHandler")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler.is_non_trading_analytics_topic")
         normalized = str(topic or "").strip().lower()
         if not normalized:
             return True
@@ -517,6 +589,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     def register(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler.register")
         if self.event_bus is None:
             self.log_warning(
                 "Cannot register StrategyEventHandler: event_bus is not configured"
@@ -569,6 +644,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     def unregister(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler.unregister")
         if self.event_bus is None:
             self._subscriptions.clear()
             self._registered = False
@@ -587,10 +665,16 @@ class StrategyEventHandler(BaseStrategyComponent):
         self._registered = False
 
     async def stop(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler.stop")
         self.unregister()
         await super().stop()
 
     async def _handle_analytics_event(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_analytics_event")
         event_name = _event_name_from_event(event)
 
         if self.is_non_trading_analytics_topic(event_name):
@@ -609,6 +693,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_context_update(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_context_update")
         event_name = _event_name_from_event(event)
         payload = _payload_from_event(event)
 
@@ -618,6 +705,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_signal_confirmed(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_signal_confirmed")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -626,6 +716,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_signal_blocked(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_signal_blocked")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -634,6 +727,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_risk_limit_warning(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_risk_limit_warning")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -642,6 +738,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_risk_size_adjusted(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_risk_size_adjusted")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -650,6 +749,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_risk_kill_switch(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_risk_kill_switch")
         payload = _payload_from_event(event)
         state = getattr(self.engine, "state", None)
         if state is not None:
@@ -664,6 +766,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_risk_trading_halted(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_risk_trading_halted")
         payload = _payload_from_event(event)
         state = getattr(self.engine, "state", None)
         if state is not None:
@@ -672,6 +777,9 @@ class StrategyEventHandler(BaseStrategyComponent):
                 set_halt(active=True, reason=payload.get("reason") or "risk_trading_halted")
 
     async def _handle_risk_trading_resumed(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_risk_trading_resumed")
         payload = _payload_from_event(event)
         state = getattr(self.engine, "state", None)
         if state is not None:
@@ -680,6 +788,9 @@ class StrategyEventHandler(BaseStrategyComponent):
                 set_halt(active=False, reason=payload.get("reason") or "risk_trading_resumed")
 
     async def _handle_execution_rejected(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_execution_rejected")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -688,6 +799,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_execution_failed(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_execution_failed")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -696,6 +810,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_execution_cancelled(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_execution_cancelled")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -704,6 +821,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         )
 
     async def _handle_execution_filled(self, event: Event | Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._handle_execution_filled")
         payload = _payload_from_event(event)
         self._mark_signal_status(
             payload=payload,
@@ -718,6 +838,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         status: SignalStatus,
         reason: str,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._mark_signal_status")
         state = getattr(self.engine, "state", None)
         if state is None:
             return
@@ -744,6 +867,9 @@ class StrategyEventHandler(BaseStrategyComponent):
         - non-trading analytics topics are skipped in _handle_analytics_event();
         - SignalProcessor must not receive heartbeat/metrics/cleanup events.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEventHandler._analytics_topics")
         configured = getattr(self.config.routing, "event_to_categories", {}) or {}
 
         topics = [
@@ -762,6 +888,7 @@ class StrategyLifecycleManager(BaseStrategyComponent):
 
     Не запускає signal processing самостійно і не містить strategy logic.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyLifecycleManager")
 
     component_namespace = "strategy.lifecycle"
 
@@ -773,6 +900,9 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLifecycleManager.__init__")
         super().__init__(
             config=config,
             event_bus=event_bus,
@@ -783,6 +913,9 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         self._cleanup_job_name = "strategy.runtime.cleanup"
 
     async def start(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLifecycleManager.start")
         if self.is_started:
             return
 
@@ -808,6 +941,9 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         )
 
     async def stop(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLifecycleManager.stop")
         if not self.is_started:
             return
 
@@ -833,6 +969,9 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         )
 
     def _schedule_cleanup_job(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLifecycleManager._schedule_cleanup_job")
         if self.scheduler is None:
             self.log_debug(
                 "Strategy cleanup job skipped because scheduler is not configured"
@@ -860,6 +999,9 @@ class StrategyLifecycleManager(BaseStrategyComponent):
         )
 
     async def _cleanup_state_job(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLifecycleManager._cleanup_state_job")
         removed = self.state.prune(
             max_signal_age_seconds=self.config.runtime.max_signal_age_seconds,
         )
@@ -876,6 +1018,7 @@ class StrategyEngineProtocol:
 
     Не використовує typing.Protocol, щоб не ускладнювати runtime imports.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyEngineProtocol")
 
     state: StrategyRuntimeState
 
@@ -886,6 +1029,9 @@ class StrategyEngineProtocol:
         payload: dict[str, Any],
         event: Event | None = None,
     ) -> ProcessedSignalBatch:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineProtocol.process_analytics_event")
         raise NotImplementedError
 
     def update_context_from_payload(
@@ -894,12 +1040,21 @@ class StrategyEngineProtocol:
         event_name: str,
         payload: dict[str, Any],
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineProtocol.update_context_from_payload")
         raise NotImplementedError
 
     async def evaluate_symbol(self, symbol: str) -> list[StrategyEvaluation]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineProtocol.evaluate_symbol")
         raise NotImplementedError
 
     def prune(self) -> dict[str, int]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngineProtocol.prune")
         raise NotImplementedError
 
 
@@ -917,6 +1072,7 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
     - delegates signal pipeline to SignalProcessor;
     - does not contain scoring/building/risk-payload/execution logic.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyEngine")
 
     component_namespace = "strategy.engine"
 
@@ -929,6 +1085,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         state: StrategyRuntimeState | None = None,
         processor: SignalProcessor | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.__init__")
         super().__init__(
             config=config,
             event_bus=event_bus,
@@ -985,10 +1144,16 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         StrategyEngine itself does not subscribe directly.
         Event subscriptions are owned by StrategyEventHandler.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.register")
         self.event_handler.register()
         self._registered = True
 
     async def start(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.start")
         if self.is_started:
             return
 
@@ -1006,6 +1171,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         )
 
     async def stop(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.stop")
         if not self.is_started:
             return
 
@@ -1022,6 +1190,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         *,
         replace: bool = False,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.add_strategy")
         self.registry.register_strategy(strategy, replace=replace)
 
     def add_strategies(
@@ -1030,9 +1201,15 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         *,
         replace: bool = False,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.add_strategies")
         self.registry.register_many(strategies, replace=replace)
 
     def remove_strategy(self, strategy_name: str) -> BaseStrategy:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.remove_strategy")
         return self.registry.unregister_strategy(strategy_name)
 
     async def process_analytics_event(
@@ -1049,6 +1226,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         - StrategyEventHandler normally filters non-trading analytics topics.
         - This method also skips them defensively in case it is called directly.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.process_analytics_event")
         self.stats.record_event_received()
 
         if StrategyEventHandler.is_non_trading_analytics_topic(event_name):
@@ -1135,6 +1315,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         event_name: str,
         payload: dict[str, Any],
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.update_context_from_payload")
         context = self.context_builder.update_from_payload(
             event_name=event_name,
             payload=payload,
@@ -1156,6 +1339,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         metadata: dict[str, Any] | None = None,
         persist: bool = True,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.build_context")
         context = self.context_builder.build(
             symbol=symbol,
             timestamp=timestamp,
@@ -1179,6 +1365,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         Не публікує signal.generated і не будує risk payload.
         Для повного pipeline використовувати process_analytics_event().
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.evaluate_symbol")
         context = self.context_builder.get_or_build(symbol=symbol)
         strategies = self.registry.select(context=context)
 
@@ -1215,11 +1404,17 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         return result
 
     def prune(self) -> dict[str, int]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.prune")
         return self.state.prune(
             max_signal_age_seconds=self.config.runtime.max_signal_age_seconds,
         )
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine.summary")
         return {
             "engine": {
                 "started": self.is_started,
@@ -1231,6 +1426,9 @@ class StrategyEngine(BaseStrategyComponent, StrategyEngineProtocol):
         }
 
     def _record_metric_error(self, strategy_name: str | None = None) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEngine._record_metric_error")
         metrics = getattr(self.state, "metrics", None)
         if metrics is None:
             return

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spreads/spot_futures_basis_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -74,6 +75,7 @@ class SpotFuturesBasisPayload:
 
     Concrete leg construction remains a SignalProcessor / SignalBuilder concern.
     """
+    _logger = logging.getLogger(__name__ + ".SpotFuturesBasisPayload")
 
     snapshot: SpreadCompositeSnapshot
     side: SignalSide
@@ -100,6 +102,7 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
     - map basis bias to internal StrategySignal side;
     - return StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".SpotFuturesBasisStrategyConfig")
 
     entry_zscore: Decimal = Decimal("2.0")
     stop_zscore: Decimal = Decimal("4.5")
@@ -168,6 +171,9 @@ class SpotFuturesBasisStrategyConfig(SpreadsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategyConfig.validate")
         SpreadsStrategyConfig.validate(self)
 
         if self.entry_zscore <= DECIMAL_ZERO:
@@ -259,6 +265,7 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SpotFuturesBasisStrategy")
 
     component_namespace = "strategy.spreads.spot_futures_basis"
     category: StrategyCategory = StrategyCategory.SPREADS
@@ -274,6 +281,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         spreads_config: SpotFuturesBasisStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy.__init__")
         resolved_spreads_config = spreads_config or SpotFuturesBasisStrategyConfig()
         resolved_spreads_config.validate()
 
@@ -290,10 +300,16 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy.strategy_name")
         return "spot_futures_basis"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPREADS,
@@ -336,6 +352,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.basis_config.required_spreads_features)
 
@@ -343,6 +362,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spreads_data(
@@ -485,6 +507,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> SpotFuturesBasisPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._extract_payload")
         snapshot = self.resolve_spread_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -536,6 +561,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> Decimal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._basis_edge")
         for candidate in (
             snapshot.funding_adjusted_spread,
             snapshot.basis,
@@ -553,6 +581,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._passes_contract_filters")
         if not self.basis_config.require_spot_futures_contract:
             return True
 
@@ -583,6 +614,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: SpotFuturesBasisPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._passes_basis_filters")
         snapshot = payload.snapshot
 
         if self.basis_config.require_valid_quote and not snapshot.is_quote_valid:
@@ -622,6 +656,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: SpotFuturesBasisPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._passes_confirmation_filters")
         signal = payload.snapshot.raw_signal
 
         if self.basis_config.require_mean_reversion_signal:
@@ -657,6 +694,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         context: StrategyContext,
         payload: SpotFuturesBasisPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         z_component = zscore_component(
@@ -771,6 +811,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._confirmation_component")
         signal = snapshot.raw_signal
 
         components = {
@@ -799,6 +842,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: SpotFuturesBasisPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._source_features")
         features = [
             *spot_futures_source_features(),
             SPREADS_FEATURES.SNAPSHOT,
@@ -826,6 +872,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: SpotFuturesBasisPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._tags")
         tags = [
             self.basis_config.tag_spreads,
             self.basis_config.tag_spot_futures,
@@ -858,6 +907,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: SpotFuturesBasisPayload,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._leg_semantics")
         snapshot = payload.snapshot
 
         if payload.basis_bias == "SHORT_BASIS":
@@ -897,6 +949,9 @@ class SpotFuturesBasisStrategy(SpreadsTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpotFuturesBasisStrategy._execution_hints")
         return {
             "entry_offset_bps": self.basis_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.basis_config.execution_stop_buffer_bps_hint,

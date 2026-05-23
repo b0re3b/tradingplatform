@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -65,6 +66,7 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 @dataclass(slots=True)
 class FeatureSnapshot:
+    _logger = logging.getLogger(__name__ + ".FeatureSnapshot")
     name: str
     value: Any
     source: FeatureSource
@@ -76,9 +78,15 @@ class FeatureSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSnapshot.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSnapshot.validate")
         if not self.name.strip():
             raise ValidationError("FeatureSnapshot.name cannot be empty")
         if not self.symbol.strip():
@@ -91,10 +99,16 @@ class FeatureSnapshot:
             raise ValidationError("FeatureSnapshot.freshness_seconds must be > 0")
 
     def age_seconds(self, now: datetime | None = None) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSnapshot.age_seconds")
         current = ensure_aware_utc(now or utcnow())
         return max(0.0, (current - self.timestamp).total_seconds())
 
     def freshness_status(self, now: datetime | None = None) -> FreshnessStatus:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSnapshot.freshness_status")
         if self.freshness_seconds is None:
             return FreshnessStatus.FRESH
 
@@ -108,17 +122,24 @@ class FeatureSnapshot:
         return FreshnessStatus.EXPIRED
 
     def is_stale(self, now: datetime | None = None) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSnapshot.is_stale")
         return self.freshness_status(now) in {
             FreshnessStatus.STALE,
             FreshnessStatus.EXPIRED,
         }
 
     def is_expired(self, now: datetime | None = None) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSnapshot.is_expired")
         return self.freshness_status(now) == FreshnessStatus.EXPIRED
 
 
 @dataclass(slots=True)
 class StrategyMetadata:
+    _logger = logging.getLogger(__name__ + ".StrategyMetadata")
     strategy_name: str
     category: StrategyCategory
     timeframe: Timeframe
@@ -131,6 +152,9 @@ class StrategyMetadata:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetadata.validate")
         if not self.strategy_name.strip():
             raise ValidationError("StrategyMetadata.strategy_name cannot be empty")
         if not self.version.strip():
@@ -139,6 +163,7 @@ class StrategyMetadata:
 
 @dataclass(slots=True)
 class EntryPlan:
+    _logger = logging.getLogger(__name__ + ".EntryPlan")
     entry_type: EntryType
     price: float | None = None
     timeout_seconds: int | None = None
@@ -148,6 +173,9 @@ class EntryPlan:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EntryPlan.validate")
         if self.price is not None and self.price <= 0:
             raise ValidationError("EntryPlan.price must be > 0")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -158,6 +186,7 @@ class EntryPlan:
 
 @dataclass(slots=True)
 class TargetPlan:
+    _logger = logging.getLogger(__name__ + ".TargetPlan")
     price: float
     size_fraction: float = 1.0
     rr: float | None = None
@@ -165,6 +194,9 @@ class TargetPlan:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TargetPlan.validate")
         if self.price <= 0:
             raise ValidationError("TargetPlan.price must be > 0")
         if not 0 < self.size_fraction <= 1:
@@ -175,6 +207,7 @@ class TargetPlan:
 
 @dataclass(slots=True)
 class InvalidationPlan:
+    _logger = logging.getLogger(__name__ + ".InvalidationPlan")
     price: float | None = None
     reason: str | None = None
     timeout_seconds: int | None = None
@@ -182,6 +215,9 @@ class InvalidationPlan:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering InvalidationPlan.validate")
         if self.price is not None and self.price <= 0:
             raise ValidationError("InvalidationPlan.price must be > 0")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -190,6 +226,7 @@ class InvalidationPlan:
 
 @dataclass(slots=True)
 class ExitPlan:
+    _logger = logging.getLogger(__name__ + ".ExitPlan")
     exit_types: list[ExitType] = field(default_factory=list)
     stop_loss: float | None = None
     take_profit_levels: list[TargetPlan] = field(default_factory=list)
@@ -199,6 +236,9 @@ class ExitPlan:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ExitPlan.validate")
         if self.stop_loss is not None and self.stop_loss <= 0:
             raise ValidationError("ExitPlan.stop_loss must be > 0")
         if self.trailing_distance is not None and self.trailing_distance <= 0:
@@ -212,6 +252,7 @@ class ExitPlan:
 
 @dataclass(slots=True)
 class ExecutionPlanDraft:
+    _logger = logging.getLogger(__name__ + ".ExecutionPlanDraft")
     symbol: str
     side: SignalSide
     entry: EntryPlan
@@ -225,6 +266,9 @@ class ExecutionPlanDraft:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ExecutionPlanDraft.validate")
         if not self.symbol.strip():
             raise ValidationError("ExecutionPlanDraft.symbol cannot be empty")
         if self.side not in {SignalSide.LONG, SignalSide.SHORT}:
@@ -241,6 +285,7 @@ class ExecutionPlanDraft:
 
 @dataclass(slots=True)
 class FilterResult:
+    _logger = logging.getLogger(__name__ + ".FilterResult")
     name: str
     decision: FilterDecision
     reason: str | None = None
@@ -248,20 +293,30 @@ class FilterResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterResult.validate")
         if not self.name.strip():
             raise ValidationError("FilterResult.name cannot be empty")
 
     @property
     def passed(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterResult.passed")
         return self.decision in {FilterDecision.PASS, FilterDecision.WARN}
 
     @property
     def blocked(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterResult.blocked")
         return self.decision == FilterDecision.BLOCK
 
 
 @dataclass(slots=True)
 class ConflictRecord:
+    _logger = logging.getLogger(__name__ + ".ConflictRecord")
     conflict_type: ConflictType
     source: str
     message: str
@@ -269,6 +324,9 @@ class ConflictRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConflictRecord.validate")
         if not self.source.strip():
             raise ValidationError("ConflictRecord.source cannot be empty")
         if not self.message.strip():
@@ -286,6 +344,7 @@ class StrategySignal:
     directly. SignalProcessor/SignalRouter converts it into RiskReadySignalPayload
     and emits signal.generated.
     """
+    _logger = logging.getLogger(__name__ + ".StrategySignal")
 
     symbol: str
     side: SignalSide
@@ -324,6 +383,9 @@ class StrategySignal:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
         self.symbol = self.symbol.strip()
         self.strategy_name = self.strategy_name.strip()
@@ -342,6 +404,9 @@ class StrategySignal:
             self.confidence_grade = confidence_to_grade(self.confidence)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.validate")
         if not self.signal_id.strip():
             raise ValidationError("StrategySignal.signal_id cannot be empty")
         if not self.symbol.strip():
@@ -372,22 +437,37 @@ class StrategySignal:
 
     @property
     def is_long(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.is_long")
         return self.side == SignalSide.LONG
 
     @property
     def is_short(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.is_short")
         return self.side == SignalSide.SHORT
 
     @property
     def is_flat(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.is_flat")
         return self.side == SignalSide.FLAT
 
     @property
     def is_directional(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.is_directional")
         return self.side in {SignalSide.LONG, SignalSide.SHORT}
 
     @property
     def is_active(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.is_active")
         return self.status in {
             SignalStatus.NEW,
             SignalStatus.PENDING,
@@ -396,14 +476,23 @@ class StrategySignal:
 
     @property
     def passed_filters(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.passed_filters")
         return all(result.passed for result in self.filter_results)
 
     @property
     def total_conflict_penalty(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.total_conflict_penalty")
         return sum(conflict.penalty for conflict in self.conflicts)
 
     @property
     def primary_entry_price(self) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.primary_entry_price")
         if self.execution_plan is not None and self.execution_plan.entry.price is not None:
             return self.execution_plan.entry.price
         if self.entry_plan is not None:
@@ -412,6 +501,9 @@ class StrategySignal:
 
     @property
     def primary_stop_loss(self) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.primary_stop_loss")
         if self.execution_plan is not None:
             if self.execution_plan.exit.stop_loss is not None:
                 return self.execution_plan.exit.stop_loss
@@ -425,6 +517,9 @@ class StrategySignal:
 
     @property
     def primary_take_profit(self) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.primary_take_profit")
         targets: list[TargetPlan] = []
         if self.execution_plan is not None:
             targets = self.execution_plan.exit.take_profit_levels
@@ -433,47 +528,86 @@ class StrategySignal:
         return targets[0].price if targets else None
 
     def add_reason(self, reason: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.add_reason")
         if reason and reason not in self.reasons:
             self.reasons.append(reason)
 
     def add_confirmation(self, confirmation: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.add_confirmation")
         if confirmation and confirmation not in self.confirmations:
             self.confirmations.append(confirmation)
 
     def add_source_feature(self, feature_name: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.add_source_feature")
         if feature_name and feature_name not in self.source_features:
             self.source_features.append(feature_name)
 
     def add_filter_result(self, filter_result: FilterResult) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.add_filter_result")
         filter_result.validate()
         self.filter_results.append(filter_result)
 
     def add_conflict(self, conflict: ConflictRecord) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.add_conflict")
         conflict.validate()
         self.conflicts.append(conflict)
 
     def to_pending(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_pending")
         self.status = SignalStatus.PENDING
 
     def to_confirmed(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_confirmed")
         self.status = SignalStatus.CONFIRMED
 
     def to_rejected(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_rejected")
         self.status = SignalStatus.REJECTED
 
     def to_cancelled(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_cancelled")
         self.status = SignalStatus.CANCELLED
 
     def to_expired(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_expired")
         self.status = SignalStatus.EXPIRED
 
     def to_executed(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_executed")
         self.status = SignalStatus.EXECUTED
 
     def to_failed(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_failed")
         self.status = SignalStatus.FAILED
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategySignal.to_dict")
         return {
             "signal_id": self.signal_id,
             "symbol": self.symbol,
@@ -505,27 +639,36 @@ class StrategySignal:
 
 @dataclass(slots=True)
 class RawStrategySignal:
+    _logger = logging.getLogger(__name__ + ".RawStrategySignal")
     signal: StrategySignal
     raw_inputs: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RawStrategySignal.validate")
         self.signal.validate()
 
 
 @dataclass(slots=True)
 class ConfirmedSignal:
+    _logger = logging.getLogger(__name__ + ".ConfirmedSignal")
     signal: StrategySignal
     accepted_by_confluence: bool = False
     accepted_by_filters: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfirmedSignal.validate")
         self.signal.validate()
 
 
 @dataclass(slots=True)
 class TradeIdea:
+    _logger = logging.getLogger(__name__ + ".TradeIdea")
     signal: StrategySignal
     execution_plan: ExecutionPlanDraft
     created_at: datetime = field(default_factory=utcnow)
@@ -533,11 +676,17 @@ class TradeIdea:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradeIdea.__post_init__")
         self.created_at = ensure_aware_utc(self.created_at)
         if self.expires_at is not None:
             self.expires_at = ensure_aware_utc(self.expires_at)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradeIdea.validate")
         self.signal.validate()
         self.execution_plan.validate()
 
@@ -545,6 +694,9 @@ class TradeIdea:
             raise ValidationError("TradeIdea.expires_at must be after created_at")
 
     def is_expired(self, now: datetime | None = None) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TradeIdea.is_expired")
         if self.expires_at is None:
             return False
         current = ensure_aware_utc(now or utcnow())
@@ -590,6 +742,7 @@ class ExecutionCostPayload:
 
     RiskManager converts this dictionary into risk.models.ExecutionCostEstimate.
     """
+    _logger = logging.getLogger(__name__ + ".ExecutionCostPayload")
 
     spread_cost: float = 0.0
     slippage_cost: float = 0.0
@@ -602,6 +755,9 @@ class ExecutionCostPayload:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ExecutionCostPayload.validate")
         for field_name, value in {
             "spread_cost": self.spread_cost,
             "slippage_cost": self.slippage_cost,
@@ -620,6 +776,9 @@ class ExecutionCostPayload:
 
     @property
     def total_cost(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ExecutionCostPayload.total_cost")
         return (
             self.spread_cost
             + self.slippage_cost
@@ -629,6 +788,9 @@ class ExecutionCostPayload:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ExecutionCostPayload.to_dict")
         self.validate()
         return {
             "spread_cost": float(self.spread_cost),
@@ -652,6 +814,7 @@ class RiskReadySignalPayload:
     that RiskManager._request_from_payload(...) reads, without importing risk.enums
     or risk.models into strategy.
     """
+    _logger = logging.getLogger(__name__ + ".RiskReadySignalPayload")
 
     signal_id: str
     symbol: str
@@ -694,6 +857,9 @@ class RiskReadySignalPayload:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RiskReadySignalPayload.__post_init__")
         self.signal_id = str(self.signal_id or uuid4().hex)
         self.symbol = self.symbol.strip()
         self.strategy_name = self.strategy_name.strip()
@@ -722,6 +888,9 @@ class RiskReadySignalPayload:
         self.metadata.setdefault("market_type", self.market_type.value)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RiskReadySignalPayload.validate")
         if not self.signal_id.strip():
             raise ValidationError("RiskReadySignalPayload.signal_id cannot be empty")
         if not self.symbol.strip():
@@ -761,6 +930,9 @@ class RiskReadySignalPayload:
             self.execution_cost.validate()
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RiskReadySignalPayload.to_dict")
         self.validate()
 
         payload = {
@@ -819,6 +991,9 @@ class RiskReadySignalPayload:
             market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES,
             margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED,
     ) -> "RiskReadySignalPayload":
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".RiskReadySignalPayload")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RiskReadySignalPayload.from_signal")
         signal.validate()
 
         entry_price = signal.primary_entry_price
@@ -902,6 +1077,7 @@ class RiskReadySignalPayload:
 
 @dataclass(slots=True)
 class StrategyEvaluation:
+    _logger = logging.getLogger(__name__ + ".StrategyEvaluation")
     strategy_name: str
     symbol: str
     timestamp: datetime
@@ -913,10 +1089,16 @@ class StrategyEvaluation:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEvaluation.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
         self.confidence = clamp(self.confidence, 0.0, 1.0)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyEvaluation.validate")
         if not self.strategy_name.strip():
             raise ValidationError("StrategyEvaluation.strategy_name cannot be empty")
         if not self.symbol.strip():
@@ -929,6 +1111,7 @@ class StrategyEvaluation:
 
 @dataclass(slots=True)
 class ConfluenceResult:
+    _logger = logging.getLogger(__name__ + ".ConfluenceResult")
     symbol: str
     timestamp: datetime
     side: SignalSide = SignalSide.UNKNOWN
@@ -944,6 +1127,9 @@ class ConfluenceResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceResult.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
         self.confidence = clamp(self.confidence, 0.0, 1.0)
 
@@ -954,6 +1140,9 @@ class ConfluenceResult:
             self.strength = confidence_to_strength(self.confidence)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceResult.validate")
         if not self.symbol.strip():
             raise ValidationError("ConfluenceResult.symbol cannot be empty")
         if not 0.0 <= self.confidence <= 1.0:
@@ -963,19 +1152,29 @@ class ConfluenceResult:
 
     @property
     def total_conflict_penalty(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceResult.total_conflict_penalty")
         return sum(conflict.penalty for conflict in self.conflicts)
 
     def add_reason(self, reason: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceResult.add_reason")
         if reason and reason not in self.reasons:
             self.reasons.append(reason)
 
     def add_confirmation(self, confirmation: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceResult.add_confirmation")
         if confirmation and confirmation not in self.confirmations:
             self.confirmations.append(confirmation)
 
 
 @dataclass(slots=True)
 class PortfolioSnapshot:
+    _logger = logging.getLogger(__name__ + ".PortfolioSnapshot")
     open_positions: int = 0
     active_signals: int = 0
     symbol_exposure: dict[str, float] = field(default_factory=dict)
@@ -985,6 +1184,9 @@ class PortfolioSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioSnapshot.validate")
         if self.open_positions < 0:
             raise ValidationError("PortfolioSnapshot.open_positions must be >= 0")
         if self.active_signals < 0:
@@ -1007,6 +1209,7 @@ class PortfolioSnapshot:
 
 @dataclass(slots=True)
 class RegimeSnapshot:
+    _logger = logging.getLogger(__name__ + ".RegimeSnapshot")
     symbol: str
     regime: MarketRegime = MarketRegime.UNKNOWN
     confidence: float = 0.0
@@ -1015,10 +1218,16 @@ class RegimeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RegimeSnapshot.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
         self.confidence = clamp(self.confidence, 0.0, 1.0)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RegimeSnapshot.validate")
         if not self.symbol.strip():
             raise ValidationError("RegimeSnapshot.symbol cannot be empty")
         if not 0.0 <= self.confidence <= 1.0:
@@ -1027,6 +1236,7 @@ class RegimeSnapshot:
 
 @dataclass(slots=True)
 class PriceSnapshot:
+    _logger = logging.getLogger(__name__ + ".PriceSnapshot")
     symbol: str
     last_price: float | None = None
     bid: float | None = None
@@ -1038,9 +1248,15 @@ class PriceSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceSnapshot.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceSnapshot.validate")
         if not self.symbol.strip():
             raise ValidationError("PriceSnapshot.symbol cannot be empty")
 
@@ -1062,6 +1278,9 @@ class PriceSnapshot:
 
     @property
     def mid_price(self) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceSnapshot.mid_price")
         if self.bid is not None and self.ask is not None:
             return (self.bid + self.ask) / 2
         return self.last_price
@@ -1075,6 +1294,7 @@ class SignalContext:
     Strategy should read this context and return StrategyEvaluation.
     Strategy should not call analytics/risk/execution modules directly.
     """
+    _logger = logging.getLogger(__name__ + ".SignalContext")
 
     symbol: str
     timestamp: datetime
@@ -1099,9 +1319,15 @@ class SignalContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.validate")
         if not self.symbol.strip():
             raise ValidationError("SignalContext.symbol cannot be empty")
 
@@ -1139,23 +1365,38 @@ class SignalContext:
 
     @property
     def current_regime(self) -> MarketRegime:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.current_regime")
         if self.regime is None:
             return MarketRegime.UNKNOWN
         return self.regime.regime
 
     @property
     def mid_price(self) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.mid_price")
         if self.price is None:
             return None
         return self.price.mid_price
 
     def has_feature(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.has_feature")
         return name in self.feature_map
 
     def get_feature_snapshot(self, name: str) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.get_feature_snapshot")
         return self.feature_map.get(name)
 
     def get_feature(self, name: str, default: Any = None) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.get_feature")
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return default
@@ -1166,6 +1407,9 @@ class SignalContext:
         name: str,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.get_normalized_feature")
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return default
@@ -1176,12 +1420,18 @@ class SignalContext:
         )
 
     def feature_age_seconds(self, name: str) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.feature_age_seconds")
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return None
         return max(0.0, (self.timestamp - snapshot.timestamp).total_seconds())
 
     def feature_is_stale(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.feature_is_stale")
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return True
@@ -1193,12 +1443,18 @@ class SignalContext:
         return snapshot.is_stale(self.timestamp)
 
     def feature_is_expired(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.feature_is_expired")
         snapshot = self.feature_map.get(name)
         if snapshot is None:
             return True
         return snapshot.is_expired(self.timestamp)
 
     def put_feature(self, snapshot: FeatureSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.put_feature")
         snapshot.validate()
 
         if snapshot.symbol != self.symbol:
@@ -1214,12 +1470,18 @@ class SignalContext:
         key: str,
         value: Any,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.put_domain_feature")
         if not key.strip():
             raise ValidationError("domain feature key cannot be empty")
 
         self.domain_dict(source)[key] = value
 
     def domain_dict(self, source: FeatureSource) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalContext.domain_dict")
         mapping = {
             FeatureSource.ORDERFLOW: self.orderflow,
             FeatureSource.LIQUIDITY: self.liquidity,
@@ -1237,6 +1499,7 @@ class SignalContext:
 
 @dataclass(slots=True)
 class SignalEnvelope:
+    _logger = logging.getLogger(__name__ + ".SignalEnvelope")
     signal: StrategySignal
     emitted_at: datetime = field(default_factory=utcnow)
     correlation_id: str | None = None
@@ -1245,52 +1508,81 @@ class SignalEnvelope:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalEnvelope.__post_init__")
         self.emitted_at = ensure_aware_utc(self.emitted_at)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalEnvelope.validate")
         self.signal.validate()
 
 
 @dataclass(slots=True)
 class CooldownState:
+    _logger = logging.getLogger(__name__ + ".CooldownState")
     symbol: str
     strategy_name: str
     until: datetime
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CooldownState.__post_init__")
         self.until = ensure_aware_utc(self.until)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CooldownState.validate")
         if not self.symbol.strip():
             raise ValidationError("CooldownState.symbol cannot be empty")
         if not self.strategy_name.strip():
             raise ValidationError("CooldownState.strategy_name cannot be empty")
 
     def is_active(self, now: datetime | None = None) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CooldownState.is_active")
         current = ensure_aware_utc(now or utcnow())
         return current < self.until
 
     def remaining_seconds(self, now: datetime | None = None) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CooldownState.remaining_seconds")
         current = ensure_aware_utc(now or utcnow())
         return max(0.0, (self.until - current).total_seconds())
 
 
 @dataclass(slots=True)
 class SignalWindow:
+    _logger = logging.getLogger(__name__ + ".SignalWindow")
     opened_at: datetime
     expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalWindow.__post_init__")
         self.opened_at = ensure_aware_utc(self.opened_at)
         if self.expires_at is not None:
             self.expires_at = ensure_aware_utc(self.expires_at)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalWindow.validate")
         if self.expires_at is not None and self.expires_at <= self.opened_at:
             raise ValidationError("SignalWindow.expires_at must be after opened_at")
 
     def is_expired(self, now: datetime | None = None) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalWindow.is_expired")
         if self.expires_at is None:
             return False
         current = ensure_aware_utc(now or utcnow())
@@ -1298,6 +1590,9 @@ class SignalWindow:
 
     @classmethod
     def from_seconds(cls, ttl_seconds: int | None) -> SignalWindow:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SignalWindow")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalWindow.from_seconds")
         if ttl_seconds is not None and ttl_seconds <= 0:
             raise ValidationError("ttl_seconds must be > 0")
 

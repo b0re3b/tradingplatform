@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidations/squeeze_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from decimal import Decimal
@@ -77,6 +78,7 @@ class SqueezeReversalStrategyConfig(LiquidationsStrategyConfig):
     - new strategy expects analytics/context to provide confirmed exhaustion or
       squeeze context if confirmation is required.
     """
+    _logger = logging.getLogger(__name__ + ".SqueezeReversalStrategyConfig")
 
     require_confirmed_result: bool = True
     require_actionable_direction: bool = True
@@ -136,6 +138,9 @@ class SqueezeReversalStrategyConfig(LiquidationsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategyConfig.validate")
         LiquidationsStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -258,6 +263,7 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
     jobs and does not emit signal.generated. SignalProcessor owns routing,
     filtering, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SqueezeReversalStrategy")
 
     component_namespace = "strategy.liquidations.squeeze_reversal"
     category: StrategyCategory = StrategyCategory.LIQUIDATIONS
@@ -273,6 +279,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         liquidations_config: SqueezeReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy.__init__")
         resolved_liquidations_config = (
             liquidations_config or SqueezeReversalStrategyConfig()
         )
@@ -293,9 +302,15 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy.strategy_name")
         return "squeeze_reversal"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.squeeze_config.required_liquidations_features
@@ -305,6 +320,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         exhaustion = self._resolve_exhaustion_context(context)
@@ -509,6 +527,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
             domain_data["cascade"] if analytics encodes exhaustion fields into
             cascade result.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._resolve_exhaustion_context")
         squeeze = liquidations_item(context, "squeeze")
         exhaustion = liquidations_item(context, "exhaustion")
         cascade = liquidations_item(context, "cascade")
@@ -532,6 +553,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
     # ------------------------------------------------------------------
 
     def _passes_squeeze_filters(self, exhaustion: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._passes_squeeze_filters")
         if self.squeeze_config.require_confirmed_exhaustion_context:
             if not is_confirmed_status(exhaustion):
                 return False
@@ -585,6 +609,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         return True
 
     def _severity_allowed(self, exhaustion: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._severity_allowed")
         severity = self._severity(exhaustion)
         allowed = {
             item.strip().lower()
@@ -599,6 +626,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
     # ------------------------------------------------------------------
 
     def _derive_reversal_side(self, exhaustion: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._derive_reversal_side")
         return extract_reversal_side(exhaustion)
 
     # ------------------------------------------------------------------
@@ -611,6 +641,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         context: StrategyContext,
         exhaustion: Any,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._build_score_breakdown")
         confidence_component = extract_confidence(exhaustion)
         exhaustion_bias = extract_exhaustion_bias(exhaustion)
         bias_delta = extract_bias_delta(exhaustion)
@@ -745,6 +778,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
 
     @staticmethod
     def _imbalance_score(exhaustion: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SqueezeReversalStrategy._imbalance_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._imbalance_score")
         side_imbalance = extract_side_imbalance_ratio(exhaustion)
         event_imbalance = extract_event_imbalance_ratio(exhaustion)
 
@@ -758,6 +794,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
 
     @staticmethod
     def _acceleration_score(exhaustion: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SqueezeReversalStrategy._acceleration_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._acceleration_score")
         acceleration = extract_acceleration_ratio(exhaustion)
 
         if acceleration <= 0:
@@ -768,6 +807,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
 
     @staticmethod
     def _cluster_quality_score(exhaustion: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SqueezeReversalStrategy._cluster_quality_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._cluster_quality_score")
         duration = extract_cluster_duration_seconds(exhaustion)
         avg_notional = extract_cluster_avg_notional_per_event(exhaustion)
 
@@ -801,9 +843,15 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
     # ------------------------------------------------------------------
 
     def _severity(self, exhaustion: Any) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._severity")
         return extract_severity_label(exhaustion, default="unknown")
 
     def _source_features(self, exhaustion: Any) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._source_features")
         features = [
             LIQUIDATIONS_FEATURES.EXHAUSTION,
             LIQUIDATIONS_FEATURES.EXHAUSTION_CONFIDENCE,
@@ -835,6 +883,9 @@ class SqueezeReversalStrategy(LiquidationsTradingStrategy):
         return list(dict.fromkeys(features))
 
     def _tags(self, exhaustion: Any) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SqueezeReversalStrategy._tags")
         tags = [
             self.squeeze_config.tag_liquidations,
             self.squeeze_config.tag_squeeze,

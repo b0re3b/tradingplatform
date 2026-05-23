@@ -1,12 +1,10 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Mapping
 
 from analytics.whales.models import (
-    DEFAULT_MARKET_TYPE,
-    DEFAULT_TIMEFRAME,
-    UNKNOWN_EXCHANGE,
     WhaleKey,
     make_whale_key,
     normalize_exchange,
@@ -15,7 +13,6 @@ from analytics.whales.models import (
     normalize_timeframe,
     whale_key_to_dict,
 )
-
 
 # =============================================================================
 # Canonical topics
@@ -38,6 +35,35 @@ DEFAULT_WHALE_LIQUIDATION_CONTEXT_TOPIC = "analytics.whales.whale_liquidation_co
 DEFAULT_WHALE_CLUSTER_TOPIC = "analytics.whales.whale_cluster"
 DEFAULT_WHALE_CLUSTER_UPDATE_TOPIC = "analytics.whales.whale_cluster_update"
 DEFAULT_WHALE_CLUSTER_EXHAUSTION_TOPIC = "analytics.whales.whale_cluster_exhaustion"
+
+# Project runtime scope.
+# Market data exchanges used by the project. Bitget is intentionally not included.
+PROJECT_EXCHANGES: set[str] = {"binance", "bybit", "okx", "mexc"}
+PROJECT_DEFAULT_EXCHANGE: str = "binance"
+
+# Futures/perpetual market types used across project adapters/normalizers.
+PROJECT_FUTURES_MARKET_TYPES: set[str] = {"usdm_futures", "linear", "swap"}
+PROJECT_DEFAULT_MARKET_TYPE: str = "usdm_futures"
+
+# Backtest/runtime symbols and timeframes used by the project.
+PROJECT_SYMBOLS: set[str] = {"BTCUSDT", "ETHUSDT", "RIVERUSDT"}
+PROJECT_TIMEFRAMES: set[str] = {"1m", "15m"}
+PROJECT_DEFAULT_TIMEFRAME: str = "1m"
+
+# Whale detector defaults tuned as safe notional gates per tracked symbol.
+# Values are intentionally conservative and can be overridden from runtime config.
+PROJECT_SYMBOL_ABS_THRESHOLDS: dict[str, float] = {
+    "BTCUSDT": 250_000.0,
+    "ETHUSDT": 150_000.0,
+    "RIVERUSDT": 25_000.0,
+}
+
+PROJECT_SYMBOL_COOLDOWNS_SEC: dict[str, float] = {
+    "BTCUSDT": 2.0,
+    "ETHUSDT": 2.0,
+    "RIVERUSDT": 3.0,
+}
+
 
 
 # =============================================================================
@@ -180,26 +206,39 @@ class WhaleScopedConfigMixin:
     Якщо allowlist порожній — значення не фільтрується.
     """
 
-    default_exchange: str = UNKNOWN_EXCHANGE
-    default_market_type: str = DEFAULT_MARKET_TYPE
-    default_timeframe: str = DEFAULT_TIMEFRAME
+    default_exchange: str = PROJECT_DEFAULT_EXCHANGE
+    default_market_type: str = PROJECT_DEFAULT_MARKET_TYPE
+    default_timeframe: str = PROJECT_DEFAULT_TIMEFRAME
 
     allowed_exchanges: set[str] = field(default_factory=set)
     allowed_market_types: set[str] = field(
-        default_factory=lambda: {
-            "perpetual",
-            "futures",
-            "linear",
-            "inverse",
-            "swap",
-            "usdm_futures",
-            "coinm_futures",
-        }
+        default_factory=lambda: set(PROJECT_FUTURES_MARKET_TYPES)
     )
-    allowed_symbols: set[str] = field(default_factory=set)
-    allowed_timeframes: set[str] = field(default_factory=set)
+    allowed_symbols: set[str] = field(default_factory=lambda: set(PROJECT_SYMBOLS))
+    allowed_timeframes: set[str] = field(default_factory=lambda: set(PROJECT_TIMEFRAMES))
 
     def _normalize_scope_fields(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_normalize_scope_fields", _analytics_args)
+        except Exception:
+            pass
         self.default_exchange = normalize_exchange(self.default_exchange)
         self.default_market_type = normalize_market_type(self.default_market_type)
         self.default_timeframe = normalize_timeframe(self.default_timeframe)
@@ -217,6 +256,27 @@ class WhaleScopedConfigMixin:
         symbol: str,
         timeframe: str | None = None,
     ) -> WhaleKey:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "make_key", _analytics_args)
+        except Exception:
+            pass
         return make_whale_key(
             exchange=exchange or self.default_exchange,
             market_type=market_type or self.default_market_type,
@@ -232,6 +292,27 @@ class WhaleScopedConfigMixin:
         symbol: str,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_scope", _analytics_args)
+        except Exception:
+            pass
         key = self.make_key(
             exchange=exchange,
             market_type=market_type,
@@ -241,6 +322,27 @@ class WhaleScopedConfigMixin:
         return self.should_process_key(key)
 
     def should_process_key(self, key: WhaleKey) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_key", _analytics_args)
+        except Exception:
+            pass
         scope = whale_key_to_dict(key)
 
         if self.allowed_exchanges and scope["exchange"] not in self.allowed_exchanges:
@@ -259,6 +361,24 @@ class WhaleScopedConfigMixin:
 
     @staticmethod
     def scoped_mapping_key(key: WhaleKey) -> str:
+        try:
+            _analytics_class_name = "WhaleScopedConfigMixin"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "scoped_mapping_key", _analytics_args)
+        except Exception:
+            pass
         scope = whale_key_to_dict(key)
         return (
             f"{scope['exchange']}:"
@@ -293,7 +413,9 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
 
     # Backward-compatible symbol-only thresholds:
     # {"BTCUSDT": 250000}
-    symbol_abs_thresholds: dict[str, float] = field(default_factory=dict)
+    symbol_abs_thresholds: dict[str, float] = field(
+        default_factory=lambda: dict(PROJECT_SYMBOL_ABS_THRESHOLDS)
+    )
 
     # New scoped thresholds:
     # {"binance:perpetual:BTCUSDT:realtime": 250000}
@@ -311,7 +433,9 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
 
     # Cooldowns
     signal_cooldown_sec: float = 2.0
-    symbol_cooldown_sec: dict[str, float] = field(default_factory=dict)
+    symbol_cooldown_sec: dict[str, float] = field(
+        default_factory=lambda: dict(PROJECT_SYMBOL_COOLDOWNS_SEC)
+    )
     scoped_cooldown_sec: dict[str, float] = field(default_factory=dict)
 
     # Cleanup / lifecycle
@@ -333,6 +457,27 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
     log_signals: bool = True
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self._normalize_scope_fields()
 
         self.symbol_abs_thresholds = _normalize_threshold_mapping(self.symbol_abs_thresholds)
@@ -350,13 +495,76 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
 
     @property
     def production_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_input_topics", _analytics_args)
+        except Exception:
+            pass
         return self.input_event_patterns
 
     @property
     def legacy_raw_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "legacy_raw_input_topics", _analytics_args)
+        except Exception:
+            pass
         return (self.raw_input_event_name,)
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         _validate_non_negative_number(
             "large_trade_detector.default_abs_notional_threshold",
             self.default_abs_notional_threshold,
@@ -449,6 +657,27 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
             )
 
     def get_symbol_abs_threshold(self, symbol: str) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "get_symbol_abs_threshold", _analytics_args)
+        except Exception:
+            pass
         normalized_symbol = normalize_symbol(symbol)
         return self.symbol_abs_thresholds.get(
             normalized_symbol,
@@ -456,6 +685,27 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
         )
 
     def get_key_abs_threshold(self, key: WhaleKey) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "get_key_abs_threshold", _analytics_args)
+        except Exception:
+            pass
         scoped_key = self.scoped_mapping_key(key)
         if scoped_key in self.scoped_abs_thresholds:
             return self.scoped_abs_thresholds[scoped_key]
@@ -464,6 +714,27 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
         return self.get_symbol_abs_threshold(scope["symbol"])
 
     def get_symbol_cooldown(self, symbol: str) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "get_symbol_cooldown", _analytics_args)
+        except Exception:
+            pass
         normalized_symbol = normalize_symbol(symbol)
         return self.symbol_cooldown_sec.get(
             normalized_symbol,
@@ -471,6 +742,27 @@ class LargeTradeDetectorConfig(WhaleScopedConfigMixin):
         )
 
     def get_key_cooldown(self, key: WhaleKey) -> float:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "get_key_cooldown", _analytics_args)
+        except Exception:
+            pass
         scoped_key = self.scoped_mapping_key(key)
         if scoped_key in self.scoped_cooldown_sec:
             return self.scoped_cooldown_sec[scoped_key]
@@ -543,6 +835,27 @@ class WhaleTrackerConfig(WhaleScopedConfigMixin):
     subscribe_liquidations: bool = True
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self._normalize_scope_fields()
 
         self.liquidation_event_patterns = _normalize_topic_patterns(
@@ -555,14 +868,77 @@ class WhaleTrackerConfig(WhaleScopedConfigMixin):
 
     @property
     def large_trade_buffer_size(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "large_trade_buffer_size", _analytics_args)
+        except Exception:
+            pass
         return max(self.cluster_window_sec, self.pressure_window_sec) * 10
 
     @property
     def liquidation_buffer_size(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "liquidation_buffer_size", _analytics_args)
+        except Exception:
+            pass
         return self.liquidation_window_sec * 10
 
     @property
     def production_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_input_topics", _analytics_args)
+        except Exception:
+            pass
         topics = [self.large_trade_event_name]
         if self.subscribe_liquidations:
             topics.extend(self.liquidation_event_patterns)
@@ -570,9 +946,51 @@ class WhaleTrackerConfig(WhaleScopedConfigMixin):
 
     @property
     def legacy_raw_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "legacy_raw_input_topics", _analytics_args)
+        except Exception:
+            pass
         return (self.raw_liquidation_event_name,)
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         _validate_non_empty_topic(
             "whale_tracker.large_trade_event_name",
             self.large_trade_event_name,
@@ -727,23 +1145,128 @@ class WhaleClusterAnalyzerConfig(WhaleScopedConfigMixin):
     log_signals: bool = True
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self._normalize_scope_fields()
         self.validate()
 
     @property
     def activity_buffer_size(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "activity_buffer_size", _analytics_args)
+        except Exception:
+            pass
         return self.analysis_window_sec * 2
 
     @property
     def pressure_buffer_size(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "pressure_buffer_size", _analytics_args)
+        except Exception:
+            pass
         return self.analysis_window_sec * 2
 
     @property
     def liquidation_context_buffer_size(self) -> int:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "liquidation_context_buffer_size", _analytics_args)
+        except Exception:
+            pass
         return self.analysis_window_sec * 2
 
     @property
     def production_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_input_topics", _analytics_args)
+        except Exception:
+            pass
         return (
             self.whale_activity_event_name,
             self.whale_pressure_event_name,
@@ -751,6 +1274,27 @@ class WhaleClusterAnalyzerConfig(WhaleScopedConfigMixin):
         )
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         _validate_non_empty_topic(
             "whale_cluster_analyzer.whale_activity_event_name",
             self.whale_activity_event_name,
@@ -877,9 +1421,51 @@ class WhalesConfig:
     )
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.validate()
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         self.large_trade_detector.validate()
         self.whale_tracker.validate()
         self.whale_cluster_analyzer.validate()
@@ -887,6 +1473,27 @@ class WhalesConfig:
 
     @property
     def production_input_topics(self) -> dict[str, tuple[str, ...]]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_input_topics", _analytics_args)
+        except Exception:
+            pass
         return {
             "large_trade_detector": self.large_trade_detector.production_input_topics,
             "whale_tracker": self.whale_tracker.production_input_topics,
@@ -895,6 +1502,27 @@ class WhalesConfig:
 
     @property
     def legacy_raw_input_topics(self) -> dict[str, tuple[str, ...]]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "legacy_raw_input_topics", _analytics_args)
+        except Exception:
+            pass
         return {
             "large_trade_detector": self.large_trade_detector.legacy_raw_input_topics,
             "whale_tracker": self.whale_tracker.legacy_raw_input_topics,
@@ -905,6 +1533,27 @@ class WhalesConfig:
         Перевіряє, що внутрішні output/input topics між whale-компонентами
         узгоджені між собою.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_pipeline_topics", _analytics_args)
+        except Exception:
+            pass
         if (
             self.large_trade_detector.output_event_name
             != self.whale_tracker.large_trade_event_name
@@ -947,6 +1596,17 @@ class WhalesConfig:
 
 
 __all__ = [
+    # project scope
+    "PROJECT_EXCHANGES",
+    "PROJECT_DEFAULT_EXCHANGE",
+    "PROJECT_FUTURES_MARKET_TYPES",
+    "PROJECT_DEFAULT_MARKET_TYPE",
+    "PROJECT_SYMBOLS",
+    "PROJECT_TIMEFRAMES",
+    "PROJECT_DEFAULT_TIMEFRAME",
+    "PROJECT_SYMBOL_ABS_THRESHOLDS",
+    "PROJECT_SYMBOL_COOLDOWNS_SEC",
+
     # topics
     "DEFAULT_TRADES_UPDATED_TOPIC",
     "DEFAULT_LIQUIDATIONS_UPDATED_TOPIC",

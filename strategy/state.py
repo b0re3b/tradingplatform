@@ -1,6 +1,7 @@
 # trading_system/strategy/state.py
 
 from __future__ import annotations
+import logging
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ class SignalState:
 
     Не містить EventBus logic, risk logic або execution logic.
     """
+    _logger = logging.getLogger(__name__ + ".SignalState")
 
     max_history_size: int = 1000
 
@@ -61,10 +63,16 @@ class SignalState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.__post_init__")
         if self.max_history_size <= 0:
             raise ValidationError("SignalState.max_history_size must be > 0")
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.validate")
         if self.max_history_size <= 0:
             raise ValidationError("SignalState.max_history_size must be > 0")
 
@@ -84,6 +92,9 @@ class SignalState:
             signal.validate()
 
     def touch(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.touch")
         self.updated_at = utcnow()
 
     def remember(
@@ -98,6 +109,9 @@ class SignalState:
         active=None:
             активність визначається через signal.is_active.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.remember")
         signal.validate()
 
         signal_id = self._signal_id(signal)
@@ -121,16 +135,25 @@ class SignalState:
         self.touch()
 
     def remember_evaluation(self, evaluation: StrategyEvaluation) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.remember_evaluation")
         evaluation.validate()
         if evaluation.signal is not None:
             self.remember(evaluation.signal, active=evaluation.passed)
 
     def get_by_signal_id(self, signal_id: str | None) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_by_signal_id")
         if not isinstance(signal_id, str) or not signal_id.strip():
             return None
         return self.signal_by_id.get(signal_id.strip())
 
     def get_active(self) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_active")
         return sorted(
             self.active_signals.values(),
             key=lambda signal: (signal.timestamp, signal.strategy_name),
@@ -138,6 +161,9 @@ class SignalState:
         )
 
     def get_active_for_symbol(self, symbol: str) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_active_for_symbol")
         return [
             signal
             for signal in self.get_active()
@@ -145,6 +171,9 @@ class SignalState:
         ]
 
     def get_active_for_strategy(self, strategy_name: str) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_active_for_strategy")
         return [
             signal
             for signal in self.get_active()
@@ -152,9 +181,15 @@ class SignalState:
         ]
 
     def get_last_for_symbol(self, symbol: str) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_last_for_symbol")
         return self.last_signal_by_symbol.get(symbol)
 
     def get_last_for_strategy(self, strategy_name: str) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_last_for_strategy")
         return self.last_signal_by_strategy.get(strategy_name)
 
     def get_last_for_symbol_side(
@@ -162,6 +197,9 @@ class SignalState:
         symbol: str,
         side: SignalSide,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.get_last_for_symbol_side")
         return self.last_signal_by_symbol_side.get((symbol, side))
 
     def find_signal(
@@ -183,6 +221,9 @@ class SignalState:
         5. symbol;
         6. strategy_name.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.find_signal")
         signal = self.get_by_signal_id(signal_id)
         if signal is not None:
             return signal
@@ -225,6 +266,9 @@ class SignalState:
         active: bool | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.mark_status_by_signal_id")
         signal = self.get_by_signal_id(signal_id)
         if signal is None:
             return None
@@ -253,6 +297,9 @@ class SignalState:
         when to call it after signal.confirmed / risk.position_blocked /
         execution.* events.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.mark_status")
         signal.validate()
 
         signal.status = status
@@ -287,6 +334,9 @@ class SignalState:
         - reason;
         - metadata.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.mark_status_from_payload")
         signal_id = payload.get("signal_id")
         symbol = payload.get("symbol")
         strategy_name = payload.get("strategy_name")
@@ -327,6 +377,9 @@ class SignalState:
         *,
         reason: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.mark_rejected")
         if reason:
             self._add_reason(signal, reason)
 
@@ -343,6 +396,9 @@ class SignalState:
         *,
         reason: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.mark_expired")
         if reason:
             self._add_reason(signal, reason)
 
@@ -354,6 +410,9 @@ class SignalState:
         self.remember(signal, active=False)
 
     def remove_active(self, signal: StrategySignal) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.remove_active")
         signal.validate()
         self.active_signals.pop(self._signal_key(signal), None)
         self.touch()
@@ -365,6 +424,9 @@ class SignalState:
         strategy_name: str,
         side: SignalSide,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.remove_active_by_key")
         key = self._make_signal_key(
             symbol=symbol,
             strategy_name=strategy_name,
@@ -381,6 +443,9 @@ class SignalState:
         signal_id: str | None = None,
         limit: int | None = None,
     ) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.history_list")
         items = list(self.history)
 
         if signal_id is not None:
@@ -412,6 +477,9 @@ class SignalState:
         return items
 
     def prune_inactive(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.prune_inactive")
         self.active_signals = {
             key: signal
             for key, signal in self.active_signals.items()
@@ -420,6 +488,9 @@ class SignalState:
         self.touch()
 
     def prune_older_than(self, cutoff: datetime) -> dict[str, int]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.prune_older_than")
         cutoff = ensure_aware_utc(cutoff)
 
         before_history = len(self.history)
@@ -453,6 +524,9 @@ class SignalState:
         }
 
     def clear_symbol(self, symbol: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.clear_symbol")
         self.active_signals = {
             key: signal
             for key, signal in self.active_signals.items()
@@ -484,6 +558,9 @@ class SignalState:
         self.touch()
 
     def clear(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.clear")
         self.active_signals.clear()
         self.signal_by_id.clear()
         self.last_signal_by_symbol.clear()
@@ -499,6 +576,9 @@ class SignalState:
         self.touch()
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState.summary")
         return {
             "active": len(self.active_signals),
             "signal_by_id": len(self.signal_by_id),
@@ -515,9 +595,15 @@ class SignalState:
         }
 
     def _append_history(self, signal: StrategySignal) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._append_history")
         self._append_bounded(self.history, signal)
 
     def _append_status_bucket(self, signal: StrategySignal) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._append_status_bucket")
         if signal.status == SignalStatus.REJECTED:
             self._append_bounded(self.rejected_signals, signal)
         elif signal.status == SignalStatus.EXPIRED:
@@ -536,6 +622,9 @@ class SignalState:
         target: Deque[StrategySignal],
         signal: StrategySignal,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._append_bounded")
         target.append(signal)
 
         while len(target) > self.max_history_size:
@@ -546,6 +635,9 @@ class SignalState:
         source: Deque[StrategySignal],
         cutoff: datetime,
     ) -> Deque[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._filtered_deque")
         return deque(
             [
                 signal
@@ -560,6 +652,9 @@ class SignalState:
         source: Deque[StrategySignal],
         symbol: str,
     ) -> Deque[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._remove_symbol_from_deque")
         return deque(
             [
                 signal
@@ -570,6 +665,9 @@ class SignalState:
         )
 
     def _rebuild_indexes_from_history(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._rebuild_indexes_from_history")
         self.active_signals.clear()
         self.signal_by_id.clear()
         self.last_signal_by_symbol.clear()
@@ -589,6 +687,9 @@ class SignalState:
             self.last_signal_by_symbol_side[(signal.symbol, signal.side)] = signal
 
     def _signal_key(self, signal: StrategySignal) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._signal_key")
         return self._make_signal_key(
             symbol=signal.symbol,
             strategy_name=signal.strategy_name,
@@ -597,6 +698,9 @@ class SignalState:
 
     @staticmethod
     def _signal_id(signal: StrategySignal) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalState._signal_id")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._signal_id")
         value = getattr(signal, "signal_id", None)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -616,10 +720,16 @@ class SignalState:
         strategy_name: str,
         side: SignalSide,
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalState._make_signal_key")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._make_signal_key")
         return f"{symbol}:{strategy_name}:{side.value}"
 
     @staticmethod
     def _parse_side(value: Any) -> SignalSide | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalState._parse_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._parse_side")
         if isinstance(value, SignalSide):
             return value
 
@@ -633,6 +743,9 @@ class SignalState:
 
     @staticmethod
     def _add_reason(signal: StrategySignal, reason: str) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalState._add_reason")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalState._add_reason")
         add_reason = getattr(signal, "add_reason", None)
         if callable(add_reason):
             add_reason(reason)
@@ -656,6 +769,7 @@ class StrategyContextStore:
 
     Це локальний runtime store, не persistence/storage.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyContextStore")
 
     contexts: dict[str, StrategyContext] = field(default_factory=dict)
     features: dict[str, dict[str, FeatureSnapshot]] = field(default_factory=dict)
@@ -667,6 +781,9 @@ class StrategyContextStore:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.validate")
         for symbol, context in self.contexts.items():
             if symbol != context.symbol:
                 raise ValidationError(
@@ -686,15 +803,24 @@ class StrategyContextStore:
         self.portfolio.validate()
 
     def touch(self, symbol: str | None = None) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.touch")
         now = utcnow()
         self.updated_at = now
         if symbol is not None:
             self.updated_at_by_symbol[symbol] = now
 
     def get_context(self, symbol: str) -> StrategyContext | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.get_context")
         return self.contexts.get(symbol)
 
     def set_context(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.set_context")
         context.validate()
         self.contexts[context.symbol] = context
 
@@ -710,6 +836,9 @@ class StrategyContextStore:
         self.touch(context.symbol)
 
     def put_feature(self, snapshot: FeatureSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.put_feature")
         snapshot.validate()
 
         self.features.setdefault(snapshot.symbol, {})[snapshot.name] = snapshot
@@ -724,6 +853,9 @@ class StrategyContextStore:
         self.touch(snapshot.symbol)
 
     def set_regime(self, snapshot: RegimeSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.set_regime")
         snapshot.validate()
         self.regimes[snapshot.symbol] = snapshot
 
@@ -735,6 +867,9 @@ class StrategyContextStore:
         self.touch(snapshot.symbol)
 
     def set_portfolio(self, snapshot: PortfolioSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.set_portfolio")
         snapshot.validate()
         self.portfolio = snapshot
 
@@ -752,6 +887,9 @@ class StrategyContextStore:
         include_regime: bool = True,
         include_portfolio: bool = True,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.build_context")
         if not symbol.strip():
             raise StrategyStateError("symbol cannot be empty")
 
@@ -779,9 +917,15 @@ class StrategyContextStore:
         symbol: str,
         name: str,
     ) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.get_feature")
         return self.features.get(symbol, {}).get(name)
 
     def remove_symbol(self, symbol: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.remove_symbol")
         self.contexts.pop(symbol, None)
         self.features.pop(symbol, None)
         self.regimes.pop(symbol, None)
@@ -789,6 +933,9 @@ class StrategyContextStore:
         self.touch()
 
     def prune_stale_features(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.prune_stale_features")
         removed = 0
 
         for symbol, feature_map in list(self.features.items()):
@@ -811,6 +958,9 @@ class StrategyContextStore:
         return removed
 
     def clear(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.clear")
         self.contexts.clear()
         self.features.clear()
         self.regimes.clear()
@@ -819,6 +969,9 @@ class StrategyContextStore:
         self.touch()
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyContextStore.summary")
         return {
             "contexts": len(self.contexts),
             "features_symbols": len(self.features),
@@ -836,6 +989,7 @@ class StrategyCooldownState:
 
     Використовується до risk layer тільки як pre-risk throttling.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyCooldownState")
 
     strategy_cooldowns: dict[tuple[str, str], CooldownState] = field(default_factory=dict)
     side_cooldowns: dict[tuple[str, SignalSide], CooldownState] = field(default_factory=dict)
@@ -843,6 +997,9 @@ class StrategyCooldownState:
     updated_at: datetime | None = None
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.validate")
         for cooldown in self.strategy_cooldowns.values():
             cooldown.validate()
 
@@ -850,6 +1007,9 @@ class StrategyCooldownState:
             cooldown.validate()
 
     def touch(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.touch")
         self.updated_at = utcnow()
 
     def add_strategy_cooldown(
@@ -860,6 +1020,9 @@ class StrategyCooldownState:
         seconds: int | float,
         reason: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.add_strategy_cooldown")
         if seconds <= 0:
             return
 
@@ -883,6 +1046,9 @@ class StrategyCooldownState:
         seconds: int | float,
         reason: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.add_side_cooldown")
         if seconds <= 0:
             return
 
@@ -905,6 +1071,9 @@ class StrategyCooldownState:
         strategy_name: str,
         now: datetime | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.is_strategy_blocked")
         cooldown = self.strategy_cooldowns.get((symbol, strategy_name))
         if cooldown is None:
             return False
@@ -917,12 +1086,18 @@ class StrategyCooldownState:
         side: SignalSide,
         now: datetime | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.is_side_blocked")
         cooldown = self.side_cooldowns.get((symbol, side))
         if cooldown is None:
             return False
         return cooldown.is_active(now)
 
     def prune_expired(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.prune_expired")
         now = utcnow()
         removed = 0
 
@@ -942,11 +1117,17 @@ class StrategyCooldownState:
         return removed
 
     def clear(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.clear")
         self.strategy_cooldowns.clear()
         self.side_cooldowns.clear()
         self.touch()
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCooldownState.summary")
         return {
             "strategy_cooldowns": len(self.strategy_cooldowns),
             "side_cooldowns": len(self.side_cooldowns),
@@ -961,6 +1142,7 @@ class StrategyMetricsState:
 
     Не є storage/persistence. Для dashboard/storage можна робити snapshots.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyMetricsState")
 
     evaluations_total: int = 0
     evaluations_passed: int = 0
@@ -991,12 +1173,21 @@ class StrategyMetricsState:
     updated_at: datetime | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.__post_init__")
         self.started_at = ensure_aware_utc(self.started_at)
 
     def touch(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.touch")
         self.updated_at = utcnow()
 
     def record_evaluation(self, evaluation: StrategyEvaluation) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_evaluation")
         evaluation.validate()
 
         self.evaluations_total += 1
@@ -1014,6 +1205,9 @@ class StrategyMetricsState:
         self.touch()
 
     def record_signal(self, signal: StrategySignal) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_signal")
         signal.validate()
 
         self.signals_generated += 1
@@ -1026,6 +1220,9 @@ class StrategyMetricsState:
         self.touch()
 
     def record_status(self, status: SignalStatus) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_status")
         if status == SignalStatus.REJECTED:
             self.signals_rejected += 1
         elif status == SignalStatus.EXPIRED:
@@ -1040,6 +1237,9 @@ class StrategyMetricsState:
             self.signals_cancelled += 1
 
     def record_rejected_signal(self, signal: StrategySignal) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_rejected_signal")
         signal.validate()
         self.signals_rejected += 1
         self.signals_by_strategy[signal.strategy_name] += 1
@@ -1048,6 +1248,9 @@ class StrategyMetricsState:
         self.touch()
 
     def record_expired_signal(self, signal: StrategySignal) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_expired_signal")
         signal.validate()
         self.signals_expired += 1
         self.touch()
@@ -1057,6 +1260,9 @@ class StrategyMetricsState:
         *,
         strategy_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_applicability_skip")
         self.applicability_skipped += 1
 
         if strategy_name:
@@ -1069,6 +1275,9 @@ class StrategyMetricsState:
         *,
         strategy_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.record_error")
         self.errors_total += 1
         now = utcnow()
 
@@ -1080,17 +1289,26 @@ class StrategyMetricsState:
 
     @property
     def pass_rate(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.pass_rate")
         if self.evaluations_total == 0:
             return 0.0
         return self.evaluations_passed / self.evaluations_total
 
     @property
     def error_rate(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.error_rate")
         if self.evaluations_total == 0:
             return 0.0
         return self.errors_total / self.evaluations_total
 
     def reset(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.reset")
         self.evaluations_total = 0
         self.evaluations_passed = 0
         self.evaluations_failed = 0
@@ -1120,6 +1338,9 @@ class StrategyMetricsState:
         self.touch()
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMetricsState.summary")
         return {
             "evaluations_total": self.evaluations_total,
             "evaluations_passed": self.evaluations_passed,
@@ -1165,6 +1386,7 @@ class StrategyRuntimeState:
     Його використовують StrategyEngine, SignalProcessor, PortfolioCoordinator
     та StrategyEventHandler як shared in-memory runtime state.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyRuntimeState")
 
     signals: SignalState = field(default_factory=SignalState)
     contexts: StrategyContextStore = field(default_factory=StrategyContextStore)
@@ -1182,9 +1404,15 @@ class StrategyRuntimeState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.__post_init__")
         self.started_at = ensure_aware_utc(self.started_at)
 
     def touch(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.touch")
         self.updated_at = utcnow()
 
     def set_risk_halt(
@@ -1197,6 +1425,9 @@ class StrategyRuntimeState:
         Mirror global risk halt / kill-switch state for strategy runtime,
         dashboard and backtesting.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.set_risk_halt")
         self.risk_halt_active = bool(active)
         self.risk_halt_reason = reason if active else None
         self.metadata["risk_halt_active"] = self.risk_halt_active
@@ -1204,6 +1435,9 @@ class StrategyRuntimeState:
         self.touch()
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.validate")
         self.signals.validate()
         self.contexts.validate()
         self.cooldowns.validate()
@@ -1215,6 +1449,9 @@ class StrategyRuntimeState:
             raise ValidationError("StrategyRuntimeState.active_symbols contains empty symbol")
 
     def update_context(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.update_context")
         context.validate()
 
         self.contexts.set_context(context)
@@ -1230,6 +1467,9 @@ class StrategyRuntimeState:
         include_regime: bool = True,
         include_portfolio: bool = True,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.build_context")
         context = self.contexts.build_context(
             symbol,
             timestamp=timestamp,
@@ -1247,6 +1487,9 @@ class StrategyRuntimeState:
         *,
         active: bool | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.update_signal")
         signal.validate()
 
         self.signals.remember(signal, active=active)
@@ -1254,6 +1497,9 @@ class StrategyRuntimeState:
         self.touch()
 
     def update_evaluation(self, evaluation: StrategyEvaluation) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.update_evaluation")
         evaluation.validate()
 
         self.metrics.record_evaluation(evaluation)
@@ -1278,6 +1524,9 @@ class StrategyRuntimeState:
         reason: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.mark_signal_status")
         signal = self.signals.find_signal(
             signal_id=signal_id,
             symbol=symbol,
@@ -1307,6 +1556,9 @@ class StrategyRuntimeState:
         status: SignalStatus,
         default_reason: str,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.mark_signal_status_from_payload")
         updated = self.signals.mark_status_from_payload(
             payload=payload,
             status=status,
@@ -1320,9 +1572,15 @@ class StrategyRuntimeState:
         return updated
 
     def get_signal_by_id(self, signal_id: str | None) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.get_signal_by_id")
         return self.signals.get_by_signal_id(signal_id)
 
     def set_regime(self, snapshot: RegimeSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.set_regime")
         snapshot.validate()
 
         self.contexts.set_regime(snapshot)
@@ -1330,12 +1588,18 @@ class StrategyRuntimeState:
         self.touch()
 
     def set_portfolio_snapshot(self, snapshot: PortfolioSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.set_portfolio_snapshot")
         snapshot.validate()
 
         self.contexts.set_portfolio(snapshot)
         self.touch()
 
     def upsert_feature(self, snapshot: FeatureSnapshot) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.upsert_feature")
         snapshot.validate()
 
         self.contexts.put_feature(snapshot)
@@ -1343,19 +1607,31 @@ class StrategyRuntimeState:
         self.touch()
 
     def block_symbol(self, symbol: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.block_symbol")
         if not symbol.strip():
             raise StrategyStateError("symbol cannot be empty")
         self.blocked_symbols.add(symbol)
         self.touch()
 
     def unblock_symbol(self, symbol: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.unblock_symbol")
         self.blocked_symbols.discard(symbol)
         self.touch()
 
     def is_symbol_blocked(self, symbol: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.is_symbol_blocked")
         return symbol in self.blocked_symbols
 
     def clear_symbol(self, symbol: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.clear_symbol")
         self.signals.clear_symbol(symbol)
         self.contexts.remove_symbol(symbol)
         self.blocked_symbols.discard(symbol)
@@ -1367,6 +1643,9 @@ class StrategyRuntimeState:
         *,
         max_signal_age_seconds: int,
     ) -> dict[str, int]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.prune")
         if max_signal_age_seconds <= 0:
             raise StrategyStateError("max_signal_age_seconds must be > 0")
 
@@ -1391,6 +1670,9 @@ class StrategyRuntimeState:
         }
 
     def reset(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.reset")
         self.signals.clear()
         self.contexts.clear()
         self.cooldowns.clear()
@@ -1401,6 +1683,9 @@ class StrategyRuntimeState:
         self.touch()
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRuntimeState.summary")
         return {
             "signals": self.signals.summary(),
             "contexts": self.contexts.summary(),

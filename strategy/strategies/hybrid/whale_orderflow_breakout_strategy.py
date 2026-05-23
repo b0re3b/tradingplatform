@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/whale_orderflow_breakout_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,6 +58,7 @@ class WhaleOrderflowBreakoutPayload:
     - whale buy activity/pressure + buy orderflow continuation -> LONG;
     - whale sell activity/pressure + sell orderflow continuation -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleOrderflowBreakoutPayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -84,6 +86,7 @@ class WhaleOrderflowBreakoutStrategyConfig(HybridStrategyConfig):
     - optional price action confirms breakout / breakdown;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleOrderflowBreakoutStrategyConfig")
 
     min_whale_orderflow_score: float = 0.64
     min_whale_orderflow_confidence: float = 0.58
@@ -170,6 +173,9 @@ class WhaleOrderflowBreakoutStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -277,6 +283,7 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
     SignalProcessor owns global routing, confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleOrderflowBreakoutStrategy")
 
     component_namespace = "strategy.hybrid.whale_orderflow_breakout"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -292,6 +299,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         hybrid_config: WhaleOrderflowBreakoutStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy.__init__")
         resolved_hybrid_config = (
             hybrid_config or WhaleOrderflowBreakoutStrategyConfig()
         )
@@ -312,10 +322,16 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy.strategy_name")
         return "whale_orderflow_breakout"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -358,6 +374,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.wo_config.required_hybrid_features)
 
@@ -365,6 +384,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -484,6 +506,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._enabled_sources")
         sources: list[FeatureSource] = [
             FeatureSource.WHALES,
             FeatureSource.ORDERFLOW,
@@ -495,6 +520,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.wo_config.require_whales:
@@ -509,6 +537,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._vote_weights")
         return {
             FeatureSource.WHALES: self.wo_config.whales_vote_weight,
             FeatureSource.ORDERFLOW: self.wo_config.orderflow_vote_weight,
@@ -527,6 +558,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> WhaleOrderflowBreakoutPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._extract_payload")
         payloads = snapshot.payloads()
 
         whales = payloads.get(FeatureSource.WHALES, {})
@@ -594,6 +628,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         )
 
     def _extract_whale_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._extract_whale_side")
         for path in (
             "whale_side",
             "activity_side",
@@ -614,6 +651,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_orderflow_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._extract_orderflow_side")
         for path in (
             "continuation_side",
             "delta_side",
@@ -633,6 +673,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_breakout_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._extract_breakout_side")
         for path in (
             "breakout_side",
             "breakdown_side",
@@ -658,6 +701,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         self,
         payload: WhaleOrderflowBreakoutPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._passes_whale_orderflow_filters")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -727,6 +773,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: WhaleOrderflowBreakoutPayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -866,6 +915,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         self,
         whales: dict[str, Any],
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._large_trade_score")
         candidates = [
             get_path(whales, "large_trade_score"),
             get_path(whales, "large_trade.zscore_score"),
@@ -885,6 +937,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         self,
         whales: dict[str, Any],
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._whale_pressure_score")
         candidates = [
             get_path(whales, "pressure_score"),
             get_path(whales, "whale_pressure_score"),
@@ -909,6 +964,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         self,
         payload: WhaleOrderflowBreakoutPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._source_features")
         features = [
             *whale_orderflow_breakout_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -928,6 +986,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         self,
         payload: WhaleOrderflowBreakoutPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._tags")
         tags = [
             self.wo_config.tag_hybrid,
             self.wo_config.tag_whale_orderflow,
@@ -961,6 +1022,9 @@ class WhaleOrderflowBreakoutStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleOrderflowBreakoutStrategy._execution_hints")
         return {
             "entry_offset_bps": self.wo_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.wo_config.execution_stop_buffer_bps_hint,

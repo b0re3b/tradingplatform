@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/open_interest/oi_capitulation_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -76,6 +77,7 @@ class OICapitulationPayload:
     analytics context і будує reversal/risk signal лише коли capitulation має
     достатній directional context.
     """
+    _logger = logging.getLogger(__name__ + ".OICapitulationPayload")
 
     regime: OIRegimeResult | None = None
     anomaly: OIAnomalyResult | None = None
@@ -88,10 +90,16 @@ class OICapitulationPayload:
 
     @property
     def has_capitulation_regime(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationPayload.has_capitulation_regime")
         return self.regime is not None and self.regime.regime is OIRegime.CAPITULATION
 
     @property
     def has_capitulation_anomaly(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationPayload.has_capitulation_anomaly")
         return (
             self.anomaly is not None
             and bool(self.anomaly.detected)
@@ -105,10 +113,16 @@ class OICapitulationPayload:
 
     @property
     def detected(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationPayload.detected")
         return self.has_capitulation_regime or self.has_capitulation_anomaly
 
     @property
     def confidence(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationPayload.confidence")
         values: list[float] = []
 
         if self.regime is not None:
@@ -127,6 +141,9 @@ class OICapitulationPayload:
 
     @property
     def score(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationPayload.score")
         values: list[float] = []
 
         if self.regime is not None:
@@ -155,6 +172,7 @@ class OICapitulationStrategyConfig(OpenInterestStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".OICapitulationStrategyConfig")
 
     require_detected_context: bool = True
     require_actionable_side: bool = True
@@ -215,6 +233,9 @@ class OICapitulationStrategyConfig(OpenInterestStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategyConfig.validate")
         OpenInterestStrategyConfig.validate(self)
 
         unit_fields = {
@@ -306,6 +327,7 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".OICapitulationStrategy")
 
     component_namespace = "strategy.open_interest.capitulation"
     category: StrategyCategory = StrategyCategory.OPEN_INTEREST
@@ -333,6 +355,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         open_interest_config: OICapitulationStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy.__init__")
         resolved_open_interest_config = (
             open_interest_config or OICapitulationStrategyConfig()
         )
@@ -353,10 +378,16 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy.strategy_name")
         return "oi_capitulation"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.OPEN_INTEREST,
@@ -411,6 +442,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.capitulation_config.required_open_interest_features
@@ -420,6 +454,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_open_interest_data(
@@ -632,6 +669,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> OICapitulationPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._extract_payload")
         regime = self.extract_oi_regime_result(context)
         anomaly = self.extract_oi_anomaly_result(context)
         features = self.extract_oi_features(context)
@@ -668,6 +708,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         )
 
     def _event_time(self, payload: OICapitulationPayload) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._event_time")
         if payload.anomaly is not None:
             anomaly_time = extract_event_time(payload.anomaly)
             if anomaly_time is not None:
@@ -685,6 +728,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _passes_capitulation_thresholds(self, payload: OICapitulationPayload) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._passes_capitulation_thresholds")
         if not payload.detected:
             return False
 
@@ -725,6 +771,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         - downside OI flush / long liquidation pressure -> LONG;
         - upside squeeze exhaustion / short liquidation pressure -> SHORT.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._map_capitulation_to_side")
         features = payload.features
 
         if features is not None:
@@ -756,6 +805,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         self,
         payload: OICapitulationPayload,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._side_from_capitulation_anomaly")
         anomaly = payload.anomaly
         if anomaly is None:
             return SignalSide.UNKNOWN
@@ -779,6 +831,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         self,
         divergence: OIDivergenceResult,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._side_from_divergence")
         hint = divergence_side_hint(divergence.divergence_type)
 
         if hint == "bullish":
@@ -793,6 +848,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         self,
         payload: OICapitulationPayload,
     ) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._map_setup_type")
         if payload.has_capitulation_regime or payload.has_capitulation_anomaly:
             return SetupType.REVERSAL
 
@@ -811,6 +869,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._block_reason")
         if self.capitulation_config.require_features_for_direction and payload.features is None:
             return "capitulation_requires_features_for_direction"
 
@@ -838,6 +899,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._features_support_reversal_side")
         features = payload.features
         if features is None:
             return False
@@ -881,6 +945,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         side: SignalSide,
         event_time: Any,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._build_score_breakdown")
         capitulation_score = unit_score(payload.score)
         features_score = self._feature_context_score(payload=payload, side=side)
         divergence_score = self._divergence_context_score(payload=payload, side=side)
@@ -985,6 +1052,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._feature_context_score")
         features = payload.features
         if features is None:
             return 0.0
@@ -1034,6 +1104,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._divergence_context_score")
         divergence = payload.divergence
         if divergence is None or not divergence.detected:
             return 0.0
@@ -1058,6 +1131,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._feature_score_adjustment")
         features = payload.features
         if features is None:
             return 0.0
@@ -1110,6 +1186,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._feature_confidence_adjustment")
         features = payload.features
         if features is None:
             return 0.0
@@ -1147,6 +1226,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._divergence_score_adjustment")
         divergence = payload.divergence
         if (
             divergence is None
@@ -1186,6 +1268,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, payload: OICapitulationPayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._source_features")
         features: list[str] = []
 
         if payload.regime is not None:
@@ -1237,6 +1322,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
         payload: OICapitulationPayload,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._tags")
         tags = [
             self.capitulation_config.tag_open_interest,
             self.capitulation_config.tag_oi_capitulation,
@@ -1268,6 +1356,9 @@ class OICapitulationStrategy(OpenInterestTradingStrategy):
 
     @staticmethod
     def _anomaly_strength(payload: OICapitulationPayload) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".OICapitulationStrategy._anomaly_strength")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OICapitulationStrategy._anomaly_strength")
         if payload.anomaly is None:
             return None
 

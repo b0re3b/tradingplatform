@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/open_interest/oi_breakout_confirmation_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -77,6 +78,7 @@ class OIBreakoutConfirmationPayload:
     breakout / continuation context через open interest, volume, pressure,
     aggressive flow, funding, liquidations, divergence і anomaly context.
     """
+    _logger = logging.getLogger(__name__ + ".OIBreakoutConfirmationPayload")
 
     regime: OIRegimeResult
     features: OIFeatures | None = None
@@ -90,28 +92,46 @@ class OIBreakoutConfirmationPayload:
 
     @property
     def oi_regime(self) -> OIRegime:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationPayload.oi_regime")
         return self.regime.regime
 
     @property
     def regime_confidence(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationPayload.regime_confidence")
         return unit_score(getattr(self.regime, "confidence", 0.0))
 
     @property
     def regime_score(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationPayload.regime_score")
         return unit_score(getattr(self.regime, "score", self.regime_confidence))
 
     @property
     def divergence_type(self) -> OIDivergenceType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationPayload.divergence_type")
         if self.divergence is None:
             return OIDivergenceType.NONE
         return self.divergence.divergence_type
 
     @property
     def divergence_detected(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationPayload.divergence_detected")
         return self.divergence is not None and bool(self.divergence.detected)
 
     @property
     def anomaly_detected(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationPayload.anomaly_detected")
         return self.anomaly is not None and bool(self.anomaly.detected)
 
 
@@ -128,6 +148,7 @@ class OIBreakoutConfirmationStrategyConfig(OpenInterestStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".OIBreakoutConfirmationStrategyConfig")
 
     require_regime_result: bool = True
     require_features: bool = False
@@ -192,6 +213,9 @@ class OIBreakoutConfirmationStrategyConfig(OpenInterestStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategyConfig.validate")
         OpenInterestStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -304,6 +328,7 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".OIBreakoutConfirmationStrategy")
 
     component_namespace = "strategy.open_interest.breakout_confirmation"
     category: StrategyCategory = StrategyCategory.OPEN_INTEREST
@@ -347,6 +372,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         open_interest_config: OIBreakoutConfirmationStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy.__init__")
         resolved_open_interest_config = (
             open_interest_config or OIBreakoutConfirmationStrategyConfig()
         )
@@ -367,10 +395,16 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy.strategy_name")
         return "oi_breakout_confirmation"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.OPEN_INTEREST,
@@ -415,6 +449,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.breakout_config.required_open_interest_features
@@ -424,6 +461,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_open_interest_data(
@@ -628,6 +668,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> OIBreakoutConfirmationPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._extract_payload")
         regime = self.extract_oi_regime_result(context)
         if regime is None:
             return None
@@ -668,6 +711,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         Best-effort extraction для випадку, коли StrategyContextBuilder
         уже передав breakout direction у FeatureSource.OPEN_INTEREST domain.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._extract_explicit_side")
         for key in (
             "side",
             "signal_side",
@@ -701,6 +747,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, payload: OIBreakoutConfirmationPayload) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._infer_side")
         if payload.explicit_side is not SignalSide.UNKNOWN:
             if self._side_supported_by_oi(payload=payload, side=payload.explicit_side):
                 return payload.explicit_side
@@ -737,6 +786,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         self,
         features: OIFeatures | None,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._infer_side_from_features")
         if features is None:
             return SignalSide.UNKNOWN
 
@@ -767,6 +819,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         self,
         features: OIFeatures | None,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._infer_squeeze_side")
         if features is None:
             return SignalSide.UNKNOWN
 
@@ -792,6 +847,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         self,
         payload: OIBreakoutConfirmationPayload,
     ) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._infer_setup_type")
         if payload.oi_regime is OIRegime.SQUEEZE_SETUP:
             return SetupType.SQUEEZE
 
@@ -816,6 +874,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._block_reason")
         anomaly_reason = self._anomaly_block_reason(payload)
         if anomaly_reason is not None:
             return anomaly_reason
@@ -837,6 +898,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         self,
         payload: OIBreakoutConfirmationPayload,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._anomaly_block_reason")
         anomaly = payload.anomaly
         if anomaly is None or not anomaly.detected:
             return None
@@ -863,6 +927,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._divergence_block_reason")
         divergence = payload.divergence
         if divergence is None or not divergence.detected:
             return None
@@ -892,6 +959,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._feature_block_reason")
         features = payload.features
         if features is None:
             return None
@@ -940,6 +1010,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._side_supported_by_oi")
         regime = payload.oi_regime
 
         if side is SignalSide.LONG and regime in self.LONG_CONFIRMATION_REGIMES:
@@ -961,6 +1034,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         return False
 
     def _positive_breakout_support(self, features: OIFeatures) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._positive_breakout_support")
         volume_ratio = get_attr_or_key(features, "volume_ratio")
         oi_delta = extract_oi_delta_pct(features)
         price_delta = extract_price_delta_pct(features)
@@ -979,6 +1055,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         )
 
     def _negative_breakout_support(self, features: OIFeatures) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._negative_breakout_support")
         volume_ratio = get_attr_or_key(features, "volume_ratio")
         oi_delta = extract_oi_delta_pct(features)
         price_delta = extract_price_delta_pct(features)
@@ -1008,6 +1087,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         side: SignalSide,
         event_time: Any,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._build_score_breakdown")
         base_score = (
             payload.regime_score
             if payload.regime_score > 0
@@ -1158,6 +1240,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._feature_context_score")
         features = payload.features
         if features is None:
             return 0.0
@@ -1209,6 +1294,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._divergence_context_score")
         divergence = payload.divergence
         if divergence is None or not divergence.detected:
             return 0.0
@@ -1233,6 +1321,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         features: OIFeatures | None,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._feature_score_adjustment")
         if features is None:
             return 0.0
 
@@ -1288,6 +1379,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         features: OIFeatures | None,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._feature_confidence_adjustment")
         if features is None:
             return 0.0
 
@@ -1334,6 +1428,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, payload: OIBreakoutConfirmationPayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._source_features")
         features = [
             OPEN_INTEREST_FEATURES.REGIME,
             OPEN_INTEREST_FEATURES.REGIME_TYPE,
@@ -1378,6 +1475,9 @@ class OIBreakoutConfirmationStrategy(OpenInterestTradingStrategy):
         payload: OIBreakoutConfirmationPayload,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIBreakoutConfirmationStrategy._tags")
         tags = [
             self.breakout_config.tag_open_interest,
             self.breakout_config.tag_oi_breakout,

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/price_action/market_structure_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -70,6 +71,7 @@ class SwingContext:
     This is strategy-layer DTO only. Analytics models remain in
     analytics.price_action.
     """
+    _logger = logging.getLogger(__name__ + ".SwingContext")
 
     swing_type: SwingType | None = None
     price: float | None = None
@@ -80,6 +82,9 @@ class SwingContext:
 
     @classmethod
     def from_payload(cls, payload: Any) -> SwingContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SwingContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SwingContext.from_payload")
         if payload is None:
             return None
 
@@ -129,6 +134,7 @@ class StructureEventContext:
     """
     Normalized BOS/CHOCH/MSS event context.
     """
+    _logger = logging.getLogger(__name__ + ".StructureEventContext")
 
     event_type: StructureEventType | None = None
     side: SignalSide = SignalSide.UNKNOWN
@@ -156,6 +162,9 @@ class StructureEventContext:
         reverse_on_choch: bool = True,
         reverse_on_mss: bool = True,
     ) -> StructureEventContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".StructureEventContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StructureEventContext.from_payload")
         if payload is None:
             return None
 
@@ -257,6 +266,7 @@ class MarketStructureContextView:
     """
     Normalized view consumed by MarketStructureStrategy.
     """
+    _logger = logging.getLogger(__name__ + ".MarketStructureContextView")
 
     module: dict[str, Any]
     primary_layer: dict[str, Any]
@@ -296,6 +306,7 @@ class MarketStructureStrategyConfig(PriceActionStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".MarketStructureStrategyConfig")
 
     prefer_external_layer: bool = True
 
@@ -356,6 +367,9 @@ class MarketStructureStrategyConfig(PriceActionStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategyConfig.validate")
         PriceActionStrategyConfig.validate(self)
 
         unit_fields = {
@@ -442,6 +456,7 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".MarketStructureStrategy")
 
     component_namespace = "strategy.price_action.market_structure"
     category: StrategyCategory = StrategyCategory.PRICE_ACTION
@@ -457,6 +472,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         price_action_config: MarketStructureStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy.__init__")
         resolved_price_action_config = (
             price_action_config or MarketStructureStrategyConfig()
         )
@@ -477,10 +495,16 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy.strategy_name")
         return "market_structure"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.PRICE_ACTION,
@@ -524,6 +548,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.structure_config.required_price_action_features
@@ -533,6 +560,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_price_action_data(
@@ -727,6 +757,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> MarketStructureContextView | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._extract_view")
         module = self.resolve_price_action_module(
             context,
             "market_structure",
@@ -845,6 +878,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         *,
         fallback: StructureLayer,
     ) -> StructureLayer:
+        _strategy_logger = logging.getLogger(__name__ + ".MarketStructureStrategy._extract_layer_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._extract_layer_name")
         return (
             parse_structure_layer(
                 get_path(layer, "layer")
@@ -861,6 +897,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         primary: dict[str, Any],
         event: StructureEventContext | None,
     ) -> list[str]:
+        _strategy_logger = logging.getLogger(__name__ + ".MarketStructureStrategy._extract_reasons")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._extract_reasons")
         reasons: list[str] = []
 
         for value in (
@@ -884,6 +923,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, view: MarketStructureContextView) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._infer_side")
         event = view.last_event
 
         if event is not None:
@@ -910,6 +952,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         self,
         view: MarketStructureContextView,
     ) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._infer_setup_type")
         event = view.last_event
         if event is None or event.event_type is None:
             return SetupType.CONTINUATION
@@ -931,6 +976,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._passes_filters")
         if self.structure_config.require_break_event and view.last_event is None:
             if not self.structure_config.allow_bias_continuation_fallback:
                 return False
@@ -990,6 +1038,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._build_score_breakdown")
         event_component = self._event_component(view)
         layer_component = average_score(view.layer_confidence, view.layer_strength)
         alignment_component = view.mtf_alignment_score
@@ -1091,6 +1142,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         ).normalize()
 
     def _event_component(self, view: MarketStructureContextView) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._event_component")
         event = view.last_event
         if event is None:
             return average_score(view.layer_confidence, view.layer_strength)
@@ -1114,6 +1168,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         )
 
     def _swing_component(self, view: MarketStructureContextView) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._swing_component")
         swing_scores = []
 
         if view.last_swing_high is not None:
@@ -1127,6 +1184,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         return average_score(*swing_scores)
 
     def _swing_bonus(self, view: MarketStructureContextView) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._swing_bonus")
         if self._swing_component(view) >= self.structure_config.min_swing_strength:
             return self.structure_config.swing_strength_bonus
 
@@ -1137,6 +1197,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, view: MarketStructureContextView) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._source_features")
         features = [
             *market_structure_source_features(),
             PRICE_ACTION_FEATURES.MARKET_STRUCTURE,
@@ -1154,6 +1217,9 @@ class MarketStructureStrategy(PriceActionTradingStrategy):
         view: MarketStructureContextView,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketStructureStrategy._tags")
         tags = [
             self.structure_config.tag_price_action,
             self.structure_config.tag_market_structure,

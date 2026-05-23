@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/orderflow/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
@@ -92,6 +93,7 @@ class OrderflowFeatureNames:
     names from analytics.orderflow.* payloads, while strategies can also read
     equivalent values from FeatureSource.ORDERFLOW domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowFeatureNames")
 
     COMPOSITE: str = "orderflow.composite"
 
@@ -138,6 +140,9 @@ class OrderflowFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".OrderflowFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -162,6 +167,7 @@ class OrderflowStrategyScope:
 
     Concrete strategies still make decisions from StrategyContext.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowStrategyScope")
 
     exchange: str
     market_type: str
@@ -170,6 +176,9 @@ class OrderflowStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowStrategyScope.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -191,13 +200,22 @@ class OrderflowStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowStrategyScope.key")
         return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange}"
 
     def to_dict(self) -> dict[str, str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -223,6 +241,7 @@ class OrderflowStrategyConfig:
     StrategyDefinitionConfig. This config keeps orderflow-specific defaults and
     quality thresholds.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowStrategyConfig")
 
     default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
     default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
@@ -267,6 +286,9 @@ class OrderflowStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowStrategyConfig.validate")
         bounded = {
             "min_context_confidence": self.min_context_confidence,
             "min_signal_confidence": self.min_signal_confidence,
@@ -337,6 +359,7 @@ class OrderflowCompositeSnapshot:
     Canonical futures scope:
         exchange + market_type + symbol + timeframe
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowCompositeSnapshot")
 
     exchange: str
     market_type: str
@@ -416,6 +439,9 @@ class OrderflowCompositeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -520,6 +546,9 @@ class OrderflowCompositeSnapshot:
 
     @property
     def scope(self) -> OrderflowStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.scope")
         return OrderflowStrategyScope(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -530,10 +559,16 @@ class OrderflowCompositeSnapshot:
 
     @property
     def scope_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.scope_key")
         return self.scope.key
 
     @property
     def aggressive_large_trade_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.aggressive_large_trade_count")
         return self.large_buy_trades + self.large_sell_trades
 
     @property
@@ -544,10 +579,16 @@ class OrderflowCompositeSnapshot:
         Prefer this over raw orderbook_imbalance_ratio because analytics can
         configure ratio as either 0..1 or -1..1.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.signed_orderbook_imbalance")
         return self.orderbook_imbalance_diff
 
     @property
     def has_orderbook(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.has_orderbook")
         return (
             self.orderbook_bid_volume > 0.0
             or self.orderbook_ask_volume > 0.0
@@ -558,6 +599,9 @@ class OrderflowCompositeSnapshot:
 
     @property
     def has_aggressive_flow(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.has_aggressive_flow")
         return (
             self.aggressive_buy_count > 0
             or self.aggressive_sell_count > 0
@@ -568,6 +612,9 @@ class OrderflowCompositeSnapshot:
         )
 
     def has_minimum_data(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.has_minimum_data")
         return (
             self.trades_count > 0
             or self.total_volume > 0.0
@@ -577,6 +624,9 @@ class OrderflowCompositeSnapshot:
         )
 
     def directional_large_trades(self, side: SignalSide | str) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.directional_large_trades")
         normalized = (
             side.value if isinstance(side, SignalSide) else str(side)
         ).strip().lower()
@@ -590,6 +640,9 @@ class OrderflowCompositeSnapshot:
         return 0
 
     def directional_aggressive_ratio(self, side: SignalSide | str) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.directional_aggressive_ratio")
         normalized = (
             side.value if isinstance(side, SignalSide) else str(side)
         ).strip().lower()
@@ -606,6 +659,9 @@ class OrderflowCompositeSnapshot:
         self,
         side: SignalSide | str,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.directional_aggressive_notional_delta")
         normalized = (
             side.value if isinstance(side, SignalSide) else str(side)
         ).strip().lower()
@@ -619,6 +675,9 @@ class OrderflowCompositeSnapshot:
         return 0.0
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowCompositeSnapshot.to_dict")
         payload = asdict(self)
         payload["timestamp"] = (
             self.timestamp.isoformat() if self.timestamp is not None else None
@@ -657,6 +716,7 @@ class OrderflowTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".OrderflowTradingStrategy")
 
     component_namespace = "strategy.orderflow"
     category: StrategyCategory = StrategyCategory.ORDERFLOW
@@ -675,6 +735,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         orderflow_config: OrderflowStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.__init__")
         self.orderflow_config = orderflow_config or OrderflowStrategyConfig()
         self.orderflow_config.validate()
 
@@ -687,6 +750,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.validate_config")
         super().validate_config()
         self.orderflow_config.validate()
 
@@ -695,6 +761,9 @@ class OrderflowTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def orderflow_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_domain")
         self.validate_context(context)
         return orderflow_domain(context)
 
@@ -704,6 +773,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_item")
         self.validate_context(context)
         return orderflow_item(context, key, default)
 
@@ -713,6 +785,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -727,6 +802,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_float")
         return to_float(self.orderflow_path(context, path, default), default)
 
     def orderflow_int(
@@ -736,6 +814,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: int | None = None,
     ) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_int")
         return to_int(self.orderflow_path(context, path, default), default)
 
     def orderflow_score(
@@ -745,6 +826,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_score")
         return unit_score(self.orderflow_path(context, path, default), default)
 
     def orderflow_signed_score(
@@ -754,6 +838,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_signed_score")
         value = self.orderflow_float(context, path, default=default)
         return clamp(float(value if value is not None else default), -1.0, 1.0)
 
@@ -764,6 +851,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_bool")
         return to_bool(self.orderflow_path(context, path, default), default)
 
     def orderflow_str(
@@ -773,6 +863,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_str")
         return to_str(self.orderflow_path(context, path, default), default)
 
     def orderflow_datetime(
@@ -782,6 +875,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_datetime")
         return parse_datetime(self.orderflow_path(context, path, default))
 
     def orderflow_feature_snapshot(
@@ -795,6 +891,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         Best-effort helper because StrategyContext may store raw values or
         FeatureSnapshot objects depending on normalization.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -813,6 +912,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_feature_age_seconds")
         snapshot = self.orderflow_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -823,6 +925,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_feature_is_stale")
         max_age = self.orderflow_config.stale_feature_max_age_seconds
         if max_age is None:
             return False
@@ -838,6 +943,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.has_any_orderflow_data")
         self.validate_context(context)
 
         if self.orderflow_domain(context):
@@ -850,6 +958,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.has_stale_orderflow_features")
         names = feature_names or tuple(self.required_features())
 
         return any(
@@ -862,6 +973,9 @@ class OrderflowTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def orderflow_scope(self, context: StrategyContext) -> OrderflowStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_scope")
         domain = self.orderflow_domain(context)
 
         exchange = (
@@ -911,6 +1025,9 @@ class OrderflowTradingStrategy(TradingStrategy):
             domain metrics: cvd, volume_delta, aggressive_trades,
             orderbook_imbalance.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.resolve_orderflow_snapshot")
         self.validate_context(context)
 
         scope = self.orderflow_scope(context)
@@ -949,6 +1066,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         CVD divergence strategy can use this directly, but most orderflow
         strategies should prefer resolve_orderflow_snapshot().
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.resolve_cvd_payload")
         self.validate_context(context)
 
         cvd = self.orderflow_item(context, "cvd")
@@ -969,6 +1089,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         scope: OrderflowStrategyScope,
         source: str,
     ) -> OrderflowCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy._coerce_composite_snapshot")
         if isinstance(value, OrderflowCompositeSnapshot):
             return value
 
@@ -989,6 +1112,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: OrderflowStrategyScope,
     ) -> OrderflowCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy._build_composite_snapshot_from_domain")
         domain = self.orderflow_domain(context)
 
         cvd = self.orderflow_item(context, "cvd")
@@ -1020,6 +1146,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: OrderflowStrategyScope,
     ) -> OrderflowCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy._build_composite_snapshot_from_features")
         feature_payload = {
             "price_change_pct": self._feature_value(
                 context,
@@ -1145,6 +1274,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         scope: OrderflowStrategyScope,
         source: str,
     ) -> OrderflowCompositeSnapshot:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy._snapshot_from_mapping")
         cvd = get_path(data, "cvd", {}) or {}
         volume_delta = get_path(data, "volume_delta", {}) or {}
         aggressive = get_path(data, "aggressive_trades", {}) or {}
@@ -1361,6 +1493,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         Final risk-ready payload conversion belongs to SignalProcessor /
         SignalBuilder, not to this domain strategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.build_orderflow_signal")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: orderflow signal side must be LONG or SHORT"
@@ -1464,6 +1599,9 @@ class OrderflowTradingStrategy(TradingStrategy):
         """
         Compact serialized orderflow context for StrategySignal.metadata.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy.orderflow_context_metadata")
         metadata: dict[str, Any] = {}
 
         snapshot = self.resolve_orderflow_snapshot(context)
@@ -1522,6 +1660,9 @@ class OrderflowTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".OrderflowTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy._feature_value")
         if not isinstance(feature_name, str) or not feature_name.strip():
             return None
 
@@ -1537,6 +1678,9 @@ class OrderflowTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _has_any_value(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".OrderflowTradingStrategy._has_any_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OrderflowTradingStrategy._has_any_value")
         if value is None:
             return False
 

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/whales/whale_distribution_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,6 +58,7 @@ class WhaleDistributionPayload:
     Direction convention:
     - sell-side distribution -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleDistributionPayload")
 
     snapshot: WhaleCompositeSnapshot
     side: SignalSide
@@ -79,6 +81,7 @@ class WhaleDistributionStrategyConfig(WhalesStrategyConfig):
     - exhaustion probability не надто висока;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleDistributionStrategyConfig")
 
     min_distribution_score: float = 0.62
     min_distribution_confidence: float = 0.56
@@ -155,6 +158,9 @@ class WhaleDistributionStrategyConfig(WhalesStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategyConfig.validate")
         WhalesStrategyConfig.validate(self)
 
         unit_fields = {
@@ -259,6 +265,7 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleDistributionStrategy")
 
     component_namespace = "strategy.whales.distribution"
     category: StrategyCategory = StrategyCategory.WHALES
@@ -274,6 +281,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         whales_config: WhaleDistributionStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy.__init__")
         resolved_whales_config = whales_config or WhaleDistributionStrategyConfig()
         resolved_whales_config.validate()
 
@@ -292,10 +302,16 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy.strategy_name")
         return "whale_distribution"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.WHALES,
@@ -337,6 +353,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.distribution_config.required_whales_features
@@ -346,6 +365,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_whales_data(
@@ -470,6 +492,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> WhaleDistributionPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._extract_payload")
         snapshot = self.resolve_whale_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -513,6 +538,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         self,
         snapshot: WhaleCompositeSnapshot,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._resolve_distribution_side")
         for candidate in (
             snapshot.whale_side,
             snapshot.dominant_side,
@@ -543,6 +571,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
     # ------------------------------------------------------------------
 
     def _required_inputs(self) -> tuple[str, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._required_inputs")
         required = []
 
         if self.distribution_config.require_activity_confirmation:
@@ -560,6 +591,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleDistributionPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._passes_distribution_filters")
         snapshot = payload.snapshot
 
         if self.distribution_config.require_sell_side:
@@ -647,6 +681,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         context: StrategyContext,
         payload: WhaleDistributionPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         inputs = snapshot.inputs()
 
@@ -813,6 +850,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleDistributionPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._source_features")
         features = [
             *whale_distribution_source_features(),
             WHALES_FEATURES.ACTIVITY,
@@ -841,6 +881,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleDistributionPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._tags")
         tags = [
             self.distribution_config.tag_whales,
             self.distribution_config.tag_distribution,
@@ -873,6 +916,9 @@ class WhaleDistributionStrategy(WhalesTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleDistributionStrategy._execution_hints")
         return {
             "entry_offset_bps": self.distribution_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.distribution_config.execution_stop_buffer_bps_hint,

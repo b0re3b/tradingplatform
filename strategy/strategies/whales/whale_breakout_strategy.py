@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/whales/whale_breakout_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +60,7 @@ class WhaleBreakoutPayload:
     - buy-side whale pressure/activity/cluster continuation -> LONG;
     - sell-side whale pressure/activity/cluster continuation -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleBreakoutPayload")
 
     snapshot: WhaleCompositeSnapshot
     side: SignalSide
@@ -81,6 +83,7 @@ class WhaleBreakoutStrategyConfig(WhalesStrategyConfig):
     - exhaustion probability is not too high;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleBreakoutStrategyConfig")
 
     min_breakout_score: float = 0.64
     min_breakout_confidence: float = 0.58
@@ -164,6 +167,9 @@ class WhaleBreakoutStrategyConfig(WhalesStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategyConfig.validate")
         WhalesStrategyConfig.validate(self)
 
         unit_fields = {
@@ -273,6 +279,7 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleBreakoutStrategy")
 
     component_namespace = "strategy.whales.breakout"
     category: StrategyCategory = StrategyCategory.WHALES
@@ -288,6 +295,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         whales_config: WhaleBreakoutStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy.__init__")
         resolved_whales_config = whales_config or WhaleBreakoutStrategyConfig()
         resolved_whales_config.validate()
 
@@ -304,10 +314,16 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy.strategy_name")
         return "whale_breakout"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.WHALES,
@@ -350,6 +366,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.breakout_config.required_whales_features
@@ -359,6 +378,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_whales_data(
@@ -487,6 +509,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> WhaleBreakoutPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._extract_payload")
         snapshot = self.resolve_whale_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -530,6 +555,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         self,
         snapshot: WhaleCompositeSnapshot,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._resolve_breakout_side")
         for candidate in (
             snapshot.dominant_side,
             snapshot.whale_side,
@@ -560,6 +588,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
     # ------------------------------------------------------------------
 
     def _required_inputs(self) -> tuple[str, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._required_inputs")
         required = []
 
         if self.breakout_config.require_activity_confirmation:
@@ -580,6 +611,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleBreakoutPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._passes_breakout_filters")
         snapshot = payload.snapshot
 
         if self.breakout_config.require_activity_confirmation:
@@ -686,6 +720,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         context: StrategyContext,
         payload: WhaleBreakoutPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         inputs = snapshot.inputs()
 
@@ -871,6 +908,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleBreakoutPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._source_features")
         features = [
             *whale_breakout_source_features(),
             WHALES_FEATURES.ACTIVITY,
@@ -902,6 +942,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleBreakoutPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._tags")
         tags = [
             self.breakout_config.tag_whales,
             self.breakout_config.tag_breakout,
@@ -937,6 +980,9 @@ class WhaleBreakoutStrategy(WhalesTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleBreakoutStrategy._execution_hints")
         return {
             "entry_offset_bps": self.breakout_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.breakout_config.execution_stop_buffer_bps_hint,

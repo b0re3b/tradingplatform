@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/price_action/fvg_reaction_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -71,6 +72,7 @@ class FVGContext:
     This DTO belongs to strategy layer only. Analytics models remain in
     analytics.price_action.
     """
+    _logger = logging.getLogger(__name__ + ".FVGContext")
 
     direction: FVGDirection | None = None
     status: FVGStatus | None = None
@@ -106,6 +108,9 @@ class FVGContext:
         *,
         fallback_layer: StructureLayer | None = None,
     ) -> FVGContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".FVGContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGContext.from_payload")
         if payload is None:
             return None
 
@@ -251,6 +256,7 @@ class FVGEventContext:
     """
     Normalized last FVG lifecycle event.
     """
+    _logger = logging.getLogger(__name__ + ".FVGEventContext")
 
     event_type: FVGEventType | None = None
     direction: FVGDirection | None = None
@@ -275,6 +281,9 @@ class FVGEventContext:
         *,
         fallback_layer: StructureLayer | None = None,
     ) -> FVGEventContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".FVGEventContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGEventContext.from_payload")
         if payload is None:
             return None
 
@@ -369,6 +378,7 @@ class FVGReactionContext:
     """
     Normalized FVG reaction view consumed by FVGReactionStrategy.
     """
+    _logger = logging.getLogger(__name__ + ".FVGReactionContext")
 
     module: dict[str, Any]
     primary_layer: dict[str, Any]
@@ -404,6 +414,7 @@ class FVGReactionStrategyConfig(PriceActionStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".FVGReactionStrategyConfig")
 
     prefer_external_layer: bool = True
 
@@ -464,6 +475,9 @@ class FVGReactionStrategyConfig(PriceActionStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategyConfig.validate")
         PriceActionStrategyConfig.validate(self)
 
         unit_fields = {
@@ -549,6 +563,7 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".FVGReactionStrategy")
 
     component_namespace = "strategy.price_action.fvg_reaction"
     category: StrategyCategory = StrategyCategory.PRICE_ACTION
@@ -564,6 +579,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         price_action_config: FVGReactionStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy.__init__")
         resolved_price_action_config = (
             price_action_config or FVGReactionStrategyConfig()
         )
@@ -582,10 +600,16 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy.strategy_name")
         return "fvg_reaction"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.PRICE_ACTION,
@@ -626,6 +650,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.fvg_config.required_price_action_features
@@ -635,6 +662,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_price_action_data(
@@ -835,6 +865,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> FVGReactionContext | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._extract_view")
         module = self.resolve_price_action_module(
             context,
             "fair_value_gap",
@@ -928,6 +961,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         last_event: FVGEventContext | None,
         fallback_layer: StructureLayer | None,
     ) -> FVGContext | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._select_reaction_gap")
         candidates: list[Any] = []
 
         if last_event is not None:
@@ -983,6 +1019,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         *,
         fallback: StructureLayer,
     ) -> StructureLayer:
+        _strategy_logger = logging.getLogger(__name__ + ".FVGReactionStrategy._extract_layer_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._extract_layer_name")
         return (
             parse_structure_layer(
                 get_path(layer, "layer")
@@ -999,6 +1038,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         primary: dict[str, Any],
         event: FVGEventContext | None,
     ) -> list[str]:
+        _strategy_logger = logging.getLogger(__name__ + ".FVGReactionStrategy._extract_reasons")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._extract_reasons")
         reasons: list[str] = []
 
         for value in (
@@ -1022,6 +1064,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, view: FVGReactionContext) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._infer_side")
         gap = view.reaction_gap
         if gap is None:
             return SignalSide.UNKNOWN
@@ -1037,6 +1082,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         self,
         view: FVGReactionContext,
     ) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._infer_setup_type")
         event = view.last_event
         gap = view.reaction_gap
 
@@ -1073,6 +1121,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._passes_filters")
         gap = view.reaction_gap
         if gap is None:
             return False
@@ -1160,6 +1211,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._build_score_breakdown")
         gap = view.reaction_gap
         event = view.last_event
 
@@ -1266,6 +1320,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         ).normalize()
 
     def _event_component(self, event: FVGEventContext | None) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._event_component")
         if event is None:
             return 0.0
 
@@ -1288,6 +1345,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         )
 
     def _proximity_score(self, gap: FVGContext) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._proximity_score")
         mid_score = distance_score(
             gap.distance_to_mid_pct,
             max_distance_pct=max(self.fvg_config.max_distance_to_mid_pct, 0.0001),
@@ -1299,6 +1359,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         return max(mid_score, edge_score)
 
     def _fill_quality_score(self, gap: FVGContext) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._fill_quality_score")
         if gap.fill_pct <= 0:
             return 0.0
 
@@ -1315,6 +1378,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, view: FVGReactionContext) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._source_features")
         features = [
             *fvg_source_features(),
             PRICE_ACTION_FEATURES.FAIR_VALUE_GAP,
@@ -1334,6 +1400,9 @@ class FVGReactionStrategy(PriceActionTradingStrategy):
         view: FVGReactionContext,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FVGReactionStrategy._tags")
         tags = [
             self.fvg_config.tag_price_action,
             self.fvg_config.tag_fvg,

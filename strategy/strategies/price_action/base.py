@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/price_action/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -72,6 +73,7 @@ class PriceActionFeatureNames:
     analytics.price_action.* payloads. Concrete strategies may also read
     equivalent values from FeatureSource.PRICE_ACTION domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".PriceActionFeatureNames")
 
     COMPOSITE: str = "price_action.composite"
 
@@ -130,6 +132,9 @@ class PriceActionFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".PriceActionFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -154,6 +159,7 @@ class PriceActionStrategyScope:
 
     Concrete strategies still make decisions from StrategyContext.
     """
+    _logger = logging.getLogger(__name__ + ".PriceActionStrategyScope")
 
     exchange: str
     market_type: str
@@ -162,6 +168,9 @@ class PriceActionStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionStrategyScope.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -183,13 +192,22 @@ class PriceActionStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionStrategyScope.key")
         return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange}"
 
     def to_dict(self) -> dict[str, str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -215,6 +233,7 @@ class PriceActionStrategyConfig:
     StrategyDefinitionConfig. This config keeps price-action-specific defaults
     and quality thresholds.
     """
+    _logger = logging.getLogger(__name__ + ".PriceActionStrategyConfig")
 
     default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
     default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
@@ -260,6 +279,9 @@ class PriceActionStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionStrategyConfig.validate")
         bounded = {
             "min_context_confidence": self.min_context_confidence,
             "min_signal_confidence": self.min_signal_confidence,
@@ -319,6 +341,7 @@ class PriceActionCompositeSnapshot:
     This is intentionally not an analytics model. It is a strategy-side
     projection that gives concrete price-action strategies one stable contract.
     """
+    _logger = logging.getLogger(__name__ + ".PriceActionCompositeSnapshot")
 
     exchange: str
     market_type: str
@@ -342,6 +365,9 @@ class PriceActionCompositeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -376,6 +402,9 @@ class PriceActionCompositeSnapshot:
 
     @property
     def scope(self) -> PriceActionStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.scope")
         return PriceActionStrategyScope(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -386,9 +415,15 @@ class PriceActionCompositeSnapshot:
 
     @property
     def scope_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.scope_key")
         return self.scope.key
 
     def module(self, name: str) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.module")
         normalized = str(name or "").strip().lower()
 
         if normalized in {"market_structure", "structure"}:
@@ -409,9 +444,15 @@ class PriceActionCompositeSnapshot:
         return {}
 
     def has_module(self, name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.has_module")
         return bool(self.module(name))
 
     def last_update(self) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.last_update")
         candidates = [
             self.timestamp,
             extract_last_update(self.market_structure),
@@ -424,6 +465,9 @@ class PriceActionCompositeSnapshot:
         return next((item for item in candidates if item is not None), None)
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionCompositeSnapshot.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -469,6 +513,7 @@ class PriceActionTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".PriceActionTradingStrategy")
 
     component_namespace = "strategy.price_action"
     category: StrategyCategory = StrategyCategory.PRICE_ACTION
@@ -487,6 +532,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         price_action_config: PriceActionStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.__init__")
         self.price_action_config = price_action_config or PriceActionStrategyConfig()
         self.price_action_config.validate()
 
@@ -499,6 +547,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.validate_config")
         super().validate_config()
         self.price_action_config.validate()
 
@@ -515,15 +566,24 @@ class PriceActionTradingStrategy(TradingStrategy):
         price-action strategies safe in deployments where the root BaseStrategy
         patch has not been applied yet.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.remember_no_signal")
         normalized = str(reason or "").strip() or "no_signal_generated"
         self._last_no_signal_reason = normalized
         self._last_no_signal_metadata = dict(metadata)
 
     def clear_no_signal_reason(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.clear_no_signal_reason")
         self._last_no_signal_reason = None
         self._last_no_signal_metadata = {}
 
     def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.consume_no_signal_reason")
         reason = getattr(self, "_last_no_signal_reason", None) or "no_signal_generated"
         metadata = dict(getattr(self, "_last_no_signal_metadata", {}) or {})
         self.clear_no_signal_reason()
@@ -534,6 +594,9 @@ class PriceActionTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def price_action_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_domain")
         self.validate_context(context)
         return price_action_domain(context)
 
@@ -543,6 +606,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_item")
         self.validate_context(context)
         return price_action_item(context, key, default)
 
@@ -552,6 +618,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -566,6 +635,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_float")
         return to_float(self.price_action_path(context, path, default), default)
 
     def price_action_int(
@@ -575,6 +647,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: int | None = None,
     ) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_int")
         return to_int(self.price_action_path(context, path, default), default)
 
     def price_action_score(
@@ -584,6 +659,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_score")
         return unit_score(self.price_action_path(context, path, default), default)
 
     def price_action_signed_score(
@@ -593,6 +671,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_signed_score")
         value = self.price_action_float(context, path, default=default)
         return clamp(float(value if value is not None else default), -1.0, 1.0)
 
@@ -603,6 +684,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_bool")
         return to_bool(self.price_action_path(context, path, default), default)
 
     def price_action_str(
@@ -612,6 +696,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_str")
         return to_str(self.price_action_path(context, path, default), default)
 
     def price_action_datetime(
@@ -621,6 +708,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_datetime")
         return parse_datetime(self.price_action_path(context, path, default))
 
     def price_action_feature_snapshot(
@@ -628,6 +718,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -646,6 +739,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_feature_age_seconds")
         snapshot = self.price_action_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -656,6 +752,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_feature_is_stale")
         max_age = self.price_action_config.stale_feature_max_age_seconds
         if max_age is None:
             return False
@@ -671,6 +770,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.has_any_price_action_data")
         self.validate_context(context)
 
         if self.price_action_domain(context):
@@ -683,6 +785,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.has_stale_price_action_features")
         names = feature_names or tuple(self.required_features())
 
         return any(
@@ -695,6 +800,9 @@ class PriceActionTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def price_action_scope(self, context: StrategyContext) -> PriceActionStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_scope")
         domain = self.price_action_domain(context)
 
         exchange = (
@@ -737,6 +845,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         """
         Resolve normalized price-action composite snapshot from StrategyContext.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.resolve_price_action_snapshot")
         self.validate_context(context)
 
         scope = self.price_action_scope(context)
@@ -774,6 +885,9 @@ class PriceActionTradingStrategy(TradingStrategy):
             fair_value_gap / fvg
             trend
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.resolve_price_action_module")
         self.validate_context(context)
 
         snapshot = self.resolve_price_action_snapshot(context)
@@ -794,6 +908,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         prefer_external_layer: bool | None = None,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.select_primary_layer")
         return select_primary_layer(
             module_payload,
             prefer_external_layer=(
@@ -809,6 +926,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         *,
         prefer_external_layer: bool | None = None,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.select_secondary_layer")
         return select_secondary_layer(
             module_payload,
             prefer_external_layer=(
@@ -819,15 +939,27 @@ class PriceActionTradingStrategy(TradingStrategy):
         )
 
     def layer_confidence(self, layer: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.layer_confidence")
         return layer_confidence(layer)
 
     def layer_strength(self, layer: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.layer_strength")
         return layer_strength(layer)
 
     def last_module_event(self, module_payload: Any) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.last_module_event")
         return extract_last_event(module_payload)
 
     def module_last_update(self, module_payload: Any) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.module_last_update")
         return extract_last_update(module_payload)
 
     # ------------------------------------------------------------------
@@ -857,6 +989,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         Final risk-ready payload conversion belongs to SignalProcessor /
         SignalBuilder, not to this domain strategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.build_price_action_signal")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: price-action signal side must be LONG or SHORT"
@@ -960,6 +1095,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         """
         Compact serialized price-action context for StrategySignal.metadata.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy.price_action_context_metadata")
         metadata: dict[str, Any] = {}
 
         snapshot = self.resolve_price_action_snapshot(context)
@@ -1015,6 +1153,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy._build_state_from_features")
         state = {
             "current_price": self._feature_value(
                 context,
@@ -1132,6 +1273,9 @@ class PriceActionTradingStrategy(TradingStrategy):
         scope: PriceActionStrategyScope,
         source: str,
     ) -> PriceActionCompositeSnapshot:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy._snapshot_from_state")
         market_structure = (
             as_dict(get_path(state, "market_structure"))
             or as_dict(get_path(state, "structure"))
@@ -1198,6 +1342,9 @@ class PriceActionTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".PriceActionTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy._feature_value")
         if not isinstance(feature_name, str) or not feature_name.strip():
             return None
 
@@ -1213,6 +1360,9 @@ class PriceActionTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _has_any_value(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".PriceActionTradingStrategy._has_any_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PriceActionTradingStrategy._has_any_value")
         if value is None:
             return False
 

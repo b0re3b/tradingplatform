@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidity/liquidity_sweep_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from typing import Any
@@ -65,6 +66,7 @@ class LiquiditySweepStrategyConfig(LiquidityStrategyConfig):
     - use only non-terminal liquidity targets;
     - return internal StrategySignal and leave risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".LiquiditySweepStrategyConfig")
 
     edge_threshold: float = 0.45
     edge_delta_threshold: float = 0.12
@@ -109,6 +111,9 @@ class LiquiditySweepStrategyConfig(LiquidityStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategyConfig.validate")
         LiquidityStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -206,6 +211,7 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, confluence, filtering, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".LiquiditySweepStrategy")
 
     component_namespace = "strategy.liquidity.sweep"
     category: StrategyCategory = StrategyCategory.LIQUIDITY
@@ -221,6 +227,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         liquidity_config: LiquiditySweepStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy.__init__")
         resolved_liquidity_config = liquidity_config or LiquiditySweepStrategyConfig()
         resolved_liquidity_config.validate()
 
@@ -237,9 +246,15 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy.strategy_name")
         return "liquidity_sweep_strategy"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.sweep_config.required_liquidity_features)
 
@@ -247,6 +262,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
@@ -449,6 +467,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[FilterResult]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._run_pre_filters")
         results = self.run_common_pre_filters(
             context=context,
             snapshot=snapshot,
@@ -515,6 +536,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._snapshot_has_usable_targets")
         return bool(
             self._collect_valid_targets_above(snapshot, current_price)
             or self._collect_valid_targets_below(snapshot, current_price)
@@ -525,6 +549,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, snapshot: LiquidityMapSnapshot) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._infer_side")
         up_edge = sweep_edge_up(snapshot)
         down_edge = sweep_edge_down(snapshot)
         delta = up_edge - down_edge
@@ -562,6 +589,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_for_side")
         if side is SignalSide.LONG:
             candidates = [
                 getattr(snapshot, "nearest_above_level", None),
@@ -624,6 +654,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         exclude: LiquidityLevel | StopCluster | None = None,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._find_extended_target")
         if side is SignalSide.LONG:
             candidates = self._collect_valid_targets_above(snapshot, current_price)
         elif side is SignalSide.SHORT:
@@ -646,6 +679,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._collect_valid_targets_above")
         return [
             item
             for item in collect_targets_above(snapshot, current_price)
@@ -661,6 +697,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._collect_valid_targets_below")
         return [
             item
             for item in collect_targets_below(snapshot, current_price)
@@ -678,6 +717,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._is_valid_follow_through_target")
         ref_price = reference_price(item)
         if ref_price <= 0 or current_price <= 0:
             return False
@@ -718,6 +760,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         target: LiquidityLevel | StopCluster | None,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._build_score_breakdown")
         edge = self._edge_for_side(snapshot=snapshot, side=side)
         target_score = self._target_quality_score(target=target, current_price=current_price)
         magnet = self._magnet_for_side(snapshot=snapshot, side=side)
@@ -842,6 +887,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._edge_for_side")
         if side is SignalSide.LONG:
             return sweep_edge_up(snapshot)
 
@@ -856,6 +904,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._magnet_for_side")
         if side is SignalSide.LONG:
             return magnet_score_up(snapshot)
 
@@ -870,6 +921,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._sweep_risk_for_side")
         if side is SignalSide.LONG:
             return sweep_risk_up(snapshot)
 
@@ -884,6 +938,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._pressure_alignment")
         pressure = signed_score(getattr(snapshot, "liquidity_pressure_score", 0.0))
 
         if side is SignalSide.LONG:
@@ -901,6 +958,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._zone_alignment_score")
         liquidity_side = LiquiditySide.BUY_SIDE if side is SignalSide.LONG else LiquiditySide.SELL_SIDE
         zone = best_zone_for_side(
             snapshot=snapshot,
@@ -918,6 +978,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_quality_score")
         if target is None:
             return 0.0
 
@@ -959,6 +1022,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_distance_score")
         if target is None or current_price <= 0:
             return 0.0
 
@@ -995,6 +1061,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         current_price: float,
         invalidation_level: LiquidityLevel | StopCluster | None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._resolve_stop_price")
         if current_price <= 0:
             return None
 
@@ -1019,6 +1088,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._invalidation_level_for_side")
         if side is SignalSide.LONG:
             candidates = collect_targets_below(snapshot, current_price)
             return candidates[0] if candidates else None
@@ -1038,6 +1110,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         stop_loss: float | None,
     ) -> list[TargetPlan]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_plans")
         result: list[TargetPlan] = []
 
         primary_price = reference_price(target) if target is not None else 0.0
@@ -1100,6 +1175,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         target_price: float | None,
         side: SignalSide,
     ) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquiditySweepStrategy._compute_rr")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._compute_rr")
         if current_price <= 0 or stop_price is None or target_price is None:
             return None
 
@@ -1117,6 +1195,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
 
     @staticmethod
     def _target_type(target: LiquidityLevel | StopCluster | None) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquiditySweepStrategy._target_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_type")
         if target is None:
             return None
 
@@ -1141,6 +1222,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         score: float,
         confidence: float,
     ) -> SignalPriority:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._resolve_priority")
         combined = unit_score(0.55 * score + 0.45 * confidence)
 
         if combined >= self.sweep_config.critical_priority_score:
@@ -1157,6 +1241,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         target: LiquidityLevel | StopCluster | None,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._source_features")
         features = [
             LIQUIDITY_FEATURES.SNAPSHOT,
             LIQUIDITY_FEATURES.MAP_SNAPSHOT,
@@ -1201,6 +1288,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         snapshot: LiquidityMapSnapshot,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._tags")
         tags = [
             self.sweep_config.tag_liquidity,
             self.sweep_config.tag_sweep,
@@ -1231,6 +1321,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._primary_reason")
         if side is SignalSide.LONG:
             return (
                 "Upside liquidity magnet dominates: "
@@ -1252,6 +1345,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_reason")
         if target is None:
             return "No explicit directional liquidity target found"
 
@@ -1273,6 +1369,9 @@ class LiquiditySweepStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquiditySweepStrategy._target_metadata")
         if target is None:
             return None
 

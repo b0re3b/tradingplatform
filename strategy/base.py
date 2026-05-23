@@ -1,6 +1,7 @@
 # trading_system/strategy/base.py
 
 from __future__ import annotations
+import logging
 
 import asyncio
 import inspect
@@ -66,6 +67,7 @@ class BaseStrategyComponent(ABC):
     - міжмодульна комунікація йде через EventBus;
     - periodic/background jobs мають іти через Scheduler, не через unmanaged loops.
     """
+    _logger = logging.getLogger(__name__ + ".BaseStrategyComponent")
 
     component_namespace: str = "strategy"
 
@@ -77,6 +79,9 @@ class BaseStrategyComponent(ABC):
         *,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.__init__")
         self.config = config
         self.event_bus = event_bus
         self.scheduler = scheduler
@@ -97,25 +102,43 @@ class BaseStrategyComponent(ABC):
 
     @property
     def component_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.component_name")
         return self.__class__.__name__
 
     @property
     def is_started(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.is_started")
         return self._started
 
     @property
     def is_registered(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.is_registered")
         return self._registered
 
     @property
     def subscriptions_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.subscriptions_count")
         return len(self._subscriptions)
 
     @property
     def scheduler_jobs_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.scheduler_jobs_count")
         return len(self._scheduler_jobs)
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.validate_config")
         if self.config is None:
             raise StrategyConfigError(f"{self.component_name}: config is required")
 
@@ -124,6 +147,9 @@ class BaseStrategyComponent(ABC):
             validate()
 
     async def _await_best_effort(awaitable: Awaitable[Any]) -> None:
+        _strategy_logger = getattr(awaitable, "logger", None) or getattr(awaitable, "_logger", None) or logging.getLogger(__name__ + "." + awaitable.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent._await_best_effort")
         await awaitable
 
     def register(self) -> None:
@@ -133,6 +159,9 @@ class BaseStrategyComponent(ABC):
         Компоненти, які реально слухають події, мають перевизначити цей метод.
         Базова реалізація тільки позначає компонент як registered.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.register")
         self._registered = True
 
     def unregister(self) -> None:
@@ -142,6 +171,9 @@ class BaseStrategyComponent(ABC):
         Concrete components should use subscribe_event(), щоб підписки були
         збережені в _subscriptions і могли бути коректно зняті під час stop().
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.unregister")
         if self.event_bus is not None:
             for subscription in list(self._subscriptions):
                 try:
@@ -159,6 +191,9 @@ class BaseStrategyComponent(ABC):
         """
         Async lifecycle hook.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.start")
         if self._started:
             self.log_debug("Component already started")
             return
@@ -179,6 +214,9 @@ class BaseStrategyComponent(ABC):
         """
         Async cleanup hook.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.stop")
         if not self._started:
             self.log_debug("Component already stopped")
             return
@@ -189,11 +227,17 @@ class BaseStrategyComponent(ABC):
         self.log_info("Component stopped")
 
     def ensure_event_bus(self) -> EventBus:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.ensure_event_bus")
         if self.event_bus is None:
             raise RuntimeError(f"{self.component_name}: event_bus is not configured")
         return self.event_bus
 
     def ensure_scheduler(self) -> Scheduler:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.ensure_scheduler")
         if self.scheduler is None:
             raise RuntimeError(f"{self.component_name}: scheduler is not configured")
         return self.scheduler
@@ -213,6 +257,9 @@ class BaseStrategyComponent(ABC):
         Використовувати тільки для domain/system events, не для локальних
         helper-обчислень.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.emit_event")
         if not topic.strip():
             raise ValueError("topic cannot be empty")
 
@@ -251,6 +298,9 @@ class BaseStrategyComponent(ABC):
         - publish_nowait_best_effort(topic, payload)
         - publish_nowait_best_effort(Event(...))
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.emit_event_nowait_best_effort")
         if not topic.strip():
             raise ValueError("topic cannot be empty")
 
@@ -397,6 +447,9 @@ class BaseStrategyComponent(ABC):
         helper prevents "coroutine was never awaited" warnings and ensures the
         event is actually submitted.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent._complete_best_effort_publish")
         if not inspect.isawaitable(result):
             return
 
@@ -450,6 +503,9 @@ class BaseStrategyComponent(ABC):
           scheduled;
         - False when only the call signature was incompatible.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent._try_publish_nowait_best_effort")
         try:
             result = publish_nowait(*args, **kwargs)
         except TypeError:
@@ -467,6 +523,9 @@ class BaseStrategyComponent(ABC):
         """
         Subscribe component to EventBus topic and remember subscription.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.subscribe_event")
         if not topic.strip():
             raise ValueError("topic cannot be empty")
 
@@ -479,34 +538,52 @@ class BaseStrategyComponent(ABC):
         """
         Store Scheduler job reference for stats/lifecycle visibility.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.remember_scheduler_job")
         self._scheduler_jobs.append(job)
         return job
 
     def log_debug(self, message: str, **extra: Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.log_debug")
         self.logger.debug(
             message,
             extra={"component": self.component_name, **extra},
         )
 
     def log_info(self, message: str, **extra: Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.log_info")
         self.logger.info(
             message,
             extra={"component": self.component_name, **extra},
         )
 
     def log_warning(self, message: str, **extra: Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.log_warning")
         self.logger.warning(
             message,
             extra={"component": self.component_name, **extra},
         )
 
     def log_error(self, message: str, **extra: Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.log_error")
         self.logger.error(
             message,
             extra={"component": self.component_name, **extra},
         )
 
     def log_exception(self, message: str, **extra: Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategyComponent.log_exception")
         self.logger.exception(
             message,
             extra={"component": self.component_name, **extra},
@@ -517,12 +594,16 @@ class StatefulStrategyComponent(BaseStrategyComponent, ABC):
     """
     Base class for strategy components that keep local runtime state.
     """
+    _logger = logging.getLogger(__name__ + ".StatefulStrategyComponent")
 
     @abstractmethod
     def reset_state(self) -> None:
         """
         Reset internal component state.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StatefulStrategyComponent.reset_state")
 
 
 class ContextAwareStrategyComponent(BaseStrategyComponent, ABC):
@@ -534,8 +615,12 @@ class ContextAwareStrategyComponent(BaseStrategyComponent, ABC):
     - старий context.py більше не потрібен;
     - concrete strategies читають тільки StrategyContext, а не analytics/data напряму.
     """
+    _logger = logging.getLogger(__name__ + ".ContextAwareStrategyComponent")
 
     def validate_context(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ContextAwareStrategyComponent.validate_context")
         if context is None:
             raise StrategyEvaluationError(f"{self.component_name}: context is required")
 
@@ -550,6 +635,9 @@ class ContextAwareStrategyComponent(BaseStrategyComponent, ABC):
         """
         Return required feature value or raise StrategyEvaluationError.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ContextAwareStrategyComponent.require_feature")
         self.validate_context(context)
 
         if not feature_name.strip():
@@ -572,6 +660,9 @@ class ContextAwareStrategyComponent(BaseStrategyComponent, ABC):
         """
         Return optional feature value from StrategyContext.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ContextAwareStrategyComponent.optional_feature")
         self.validate_context(context)
 
         if not feature_name.strip():
@@ -587,6 +678,9 @@ class ContextAwareStrategyComponent(BaseStrategyComponent, ABC):
         context: StrategyContext,
         required_features: set[str],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ContextAwareStrategyComponent.has_required_features")
         self.validate_context(context)
         return all(context.has_feature(feature) for feature in required_features)
 
@@ -603,6 +697,7 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
     - strategy повертає StrategyEvaluation;
     - SignalProcessor/SignalRouter перетворює StrategySignal у risk-ready payload.
     """
+    _logger = logging.getLogger(__name__ + ".BaseStrategy")
 
     component_namespace: str = "strategy.base_strategy"
 
@@ -620,6 +715,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         definition: StrategyDefinitionConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.__init__")
         self._definition_override = definition
 
         super().__init__(
@@ -636,6 +734,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.strategy_name")
         definition = self.get_definition_config()
         if definition is not None and definition.name.strip():
             return definition.name
@@ -643,10 +744,16 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
     @property
     def name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.name")
         return self.strategy_name
 
     @property
     def priority(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.priority")
         definition = self.get_definition_config()
         if definition is None:
             return 100
@@ -654,6 +761,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
     @property
     def weight(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.weight")
         definition = self.get_definition_config()
         if definition is None:
             return 1.0
@@ -668,6 +778,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         - StrategyConfig.get_strategy(name);
         - StrategyConfig.strategies dict fallback.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.get_definition_config")
         if self._definition_override is not None:
             return self._definition_override
 
@@ -723,6 +836,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         return None
 
     def get_runtime_config(self) -> StrategyRuntimeConfig:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.get_runtime_config")
         definition = self.get_definition_config()
         if definition is not None:
             return definition.runtime
@@ -743,6 +859,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         return runtime
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.validate_config")
         super().validate_config()
 
         definition = self._definition_override
@@ -753,39 +872,69 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         runtime.validate()
 
     def is_enabled(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.is_enabled")
         return self.get_runtime_config().enabled
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.required_features")
         definition = self.get_definition_config()
         if definition is not None:
             return set(definition.required_features)
         return set()
 
     def supported_regimes(self) -> set[MarketRegime]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.supported_regimes")
         runtime = self.get_runtime_config()
         return set(runtime.allowed_regimes)
 
     def supported_timeframes(self) -> set[Timeframe]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.supported_timeframes")
         runtime = self.get_runtime_config()
         return set(runtime.timeframes)
 
     def allowed_symbols(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.allowed_symbols")
         runtime = self.get_runtime_config()
         return set(runtime.symbols)
 
     def min_confidence(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.min_confidence")
         return float(self.get_runtime_config().min_confidence)
 
     def min_score(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.min_score")
         return float(self.get_runtime_config().min_score)
 
     def cooldown_seconds(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.cooldown_seconds")
         return int(self.get_runtime_config().cooldown_seconds)
 
     def max_signal_age_seconds(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.max_signal_age_seconds")
         return int(self.get_runtime_config().max_signal_age_seconds)
 
     def supports_symbol(self, symbol: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.supports_symbol")
         if not symbol.strip():
             return False
 
@@ -796,9 +945,15 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         return symbol in allowed
 
     def supports_timeframe(self, timeframe: Timeframe) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.supports_timeframe")
         return timeframe in self.supported_timeframes()
 
     def supports_regime(self, regime: MarketRegime) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.supports_regime")
         regimes = self.supported_regimes()
 
         if MarketRegime.UNKNOWN in regimes:
@@ -807,6 +962,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         return regime in regimes
 
     def validate_context_requirements(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.validate_context_requirements")
         self.validate_context(context)
 
         if not self.supports_symbol(context.symbol):
@@ -843,30 +1001,48 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         StrategyEvaluation objects can now expose actionable diagnostics instead
         of the generic no_signal_generated reason.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.remember_no_signal")
         normalized = str(reason or "").strip() or "no_signal_generated"
         self._last_no_signal_reason = normalized
         self._last_no_signal_metadata = dict(metadata)
 
     def clear_no_signal_reason(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.clear_no_signal_reason")
         self._last_no_signal_reason = None
         self._last_no_signal_metadata = {}
 
     def consume_no_signal_reason(self) -> tuple[list[str], dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.consume_no_signal_reason")
         reason = self._last_no_signal_reason or "no_signal_generated"
         metadata = dict(self._last_no_signal_metadata or {})
         self.clear_no_signal_reason()
         return [reason], metadata
 
     def remember_not_applicable(self, reason: str, **metadata: Any) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.remember_not_applicable")
         normalized = str(reason or "").strip() or "strategy_not_applicable"
         self._last_not_applicable_reason = normalized
         self._last_not_applicable_metadata = dict(metadata)
 
     def clear_not_applicable_reason(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.clear_not_applicable_reason")
         self._last_not_applicable_reason = None
         self._last_not_applicable_metadata = {}
 
     def consume_not_applicable_reason(self) -> tuple[list[str], dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.consume_not_applicable_reason")
         reason = self._last_not_applicable_reason or "strategy_not_applicable"
         metadata = dict(self._last_not_applicable_metadata or {})
         self.clear_not_applicable_reason()
@@ -878,6 +1054,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
         Не кидає exception для normal negative cases.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.should_evaluate")
         self.clear_not_applicable_reason()
 
         if not self.is_enabled():
@@ -925,6 +1104,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         - signal enrichment;
         - consistent StrategyEvaluation construction.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.evaluate")
         timestamp = getattr(context, "timestamp", None) or utcnow()
         timestamp = ensure_aware_utc(timestamp)
 
@@ -1044,6 +1226,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         - рахувати final position size;
         - читати analytics/data напряму.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.generate_signal")
 
     def build_signal(
         self,
@@ -1068,6 +1253,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         Стратегія може створювати signal через цей метод, а SignalProcessor
         пізніше добудує entry/exit/execution plan і risk-ready payload.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy.build_signal")
         self.validate_context_requirements(context)
 
         signal = StrategySignal(
@@ -1101,6 +1289,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy._call_generate_signal")
         result = self.generate_signal(context)
 
         if inspect.isawaitable(result):
@@ -1117,6 +1308,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
         """
         Normalize/enrich StrategySignal before returning StrategyEvaluation.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy._prepare_signal")
         if not signal.symbol:
             signal.symbol = context.symbol
 
@@ -1156,6 +1350,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
             reasons: list[str] | None = None,
             metadata: dict[str, Any] | None = None,
     ) -> StrategyEvaluation:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy._build_evaluation")
         symbol = "unknown"
 
         if context is not None:
@@ -1182,6 +1379,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
     @staticmethod
     def _signal_is_directional(signal: StrategySignal) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".BaseStrategy._signal_is_directional")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy._signal_is_directional")
         side = signal.side
 
         if isinstance(side, SignalSide):
@@ -1191,6 +1391,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
     @staticmethod
     def _add_signal_reason(signal: StrategySignal, reason: str) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".BaseStrategy._add_signal_reason")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy._add_signal_reason")
         if not reason:
             return
 
@@ -1204,6 +1407,9 @@ class BaseStrategy(ContextAwareStrategyComponent, ABC):
 
     @staticmethod
     def _context_regime(context: StrategyContext) -> MarketRegime:
+        _strategy_logger = logging.getLogger(__name__ + ".BaseStrategy._context_regime")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BaseStrategy._context_regime")
         current_regime = getattr(context, "current_regime", None)
         if isinstance(current_regime, MarketRegime):
             return current_regime

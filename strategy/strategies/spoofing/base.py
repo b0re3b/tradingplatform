@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -104,6 +105,7 @@ class SpoofingFeatureNames:
     analytics.spoofing.* payloads. Concrete strategies may also read equivalent
     values from FeatureSource.SPOOFING domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingFeatureNames")
 
     COMPOSITE: str = "spoofing.composite"
     SIGNAL: str = "spoofing.signal"
@@ -146,6 +148,9 @@ class SpoofingFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SpoofingFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -170,6 +175,7 @@ class SpoofingStrategyScope:
 
     Concrete strategies still make decisions from StrategyContext.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingStrategyScope")
 
     exchange: str
     market_type: str
@@ -178,6 +184,9 @@ class SpoofingStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingStrategyScope.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -199,13 +208,22 @@ class SpoofingStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingStrategyScope.key")
         return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange}"
 
     def to_dict(self) -> dict[str, str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -231,6 +249,7 @@ class SpoofingStrategyConfig:
     setup TTLs, active setup indexes, cleanup loops or trade confirmation logic.
     Those concerns must stay outside concrete strategy classes.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingStrategyConfig")
 
     default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
     default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
@@ -279,6 +298,9 @@ class SpoofingStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingStrategyConfig.validate")
         bounded = {
             "min_score": self.min_score,
             "min_confidence": self.min_confidence,
@@ -348,6 +370,7 @@ class SpoofingCompositeSnapshot:
     pattern, side, features, detector results and score breakdown through one
     stable contract.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingCompositeSnapshot")
 
     exchange: str
     market_type: str
@@ -392,6 +415,9 @@ class SpoofingCompositeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -455,6 +481,9 @@ class SpoofingCompositeSnapshot:
 
     @property
     def scope(self) -> SpoofingStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.scope")
         return SpoofingStrategyScope(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -465,37 +494,67 @@ class SpoofingCompositeSnapshot:
 
     @property
     def scope_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.scope_key")
         return self.scope.key
 
     @property
     def signal_side(self) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.signal_side")
         return spoofing_side_to_signal_side(self.side)
 
     @property
     def detector_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.detector_count")
         return detector_count(self.raw_signal or self.to_signal_payload())
 
     @property
     def detector_agreement_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.detector_agreement_ratio")
         return detector_agreement_ratio(self.raw_signal or self.to_signal_payload())
 
     @property
     def detector_average_confidence(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.detector_average_confidence")
         return detector_average_confidence(self.raw_signal or self.to_signal_payload())
 
     def detector_payload(self, component: SpoofingComponent | str) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.detector_payload")
         return detector_payload(self.raw_signal or self.to_signal_payload(), component)
 
     def detector_score(self, component: SpoofingComponent | str) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.detector_score")
         return detector_score(self.raw_signal or self.to_signal_payload(), component)
 
     def detector_passed(self, component: SpoofingComponent | str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.detector_passed")
         return detector_passed(self.raw_signal or self.to_signal_payload(), component)
 
     def has_detector(self, component: SpoofingComponent | str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.has_detector")
         return bool(self.detector_payload(component))
 
     def to_signal_payload(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.to_signal_payload")
         return {
             "spoofing_type": self.spoofing_type,
             "pattern": self.pattern,
@@ -514,6 +573,9 @@ class SpoofingCompositeSnapshot:
         }
 
     def has_minimum_data(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.has_minimum_data")
         return (
             self.spoofing_type is not None
             or self.pattern is not None
@@ -525,6 +587,9 @@ class SpoofingCompositeSnapshot:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingCompositeSnapshot.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -595,6 +660,7 @@ class SpoofingTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingTradingStrategy")
 
     component_namespace = "strategy.spoofing"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -613,6 +679,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         spoofing_config: SpoofingStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.__init__")
         self.spoofing_config = spoofing_config or SpoofingStrategyConfig()
         self.spoofing_config.validate()
 
@@ -625,6 +694,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.validate_config")
         super().validate_config()
         self.spoofing_config.validate()
 
@@ -633,6 +705,9 @@ class SpoofingTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def spoofing_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_domain")
         self.validate_context(context)
         return spoofing_domain(context)
 
@@ -642,6 +717,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_item")
         self.validate_context(context)
         return spoofing_item(context, key, default)
 
@@ -651,6 +729,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -665,6 +746,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_float")
         return to_float(self.spoofing_path(context, path, default), default)
 
     def spoofing_int(
@@ -674,6 +758,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         *,
         default: int | None = None,
     ) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_int")
         return to_int(self.spoofing_path(context, path, default), default)
 
     def spoofing_score(
@@ -683,6 +770,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_score")
         return unit_score(self.spoofing_path(context, path, default), default)
 
     def spoofing_bool(
@@ -692,6 +782,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_bool")
         return to_bool(self.spoofing_path(context, path, default), default)
 
     def spoofing_str(
@@ -701,6 +794,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_str")
         return to_str(self.spoofing_path(context, path, default), default)
 
     def spoofing_datetime(
@@ -710,6 +806,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_datetime")
         return parse_datetime(self.spoofing_path(context, path, default))
 
     def spoofing_feature_snapshot(
@@ -717,6 +816,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -735,6 +837,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_feature_age_seconds")
         snapshot = self.spoofing_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -745,6 +850,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_feature_is_stale")
         max_age = self.spoofing_config.stale_feature_max_age_seconds
         if max_age is None:
             return False
@@ -760,6 +868,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.has_any_spoofing_data")
         self.validate_context(context)
 
         if self.spoofing_domain(context):
@@ -772,6 +883,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.has_stale_spoofing_features")
         names = feature_names or tuple(self.required_features())
 
         return any(
@@ -784,6 +898,9 @@ class SpoofingTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def spoofing_scope(self, context: StrategyContext) -> SpoofingStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_scope")
         domain = self.spoofing_domain(context)
 
         exchange = (
@@ -832,6 +949,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         Fallback:
             individual spoofing.* features.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.resolve_spoofing_snapshot")
         self.validate_context(context)
 
         scope = self.spoofing_scope(context)
@@ -876,6 +996,9 @@ class SpoofingTradingStrategy(TradingStrategy):
 
         Concrete strategies should add their own pattern-specific checks.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.accepts_spoofing_snapshot")
         if not snapshot.has_minimum_data():
             return False
 
@@ -920,6 +1043,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         scope: SpoofingStrategyScope,
         source: str,
     ) -> SpoofingCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy._coerce_spoofing_snapshot")
         if value is None:
             return None
 
@@ -943,6 +1069,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: SpoofingStrategyScope,
     ) -> SpoofingCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy._build_snapshot_from_domain")
         domain = self.spoofing_domain(context)
         if not domain:
             return None
@@ -969,6 +1098,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: SpoofingStrategyScope,
     ) -> SpoofingCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy._build_snapshot_from_features")
         payload = {
             "spoofing_type": self._feature_value(
                 context,
@@ -1092,6 +1224,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         scope: SpoofingStrategyScope,
         source: str,
     ) -> SpoofingCompositeSnapshot:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy._snapshot_from_payload")
         signal_payload = extract_signal_payload(payload) or dict(payload)
 
         features = extract_features(signal_payload)
@@ -1163,6 +1298,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         snapshot: SpoofingCompositeSnapshot,
         component: SpoofingComponent | str,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.detector_payload")
         return snapshot.detector_payload(component)
 
     def detector_score(
@@ -1170,6 +1308,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         snapshot: SpoofingCompositeSnapshot,
         component: SpoofingComponent | str,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.detector_score")
         return snapshot.detector_score(component)
 
     def detector_passed(
@@ -1177,6 +1318,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         snapshot: SpoofingCompositeSnapshot,
         component: SpoofingComponent | str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.detector_passed")
         return snapshot.detector_passed(component)
 
     # ------------------------------------------------------------------
@@ -1206,6 +1350,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         Final risk-ready payload conversion belongs to SignalProcessor /
         SignalBuilder, not to this domain strategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.build_spoofing_signal")
         if not is_directional_side(side):
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: spoofing signal side must be LONG or SHORT"
@@ -1309,6 +1456,9 @@ class SpoofingTradingStrategy(TradingStrategy):
         """
         Compact serialized spoofing context for StrategySignal.metadata.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy.spoofing_context_metadata")
         metadata: dict[str, Any] = {}
 
         snapshot = self.resolve_spoofing_snapshot(context)
@@ -1365,6 +1515,9 @@ class SpoofingTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".SpoofingTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy._feature_value")
         if not isinstance(feature_name, str) or not feature_name.strip():
             return None
 
@@ -1380,6 +1533,9 @@ class SpoofingTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _has_any_value(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".SpoofingTradingStrategy._has_any_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingTradingStrategy._has_any_value")
         if value is None:
             return False
 

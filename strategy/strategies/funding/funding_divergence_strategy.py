@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/funding/funding_divergence_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -61,6 +62,7 @@ class FundingDivergenceStrategyConfig(FundingStrategyConfig):
     - leave filtering, confluence, build and risk-ready conversion to
       SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".FundingDivergenceStrategyConfig")
 
     min_divergence_confidence: float = 0.50
     min_pressure_score: float = 0.35
@@ -151,6 +153,9 @@ class FundingDivergenceStrategyConfig(FundingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategyConfig.validate")
         FundingStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -243,6 +248,7 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, confluence, filters, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".FundingDivergenceStrategy")
 
     component_namespace = "strategy.funding.divergence"
     category: StrategyCategory = StrategyCategory.FUNDING
@@ -258,6 +264,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         funding_config: FundingDivergenceStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy.__init__")
         resolved_funding_config = funding_config or FundingDivergenceStrategyConfig()
         resolved_funding_config.validate()
 
@@ -276,9 +285,15 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy.strategy_name")
         return "funding_divergence"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.divergence_config.required_funding_features)
 
@@ -286,6 +301,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         divergence = funding_item(context, "divergence")
@@ -448,6 +466,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
     # ------------------------------------------------------------------
 
     def _passes_regime_filter(self, regime: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._passes_regime_filter")
         if regime is None:
             return not self.divergence_config.require_non_neutral_regime
 
@@ -484,6 +505,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         side: SignalSide,
         pressure: Any,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._passes_pressure_filter")
         if pressure is None:
             return not self.divergence_config.require_pressure_alignment
 
@@ -502,6 +526,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
     # ------------------------------------------------------------------
 
     def _derive_side_from_divergence(self, divergence: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._derive_side_from_divergence")
         explicit_side = side_from_bias(
             first_present(
                 divergence,
@@ -604,6 +631,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         flip: Any,
         funding_signal: Any,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._build_score_breakdown")
         divergence_score = self._divergence_score(divergence)
         divergence_confidence = self._divergence_confidence(divergence)
 
@@ -746,6 +776,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         ).normalize()
 
     def _divergence_score(self, divergence: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._divergence_score")
         base = unit_score(
             first_present(
                 divergence,
@@ -765,11 +798,17 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         return unit_score(base + bonus)
 
     def _divergence_confidence(self, divergence: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._divergence_confidence")
         base = extract_confidence(divergence)
         bonus = self._divergence_type_bonus(divergence)
         return unit_score(base + bonus)
 
     def _pressure_score(self, pressure: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._pressure_score")
         if pressure is None:
             return 0.0
 
@@ -789,12 +828,18 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         )
 
     def _regime_score(self, regime: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._regime_score")
         if regime is None:
             return 0.0
 
         return extract_confidence(regime)
 
     def _pressure_side(self, pressure: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._pressure_side")
         if pressure is None:
             return SignalSide.UNKNOWN
 
@@ -814,6 +859,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         )
 
     def _regime_side(self, regime: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._regime_side")
         if regime is None:
             return SignalSide.UNKNOWN
 
@@ -825,6 +873,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         side: SignalSide,
         pressure: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._pressure_alignment")
         if pressure is None:
             return 0.0
 
@@ -840,6 +891,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         side: SignalSide,
         regime: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._regime_alignment")
         if regime is None:
             return 0.0
 
@@ -855,6 +909,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         side: SignalSide,
         extreme: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._extreme_alignment")
         if not self.divergence_config.allow_extreme_confirmation or extreme is None:
             return 0.0
 
@@ -902,6 +959,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         side: SignalSide,
         funding_signal: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._funding_signal_alignment")
         if not self.divergence_config.allow_signal_confirmation:
             return 0.0
 
@@ -949,6 +1009,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         side: SignalSide,
         flip: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._flip_confirmation")
         if not self.divergence_config.allow_flip_confirmation:
             return 0.0
 
@@ -1011,6 +1074,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
     # ------------------------------------------------------------------
 
     def _divergence_type_bonus(self, divergence: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._divergence_type_bonus")
         labels = self._divergence_labels(divergence)
 
         bonus = 0.0
@@ -1037,6 +1103,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         return unit_score(bonus)
 
     def _divergence_labels(self, divergence: Any) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._divergence_labels")
         raw_values = [
             first_present(
                 divergence,
@@ -1083,6 +1152,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         return result
 
     def _signal_origin_alignment_weight(self, funding_signal: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._signal_origin_alignment_weight")
         origin = normalize_label(
             first_present(
                 funding_signal,
@@ -1115,6 +1187,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         flip: Any,
         funding_signal: Any,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._source_features")
         features = [FUNDING_FEATURES.DIVERGENCE]
 
         if pressure is not None:
@@ -1148,6 +1223,9 @@ class FundingDivergenceStrategy(FundingTradingStrategy):
         extreme: Any,
         funding_signal: Any,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingDivergenceStrategy._tags")
         tags = [
             self.divergence_config.tag_funding,
             self.divergence_config.tag_divergence,

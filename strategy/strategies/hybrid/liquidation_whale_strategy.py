@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/liquidation_whale_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +60,7 @@ class LiquidationWhalePayload:
     - sell-side liquidation cascade / forced flow + buy-side whale absorption -> LONG;
     - buy-side liquidation cascade / forced flow + sell-side whale absorption -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidationWhalePayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -89,6 +91,7 @@ class LiquidationWhaleStrategyConfig(HybridStrategyConfig):
     This is stricter than whales.WhaleLiquidationReversalStrategy because both
     LIQUIDATIONS and WHALES domains are required by default.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidationWhaleStrategyConfig")
 
     min_liquidation_whale_score: float = 0.66
     min_liquidation_whale_confidence: float = 0.60
@@ -164,6 +167,9 @@ class LiquidationWhaleStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -263,6 +269,7 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
     SignalProcessor owns global routing, confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidationWhaleStrategy")
 
     component_namespace = "strategy.hybrid.liquidation_whale"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -278,6 +285,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         hybrid_config: LiquidationWhaleStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy.__init__")
         resolved_hybrid_config = hybrid_config or LiquidationWhaleStrategyConfig()
         resolved_hybrid_config.validate()
 
@@ -294,10 +304,16 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy.strategy_name")
         return "liquidation_whale"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -340,6 +356,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.liq_whale_config.required_hybrid_features
@@ -349,6 +368,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -467,9 +489,15 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._enabled_sources")
         return LIQUIDATION_WHALE_SOURCES
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.liq_whale_config.require_liquidations:
@@ -481,6 +509,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._vote_weights")
         return {
             FeatureSource.LIQUIDATIONS: self.liq_whale_config.liquidations_vote_weight,
             FeatureSource.WHALES: self.liq_whale_config.whales_vote_weight,
@@ -498,6 +529,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> LiquidationWhalePayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._extract_payload")
         payloads = snapshot.payloads()
         liquidations = payloads.get(FeatureSource.LIQUIDATIONS, {})
         whales = payloads.get(FeatureSource.WHALES, {})
@@ -560,6 +594,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         )
 
     def _extract_liquidation_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._extract_liquidation_side")
         for path in (
             "liquidation_side",
             "liquidated_side",
@@ -577,6 +614,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_whale_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._extract_whale_side")
         for path in (
             "whale_side",
             "absorption_side",
@@ -598,6 +638,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         whales: dict[str, Any],
         liquidations: dict[str, Any],
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._extract_exhausted_side")
         for payload in (whales, liquidations):
             for path in (
                 "exhausted_side",
@@ -621,6 +664,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         self,
         payload: LiquidationWhalePayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._passes_liquidation_whale_filters")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -685,6 +731,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: LiquidationWhalePayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -801,6 +850,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         self,
         whales: dict[str, Any],
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._absorption_score")
         candidates = [
             get_path(whales, "absorption_score"),
             get_path(whales, "whale_absorption_score"),
@@ -822,6 +874,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         liquidations: dict[str, Any],
         whales: dict[str, Any],
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._exhaustion_score")
         candidates = [
             get_path(liquidations, "exhaustion_score"),
             get_path(liquidations, "exhaustion_probability"),
@@ -846,6 +901,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         self,
         payload: LiquidationWhalePayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._source_features")
         features = [
             *liquidation_whale_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -864,6 +922,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         self,
         payload: LiquidationWhalePayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._tags")
         tags = [
             self.liq_whale_config.tag_hybrid,
             self.liq_whale_config.tag_liquidation_whale,
@@ -891,6 +952,9 @@ class LiquidationWhaleStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidationWhaleStrategy._execution_hints")
         return {
             "entry_offset_bps": self.liq_whale_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.liq_whale_config.execution_stop_buffer_bps_hint,

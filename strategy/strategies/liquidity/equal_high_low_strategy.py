@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidity/equal_high_low_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -70,6 +71,7 @@ class EqualLevelCandidate:
 
     Це локальний DTO для candidate selection, не runtime state.
     """
+    _logger = logging.getLogger(__name__ + ".EqualLevelCandidate")
 
     side: SignalSide
     level: EqualLevel | LiquidityLevel
@@ -78,6 +80,9 @@ class EqualLevelCandidate:
 
     @property
     def level_price(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualLevelCandidate.level_price")
         return reference_price(self.level)
 
 
@@ -93,6 +98,7 @@ class EqualHighLowStrategyConfig(LiquidityStrategyConfig):
       belong to StopHuntReversalStrategy;
     - return internal StrategySignal only; SignalProcessor owns final emission.
     """
+    _logger = logging.getLogger(__name__ + ".EqualHighLowStrategyConfig")
 
     allow_swept_equal_levels: bool = False
 
@@ -148,6 +154,9 @@ class EqualHighLowStrategyConfig(LiquidityStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategyConfig.validate")
         LiquidityStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -263,6 +272,7 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
 
     This class does not subscribe to EventBus and does not emit signal.generated.
     """
+    _logger = logging.getLogger(__name__ + ".EqualHighLowStrategy")
 
     component_namespace = "strategy.liquidity.equal_high_low"
     category: StrategyCategory = StrategyCategory.LIQUIDITY
@@ -278,6 +288,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         liquidity_config: EqualHighLowStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy.__init__")
         resolved_liquidity_config = liquidity_config or EqualHighLowStrategyConfig()
         resolved_liquidity_config.validate()
 
@@ -294,9 +307,15 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy.strategy_name")
         return "equal_high_low_strategy"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.equal_config.required_liquidity_features)
 
@@ -304,6 +323,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
@@ -520,6 +542,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[FilterResult]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._run_pre_filters")
         results = self.run_common_pre_filters(
             context=context,
             snapshot=snapshot,
@@ -563,6 +588,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> EqualLevelCandidate | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._find_best_candidate")
         candidates: list[EqualLevelCandidate] = []
 
         for level in self._valid_equal_levels(
@@ -611,6 +639,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[EqualLevel | LiquidityLevel]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._valid_equal_levels")
         levels = list(getattr(snapshot, "equal_levels", []) or [])
 
         result: list[EqualLevel | LiquidityLevel] = []
@@ -639,6 +670,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         self,
         level: EqualLevel | LiquidityLevel,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._is_valid_equal_reaction_level")
         if self.equal_config.require_valid_equal_level_type:
             if not is_equal_level(level):
                 return False
@@ -666,6 +700,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         level: EqualLevel | LiquidityLevel,
         current_price: float,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._level_distance_ok")
         price = reference_price(level)
         if price <= 0 or current_price <= 0:
             return False
@@ -691,6 +728,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         level: EqualLevel | LiquidityLevel,
         current_price: float,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._side_from_equal_level")
         level_type = getattr(level, "level_type", None)
         liquidity_side = getattr(level, "side", None)
 
@@ -722,6 +762,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         self,
         candidate: EqualLevelCandidate,
     ) -> tuple[float, float, int, int, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._candidate_rank")
         level = candidate.level
         confidence, touches, reactions, compactness_rank = level_quality(level)
         return (
@@ -743,6 +786,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._target_for_side")
         if side is SignalSide.LONG:
             candidates = collect_targets_above(snapshot, current_price)
         elif side is SignalSide.SHORT:
@@ -775,6 +821,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._is_valid_target")
         price = reference_price(item)
         if price <= 0 or current_price <= 0:
             return False
@@ -805,6 +854,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         current_price: float,
         candidate: EqualLevelCandidate,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._build_score_breakdown")
         level = candidate.level
         side = candidate.side
         target = candidate.target
@@ -933,6 +985,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._edge_for_level")
         level_quality_score = self._level_quality_score(level)
         distance_component = self._level_distance_score(
             level=level,
@@ -954,6 +1009,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
 
     @staticmethod
     def _level_quality_score(level: EqualLevel | LiquidityLevel) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".EqualHighLowStrategy._level_quality_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._level_quality_score")
         confidence = unit_score(getattr(level, "confidence", 0.0))
         touches = max(int(getattr(level, "touches_count", 0) or 0), 0)
         reactions = max(int(getattr(level, "reaction_count", 0) or 0), 0)
@@ -971,6 +1029,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         level: EqualLevel | LiquidityLevel,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._level_distance_score")
         return distance_score(
             price=reference_price(level),
             current_price=current_price,
@@ -983,6 +1044,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._target_quality_score")
         if target is None:
             return 0.0
 
@@ -1022,6 +1086,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._context_score")
         pressure = signed_score(getattr(snapshot, "liquidity_pressure_score", 0.0))
 
         if side is SignalSide.LONG:
@@ -1053,6 +1120,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._zone_alignment_score")
         liquidity_side = (
             LiquiditySide.BUY_SIDE
             if side is SignalSide.LONG
@@ -1079,6 +1149,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         current_price: float,
         level: EqualLevel | LiquidityLevel,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._resolve_stop_price")
         level_price = reference_price(level)
         if current_price <= 0 or level_price <= 0:
             return None
@@ -1103,6 +1176,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         stop_loss: float | None,
     ) -> list[TargetPlan]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._target_plans")
         result: list[TargetPlan] = []
 
         target_price = reference_price(target) if target is not None else 0.0
@@ -1138,6 +1214,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         target_price: float | None,
         side: SignalSide,
     ) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".EqualHighLowStrategy._compute_rr")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._compute_rr")
         if current_price <= 0 or stop_price is None or target_price is None:
             return None
 
@@ -1163,6 +1242,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         score: float,
         confidence: float,
     ) -> SignalPriority:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._resolve_priority")
         combined = unit_score(0.55 * score + 0.45 * confidence)
 
         if combined >= self.equal_config.critical_priority_score:
@@ -1174,6 +1256,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         return self.equal_config.default_priority
 
     def _source_features(self, candidate: EqualLevelCandidate) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._source_features")
         features = [
             LIQUIDITY_FEATURES.SNAPSHOT,
             LIQUIDITY_FEATURES.MAP_SNAPSHOT,
@@ -1216,6 +1301,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         candidate: EqualLevelCandidate,
         snapshot: LiquidityMapSnapshot,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._tags")
         tags = [
             self.equal_config.tag_liquidity,
             self.equal_config.tag_equal_levels,
@@ -1249,6 +1337,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         current_price: float,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._build_primary_reason")
         prefix = (
             "Equal lows reaction -> long setup"
             if side is SignalSide.LONG
@@ -1269,6 +1360,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._build_target_reason")
         if target is None:
             return "No explicit target found; signal based on equal highs/lows structure quality"
 
@@ -1294,6 +1388,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         current_price: float,
         target: LiquidityLevel | StopCluster | None,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._build_confirmations")
         confirmations: list[str] = []
 
         if int(getattr(level, "touches_count", 0) or 0) >= 3:
@@ -1337,6 +1434,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         side: LiquiditySide,
         current_price: float,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._has_high_quality_zone")
         zone = best_zone_for_side(
             snapshot=snapshot,
             side=side,
@@ -1349,6 +1449,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
 
     @staticmethod
     def _target_type(target: LiquidityLevel | StopCluster | None) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".EqualHighLowStrategy._target_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._target_type")
         if target is None:
             return None
 
@@ -1367,6 +1470,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         self,
         level: EqualLevel | LiquidityLevel,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._level_metadata")
         return {
             "type": self._target_type(level),
             "price": reference_price(level),
@@ -1384,6 +1490,9 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering EqualHighLowStrategy._target_metadata")
         if target is None:
             return None
 

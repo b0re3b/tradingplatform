@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/utils.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1037,6 +1038,7 @@ def extract_context_domain_payloads(
 
 @dataclass(slots=True)
 class DirectionVote:
+    _logger = logging.getLogger(__name__ + ".DirectionVote")
     source: FeatureSource
     side: SignalSide = SignalSide.UNKNOWN
     confidence: float = 0.0
@@ -1048,6 +1050,9 @@ class DirectionVote:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering DirectionVote.__post_init__")
         self.confidence = unit_score(self.confidence)
         self.score = unit_score(self.score)
         self.weight = max(0.0, float(self.weight))
@@ -1057,19 +1062,31 @@ class DirectionVote:
 
     @property
     def directional(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering DirectionVote.directional")
         return is_directional_side(self.side)
 
     @property
     def weighted_strength(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering DirectionVote.weighted_strength")
         if not self.directional:
             return 0.0
         return unit_score(self.confidence * 0.5 + self.score * 0.5) * self.weight
 
     @property
     def side_label(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering DirectionVote.side_label")
         return signal_side_to_label(self.side)
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering DirectionVote.to_dict")
         return {
             "source": self.source.value,
             "side": self.side.value,
@@ -1446,6 +1463,7 @@ def hybrid_freshness_score(
 
 @dataclass(slots=True)
 class HybridScoreBreakdown:
+    _logger = logging.getLogger(__name__ + ".HybridScoreBreakdown")
     score: float = 0.0
     confidence: float = 0.0
     components: dict[str, float] = field(default_factory=dict)
@@ -1456,6 +1474,9 @@ class HybridScoreBreakdown:
     conflicts: list[str] = field(default_factory=list)
 
     def normalize(self) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridScoreBreakdown.normalize")
         self.score = unit_score(self.score)
         self.confidence = unit_score(self.confidence)
         self.components = {
@@ -1490,6 +1511,9 @@ class HybridScoreBreakdown:
         return self
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering HybridScoreBreakdown.to_dict")
         self.normalize()
         return {
             "score": self.score,

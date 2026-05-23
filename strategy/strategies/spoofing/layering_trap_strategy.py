@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/layering_trap_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -70,6 +71,7 @@ class LayeringTrapPayload:
     - multi-level fake ASK supply removed -> fake resistance disappears -> LONG;
     - multi-level fake BID demand removed -> fake support disappears -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".LayeringTrapPayload")
 
     snapshot: SpoofingCompositeSnapshot
     side: SignalSide
@@ -80,30 +82,51 @@ class LayeringTrapPayload:
 
     @property
     def layer_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.layer_count")
         return extract_layer_count(self.snapshot.raw_signal)
 
     @property
     def layer_price_span_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.layer_price_span_bps")
         return extract_layer_price_span_bps(self.snapshot.raw_signal)
 
     @property
     def pull_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.pull_ratio")
         return extract_pull_ratio(self.snapshot.raw_signal)
 
     @property
     def fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.fill_ratio")
         return extract_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def price_reaction_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.price_reaction_bps")
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def wall_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.wall_notional")
         return extract_wall_notional(self.snapshot.raw_signal)
 
     @property
     def pulled_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapPayload.pulled_notional")
         return extract_pulled_notional(self.snapshot.raw_signal)
 
 
@@ -119,6 +142,7 @@ class LayeringTrapStrategyConfig(SpoofingStrategyConfig):
     - optional reaction confirms unwind direction;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".LayeringTrapStrategyConfig")
 
     min_layering_score: float = 0.70
     min_layering_confidence: float = 0.60
@@ -186,6 +210,9 @@ class LayeringTrapStrategyConfig(SpoofingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategyConfig.validate")
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
@@ -291,6 +318,7 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".LayeringTrapStrategy")
 
     component_namespace = "strategy.spoofing.layering_trap"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -306,6 +334,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         spoofing_config: LayeringTrapStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy.__init__")
         resolved_spoofing_config = spoofing_config or LayeringTrapStrategyConfig()
         resolved_spoofing_config.validate()
 
@@ -322,10 +353,16 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy.strategy_name")
         return "layering_trap"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPOOFING,
@@ -365,6 +402,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.layering_config.required_spoofing_features
@@ -374,6 +414,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spoofing_data(
@@ -510,6 +553,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> LayeringTrapPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._extract_payload")
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -552,6 +598,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._supports_snapshot")
         return (
             snapshot.spoofing_type is SpoofingType.LAYERING
             or snapshot.pattern is SpoofingPattern.MULTI_LEVEL_LAYERING
@@ -563,6 +612,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: LayeringTrapPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._passes_layering_filters")
         snapshot = payload.snapshot
 
         if self.layering_config.require_layering_detector:
@@ -630,6 +682,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         context: StrategyContext,
         payload: LayeringTrapPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         base_component = average_score(
@@ -756,6 +811,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: LayeringTrapPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._span_component")
         max_span = max(self.layering_config.max_layer_price_span_bps, 0.0001)
         return unit_score(1.0 - (payload.layer_price_span_bps / max_span))
 
@@ -763,6 +821,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: LayeringTrapPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._notional_component")
         if payload.wall_notional <= 0:
             return 0.0
 
@@ -776,6 +837,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: LayeringTrapPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._source_features")
         features = [
             *layering_source_features(),
             SPOOFING_FEATURES.SIGNAL,
@@ -801,6 +865,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         self,
         payload: LayeringTrapPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._tags")
         tags = [
             self.layering_config.tag_spoofing,
             self.layering_config.tag_layering,
@@ -830,6 +897,9 @@ class LayeringTrapStrategy(SpoofingTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LayeringTrapStrategy._execution_hints")
         return {
             "entry_offset_bps": self.layering_config.entry_offset_bps_hint,
             "stop_buffer_bps": self.layering_config.stop_buffer_bps_hint,

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.logger import get_logger
 
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
@@ -47,6 +48,19 @@ DEFAULT_ANALYZER_STOPPED_TOPIC = "analytics.spreads.analyzer.stopped"
 DEFAULT_ANALYZER_HEARTBEAT_TOPIC = "analytics.spreads.analyzer.heartbeat"
 
 DECIMAL_ZERO = Decimal("0")
+
+# Project runtime scope.
+# Market data exchanges used by the project: Binance, Bybit, OKX, MEXC.
+# Bitget is intentionally not included.
+PROJECT_DEFAULT_EXCHANGE = "binance"
+PROJECT_EXCHANGES: frozenset[str] = frozenset({"binance", "bybit", "okx", "mexc"})
+PROJECT_FUTURES_MARKET_TYPES: frozenset[str] = frozenset({"usdm_futures", "linear", "swap"})
+PROJECT_SPOT_MARKET_TYPES: frozenset[str] = frozenset({"spot"})
+PROJECT_SPREAD_SYMBOLS: frozenset[str] = frozenset({"BTCUSDT", "ETHUSDT", "RIVERUSDT"})
+PROJECT_TIMEFRAMES: frozenset[str] = frozenset({"1m", "15m"})
+PROJECT_DERIVATIVE_INSTRUMENT_TYPES: frozenset[InstrumentType] = frozenset(
+    {InstrumentType.PERPETUAL, InstrumentType.FUTURES}
+)
 
 
 # ============================================================
@@ -253,12 +267,14 @@ class BaseSpreadConfig:
     analyzer_heartbeat_event_topic: str = DEFAULT_ANALYZER_HEARTBEAT_TOPIC
 
     # Scoped defaults
-    default_timeframe: str = DEFAULT_TIMEFRAME
+    default_timeframe: str = "1m"
 
-    # Optional scoped filters
-    allowed_symbols: set[str] = field(default_factory=set)
-    allowed_timeframes: set[str] = field(default_factory=set)
-    allowed_market_types: set[str] = field(default_factory=set)
+    # Optional scoped filters.
+    # Filled with the project runtime scope by default so analyzers can bootstrap
+    # without receiving empty allowlists from package-level config.
+    allowed_symbols: set[str] = field(default_factory=lambda: set(PROJECT_SPREAD_SYMBOLS))
+    allowed_timeframes: set[str] = field(default_factory=lambda: set(PROJECT_TIMEFRAMES))
+    allowed_market_types: set[str] = field(default_factory=lambda: set(PROJECT_FUTURES_MARKET_TYPES))
 
     # Top-of-book freshness / alignment
     max_quote_age_ms: int = 2_000
@@ -290,6 +306,27 @@ class BaseSpreadConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.default_timeframe = _normalize_timeframe(self.default_timeframe)
 
         self.allowed_symbols = _normalize_symbol_set(self.allowed_symbols)
@@ -325,6 +362,27 @@ class BaseSpreadConfig:
         self.validate()
 
     def validate(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "validate", _analytics_args)
+        except Exception:
+            pass
         _validate_positive_int("max_quote_age_ms", self.max_quote_age_ms)
         _validate_positive_int("max_quote_skew_ms", self.max_quote_skew_ms)
         _validate_positive_int("rolling_window_size", self.rolling_window_size)
@@ -401,15 +459,75 @@ class BaseSpreadConfig:
 
     @staticmethod
     def _validate_topic(field_name: str, value: str) -> None:
+        try:
+            _analytics_class_name = "BaseSpreadConfig"
+            _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_validate_topic", _analytics_args)
+        except Exception:
+            pass
         if not value or not value.strip():
             raise ValueError(f"{field_name} must not be empty")
 
     @property
     def production_price_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_price_input_topics", _analytics_args)
+        except Exception:
+            pass
         return self.orderbook_event_topic_patterns
 
     @property
     def production_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "production_input_topics", _analytics_args)
+        except Exception:
+            pass
         return (
             *self.orderbook_event_topic_patterns,
             *self.funding_event_topic_patterns,
@@ -417,6 +535,27 @@ class BaseSpreadConfig:
 
     @property
     def legacy_raw_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "legacy_raw_input_topics", _analytics_args)
+        except Exception:
+            pass
         return (
             self.raw_orderbook_event_topic,
             self.raw_quote_event_topic,
@@ -425,6 +564,27 @@ class BaseSpreadConfig:
 
     @property
     def legacy_quote_input_topics(self) -> tuple[str, ...]:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "legacy_quote_input_topics", _analytics_args)
+        except Exception:
+            pass
         return (self.legacy_quote_event_topic,)
 
     def should_process_scope(
@@ -434,6 +594,27 @@ class BaseSpreadConfig:
         market_type: str,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_scope", _analytics_args)
+        except Exception:
+            pass
         normalized_symbol = _normalize_symbol(symbol)
         normalized_market_type = _normalize_market_type(market_type)
         normalized_timeframe = _normalize_timeframe(timeframe or self.default_timeframe)
@@ -453,6 +634,27 @@ class BaseSpreadConfig:
         return True
 
     def should_process_key(self, key: SpreadKey) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "should_process_key", _analytics_args)
+        except Exception:
+            pass
         scope = spread_key_to_dict(key)
         return self.should_process_scope(
             symbol=scope["symbol"],
@@ -468,6 +670,27 @@ class BaseSpreadConfig:
         symbol: str,
         timeframe: str | None = None,
     ) -> SpreadKey:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "make_key", _analytics_args)
+        except Exception:
+            pass
         return make_spread_key(
             exchange=exchange,
             market_type=market_type,
@@ -479,6 +702,27 @@ class BaseSpreadConfig:
         """
         Повертає копію config з оновленим metadata.
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "with_metadata", _analytics_args)
+        except Exception:
+            pass
         return replace(
             self,
             metadata={
@@ -521,28 +765,20 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
     notional_for_funding_adjustment: Decimal | None = None
 
     # Optional filters/default routing
-    default_spot_exchange: str | None = None
-    default_futures_exchange: str | None = None
+    default_spot_exchange: str | None = PROJECT_DEFAULT_EXCHANGE
+    default_futures_exchange: str | None = PROJECT_DEFAULT_EXCHANGE
 
     default_spot_market_type: str = DEFAULT_SPOT_MARKET_TYPE
     default_futures_market_type: str = DEFAULT_PERPETUAL_MARKET_TYPE
 
-    allowed_spot_exchanges: set[str] = field(default_factory=set)
-    allowed_futures_exchanges: set[str] = field(default_factory=set)
+    allowed_spot_exchanges: set[str] = field(default_factory=lambda: set(PROJECT_EXCHANGES))
+    allowed_futures_exchanges: set[str] = field(default_factory=lambda: set(PROJECT_EXCHANGES))
 
     allowed_spot_market_types: set[str] = field(
         default_factory=lambda: {DEFAULT_SPOT_MARKET_TYPE}
     )
     allowed_futures_market_types: set[str] = field(
-        default_factory=lambda: {
-            DEFAULT_PERPETUAL_MARKET_TYPE,
-            DEFAULT_FUTURES_MARKET_TYPE,
-            "linear",
-            "inverse",
-            "swap",
-            "usdm_futures",
-            "coinm_futures",
-        }
+        default_factory=lambda: set(PROJECT_FUTURES_MARKET_TYPES)
     )
 
     allowed_spot_instrument_types: set[InstrumentType] = field(
@@ -556,6 +792,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
     )
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.allowed_spot_exchanges = _normalize_exchange_set(self.allowed_spot_exchanges)
         self.allowed_futures_exchanges = _normalize_exchange_set(self.allowed_futures_exchanges)
 
@@ -629,12 +886,54 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
             )
 
     def is_spot_exchange_allowed(self, exchange: str) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_spot_exchange_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized = _normalize_exchange(exchange)
         if normalized is None:
             return False
         return not self.allowed_spot_exchanges or normalized in self.allowed_spot_exchanges
 
     def is_futures_exchange_allowed(self, exchange: str) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_futures_exchange_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized = _normalize_exchange(exchange)
         if normalized is None:
             return False
@@ -644,6 +943,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         )
 
     def is_spot_market_type_allowed(self, market_type: str | None) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_spot_market_type_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized = _normalize_market_type(
             market_type,
             fallback=self.default_spot_market_type,
@@ -654,6 +974,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         )
 
     def is_futures_market_type_allowed(self, market_type: str | None) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_futures_market_type_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized = _normalize_market_type(
             market_type,
             fallback=self.default_futures_market_type,
@@ -667,6 +1008,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         self,
         instrument_type: InstrumentType | str | None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_spot_instrument_type_allowed", _analytics_args)
+        except Exception:
+            pass
         parsed = parse_instrument_type(instrument_type)
         return parsed in self.allowed_spot_instrument_types
 
@@ -674,6 +1036,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         self,
         instrument_type: InstrumentType | str | None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_futures_instrument_type_allowed", _analytics_args)
+        except Exception:
+            pass
         parsed = parse_instrument_type(instrument_type)
         return parsed in self.allowed_futures_instrument_types
 
@@ -686,6 +1069,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         symbol: str,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_spot_quote_allowed", _analytics_args)
+        except Exception:
+            pass
         return (
             self.is_spot_exchange_allowed(exchange)
             and self.is_spot_market_type_allowed(market_type)
@@ -706,6 +1110,27 @@ class SpotFuturesSpreadConfig(BaseSpreadConfig):
         symbol: str,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_futures_quote_allowed", _analytics_args)
+        except Exception:
+            pass
         return (
             self.is_futures_exchange_allowed(exchange)
             and self.is_futures_market_type_allowed(market_type)
@@ -758,16 +1183,33 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
 
     # Filters
     allowed_instrument_types: set[InstrumentType] = field(
-        default_factory=lambda: {
-            InstrumentType.SPOT,
-            InstrumentType.PERPETUAL,
-            InstrumentType.FUTURES,
-        }
+        default_factory=lambda: set(PROJECT_DERIVATIVE_INSTRUMENT_TYPES)
     )
-    allowed_exchanges: set[str] = field(default_factory=set)
-    preferred_exchanges: set[str] = field(default_factory=set)
+    allowed_exchanges: set[str] = field(default_factory=lambda: set(PROJECT_EXCHANGES))
+    preferred_exchanges: set[str] = field(default_factory=lambda: set(PROJECT_EXCHANGES))
 
     def __post_init__(self) -> None:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "__post_init__", _analytics_args)
+        except Exception:
+            pass
         self.allowed_exchanges = _normalize_exchange_set(self.allowed_exchanges)
         self.preferred_exchanges = _normalize_exchange_set(self.preferred_exchanges)
 
@@ -827,6 +1269,27 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
                 raise ValueError("default_trade_size must be <= max_trade_size")
 
     def is_exchange_allowed(self, exchange: str) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_exchange_allowed", _analytics_args)
+        except Exception:
+            pass
         normalized = _normalize_exchange(exchange)
         if normalized is None:
             return False
@@ -834,6 +1297,27 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
         return not self.allowed_exchanges or normalized in self.allowed_exchanges
 
     def is_exchange_preferred(self, exchange: str) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_exchange_preferred", _analytics_args)
+        except Exception:
+            pass
         normalized = _normalize_exchange(exchange)
         if normalized is None:
             return False
@@ -844,6 +1328,27 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
         self,
         instrument_type: InstrumentType | str | None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_instrument_type_allowed", _analytics_args)
+        except Exception:
+            pass
         parsed = parse_instrument_type(instrument_type)
         return parsed in self.allowed_instrument_types
 
@@ -856,6 +1361,27 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
         instrument_type: InstrumentType | str | None,
         timeframe: str | None = None,
     ) -> bool:
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "is_quote_allowed", _analytics_args)
+        except Exception:
+            pass
         return (
             self.is_exchange_allowed(exchange)
             and self.is_instrument_type_allowed(instrument_type)
@@ -878,6 +1404,27 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
                 }
             }
         """
+        try:
+            _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
+            if _analytics_logger is None:
+                _analytics_logger = get_logger(f"{__name__}.{self.__class__.__name__}")
+                self.logger = _analytics_logger
+            _analytics_class_name = self.__class__.__name__
+            _analytics_args = {
+                _k: (
+                    {"type": "dict", "size": len(_v), "keys": [str(_key) for _key in list(_v.keys())[:20]]}
+                    if isinstance(_v, dict)
+                    else {"type": type(_v).__name__, "size": len(_v)}
+                    if isinstance(_v, (list, tuple, set, frozenset))
+                    else {"type": type(_v).__name__}
+                )
+                for _k, _v in locals().items()
+                if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
+                and not _k.startswith("_analytics")
+            }
+            _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "fee_rates_from_metadata", _analytics_args)
+        except Exception:
+            pass
         value = self.metadata.get("fee_rates", {})
         if isinstance(value, Mapping):
             return value
@@ -885,6 +1432,13 @@ class CrossExchangeSpreadConfig(BaseSpreadConfig):
 
 
 __all__ = [
+    "PROJECT_DEFAULT_EXCHANGE",
+    "PROJECT_EXCHANGES",
+    "PROJECT_FUTURES_MARKET_TYPES",
+    "PROJECT_SPOT_MARKET_TYPES",
+    "PROJECT_SPREAD_SYMBOLS",
+    "PROJECT_TIMEFRAMES",
+    "PROJECT_DERIVATIVE_INSTRUMENT_TYPES",
     "DEFAULT_ORDERBOOK_EVENT_TOPIC",
     "DEFAULT_QUOTE_EVENT_TOPIC",
     "DEFAULT_FUNDING_EVENT_TOPIC",

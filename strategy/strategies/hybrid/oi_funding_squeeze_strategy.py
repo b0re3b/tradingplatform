@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/oi_funding_squeeze_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +60,7 @@ class OIFundingSqueezePayload:
     - crowded shorts + negative/extreme funding + squeeze confirmation -> LONG;
     - crowded longs + positive/extreme funding + unwind confirmation -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".OIFundingSqueezePayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -89,6 +91,7 @@ class OIFundingSqueezeStrategyConfig(HybridStrategyConfig):
     - optional price action confirms reclaim/rejection;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".OIFundingSqueezeStrategyConfig")
 
     min_squeeze_score: float = 0.64
     min_squeeze_confidence: float = 0.58
@@ -167,6 +170,9 @@ class OIFundingSqueezeStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -268,6 +274,7 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
     SignalProcessor owns global routing, confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".OIFundingSqueezeStrategy")
 
     component_namespace = "strategy.hybrid.oi_funding_squeeze"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -283,6 +290,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         hybrid_config: OIFundingSqueezeStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy.__init__")
         resolved_hybrid_config = hybrid_config or OIFundingSqueezeStrategyConfig()
         resolved_hybrid_config.validate()
 
@@ -299,10 +309,16 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy.strategy_name")
         return "oi_funding_squeeze"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -347,6 +363,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.squeeze_config.required_hybrid_features)
 
@@ -354,6 +373,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -475,6 +497,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._enabled_sources")
         sources: list[FeatureSource] = [
             FeatureSource.OPEN_INTEREST,
             FeatureSource.FUNDING,
@@ -486,6 +511,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.squeeze_config.require_open_interest:
@@ -500,6 +528,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._vote_weights")
         return {
             FeatureSource.OPEN_INTEREST: self.squeeze_config.open_interest_vote_weight,
             FeatureSource.FUNDING: self.squeeze_config.funding_vote_weight,
@@ -518,6 +549,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> OIFundingSqueezePayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._extract_payload")
         payloads = snapshot.payloads()
 
         open_interest = payloads.get(FeatureSource.OPEN_INTEREST, {})
@@ -588,6 +622,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         )
 
     def _extract_oi_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._extract_oi_side")
         for path in (
             "oi_side",
             "open_interest_side",
@@ -608,6 +645,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_funding_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._extract_funding_side")
         for path in (
             "funding_side",
             "crowded_side",
@@ -630,6 +670,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         open_interest: dict[str, Any],
         funding: dict[str, Any],
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._extract_crowded_side")
         for payload in (funding, open_interest):
             for path in (
                 "crowded_side",
@@ -653,6 +696,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         open_interest: dict[str, Any],
         funding: dict[str, Any],
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._extract_squeeze_side")
         for payload in (open_interest, funding):
             for path in (
                 "squeeze_side",
@@ -671,6 +717,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_price_action_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._extract_price_action_side")
         for path in (
             "confirmation_side",
             "reclaim_side",
@@ -696,6 +745,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         self,
         payload: OIFundingSqueezePayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._passes_squeeze_filters")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -764,6 +816,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: OIFundingSqueezePayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -888,6 +943,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         self,
         funding: dict[str, Any],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._funding_is_extreme")
         label = normalize_label(
             get_path(funding, "extreme")
             or get_path(funding, "is_extreme")
@@ -915,6 +973,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         open_interest: dict[str, Any],
         funding: dict[str, Any],
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._squeeze_probability")
         candidates = [
             get_path(open_interest, "squeeze_probability"),
             get_path(open_interest, "short_squeeze_probability"),
@@ -946,6 +1007,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         self,
         payload: OIFundingSqueezePayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._source_features")
         features = [
             *oi_funding_squeeze_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -965,6 +1029,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         self,
         payload: OIFundingSqueezePayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._tags")
         tags = [
             self.squeeze_config.tag_hybrid,
             self.squeeze_config.tag_oi_funding,
@@ -990,6 +1057,9 @@ class OIFundingSqueezeStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIFundingSqueezeStrategy._execution_hints")
         return {
             "entry_offset_bps": self.squeeze_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.squeeze_config.execution_stop_buffer_bps_hint,

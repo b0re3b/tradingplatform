@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/funding/funding_extreme_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,6 +65,7 @@ class FundingExtremeReversalStrategyConfig(FundingStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and risk-ready
       conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".FundingExtremeReversalStrategyConfig")
 
     min_extreme_severity: float = 0.60
     min_pressure_score: float = 0.55
@@ -162,6 +164,9 @@ class FundingExtremeReversalStrategyConfig(FundingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategyConfig.validate")
         FundingStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -261,6 +266,7 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".FundingExtremeReversalStrategy")
 
     component_namespace = "strategy.funding.extreme_reversal"
     category: StrategyCategory = StrategyCategory.FUNDING
@@ -276,6 +282,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         funding_config: FundingExtremeReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy.__init__")
         resolved_funding_config = (
             funding_config or FundingExtremeReversalStrategyConfig()
         )
@@ -296,9 +305,15 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy.strategy_name")
         return "funding_extreme_reversal"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.extreme_config.required_funding_features)
 
@@ -306,6 +321,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         extreme = funding_item(context, "extreme")
@@ -465,6 +483,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
     # ------------------------------------------------------------------
 
     def _passes_extreme_thresholds(self, extreme: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._passes_extreme_thresholds")
         severity = self._extreme_severity(extreme)
         if severity < self.extreme_config.min_extreme_severity:
             return False
@@ -492,6 +513,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         side: SignalSide,
         pressure: Any,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._passes_pressure_filter")
         if pressure is None:
             return not self.extreme_config.require_high_pressure_level
 
@@ -509,6 +533,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return pressure_side in {side, opposite_side(side)}
 
     def _passes_regime_filter(self, regime: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._passes_regime_filter")
         if regime is None:
             return True
 
@@ -523,6 +550,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
     # ------------------------------------------------------------------
 
     def _derive_contrarian_side_from_extreme(self, extreme: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._derive_contrarian_side_from_extreme")
         explicit_side = side_from_bias(
             first_present(
                 extreme,
@@ -635,6 +665,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         flip: Any,
         funding_signal: Any,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._build_score_breakdown")
         extreme_score = self._extreme_score(extreme)
         extreme_confidence = self._extreme_confidence(extreme)
 
@@ -793,6 +826,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         ).normalize()
 
     def _extreme_score(self, extreme: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._extreme_score")
         base = unit_score(
             first_present(
                 extreme,
@@ -812,6 +848,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return unit_score(base + bonus)
 
     def _extreme_confidence(self, extreme: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._extreme_confidence")
         confidence = unit_score(
             first_present(
                 extreme,
@@ -828,6 +867,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return unit_score(confidence + bonus)
 
     def _extreme_severity(self, extreme: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._extreme_severity")
         return unit_score(
             first_present(
                 extreme,
@@ -844,6 +886,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
     def _mean_reversion_probability(self, extreme: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._mean_reversion_probability")
         return unit_score(
             first_present(
                 extreme,
@@ -859,6 +904,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
     def _squeeze_probability(self, extreme: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._squeeze_probability")
         return unit_score(
             first_present(
                 extreme,
@@ -875,6 +923,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
     def _has_reversal_risk(self, extreme: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._has_reversal_risk")
         explicit = first_present(
             extreme,
             (
@@ -899,6 +950,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
     def _pressure_score(self, pressure: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._pressure_score")
         if pressure is None:
             return 0.0
 
@@ -918,11 +972,17 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
     def _regime_score(self, regime: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._regime_score")
         if regime is None:
             return 0.0
         return extract_confidence(regime)
 
     def _pressure_side(self, pressure: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._pressure_side")
         if pressure is None:
             return SignalSide.UNKNOWN
 
@@ -942,6 +1002,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         )
 
     def _regime_side(self, regime: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._regime_side")
         if regime is None:
             return SignalSide.UNKNOWN
         return side_from_bias(extract_bias(regime))
@@ -952,6 +1015,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         side: SignalSide,
         pressure: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._pressure_reversal_confirmation")
         if not self.extreme_config.allow_pressure_release_confirmation:
             return 0.0
 
@@ -1013,6 +1079,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         side: SignalSide,
         regime: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._regime_confirmation")
         if not self.extreme_config.allow_regime_confirmation:
             return 0.0
 
@@ -1031,6 +1100,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         side: SignalSide,
         divergence: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._divergence_confirmation")
         if not self.extreme_config.allow_divergence_confirmation:
             return 0.0
 
@@ -1078,6 +1150,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         side: SignalSide,
         funding_signal: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._funding_signal_confirmation")
         if not self.extreme_config.allow_signal_confirmation:
             return 0.0
 
@@ -1126,6 +1201,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         side: SignalSide,
         flip: Any,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._flip_confirmation")
         if not self.extreme_config.allow_flip_confirmation:
             return 0.0
 
@@ -1187,6 +1265,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
     # ------------------------------------------------------------------
 
     def _extreme_type_bonus(self, extreme: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._extreme_type_bonus")
         labels = self._extreme_labels(extreme)
 
         bonus = 0.0
@@ -1206,6 +1287,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return unit_score(bonus)
 
     def _divergence_type_bonus(self, divergence: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._divergence_type_bonus")
         labels = self._divergence_labels(divergence)
 
         bonus = 0.0
@@ -1232,6 +1316,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return unit_score(bonus)
 
     def _extreme_labels(self, extreme: Any) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._extreme_labels")
         raw_values = [
             first_present(
                 extreme,
@@ -1266,6 +1353,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return self._labels_from_raw(raw_values)
 
     def _divergence_labels(self, divergence: Any) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._divergence_labels")
         raw_values = [
             first_present(
                 divergence,
@@ -1301,6 +1391,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
 
     @staticmethod
     def _labels_from_raw(raw_values: list[Any]) -> set[str]:
+        _strategy_logger = logging.getLogger(__name__ + ".FundingExtremeReversalStrategy._labels_from_raw")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._labels_from_raw")
         result: set[str] = set()
 
         for value in raw_values:
@@ -1318,6 +1411,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return result
 
     def _side_from_divergence_type(self, divergence: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._side_from_divergence_type")
         divergence_type = normalize_label(
             first_present(
                 divergence,
@@ -1341,6 +1437,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _signal_origin_alignment_weight(self, funding_signal: Any) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._signal_origin_alignment_weight")
         origin = normalize_label(
             first_present(
                 funding_signal,
@@ -1373,6 +1472,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         flip: Any,
         funding_signal: Any,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._source_features")
         features = [
             FUNDING_FEATURES.EXTREME,
             FUNDING_FEATURES.EXTREME_SEVERITY,
@@ -1411,6 +1513,9 @@ class FundingExtremeReversalStrategy(FundingTradingStrategy):
         divergence: Any,
         funding_signal: Any,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingExtremeReversalStrategy._tags")
         tags = [
             self.extreme_config.tag_funding,
             self.extreme_config.tag_extreme,

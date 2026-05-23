@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/whales/whale_accumulation_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,6 +58,7 @@ class WhaleAccumulationPayload:
     Direction convention:
     - buy-side accumulation -> LONG.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleAccumulationPayload")
 
     snapshot: WhaleCompositeSnapshot
     side: SignalSide
@@ -79,6 +81,7 @@ class WhaleAccumulationStrategyConfig(WhalesStrategyConfig):
     - exhaustion probability низька;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleAccumulationStrategyConfig")
 
     min_accumulation_score: float = 0.62
     min_accumulation_confidence: float = 0.56
@@ -155,6 +158,9 @@ class WhaleAccumulationStrategyConfig(WhalesStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategyConfig.validate")
         WhalesStrategyConfig.validate(self)
 
         unit_fields = {
@@ -259,6 +265,7 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleAccumulationStrategy")
 
     component_namespace = "strategy.whales.accumulation"
     category: StrategyCategory = StrategyCategory.WHALES
@@ -274,6 +281,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         whales_config: WhaleAccumulationStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy.__init__")
         resolved_whales_config = whales_config or WhaleAccumulationStrategyConfig()
         resolved_whales_config.validate()
 
@@ -292,10 +302,16 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy.strategy_name")
         return "whale_accumulation"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.WHALES,
@@ -337,6 +353,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.accumulation_config.required_whales_features
@@ -346,6 +365,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_whales_data(
@@ -470,6 +492,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> WhaleAccumulationPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._extract_payload")
         snapshot = self.resolve_whale_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -513,6 +538,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         self,
         snapshot: WhaleCompositeSnapshot,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._resolve_accumulation_side")
         for candidate in (
             snapshot.whale_side,
             snapshot.dominant_side,
@@ -543,6 +571,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
     # ------------------------------------------------------------------
 
     def _required_inputs(self) -> tuple[str, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._required_inputs")
         required = []
 
         if self.accumulation_config.require_activity_confirmation:
@@ -560,6 +591,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleAccumulationPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._passes_accumulation_filters")
         snapshot = payload.snapshot
 
         if self.accumulation_config.require_buy_side:
@@ -647,6 +681,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         context: StrategyContext,
         payload: WhaleAccumulationPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         inputs = snapshot.inputs()
 
@@ -813,6 +850,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleAccumulationPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._source_features")
         features = [
             *whale_accumulation_source_features(),
             WHALES_FEATURES.ACTIVITY,
@@ -841,6 +881,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleAccumulationPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._tags")
         tags = [
             self.accumulation_config.tag_whales,
             self.accumulation_config.tag_accumulation,
@@ -873,6 +916,9 @@ class WhaleAccumulationStrategy(WhalesTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAccumulationStrategy._execution_hints")
         return {
             "entry_offset_bps": self.accumulation_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.accumulation_config.execution_stop_buffer_bps_hint,

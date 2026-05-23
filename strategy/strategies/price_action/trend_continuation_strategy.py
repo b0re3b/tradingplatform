@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/price_action/trend_continuation_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -67,6 +68,7 @@ class TrendEventContext:
 
     Strategy-layer DTO only. Analytics models remain in analytics.price_action.
     """
+    _logger = logging.getLogger(__name__ + ".TrendEventContext")
 
     event_type: TrendEventType | None = None
     direction: TrendDirection | None = None
@@ -92,6 +94,9 @@ class TrendEventContext:
         *,
         fallback_layer: StructureLayer | None = None,
     ) -> TrendEventContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".TrendEventContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendEventContext.from_payload")
         if payload is None:
             return None
 
@@ -186,6 +191,7 @@ class TrendLayerContext:
     """
     Normalized trend layer view.
     """
+    _logger = logging.getLogger(__name__ + ".TrendLayerContext")
 
     direction: TrendDirection | None = None
     regime: TrendRegime | None = None
@@ -216,6 +222,9 @@ class TrendLayerContext:
         *,
         fallback_layer: StructureLayer | None = None,
     ) -> TrendLayerContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".TrendLayerContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendLayerContext.from_payload")
         if payload is None:
             return None
 
@@ -327,6 +336,7 @@ class TrendContinuationContextView:
     """
     Normalized trend-continuation view consumed by TrendContinuationStrategy.
     """
+    _logger = logging.getLogger(__name__ + ".TrendContinuationContextView")
 
     module: dict[str, Any]
     primary_layer: dict[str, Any]
@@ -363,6 +373,7 @@ class TrendContinuationStrategyConfig(PriceActionStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".TrendContinuationStrategyConfig")
 
     prefer_external_layer: bool = True
 
@@ -427,6 +438,9 @@ class TrendContinuationStrategyConfig(PriceActionStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategyConfig.validate")
         PriceActionStrategyConfig.validate(self)
 
         unit_fields = {
@@ -516,6 +530,7 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".TrendContinuationStrategy")
 
     component_namespace = "strategy.price_action.trend_continuation"
     category: StrategyCategory = StrategyCategory.PRICE_ACTION
@@ -531,6 +546,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         price_action_config: TrendContinuationStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy.__init__")
         resolved_price_action_config = (
             price_action_config or TrendContinuationStrategyConfig()
         )
@@ -551,10 +569,16 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy.strategy_name")
         return "trend_continuation"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.PRICE_ACTION,
@@ -597,6 +621,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.trend_config.required_price_action_features
@@ -606,6 +633,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_price_action_data(
@@ -801,6 +831,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> TrendContinuationContextView | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._extract_view")
         module = self.resolve_price_action_module(
             context,
             "trend",
@@ -907,6 +940,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         *,
         fallback: StructureLayer,
     ) -> StructureLayer:
+        _strategy_logger = logging.getLogger(__name__ + ".TrendContinuationStrategy._extract_layer_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._extract_layer_name")
         return (
             parse_structure_layer(
                 get_path(layer, "layer")
@@ -923,6 +959,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         primary: dict[str, Any],
         event: TrendEventContext | None,
     ) -> list[str]:
+        _strategy_logger = logging.getLogger(__name__ + ".TrendContinuationStrategy._extract_reasons")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._extract_reasons")
         reasons: list[str] = []
 
         for value in (
@@ -946,6 +985,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, view: TrendContinuationContextView) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._infer_side")
         trend = view.primary_trend
         if trend is None:
             return SignalSide.UNKNOWN
@@ -967,6 +1009,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         view: TrendContinuationContextView,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._passes_filters")
         trend = view.primary_trend
         if trend is None:
             return False
@@ -1026,6 +1071,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         view: TrendContinuationContextView,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._direction_alignment_ok")
         secondary = view.secondary_trend
         if secondary is None:
             return True
@@ -1047,6 +1095,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         view: TrendContinuationContextView,
         side: SignalSide,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._build_score_breakdown")
         trend = view.primary_trend
         if trend is None:
             return ScoreBreakdown()
@@ -1173,6 +1224,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, view: TrendContinuationContextView) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._source_features")
         features = [
             *trend_source_features(),
             PRICE_ACTION_FEATURES.TREND,
@@ -1191,6 +1245,9 @@ class TrendContinuationStrategy(PriceActionTradingStrategy):
         *,
         view: TrendContinuationContextView,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendContinuationStrategy._tags")
         tags = [
             self.trend_config.tag_price_action,
             self.trend_config.tag_trend,

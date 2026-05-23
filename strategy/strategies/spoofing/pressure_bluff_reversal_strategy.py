@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/pressure_bluff_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,6 +69,7 @@ class PressureBluffReversalPayload:
     - fake ASK pressure disappears / flips -> fake resistance removed -> LONG;
     - fake BID pressure disappears / flips -> fake support removed -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".PressureBluffReversalPayload")
 
     snapshot: SpoofingCompositeSnapshot
     side: SignalSide
@@ -78,22 +80,37 @@ class PressureBluffReversalPayload:
 
     @property
     def pressure_flip_strength(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalPayload.pressure_flip_strength")
         return extract_pressure_flip_strength(self.snapshot.raw_signal)
 
     @property
     def price_reaction_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalPayload.price_reaction_bps")
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def distance_from_mid_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalPayload.distance_from_mid_bps")
         return extract_distance_from_mid_bps(self.snapshot.raw_signal)
 
     @property
     def pull_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalPayload.pull_ratio")
         return extract_pull_ratio(self.snapshot.raw_signal)
 
     @property
     def fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalPayload.fill_ratio")
         return extract_fill_ratio(self.snapshot.raw_signal)
 
 
@@ -108,6 +125,7 @@ class PressureBluffReversalStrategyConfig(SpoofingStrategyConfig):
     - market reaction confirms unwind/reversal direction;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".PressureBluffReversalStrategyConfig")
 
     min_pressure_bluff_score: float = 0.70
     min_pressure_bluff_confidence: float = 0.60
@@ -172,6 +190,9 @@ class PressureBluffReversalStrategyConfig(SpoofingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategyConfig.validate")
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
@@ -269,6 +290,7 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".PressureBluffReversalStrategy")
 
     component_namespace = "strategy.spoofing.pressure_bluff_reversal"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -284,6 +306,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         spoofing_config: PressureBluffReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy.__init__")
         resolved_spoofing_config = (
             spoofing_config or PressureBluffReversalStrategyConfig()
         )
@@ -304,10 +329,16 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy.strategy_name")
         return "pressure_bluff_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPOOFING,
@@ -347,6 +378,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.pressure_config.required_spoofing_features)
 
@@ -354,6 +388,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spoofing_data(
@@ -488,6 +525,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> PressureBluffReversalPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._extract_payload")
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -530,6 +570,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._supports_snapshot")
         return (
             snapshot.spoofing_type is SpoofingType.FLIP_PRESSURE
             or snapshot.pattern is SpoofingPattern.PRESSURE_BLUFF
@@ -541,6 +584,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: PressureBluffReversalPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._passes_pressure_filters")
         snapshot = payload.snapshot
 
         if self.pressure_config.require_flip_pressure_detector:
@@ -612,6 +658,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         context: StrategyContext,
         payload: PressureBluffReversalPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         base_component = average_score(
@@ -735,6 +784,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: PressureBluffReversalPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._distance_component")
         max_distance = max(self.pressure_config.max_distance_from_mid_bps, 0.0001)
         return unit_score(1.0 - (payload.distance_from_mid_bps / max_distance))
 
@@ -746,6 +798,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: PressureBluffReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._source_features")
         features = [
             *pressure_bluff_source_features(),
             SPOOFING_FEATURES.SIGNAL,
@@ -769,6 +824,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: PressureBluffReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._tags")
         tags = [
             self.pressure_config.tag_spoofing,
             self.pressure_config.tag_pressure_bluff,
@@ -798,6 +856,9 @@ class PressureBluffReversalStrategy(SpoofingTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PressureBluffReversalStrategy._execution_hints")
         return {
             "entry_offset_bps": self.pressure_config.entry_offset_bps_hint,
             "stop_buffer_bps": self.pressure_config.stop_buffer_bps_hint,

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/funding/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -282,6 +283,7 @@ class FundingFeatureNames:
     analytics.funding.* events. Concrete funding strategies can require a subset
     through StrategyDefinitionConfig.required_features.
     """
+    _logger = logging.getLogger(__name__ + ".FundingFeatureNames")
 
     SNAPSHOT: str = "funding.snapshot"
     STATISTICS: str = "funding.statistics"
@@ -319,6 +321,9 @@ class FundingFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".FundingFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -343,6 +348,7 @@ class FundingStrategyScope:
 
     Concrete strategies should still make decisions from StrategyContext.
     """
+    _logger = logging.getLogger(__name__ + ".FundingStrategyScope")
 
     exchange: str
     market_type: str
@@ -351,6 +357,9 @@ class FundingStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingStrategyScope.__post_init__")
         exchange = str(self.exchange or "unknown").strip().lower()
         market_type = str(
             self.market_type or StrategyMarketType.USDM_FUTURES.value
@@ -370,13 +379,22 @@ class FundingStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingStrategyScope.key")
         return f"{self.exchange}:{self.market_type}:{self.symbol}:{self.timeframe}"
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingStrategyScope.legacy_key")
         return f"{self.symbol}:{self.exchange}"
 
     def to_dict(self) -> dict[str, str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -402,6 +420,7 @@ class FundingStrategyConfig:
     thresholds / metadata defaults. Runtime enabled/symbol/timeframe/regime
     checks still belong to StrategyDefinitionConfig / StrategyRuntimeConfig.
     """
+    _logger = logging.getLogger(__name__ + ".FundingStrategyConfig")
 
     default_market_type: StrategyMarketType = StrategyMarketType.USDM_FUTURES
     default_margin_mode: StrategyMarginMode = StrategyMarginMode.ISOLATED
@@ -441,6 +460,9 @@ class FundingStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingStrategyConfig.validate")
         bounded = {
             "min_context_confidence": self.min_context_confidence,
             "min_signal_confidence": self.min_signal_confidence,
@@ -504,6 +526,7 @@ class FundingTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no parquet/history persistence.
     """
+    _logger = logging.getLogger(__name__ + ".FundingTradingStrategy")
 
     component_namespace = "strategy.funding"
     category: StrategyCategory = StrategyCategory.FUNDING
@@ -522,6 +545,9 @@ class FundingTradingStrategy(TradingStrategy):
         funding_config: FundingStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.__init__")
         self.funding_config = funding_config or FundingStrategyConfig()
         self.funding_config.validate()
 
@@ -534,6 +560,9 @@ class FundingTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.validate_config")
         super().validate_config()
         self.funding_config.validate()
 
@@ -548,6 +577,9 @@ class FundingTradingStrategy(TradingStrategy):
         SignalNormalizer / StrategyContextBuilder should populate this from
         analytics.funding.* payloads.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_domain")
         self.validate_context(context)
         domain = context.domain_dict(FeatureSource.FUNDING)
         return dict(domain)
@@ -558,6 +590,9 @@ class FundingTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_item")
         domain = self.funding_domain(context)
 
         if key in domain:
@@ -594,6 +629,9 @@ class FundingTradingStrategy(TradingStrategy):
         2. Feature name prefixed with 'funding.';
         3. Funding domain data dotted path.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_path")
         self.validate_context(context)
 
         if not path.strip():
@@ -625,6 +663,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_float")
         return _to_float(self.funding_path(context, path, default), default)
 
     def funding_score(
@@ -634,6 +675,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_score")
         value = self.funding_float(context, path, default=default)
         return clamp(float(value if value is not None else default), 0.0, 1.0)
 
@@ -644,6 +688,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_signed_score")
         value = self.funding_float(context, path, default=default)
         return clamp(float(value if value is not None else default), -1.0, 1.0)
 
@@ -654,6 +701,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_abs_score")
         return abs(self.funding_signed_score(context, path, default=default))
 
     def funding_bool(
@@ -663,6 +713,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_bool")
         return _to_bool(self.funding_path(context, path, default), default)
 
     def funding_str(
@@ -672,6 +725,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_str")
         value = self.funding_path(context, path, default)
         if value is None:
             return default
@@ -688,6 +744,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_datetime")
         return parse_datetime(self.funding_path(context, path, default))
 
     def funding_feature_snapshot(
@@ -701,6 +760,9 @@ class FundingTradingStrategy(TradingStrategy):
         This method is best-effort because StrategyContext may store either raw
         values or FeatureSnapshot objects depending on normalization.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_feature_snapshot")
         self.validate_context(context)
 
         if not feature_name.strip():
@@ -719,6 +781,9 @@ class FundingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_feature_age_seconds")
         snapshot = self.funding_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -731,6 +796,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         max_age_seconds: float | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_feature_is_fresh")
         age = self.funding_feature_age_seconds(context, feature_name)
         if age is None:
             return True
@@ -751,6 +819,9 @@ class FundingTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def funding_scope(self, context: StrategyContext) -> FundingStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_scope")
         self.validate_context(context)
 
         metadata = dict(context.metadata or {})
@@ -803,6 +874,9 @@ class FundingTradingStrategy(TradingStrategy):
         source_features: list[str] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.funding_context_metadata")
         metadata: dict[str, Any] = {
             "feature_source": FeatureSource.FUNDING.value,
             "strategy_category": StrategyCategory.FUNDING.value,
@@ -848,6 +922,9 @@ class FundingTradingStrategy(TradingStrategy):
         context: StrategyContext,
         source_features: list[str],
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy._selected_feature_values")
         result: dict[str, Any] = {}
 
         for feature in source_features:
@@ -873,6 +950,9 @@ class FundingTradingStrategy(TradingStrategy):
         """
         Convert normalized funding bias/direction into strategy-side signal side.
         """
+        _strategy_logger = logging.getLogger(__name__ + ".FundingTradingStrategy.side_from_bias")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.side_from_bias")
         if isinstance(value, SignalSide):
             return value
 
@@ -915,6 +995,9 @@ class FundingTradingStrategy(TradingStrategy):
 
     @staticmethod
     def opposite_side(side: SignalSide) -> SignalSide:
+        _strategy_logger = logging.getLogger(__name__ + ".FundingTradingStrategy.opposite_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.opposite_side")
         if side is SignalSide.LONG:
             return SignalSide.SHORT
         if side is SignalSide.SHORT:
@@ -929,6 +1012,9 @@ class FundingTradingStrategy(TradingStrategy):
         negative_side: SignalSide = SignalSide.SHORT,
         dead_zone: float = 0.0,
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.side_from_signed_value")
         parsed = _to_float(value)
         if parsed is None:
             return SignalSide.UNKNOWN
@@ -942,6 +1028,9 @@ class FundingTradingStrategy(TradingStrategy):
         return SignalSide.UNKNOWN
 
     def contrarian_side_from_funding_bias(self, value: Any) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.contrarian_side_from_funding_bias")
         return self.opposite_side(self.side_from_bias(value))
 
     # ------------------------------------------------------------------
@@ -957,6 +1046,9 @@ class FundingTradingStrategy(TradingStrategy):
         bias_path: str = "regime.bias",
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.regime_alignment_score")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             return 0.0
 
@@ -977,6 +1069,9 @@ class FundingTradingStrategy(TradingStrategy):
         direction_path: str = "pressure.direction",
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.pressure_alignment_score")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             return 0.0
 
@@ -998,6 +1093,9 @@ class FundingTradingStrategy(TradingStrategy):
         bias_path: str = "signal.bias",
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.signal_alignment_score")
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
             return 0.0
 
@@ -1020,6 +1118,9 @@ class FundingTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".FundingTradingStrategy.weighted_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.weighted_score")
         total_weight = 0.0
         total_value = 0.0
 
@@ -1048,6 +1149,9 @@ class FundingTradingStrategy(TradingStrategy):
         confirmation_weight: float = 0.15,
         freshness_weight: float = 0.05,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.confidence_from_components")
         return self.weighted_score(
             {
                 "primary": primary,
@@ -1089,6 +1193,9 @@ class FundingTradingStrategy(TradingStrategy):
         owns final risk-ready enrichment and will parse fallback values before
         RiskReadySignalPayload conversion.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.build_funding_trade_metadata")
         priority = self.build_priority_metadata(
             setup_quality=setup_quality,
             confluence_score=confluence_score,
@@ -1144,6 +1251,9 @@ class FundingTradingStrategy(TradingStrategy):
         SignalBuilder may later replace/enrich these plans before converting the
         signal into RiskReadySignalPayload.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.build_basic_funding_plans")
         self.validate_context(context)
 
         if side not in {SignalSide.LONG, SignalSide.SHORT}:
@@ -1204,6 +1314,9 @@ class FundingTradingStrategy(TradingStrategy):
         return entry, exit_plan, invalidation
 
     def scope_from_context(self, context: StrategyContext) -> FundingStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.scope_from_context")
         domain = self.funding_domain(context)
         scope = domain.get("scope")
         if not isinstance(scope, dict):
@@ -1263,6 +1376,9 @@ class FundingTradingStrategy(TradingStrategy):
         This is NOT a risk-ready payload. SignalProcessor / SignalBuilder owns
         final signal.generated payload creation for RiskManager.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.build_funding_signal")
         self.validate_context_requirements(context)
 
         domain = self.funding_domain(context)
@@ -1340,6 +1456,9 @@ class FundingTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def validate_context_requirements(self, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.validate_context_requirements")
         super().validate_context_requirements(context)
 
         domain = self.funding_domain(context)
@@ -1354,6 +1473,9 @@ class FundingTradingStrategy(TradingStrategy):
             )
 
     def supports_regime(self, regime: MarketRegime) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingTradingStrategy.supports_regime")
         return super().supports_regime(regime)
 
 

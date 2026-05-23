@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 
 import inspect
 from dataclasses import dataclass, field
@@ -155,6 +156,7 @@ def _parse_enum(enum_cls: type[EnumT], value: Any, default: EnumT) -> EnumT:
 
 @dataclass(slots=True)
 class NormalizedPayload:
+    _logger = logging.getLogger(__name__ + ".NormalizedPayload")
     source: FeatureSource
     symbol: str
     timestamp: datetime
@@ -165,11 +167,15 @@ class NormalizedPayload:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering NormalizedPayload.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
 
 @dataclass(slots=True)
 class RouteDecision:
+    _logger = logging.getLogger(__name__ + ".RouteDecision")
     event_name: str
     symbol: str
     source: FeatureSource | None = None
@@ -181,23 +187,36 @@ class RouteDecision:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RouteDecision.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     @property
     def selected_names(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RouteDecision.selected_names")
         return [strategy.strategy_name for strategy in self.selected]
 
     @property
     def total_selected(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RouteDecision.total_selected")
         return len(self.selected)
 
     @property
     def is_empty(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering RouteDecision.is_empty")
         return not self.selected
 
 
 @dataclass(slots=True)
 class WeightedSignal:
+    _logger = logging.getLogger(__name__ + ".WeightedSignal")
     signal: StrategySignal
     category_weight: float
     regime_weight: float
@@ -208,6 +227,9 @@ class WeightedSignal:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WeightedSignal.validate")
         self.signal.validate()
 
         if self.category_weight < 0:
@@ -222,6 +244,7 @@ class WeightedSignal:
 
 @dataclass(slots=True)
 class VoteSummary:
+    _logger = logging.getLogger(__name__ + ".VoteSummary")
     total_votes: int = 0
     long_votes: int = 0
     short_votes: int = 0
@@ -235,12 +258,16 @@ class VoteSummary:
 
 @dataclass(slots=True)
 class ConflictSummary:
+    _logger = logging.getLogger(__name__ + ".ConflictSummary")
     accepted: bool = True
     total_penalty: float = 0.0
     conflicts: list[ConflictRecord] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
 
     def add_conflict(self, conflict: ConflictRecord) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConflictSummary.add_conflict")
         conflict.validate()
         self.conflicts.append(conflict)
         self.total_penalty += conflict.penalty
@@ -248,6 +275,7 @@ class ConflictSummary:
 
 @dataclass(slots=True)
 class ConfluenceEvaluation:
+    _logger = logging.getLogger(__name__ + ".ConfluenceEvaluation")
     symbol: str
     timestamp: datetime
     raw_signals: list[StrategySignal] = field(default_factory=list)
@@ -260,19 +288,29 @@ class ConfluenceEvaluation:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceEvaluation.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     @property
     def accepted(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceEvaluation.accepted")
         return self.result is not None and self.result.accepted
 
     @property
     def selected_strategy_names(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceEvaluation.selected_strategy_names")
         return [signal.strategy_name for signal in self.accepted_signals]
 
 
 @dataclass(slots=True)
 class FilterEvaluation:
+    _logger = logging.getLogger(__name__ + ".FilterEvaluation")
     signal: StrategySignal
     context_symbol: str
     timestamp: datetime = field(default_factory=utcnow)
@@ -284,9 +322,15 @@ class FilterEvaluation:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterEvaluation.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     def add_result(self, result: FilterResult) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterEvaluation.add_result")
         result.validate()
         self.results.append(result)
 
@@ -303,15 +347,22 @@ class FilterEvaluation:
 
     @property
     def has_warnings(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterEvaluation.has_warnings")
         return bool(self.warning_filters)
 
     @property
     def has_blocks(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterEvaluation.has_blocks")
         return bool(self.blocking_filters)
 
 
 @dataclass(slots=True)
 class BuildEvaluation:
+    _logger = logging.getLogger(__name__ + ".BuildEvaluation")
     signal: StrategySignal
     context_symbol: str
     entry: EntryPlan | None = None
@@ -324,6 +375,9 @@ class BuildEvaluation:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def reject(self, reason: str) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering BuildEvaluation.reject")
         self.accepted = False
         if reason not in self.reasons:
             self.reasons.append(reason)
@@ -331,6 +385,7 @@ class BuildEvaluation:
 
 @dataclass(slots=True)
 class CoordinationDecision:
+    _logger = logging.getLogger(__name__ + ".CoordinationDecision")
     symbol: str
     timestamp: datetime
     raw_signals: list[StrategySignal] = field(default_factory=list)
@@ -344,19 +399,29 @@ class CoordinationDecision:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CoordinationDecision.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
     @property
     def final_signals(self) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CoordinationDecision.final_signals")
         return self.merged_signals if self.merged_signals else self.accepted_signals
 
     @property
     def selected_names(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CoordinationDecision.selected_names")
         return [signal.strategy_name for signal in self.final_signals]
 
 
 @dataclass(slots=True)
 class ProcessedSignalBatch:
+    _logger = logging.getLogger(__name__ + ".ProcessedSignalBatch")
     symbol: str
     timestamp: datetime
     normalized: NormalizedPayload | None = None
@@ -376,6 +441,9 @@ class ProcessedSignalBatch:
     debug: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ProcessedSignalBatch.__post_init__")
         self.timestamp = ensure_aware_utc(self.timestamp)
 
 
@@ -399,6 +467,7 @@ class SignalNormalizer(BaseStrategyComponent):
     context.domain_dict(source), while also producing FeatureSnapshot entries
     for registry routing and required_features checks.
     """
+    _logger = logging.getLogger(__name__ + ".SignalNormalizer")
 
     component_namespace = "strategy.processor.normalizer"
 
@@ -474,6 +543,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _as_mapping_or_none(value: Any) -> dict[str, Any] | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._as_mapping_or_none")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._as_mapping_or_none")
         if isinstance(value, dict):
             return value
 
@@ -487,6 +559,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _topic_from_payload(payload: dict[str, Any]) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._topic_from_payload")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._topic_from_payload")
         return (
             str(
                 payload.get("event_name")
@@ -515,6 +590,9 @@ class SignalNormalizer(BaseStrategyComponent):
         analytics.price_action.market_structure.updated.  This helper lets the
         topic decide the canonical section while preserving typed objects.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._direct_payload_value")
         feature_map = feature_map if isinstance(feature_map, dict) else {}
         for key in (
                 "state",
@@ -538,6 +616,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
     ) -> str | None:
         """Infer canonical domain section from the analytics topic."""
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._direct_topic_section")
         topic = self._topic_from_payload(payload)
         if not topic:
             return None
@@ -696,6 +777,9 @@ class SignalNormalizer(BaseStrategyComponent):
             domain_data: dict[str, Any],
     ) -> None:
         """Expose direct analytics event payload under its canonical section."""
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._apply_direct_topic_section_alias")
         section = self._direct_topic_section(source, payload)
         if not section:
             return
@@ -801,6 +885,9 @@ class SignalNormalizer(BaseStrategyComponent):
             section: str,
     ) -> Any:
         """Wrap flat price-action module events into internal/external layer views."""
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._wrap_price_action_module_view")
         module_map = self._as_mapping_or_none(module)
         if module_map is None:
             return module
@@ -865,6 +952,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - do NOT synthesize extreme/divergence/flip/signal unless analytics
           explicitly supplied a detected/actionable context.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_funding_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -1277,6 +1367,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - enriches flat payload into sections only when meaningful;
         - does not synthesize trade setup sections.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_orderflow_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -1796,6 +1889,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - it does NOT synthesize anomaly/divergence sections unless analytics
           actually supplied a detected anomaly/divergence context.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_open_interest_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -2317,6 +2413,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - does NOT synthesize cascade/exhaustion/squeeze/signal sections unless
           analytics explicitly supplied a detected/actionable context.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_liquidations_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -2818,6 +2917,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - enriches context scores only when they are present;
         - does NOT fabricate a liquidity snapshot from a generic flat payload.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_liquidity_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -3215,6 +3317,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - enriches composite/state only from real price-action sections;
         - does not synthesize strategy setup sections without explicit signal/setup.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_price_action_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -3744,6 +3849,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _direction_to_long_short(value: Any) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._direction_to_long_short")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._direction_to_long_short")
         text = str(value or "").strip().lower()
         if text in {"long", "buy", "bull", "bullish", "up", "uptrend"}:
             return "long"
@@ -3766,6 +3874,9 @@ class SignalNormalizer(BaseStrategyComponent):
         internal layer and then read last_break_event / last_event from it.
         Backtests often emit a flat event payload, so the adapter must wrap it.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._ensure_price_action_market_structure_view")
         result = dict(module)
 
         event = dict(event_payload)
@@ -3868,6 +3979,9 @@ class SignalNormalizer(BaseStrategyComponent):
         Convert a direct analytics.price_action.trend event into the
         external/internal layer shape consumed by TrendContinuationStrategy.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._ensure_price_action_trend_view")
         result = dict(module)
 
         event = dict(event_payload)
@@ -4026,6 +4140,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - keeps detector-specific details available for concrete spoofing
           strategies without duplicating detector logic in strategies.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_spoofing_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -4515,6 +4632,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - does not synthesize setup/signal/opportunity unless analytics supplied it;
         - does not collapse spot_futures/cross_exchange structure.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_spreads_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -4974,6 +5094,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - does not create trade signals or risk-ready payloads;
         - concrete whale strategies remain StrategyContext decision modules.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_whales_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -5534,6 +5657,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._augment_domain_data_contracts")
         if source is FeatureSource.OPEN_INTEREST:
             self._augment_open_interest_domain_data(
                 payload=payload,
@@ -5613,6 +5739,9 @@ class SignalNormalizer(BaseStrategyComponent):
         guarantees basic contract metadata and the original analytics payload
         for diagnostics / fallback-free debugging.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._ensure_common_domain_contract")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -5656,6 +5785,9 @@ class SignalNormalizer(BaseStrategyComponent):
         ``context.domain_dict(FeatureSource.SYSTEM)["hybrid"]`` and native
         source domains, never raw analytics payloads.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_cross_domain_contracts")
         if source not in {
             FeatureSource.OPEN_INTEREST,
             FeatureSource.FUNDING,
@@ -5691,6 +5823,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_hybrid_domain_data")
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -5801,6 +5936,9 @@ class SignalNormalizer(BaseStrategyComponent):
         - Full multi-domain aggregation should still be done by StrategyContextBuilder
           or a context-aware normalizer step that can see all current domain sections.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_hybrid_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -6269,6 +6407,9 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime | None = None,
     ) -> NormalizedPayload:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer.normalize_event")
         if not event_name.strip():
             raise SignalNormalizationError("event_name cannot be empty")
         if not isinstance(payload, dict):
@@ -6356,6 +6497,9 @@ class SignalNormalizer(BaseStrategyComponent):
         context: StrategyContext,
         normalized: NormalizedPayload,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer.apply_to_context")
         context.validate()
 
         if context.symbol != normalized.symbol:
@@ -6433,6 +6577,9 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime | None = None,
     ) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer.normalize_and_apply")
         normalized = self.normalize_event(
             event_name=event_name,
             payload=payload,
@@ -6441,6 +6588,9 @@ class SignalNormalizer(BaseStrategyComponent):
         return self.apply_to_context(context, normalized)
 
     def _resolve_source(self, event_name: str, payload: dict[str, Any]) -> FeatureSource:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._resolve_source")
         explicit = payload.get("source")
 
         if isinstance(explicit, FeatureSource):
@@ -6466,6 +6616,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _resolve_source_from_text(value: str) -> FeatureSource | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._resolve_source_from_text")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._resolve_source_from_text")
         text = value.lower()
 
         if "orderflow" in text or "cvd" in text or "imbalance" in text or "volume_delta" in text:
@@ -6491,6 +6644,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @classmethod
     def _resolve_source_from_payload(cls, payload: dict[str, Any]) -> FeatureSource | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SignalNormalizer")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._resolve_source_from_payload")
         candidates = [
             payload.get("metric"),
             payload.get("category"),
@@ -6509,6 +6665,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _extract_symbol(payload: dict[str, Any]) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._extract_symbol")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_symbol")
         raw = (
             payload.get("symbol")
             or payload.get("instrument")
@@ -6531,6 +6690,9 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         fallback: datetime | None = None,
     ) -> datetime:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._extract_timestamp")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_timestamp")
         raw = (
             payload.get("timestamp")
             or payload.get("ts")
@@ -6560,6 +6722,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @classmethod
     def _extract_timeframe(cls, payload: dict[str, Any]) -> Timeframe:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SignalNormalizer")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_timeframe")
         raw = payload.get("timeframe")
 
         if raw is None:
@@ -6584,6 +6749,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @classmethod
     def _extract_domain_data(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SignalNormalizer")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_domain_data")
         return {
             key: value
             for key, value in payload.items()
@@ -6598,6 +6766,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_contract_features")
         result: list[FeatureSnapshot] = []
 
         if source is FeatureSource.OPEN_INTEREST:
@@ -6705,6 +6876,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_whales_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -7268,6 +7442,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_spreads_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -7734,6 +7911,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_spoofing_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -8125,6 +8305,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_price_action_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -8696,6 +8879,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_liquidity_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -9062,6 +9248,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_liquidations_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -9577,6 +9766,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_orderflow_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -10187,6 +10379,9 @@ class SignalNormalizer(BaseStrategyComponent):
         is actually present/detected. This prevents the registry from routing
         OI divergence/anomaly/capitulation strategies on generic OI updates.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_open_interest_contract_features")
         result: list[FeatureSnapshot] = []
         confidence = payload.get("confidence", 0.0)
 
@@ -10611,6 +10806,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_funding_contract_features")
         result: list[FeatureSnapshot] = []
 
         confidence = payload.get("confidence", 0.0)
@@ -11025,6 +11223,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_features")
         result: dict[str, FeatureSnapshot] = {}
 
         for snapshot in self._extract_explicit_features(
@@ -11077,6 +11278,9 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_explicit_features")
         explicit = payload.get("features")
         if explicit is None:
             return []
@@ -11145,6 +11349,9 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_feature_map")
         feature_map = payload.get("feature_map")
         if feature_map is None:
             return []
@@ -11184,6 +11391,9 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._extract_nested_features")
         result: list[FeatureSnapshot] = []
         default_confidence = payload.get("confidence", payload.get("strength", 0.0))
 
@@ -11234,6 +11444,9 @@ class SignalNormalizer(BaseStrategyComponent):
         payload: dict[str, Any],
         timestamp: datetime,
     ) -> list[FeatureSnapshot]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._build_implicit_features")
         base_confidence = self._safe_confidence(payload.get("confidence", 0.0))
         result: list[FeatureSnapshot] = []
 
@@ -11267,6 +11480,9 @@ class SignalNormalizer(BaseStrategyComponent):
         default_confidence: Any,
         metadata: dict[str, Any] | None = None,
     ) -> FeatureSnapshot:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._snapshot_from_feature_item")
         name = item.get("name")
         if not isinstance(name, str) or not name.strip():
             raise SignalNormalizationError("feature item must contain non-empty 'name'")
@@ -11307,6 +11523,9 @@ class SignalNormalizer(BaseStrategyComponent):
         confidence: Any,
         metadata: dict[str, Any] | None = None,
     ) -> FeatureSnapshot:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._snapshot_from_raw_value")
         feature_name = self._normalize_feature_name(name)
         snapshot = FeatureSnapshot(
             name=feature_name,
@@ -11331,6 +11550,9 @@ class SignalNormalizer(BaseStrategyComponent):
         leaf_name: str,
         payload: dict[str, Any],
     ) -> list[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SignalNormalizer")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._feature_name_candidates")
         metric = payload.get("metric")
         names: list[str] = []
 
@@ -11356,6 +11578,9 @@ class SignalNormalizer(BaseStrategyComponent):
         prefix: str = "",
         max_depth: int = 4,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SignalNormalizer")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._flatten_scalar_dict")
         if max_depth <= 0:
             return {}
 
@@ -11387,10 +11612,16 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _is_feature_scalar(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._is_feature_scalar")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._is_feature_scalar")
         return isinstance(value, (int, float, bool, str)) and value is not None
 
     @staticmethod
     def _normalize_feature_name(value: str) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._normalize_feature_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._normalize_feature_name")
         return (
             str(value)
             .strip()
@@ -11404,6 +11635,9 @@ class SignalNormalizer(BaseStrategyComponent):
         feature_name: str,
         explicit: Any,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._resolve_freshness_seconds")
         if explicit is not None:
             explicit_f = _to_float(explicit)
             if explicit_f is None or explicit_f <= 0:
@@ -11416,11 +11650,17 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _safe_confidence(value: Any) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._safe_confidence")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._safe_confidence")
         parsed = _to_float(value, default=0.0)
         return clamp(parsed if parsed is not None else 0.0, 0.0, 1.0)
 
     @staticmethod
     def _safe_normalized_value(value: Any) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._safe_normalized_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._safe_normalized_value")
         parsed = _to_float(value)
         if parsed is None:
             return None
@@ -11428,6 +11668,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
     @staticmethod
     def _infer_normalized_value(value: Any) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalNormalizer._infer_normalized_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalNormalizer._infer_normalized_value")
         if isinstance(value, bool):
             return 1.0 if value else 0.0
 
@@ -11450,6 +11693,7 @@ class SignalRouter(BaseStrategyComponent):
     """
     Selects strategies for analytics events and emits final risk-ready signals.
     """
+    _logger = logging.getLogger(__name__ + ".SignalRouter")
 
     component_namespace = "strategy.processor.router"
 
@@ -11460,6 +11704,9 @@ class SignalRouter(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter.__init__")
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
         self.registry = registry
         self.routing_config: RoutingConfig = config.routing
@@ -11473,6 +11720,9 @@ class SignalRouter(BaseStrategyComponent):
         changed_features: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> RouteDecision:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter.route")
         if not event_name.strip():
             raise SignalRoutingError("event_name cannot be empty")
 
@@ -11526,6 +11776,9 @@ class SignalRouter(BaseStrategyComponent):
         """
         Emit the final signal.generated event consumed by RiskManager.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter.emit_signal_generated")
         payload.validate()
 
         await self.emit_event(
@@ -11543,6 +11796,9 @@ class SignalRouter(BaseStrategyComponent):
         reason: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter.emit_signal_rejected")
         payload = {
             "signal_id": getattr(signal, "signal_id", None),
             "symbol": symbol,
@@ -11560,6 +11816,9 @@ class SignalRouter(BaseStrategyComponent):
 
     @staticmethod
     def _event_priority(payload: RiskReadySignalPayload) -> EventPriority:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalRouter._event_priority")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter._event_priority")
         if payload.priority_score >= 0.85:
             return EventPriority.HIGH
         return EventPriority.NORMAL
@@ -11570,6 +11829,9 @@ class SignalRouter(BaseStrategyComponent):
             event_name: str,
             source: FeatureSource | None,
     ) -> list[StrategyCategory]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter._resolve_categories")
         categories = self.routing_config.categories_for_event(event_name)
 
         if categories:
@@ -11594,6 +11856,9 @@ class SignalRouter(BaseStrategyComponent):
 
     @staticmethod
     def _map_source_to_category(source: FeatureSource) -> StrategyCategory | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalRouter._map_source_to_category")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter._map_source_to_category")
         mapping = {
             FeatureSource.ORDERFLOW: StrategyCategory.ORDERFLOW,
             FeatureSource.LIQUIDITY: StrategyCategory.LIQUIDITY,
@@ -11617,6 +11882,7 @@ class SignalScorer(BaseStrategyComponent):
     """
     Scores and enriches StrategySignal objects before confluence/filter/build.
     """
+    _logger = logging.getLogger(__name__ + ".SignalScorer")
 
     component_namespace = "strategy.processor.scorer"
 
@@ -11626,6 +11892,9 @@ class SignalScorer(BaseStrategyComponent):
         signal: StrategySignal,
         context: StrategyContext,
     ) -> StrategySignal:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer.score_signal")
         signal.validate()
         context.validate()
 
@@ -11655,6 +11924,9 @@ class SignalScorer(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext,
     ) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer.score_many")
         return [self.score_signal(signal=signal, context=context) for signal in signals]
 
     def score_signals(
@@ -11663,6 +11935,9 @@ class SignalScorer(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext | None = None,
     ) -> ConfluenceResult:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer.score_signals")
         if not signals:
             raise ConfluenceError("signals cannot be empty")
 
@@ -11697,6 +11972,9 @@ class SignalScorer(BaseStrategyComponent):
         signal: StrategySignal,
         context: StrategyContext,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._calculate_priority_score")
         components = signal.metadata.get("priority_components")
 
         if isinstance(components, dict):
@@ -11742,6 +12020,9 @@ class SignalScorer(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext | None,
     ) -> list[WeightedSignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._apply_weights")
         result: list[WeightedSignal] = []
 
         for signal in signals:
@@ -11773,6 +12054,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _summarize_votes(signals: list[StrategySignal]) -> VoteSummary:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._summarize_votes")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._summarize_votes")
         summary = VoteSummary(total_votes=len(signals))
 
         for signal in signals:
@@ -11807,6 +12091,9 @@ class SignalScorer(BaseStrategyComponent):
         signals: list[StrategySignal],
         dominant_side: SignalSide,
     ) -> ConflictSummary:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._resolve_conflicts")
         summary = ConflictSummary()
 
         for signal in signals:
@@ -11835,6 +12122,9 @@ class SignalScorer(BaseStrategyComponent):
         vote_summary: VoteSummary,
         conflict_summary: ConflictSummary,
     ) -> ConfluenceResult:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._to_confluence_result")
         if not weighted_signals:
             raise ConfluenceError("weighted_signals cannot be empty")
 
@@ -11897,6 +12187,9 @@ class SignalScorer(BaseStrategyComponent):
         )
 
     def _confidence_grade(self, confidence: float) -> ConfidenceGrade:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._confidence_grade")
         value = clamp(confidence, 0.0, 1.0)
         very_low, low, medium, high = self.config.confidence.grade_bounds()
 
@@ -11911,6 +12204,9 @@ class SignalScorer(BaseStrategyComponent):
         return ConfidenceGrade.VERY_LOW
 
     def _confidence_strength(self, confidence: float) -> SignalStrength:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._confidence_strength")
         value = clamp(confidence, 0.0, 1.0)
         _, low, medium, high = self.config.confidence.grade_bounds()
 
@@ -11924,6 +12220,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _tier_from_priority_score(value: float) -> StrategyTradeTier:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._tier_from_priority_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._tier_from_priority_score")
         score = clamp(value, 0.0, 1.0)
         if score >= 0.88:
             return StrategyTradeTier.T4
@@ -11934,6 +12233,9 @@ class SignalScorer(BaseStrategyComponent):
         return StrategyTradeTier.T1
 
     def _liquidity_class(self, context: StrategyContext) -> StrategyLiquidityClass:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._liquidity_class")
         score = self._liquidity_score(context)
 
         if score >= 0.90:
@@ -11949,6 +12251,9 @@ class SignalScorer(BaseStrategyComponent):
         return StrategyLiquidityClass.SHITCOIN
 
     def _execution_quality(self, signal: StrategySignal) -> StrategyExecutionQuality:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._execution_quality")
         score = self._execution_quality_score(signal)
 
         if score >= 0.90:
@@ -11963,6 +12268,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _liquidity_score(context: StrategyContext) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._liquidity_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._liquidity_score")
         for name in ("liquidity_score", "market_liquidity_score", "depth_score"):
             value = context.get_feature(name, None)
             parsed = _to_float(value)
@@ -11973,6 +12281,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _risk_reward_score(signal: StrategySignal) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._risk_reward_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._risk_reward_score")
         rr = _to_float(signal.metadata.get("rr"))
 
         if rr is None:
@@ -12009,6 +12320,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _execution_quality_score(signal: StrategySignal) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._execution_quality_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._execution_quality_score")
         raw_score = _to_float(signal.metadata.get("execution_quality_score"))
         if raw_score is not None:
             return clamp(raw_score, 0.0, 1.0)
@@ -12030,6 +12344,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _regime_alignment_score(signal: StrategySignal, context: StrategyContext) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._regime_alignment_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._regime_alignment_score")
         regime = context.current_regime
 
         if regime is MarketRegime.UNKNOWN:
@@ -12057,6 +12374,9 @@ class SignalScorer(BaseStrategyComponent):
 
     @staticmethod
     def _freshness_score(context: StrategyContext) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalScorer._freshness_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalScorer._freshness_score")
         if not context.feature_map:
             return 0.5
 
@@ -12078,6 +12398,7 @@ class ConfluenceEngine(BaseStrategyComponent):
     """
     Builds one confluence evaluation and optionally merges compatible signals.
     """
+    _logger = logging.getLogger(__name__ + ".ConfluenceEngine")
 
     component_namespace = "strategy.processor.confluence"
 
@@ -12087,6 +12408,9 @@ class ConfluenceEngine(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceEngine.__init__")
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
         self.confluence_config: ConfluenceConfig = config.confluence
         self.scorer = SignalScorer(config=config, event_bus=event_bus, scheduler=scheduler)
@@ -12097,6 +12421,9 @@ class ConfluenceEngine(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext,
     ) -> ConfluenceEvaluation:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceEngine.evaluate")
         evaluation = ConfluenceEvaluation(
             symbol=context.symbol,
             timestamp=context.timestamp,
@@ -12154,6 +12481,9 @@ class ConfluenceEngine(BaseStrategyComponent):
         result: ConfluenceResult,
         signals: list[StrategySignal],
     ) -> StrategySignal | None:
+        _strategy_logger = logging.getLogger(__name__ + ".ConfluenceEngine._merge")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfluenceEngine._merge")
         if not signals:
             return None
 
@@ -12206,6 +12536,7 @@ class SignalFilterChain(BaseStrategyComponent):
     """
     Applies strategy-level signal filters before SignalBuilder.
     """
+    _logger = logging.getLogger(__name__ + ".SignalFilterChain")
 
     component_namespace = "strategy.processor.filters"
 
@@ -12215,6 +12546,9 @@ class SignalFilterChain(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext,
     ) -> list[StrategySignal]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain.apply")
         accepted: list[StrategySignal] = []
 
         for signal in signals:
@@ -12238,6 +12572,9 @@ class SignalFilterChain(BaseStrategyComponent):
         signal: StrategySignal,
         context: StrategyContext,
     ) -> FilterEvaluation:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain.evaluate_signal")
         signal.validate()
         context.validate()
 
@@ -12288,6 +12625,9 @@ class SignalFilterChain(BaseStrategyComponent):
         evaluation: FilterEvaluation,
         context: StrategyContext,
     ) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalFilterChain._filter_symbol_match")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_symbol_match")
         if evaluation.signal.symbol != context.symbol:
             evaluation.add_result(
                 FilterResult(
@@ -12299,6 +12639,9 @@ class SignalFilterChain(BaseStrategyComponent):
 
     @staticmethod
     def _filter_directional(evaluation: FilterEvaluation) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalFilterChain._filter_directional")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_directional")
         if evaluation.signal.side not in {SignalSide.LONG, SignalSide.SHORT}:
             evaluation.add_result(
                 FilterResult(
@@ -12309,6 +12652,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_confidence(self, evaluation: FilterEvaluation) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_confidence")
         configured = self.config.filters.min_signal_confidence
         threshold = self.config.runtime.min_confidence if configured is None else configured
 
@@ -12323,6 +12669,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_score(self, evaluation: FilterEvaluation) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_score")
         configured = self.config.filters.min_signal_score
         threshold = self.config.runtime.min_score if configured is None else configured
 
@@ -12341,6 +12690,9 @@ class SignalFilterChain(BaseStrategyComponent):
         evaluation: FilterEvaluation,
         context: StrategyContext,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_age")
         max_age = self.config.runtime.max_signal_age_seconds
         reference_time = ensure_aware_utc(context.timestamp)
         signal_time = ensure_aware_utc(evaluation.signal.timestamp)
@@ -12359,6 +12711,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_risk_reward(self, evaluation: FilterEvaluation) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_risk_reward")
         threshold = self.config.filters.min_risk_reward
         if threshold <= 0:
             return
@@ -12385,6 +12740,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_regime(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_regime")
         allowed = self.config.runtime.allowed_regimes
         if not allowed or MarketRegime.UNKNOWN in allowed:
             return
@@ -12401,6 +12759,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_volatility(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_volatility")
         value = self._context_float(
             context,
             "volatility_zscore",
@@ -12423,6 +12784,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_liquidity(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_liquidity")
         value = self._context_float(
             context,
             "liquidity_score",
@@ -12445,6 +12809,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_spread(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_spread")
         value = self._context_float(
             context,
             "spread_bps",
@@ -12467,6 +12834,9 @@ class SignalFilterChain(BaseStrategyComponent):
             )
 
     def _filter_funding(self, evaluation: FilterEvaluation, context: StrategyContext) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_funding")
         value = self._context_float(
             context,
             "funding_alignment",
@@ -12489,6 +12859,9 @@ class SignalFilterChain(BaseStrategyComponent):
 
     @staticmethod
     def _context_float(context: StrategyContext, *names: str) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalFilterChain._context_float")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._context_float")
         for name in names:
             value = context.get_feature(name, None)
             parsed = _to_float(value)
@@ -12510,6 +12883,9 @@ class SignalFilterChain(BaseStrategyComponent):
         evaluation: FilterEvaluation,
         context: StrategyContext,
     ) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalFilterChain._filter_freshness")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_freshness")
         stale_features = [
             name
             for name, snapshot in context.feature_map.items()
@@ -12528,6 +12904,9 @@ class SignalFilterChain(BaseStrategyComponent):
 
     @staticmethod
     def _filter_execution_quality(evaluation: FilterEvaluation) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalFilterChain._filter_execution_quality")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalFilterChain._filter_execution_quality")
         raw = evaluation.signal.metadata.get("execution_quality")
         if raw is None:
             return
@@ -12557,11 +12936,15 @@ class SignalBuilder(BaseStrategyComponent):
     """
     Ensures every final signal has entry/exit/invalidation/execution plan.
     """
+    _logger = logging.getLogger(__name__ + ".SignalBuilder")
 
     component_namespace = "strategy.processor.builder"
 
     @property
     def builder_config(self) -> BuilderConfig:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder.builder_config")
         return self.config.builders
 
     def build(
@@ -12570,6 +12953,9 @@ class SignalBuilder(BaseStrategyComponent):
         signal: StrategySignal,
         context: StrategyContext,
     ) -> BuildEvaluation:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder.build")
         signal.validate()
         context.validate()
 
@@ -12622,6 +13008,9 @@ class SignalBuilder(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext,
     ) -> tuple[list[StrategySignal], dict[str, str]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder.build_many")
         accepted: list[StrategySignal] = []
         rejected: dict[str, str] = {}
 
@@ -12637,6 +13026,9 @@ class SignalBuilder(BaseStrategyComponent):
 
     @staticmethod
     def assert_risk_ready(signal: StrategySignal) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalBuilder.assert_risk_ready")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder.assert_risk_ready")
         signal.validate()
 
         if signal.execution_plan is None:
@@ -12672,6 +13064,9 @@ class SignalBuilder(BaseStrategyComponent):
         signal: StrategySignal,
         context: StrategyContext,
     ) -> EntryPlan:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._resolve_entry")
         if signal.entry_plan is not None:
             signal.entry_plan.validate()
             return signal.entry_plan
@@ -12750,6 +13145,9 @@ class SignalBuilder(BaseStrategyComponent):
             *,
             entry: EntryPlan,
     ) -> InvalidationPlan:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._resolve_invalidation")
         if signal.invalidation_plan is not None:
             signal.invalidation_plan.validate()
             return signal.invalidation_plan
@@ -12786,6 +13184,9 @@ class SignalBuilder(BaseStrategyComponent):
             entry: EntryPlan,
             invalidation: InvalidationPlan,
     ) -> list[TargetPlan]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._resolve_targets")
         if signal.exit_plan is not None and signal.exit_plan.take_profit_levels:
             for target in signal.exit_plan.take_profit_levels:
                 target.validate()
@@ -12858,6 +13259,9 @@ class SignalBuilder(BaseStrategyComponent):
         invalidation: InvalidationPlan,
         targets: list[TargetPlan],
     ) -> ExitPlan:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._resolve_exit_plan")
         if signal.exit_plan is not None:
             if signal.exit_plan.stop_loss is None:
                 signal.exit_plan.stop_loss = invalidation.price
@@ -12890,6 +13294,9 @@ class SignalBuilder(BaseStrategyComponent):
         exit_plan: ExitPlan,
         invalidation: InvalidationPlan,
     ) -> ExecutionPlanDraft:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._resolve_execution_plan")
         if signal.execution_plan is not None:
             signal.execution_plan.validate()
             return signal.execution_plan
@@ -12929,6 +13336,9 @@ class SignalBuilder(BaseStrategyComponent):
         analytics-driven/backtest payloads where the strategy intentionally
         returns only the decision and leaves plan completion to SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._infer_stop_loss")
         stop_distance = _to_float(signal.metadata.get("stop_distance"))
 
         if stop_distance is None:
@@ -13000,6 +13410,9 @@ class SignalBuilder(BaseStrategyComponent):
         entry_price: float,
         stop_loss: float,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._infer_take_profit")
         rr = _to_float(signal.metadata.get("rr"))
         if rr is None:
             rr = _to_float(getattr(self.builder_config, "default_rr_ratio", None), 2.0) or 2.0
@@ -13021,6 +13434,9 @@ class SignalBuilder(BaseStrategyComponent):
 
     @staticmethod
     def _entry_type(signal: StrategySignal) -> EntryType:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalBuilder._entry_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalBuilder._entry_type")
         raw = signal.metadata.get("entry_type")
         return _parse_enum(EntryType, raw, EntryType.LIMIT)
 
@@ -13037,6 +13453,7 @@ class PortfolioCoordinator(BaseStrategyComponent):
     It does not approve risk. It only decides which already built signals are
     worth sending to RiskManager.
     """
+    _logger = logging.getLogger(__name__ + ".PortfolioCoordinator")
 
     component_namespace = "strategy.processor.portfolio"
 
@@ -13047,6 +13464,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator.__init__")
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
         self.state = state
         self.portfolio_config: PortfolioCoordinatorConfig = config.portfolio
@@ -13057,6 +13477,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
         signals: list[StrategySignal],
         context: StrategyContext,
     ) -> CoordinationDecision:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator.coordinate")
         decision = CoordinationDecision(
             symbol=context.symbol,
             timestamp=context.timestamp,
@@ -13108,6 +13531,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
         signals: list[StrategySignal],
         now: datetime,
     ) -> tuple[list[StrategySignal], dict[str, str]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator._suppress_repeating_signals")
         window = self.portfolio_config.repeated_signal_suppression_seconds
         if window <= 0:
             return signals, {}
@@ -13152,6 +13578,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
         self,
         signals: list[StrategySignal],
     ) -> tuple[list[StrategySignal], dict[str, str]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator._deduplicate_by_side")
         if not self.portfolio_config.deduplicate_by_side:
             return signals, {}
 
@@ -13195,6 +13624,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
         symbol: str,
         signals: list[StrategySignal],
     ) -> tuple[list[StrategySignal], dict[str, str]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator._apply_symbol_limits")
         active_count = len(self.state.signals.get_active_for_symbol(symbol))
         limit = self.portfolio_config.max_signals_per_symbol
 
@@ -13224,6 +13656,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
 
     @staticmethod
     def _merge_similar_signals(signals: list[StrategySignal]) -> list[StrategySignal]:
+        _strategy_logger = logging.getLogger(__name__ + ".PortfolioCoordinator._merge_similar_signals")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator._merge_similar_signals")
         if len(signals) <= 1:
             return signals
 
@@ -13267,6 +13702,9 @@ class PortfolioCoordinator(BaseStrategyComponent):
         symbol: str,
         signals: list[StrategySignal],
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering PortfolioCoordinator._update_state_after_acceptance")
         for signal in signals:
             signal.to_pending()
             self.state.update_signal(signal, active=True)
@@ -13289,6 +13727,7 @@ class SignalProcessor(BaseStrategyComponent):
     """
     Facade class for full strategy signal processing.
     """
+    _logger = logging.getLogger(__name__ + ".SignalProcessor")
 
     component_namespace = "strategy.processor"
 
@@ -13300,6 +13739,9 @@ class SignalProcessor(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor.__init__")
         super().__init__(config=config, event_bus=event_bus, scheduler=scheduler)
         self.registry = registry
         self.state = state
@@ -13350,6 +13792,9 @@ class SignalProcessor(BaseStrategyComponent):
         timestamp: datetime | None = None,
         emit: bool = True,
     ) -> ProcessedSignalBatch:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor.process_event")
         normalized = self.normalizer.normalize_event(
             event_name=event_name,
             payload=payload,
@@ -13588,6 +14033,9 @@ class SignalProcessor(BaseStrategyComponent):
         strategies: list[BaseStrategy],
         context: StrategyContext,
     ) -> list[StrategyEvaluation]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor.evaluate_strategies")
         result: list[StrategyEvaluation] = []
 
         for strategy in strategies:
@@ -13642,6 +14090,9 @@ class SignalProcessor(BaseStrategyComponent):
         """
         Convert final built StrategySignal into signal.generated payload.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor.to_risk_payload")
         signal.validate()
         context.validate()
         self.builder.assert_risk_ready(signal)
@@ -13748,12 +14199,18 @@ class SignalProcessor(BaseStrategyComponent):
 
     @staticmethod
     def _enum_value(value: Any) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalProcessor._enum_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._enum_value")
         if hasattr(value, "value"):
             return value.value
         return value
 
     @staticmethod
     def _safe_iso(value: Any) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalProcessor._safe_iso")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._safe_iso")
         if isinstance(value, datetime):
             return ensure_aware_utc(value).isoformat()
         return None
@@ -13762,6 +14219,9 @@ class SignalProcessor(BaseStrategyComponent):
         self,
         evaluations: list[StrategyEvaluation],
     ) -> list[dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._evaluation_debug")
         result: list[dict[str, Any]] = []
 
         for evaluation in evaluations:
@@ -13788,6 +14248,9 @@ class SignalProcessor(BaseStrategyComponent):
         return result
 
     def _route_debug(self, route: RouteDecision | None) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._route_debug")
         if route is None:
             return {}
 
@@ -13807,6 +14270,9 @@ class SignalProcessor(BaseStrategyComponent):
         }
 
     def _context_debug(self, context: StrategyContext | None) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._context_debug")
         if context is None:
             return {}
 
@@ -13841,6 +14307,9 @@ class SignalProcessor(BaseStrategyComponent):
         }
 
     def _normalized_debug(self, normalized: NormalizedPayload | None) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._normalized_debug")
         if normalized is None:
             return {}
 
@@ -13860,6 +14329,9 @@ class SignalProcessor(BaseStrategyComponent):
         }
 
     def _signals_debug(self, signals: list[StrategySignal]) -> list[dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._signals_debug")
         result: list[dict[str, Any]] = []
 
         for signal in signals:
@@ -13885,6 +14357,9 @@ class SignalProcessor(BaseStrategyComponent):
         return result
 
     def _confluence_debug(self, confluence: ConfluenceEvaluation | None) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._confluence_debug")
         if confluence is None:
             return {}
 
@@ -13902,6 +14377,9 @@ class SignalProcessor(BaseStrategyComponent):
         }
 
     def _coordination_debug(self, coordinated: CoordinationDecision | None) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._coordination_debug")
         if coordinated is None:
             return {}
 
@@ -13928,6 +14406,9 @@ class SignalProcessor(BaseStrategyComponent):
         payload: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._update_batch_debug")
         batch.debug.update(
             {
                 "failure_stage": failure_stage,
@@ -13963,6 +14444,9 @@ class SignalProcessor(BaseStrategyComponent):
             batch.debug.update(extra)
 
     def _resolve_context(self, normalized: NormalizedPayload) -> StrategyContext:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._resolve_context")
         existing = self.state.contexts.get_context(normalized.symbol)
         if existing is not None:
             existing.timestamp = normalized.timestamp
@@ -13983,6 +14467,9 @@ class SignalProcessor(BaseStrategyComponent):
         confluence: ConfluenceEvaluation,
         fallback: list[StrategySignal],
     ) -> list[StrategySignal]:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalProcessor._signals_after_confluence")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._signals_after_confluence")
         if confluence.result is None:
             return list(confluence.accepted_signals or fallback)
 
@@ -14000,6 +14487,9 @@ class SignalProcessor(BaseStrategyComponent):
         *,
         reason: str,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._emit_rejected_batch")
         if self.event_bus is None:
             return
 
@@ -14045,6 +14535,9 @@ class SignalProcessor(BaseStrategyComponent):
         )
 
     def _record_final_signals(self, signals: list[StrategySignal]) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._record_final_signals")
         for signal in signals:
             signal.to_pending()
             self.state.update_signal(signal, active=True)
@@ -14054,6 +14547,9 @@ class SignalProcessor(BaseStrategyComponent):
     def _execution_cost_from_metadata(
         signal: StrategySignal,
     ) -> ExecutionCostPayload | None:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalProcessor._execution_cost_from_metadata")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._execution_cost_from_metadata")
         raw = signal.metadata.get("execution_cost")
 
         if raw is None:
@@ -14087,6 +14583,9 @@ class SignalProcessor(BaseStrategyComponent):
         raise SignalRoutingError("execution_cost metadata must be dict or ExecutionCostPayload")
 
     def _confidence_grade(self, confidence: float) -> ConfidenceGrade:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._confidence_grade")
         value = clamp(confidence, 0.0, 1.0)
         very_low, low, medium, high = self.config.confidence.grade_bounds()
 
@@ -14101,6 +14600,9 @@ class SignalProcessor(BaseStrategyComponent):
         return ConfidenceGrade.VERY_LOW
 
     def _confidence_strength(self, confidence: float) -> SignalStrength:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._confidence_strength")
         value = clamp(confidence, 0.0, 1.0)
         _, low, medium, high = self.config.confidence.grade_bounds()
 
@@ -14114,6 +14616,9 @@ class SignalProcessor(BaseStrategyComponent):
 
     @staticmethod
     def _tier_from_priority_score(value: float) -> StrategyTradeTier:
+        _strategy_logger = logging.getLogger(__name__ + ".SignalProcessor._tier_from_priority_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalProcessor._tier_from_priority_score")
         score = clamp(value, 0.0, 1.0)
 
         if score >= 0.88:

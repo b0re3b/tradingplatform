@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidity/liquidity_map_bias_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from typing import Any
@@ -68,6 +69,7 @@ class LiquidityMapBiasStrategyConfig(LiquidityStrategyConfig):
     - target is optional;
     - leave routing, filtering, confluence and risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityMapBiasStrategyConfig")
 
     min_directional_edge: float = 0.42
     min_edge_delta: float = 0.10
@@ -117,6 +119,9 @@ class LiquidityMapBiasStrategyConfig(LiquidityStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategyConfig.validate")
         LiquidityStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -224,6 +229,7 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     It returns an internal StrategySignal for the shared strategy pipeline.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityMapBiasStrategy")
 
     component_namespace = "strategy.liquidity.map_bias"
     category: StrategyCategory = StrategyCategory.LIQUIDITY
@@ -239,6 +245,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         liquidity_config: LiquidityMapBiasStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy.__init__")
         resolved_liquidity_config = liquidity_config or LiquidityMapBiasStrategyConfig()
         resolved_liquidity_config.validate()
 
@@ -255,9 +264,15 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy.strategy_name")
         return "liquidity_map_bias_strategy"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.bias_config.required_liquidity_features)
 
@@ -265,6 +280,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
@@ -470,6 +488,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[FilterResult]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._run_pre_filters")
         results = self.run_common_pre_filters(
             context=context,
             snapshot=snapshot,
@@ -566,6 +587,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, snapshot: LiquidityMapSnapshot) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._infer_side")
         upside_edge = upside_bias_edge(snapshot)
         downside_edge = downside_bias_edge(snapshot)
         delta = upside_edge - downside_edge
@@ -618,6 +642,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._target_for_side")
         if side is SignalSide.LONG:
             candidates = [
                 getattr(snapshot, "nearest_above_level", None),
@@ -676,6 +703,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._collect_valid_targets_above")
         return [
             item
             for item in collect_targets_above(snapshot, current_price)
@@ -691,6 +721,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._collect_valid_targets_below")
         return [
             item
             for item in collect_targets_below(snapshot, current_price)
@@ -708,6 +741,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._is_valid_bias_target")
         ref_price = reference_price(item)
         if ref_price <= 0 or current_price <= 0:
             return False
@@ -748,6 +784,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         target: LiquidityLevel | StopCluster | None,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._build_score_breakdown")
         directional_edge = self._directional_edge(snapshot=snapshot, side=side)
         opposite_edge = self._opposite_edge(snapshot=snapshot, side=side)
         edge_delta = unit_score(abs(directional_edge - opposite_edge))
@@ -893,6 +932,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._directional_edge")
         if side is SignalSide.LONG:
             return upside_bias_edge(snapshot)
 
@@ -907,6 +949,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._opposite_edge")
         if side is SignalSide.LONG:
             return downside_bias_edge(snapshot)
 
@@ -921,6 +966,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._pressure_alignment")
         pressure = signed_score(getattr(snapshot, "liquidity_pressure_score", 0.0))
 
         if side is SignalSide.LONG:
@@ -938,6 +986,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._zone_alignment_score")
         liquidity_side = (
             LiquiditySide.BUY_SIDE
             if side is SignalSide.LONG
@@ -959,6 +1010,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._target_quality_score")
         if target is None:
             return 0.0
 
@@ -1000,6 +1054,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         current_price: float,
         invalidation_level: LiquidityLevel | StopCluster | None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._resolve_stop_price")
         if current_price <= 0:
             return None
 
@@ -1024,6 +1081,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._invalidation_level_for_side")
         if side is SignalSide.LONG:
             candidates = collect_targets_below(snapshot, current_price)
             return candidates[0] if candidates else None
@@ -1043,6 +1103,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         stop_loss: float | None,
     ) -> list[TargetPlan]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._target_plans")
         result: list[TargetPlan] = []
 
         primary_price = reference_price(target) if target is not None else 0.0
@@ -1078,6 +1141,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         target_price: float | None,
         side: SignalSide,
     ) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidityMapBiasStrategy._compute_rr")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._compute_rr")
         if current_price <= 0 or stop_price is None or target_price is None:
             return None
 
@@ -1095,6 +1161,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
 
     @staticmethod
     def _target_type(target: LiquidityLevel | StopCluster | None) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".LiquidityMapBiasStrategy._target_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._target_type")
         if target is None:
             return None
 
@@ -1119,6 +1188,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         score: float,
         confidence: float,
     ) -> SignalPriority:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._resolve_priority")
         combined = unit_score(0.55 * score + 0.45 * confidence)
 
         if combined >= self.bias_config.critical_priority_score:
@@ -1135,6 +1207,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         side: SignalSide,
         target: LiquidityLevel | StopCluster | None,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._source_features")
         features = [
             LIQUIDITY_FEATURES.SNAPSHOT,
             LIQUIDITY_FEATURES.MAP_SNAPSHOT,
@@ -1179,6 +1254,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         snapshot: LiquidityMapSnapshot,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._tags")
         tags = [
             self.bias_config.tag_liquidity,
             self.bias_config.tag_bias,
@@ -1209,6 +1287,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         side: SignalSide,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._primary_reason")
         if side is SignalSide.LONG:
             return (
                 "Liquidity map favors upside: "
@@ -1230,6 +1311,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._target_reason")
         if target is None:
             return "Directional liquidity bias accepted without explicit target"
 
@@ -1251,6 +1335,9 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityMapBiasStrategy._target_metadata")
         if target is None:
             return None
 

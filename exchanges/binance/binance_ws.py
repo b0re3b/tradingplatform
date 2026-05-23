@@ -72,7 +72,7 @@ class BinanceWebSocketClientConfig:
             reconnect_delay_seconds=config.exchange.reconnect_delay,
             max_reconnect_attempts=config.exchange.max_reconnect_attempts,
             symbols=symbols,
-            streams=streams or ["trade", "depth", "kline"],
+            streams=streams or ["trade", "depth", "kline", "forceorder"],
             depth_level=depth_level,
             kline_interval=kline_interval,
             enable_private_stream=enable_private_stream,
@@ -118,7 +118,7 @@ class BinanceWebSocketClient:
     EXCHANGE = "binance"
     SOURCE = "binance_ws"
 
-    SUPPORTED_STREAMS = {"trade", "depth", "kline"}
+    SUPPORTED_STREAMS = {"trade", "depth", "kline", "forceorder", "liquidation"}
 
     def __init__(
         self,
@@ -406,6 +406,12 @@ class BinanceWebSocketClient:
 
         if "@depth" in stream_name:
             await self._publish_orderbook_event(data)
+            return
+
+        stream_name_normalized = stream_name.lower()
+
+        if "@forceorder" in stream_name_normalized:
+            await self._publish_liquidation_event(data)
             return
 
         if "@kline_" in stream_name:
@@ -986,6 +992,52 @@ class BinanceWebSocketClient:
             priority=EventPriority.HIGH,
         )
 
+    async def _publish_liquidation_event(self, data: dict[str, Any]) -> None:
+        """Publish Binance USD-M forceOrder stream as canonical liquidation input."""
+        order = data.get("o")
+        if not isinstance(order, dict):
+            self._logger.debug("Malformed Binance forceOrder payload")
+            return
+
+        symbol = order.get("s") or data.get("s")
+        price = self._safe_float(order.get("ap")) or self._safe_float(order.get("p"))
+        quantity = self._safe_float(order.get("q"))
+        notional = price * quantity if price is not None and quantity is not None else None
+
+        payload = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol,
+            "exchange_symbol": symbol,
+            "timeframe": self._ws_config.kline_interval,
+            "side": order.get("S"),
+            "order_type": order.get("o"),
+            "time_in_force": order.get("f"),
+            "quantity": quantity,
+            "qty": quantity,
+            "price": price,
+            "avg_price": self._safe_float(order.get("ap")),
+            "limit_price": self._safe_float(order.get("p")),
+            "notional_usd": notional,
+            "order_status": order.get("X"),
+            "last_filled_qty": self._safe_float(order.get("l")),
+            "accumulated_filled_qty": self._safe_float(order.get("z")),
+            "trade_time": order.get("T"),
+            "event_time": data.get("E"),
+            "timestamp_ms": order.get("T") or data.get("E"),
+            "source": self.SOURCE,
+        }
+
+        if not payload["symbol"] or not payload["price"] or not payload["quantity"]:
+            self._logger.debug("Skipping incomplete Binance liquidation payload | payload=%s", payload)
+            return
+
+        await self._emit_event(
+            "market.liquidation",
+            payload,
+            priority=EventPriority.HIGH,
+        )
+
     # ------------------------------------------------------------------
     # Event publishers: private exchange updates
     # ------------------------------------------------------------------
@@ -1140,6 +1192,9 @@ class BinanceWebSocketClient:
                 stream_names.append(
                     f"{symbol}@kline_{self._ws_config.kline_interval}"
                 )
+
+            if "forceorder" in self._streams or "liquidation" in self._streams:
+                stream_names.append(f"{symbol}@forceOrder")
 
         if not stream_names:
             raise RuntimeError("No Binance public streams configured")

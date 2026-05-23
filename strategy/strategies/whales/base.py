@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/whales/base.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -105,6 +106,7 @@ class WhalesFeatureNames:
     analytics.whales.* payloads. Concrete strategies may also read equivalent
     values from FeatureSource.WHALES domain_data aliases.
     """
+    _logger = logging.getLogger(__name__ + ".WhalesFeatureNames")
 
     PRESSURE: str = "whales.pressure"
     ACTIVITY: str = "whales.activity"
@@ -148,6 +150,9 @@ class WhalesFeatureNames:
 
     @classmethod
     def all(cls) -> set[str]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".WhalesFeatureNames")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesFeatureNames.all")
         instance = cls()
         return {
             getattr(instance, item.name)
@@ -167,6 +172,7 @@ WHALES_FEATURES = WhalesFeatureNames()
 
 @dataclass(frozen=True, slots=True)
 class WhalePayloadValidation:
+    _logger = logging.getLogger(__name__ + ".WhalePayloadValidation")
     valid: bool
     reason: str | None = None
     payload_age_seconds: float | None = None
@@ -179,6 +185,9 @@ class WhalePayloadValidation:
         payload_age_seconds: float | None = None,
         source: str = "unknown",
     ) -> WhalePayloadValidation:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".WhalePayloadValidation")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalePayloadValidation.ok")
         return cls(
             valid=True,
             reason=None,
@@ -194,6 +203,9 @@ class WhalePayloadValidation:
         payload_age_seconds: float | None = None,
         source: str = "unknown",
     ) -> WhalePayloadValidation:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".WhalePayloadValidation")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalePayloadValidation.failed")
         return cls(
             valid=False,
             reason=reason,
@@ -202,6 +214,9 @@ class WhalePayloadValidation:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalePayloadValidation.to_dict")
         return {
             "valid": self.valid,
             "reason": self.reason,
@@ -212,6 +227,7 @@ class WhalePayloadValidation:
 
 @dataclass(slots=True)
 class WhaleFeaturePayload:
+    _logger = logging.getLogger(__name__ + ".WhaleFeaturePayload")
     name: str
     payload: dict[str, Any] = field(default_factory=dict)
     event_time: datetime | None = None
@@ -220,14 +236,23 @@ class WhaleFeaturePayload:
     )
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleFeaturePayload.__post_init__")
         self.payload = as_dict(self.payload)
         self.event_time = parse_datetime(self.event_time)
 
     @property
     def available(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleFeaturePayload.available")
         return bool(self.payload) and self.validation.valid
 
     def age_seconds(self, now: datetime | None = None) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleFeaturePayload.age_seconds")
         if self.event_time is None:
             return None
         current = parse_datetime(now) or parse_datetime(datetime.utcnow())
@@ -236,6 +261,9 @@ class WhaleFeaturePayload:
         return max(0.0, (current - self.event_time).total_seconds())
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleFeaturePayload.to_dict")
         return {
             "name": self.name,
             "available": self.available,
@@ -253,6 +281,7 @@ class WhaleFeaturePayload:
 
 @dataclass(frozen=True, slots=True)
 class WhalesStrategyScope:
+    _logger = logging.getLogger(__name__ + ".WhalesStrategyScope")
     exchange: str
     market_type: str
     symbol: str
@@ -260,6 +289,9 @@ class WhalesStrategyScope:
     exchange_symbol: str | None = None
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesStrategyScope.__post_init__")
         exchange = normalize_exchange(self.exchange) or "unknown"
         market_type = normalize_market_type(self.market_type) or "unknown"
         symbol = normalize_symbol(self.symbol)
@@ -277,6 +309,9 @@ class WhalesStrategyScope:
 
     @property
     def key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesStrategyScope.key")
         return (
             f"{self.exchange}:"
             f"{self.market_type}:"
@@ -286,15 +321,24 @@ class WhalesStrategyScope:
 
     @property
     def legacy_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesStrategyScope.legacy_key")
         return f"{self.exchange}:{self.symbol}"
 
     @property
     def is_futures(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesStrategyScope.is_futures")
         if not self.market_type or self.market_type == "unknown":
             return True
         return self.market_type in FUTURES_MARKET_TYPES
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesStrategyScope.to_dict")
         return {
             "exchange": self.exchange,
             "market_type": self.market_type,
@@ -321,6 +365,7 @@ class WhalesStrategyConfig:
     no StrategyEvaluation publishing. Concrete strategies consume StrategyContext
     and return StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".WhalesStrategyConfig")
 
     min_score: float = 0.60
     min_confidence: float = 0.55
@@ -365,6 +410,9 @@ class WhalesStrategyConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesStrategyConfig.validate")
         bounded = {
             "min_score": self.min_score,
             "min_confidence": self.min_confidence,
@@ -425,6 +473,7 @@ class WhaleCompositeSnapshot:
     concrete whale strategies consume pressure/activity/cluster/liquidation
     payloads through one contract.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleCompositeSnapshot")
 
     symbol: str
     exchange: str = "unknown"
@@ -468,6 +517,9 @@ class WhaleCompositeSnapshot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.__post_init__")
         self.symbol = normalize_symbol(self.symbol)
         self.exchange = normalize_exchange(self.exchange) or "unknown"
         self.market_type = normalize_market_type(self.market_type) or "unknown"
@@ -524,6 +576,9 @@ class WhaleCompositeSnapshot:
 
     @property
     def scope(self) -> WhalesStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.scope")
         return WhalesStrategyScope(
             exchange=self.exchange,
             market_type=self.market_type,
@@ -534,14 +589,23 @@ class WhaleCompositeSnapshot:
 
     @property
     def scope_key(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.scope_key")
         return self.scope.key
 
     @property
     def is_futures(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.is_futures")
         return self.scope.is_futures
 
     @property
     def whale_signal_side(self) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.whale_signal_side")
         for candidate in (
             self.dominant_side,
             self.whale_side,
@@ -555,25 +619,43 @@ class WhaleCompositeSnapshot:
 
     @property
     def has_pressure(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.has_pressure")
         return bool(self.pressure)
 
     @property
     def has_activity(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.has_activity")
         return bool(self.activity)
 
     @property
     def has_large_trade(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.has_large_trade")
         return bool(self.large_trade)
 
     @property
     def has_cluster(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.has_cluster")
         return bool(self.cluster or self.cluster_update or self.cluster_exhaustion)
 
     @property
     def has_liquidation_context(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.has_liquidation_context")
         return bool(self.liquidation_context)
 
     def has_minimum_data(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.has_minimum_data")
         return any(
             (
                 self.has_pressure,
@@ -590,6 +672,9 @@ class WhaleCompositeSnapshot:
         )
 
     def inputs(self) -> dict[str, dict[str, Any]]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.inputs")
         return {
             "pressure": self.pressure,
             "activity": self.activity,
@@ -601,6 +686,9 @@ class WhaleCompositeSnapshot:
         }
 
     def to_signal_payload(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.to_signal_payload")
         return {
             "symbol": self.symbol,
             "exchange": self.exchange,
@@ -630,6 +718,9 @@ class WhaleCompositeSnapshot:
         }
 
     def to_dict(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleCompositeSnapshot.to_dict")
         return {
             "symbol": self.symbol,
             "exchange": self.exchange,
@@ -709,6 +800,7 @@ class WhalesTradingStrategy(TradingStrategy):
     - no RiskManager / Execution calls;
     - no raw market data reads.
     """
+    _logger = logging.getLogger(__name__ + ".WhalesTradingStrategy")
 
     component_namespace = "strategy.whales"
     category: StrategyCategory = StrategyCategory.WHALES
@@ -727,6 +819,9 @@ class WhalesTradingStrategy(TradingStrategy):
         whales_config: WhalesStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.__init__")
         self.whales_config = whales_config or WhalesStrategyConfig()
         self.whales_config.validate()
 
@@ -739,6 +834,9 @@ class WhalesTradingStrategy(TradingStrategy):
         )
 
     def validate_config(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.validate_config")
         super().validate_config()
         self.whales_config.validate()
 
@@ -747,6 +845,9 @@ class WhalesTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def whales_domain(self, context: StrategyContext) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_domain")
         self.validate_context(context)
         return whales_domain(context)
 
@@ -756,6 +857,9 @@ class WhalesTradingStrategy(TradingStrategy):
         key: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_item")
         self.validate_context(context)
         return whales_item(context, key, default)
 
@@ -765,6 +869,9 @@ class WhalesTradingStrategy(TradingStrategy):
         path: str,
         default: Any = None,
     ) -> Any:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_path")
         self.validate_context(context)
 
         if not isinstance(path, str) or not path.strip():
@@ -779,6 +886,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         default: float | None = None,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_float")
         return to_float(self.whales_path(context, path, default), default)
 
     def whales_int(
@@ -788,6 +898,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         default: int | None = None,
     ) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_int")
         return to_int(self.whales_path(context, path, default), default)
 
     def whales_score(
@@ -797,6 +910,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         default: float = 0.0,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_score")
         return unit_score(self.whales_path(context, path, default), default)
 
     def whales_bool(
@@ -806,6 +922,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         default: bool = False,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_bool")
         return to_bool(self.whales_path(context, path, default), default)
 
     def whales_str(
@@ -815,6 +934,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         default: str | None = None,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_str")
         return to_str(self.whales_path(context, path, default), default)
 
     def whales_datetime(
@@ -824,6 +946,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         default: datetime | None = None,
     ) -> datetime | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_datetime")
         return parse_datetime(self.whales_path(context, path, default))
 
     def whales_feature_snapshot(
@@ -831,6 +956,9 @@ class WhalesTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> FeatureSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_feature_snapshot")
         self.validate_context(context)
 
         if not isinstance(feature_name, str) or not feature_name.strip():
@@ -849,6 +977,9 @@ class WhalesTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_feature_age_seconds")
         snapshot = self.whales_feature_snapshot(context, feature_name)
         if snapshot is None:
             return None
@@ -859,6 +990,9 @@ class WhalesTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_name: str,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_feature_is_stale")
         max_age = self.whales_config.stale_feature_max_age_seconds
         if max_age is None:
             return False
@@ -874,6 +1008,9 @@ class WhalesTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] = (),
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.has_any_whales_data")
         self.validate_context(context)
 
         if self.whales_domain(context):
@@ -886,6 +1023,9 @@ class WhalesTradingStrategy(TradingStrategy):
         context: StrategyContext,
         feature_names: tuple[str, ...] | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.has_stale_whales_features")
         names = feature_names or tuple(self.required_features())
 
         return any(
@@ -898,6 +1038,9 @@ class WhalesTradingStrategy(TradingStrategy):
     # ------------------------------------------------------------------
 
     def whales_scope(self, context: StrategyContext) -> WhalesStrategyScope:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whales_scope")
         domain = self.whales_domain(context)
 
         candidate = (
@@ -944,6 +1087,9 @@ class WhalesTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> WhaleCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.resolve_whale_snapshot")
         self.validate_context(context)
 
         scope = self.whales_scope(context)
@@ -1086,6 +1232,9 @@ class WhalesTradingStrategy(TradingStrategy):
         require_futures_market_type: bool | None = None,
         min_confidence: float | None = None,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.accepts_whale_snapshot")
         if not snapshot.has_minimum_data():
             return False
 
@@ -1122,6 +1271,9 @@ class WhalesTradingStrategy(TradingStrategy):
         feature_name: str,
         extractor: Any,
     ) -> WhaleFeaturePayload:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_feature_payload")
         candidate = (
             self.whales_item(context, key)
             or self.whales_path(context, key, None)
@@ -1181,6 +1333,9 @@ class WhalesTradingStrategy(TradingStrategy):
         context: StrategyContext,
         scope: WhalesStrategyScope,
     ) -> WhaleCompositeSnapshot | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._build_snapshot_from_features")
         payload = {
             "symbol": self._feature_value(context, WHALES_FEATURES.SYMBOL),
             "exchange": self._feature_value(context, WHALES_FEATURES.EXCHANGE),
@@ -1338,6 +1493,9 @@ class WhalesTradingStrategy(TradingStrategy):
         origin: SignalOrigin = SignalOrigin.SINGLE_STRATEGY,
         status: SignalStatus = SignalStatus.NEW,
     ) -> StrategySignal:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.build_whale_signal")
         if not is_directional_side(side):
             raise StrategyEvaluationError(
                 f"{self.strategy_name}: whale signal side must be LONG or SHORT"
@@ -1440,6 +1598,9 @@ class WhalesTradingStrategy(TradingStrategy):
         self,
         context: StrategyContext,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whale_context_metadata")
         metadata: dict[str, Any] = {}
 
         snapshot = self.resolve_whale_snapshot(context)
@@ -1515,6 +1676,9 @@ class WhalesTradingStrategy(TradingStrategy):
         confidence: float,
         required_inputs: tuple[str, ...] = (),
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.whale_quality_rejection_reason")
         return whale_quality_filter_reason(
             inputs=snapshot.inputs(),
             min_score=self.whales_config.min_score,
@@ -1530,6 +1694,9 @@ class WhalesTradingStrategy(TradingStrategy):
         *,
         now: datetime | None = None,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy.snapshot_freshness_score")
         return freshness_score(
             event_time=snapshot.timestamp,
             now=now,
@@ -1542,6 +1709,9 @@ class WhalesTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _feature_value(context: StrategyContext, feature_name: str) -> Any:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._feature_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._feature_value")
         if not isinstance(feature_name, str) or not feature_name.strip():
             return None
 
@@ -1557,6 +1727,9 @@ class WhalesTradingStrategy(TradingStrategy):
 
     @staticmethod
     def _has_any_value(value: Any) -> bool:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._has_any_value")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._has_any_value")
         if value is None:
             return False
 
@@ -1580,6 +1753,9 @@ class WhalesTradingStrategy(TradingStrategy):
         event_time: datetime | None,
         now: datetime | None,
     ) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._payload_age_seconds")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._payload_age_seconds")
         event_ts = parse_datetime(event_time)
         now_ts = parse_datetime(now)
         if event_ts is None or now_ts is None:
@@ -1593,6 +1769,9 @@ class WhalesTradingStrategy(TradingStrategy):
         payloads: Mapping[str, Mapping[str, Any]],
         fallback: datetime | None,
     ) -> datetime | None:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_snapshot_timestamp")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_snapshot_timestamp")
         timestamps: list[datetime] = []
 
         for payload in payloads.values():
@@ -1610,6 +1789,9 @@ class WhalesTradingStrategy(TradingStrategy):
         payloads: Mapping[str, Mapping[str, Any]],
         fallback: str,
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._first_non_empty_symbol")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._first_non_empty_symbol")
         for payload in payloads.values():
             symbol = extract_symbol(payload)
             if symbol:
@@ -1621,6 +1803,9 @@ class WhalesTradingStrategy(TradingStrategy):
         payloads: Mapping[str, Mapping[str, Any]],
         fallback: str,
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._first_non_empty_exchange")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._first_non_empty_exchange")
         for payload in payloads.values():
             exchange = extract_exchange(payload)
             if exchange:
@@ -1632,6 +1817,9 @@ class WhalesTradingStrategy(TradingStrategy):
         payloads: Mapping[str, Mapping[str, Any]],
         fallback: str,
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._first_non_empty_market_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._first_non_empty_market_type")
         for payload in payloads.values():
             market_type = extract_market_type(payload)
             if market_type:
@@ -1643,6 +1831,9 @@ class WhalesTradingStrategy(TradingStrategy):
         payloads: Mapping[str, Mapping[str, Any]],
         fallback: str,
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._first_non_empty_timeframe")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._first_non_empty_timeframe")
         for payload in payloads.values():
             timeframe = extract_timeframe(payload, "")
             if timeframe:
@@ -1654,6 +1845,9 @@ class WhalesTradingStrategy(TradingStrategy):
         payloads: Mapping[str, Mapping[str, Any]],
         fallback: str | None,
     ) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._first_non_empty_exchange_symbol")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._first_non_empty_exchange_symbol")
         for payload in payloads.values():
             exchange_symbol = extract_exchange_symbol(payload)
             if exchange_symbol:
@@ -1664,6 +1858,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_dominant_side(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_dominant_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_dominant_side")
         for key in (
             "pressure",
             "activity",
@@ -1680,6 +1877,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_whale_side(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_whale_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_whale_side")
         for key in (
             "liquidation_context",
             "pressure",
@@ -1697,6 +1897,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_liquidation_side(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_liquidation_side")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_liquidation_side")
         for key in ("liquidation_context", "cluster_exhaustion", "cluster_update"):
             side = extract_liquidation_side(payloads.get(key) or {})
             if side not in {"unknown", ""}:
@@ -1707,6 +1910,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_total_notional(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_total_notional")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_total_notional")
         values = [
             extract_total_notional(payloads.get("activity") or {}),
             extract_notional(payloads.get("pressure") or {}),
@@ -1722,6 +1928,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_trade_count(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> int:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_trade_count")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_trade_count")
         values = [
             extract_trade_count(payloads.get("activity") or {}),
             extract_trade_count(payloads.get("pressure") or {}),
@@ -1735,6 +1944,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_reference_price(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_reference_price")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_reference_price")
         for key in (
             "large_trade",
             "activity",
@@ -1753,6 +1965,9 @@ class WhalesTradingStrategy(TradingStrategy):
     def _resolve_confidence(
         payloads: Mapping[str, Mapping[str, Any]],
     ) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".WhalesTradingStrategy._resolve_confidence")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_confidence")
         candidates = [
             extract_pressure_score(payloads.get("pressure") or {}),
             extract_context_strength(payloads.get("liquidation_context") or {}),

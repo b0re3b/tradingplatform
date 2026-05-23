@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/liquidity/stop_hunt_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from decimal import Decimal
@@ -68,6 +69,7 @@ class StopHuntReversalStrategyConfig(LiquidityStrategyConfig):
     - unswept liquidity is not enough;
     - return internal StrategySignal only; SignalProcessor owns final emission.
     """
+    _logger = logging.getLogger(__name__ + ".StopHuntReversalStrategyConfig")
 
     min_edge: float = 0.18
     min_reclaim_score: float = 0.04
@@ -115,6 +117,9 @@ class StopHuntReversalStrategyConfig(LiquidityStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategyConfig.validate")
         LiquidityStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -209,6 +214,7 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
 
     This class does not subscribe to EventBus and does not emit signal.generated.
     """
+    _logger = logging.getLogger(__name__ + ".StopHuntReversalStrategy")
 
     component_namespace = "strategy.liquidity.stop_hunt_reversal"
     category: StrategyCategory = StrategyCategory.LIQUIDITY
@@ -224,6 +230,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         liquidity_config: StopHuntReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy.__init__")
         resolved_liquidity_config = liquidity_config or StopHuntReversalStrategyConfig()
         resolved_liquidity_config.validate()
 
@@ -242,9 +251,15 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy.strategy_name")
         return "stop_hunt_reversal_strategy"
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.stop_hunt_config.required_liquidity_features
@@ -254,6 +269,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         snapshot = self.liquidity_snapshot(context)
@@ -442,6 +460,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> list[FilterResult]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._run_pre_filters")
         results = self.run_common_pre_filters(
             context=context,
             snapshot=snapshot,
@@ -482,6 +503,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         snapshot: LiquidityMapSnapshot,
         current_price: float,
     ) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._find_reversal_candidate")
         sell_side = self._find_sell_side_stop_hunt(
             snapshot=snapshot,
             current_price=current_price,
@@ -515,6 +539,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         """
         LONG reversal after sell-side liquidity sweep.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._find_sell_side_stop_hunt")
         swept_sell_levels = [
             level
             for level in swept_levels(snapshot, side=LiquiditySide.SELL_SIDE)
@@ -615,6 +642,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         """
         SHORT reversal after buy-side liquidity sweep.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._find_buy_side_stop_hunt")
         swept_buy_levels = [
             level
             for level in swept_levels(snapshot, side=LiquiditySide.BUY_SIDE)
@@ -714,6 +744,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         self,
         snapshot: LiquidityMapSnapshot,
     ) -> list[LiquidityLevel | StopCluster]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._collect_swept_evidence")
         return [
             *[
                 item
@@ -730,6 +763,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         ]
 
     def _swept_evidence_allowed(self, item: Any) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._swept_evidence_allowed")
         if self.stop_hunt_config.allow_partially_swept_evidence:
             return True
 
@@ -748,6 +784,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         evidence: LiquidityLevel | StopCluster,
         current_price: float,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._evidence_distance_ok")
         if current_price <= 0:
             return False
 
@@ -765,6 +804,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         levels: list[LiquidityLevel],
         current_price: float,
     ) -> LiquidityLevel | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._pick_best_level")
         if not levels:
             return None
 
@@ -782,6 +824,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         clusters: list[StopCluster],
         current_price: float,
     ) -> StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._pick_best_cluster")
         if not clusters:
             return None
 
@@ -801,6 +846,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         cluster: StopCluster | None,
         current_price: float,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._pick_best_evidence")
         if level is None and cluster is None:
             return None
 
@@ -826,6 +874,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         level: LiquidityLevel | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._level_reversal_score")
         if level is None:
             return 0.0
 
@@ -860,6 +911,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         cluster: StopCluster | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._cluster_reversal_score")
         if cluster is None:
             return 0.0
 
@@ -903,6 +957,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         current_price: float,
         side: SignalSide,
     ) -> LiquidityLevel | StopCluster | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._nearest_opposite_target")
         if side is SignalSide.LONG:
             candidates = collect_targets_above(snapshot, current_price)
         elif side is SignalSide.SHORT:
@@ -930,6 +987,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         current_price: float,
         reference_price_value: float,
     ) -> float | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._resolve_stop_price")
         if current_price <= 0 or reference_price_value <= 0:
             return None
 
@@ -953,6 +1013,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         stop_loss: float | None,
     ) -> list[TargetPlan]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._target_plans")
         result: list[TargetPlan] = []
 
         target_price = reference_price(target) if target is not None else 0.0
@@ -988,6 +1051,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         target_price: float | None,
         side: SignalSide,
     ) -> float | None:
+        _strategy_logger = logging.getLogger(__name__ + ".StopHuntReversalStrategy._compute_rr")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._compute_rr")
         if current_price <= 0 or stop_price is None or target_price is None:
             return None
 
@@ -1015,6 +1081,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         current_price: float,
         candidate: dict[str, Any],
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._build_score_breakdown")
         edge = unit_score(candidate.get("edge", 0.0))
         reclaim = unit_score(candidate.get("reclaim_score", 0.0))
         evidence_score = self._evidence_score(candidate)
@@ -1126,6 +1195,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
 
     @staticmethod
     def _evidence_score(candidate: dict[str, Any]) -> float:
+        _strategy_logger = logging.getLogger(__name__ + ".StopHuntReversalStrategy._evidence_score")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._evidence_score")
         level_score = unit_score(candidate.get("level_score", 0.0))
         cluster_score = unit_score(candidate.get("cluster_score", 0.0))
         return max(level_score, cluster_score)
@@ -1136,6 +1208,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         target: LiquidityLevel | StopCluster | None,
         current_price: float,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._target_quality_score")
         if target is None:
             return 0.0
 
@@ -1182,6 +1257,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         score: float,
         confidence: float,
     ) -> SignalPriority:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._resolve_priority")
         combined = unit_score(0.55 * score + 0.45 * confidence)
 
         if combined >= self.stop_hunt_config.critical_priority_score:
@@ -1193,6 +1271,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         return self.stop_hunt_config.default_priority
 
     def _source_features(self, candidate: dict[str, Any]) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._source_features")
         features = [
             LIQUIDITY_FEATURES.SNAPSHOT,
             LIQUIDITY_FEATURES.MAP_SNAPSHOT,
@@ -1231,6 +1312,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         candidate: dict[str, Any],
         snapshot: LiquidityMapSnapshot,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._tags")
         side = candidate.get("side")
 
         tags = [
@@ -1268,6 +1352,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         return list(dict.fromkeys(tags))
 
     def _primary_reason(self, candidate: dict[str, Any]) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._primary_reason")
         side = candidate.get("side")
         reference = float(candidate.get("reference_price", 0.0))
         reclaim = float(candidate.get("reclaim_score", 0.0))
@@ -1287,6 +1374,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._target_reason")
         if target is None:
             return "No explicit opposite liquidity target found"
 
@@ -1306,6 +1396,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
 
     @staticmethod
     def _target_type(target: LiquidityLevel | StopCluster | None) -> str | None:
+        _strategy_logger = logging.getLogger(__name__ + ".StopHuntReversalStrategy._target_type")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._target_type")
         if target is None:
             return None
 
@@ -1324,6 +1417,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         self,
         target: LiquidityLevel | StopCluster | None,
     ) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._target_metadata")
         if target is None:
             return None
 
@@ -1341,6 +1437,9 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         self,
         evidence: LiquidityLevel | StopCluster | None,
     ) -> dict[str, Any] | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StopHuntReversalStrategy._evidence_metadata")
         if evidence is None:
             return None
 

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/mean_reversion_stack_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -58,6 +59,7 @@ class MeanReversionStackPayload:
     - sweep/forced-flow/exhaustion down -> reversal LONG;
     - sweep/forced-flow/exhaustion up -> reversal SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".MeanReversionStackPayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -88,6 +90,7 @@ class MeanReversionStackStrategyConfig(HybridStrategyConfig):
     - liquidations / whales may strengthen reversal context;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".MeanReversionStackStrategyConfig")
 
     min_reversion_score: float = 0.64
     min_reversion_confidence: float = 0.58
@@ -176,6 +179,9 @@ class MeanReversionStackStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -284,6 +290,7 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
     SignalProcessor owns global routing, confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".MeanReversionStackStrategy")
 
     component_namespace = "strategy.hybrid.mean_reversion_stack"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -299,6 +306,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         hybrid_config: MeanReversionStackStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy.__init__")
         resolved_hybrid_config = hybrid_config or MeanReversionStackStrategyConfig()
         resolved_hybrid_config.validate()
 
@@ -317,10 +327,16 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy.strategy_name")
         return "mean_reversion_stack"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -367,6 +383,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.reversion_config.required_hybrid_features
@@ -376,6 +395,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -499,6 +521,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._enabled_sources")
         sources: list[FeatureSource] = [
             FeatureSource.LIQUIDITY,
             FeatureSource.ORDERFLOW,
@@ -514,6 +539,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.reversion_config.require_liquidity:
@@ -534,6 +562,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._vote_weights")
         return {
             FeatureSource.LIQUIDITY: self.reversion_config.liquidity_vote_weight,
             FeatureSource.ORDERFLOW: self.reversion_config.orderflow_vote_weight,
@@ -547,6 +578,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         context: StrategyContext,
         sources: tuple[FeatureSource, ...],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._has_minimum_available_domains")
         available_count = len(self.available_domain_sources(context, sources))
         return available_count >= self.reversion_config.min_required_domains
 
@@ -562,6 +596,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> MeanReversionStackPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_payload")
         payloads = snapshot.payloads()
 
         liquidity = payloads.get(FeatureSource.LIQUIDITY, {})
@@ -628,6 +665,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         )
 
     def _extract_sweep_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_sweep_side")
         for path in (
             "sweep_side",
             "stop_hunt_side",
@@ -645,6 +685,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_exhaustion_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_exhaustion_side")
         for path in (
             "exhaustion_side",
             "absorbed_side",
@@ -662,6 +705,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_rejection_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_rejection_side")
         for path in (
             "rejection_side",
             "reversal_side",
@@ -678,6 +724,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_liquidation_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_liquidation_side")
         for path in (
             "liquidation_side",
             "liquidated_side",
@@ -694,6 +743,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_whale_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_whale_side")
         for path in (
             "whale_side",
             "absorption_side",
@@ -715,6 +767,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         orderflow: dict[str, Any],
         whales: dict[str, Any],
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._extract_reversal_side")
         for payload, extractor in (
             (price_action, self._extract_rejection_side),
             (whales, self._extract_whale_side),
@@ -737,6 +792,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         self,
         payload: MeanReversionStackPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._passes_stack_filters")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -815,6 +873,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         self,
         payload: MeanReversionStackPayload,
     ) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._aligned_confirmation_count")
         count = 0
 
         if is_directional_side(payload.sweep_side) and payload.sweep_side == opposite_signal_side(payload.side):
@@ -844,6 +905,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: MeanReversionStackPayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -980,6 +1044,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         self,
         payload: MeanReversionStackPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._source_features")
         features = [
             *mean_reversion_stack_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -1001,6 +1068,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         self,
         payload: MeanReversionStackPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._tags")
         tags = [
             self.reversion_config.tag_hybrid,
             self.reversion_config.tag_mean_reversion_stack,
@@ -1028,6 +1098,9 @@ class MeanReversionStackStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MeanReversionStackStrategy._execution_hints")
         return {
             "entry_offset_bps": self.reversion_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.reversion_config.execution_stop_buffer_bps_hint,

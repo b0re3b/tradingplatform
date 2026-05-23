@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/orderflow/cvd_divergence_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -77,6 +78,7 @@ class CvdDivergencePayload:
         bearish divergence:
             price_change_pct > 0 while CVD weakens.
     """
+    _logger = logging.getLogger(__name__ + ".CvdDivergencePayload")
 
     snapshot: OrderflowCompositeSnapshot
     side: SignalSide
@@ -87,30 +89,51 @@ class CvdDivergencePayload:
 
     @property
     def price_change_pct(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.price_change_pct")
         return extract_price_change_pct(self.snapshot)
 
     @property
     def cvd_change_pct(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.cvd_change_pct")
         return extract_cvd_change_pct(self.snapshot)
 
     @property
     def cvd_delta_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.cvd_delta_ratio")
         return extract_cvd_delta_ratio(self.snapshot)
 
     @property
     def cvd_slope(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.cvd_slope")
         return extract_cvd_slope(self.snapshot)
 
     @property
     def trades_count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.trades_count")
         return extract_trades_count(self.snapshot)
 
     @property
     def total_volume(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.total_volume")
         return extract_total_volume(self.snapshot)
 
     @property
     def total_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergencePayload.total_notional")
         return extract_total_notional(self.snapshot)
 
 
@@ -126,6 +149,7 @@ class CvdDivergenceStrategyConfig(OrderflowStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".CvdDivergenceStrategyConfig")
 
     require_fresh_cvd: bool = True
     require_actionable_side: bool = True
@@ -182,6 +206,9 @@ class CvdDivergenceStrategyConfig(OrderflowStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategyConfig.validate")
         OrderflowStrategyConfig.validate(self)
 
         non_negative_fields = {
@@ -284,6 +311,7 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".CvdDivergenceStrategy")
 
     component_namespace = "strategy.orderflow.cvd_divergence"
     category: StrategyCategory = StrategyCategory.ORDERFLOW
@@ -299,6 +327,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         orderflow_config: CvdDivergenceStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy.__init__")
         resolved_orderflow_config = (
             orderflow_config or CvdDivergenceStrategyConfig()
         )
@@ -317,10 +348,16 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy.strategy_name")
         return "cvd_divergence"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.ORDERFLOW,
@@ -364,6 +401,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.cvd_config.required_orderflow_features
@@ -373,6 +413,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
             self,
             context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         required_features = tuple(self.cvd_config.required_orderflow_features)
@@ -560,6 +603,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         self,
         context: StrategyContext,
     ) -> CvdDivergencePayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._extract_payload")
         snapshot = self.resolve_orderflow_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -611,6 +657,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         context: StrategyContext,
         payload: CvdDivergencePayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         side = payload.side
 
@@ -732,6 +781,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         self,
         snapshot: OrderflowCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._participation_component")
         trades_component = unit_score(
             snapshot.trades_count / max(self.cvd_config.min_trades_count * 3, 1)
         )
@@ -762,6 +814,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._context_component")
         orderbook = max(
             0.0,
             self._orderbook_alignment_score(snapshot, side),
@@ -793,6 +848,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._orderbook_alignment_score")
         imbalance = extract_orderbook_imbalance_diff(snapshot)
 
         if side is SignalSide.LONG:
@@ -808,6 +866,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._aggressive_alignment_score")
         buy_ratio = extract_aggressive_buy_ratio(snapshot)
         sell_ratio = extract_aggressive_sell_ratio(snapshot)
         aggressive_delta = extract_aggressive_net_notional_delta(snapshot)
@@ -843,6 +904,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._large_trade_alignment_score")
         large_buy = extract_large_buy_trades(snapshot)
         large_sell = extract_large_sell_trades(snapshot)
         total = large_buy + large_sell
@@ -863,6 +927,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._orderbook_alignment_bonus")
         threshold = self.cvd_config.min_orderbook_alignment_bonus_threshold
         imbalance = extract_orderbook_imbalance_diff(snapshot)
 
@@ -879,6 +946,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._aggressive_confirmation_bonus")
         threshold = self.cvd_config.min_aggressive_confirmation_ratio
 
         if side is SignalSide.LONG:
@@ -896,6 +966,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         snapshot: OrderflowCompositeSnapshot,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._large_trade_confirmation_bonus")
         min_count = self.cvd_config.min_large_trade_confirmation_count
         if min_count <= 0:
             return 0.0
@@ -914,6 +987,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         self,
         snapshot: OrderflowCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._volume_participation_bonus")
         if self.cvd_config.min_total_volume > 0:
             if snapshot.total_volume >= self.cvd_config.min_total_volume:
                 return self.cvd_config.volume_participation_bonus
@@ -929,6 +1005,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, payload: CvdDivergencePayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._source_features")
         features = [
             *cvd_source_features(),
             ORDERFLOW_FEATURES.TRADES_COUNT,
@@ -960,6 +1039,9 @@ class CvdDivergenceStrategy(OrderflowTradingStrategy):
         return list(dict.fromkeys(features))
 
     def _tags(self, payload: CvdDivergencePayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CvdDivergenceStrategy._tags")
         tags = [
             self.cvd_config.tag_orderflow,
             self.cvd_config.tag_cvd,

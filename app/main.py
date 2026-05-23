@@ -138,6 +138,8 @@ class TradingSystemRuntime:
         self.components: list[Any] = []
         self.telegram: Any | None = None
         self.news_service: Any | None = None
+        self._derivative_snapshot_poll_job_id: str | None = None
+        self._derivative_snapshot_disabled_symbols: set[str] = set()
         self._started = False
 
     async def start(self) -> None:
@@ -201,6 +203,12 @@ class TradingSystemRuntime:
                 self.components.append(component)
                 await start_component(component)
 
+            # Orderflow is WebSocket-driven, but Binance USD-M open interest and
+            # funding are REST snapshot endpoints. Start the poller only after
+            # caches and analytics have subscribed to market.*.snapshot events so
+            # the first run_immediately tick is not lost.
+            self._start_derivative_snapshot_polling(universe)
+
         if self.settings.enable_strategy:
             strategy_engine = build_strategy_engine(
                 event_bus=self.event_bus,
@@ -257,7 +265,191 @@ class TradingSystemRuntime:
         )
         self._started = True
 
+    def _derivative_snapshot_poll_interval_seconds(self) -> float:
+        value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS")
+        if value is None or not value.strip():
+            return 60.0
+
+        try:
+            interval = float(value)
+        except ValueError:
+            logger.warning(
+                "Invalid DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS=%r; using default 60s",
+                value,
+            )
+            return 60.0
+
+        if interval < 10.0:
+            logger.warning(
+                "DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS=%s is too low; clamping to 10s",
+                interval,
+            )
+            return 10.0
+
+        return interval
+
+    @staticmethod
+    def _is_derivative_symbol_unavailable_error(exc: BaseException) -> bool:
+        """
+        Return True for Binance USD-M symbols that should not be polled anymore.
+
+        Binance can keep some symbols in discovery/universe or user allowlists while
+        individual derivative endpoints reject them as delivering, delivered, settling,
+        closed, or pre-trading. Retrying those symbols every scheduler tick only
+        creates log noise and blocks useful REST budget for active contracts.
+        """
+        text = str(exc).lower()
+        return (
+            "code=-4108" in text
+            or "code=-1121" in text
+            or "delivering" in text
+            or "delivered" in text
+            or "settling" in text
+            or "closed" in text
+            or "pre-trading" in text
+            or "invalid symbol" in text
+        )
+
+    def _disable_derivative_snapshot_symbol(self, symbol: str, exc: BaseException) -> None:
+        normalized = str(symbol).upper()
+        if normalized in self._derivative_snapshot_disabled_symbols:
+            return
+
+        self._derivative_snapshot_disabled_symbols.add(normalized)
+        logger.warning(
+            "Derivative snapshot polling disabled for unavailable Binance symbol | symbol=%s reason=%s",
+            normalized,
+            exc,
+        )
+
+    def _derivative_snapshot_symbols(self, universe: Any) -> list[str]:
+        symbols = [
+            str(symbol).upper()
+            for symbol in getattr(universe, "binance", [])
+            if str(symbol).strip()
+        ]
+
+        allowlist = [symbol.upper() for symbol in self.settings.symbol_allowlist]
+        if allowlist:
+            allowed = set(allowlist)
+            symbols = [symbol for symbol in symbols if symbol in allowed]
+
+        blocklist = {symbol.upper() for symbol in self.settings.symbol_blocklist}
+        if blocklist:
+            symbols = [symbol for symbol in symbols if symbol not in blocklist]
+
+        # Preserve order while removing duplicates.
+        seen: set[str] = set()
+        unique_symbols: list[str] = []
+        for symbol in symbols:
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            unique_symbols.append(symbol)
+
+        return unique_symbols
+
+    def _start_derivative_snapshot_polling(self, universe: Any) -> None:
+        """
+        Start REST polling for derivative-only market-data snapshots.
+
+        Orderflow is fed by WebSocket trades/orderbook data. Binance USD-M open
+        interest and funding are REST endpoints in this project, so caches and
+        analytics stay silent unless the REST client is called periodically.
+        """
+        if self._derivative_snapshot_poll_job_id is not None:
+            return
+
+        if not self.settings.enable_market_data or not self.settings.enable_analytics:
+            return
+
+        if "binance" not in self.settings.market_data_exchanges:
+            return
+
+        binance = self.rest_clients.get("binance")
+        if binance is None:
+            logger.warning("Derivative snapshot polling disabled: Binance REST client is missing")
+            return
+
+        symbols = self._derivative_snapshot_symbols(universe)
+        if not symbols:
+            logger.warning("Derivative snapshot polling disabled: Binance universe is empty")
+            return
+
+        interval = self._derivative_snapshot_poll_interval_seconds()
+
+        async def poll_binance_derivative_snapshots() -> None:
+            active_symbols = [
+                symbol
+                for symbol in symbols
+                if symbol not in self._derivative_snapshot_disabled_symbols
+            ]
+
+            if not active_symbols:
+                logger.warning(
+                    "Derivative snapshot polling skipped: all Binance symbols are disabled | original_symbols=%s",
+                    len(symbols),
+                )
+                return
+
+            for symbol in active_symbols:
+                try:
+                    await binance.get_open_interest(symbol=symbol)
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                        continue
+
+                    logger.exception(
+                        "Failed to poll Binance open interest snapshot | symbol=%s",
+                        symbol,
+                    )
+
+                try:
+                    await binance.get_funding_rate(symbol=symbol, limit=1)
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                        continue
+
+                    logger.exception(
+                        "Failed to poll Binance funding snapshot | symbol=%s",
+                        symbol,
+                    )
+
+        self._derivative_snapshot_poll_job_id = self.scheduler.add_interval_job(
+            name="binance-derivative-snapshots-poll",
+            func=poll_binance_derivative_snapshots,
+            interval=interval,
+            run_immediately=True,
+            max_retries=0,
+            timeout=max(30.0, min(interval * 0.8, 120.0)),
+            allow_overlap=False,
+        )
+
+        logger.info(
+            "Derivative snapshot polling started | exchange=binance symbols=%s interval=%s job_id=%s",
+            len(symbols),
+            interval,
+            self._derivative_snapshot_poll_job_id,
+        )
+
+    def _stop_derivative_snapshot_polling(self) -> None:
+        job_id = self._derivative_snapshot_poll_job_id
+        if job_id is None:
+            return
+
+        self._derivative_snapshot_poll_job_id = None
+        try:
+            self.scheduler.remove_job(job_id)
+        except Exception:
+            logger.exception("Failed to remove derivative snapshot polling job | job_id=%s", job_id)
+        else:
+            logger.info("Derivative snapshot polling stopped | job_id=%s", job_id)
+
     async def stop(self) -> None:
+        self._stop_derivative_snapshot_polling()
+
         # Stop in reverse order. Telegram/news/execution/risk/strategy/analytics/market_stream.
         for component in reversed(self.components):
             try:

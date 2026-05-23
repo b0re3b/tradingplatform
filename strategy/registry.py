@@ -1,6 +1,7 @@
 # trading_system/strategy/registry.py
 
 from __future__ import annotations
+import logging
 
 from collections import defaultdict
 from collections.abc import Iterable
@@ -39,6 +40,7 @@ class StrategyRegistry(BaseStrategyComponent):
     - no RiskReadySignalPayload creation;
     - no risk/trading/execution decisions.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyRegistry")
 
     component_namespace: str = "strategy.registry"
 
@@ -48,6 +50,9 @@ class StrategyRegistry(BaseStrategyComponent):
         event_bus: EventBus | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.__init__")
         super().__init__(
             config=config,
             event_bus=event_bus,
@@ -67,9 +72,15 @@ class StrategyRegistry(BaseStrategyComponent):
 
         Kept for lifecycle compatibility with BaseStrategyComponent.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.register")
         self._registered = True
 
     async def start(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.start")
         await super().start()
         await self.emit_event(
             "strategy.registry.started",
@@ -79,6 +90,9 @@ class StrategyRegistry(BaseStrategyComponent):
         )
 
     async def stop(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.stop")
         await self.emit_event(
             "strategy.registry.stopped",
             self.summary(),
@@ -100,6 +114,9 @@ class StrategyRegistry(BaseStrategyComponent):
         If replace=False and strategy already exists, raises
         StrategyRegistrationError.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.register_strategy")
         self._validate_strategy_instance(strategy)
 
         name = strategy.strategy_name
@@ -142,6 +159,9 @@ class StrategyRegistry(BaseStrategyComponent):
         replace: bool = False,
         emit_event: bool = True,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.register_many")
         for strategy in strategies:
             self.register_strategy(
                 strategy,
@@ -155,6 +175,9 @@ class StrategyRegistry(BaseStrategyComponent):
         *,
         emit_event: bool = True,
     ) -> BaseStrategy:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.unregister_strategy")
         name = self._require_strategy_name(strategy_name)
 
         strategy = self._strategies.pop(name, None)
@@ -182,6 +205,9 @@ class StrategyRegistry(BaseStrategyComponent):
         return strategy
 
     def clear(self, *, emit_event: bool = True) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.clear")
         total = len(self._strategies)
 
         self._strategies.clear()
@@ -200,11 +226,17 @@ class StrategyRegistry(BaseStrategyComponent):
             )
 
     def get(self, strategy_name: str) -> BaseStrategy | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.get")
         if not isinstance(strategy_name, str) or not strategy_name.strip():
             return None
         return self._strategies.get(strategy_name.strip())
 
     def require(self, strategy_name: str) -> BaseStrategy:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.require")
         name = self._require_strategy_name(strategy_name)
 
         strategy = self.get(name)
@@ -214,15 +246,27 @@ class StrategyRegistry(BaseStrategyComponent):
         return strategy
 
     def has(self, strategy_name: str) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.has")
         return self.get(strategy_name) is not None
 
     def count(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.count")
         return len(self._strategies)
 
     def is_empty(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.is_empty")
         return not self._strategies
 
     def list_all(self, *, include_disabled: bool = False) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_all")
         strategies = [
             strategy
             for strategy in self._strategies.values()
@@ -235,6 +279,9 @@ class StrategyRegistry(BaseStrategyComponent):
         )
 
     def list_names(self, *, include_disabled: bool = False) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_names")
         return [
             strategy.strategy_name
             for strategy in self.list_all(include_disabled=include_disabled)
@@ -244,6 +291,9 @@ class StrategyRegistry(BaseStrategyComponent):
         self,
         category: StrategyCategory,
     ) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_by_category")
         names = self._by_category.get(category, set())
         return self._strategies_by_names(names)
 
@@ -251,6 +301,9 @@ class StrategyRegistry(BaseStrategyComponent):
         self,
         timeframe: Timeframe,
     ) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_by_timeframe")
         names = self._by_timeframe.get(timeframe, set())
         return self._strategies_by_names(names)
 
@@ -258,6 +311,9 @@ class StrategyRegistry(BaseStrategyComponent):
         self,
         feature_name: str,
     ) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_by_feature")
         if not feature_name.strip():
             return []
         names = self._feature_index.get(feature_name.strip(), set())
@@ -267,6 +323,9 @@ class StrategyRegistry(BaseStrategyComponent):
         self,
         symbol: str,
     ) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_by_symbol")
         if not symbol.strip():
             return []
 
@@ -280,6 +339,9 @@ class StrategyRegistry(BaseStrategyComponent):
         self,
         regime: MarketRegime,
     ) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.list_by_regime")
         names = self._by_regime.get(regime, set())
 
         # UNKNOWN in strategy config means "allowed in any regime".
@@ -300,6 +362,9 @@ class StrategyRegistry(BaseStrategyComponent):
 
         This method only selects strategy instances. It does not evaluate them.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.select")
         context.validate()
 
         candidates = self._candidate_names(
@@ -345,6 +410,9 @@ class StrategyRegistry(BaseStrategyComponent):
         event_name is stored only for metadata/debug compatibility. Registry
         does not parse trading logic from event names.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.select_for_event")
         if not event_name.strip():
             raise StrategyRegistrationError("event_name cannot be empty")
 
@@ -357,12 +425,21 @@ class StrategyRegistry(BaseStrategyComponent):
         )
 
     def categories(self) -> list[StrategyCategory]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.categories")
         return sorted(self._by_category.keys(), key=lambda item: item.value)
 
     def features(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.features")
         return sorted(self._feature_index.keys())
 
     def summary(self) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry.summary")
         return {
             "total": len(self._strategies),
             "strategies": self.list_names(),
@@ -403,6 +480,9 @@ class StrategyRegistry(BaseStrategyComponent):
         changed_features: set[str],
         source: FeatureSource | None,
     ) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._candidate_names")
         if not self._strategies:
             return set()
 
@@ -455,6 +535,9 @@ class StrategyRegistry(BaseStrategyComponent):
         strategy: BaseStrategy,
         context: StrategyContext,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._strategy_matches_context")
         if not strategy.supports_symbol(context.symbol):
             return False
 
@@ -476,6 +559,9 @@ class StrategyRegistry(BaseStrategyComponent):
         name: str,
         strategy: BaseStrategy,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._add_indexes")
         self._by_category[strategy.category].add(name)
 
         for timeframe in strategy.supported_timeframes():
@@ -497,6 +583,9 @@ class StrategyRegistry(BaseStrategyComponent):
         name: str,
         strategy: BaseStrategy,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._remove_indexes")
         self._discard_from_index(self._by_category, strategy.category, name)
 
         for timeframe in strategy.supported_timeframes():
@@ -517,6 +606,9 @@ class StrategyRegistry(BaseStrategyComponent):
         key: Any,
         name: str,
     ) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRegistry._discard_from_index")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._discard_from_index")
         names = index.get(key)
         if names is None:
             return
@@ -530,6 +622,9 @@ class StrategyRegistry(BaseStrategyComponent):
         self,
         names: set[str],
     ) -> list[BaseStrategy]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._strategies_by_names")
         result = [
             self._strategies[name]
             for name in names
@@ -546,6 +641,9 @@ class StrategyRegistry(BaseStrategyComponent):
         topic: str,
         payload: dict[str, Any],
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._emit_registry_event_nowait")
         if self.event_bus is None:
             return
 
@@ -558,6 +656,9 @@ class StrategyRegistry(BaseStrategyComponent):
 
     @staticmethod
     def _validate_strategy_instance(strategy: BaseStrategy) -> None:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRegistry._validate_strategy_instance")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._validate_strategy_instance")
         if strategy is None:
             raise StrategyRegistrationError("strategy cannot be None")
 
@@ -571,12 +672,18 @@ class StrategyRegistry(BaseStrategyComponent):
 
     @staticmethod
     def _require_strategy_name(strategy_name: str) -> str:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRegistry._require_strategy_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._require_strategy_name")
         if not isinstance(strategy_name, str) or not strategy_name.strip():
             raise StrategyRegistrationError("strategy_name cannot be empty")
         return strategy_name.strip()
 
     @staticmethod
     def _source_to_category(source: FeatureSource) -> StrategyCategory | None:
+        _strategy_logger = logging.getLogger(__name__ + ".StrategyRegistry._source_to_category")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyRegistry._source_to_category")
         mapping: dict[FeatureSource, StrategyCategory] = {
             FeatureSource.ORDERFLOW: StrategyCategory.ORDERFLOW,
             FeatureSource.LIQUIDITY: StrategyCategory.LIQUIDITY,

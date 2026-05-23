@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spoofing/spoofing_absorption_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -70,6 +71,7 @@ class SpoofingAbsorptionReversalPayload:
     - fake BID absorption/support -> buyers were not real -> SHORT;
     - fake ASK absorption/resistance -> sellers were not real -> LONG.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingAbsorptionReversalPayload")
 
     snapshot: SpoofingCompositeSnapshot
     side: SignalSide
@@ -80,26 +82,44 @@ class SpoofingAbsorptionReversalPayload:
 
     @property
     def pull_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalPayload.pull_ratio")
         return extract_pull_ratio(self.snapshot.raw_signal)
 
     @property
     def fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalPayload.fill_ratio")
         return extract_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def cancel_to_fill_ratio(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalPayload.cancel_to_fill_ratio")
         return extract_cancel_to_fill_ratio(self.snapshot.raw_signal)
 
     @property
     def price_reaction_bps(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalPayload.price_reaction_bps")
         return extract_price_reaction_bps(self.snapshot.raw_signal)
 
     @property
     def wall_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalPayload.wall_notional")
         return extract_wall_notional(self.snapshot.raw_signal)
 
     @property
     def pulled_notional(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalPayload.pulled_notional")
         return extract_pulled_notional(self.snapshot.raw_signal)
 
 
@@ -114,6 +134,7 @@ class SpoofingAbsorptionReversalStrategyConfig(SpoofingStrategyConfig):
     - pulled liquidity invalidates absorption narrative;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingAbsorptionReversalStrategyConfig")
 
     min_absorption_score: float = 0.70
     min_absorption_confidence: float = 0.60
@@ -179,6 +200,9 @@ class SpoofingAbsorptionReversalStrategyConfig(SpoofingStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategyConfig.validate")
         SpoofingStrategyConfig.validate(self)
 
         unit_fields = {
@@ -278,6 +302,7 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SpoofingAbsorptionReversalStrategy")
 
     component_namespace = "strategy.spoofing.absorption_reversal"
     category: StrategyCategory = StrategyCategory.SPOOFING
@@ -293,6 +318,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         spoofing_config: SpoofingAbsorptionReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy.__init__")
         resolved_spoofing_config = (
             spoofing_config or SpoofingAbsorptionReversalStrategyConfig()
         )
@@ -313,10 +341,16 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy.strategy_name")
         return "spoofing_absorption_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPOOFING,
@@ -357,6 +391,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.absorption_config.required_spoofing_features
@@ -366,6 +403,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spoofing_data(
@@ -501,6 +541,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         self,
         context: StrategyContext,
     ) -> SpoofingAbsorptionReversalPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._extract_payload")
         snapshot = self.resolve_spoofing_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -546,6 +589,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         self,
         snapshot: SpoofingCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._supports_snapshot")
         if snapshot.pattern is SpoofingPattern.FAKE_ABSORPTION:
             return True
 
@@ -561,6 +607,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: SpoofingAbsorptionReversalPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._passes_absorption_filters")
         snapshot = payload.snapshot
 
         if self.absorption_config.require_fake_absorption_pattern:
@@ -631,6 +680,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         context: StrategyContext,
         payload: SpoofingAbsorptionReversalPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         base_component = average_score(
@@ -759,6 +811,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: SpoofingAbsorptionReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._source_features")
         features = [
             *base_spoofing_source_features(),
             *fake_liquidity_source_features(),
@@ -784,6 +839,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         self,
         payload: SpoofingAbsorptionReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._tags")
         tags = [
             self.absorption_config.tag_spoofing,
             self.absorption_config.tag_absorption,
@@ -814,6 +872,9 @@ class SpoofingAbsorptionReversalStrategy(SpoofingTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SpoofingAbsorptionReversalStrategy._execution_hints")
         return {
             "entry_offset_bps": self.absorption_config.entry_offset_bps_hint,
             "stop_buffer_bps": self.absorption_config.stop_buffer_bps_hint,

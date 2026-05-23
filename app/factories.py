@@ -99,7 +99,7 @@ def build_exchange_ws_clients(
             private_ws_base_url="wss://fstream.binance.com/ws",
             rest_url="https://fapi.binance.com",
             symbols=[],
-            streams=["trade", "depth", "kline"],
+            streams=["trade", "depth", "kline", "forceorder"],
             depth_level="20",
             kline_interval="1m",
             orderbook_emit_min_interval_ms=500,
@@ -227,9 +227,18 @@ def build_analytics_components(
     universe: ExchangeUniverse,
 ) -> list[Any]:
     symbols = universe.all_canonical_symbols()
-    first_symbol = symbols[0] if symbols else "BTCUSDT"
+    binance_symbols = [symbol for symbol in universe.binance if str(symbol).strip()]
+    price_action_symbols = binance_symbols or symbols or ["BTCUSDT"]
+    price_action_timeframes = ("1m", "15m")
 
-    liquidity_config = LiquidityConfig()
+    # Dev-friendly defaults: liquidity still uses canonical cache-layer topics,
+    # but it can build initial snapshots faster and also reacts to candles-cache
+    # updates. For stricter production behavior, raise min_candles_for_snapshot
+    # back to 30.
+    liquidity_config = LiquidityConfig(
+        candles_updated_input_topics=("market.candles.updated",),
+        min_candles_for_snapshot=5,
+    )
     liquidity_map = LiquidityMap(config=liquidity_config)
 
     components: list[Any] = [
@@ -255,14 +264,18 @@ def build_analytics_components(
             config=liquidity_config,
             liquidity_map=liquidity_map,
         ),
-        PriceActionAnalyzer(
-            first_symbol,
-            timeframe="1m",
-            event_bus=event_bus,
-            exchange="binance",
-            market_type="usdm_futures",
-            scheduler=scheduler,
-        ),
+        *[
+            PriceActionAnalyzer(
+                symbol,
+                timeframe=timeframe,
+                event_bus=event_bus,
+                exchange="binance",
+                market_type="usdm_futures",
+                scheduler=scheduler,
+            )
+            for symbol in price_action_symbols
+            for timeframe in price_action_timeframes
+        ],
         SpoofingAnalyzer(
             event_bus=event_bus,
             scheduler=scheduler,

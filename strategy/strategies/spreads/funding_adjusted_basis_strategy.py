@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spreads/funding_adjusted_basis_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,6 +70,7 @@ class FundingAdjustedBasisPayload:
 
     Exact multi-leg construction belongs to SignalProcessor / SignalBuilder.
     """
+    _logger = logging.getLogger(__name__ + ".FundingAdjustedBasisPayload")
 
     snapshot: SpreadCompositeSnapshot
     side: SignalSide
@@ -92,6 +94,7 @@ class FundingAdjustedBasisStrategyConfig(SpreadsStrategyConfig):
     This strategy is stricter than generic spot/futures basis:
     entry is allowed only when funding-adjusted edge is present and strong enough.
     """
+    _logger = logging.getLogger(__name__ + ".FundingAdjustedBasisStrategyConfig")
 
     entry_zscore: Decimal = Decimal("1.75")
     stop_zscore: Decimal = Decimal("4.5")
@@ -165,6 +168,9 @@ class FundingAdjustedBasisStrategyConfig(SpreadsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategyConfig.validate")
         SpreadsStrategyConfig.validate(self)
 
         if self.entry_zscore <= DECIMAL_ZERO:
@@ -263,6 +269,7 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".FundingAdjustedBasisStrategy")
 
     component_namespace = "strategy.spreads.funding_adjusted_basis"
     category: StrategyCategory = StrategyCategory.SPREADS
@@ -278,6 +285,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         spreads_config: FundingAdjustedBasisStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy.__init__")
         resolved_spreads_config = spreads_config or FundingAdjustedBasisStrategyConfig()
         resolved_spreads_config.validate()
 
@@ -296,10 +306,16 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy.strategy_name")
         return "funding_adjusted_basis"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPREADS,
@@ -342,6 +358,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.funding_basis_config.required_spreads_features
@@ -351,6 +370,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spreads_data(
@@ -494,6 +516,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> FundingAdjustedBasisPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._extract_payload")
         snapshot = self.resolve_spread_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -565,6 +590,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._passes_contract_filters")
         if not self.funding_basis_config.require_spot_futures_contract:
             return True
 
@@ -595,6 +623,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: FundingAdjustedBasisPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._passes_funding_adjusted_filters")
         snapshot = payload.snapshot
 
         if self.funding_basis_config.require_valid_quote and not snapshot.is_quote_valid:
@@ -649,6 +680,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: FundingAdjustedBasisPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._passes_confirmation_filters")
         signal = payload.snapshot.raw_signal
 
         if self.funding_basis_config.require_mean_reversion_signal:
@@ -680,6 +714,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         context: StrategyContext,
         payload: FundingAdjustedBasisPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         edge_scale = max(
@@ -801,6 +838,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: FundingAdjustedBasisPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._basis_confluence_component")
         raw_basis = payload.raw_basis
         if raw_basis is None or raw_basis == DECIMAL_ZERO:
             return 0.0
@@ -828,6 +868,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._confirmation_component")
         signal = snapshot.raw_signal
 
         components = {
@@ -858,6 +901,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: FundingAdjustedBasisPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._source_features")
         features = [
             *funding_adjusted_source_features(),
             SPREADS_FEATURES.SNAPSHOT,
@@ -885,6 +931,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: FundingAdjustedBasisPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._tags")
         tags = [
             self.funding_basis_config.tag_spreads,
             self.funding_basis_config.tag_spot_futures,
@@ -918,6 +967,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         self,
         payload: FundingAdjustedBasisPayload,
     ) -> dict[str, Any]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._leg_semantics")
         snapshot = payload.snapshot
 
         if payload.basis_bias == "SHORT_BASIS":
@@ -955,6 +1007,9 @@ class FundingAdjustedBasisStrategy(SpreadsTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FundingAdjustedBasisStrategy._execution_hints")
         return {
             "entry_offset_bps": self.funding_basis_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.funding_basis_config.execution_stop_buffer_bps_hint,

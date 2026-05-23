@@ -1,6 +1,7 @@
 # trading_system/strategy/enums.py
 
 from __future__ import annotations
+import logging
 
 from enum import Enum
 
@@ -20,14 +21,23 @@ class StrEnum(str, Enum):
 
     @classmethod
     def values(cls) -> tuple[str, ...]:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".StrEnum")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrEnum.values")
         return tuple(item.value for item in cls)
 
     @classmethod
     def has_value(cls, value: str) -> bool:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".StrEnum")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrEnum.has_value")
         return value in cls.values()
 
     @classmethod
     def safe_parse(cls, value: object, default: "StrEnum") -> "StrEnum":
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".StrEnum")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrEnum.safe_parse")
         if isinstance(value, cls):
             return value
         if isinstance(value, str):
@@ -53,10 +63,16 @@ class SignalSide(StrEnum):
 
     @property
     def is_directional(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalSide.is_directional")
         return self in {SignalSide.LONG, SignalSide.SHORT}
 
     @property
     def sign(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalSide.sign")
         if self is SignalSide.LONG:
             return 1
         if self is SignalSide.SHORT:
@@ -83,6 +99,9 @@ class SignalStatus(StrEnum):
 
     @property
     def is_active(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalStatus.is_active")
         return self in {
             SignalStatus.NEW,
             SignalStatus.PENDING,
@@ -91,6 +110,9 @@ class SignalStatus(StrEnum):
 
     @property
     def is_terminal(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalStatus.is_terminal")
         return self in {
             SignalStatus.REJECTED,
             SignalStatus.CANCELLED,
@@ -173,6 +195,9 @@ class StrategyCategory(StrEnum):
 
     def to_feature_source(self) -> "FeatureSource":
         """Return the canonical FeatureSource for this strategy category."""
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCategory.to_feature_source")
         return FeatureSource.from_strategy_category(self)
 
 
@@ -197,6 +222,9 @@ class FeatureSource(StrEnum):
 
     @classmethod
     def from_strategy_category(cls, category: StrategyCategory) -> "FeatureSource":
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".FeatureSource")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FeatureSource.from_strategy_category")
         mapping: dict[StrategyCategory, FeatureSource] = {
             StrategyCategory.ORDERFLOW: cls.ORDERFLOW,
             StrategyCategory.LIQUIDITY: cls.LIQUIDITY,
@@ -227,6 +255,9 @@ class MarketRegime(StrEnum):
 
     @property
     def is_directional(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketRegime.is_directional")
         return self in {
             MarketRegime.TRENDING_UP,
             MarketRegime.TRENDING_DOWN,
@@ -236,6 +267,9 @@ class MarketRegime(StrEnum):
 
     @property
     def is_risky(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering MarketRegime.is_risky")
         return self in {
             MarketRegime.HIGH_VOLATILITY,
             MarketRegime.NEWS_DRIVEN,
@@ -266,6 +300,9 @@ class ConfidenceGrade(StrEnum):
 
     @property
     def rank(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering ConfidenceGrade.rank")
         return {
             ConfidenceGrade.VERY_LOW: 1,
             ConfidenceGrade.LOW: 2,
@@ -291,6 +328,9 @@ class Timeframe(StrEnum):
 
     @property
     def seconds(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering Timeframe.seconds")
         return {
             Timeframe.TICK: 0,
             Timeframe.S1: 1,
@@ -308,6 +348,9 @@ class Timeframe(StrEnum):
 
     @property
     def is_intraday(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering Timeframe.is_intraday")
         return self.seconds < 86400
 
 
@@ -319,10 +362,16 @@ class FilterDecision(StrEnum):
 
     @property
     def passed(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterDecision.passed")
         return self in {FilterDecision.PASS, FilterDecision.WARN}
 
     @property
     def blocked(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FilterDecision.blocked")
         return self is FilterDecision.BLOCK
 
 
@@ -334,6 +383,9 @@ class SignalStrength(StrEnum):
 
     @property
     def rank(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalStrength.rank")
         return {
             SignalStrength.WEAK: 1,
             SignalStrength.MODERATE: 2,
@@ -364,6 +416,9 @@ class SignalPriority(StrEnum):
 
     @property
     def rank(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalPriority.rank")
         return {
             SignalPriority.LOW: 1,
             SignalPriority.MEDIUM: 2,
@@ -389,6 +444,9 @@ class FreshnessStatus(StrEnum):
 
     @property
     def usable(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering FreshnessStatus.usable")
         return self in {FreshnessStatus.FRESH, FreshnessStatus.AGING}
 
 
@@ -422,6 +480,9 @@ class StrategyTradeTier(StrEnum):
 
     @property
     def rank(self) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyTradeTier.rank")
         return {
             StrategyTradeTier.T1: 1,
             StrategyTradeTier.T2: 2,
@@ -431,6 +492,9 @@ class StrategyTradeTier(StrEnum):
 
     @classmethod
     def from_rank(cls, rank: int) -> "StrategyTradeTier":
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".StrategyTradeTier")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyTradeTier.from_rank")
         normalized = max(1, min(int(rank), 4))
         return {
             1: cls.T1,
@@ -440,6 +504,9 @@ class StrategyTradeTier(StrEnum):
         }[normalized]
 
     def downgrade(self, steps: int = 1) -> "StrategyTradeTier":
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyTradeTier.downgrade")
         return self.from_rank(self.rank - max(0, int(steps)))
 
 
@@ -458,6 +525,9 @@ class StrategyOrderIntent(StrEnum):
 
     @property
     def increases_risk(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyOrderIntent.increases_risk")
         return self in {
             StrategyOrderIntent.OPEN,
             StrategyOrderIntent.INCREASE,
@@ -466,6 +536,9 @@ class StrategyOrderIntent(StrEnum):
 
     @property
     def reduces_risk(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyOrderIntent.reduces_risk")
         return self in {
             StrategyOrderIntent.REDUCE,
             StrategyOrderIntent.CLOSE,
@@ -489,6 +562,9 @@ class StrategyLiquidityClass(StrEnum):
 
     @property
     def is_high_quality(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLiquidityClass.is_high_quality")
         return self in {
             StrategyLiquidityClass.TOP,
             StrategyLiquidityClass.HIGH,
@@ -496,6 +572,9 @@ class StrategyLiquidityClass(StrEnum):
 
     @property
     def is_risky(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyLiquidityClass.is_risky")
         return self in {
             StrategyLiquidityClass.LOW,
             StrategyLiquidityClass.ILLIQUID,
@@ -519,6 +598,9 @@ class StrategyExecutionQuality(StrEnum):
 
     @property
     def is_tradeable(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyExecutionQuality.is_tradeable")
         return self in {
             StrategyExecutionQuality.EXCELLENT,
             StrategyExecutionQuality.GOOD,
@@ -555,6 +637,9 @@ class StrategyMarketType(StrEnum):
 
     @property
     def is_futures(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyMarketType.is_futures")
         return True
 
 

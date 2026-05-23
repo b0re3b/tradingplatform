@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/open_interest/oi_divergence_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -76,6 +77,7 @@ class OIDivergencePayload:
         - OIAnomalyResult;
         - full OI analysis confidence через OpenInterestTradingStrategy.
     """
+    _logger = logging.getLogger(__name__ + ".OIDivergencePayload")
 
     divergence: OIDivergenceResult
     features: OIFeatures | None = None
@@ -88,22 +90,37 @@ class OIDivergencePayload:
 
     @property
     def divergence_type(self) -> OIDivergenceType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergencePayload.divergence_type")
         return self.divergence.divergence_type
 
     @property
     def detected(self) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergencePayload.detected")
         return bool(self.divergence.detected)
 
     @property
     def confidence(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergencePayload.confidence")
         return unit_score(getattr(self.divergence, "confidence", 0.0))
 
     @property
     def score(self) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergencePayload.score")
         return unit_score(getattr(self.divergence, "score", self.confidence))
 
     @property
     def window_size(self) -> int | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergencePayload.window_size")
         return getattr(self.divergence, "window_size", None)
 
 
@@ -120,6 +137,7 @@ class OIDivergenceStrategyConfig(OpenInterestStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".OIDivergenceStrategyConfig")
 
     require_detected_result: bool = True
     require_actionable_side: bool = True
@@ -172,6 +190,9 @@ class OIDivergenceStrategyConfig(OpenInterestStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategyConfig.validate")
         OpenInterestStrategyConfig.validate(self)
 
         bounded_fields = {
@@ -273,6 +294,7 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".OIDivergenceStrategy")
 
     component_namespace = "strategy.open_interest.divergence"
     category: StrategyCategory = StrategyCategory.OPEN_INTEREST
@@ -315,6 +337,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         open_interest_config: OIDivergenceStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy.__init__")
         resolved_open_interest_config = (
             open_interest_config or OIDivergenceStrategyConfig()
         )
@@ -335,10 +360,16 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy.strategy_name")
         return "oi_divergence"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.OPEN_INTEREST,
@@ -384,6 +415,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.divergence_config.required_open_interest_features
@@ -393,6 +427,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_open_interest_data(
@@ -585,6 +622,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _extract_payload(self, context: StrategyContext) -> OIDivergencePayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._extract_payload")
         divergence = self.extract_oi_divergence_result(context)
         if divergence is None:
             return None
@@ -622,6 +662,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
 
         Додатково використовує OIFeatures як tie-breaker для contextual cases.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._map_divergence_to_side")
         divergence_type = payload.divergence_type
         semantic_hint = divergence_side_hint(divergence_type)
 
@@ -672,6 +715,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _map_divergence_to_setup_type(self, payload: OIDivergencePayload) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._map_divergence_to_setup_type")
         divergence_type = payload.divergence_type
         regime = payload.regime.regime if payload.regime is not None else None
 
@@ -716,6 +762,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         payload: OIDivergencePayload,
         side: SignalSide,
     ) -> str | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._risk_block_reason")
         anomaly = payload.anomaly
         if anomaly is None or not anomaly.detected:
             return None
@@ -740,6 +789,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         payload: OIDivergencePayload,
         side: SignalSide,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._hard_anomaly_flush_supports_side")
         features = payload.features
         if features is None:
             return False
@@ -769,6 +821,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         side: SignalSide,
         event_time: datetime | None,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._build_score_breakdown")
         base_score = payload.score if payload.score > 0 else payload.confidence
         divergence_score = unit_score(base_score)
 
@@ -902,6 +957,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         ).normalize()
 
     def _regime_context_score(self, payload: OIDivergencePayload) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._regime_context_score")
         regime = payload.regime
         if regime is None:
             return 0.0
@@ -922,6 +980,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         payload: OIDivergencePayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._feature_context_score")
         features = payload.features
         if features is None:
             return 0.0
@@ -967,6 +1028,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         payload: OIDivergencePayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._feature_score_adjustment")
         features = payload.features
         if features is None:
             return 0.0
@@ -1042,6 +1106,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         payload: OIDivergencePayload,
         side: SignalSide,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._feature_confidence_adjustment")
         features = payload.features
         if features is None:
             return 0.0
@@ -1094,6 +1161,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, payload: OIDivergencePayload) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._source_features")
         features = [
             OPEN_INTEREST_FEATURES.DIVERGENCE,
             OPEN_INTEREST_FEATURES.DIVERGENCE_TYPE,
@@ -1138,6 +1208,9 @@ class OIDivergenceStrategy(OpenInterestTradingStrategy):
         payload: OIDivergencePayload,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering OIDivergenceStrategy._tags")
         tags = [
             self.divergence_config.tag_open_interest,
             self.divergence_config.tag_oi_divergence,

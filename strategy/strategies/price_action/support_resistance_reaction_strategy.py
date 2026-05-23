@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/price_action/support_resistance_reaction_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -70,6 +71,7 @@ class SupportResistanceLevelContext:
     This DTO belongs to strategy layer only. Analytics models remain in
     analytics.price_action.
     """
+    _logger = logging.getLogger(__name__ + ".SupportResistanceLevelContext")
 
     level_type: LevelType | None = None
     status: LevelStatus | None = None
@@ -103,6 +105,9 @@ class SupportResistanceLevelContext:
         *,
         fallback_layer: StructureLayer | None = None,
     ) -> SupportResistanceLevelContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SupportResistanceLevelContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceLevelContext.from_payload")
         if payload is None:
             return None
 
@@ -223,6 +228,7 @@ class SupportResistanceEventContext:
     """
     Normalized support/resistance lifecycle event.
     """
+    _logger = logging.getLogger(__name__ + ".SupportResistanceEventContext")
 
     event_type: SREventType | None = None
     level_type: LevelType | None = None
@@ -248,6 +254,9 @@ class SupportResistanceEventContext:
         *,
         fallback_layer: StructureLayer | None = None,
     ) -> SupportResistanceEventContext | None:
+        _strategy_logger = getattr(cls, "_logger", None) or logging.getLogger(__name__ + ".SupportResistanceEventContext")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceEventContext.from_payload")
         if payload is None:
             return None
 
@@ -346,6 +355,7 @@ class SupportResistanceReactionContext:
     """
     Normalized SR reaction view consumed by SupportResistanceReactionStrategy.
     """
+    _logger = logging.getLogger(__name__ + ".SupportResistanceReactionContext")
 
     module: dict[str, Any]
     primary_layer: dict[str, Any]
@@ -381,6 +391,7 @@ class SupportResistanceReactionStrategyConfig(PriceActionStrategyConfig):
     - leave routing, filtering, confluence, portfolio coordination and
       risk-ready conversion to SignalProcessor.
     """
+    _logger = logging.getLogger(__name__ + ".SupportResistanceReactionStrategyConfig")
 
     prefer_external_layer: bool = True
 
@@ -444,6 +455,9 @@ class SupportResistanceReactionStrategyConfig(PriceActionStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategyConfig.validate")
         PriceActionStrategyConfig.validate(self)
 
         unit_fields = {
@@ -531,6 +545,7 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".SupportResistanceReactionStrategy")
 
     component_namespace = "strategy.price_action.support_resistance_reaction"
     category: StrategyCategory = StrategyCategory.PRICE_ACTION
@@ -546,6 +561,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         price_action_config: SupportResistanceReactionStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy.__init__")
         resolved_price_action_config = (
             price_action_config or SupportResistanceReactionStrategyConfig()
         )
@@ -566,10 +584,16 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy.strategy_name")
         return "support_resistance_reaction"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.PRICE_ACTION,
@@ -611,6 +635,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.sr_config.required_price_action_features
@@ -620,6 +647,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_price_action_data(
@@ -820,6 +850,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         self,
         context: StrategyContext,
     ) -> SupportResistanceReactionContext | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._extract_view")
         module = self.resolve_price_action_module(
             context,
             "support_resistance",
@@ -913,6 +946,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         last_event: SupportResistanceEventContext | None,
         fallback_layer: StructureLayer | None,
     ) -> SupportResistanceLevelContext | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._select_reaction_level")
         candidates: list[Any] = []
 
         if last_event is not None:
@@ -972,6 +1008,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         *,
         fallback: StructureLayer,
     ) -> StructureLayer:
+        _strategy_logger = logging.getLogger(__name__ + ".SupportResistanceReactionStrategy._extract_layer_name")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._extract_layer_name")
         return (
             parse_structure_layer(
                 get_path(layer, "layer")
@@ -988,6 +1027,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         primary: dict[str, Any],
         event: SupportResistanceEventContext | None,
     ) -> list[str]:
+        _strategy_logger = logging.getLogger(__name__ + ".SupportResistanceReactionStrategy._extract_reasons")
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._extract_reasons")
         reasons: list[str] = []
 
         for value in (
@@ -1011,6 +1053,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _infer_side(self, view: SupportResistanceReactionContext) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._infer_side")
         if view.reaction_level is None:
             return SignalSide.UNKNOWN
 
@@ -1028,6 +1073,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         self,
         view: SupportResistanceReactionContext,
     ) -> SetupType:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._infer_setup_type")
         event = view.last_event
 
         if event is not None and event.event_type is not None:
@@ -1080,6 +1128,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._passes_filters")
         level = view.reaction_level
         if level is None:
             return False
@@ -1160,6 +1211,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._build_score_breakdown")
         level = view.reaction_level
         event = view.last_event
 
@@ -1273,6 +1327,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         self,
         event: SupportResistanceEventContext | None,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._event_component")
         if event is None:
             return 0.0
 
@@ -1301,6 +1358,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         side: SignalSide,
         setup_type: SetupType,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._reaction_component")
         level = view.reaction_level
         event = view.last_event
 
@@ -1350,6 +1410,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         self,
         level: SupportResistanceLevelContext,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._proximity_score")
         return distance_score(
             level.distance_pct,
             max_distance_pct=max(self.sr_config.max_distance_to_level_pct, 0.0001),
@@ -1359,6 +1422,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         self,
         level: SupportResistanceLevelContext,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._level_quality_score")
         touch_component = unit_score(
             level.touch_count / max(self.sr_config.min_touch_count * 3, 1)
         )
@@ -1390,6 +1456,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
     # ------------------------------------------------------------------
 
     def _source_features(self, view: SupportResistanceReactionContext) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._source_features")
         features = [
             *support_resistance_source_features(),
             PRICE_ACTION_FEATURES.SUPPORT_RESISTANCE,
@@ -1408,6 +1477,9 @@ class SupportResistanceReactionStrategy(PriceActionTradingStrategy):
         view: SupportResistanceReactionContext,
         setup_type: SetupType,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SupportResistanceReactionStrategy._tags")
         tags = [
             self.sr_config.tag_price_action,
             self.sr_config.tag_support_resistance,

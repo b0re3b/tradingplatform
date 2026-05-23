@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/whales/whale_absorption_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -58,6 +59,7 @@ class WhaleAbsorptionPayload:
     - whale buy absorption + sell-side liquidation/exhaustion -> LONG;
     - whale sell absorption + buy-side liquidation/exhaustion -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleAbsorptionPayload")
 
     snapshot: WhaleCompositeSnapshot
     side: SignalSide
@@ -80,6 +82,7 @@ class WhaleAbsorptionStrategyConfig(WhalesStrategyConfig):
     - cluster/activity/large trade may strengthen the setup;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleAbsorptionStrategyConfig")
 
     min_absorption_score: float = 0.64
     min_absorption_confidence: float = 0.58
@@ -152,6 +155,9 @@ class WhaleAbsorptionStrategyConfig(WhalesStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategyConfig.validate")
         WhalesStrategyConfig.validate(self)
 
         unit_fields = {
@@ -256,6 +262,7 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".WhaleAbsorptionStrategy")
 
     component_namespace = "strategy.whales.absorption"
     category: StrategyCategory = StrategyCategory.WHALES
@@ -271,6 +278,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         whales_config: WhaleAbsorptionStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy.__init__")
         resolved_whales_config = whales_config or WhaleAbsorptionStrategyConfig()
         resolved_whales_config.validate()
 
@@ -287,10 +297,16 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy.strategy_name")
         return "whale_absorption"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.WHALES,
@@ -332,6 +348,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(
             self.absorption_config.required_whales_features
@@ -341,6 +360,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_whales_data(
@@ -469,6 +491,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         self,
         context: StrategyContext,
     ) -> WhaleAbsorptionPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._extract_payload")
         snapshot = self.resolve_whale_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -516,6 +541,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         self,
         snapshot: WhaleCompositeSnapshot,
     ) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._resolve_absorbing_whale_side")
         for candidate in (
             snapshot.whale_side,
             snapshot.dominant_side,
@@ -531,6 +559,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
     # ------------------------------------------------------------------
 
     def _required_inputs(self) -> tuple[str, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._required_inputs")
         required = ["pressure"]
 
         if self.absorption_config.require_liquidation_context:
@@ -545,6 +576,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleAbsorptionPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._passes_absorption_filters")
         snapshot = payload.snapshot
 
         if self.absorption_config.require_pressure_context:
@@ -613,6 +647,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         context: StrategyContext,
         payload: WhaleAbsorptionPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         inputs = snapshot.inputs()
 
@@ -766,6 +803,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleAbsorptionPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._source_features")
         features = [
             *whale_absorption_source_features(),
             WHALES_FEATURES.PRESSURE,
@@ -797,6 +837,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         self,
         payload: WhaleAbsorptionPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._tags")
         tags = [
             self.absorption_config.tag_whales,
             self.absorption_config.tag_absorption,
@@ -827,6 +870,9 @@ class WhaleAbsorptionStrategy(WhalesTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering WhaleAbsorptionStrategy._execution_hints")
         return {
             "entry_offset_bps": self.absorption_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.absorption_config.execution_stop_buffer_bps_hint,

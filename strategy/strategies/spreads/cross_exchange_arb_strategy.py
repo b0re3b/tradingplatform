@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/spreads/cross_exchange_arb_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,6 +69,7 @@ class CrossExchangeArbPayload:
     - StrategySignal.side remains generic LONG/SHORT;
     - exact leg construction is metadata for SignalProcessor/SignalBuilder.
     """
+    _logger = logging.getLogger(__name__ + ".CrossExchangeArbPayload")
 
     snapshot: SpreadCompositeSnapshot
     side: SignalSide
@@ -94,6 +96,7 @@ class CrossExchangeArbStrategyConfig(SpreadsStrategyConfig):
     - map buy/sell leg semantics into metadata;
     - return internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".CrossExchangeArbStrategyConfig")
 
     min_net_edge: Decimal = Decimal("0")
     min_edge_bps: Decimal = Decimal("5")
@@ -155,6 +158,9 @@ class CrossExchangeArbStrategyConfig(SpreadsStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategyConfig.validate")
         SpreadsStrategyConfig.validate(self)
 
         if self.min_net_edge < DECIMAL_ZERO:
@@ -250,6 +256,7 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
     This class does not subscribe to EventBus and does not emit signal.generated.
     SignalProcessor owns routing, filters, confluence, building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".CrossExchangeArbStrategy")
 
     component_namespace = "strategy.spreads.cross_exchange_arb"
     category: StrategyCategory = StrategyCategory.SPREADS
@@ -265,6 +272,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         spreads_config: CrossExchangeArbStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy.__init__")
         resolved_spreads_config = spreads_config or CrossExchangeArbStrategyConfig()
         resolved_spreads_config.validate()
 
@@ -281,10 +291,16 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy.strategy_name")
         return "cross_exchange_arb"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.SPREADS,
@@ -325,6 +341,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.arb_config.required_spreads_features)
 
@@ -332,6 +351,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         if not self.has_any_spreads_data(
@@ -469,6 +491,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         context: StrategyContext,
     ) -> CrossExchangeArbPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._extract_payload")
         snapshot = self.resolve_spread_snapshot(context)
         if snapshot is None or not snapshot.has_minimum_data():
             return None
@@ -531,6 +556,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> Decimal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._net_edge")
         for candidate in (
             snapshot.net_edge,
             extract_net_edge(snapshot.raw_opportunity),
@@ -545,6 +573,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> Decimal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._net_edge_bps")
         for candidate in (
             snapshot.net_edge_bps,
             extract_net_edge_bps(snapshot.raw_opportunity),
@@ -563,6 +594,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._passes_contract_filters")
         if not self.arb_config.require_cross_exchange_contract:
             return True
 
@@ -616,6 +650,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         payload: CrossExchangeArbPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._passes_arb_filters")
         snapshot = payload.snapshot
 
         if self.arb_config.require_valid_quote and not snapshot.is_quote_valid:
@@ -651,6 +688,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._has_arb_signal_confirmation")
         if snapshot.signal_type is None:
             return bool(snapshot.raw_signal)
 
@@ -673,6 +713,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         context: StrategyContext,
         payload: CrossExchangeArbPayload,
     ) -> ScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._build_score_breakdown")
         snapshot = payload.snapshot
 
         edge_scale = max(self.arb_config.min_net_edge, DECIMAL_ONE)
@@ -777,6 +820,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         snapshot: SpreadCompositeSnapshot,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._persistence_component")
         if self.arb_config.min_persistence_ms <= 0:
             return 1.0 if snapshot.persistence_ms > 0 else 0.0
 
@@ -792,6 +838,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         payload: CrossExchangeArbPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._source_features")
         features = [
             *cross_exchange_source_features(),
             *arbitrage_opportunity_source_features(),
@@ -820,6 +869,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         self,
         payload: CrossExchangeArbPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._tags")
         tags = [
             self.arb_config.tag_spreads,
             self.arb_config.tag_cross_exchange,
@@ -855,6 +907,9 @@ class CrossExchangeArbStrategy(SpreadsTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering CrossExchangeArbStrategy._execution_hints")
         return {
             "entry_offset_bps": self.arb_config.entry_offset_bps_hint,
             "stop_buffer_bps": self.arb_config.stop_buffer_bps_hint,

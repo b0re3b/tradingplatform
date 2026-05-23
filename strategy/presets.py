@@ -1,6 +1,7 @@
 # trading_system/strategy/presets.py
 
 from __future__ import annotations
+import logging
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
@@ -135,6 +136,7 @@ class StrategyCatalogEntry:
     - no signal.generated emit;
     - no risk/execution calls.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyCatalogEntry")
 
     name: str
     category: StrategyCategory
@@ -146,6 +148,9 @@ class StrategyCatalogEntry:
     metadata: dict[str, object] = field(default_factory=dict)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyCatalogEntry.validate")
         if not self.name.strip():
             raise StrategyConfigError("StrategyCatalogEntry.name cannot be empty")
 
@@ -1412,6 +1417,7 @@ class StrategyPreset:
     This object is safe to use as preset template. Use to_config(copy=True)
     before passing config into StrategyEngine if runtime mutation is possible.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyPreset")
 
     name: str
     mode: PresetMode
@@ -1420,17 +1426,29 @@ class StrategyPreset:
     metadata: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPreset.__post_init__")
         self.validate()
 
     @property
     def enabled_strategy_names(self) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPreset.enabled_strategy_names")
         return list(self.config.preset.enabled_strategy_names)
 
     @property
     def strategy_definitions(self) -> dict[str, StrategyDefinitionConfig]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPreset.strategy_definitions")
         return dict(self.config.strategies)
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPreset.validate")
         if not self.name.strip():
             raise StrategyConfigError("StrategyPreset.name cannot be empty")
 
@@ -1449,9 +1467,15 @@ class StrategyPreset:
         self.config.validate()
 
     def to_config(self, *, copy: bool = True) -> StrategyConfig:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPreset.to_config")
         return deepcopy(self.config) if copy else self.config
 
     def summary(self) -> dict[str, object]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPreset.summary")
         return {
             "name": self.name,
             "mode": self.mode.value,
@@ -1469,6 +1493,7 @@ class StrategyPresetBuilder:
     This builder does not instantiate strategies, does not subscribe to EventBus,
     and does not emit strategy/risk/execution events.
     """
+    _logger = logging.getLogger(__name__ + ".StrategyPresetBuilder")
 
     def __init__(
         self,
@@ -1483,6 +1508,9 @@ class StrategyPresetBuilder:
         use_required_features: bool = False,
         metadata: Mapping[str, object] | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.__init__")
         if not name.strip():
             raise StrategyConfigError("preset name cannot be empty")
 
@@ -1528,6 +1556,9 @@ class StrategyPresetBuilder:
         min_confidence: float | None = None,
         min_score: float | None = None,
     ) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_runtime_defaults")
         if cooldown_seconds is not None:
             self._runtime_defaults["cooldown_seconds"] = cooldown_seconds
 
@@ -1558,6 +1589,9 @@ class StrategyPresetBuilder:
         tags: Sequence[str] | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_strategy_override")
         name = strategy_name.strip()
         if not name:
             raise StrategyConfigError("strategy_name cannot be empty")
@@ -1603,36 +1637,57 @@ class StrategyPresetBuilder:
         return self
 
     def with_routing(self, routing: RoutingConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_routing")
         routing.validate()
         self._routing = routing
         return self
 
     def with_confluence(self, confluence: ConfluenceConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_confluence")
         confluence.validate()
         self._confluence = confluence
         return self
 
     def with_confidence(self, confidence: ConfidenceConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_confidence")
         confidence.validate()
         self._confidence = confidence
         return self
 
     def with_voting(self, voting: VotingConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_voting")
         voting.validate()
         self._voting = voting
         return self
 
     def with_conflict(self, conflict: ConflictConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_conflict")
         conflict.validate()
         self._conflict = conflict
         return self
 
     def with_filters(self, filters: FilterConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_filters")
         filters.validate()
         self._filters = filters
         return self
 
     def with_builders(self, builders: BuilderConfig) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_builders")
         builders.validate()
         self._builders = builders
         return self
@@ -1641,6 +1696,9 @@ class StrategyPresetBuilder:
         self,
         portfolio: PortfolioCoordinatorConfig,
     ) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_portfolio")
         portfolio.validate()
         self._portfolio = portfolio
         return self
@@ -1649,6 +1707,9 @@ class StrategyPresetBuilder:
         self,
         freshness: FeatureFreshnessConfig,
     ) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_freshness")
         freshness.validate()
         self._freshness = freshness
         return self
@@ -1657,6 +1718,9 @@ class StrategyPresetBuilder:
         self,
         values: Mapping[StrategyCategory, float],
     ) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_category_weights")
         self._category_weight_overrides.update(dict(values))
         return self
 
@@ -1664,10 +1728,16 @@ class StrategyPresetBuilder:
         self,
         values: Mapping[MarketRegime, float],
     ) -> StrategyPresetBuilder:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.with_regime_adjustments")
         self._regime_adjustment_overrides.update(dict(values))
         return self
 
     def build(self) -> StrategyPreset:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder.build")
         strategy_names = self.strategy_names or list(ALL_STRATEGY_NAMES)
 
         default_cooldown = int(self._runtime_defaults["cooldown_seconds"])
@@ -1794,6 +1864,9 @@ class StrategyPresetBuilder:
         )
 
     def _default_runtime_timeframes(self) -> Timeframes:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering StrategyPresetBuilder._default_runtime_timeframes")
         if self.mode is PresetMode.SCALPING:
             return TF_SCALP
 

@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/trend_stack_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -58,6 +59,7 @@ class TrendStackPayload:
     - price-action uptrend/breakout + same-side orderflow/OI/whales -> LONG;
     - price-action downtrend/breakdown + same-side orderflow/OI/whales -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".TrendStackPayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -89,6 +91,7 @@ class TrendStackStrategyConfig(HybridStrategyConfig):
     - funding can act as a guard against overcrowded/extreme opposite context;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".TrendStackStrategyConfig")
 
     min_trend_stack_score: float = 0.64
     min_trend_stack_confidence: float = 0.58
@@ -179,6 +182,9 @@ class TrendStackStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -289,6 +295,7 @@ class TrendStackStrategy(HybridTradingStrategy):
     SignalProcessor owns global routing, confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".TrendStackStrategy")
 
     component_namespace = "strategy.hybrid.trend_stack"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -304,6 +311,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         hybrid_config: TrendStackStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy.__init__")
         resolved_hybrid_config = hybrid_config or TrendStackStrategyConfig()
         resolved_hybrid_config.validate()
 
@@ -320,10 +330,16 @@ class TrendStackStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy.strategy_name")
         return "trend_stack"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -367,6 +383,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.trend_config.required_hybrid_features)
 
@@ -374,6 +393,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -497,6 +519,9 @@ class TrendStackStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._enabled_sources")
         sources: list[FeatureSource] = [
             FeatureSource.PRICE_ACTION,
             FeatureSource.ORDERFLOW,
@@ -514,6 +539,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.trend_config.require_price_action:
@@ -534,6 +562,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._vote_weights")
         return {
             FeatureSource.PRICE_ACTION: self.trend_config.price_action_vote_weight,
             FeatureSource.ORDERFLOW: self.trend_config.orderflow_vote_weight,
@@ -547,6 +578,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         context: StrategyContext,
         sources: tuple[FeatureSource, ...],
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._has_minimum_available_domains")
         available_count = len(self.available_domain_sources(context, sources))
         return available_count >= self.trend_config.min_required_domains
 
@@ -562,6 +596,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> TrendStackPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._extract_payload")
         payloads = snapshot.payloads()
 
         price_action = payloads.get(FeatureSource.PRICE_ACTION, {})
@@ -628,6 +665,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         )
 
     def _extract_trend_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._extract_trend_side")
         for path in (
             "trend_side",
             "trend_direction",
@@ -646,6 +686,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_orderflow_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._extract_orderflow_side")
         for path in (
             "continuation_side",
             "delta_side",
@@ -664,6 +707,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_oi_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._extract_oi_side")
         for path in (
             "oi_side",
             "open_interest_side",
@@ -683,6 +729,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_whale_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._extract_whale_side")
         for path in (
             "whale_side",
             "activity_side",
@@ -701,6 +750,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_funding_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._extract_funding_side")
         for path in (
             "funding_side",
             "pressure_side",
@@ -725,6 +777,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         payload: TrendStackPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._passes_trend_filters")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -795,6 +850,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         payload: TrendStackPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._passes_funding_guard")
         funding = payload.snapshot.payloads().get(FeatureSource.FUNDING, {})
         funding_score = extract_domain_score(funding)
 
@@ -837,6 +895,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         payload: TrendStackPayload,
     ) -> int:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._aligned_confirmation_count")
         count = 0
 
         if is_directional_side(payload.trend_side) and payload.trend_side == payload.side:
@@ -866,6 +927,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: TrendStackPayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -1007,6 +1071,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         payload: TrendStackPayload,
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._funding_guard_score")
         funding = payload.snapshot.payloads().get(FeatureSource.FUNDING, {})
         if not funding:
             return 1.0
@@ -1051,6 +1118,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         payload: TrendStackPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._source_features")
         features = [
             *trend_stack_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -1072,6 +1142,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         self,
         payload: TrendStackPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._tags")
         tags = [
             self.trend_config.tag_hybrid,
             self.trend_config.tag_trend_stack,
@@ -1101,6 +1174,9 @@ class TrendStackStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering TrendStackStrategy._execution_hints")
         return {
             "entry_offset_bps": self.trend_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.trend_config.execution_stop_buffer_bps_hint,

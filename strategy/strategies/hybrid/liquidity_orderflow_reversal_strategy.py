@@ -1,6 +1,7 @@
 # trading_system/strategy/strategies/hybrid/liquidity_orderflow_reversal_strategy.py
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -58,6 +59,7 @@ class LiquidityOrderflowReversalPayload:
     - sweep / stop-hunt down + sell exhaustion / absorption -> LONG;
     - sweep / stop-hunt up + buy exhaustion / absorption -> SHORT.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityOrderflowReversalPayload")
 
     snapshot: HybridCompositeSnapshot
     side: SignalSide
@@ -86,6 +88,7 @@ class LiquidityOrderflowReversalStrategyConfig(HybridStrategyConfig):
     - optional price action rejection confirms reversal side;
     - strategy returns internal StrategySignal only.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityOrderflowReversalStrategyConfig")
 
     min_liquidity_orderflow_score: float = 0.64
     min_liquidity_orderflow_confidence: float = 0.58
@@ -167,6 +170,9 @@ class LiquidityOrderflowReversalStrategyConfig(HybridStrategyConfig):
     )
 
     def validate(self) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategyConfig.validate")
         HybridStrategyConfig.validate(self)
 
         unit_fields = {
@@ -269,6 +275,7 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
     SignalProcessor owns global routing, confluence, filters, portfolio coordination,
     building and risk payloads.
     """
+    _logger = logging.getLogger(__name__ + ".LiquidityOrderflowReversalStrategy")
 
     component_namespace = "strategy.hybrid.liquidity_orderflow_reversal"
     category: StrategyCategory = StrategyCategory.HYBRID
@@ -284,6 +291,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         hybrid_config: LiquidityOrderflowReversalStrategyConfig | None = None,
         service_name: str | None = None,
     ) -> None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy.__init__")
         resolved_hybrid_config = (
             hybrid_config or LiquidityOrderflowReversalStrategyConfig()
         )
@@ -304,10 +314,16 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
 
     @property
     def strategy_name(self) -> str:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy.strategy_name")
         return "liquidity_orderflow_reversal"
 
     @property
     def metadata(self) -> StrategyMetadata:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy.metadata")
         return StrategyMetadata(
             strategy_name=self.strategy_name,
             category=StrategyCategory.HYBRID,
@@ -351,6 +367,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         )
 
     def required_features(self) -> set[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy.required_features")
         base_required = super().required_features()
         return set(base_required).union(self.lo_config.required_hybrid_features)
 
@@ -358,6 +377,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         self,
         context: StrategyContext,
     ) -> StrategySignal | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy.generate_signal")
         self.validate_context_requirements(context)
 
         sources = self._enabled_sources()
@@ -479,6 +501,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
     # ------------------------------------------------------------------
 
     def _enabled_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._enabled_sources")
         sources: list[FeatureSource] = [
             FeatureSource.LIQUIDITY,
             FeatureSource.ORDERFLOW,
@@ -490,6 +515,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _required_sources(self) -> tuple[FeatureSource, ...]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._required_sources")
         sources: list[FeatureSource] = []
 
         if self.lo_config.require_liquidity:
@@ -504,6 +532,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         return tuple(dict.fromkeys(sources))
 
     def _vote_weights(self) -> dict[FeatureSource, float]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._vote_weights")
         return {
             FeatureSource.LIQUIDITY: self.lo_config.liquidity_vote_weight,
             FeatureSource.ORDERFLOW: self.lo_config.orderflow_vote_weight,
@@ -522,6 +553,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         sources: tuple[FeatureSource, ...],
         required_sources: tuple[FeatureSource, ...],
     ) -> LiquidityOrderflowReversalPayload | None:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._extract_payload")
         payloads = snapshot.payloads()
 
         liquidity = payloads.get(FeatureSource.LIQUIDITY, {})
@@ -586,6 +620,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         )
 
     def _extract_sweep_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._extract_sweep_side")
         for path in (
             "sweep_side",
             "stop_hunt_side",
@@ -604,6 +641,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_orderflow_exhaustion_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._extract_orderflow_exhaustion_side")
         for path in (
             "exhaustion_side",
             "exhausted_side",
@@ -622,6 +662,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_absorption_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._extract_absorption_side")
         for path in (
             "absorption_side",
             "absorbing_side",
@@ -638,6 +681,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         return SignalSide.UNKNOWN
 
     def _extract_rejection_side(self, payload: dict[str, Any]) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._extract_rejection_side")
         for path in (
             "rejection_side",
             "reversal_side",
@@ -658,6 +704,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         orderflow: dict[str, Any],
         price_action: dict[str, Any],
     ) -> SignalSide:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._extract_reversal_side")
         for extractor, payload in (
             (self._extract_absorption_side, orderflow),
             (self._extract_rejection_side, price_action),
@@ -680,6 +729,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         self,
         payload: LiquidityOrderflowReversalPayload,
     ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._passes_liquidity_orderflow_filters")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -753,6 +805,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         context: StrategyContext,
         payload: LiquidityOrderflowReversalPayload,
     ) -> HybridScoreBreakdown:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._build_score_breakdown")
         snapshot = payload.snapshot
         payloads = snapshot.payloads()
 
@@ -881,6 +936,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         self,
         orderflow: dict[str, Any],
     ) -> float:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._absorption_score")
         candidates = [
             get_path(orderflow, "absorption_score"),
             get_path(orderflow, "orderflow_absorption_score"),
@@ -905,6 +963,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         self,
         payload: LiquidityOrderflowReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._source_features")
         features = [
             *liquidity_orderflow_reversal_source_features(),
             HYBRID_FEATURES.DOMINANT_SIDE,
@@ -924,6 +985,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         self,
         payload: LiquidityOrderflowReversalPayload,
     ) -> list[str]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._tags")
         tags = [
             self.lo_config.tag_hybrid,
             self.lo_config.tag_liquidity_orderflow,
@@ -951,6 +1015,9 @@ class LiquidityOrderflowReversalStrategy(HybridTradingStrategy):
         Execution hints only. Final EntryPlan/ExitPlan/RiskReadySignalPayload
         is owned by SignalProcessor / SignalBuilder.
         """
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering LiquidityOrderflowReversalStrategy._execution_hints")
         return {
             "entry_offset_bps": self.lo_config.execution_entry_offset_bps_hint,
             "stop_buffer_bps": self.lo_config.execution_stop_buffer_bps_hint,
