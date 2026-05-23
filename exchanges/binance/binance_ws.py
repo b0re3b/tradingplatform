@@ -42,6 +42,9 @@ class BinanceWebSocketClientConfig:
     depth_speed: str = "100ms"
     kline_interval: str = "1m"
     orderbook_emit_min_interval_ms: int = 250
+    orderbook_batch_max_size: int = 500
+    trade_emit_min_interval_ms: int = 250
+    trade_batch_max_size: int = 1000
 
 
     enable_private_stream: bool = False
@@ -58,6 +61,9 @@ class BinanceWebSocketClientConfig:
         kline_interval: str = "1m",
         enable_private_stream: bool = False,
         orderbook_emit_min_interval_ms: int = 250,
+        orderbook_batch_max_size: int = 500,
+        trade_emit_min_interval_ms: int = 250,
+        trade_batch_max_size: int = 1000,
     ) -> "BinanceWebSocketClientConfig":
         return cls(
             public_ws_url=config.exchange.ws_url or cls.public_ws_url,
@@ -71,6 +77,9 @@ class BinanceWebSocketClientConfig:
             kline_interval=kline_interval,
             enable_private_stream=enable_private_stream,
             orderbook_emit_min_interval_ms=orderbook_emit_min_interval_ms,
+            orderbook_batch_max_size=orderbook_batch_max_size,
+            trade_emit_min_interval_ms=trade_emit_min_interval_ms,
+            trade_batch_max_size=trade_batch_max_size,
         )
 
 
@@ -124,6 +133,9 @@ class BinanceWebSocketClient:
         kline_interval: str = "1m",
         enable_private_stream: bool = False,
         orderbook_emit_min_interval_ms: int = 250,
+        orderbook_batch_max_size: int = 500,
+        trade_emit_min_interval_ms: int = 250,
+        trade_batch_max_size: int = 1000,
     ) -> None:
         resolved_config = ws_config or BinanceWebSocketClientConfig.from_core_config(
             config=config,
@@ -133,6 +145,9 @@ class BinanceWebSocketClient:
             kline_interval=kline_interval,
             enable_private_stream=enable_private_stream,
             orderbook_emit_min_interval_ms=orderbook_emit_min_interval_ms,
+            orderbook_batch_max_size=orderbook_batch_max_size,
+            trade_emit_min_interval_ms=trade_emit_min_interval_ms,
+            trade_batch_max_size=trade_batch_max_size,
         )
 
         self._config = config
@@ -165,9 +180,14 @@ class BinanceWebSocketClient:
         self._running = False
         self._started = False
         self._last_orderbook_emit_ms: dict[str, int] = {}
-        self._pending_orderbook_payloads: dict[str, dict[str, Any]] = {}
+        self._pending_orderbook_payloads: dict[str, list[dict[str, Any]]] = {}
         self._orderbook_flush_tasks: dict[str, asyncio.Task] = {}
         self._orderbook_throttled_updates: dict[str, int] = {}
+
+        self._last_trade_batch_emit_ms: dict[str, int] = {}
+        self._pending_trade_payloads: dict[str, list[dict[str, Any]]] = {}
+        self._trade_flush_tasks: dict[str, asyncio.Task] = {}
+        self._trade_throttled_updates: dict[str, int] = {}
 
 
         self._validate_config()
@@ -251,6 +271,7 @@ class BinanceWebSocketClient:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         await self._cancel_orderbook_flush_tasks()
+        await self._cancel_trade_flush_tasks()
 
         self._public_task = None
         self._private_task = None
@@ -672,37 +693,56 @@ class BinanceWebSocketClient:
         self._orderbook_flush_tasks.clear()
         self._pending_orderbook_payloads.clear()
 
-    async def _emit_orderbook_event_throttled(
+    async def _emit_orderbook_event_coalesced(
         self,
         *,
         key: str,
         payload: dict[str, Any],
     ) -> None:
         """
-        Emits market.orderbook at most once per configured interval per symbol.
+        Coalesces high-frequency orderbook updates into market.orderbook.batch.
 
-        Intermediate updates are coalesced: only the latest payload is kept and
-        flushed after the remaining interval. This protects the shared EventBus
-        from high-frequency orderbook bursts while preserving the freshest state.
+        Important: orderbook updates may be exchange deltas, so this method keeps
+        every pending update in order instead of replacing them with the latest
+        payload. OrderBookCache applies the batch sequentially and performs the
+        usual sequence validation.
         """
-        interval_ms = max(0, int(getattr(self._ws_config, "orderbook_emit_min_interval_ms", 0) or 0))
+        interval_ms = max(
+            0,
+            int(getattr(self._ws_config, "orderbook_emit_min_interval_ms", 0) or 0),
+        )
+
         if interval_ms <= 0:
             await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
             return
 
-        normalized_key = key or str(payload.get("symbol") or "unknown")
+        normalized_key = key or str(payload.get("symbol") or "unknown").upper()
         now_ms = int(time.time() * 1000)
+
+        batch = self._pending_orderbook_payloads.setdefault(normalized_key, [])
+        batch.append(payload)
+
+        max_batch_size = max(
+            1,
+            int(getattr(self._ws_config, "orderbook_batch_max_size", 500) or 500),
+        )
+
         last_emit_ms = self._last_orderbook_emit_ms.get(normalized_key, 0)
         elapsed_ms = now_ms - last_emit_ms
 
-        if last_emit_ms <= 0 or elapsed_ms >= interval_ms:
-            self._last_orderbook_emit_ms[normalized_key] = now_ms
-            self._pending_orderbook_payloads.pop(normalized_key, None)
-            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+        should_flush_now = (
+            last_emit_ms <= 0
+            or elapsed_ms >= interval_ms
+            or len(batch) >= max_batch_size
+        )
+
+        if should_flush_now:
+            await self._flush_pending_orderbook_batch(normalized_key, delay_seconds=0.0)
             return
 
-        self._pending_orderbook_payloads[normalized_key] = payload
-        self._orderbook_throttled_updates[normalized_key] = self._orderbook_throttled_updates.get(normalized_key, 0) + 1
+        self._orderbook_throttled_updates[normalized_key] = (
+            self._orderbook_throttled_updates.get(normalized_key, 0) + 1
+        )
 
         existing_task = self._orderbook_flush_tasks.get(normalized_key)
         if existing_task is not None and not existing_task.done():
@@ -710,26 +750,44 @@ class BinanceWebSocketClient:
 
         delay_seconds = max((interval_ms - elapsed_ms) / 1000.0, 0.0)
         self._orderbook_flush_tasks[normalized_key] = asyncio.create_task(
-            self._flush_pending_orderbook_event(normalized_key, delay_seconds)
+            self._flush_pending_orderbook_batch(normalized_key, delay_seconds)
         )
 
-    async def _flush_pending_orderbook_event(self, key: str, delay_seconds: float) -> None:
+    async def _flush_pending_orderbook_batch(self, key: str, delay_seconds: float) -> None:
         try:
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
 
-            payload = self._pending_orderbook_payloads.pop(key, None)
-            if payload is None:
+            updates = self._pending_orderbook_payloads.pop(key, None)
+            if not updates:
                 return
 
             self._last_orderbook_emit_ms[key] = int(time.time() * 1000)
-            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+
+            first = updates[0]
+            last = updates[-1]
+            batch_payload = {
+                "exchange": self.EXCHANGE,
+                "symbol": first.get("symbol") or last.get("symbol"),
+                "market_type": first.get("market_type") or last.get("market_type") or "usdm_futures",
+                "source": self.SOURCE,
+                "count": len(updates),
+                "first_event_time": first.get("event_time") or first.get("timestamp_ms") or first.get("timestamp"),
+                "last_event_time": last.get("event_time") or last.get("timestamp_ms") or last.get("timestamp"),
+                "updates": updates,
+            }
+
+            await self._emit_event(
+                "market.orderbook.batch",
+                batch_payload,
+                priority=EventPriority.LOW,
+            )
 
         except asyncio.CancelledError:
             raise
         except Exception:
             self._logger.exception(
-                "Failed to flush throttled orderbook event | exchange=%s key=%s",
+                "Failed to flush coalesced orderbook batch | exchange=%s key=%s",
                 self.EXCHANGE,
                 key,
             )
@@ -738,6 +796,117 @@ class BinanceWebSocketClient:
             if task is asyncio.current_task():
                 self._orderbook_flush_tasks.pop(key, None)
 
+    async def _cancel_trade_flush_tasks(self) -> None:
+        tasks = [task for task in self._trade_flush_tasks.values() if task is not None and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._trade_flush_tasks.clear()
+        self._pending_trade_payloads.clear()
+
+    async def _emit_trade_event_coalesced(
+        self,
+        *,
+        key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """
+        Coalesces high-frequency raw trades into market.trades.batch.
+
+        TradesCache can already ingest a list from payload["trades"], so this
+        reduces EventBus pressure without losing individual trade records.
+        """
+        interval_ms = max(
+            0,
+            int(getattr(self._ws_config, "trade_emit_min_interval_ms", 0) or 0),
+        )
+
+        if interval_ms <= 0:
+            await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
+            return
+
+        normalized_key = key or str(payload.get("symbol") or "unknown").upper()
+        now_ms = int(time.time() * 1000)
+
+        batch = self._pending_trade_payloads.setdefault(normalized_key, [])
+        batch.append(payload)
+
+        max_batch_size = max(
+            1,
+            int(getattr(self._ws_config, "trade_batch_max_size", 1000) or 1000),
+        )
+
+        last_emit_ms = self._last_trade_batch_emit_ms.get(normalized_key, 0)
+        elapsed_ms = now_ms - last_emit_ms
+
+        should_flush_now = (
+            last_emit_ms <= 0
+            or elapsed_ms >= interval_ms
+            or len(batch) >= max_batch_size
+        )
+
+        if should_flush_now:
+            await self._flush_pending_trade_batch(normalized_key, delay_seconds=0.0)
+            return
+
+        self._trade_throttled_updates[normalized_key] = (
+            self._trade_throttled_updates.get(normalized_key, 0) + 1
+        )
+
+        existing_task = self._trade_flush_tasks.get(normalized_key)
+        if existing_task is not None and not existing_task.done():
+            return
+
+        delay_seconds = max((interval_ms - elapsed_ms) / 1000.0, 0.0)
+        self._trade_flush_tasks[normalized_key] = asyncio.create_task(
+            self._flush_pending_trade_batch(normalized_key, delay_seconds)
+        )
+
+    async def _flush_pending_trade_batch(self, key: str, delay_seconds: float) -> None:
+        try:
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            trades = self._pending_trade_payloads.pop(key, None)
+            if not trades:
+                return
+
+            self._last_trade_batch_emit_ms[key] = int(time.time() * 1000)
+
+            first = trades[0]
+            last = trades[-1]
+            batch_payload = {
+                "exchange": self.EXCHANGE,
+                "symbol": first.get("symbol") or last.get("symbol"),
+                "market_type": first.get("market_type") or last.get("market_type") or "usdm_futures",
+                "source": self.SOURCE,
+                "count": len(trades),
+                "first_trade_time": first.get("trade_time") or first.get("event_time") or first.get("timestamp_ms"),
+                "last_trade_time": last.get("trade_time") or last.get("event_time") or last.get("timestamp_ms"),
+                "trades": trades,
+            }
+
+            await self._emit_event(
+                "market.trades.batch",
+                batch_payload,
+                priority=EventPriority.LOW,
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "Failed to flush coalesced trade batch | exchange=%s key=%s",
+                self.EXCHANGE,
+                key,
+            )
+        finally:
+            task = self._trade_flush_tasks.get(key)
+            if task is asyncio.current_task():
+                self._trade_flush_tasks.pop(key, None)
+
+
     # ------------------------------------------------------------------
     # Event publishers: public market data
     # ------------------------------------------------------------------
@@ -745,6 +914,7 @@ class BinanceWebSocketClient:
     async def _publish_trade_event(self, data: dict[str, Any]) -> None:
         payload = {
             "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
             "symbol": data.get("s"),
             "trade_id": data.get("t"),
             "price": self._safe_float(data.get("p")),
@@ -755,15 +925,15 @@ class BinanceWebSocketClient:
             "trade_time": data.get("T"),
         }
 
-        await self._emit_event(
-            "market.trade",
-            payload,
-            priority=EventPriority.NORMAL,
+        await self._emit_trade_event_coalesced(
+            key=str(payload.get("symbol") or "unknown").upper(),
+            payload=payload,
         )
 
     async def _publish_orderbook_event(self, data: dict[str, Any]) -> None:
         payload = {
             "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
             "symbol": data.get("s"),
             "first_update_id": data.get("U"),
             "final_update_id": data.get("u"),
@@ -778,7 +948,7 @@ class BinanceWebSocketClient:
             "event_time": data.get("E"),
         }
 
-        await self._emit_orderbook_event_throttled(
+        await self._emit_orderbook_event_coalesced(
             key=str(payload.get("symbol") or "unknown").upper(),
             payload=payload,
         )
@@ -792,6 +962,7 @@ class BinanceWebSocketClient:
 
         payload = {
             "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
             "symbol": data.get("s"),
             "timeframe": kline.get("i"),
             "open_time": kline.get("t"),
@@ -812,7 +983,7 @@ class BinanceWebSocketClient:
         await self._emit_event(
             "market.candle",
             payload,
-            priority=EventPriority.NORMAL,
+            priority=EventPriority.HIGH,
         )
 
     # ------------------------------------------------------------------

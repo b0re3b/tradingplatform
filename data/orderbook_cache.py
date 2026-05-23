@@ -102,8 +102,12 @@ class OrderBookCache:
             self._logger.warning("OrderBookCache register skipped: EventBus is not provided")
             return
         self.event_bus.subscribe("market.orderbook", self._on_market_orderbook)
+        self.event_bus.subscribe("market.orderbook.batch", self._on_market_orderbook_batch)
         self.event_bus.subscribe("market.orderbook.snapshot", self._on_market_orderbook_snapshot)
-        self._logger.info("OrderBookCache registered | topics=%s", ["market.orderbook", "market.orderbook.snapshot"])
+        self._logger.info(
+            "OrderBookCache registered | topics=%s",
+            ["market.orderbook", "market.orderbook.batch", "market.orderbook.snapshot"],
+        )
 
     async def start(self) -> None:
         self.register()
@@ -122,6 +126,44 @@ class OrderBookCache:
             await self.apply_snapshot(payload)
         else:
             await self.apply_delta(payload)
+
+    async def _on_market_orderbook_batch(self, event: Any) -> None:
+        """
+        Handles coalesced orderbook updates emitted by WS adapters.
+
+        The batch preserves the original update order. Each item is still applied
+        through the same snapshot/delta path as a single market.orderbook event,
+        so sequence validation and resync signaling remain centralized here.
+        """
+        payload = self._extract_payload(event)
+        updates = payload.get("updates") or payload.get("deltas") or payload.get("items") or []
+
+        if not isinstance(updates, list):
+            self._logger.warning(
+                "Orderbook batch ignored: updates is not a list | exchange=%s symbol=%s",
+                payload.get("exchange"),
+                payload.get("symbol"),
+            )
+            return
+
+        for item in updates:
+            if not isinstance(item, dict):
+                continue
+
+            merged = {**payload, **item}
+            merged.pop("updates", None)
+            merged.pop("deltas", None)
+            merged.pop("items", None)
+
+            normalized = self._normalize_inbound_payload(merged)
+            key = self._build_book_key_from_event(normalized)
+            state = self._books.get(key)
+
+            if state is None or not state.snapshot_received or normalized.get("type") == "snapshot":
+                await self.apply_snapshot(normalized)
+            else:
+                await self.apply_delta(normalized)
+
 
     @staticmethod
     def _extract_payload(event: Any) -> dict[str, Any]:

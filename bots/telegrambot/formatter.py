@@ -304,7 +304,7 @@ class TelegramFormatter:
                 "position_size": self._format_number(payload.get("position_size", payload.get("size"))),
                 "risk_decision": self._multiline(payload.get("risk_decision", payload.get("decision", "n/a"))),
                 "reject_reason": self._safe(payload.get("reject_reason", payload.get("reason"))),
-                "details": self._format_details(payload.get("details", payload)),
+                "details": self._format_signal_details(payload, route.message_type),
                 "signal_id": self._safe(payload.get("signal_id")),
                 "status": self._safe(payload.get("status")),
                 "update_type": self._safe(payload.get("update_type")),
@@ -1305,6 +1305,56 @@ class TelegramFormatter:
             return ", ".join(items) if items else default
 
         return self._safe(value, default=default)
+
+    def _format_signal_details(self, payload: dict[str, Any], message_type: TelegramMessageType) -> str:
+        """
+        Формує деталі для signal events без дампу всього payload.
+
+        Для SIGNAL_REJECTED витягує тільки корисні поля:
+        strategy_name, source_topic/event_name, raw_signals count, reason.
+        Повний payload (route з 135 features тощо) ніколи не дампується.
+        """
+        # Якщо в payload є явний details — використовуємо його
+        explicit_details = payload.get("details")
+        if explicit_details is not None and isinstance(explicit_details, (dict, str)):
+            return self._format_details(explicit_details)
+
+        if message_type == TelegramMessageType.SIGNAL_REJECTED:
+            parts: dict[str, Any] = {}
+
+            strategy = payload.get("strategy_name") or payload.get("strategy")
+            if strategy:
+                parts["strategy"] = strategy
+
+            source = (
+                payload.get("source_topic")
+                or payload.get("source_event_name")
+                or payload.get("event_name")
+            )
+            if source:
+                parts["source"] = source
+
+            reason = payload.get("reason") or payload.get("reject_reason")
+            if reason:
+                parts["reason"] = reason
+
+            raw_signals = payload.get("raw_signals")
+            if isinstance(raw_signals, list):
+                parts["raw_signals_count"] = len(raw_signals)
+
+            route = payload.get("route")
+            if isinstance(route, dict):
+                route_event = route.get("event_name")
+                if route_event:
+                    parts["route_event"] = route_event
+
+            if not parts:
+                return "n/a"
+
+            return f"<pre>{self._format_json(parts)}</pre>"
+
+        # Для інших signal types — стандартна поведінка, але без fallback на весь payload
+        return "n/a"
 
     def _format_details(self, value: Any, *, default: str = "n/a") -> str:
         if value is None:

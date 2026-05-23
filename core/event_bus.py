@@ -88,11 +88,37 @@ class EventBus:
     - async + sync handlers
     - middleware chain
     - bounded queue
-    - queue overflow policies
+    - topic-aware queue overflow policies
     - retry
     - graceful shutdown
     - metrics
     """
+
+    # High-volume market-data topics are intentionally lossy. They may be
+    # dropped under backpressure before they are allowed to evict critical
+    # trading/system events from the shared queue.
+    LOSSY_TOPIC_PREFIXES: tuple[str, ...] = (
+        "market.trade",
+        "market.trades.",
+        "market.orderbook",
+        "market.orderbook.",
+    )
+
+    # Protected topics must not be evicted by market-data pressure. If the
+    # queue is full and no lossy queued event can be removed, async publishers
+    # will backpressure until capacity is available.
+    PROTECTED_TOPIC_PREFIXES: tuple[str, ...] = (
+        "market.candle",
+        "market.candles.",
+        "analytics.",
+        "strategy.",
+        "signal.",
+        "risk.",
+        "execution.",
+        "position.",
+        "account.",
+        "system.",
+    )
 
     def __init__(
         self,
@@ -146,6 +172,9 @@ class EventBus:
             "subscriptions": 0,
             "topic_published": {},
             "topic_processed": {},
+            "topic_dropped": {},
+            "drop_reasons": {},
+            "protected_enqueue_waits": 0,
             "handler_errors": {},
         }
 
@@ -464,12 +493,7 @@ class EventBus:
 
     async def _enqueue_event(self, event: Event) -> bool:
         async with self._publish_lock:
-            item = (
-                int(event.priority),
-                self._publish_seq,
-                _QueuedItem(event=event),
-            )
-            self._publish_seq += 1
+            item = self._make_queue_item(event)
 
             if self._queue_full_policy == QueueFullPolicy.WAIT:
                 await self._queue.put(item)
@@ -477,11 +501,12 @@ class EventBus:
 
             if self._queue_full_policy == QueueFullPolicy.DROP_NEW:
                 if self._queue.full():
-                    self._inc_metric("dropped")
-                    self._logger.warning(
-                        "Queue full, dropping new event | topic=%s event_id=%s",
-                        event.topic,
-                        event.event_id,
+                    # DROP_NEW is explicit best-effort behaviour. Keep this
+                    # policy simple, but track the actual incoming topic.
+                    self._record_drop(
+                        event,
+                        reason="queue_full_drop_new",
+                        log_message="Queue full, dropping new event",
                     )
                     return False
 
@@ -489,59 +514,215 @@ class EventBus:
                 return True
 
             if self._queue_full_policy == QueueFullPolicy.DROP_OLDEST:
-                if self._queue.full():
-                    try:
-                        self._queue.get_nowait()
-                        self._queue.task_done()
-                        self._inc_metric("dropped")
+                if not self._queue.full():
+                    self._queue.put_nowait(item)
+                    return True
 
-                        self._logger.warning(
-                            "Queue full, dropped oldest event | topic=%s event_id=%s",
-                            event.topic,
-                            event.event_id,
-                        )
-                    except asyncio.QueueEmpty:
-                        pass
-
-                self._queue.put_nowait(item)
-                return True
+                return await self._enqueue_with_topic_aware_drop(item)
 
             raise ValueError(f"Unsupported queue full policy: {self._queue_full_policy}")
 
     def _try_enqueue_nowait(self, event: Event) -> bool:
+        item = self._make_queue_item(event)
+
+        if self._queue_full_policy == QueueFullPolicy.WAIT:
+            if self._queue.full():
+                self._record_drop(
+                    event,
+                    reason="queue_full_wait_nowait_rejected",
+                    log_message="Queue full, best-effort event rejected",
+                )
+                return False
+
+            self._queue.put_nowait(item)
+            return True
+
+        if self._queue_full_policy == QueueFullPolicy.DROP_NEW:
+            if self._queue.full():
+                self._record_drop(
+                    event,
+                    reason="queue_full_drop_new",
+                    log_message="Queue full, dropping new event",
+                )
+                return False
+
+            self._queue.put_nowait(item)
+            return True
+
+        if self._queue_full_policy == QueueFullPolicy.DROP_OLDEST:
+            if not self._queue.full():
+                self._queue.put_nowait(item)
+                return True
+
+            dropped = self._drop_one_queued_lossy_event_nowait(
+                incoming_event=event,
+                reason="queue_full_drop_queued_lossy_nowait",
+            )
+            if dropped:
+                self._queue.put_nowait(item)
+                return True
+
+            if self._is_lossy_topic(event.topic):
+                self._record_drop(
+                    event,
+                    reason="queue_full_drop_incoming_lossy_nowait",
+                    log_message="Queue full, dropping incoming lossy event",
+                )
+                return False
+
+            # Best-effort publish cannot safely block. Refuse the protected
+            # incoming event instead of evicting another protected event.
+            self._record_drop(
+                event,
+                reason="queue_full_protected_nowait_rejected",
+                log_message="Queue full, protected best-effort event rejected",
+            )
+            return False
+
+        return False
+
+    def _make_queue_item(self, event: Event) -> tuple[int, int, _QueuedItem]:
         item = (
             int(event.priority),
             self._publish_seq,
             _QueuedItem(event=event),
         )
         self._publish_seq += 1
+        return item
 
-        if self._queue_full_policy == QueueFullPolicy.WAIT:
-            if self._queue.full():
-                self._inc_metric("dropped")
-                return False
+    async def _enqueue_with_topic_aware_drop(
+        self,
+        item: tuple[int, int, _QueuedItem],
+    ) -> bool:
+        event = item[2].event
+
+        dropped = self._drop_one_queued_lossy_event_nowait(
+            incoming_event=event,
+            reason="queue_full_drop_queued_lossy",
+        )
+        if dropped:
             self._queue.put_nowait(item)
             return True
 
-        if self._queue_full_policy == QueueFullPolicy.DROP_NEW:
-            if self._queue.full():
-                self._inc_metric("dropped")
-                return False
-            self._queue.put_nowait(item)
-            return True
+        if self._is_lossy_topic(event.topic):
+            self._record_drop(
+                event,
+                reason="queue_full_drop_incoming_lossy",
+                log_message="Queue full, dropping incoming lossy event",
+            )
+            return False
 
-        if self._queue_full_policy == QueueFullPolicy.DROP_OLDEST:
-            if self._queue.full():
-                try:
-                    self._queue.get_nowait()
-                    self._queue.task_done()
-                    self._inc_metric("dropped")
-                except asyncio.QueueEmpty:
-                    pass
-            self._queue.put_nowait(item)
-            return True
+        # Protected events should not be sacrificed because of market-data
+        # pressure. If the queue contains no lossy event to evict, apply
+        # backpressure to the protected publisher until a worker frees capacity.
+        self._inc_metric("protected_enqueue_waits")
+        self._inc_nested_metric("drop_reasons", "protected_backpressure_wait")
+        self._logger.warning(
+            "Queue full, waiting to enqueue protected event | topic=%s event_id=%s queue_size=%s",
+            event.topic,
+            event.event_id,
+            self._queue.qsize(),
+        )
+        await self._queue.put(item)
+        return True
 
-        return False
+    def _drop_one_queued_lossy_event_nowait(
+        self,
+        *,
+        incoming_event: Event,
+        reason: str,
+    ) -> bool:
+        if self._queue.empty():
+            return False
+
+        drained: list[tuple[int, int, _QueuedItem]] = []
+
+        while True:
+            try:
+                queued = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            # We are temporarily removing this item from the Queue. Mark the
+            # original queue task as done; reinserted items will create a fresh
+            # unfinished task and will be task_done()'d by workers later.
+            self._queue.task_done()
+            drained.append(queued)
+
+        if not drained:
+            return False
+
+        drop_index: int | None = None
+
+        # Drop the oldest queued lossy item by publish sequence. Do not use
+        # PriorityQueue.get_nowait() semantics here because it returns the
+        # highest-priority item, which is exactly what we must avoid dropping.
+        for index, (_, _, queued_item) in enumerate(drained):
+            queued_event = queued_item.event
+            if self._is_lossy_topic(queued_event.topic):
+                if drop_index is None or drained[index][1] < drained[drop_index][1]:
+                    drop_index = index
+
+        dropped_event: Event | None = None
+        if drop_index is not None:
+            _, _, dropped_item = drained.pop(drop_index)
+            dropped_event = dropped_item.event
+
+        for queued in drained:
+            self._queue.put_nowait(queued)
+
+        if dropped_event is None:
+            return False
+
+        self._record_drop(
+            dropped_event,
+            reason=reason,
+            log_message="Queue full, dropped queued lossy event",
+            incoming_event=incoming_event,
+        )
+        return True
+
+    @classmethod
+    def _is_lossy_topic(cls, topic: str) -> bool:
+        return topic.startswith(cls.LOSSY_TOPIC_PREFIXES)
+
+    @classmethod
+    def _is_protected_topic(cls, topic: str) -> bool:
+        return topic.startswith(cls.PROTECTED_TOPIC_PREFIXES)
+
+    def _record_drop(
+        self,
+        event: Event,
+        *,
+        reason: str,
+        log_message: str,
+        incoming_event: Event | None = None,
+    ) -> None:
+        self._inc_metric("dropped")
+        self._inc_nested_metric("topic_dropped", event.topic)
+        self._inc_nested_metric("drop_reasons", reason)
+
+        if incoming_event is None:
+            self._logger.warning(
+                "%s | dropped_topic=%s dropped_event_id=%s reason=%s queue_size=%s",
+                log_message,
+                event.topic,
+                event.event_id,
+                reason,
+                self._queue.qsize(),
+            )
+            return
+
+        self._logger.warning(
+            "%s | dropped_topic=%s dropped_event_id=%s incoming_topic=%s incoming_event_id=%s reason=%s queue_size=%s",
+            log_message,
+            event.topic,
+            event.event_id,
+            incoming_event.topic,
+            incoming_event.event_id,
+            reason,
+            self._queue.qsize(),
+        )
 
     # ---------------------------------------------------------------------
     # Errors / metrics
@@ -583,6 +764,9 @@ class EventBus:
             "retried": self._metrics["retried"],
             "topic_published": dict(self._metrics["topic_published"]),
             "topic_processed": dict(self._metrics["topic_processed"]),
+            "topic_dropped": dict(self._metrics["topic_dropped"]),
+            "drop_reasons": dict(self._metrics["drop_reasons"]),
+            "protected_enqueue_waits": self._metrics["protected_enqueue_waits"],
             "handler_errors": dict(self._metrics["handler_errors"]),
         }
 

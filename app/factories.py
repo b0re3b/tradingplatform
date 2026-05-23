@@ -102,6 +102,10 @@ def build_exchange_ws_clients(
             streams=["trade", "depth", "kline"],
             depth_level="20",
             kline_interval="1m",
+            orderbook_emit_min_interval_ms=500,
+            orderbook_batch_max_size=2000,
+            trade_emit_min_interval_ms=500,
+            trade_batch_max_size=2000,
             enable_private_stream=False,
         )
         for index, symbols in enumerate(chunked(universe.binance, settings.ws_shard_size_binance), start=1):
@@ -118,6 +122,10 @@ def build_exchange_ws_clients(
                 depth_level=futures_ws_config.depth_level,
                 depth_speed=futures_ws_config.depth_speed,
                 kline_interval=futures_ws_config.kline_interval,
+                orderbook_emit_min_interval_ms=futures_ws_config.orderbook_emit_min_interval_ms,
+                orderbook_batch_max_size=futures_ws_config.orderbook_batch_max_size,
+                trade_emit_min_interval_ms=futures_ws_config.trade_emit_min_interval_ms,
+                trade_batch_max_size=futures_ws_config.trade_batch_max_size,
                 enable_private_stream=False,
             )
             clients[f"binance_{index}"] = BinanceWebSocketClient(
@@ -137,6 +145,10 @@ def build_exchange_ws_clients(
                 category="linear",
                 orderbook_depth=50,
                 kline_interval="1",
+                orderbook_emit_min_interval_ms=100,
+                orderbook_batch_max_size=500,
+                trade_emit_min_interval_ms=250,
+                trade_batch_max_size=1000,
                 enable_private_stream=False,
             )
 
@@ -149,6 +161,10 @@ def build_exchange_ws_clients(
                 streams=["trades", "books", "candle"],
                 orderbook_channel="books5",
                 candle_channel="candle1m",
+                orderbook_emit_min_interval_ms=100,
+                orderbook_batch_max_size=500,
+                trade_emit_min_interval_ms=250,
+                trade_batch_max_size=1000,
                 enable_private_stream=False,
             )
 
@@ -160,6 +176,10 @@ def build_exchange_ws_clients(
                 symbols=symbols,
                 streams=["deal", "depth", "kline"],
                 kline_interval="Min1",
+                orderbook_emit_min_interval_ms=100,
+                orderbook_batch_max_size=500,
+                trade_emit_min_interval_ms=250,
+                trade_batch_max_size=1000,
                 enable_private_stream=False,
             )
 

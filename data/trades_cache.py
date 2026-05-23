@@ -119,9 +119,13 @@ class TradesCache:
             self._logger.warning("TradesCache register skipped: EventBus is not provided")
             return
         self.event_bus.subscribe("market.trade", self._on_market_trade)
+        self.event_bus.subscribe("market.trades.batch", self._on_market_trades_snapshot)
         self.event_bus.subscribe("market.trades.snapshot", self._on_market_trades_snapshot)
         self._register_cleanup_job()
-        self._logger.info("TradesCache registered | topics=%s", ["market.trade", "market.trades.snapshot"])
+        self._logger.info(
+            "TradesCache registered | topics=%s",
+            ["market.trade", "market.trades.batch", "market.trades.snapshot"],
+        )
 
     async def start(self) -> None:
         self.register()
