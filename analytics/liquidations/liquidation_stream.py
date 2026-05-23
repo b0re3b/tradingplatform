@@ -12,10 +12,10 @@ from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
-from .config import LiquidationStreamConfig
-from .enums import LiquidationEventType, LiquidationSide
-from .metrics import LiquidationMetrics
-from .models import (
+from analytics.liquidations.config import LiquidationStreamConfig
+from analytics.liquidations.enums import LiquidationEventType, LiquidationSide
+from analytics.liquidations.metrics import LiquidationMetrics
+from analytics.liquidations.models import (
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     LiquidationEvent,

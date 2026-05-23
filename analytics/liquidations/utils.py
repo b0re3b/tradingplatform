@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Iterable, Mapping, Sequence
 
-from .enums import CascadeDirection, CascadeSeverity, LiquidationSide, LiquidationStatus
-from .models import (
+from analytics.liquidations.enums import CascadeDirection, CascadeSeverity, LiquidationSide, LiquidationStatus
+from analytics.liquidations.models import (
     DECIMAL_ZERO,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,

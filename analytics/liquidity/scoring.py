@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from .config import LiquidityConfig
-from .enums import (
+from analytics.liquidity.config import LiquidityConfig
+from analytics.liquidity.enums import (
     ClusterStrength,
     LiquidityBias,
     LiquidityLevelType,
     LiquiditySide,
 )
-from .models import (
+from analytics.liquidity.models import (
     EqualLevel,
     LiquidityLevel,
     LiquidityMapSnapshot,
     StopCluster,
 )
-from .utils import (
+from analytics.liquidity.utils import (
     clamp,
     normalize_confidence,
     pct_distance,

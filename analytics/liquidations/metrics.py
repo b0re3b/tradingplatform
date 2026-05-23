@@ -5,8 +5,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from .enums import CascadeSeverity, LiquidationSide
-from .models import (
+from analytics.liquidations.enums import CascadeSeverity, LiquidationSide
+from analytics.liquidations.models import (
     CascadeDetectionResult,
     LiquidationEvent,
     LiquidationKey,
@@ -16,7 +16,7 @@ from .models import (
     normalize_market_type,
     normalize_symbol,
 )
-from .utils import utc_now
+from analytics.liquidations.utils import utc_now
 
 DECIMAL_ZERO = Decimal("0")
 

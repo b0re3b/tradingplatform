@@ -68,6 +68,113 @@ class TelegramBotService:
 
     HEALTHCHECK_JOB_NAME = "telegram_bot_healthcheck"
 
+    # Explicit signal/actionable analytics subscriptions only.
+    # Do not subscribe to broad analytics.*, system.*, market.*, or candle/state
+    # update streams here: Telegram is a notification layer, not a market-data
+    # consumer. Non-actionable updates are still filtered again by TelegramRouter.
+    ANALYTICS_SIGNAL_EVENTS: tuple[str, ...] = (
+        # Orderflow
+        "analytics.orderflow.cvd.signal",
+        "analytics.orderflow.volume_delta.signal",
+        "analytics.orderflow.aggressive_trades.signal",
+        "analytics.orderflow.orderbook_imbalance.signal",
+
+        # Liquidity
+        "analytics.liquidity.signal.updated",
+        "analytics.liquidity.level.detected",
+        "analytics.liquidity.level.swept",
+        "analytics.liquidity.stop_cluster.detected",
+
+        # Liquidations
+        "analytics.liquidations.cascade_detected",
+        "analytics.liquidations.exhaustion_detected",
+
+        # Whales
+        "analytics.whales.whale_activity",
+        "analytics.whales.whale_pressure",
+        "analytics.whales.whale_liquidation_context",
+        "analytics.whales.whale_cluster_exhaustion",
+
+        # Spoofing
+        "analytics.spoofing.detected",
+
+        # Spreads
+        "analytics.spreads.signal.generated",
+        "analytics.spreads.arbitrage.opportunity",
+
+        # Funding
+        "analytics.funding.signal",
+        "analytics.funding.extreme",
+        "analytics.funding.flip",
+        "analytics.funding.divergence",
+        "analytics.funding.pressure",
+
+        # Open Interest / OI aliases
+        "analytics.oi.divergence",
+        "analytics.oi.divergence.detected",
+        "analytics.oi.anomaly",
+        "analytics.oi.anomaly.detected",
+        "analytics.oi.squeeze_setup",
+        "analytics.oi.capitulation",
+        "analytics.oi.capitulation.detected",
+        "analytics.oi.regime.changed",
+        "analytics.open_interest.divergence",
+        "analytics.open_interest.divergence.detected",
+        "analytics.open_interest.anomaly",
+        "analytics.open_interest.anomaly.detected",
+        "analytics.open_interest.squeeze_setup",
+        "analytics.open_interest.capitulation",
+        "analytics.open_interest.capitulation.detected",
+        "analytics.open_interest.regime.changed",
+    )
+
+    NEWS_SIGNAL_PATTERNS: tuple[str, ...] = (
+        "news.*",
+    )
+
+    AI_SIGNAL_PATTERNS: tuple[str, ...] = (
+        "ai.*",
+    )
+
+    STRATEGY_SIGNAL_EVENTS: tuple[str, ...] = (
+        "signal.generated",
+        "signal.confirmed",
+        "signal.rejected",
+    )
+
+    EXECUTION_SIGNAL_EVENTS: tuple[str, ...] = (
+        "execution.order_submitted",
+        "execution.order_filled",
+        "execution.order_partially_filled",
+        "execution.order_rejected",
+        "execution.order_failed",
+        "execution.order_cancelled",
+    )
+
+    POSITION_SIGNAL_EVENTS: tuple[str, ...] = (
+        "position.opened",
+        "position.updated",
+        "position.closed",
+    )
+
+    RISK_SIGNAL_EVENTS: tuple[str, ...] = (
+        "risk.limit_warning",
+        "risk.position_blocked",
+        "risk.kill_switch",
+        "risk.position_close_requested",
+        "risk.position_reduce_requested",
+        "risk.stop_update_requested",
+        "risk.take_profit_update_requested",
+        "risk.trailing_stop_requested",
+    )
+
+    SYSTEM_ALERT_EVENTS: tuple[str, ...] = (
+        "system.*.error",
+        "system.*.failed",
+        "system.*.warning",
+        "system.telegram_bot.healthcheck_failed",
+    )
+
     def __init__(
         self,
         *,
@@ -357,77 +464,67 @@ class TelegramBotService:
 
     async def _subscribe_events(self) -> None:
         """
-        Реєструє всі потрібні EventBus subscriptions.
+        Реєструє тільки явні notification-worthy subscriptions.
 
-        Патерни відповідають нашій event-driven архітектурі:
-        - analytics.* -> analytics topics;
-        - news.* / ai.news.* -> news topic;
-        - signal.* -> signals/open trades;
-        - execution.* -> open trades/risk;
-        - position.* -> open/closed trades;
-        - risk.* -> risk topic;
-        - system.* -> system topic.
-
-        Щоб уникнути нескінченного циклу, system.telegram_bot.* теж слухається,
-        але handlers мають захист від повторного emit error loops.
+        Важливо:
+        - не підписуємось на broad analytics.*;
+        - не підписуємось на market.* / market.candle.* / candle updates;
+        - не підписуємось на broad system.* lifecycle/state/health updates;
+        - TelegramRouter додатково фільтрує non-actionable analytics events.
         """
 
         subscriptions: list[Subscription] = []
 
-        subscriptions.append(
-             self.event_bus.subscribe(
-                "analytics.*",
-                self.handlers.handle_analytics_event,
-            )
+        def subscribe_many(
+            patterns: tuple[str, ...],
+            handler: Any,
+        ) -> None:
+            for pattern in patterns:
+                subscriptions.append(
+                    self.event_bus.subscribe(
+                        pattern,
+                        handler,
+                    )
+                )
+
+        subscribe_many(
+            self.ANALYTICS_SIGNAL_EVENTS,
+            self.handlers.handle_analytics_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "news.*",
-                self.handlers.handle_news_event,
-            )
+        subscribe_many(
+            self.NEWS_SIGNAL_PATTERNS,
+            self.handlers.handle_news_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "ai.*",
-                self.handlers.handle_ai_event,
-            )
+        subscribe_many(
+            self.AI_SIGNAL_PATTERNS,
+            self.handlers.handle_ai_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "signal.*",
-                self.handlers.handle_signal_event,
-            )
+        subscribe_many(
+            self.STRATEGY_SIGNAL_EVENTS,
+            self.handlers.handle_signal_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "execution.*",
-                self.handlers.handle_execution_event,
-            )
+        subscribe_many(
+            self.EXECUTION_SIGNAL_EVENTS,
+            self.handlers.handle_execution_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "position.*",
-                self.handlers.handle_position_event,
-            )
+        subscribe_many(
+            self.POSITION_SIGNAL_EVENTS,
+            self.handlers.handle_position_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "risk.*",
-                self.handlers.handle_risk_event,
-            )
+        subscribe_many(
+            self.RISK_SIGNAL_EVENTS,
+            self.handlers.handle_risk_event,
         )
 
-        subscriptions.append(
-            self.event_bus.subscribe(
-                "system.*",
-                self.handlers.handle_system_event,
-            )
+        subscribe_many(
+            self.SYSTEM_ALERT_EVENTS,
+            self.handlers.handle_system_event,
         )
 
         self._subscriptions.extend(subscriptions)

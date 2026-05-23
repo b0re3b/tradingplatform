@@ -1,4 +1,4 @@
-from .enums import (
+from analytics.funding.enums import (
     FundingBias,
     FundingDataSource,
     FundingDivergenceType,
@@ -11,7 +11,7 @@ from .enums import (
     FundingSignalType,
     FundingTimeframe,
 )
-from .models import (
+from analytics.funding.models import (
     FundingAnalyticsEvent,
     FundingDivergenceEvent,
     FundingExtremeEvent,
@@ -23,27 +23,27 @@ from .models import (
     FundingStatistics,
 )
 
-from .funding_regime_detector import (
+from analytics.funding.funding_regime_detector import (
     FundingRegimeDetector,
     FundingRegimeDetectorConfig,
 )
-from .funding_pressure import (
+from analytics.funding.funding_pressure import (
     FundingPressureAnalyzer,
     FundingPressureConfig,
 )
-from .funding_flip_detector import (
+from analytics.funding.funding_flip_detector import (
     FundingFlipDetector,
     FundingFlipDetectorConfig,
 )
-from .funding_extremes import (
+from analytics.funding.funding_extremes import (
     FundingExtremesConfig,
     FundingExtremesDetector,
 )
-from .funding_divergence import (
+from analytics.funding.funding_divergence import (
     FundingDivergenceConfig,
     FundingDivergenceDetector,
 )
-from .funding_analyzer import (
+from analytics.funding.funding_analyzer import (
     FundingAnalyzer,
     FundingAnalyzerConfig,
     FundingMarketContext,

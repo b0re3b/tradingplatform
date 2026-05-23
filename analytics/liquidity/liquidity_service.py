@@ -10,10 +10,10 @@ from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
-from .config import LiquidityConfig
-from .enums import SweepStatus
-from .liquidity_map import LiquidityMap
-from .models import (
+from analytics.liquidity.config import LiquidityConfig
+from analytics.liquidity.enums import SweepStatus
+from analytics.liquidity.liquidity_map import LiquidityMap
+from analytics.liquidity.models import (
     DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,

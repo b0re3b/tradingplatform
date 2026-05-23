@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping, TypeAlias
 
-from .enums import (
+from analytics.liquidations.enums import (
     CascadeDirection,
     CascadeSeverity,
     LiquidationEventType,

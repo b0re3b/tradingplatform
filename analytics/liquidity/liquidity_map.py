@@ -6,10 +6,10 @@ from typing import Any, Sequence
 
 from core.logger import get_logger
 
-from .config import LiquidityConfig
-from .enums import LiquidityBias, LiquidityLevelType, LiquiditySide
-from .equal_highs_lows import EqualHighsLowsDetector
-from .models import (
+from analytics.liquidity.config import LiquidityConfig
+from analytics.liquidity.enums import LiquidityBias, LiquidityLevelType, LiquiditySide
+from analytics.liquidity.equal_highs_lows import EqualHighsLowsDetector
+from analytics.liquidity.models import (
     DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,

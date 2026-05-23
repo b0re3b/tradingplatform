@@ -6,17 +6,17 @@ from typing import Any, Sequence
 
 from core.logger import get_logger
 
-from .config import LiquidityConfig
-from .enums import LiquidityLevelType, LiquiditySide
-from .models import (
+from analytics.liquidity.config import LiquidityConfig
+from analytics.liquidity.enums import LiquidityLevelType, LiquiditySide
+from analytics.liquidity.models import (
     DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     EqualLevel,
     LiquidityLevel,
     StopCluster,
 )
-from .scoring import LiquidityScorer
-from .utils import (
+from analytics.liquidity.scoring import LiquidityScorer
+from analytics.liquidity.utils import (
     clamp,
     get_candle_close,
     get_candle_high,

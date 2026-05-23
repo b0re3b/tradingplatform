@@ -7,10 +7,10 @@ from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
-from .config import CascadeDetectorConfig
-from .enums import LiquidationEventType, LiquidationStatus
-from .metrics import LiquidationMetrics
-from .models import (
+from analytics.liquidations.config import CascadeDetectorConfig
+from analytics.liquidations.enums import LiquidationEventType, LiquidationStatus
+from analytics.liquidations.metrics import LiquidationMetrics
+from analytics.liquidations.models import (
     CascadeDetectionResult,
     LiquidationEvent,
     LiquidationKey,
@@ -22,8 +22,8 @@ from .models import (
     normalize_symbol,
     normalize_timeframe,
 )
-from .state import LiquidationState, SymbolLiquidationState, get_shared_liquidation_state
-from .utils import (
+from analytics.liquidations.state import LiquidationState, SymbolLiquidationState, get_shared_liquidation_state
+from analytics.liquidations.utils import (
     build_cluster_from_events_for_key,
     clamp_float,
     compute_acceleration_ratio,

@@ -5,13 +5,13 @@ from typing import Any
 
 from core.logger import get_logger
 
-from .enums import (
+from analytics.funding.enums import (
     FundingBias,
     FundingPressureDirection,
     FundingPressureLevel,
     FundingTimeframe,
 )
-from .models import (
+from analytics.funding.models import (
     FundingPressureState,
     FundingRegimeState,
     FundingSnapshot,

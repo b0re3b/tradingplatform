@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from .models import (
+from analytics.liquidity.models import (
     DEFAULT_EXCHANGE,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,

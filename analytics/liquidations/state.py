@@ -6,8 +6,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Deque, Iterable
 
-from .enums import LiquidationSide
-from .models import (
+from analytics.liquidations.enums import LiquidationSide
+from analytics.liquidations.models import (
     DECIMAL_ZERO,
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
@@ -22,7 +22,7 @@ from .models import (
     normalize_symbol,
     normalize_timeframe,
 )
-from .utils import ensure_utc, prune_events_older_than, utc_now
+from analytics.liquidations.utils import ensure_utc, prune_events_older_than, utc_now
 
 
 @dataclass(slots=True)

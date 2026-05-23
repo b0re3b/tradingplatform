@@ -5,11 +5,11 @@ from typing import Any
 
 from core.logger import get_logger
 
-from .enums import (
+from analytics.funding.enums import (
     FundingDivergenceType,
     FundingTimeframe,
 )
-from .models import (
+from analytics.funding.models import (
     FundingDivergenceEvent,
     FundingSnapshot,
     FundingStatistics,

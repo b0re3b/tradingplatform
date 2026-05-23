@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .enums import FundingTimeframe
-from .models import (
+from analytics.funding.enums import FundingTimeframe
+from analytics.funding.models import (
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     FundingKey,

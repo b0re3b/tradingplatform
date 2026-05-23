@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, TypeAlias
 
-from .enums import (
+from analytics.funding.enums import (
     FundingBias,
     FundingDataSource,
     FundingDivergenceType,

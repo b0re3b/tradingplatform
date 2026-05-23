@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, TypeAlias
 
-from .enums import (
+from analytics.liquidity.enums import (
     ClusterStrength,
     LiquidityBias,
     LiquidityLevelType,

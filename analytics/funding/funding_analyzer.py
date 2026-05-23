@@ -15,14 +15,14 @@ from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
 
-from .config import FundingAnalyzerConfig
-from .enums import FundingDataSource, FundingEventType, FundingTimeframe
-from .funding_divergence import FundingDivergenceConfig, FundingDivergenceDetector
-from .funding_extremes import FundingExtremesConfig, FundingExtremesDetector
-from .funding_flip_detector import FundingFlipDetector, FundingFlipDetectorConfig
-from .funding_pressure import FundingPressureAnalyzer, FundingPressureConfig
-from .funding_regime_detector import FundingRegimeDetector, FundingRegimeDetectorConfig
-from .models import (
+from analytics.funding.config import FundingAnalyzerConfig
+from analytics.funding.enums import FundingDataSource, FundingEventType, FundingTimeframe
+from analytics.funding.funding_divergence import FundingDivergenceConfig, FundingDivergenceDetector
+from analytics.funding.funding_extremes import FundingExtremesConfig, FundingExtremesDetector
+from analytics.funding.funding_flip_detector import FundingFlipDetector, FundingFlipDetectorConfig
+from analytics.funding.funding_pressure import FundingPressureAnalyzer, FundingPressureConfig
+from analytics.funding.funding_regime_detector import FundingRegimeDetector, FundingRegimeDetectorConfig
+from analytics.funding.models import (
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     FundingAnalyticsEvent,

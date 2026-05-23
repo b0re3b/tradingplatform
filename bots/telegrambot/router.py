@@ -92,6 +92,7 @@ class TelegramRouter:
 
             # Liquidity
             "analytics.liquidity.signal.updated",
+            "analytics.liquidity.level.detected",
             "analytics.liquidity.level.swept",
             "analytics.liquidity.stop_cluster.detected",
 
@@ -100,6 +101,7 @@ class TelegramRouter:
             "analytics.liquidations.exhaustion_detected",
 
             # Whales
+            "analytics.whales.whale_activity",
             "analytics.whales.whale_pressure",
             "analytics.whales.whale_liquidation_context",
             "analytics.whales.whale_cluster_exhaustion",
@@ -120,14 +122,20 @@ class TelegramRouter:
 
             # Open Interest: current package may emit analytics.oi.*
             "analytics.oi.divergence",
+            "analytics.oi.divergence.detected",
             "analytics.oi.anomaly",
+            "analytics.oi.anomaly.detected",
             "analytics.oi.squeeze_setup",
             "analytics.oi.capitulation",
+            "analytics.oi.capitulation.detected",
             "analytics.oi.regime.changed",
             "analytics.open_interest.divergence",
+            "analytics.open_interest.divergence.detected",
             "analytics.open_interest.anomaly",
+            "analytics.open_interest.anomaly.detected",
             "analytics.open_interest.squeeze_setup",
             "analytics.open_interest.capitulation",
+            "analytics.open_interest.capitulation.detected",
             "analytics.open_interest.regime.changed",
         }
     )

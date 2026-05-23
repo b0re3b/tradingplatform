@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from .models import (
+from analytics.liquidations.models import (
     DEFAULT_MARKET_TYPE,
     DEFAULT_TIMEFRAME,
     LiquidationKey,
