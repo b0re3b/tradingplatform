@@ -1,0 +1,9 @@
+
+# Backtesting generated reports / heavy artifacts
+reports/backtests/
+backtesting/reports/backtests/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
