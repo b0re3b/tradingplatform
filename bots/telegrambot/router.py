@@ -581,6 +581,12 @@ class TelegramRouter:
                 reason=f"non-actionable analytics event skipped: {event_name}",
             )
 
+        if self._should_skip_low_value_analytics_alert(event):
+            return self._skipped_route(
+                event=event,
+                reason=f"low-value analytics alert skipped: {event_name}",
+            )
+
         if self._should_skip_diagnostic_signal_reject(event):
             return self._skipped_route(
                 event=event,
@@ -706,6 +712,124 @@ class TelegramRouter:
             return False
 
         return True
+
+
+    def _should_skip_low_value_analytics_alert(self, event: TelegramEventPayload) -> bool:
+        event_name = event.metadata.event_name.strip().lower()
+        if not event_name.startswith("analytics."):
+            return False
+
+        if event_name == "analytics.liquidity.signal.updated":
+            return self._should_skip_liquidity_signal_update(event)
+
+        return False
+
+    def _should_skip_liquidity_signal_update(self, event: TelegramEventPayload) -> bool:
+        if not self.config.filter_non_actionable_liquidity_alerts:
+            return False
+
+        payload = self._flatten_payload(event.payload if isinstance(event.payload, dict) else {})
+
+        confidence = self._first_number(
+            payload,
+            "confidence",
+            "signal_confidence",
+            "confidence_score",
+            "signal.confidence",
+            "payload.confidence",
+        )
+        score = self._first_number(
+            payload,
+            "score",
+            "signal_score",
+            "liquidity_score",
+            "quality_score",
+            "signal.score",
+            "payload.score",
+        )
+        sweep_up = self._first_number(payload, "sweep_risk_up", "up_sweep_risk", "sweep_risk.up")
+        sweep_down = self._first_number(payload, "sweep_risk_down", "down_sweep_risk", "sweep_risk.down")
+        magnet_up = self._first_number(payload, "magnet_score_up", "up_magnet_score", "magnet_score.up")
+        magnet_down = self._first_number(payload, "magnet_score_down", "down_magnet_score", "magnet_score.down")
+
+        if self._first_bool(payload, "sweep_detected", "swept", "is_swept", "detected"):
+            return False
+
+        if self._first_present(payload, "level", "price_level", "liquidity_level", "stop_cluster", "stop_cluster_price") is not None:
+            return False
+
+        if self._first_present(payload, "nearest_buy_side_liquidity", "nearest_sell_side_liquidity") is not None:
+            # Nearest liquidity alone is useful only when at least one score/risk is meaningful.
+            pass
+
+        bias = str(self._first_present(payload, "bias", "direction", "side") or "").strip().lower()
+        non_neutral_bias = bool(bias and bias not in {"neutral", "none", "unknown", "flat", "0"})
+        if non_neutral_bias:
+            return False
+        if bias in {"neutral", "none", "unknown", "flat", "0"} and self.config.liquidity_allow_neutral_bias_alerts:
+            return False
+
+        return not (
+            abs(confidence or 0.0) >= self.config.liquidity_min_signal_confidence_to_alert
+            or abs(score or 0.0) >= self.config.liquidity_min_signal_score_to_alert
+            or max(abs(sweep_up or 0.0), abs(sweep_down or 0.0)) >= self.config.liquidity_min_sweep_risk_to_alert
+            or max(abs(magnet_up or 0.0), abs(magnet_down or 0.0)) >= self.config.liquidity_min_magnet_score_to_alert
+        )
+
+    def _flatten_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+
+        def merge(value: Any) -> None:
+            if isinstance(value, dict):
+                merged.update(value)
+
+        merge(payload.get("payload"))
+        merge(payload.get("data"))
+        merge(payload.get("result"))
+        merge(payload.get("signal"))
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+        merge(context.get("stats") if isinstance(context, dict) else None)
+        merge(stats)
+        merge(context)
+        merged.update(payload)
+        return merged
+
+    def _first_present(self, payload: dict[str, Any], *paths: str) -> Any:
+        for path in paths:
+            value = self._get_path(payload, path)
+            if value is not None and value != "":
+                return value
+        return None
+
+    def _get_path(self, payload: dict[str, Any], path: str) -> Any:
+        current: Any = payload
+        for part in path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+                continue
+            return None
+        return current
+
+    def _first_number(self, payload: dict[str, Any], *paths: str) -> float | None:
+        value = self._first_present(payload, *paths)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _first_bool(self, payload: dict[str, Any], *paths: str) -> bool:
+        value = self._first_present(payload, *paths)
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        text = str(value).strip().lower()
+        return text in {"1", "true", "yes", "y", "on", "detected", "swept"}
 
     def _should_skip_diagnostic_signal_reject(self, event: TelegramEventPayload) -> bool:
         event_name = event.metadata.event_name.strip().lower()

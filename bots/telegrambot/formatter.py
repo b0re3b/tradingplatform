@@ -784,9 +784,47 @@ class TelegramFormatter:
 
             return " | ".join(parts)
 
+        if normalized_domain == "liquidity":
+            parts: list[str] = []
+            bias = self._first_present(payload, "bias", "side", "direction")
+            if bias is not None:
+                parts.append(f"bias {self._safe_plain(bias)}")
+
+            sweep_up = self._first_present(payload, "sweep_risk_up", "up_sweep_risk", "sweep_risk.up")
+            sweep_down = self._first_present(payload, "sweep_risk_down", "down_sweep_risk", "sweep_risk.down")
+            if sweep_up is not None:
+                parts.append(f"sweep up {self._format_number(sweep_up)}")
+            if sweep_down is not None:
+                parts.append(f"sweep down {self._format_number(sweep_down)}")
+
+            magnet_up = self._first_present(payload, "magnet_score_up", "up_magnet_score", "magnet_score.up")
+            magnet_down = self._first_present(payload, "magnet_score_down", "down_magnet_score", "magnet_score.down")
+            if magnet_up is not None:
+                parts.append(f"magnet up {self._format_number(magnet_up)}")
+            if magnet_down is not None:
+                parts.append(f"magnet down {self._format_number(magnet_down)}")
+
+            nearest_buy = self._first_present(payload, "nearest_buy_side_liquidity")
+            nearest_sell = self._first_present(payload, "nearest_sell_side_liquidity")
+            if nearest_buy is not None:
+                parts.append(f"nearest buy-side {self._format_price(nearest_buy)}")
+            if nearest_sell is not None:
+                parts.append(f"nearest sell-side {self._format_price(nearest_sell)}")
+
+            explanation = self._first_present(payload, "explanation")
+            if explanation is not None:
+                parts.append(self._safe_plain(explanation))
+
+            if parts:
+                return " | ".join(parts)
+
         reason = self._first_present(payload, "reason", "signal_type", "event_type")
         if reason is not None:
             return str(reason).replace("_", " ")
+
+        # Do not turn a generic lifecycle/update topic into a fake summary.
+        if normalized_domain == "liquidity" and event_name.endswith(".updated"):
+            return None
 
         return event_name
 
@@ -814,10 +852,22 @@ class TelegramFormatter:
             "pattern",
             "reason",
         )
+        if detail is None and domain == "liquidity" and event_name.endswith(".signal.updated"):
+            bias = self._first_present(payload, "bias", "side", "direction")
+            if bias is not None:
+                bias_text = str(bias).strip().lower()
+                if bias_text and bias_text not in {"neutral", "none", "unknown", "flat", "0"}:
+                    detail = f"{bias_text} bias"
+
         if detail is None and event_tail:
             parts = event_tail.split(".")
             if len(parts) > 1:
-                detail = parts[-1] if parts[-1] != "signal" else parts[-2]
+                fallback_detail = parts[-1] if parts[-1] != "signal" else parts[-2]
+                # For liquidity signal.updated, "Updated" is a lifecycle verb,
+                # not a useful alert type. Keep the title clean unless payload
+                # provides a real signal detail.
+                if not (domain == "liquidity" and fallback_detail == "updated"):
+                    detail = fallback_detail
 
         if detail is None:
             return domain_title
@@ -995,10 +1045,17 @@ class TelegramFormatter:
     def _liquidity_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
         return (
             ("Event", ("liquidity_event", "event_type", "type", "reason"), "text"),
+            ("Bias", ("bias",), "text"),
             ("Side", ("side", "direction", "sweep_side"), "text"),
             ("Level", ("level", "price_level", "liquidity_level", "price"), "price"),
             ("Current Price", ("current_price", "last_price", "price", "mid_price"), "price"),
             ("Sweep", ("sweep_detected", "swept", "is_swept", "detected"), "bool"),
+            ("Sweep Risk Up", ("sweep_risk_up", "up_sweep_risk", "sweep_risk.up"), "number"),
+            ("Sweep Risk Down", ("sweep_risk_down", "down_sweep_risk", "sweep_risk.down"), "number"),
+            ("Magnet Up", ("magnet_score_up", "up_magnet_score", "magnet_score.up"), "number"),
+            ("Magnet Down", ("magnet_score_down", "down_magnet_score", "magnet_score.down"), "number"),
+            ("Nearest Buy-Side", ("nearest_buy_side_liquidity",), "price"),
+            ("Nearest Sell-Side", ("nearest_sell_side_liquidity",), "price"),
             ("Liquidity", ("liquidity", "liquidity_score", "liquidity_volume", "volume"), "number"),
             ("Stop Cluster", ("stop_cluster", "stop_cluster_price", "cluster_price"), "price"),
             ("Distance", ("distance", "distance_to_level", "distance_pct"), "number_or_text"),

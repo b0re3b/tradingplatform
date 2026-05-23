@@ -180,6 +180,17 @@ class TelegramBotConfig:
     enable_risk_alerts: bool = True
     enable_system_alerts: bool = True
 
+    # Analytics alert hygiene. Telegram should not publish context/noise updates
+    # that carry no actionable signal strength. These thresholds are intentionally
+    # Telegram-only: analytics still publishes/stores its own events, but the
+    # notification layer filters low-value alerts.
+    filter_non_actionable_liquidity_alerts: bool = True
+    liquidity_min_signal_confidence_to_alert: float = 0.20
+    liquidity_min_signal_score_to_alert: float = 0.20
+    liquidity_min_sweep_risk_to_alert: float = 0.20
+    liquidity_min_magnet_score_to_alert: float = 0.20
+    liquidity_allow_neutral_bias_alerts: bool = False
+
     # Sub-configs.
     retry: TelegramRetryConfig = field(default_factory=TelegramRetryConfig)
     rate_limit: TelegramRateLimitConfig = field(default_factory=TelegramRateLimitConfig)
@@ -301,6 +312,30 @@ class TelegramBotConfig:
             enable_system_alerts=_to_bool(
                 os.getenv(f"{prefix}ENABLE_SYSTEM_ALERTS"),
                 default=True,
+            ),
+            filter_non_actionable_liquidity_alerts=_to_bool(
+                os.getenv(f"{prefix}FILTER_NON_ACTIONABLE_LIQUIDITY_ALERTS"),
+                default=True,
+            ),
+            liquidity_min_signal_confidence_to_alert=_to_float(
+                os.getenv(f"{prefix}LIQUIDITY_MIN_SIGNAL_CONFIDENCE_TO_ALERT"),
+                default=0.20,
+            ),
+            liquidity_min_signal_score_to_alert=_to_float(
+                os.getenv(f"{prefix}LIQUIDITY_MIN_SIGNAL_SCORE_TO_ALERT"),
+                default=0.20,
+            ),
+            liquidity_min_sweep_risk_to_alert=_to_float(
+                os.getenv(f"{prefix}LIQUIDITY_MIN_SWEEP_RISK_TO_ALERT"),
+                default=0.20,
+            ),
+            liquidity_min_magnet_score_to_alert=_to_float(
+                os.getenv(f"{prefix}LIQUIDITY_MIN_MAGNET_SCORE_TO_ALERT"),
+                default=0.20,
+            ),
+            liquidity_allow_neutral_bias_alerts=_to_bool(
+                os.getenv(f"{prefix}LIQUIDITY_ALLOW_NEUTRAL_BIAS_ALERTS"),
+                default=False,
             ),
             retry=TelegramRetryConfig(
                 max_retries=_to_int(
@@ -442,6 +477,19 @@ class TelegramBotConfig:
                 details={"route_policy": str(self.route_policy)},
             )
 
+        threshold_values = {
+            "liquidity_min_signal_confidence_to_alert": self.liquidity_min_signal_confidence_to_alert,
+            "liquidity_min_signal_score_to_alert": self.liquidity_min_signal_score_to_alert,
+            "liquidity_min_sweep_risk_to_alert": self.liquidity_min_sweep_risk_to_alert,
+            "liquidity_min_magnet_score_to_alert": self.liquidity_min_magnet_score_to_alert,
+        }
+        for name, value in threshold_values.items():
+            if value < 0:
+                raise TelegramConfigError(
+                    "Telegram liquidity alert thresholds must be >= 0.",
+                    details={name: value},
+                )
+
         self.retry.validate()
         self.rate_limit.validate()
 
@@ -512,6 +560,12 @@ class TelegramBotConfig:
             "enable_trade_updates": self.enable_trade_updates,
             "enable_risk_alerts": self.enable_risk_alerts,
             "enable_system_alerts": self.enable_system_alerts,
+            "filter_non_actionable_liquidity_alerts": self.filter_non_actionable_liquidity_alerts,
+            "liquidity_min_signal_confidence_to_alert": self.liquidity_min_signal_confidence_to_alert,
+            "liquidity_min_signal_score_to_alert": self.liquidity_min_signal_score_to_alert,
+            "liquidity_min_sweep_risk_to_alert": self.liquidity_min_sweep_risk_to_alert,
+            "liquidity_min_magnet_score_to_alert": self.liquidity_min_magnet_score_to_alert,
+            "liquidity_allow_neutral_bias_alerts": self.liquidity_allow_neutral_bias_alerts,
             "topic_ids": {
                 topic.value: thread_id
                 for topic, thread_id in self.topic_ids.items()

@@ -73,15 +73,33 @@ from .universe import ExchangeUniverse
 # -----------------------------------------------------------------------------
 
 
-def build_rest_clients(config: Config, event_bus: EventBus, scheduler: Scheduler | None = None) -> dict[str, Any]:
-    # Binance REST is both market-data capable and execution-capable.
-    # Other REST clients are used for discovery/snapshots only.
-    return {
-        "binance": BinanceRestClient(config=config, event_bus=event_bus),
-        "bybit": BybitRestClient(config=config, event_bus=event_bus),
-        "okx": OkxRestClient(config=config, event_bus=event_bus),
-        "mexc": MexcRestClient(config=config, event_bus=event_bus),
-    }
+def build_rest_clients(
+    config: Config,
+    event_bus: EventBus,
+    scheduler: Scheduler | None = None,
+    settings: RuntimeSettings | None = None,
+) -> dict[str, Any]:
+    """
+    Build only REST clients that are enabled through RuntimeSettings/.env.
+
+    Market-data discovery clients follow MARKET_DATA_EXCHANGES.
+    Binance REST is also added when execution is enabled, because execution is
+    Binance USD-M Futures only in this project.
+    """
+    enabled = set(settings.market_data_exchanges if settings is not None else ["binance", "bybit", "okx", "mexc"])
+    if settings is not None and settings.execution_exchange == "binance":
+        enabled.add("binance")
+
+    clients: dict[str, Any] = {}
+    if "binance" in enabled:
+        clients["binance"] = BinanceRestClient(config=config, event_bus=event_bus)
+    if "bybit" in enabled:
+        clients["bybit"] = BybitRestClient(config=config, event_bus=event_bus)
+    if "okx" in enabled:
+        clients["okx"] = OkxRestClient(config=config, event_bus=event_bus)
+    if "mexc" in enabled:
+        clients["mexc"] = MexcRestClient(config=config, event_bus=event_bus)
+    return clients
 
 
 def build_exchange_ws_clients(
@@ -92,22 +110,28 @@ def build_exchange_ws_clients(
     universe: ExchangeUniverse,
     settings: RuntimeSettings,
 ) -> dict[str, Any]:
+    """
+    Build WS clients from .env-driven RuntimeSettings.
+
+    No stream/channel/timeframe/depth/batch values are hard-coded here; each one
+    is read from settings populated by RuntimeSettings.from_env().
+    """
     clients: dict[str, Any] = {}
 
     if "binance" in settings.market_data_exchanges:
         futures_ws_config = BinanceWebSocketClientConfig(
-            public_ws_url="wss://fstream.binance.com/stream",
-            private_ws_base_url="wss://fstream.binance.com/ws",
-            rest_url="https://fapi.binance.com",
+            public_ws_url=settings.binance_public_ws_url,
+            private_ws_base_url=settings.binance_private_ws_base_url,
+            rest_url=settings.binance_rest_url,
             symbols=[],
-            streams=["trade", "depth", "kline", "forceorder"],
-            depth_level="20",
-            kline_interval="1m",
-            orderbook_emit_min_interval_ms=500,
-            orderbook_batch_max_size=2000,
-            trade_emit_min_interval_ms=500,
-            trade_batch_max_size=2000,
-            enable_private_stream=False,
+            streams=list(settings.binance_ws_streams),
+            depth_level=str(settings.binance_ws_depth_level),
+            kline_interval=str(settings.binance_ws_kline_interval),
+            orderbook_emit_min_interval_ms=settings.binance_orderbook_emit_min_interval_ms,
+            orderbook_batch_max_size=settings.binance_orderbook_batch_max_size,
+            trade_emit_min_interval_ms=settings.binance_trade_emit_min_interval_ms,
+            trade_batch_max_size=settings.binance_trade_batch_max_size,
+            enable_private_stream=settings.binance_enable_private_stream,
         )
         for index, symbols in enumerate(chunked(universe.binance, settings.ws_shard_size_binance), start=1):
             shard_config = BinanceWebSocketClientConfig(
@@ -127,7 +151,7 @@ def build_exchange_ws_clients(
                 orderbook_batch_max_size=futures_ws_config.orderbook_batch_max_size,
                 trade_emit_min_interval_ms=futures_ws_config.trade_emit_min_interval_ms,
                 trade_batch_max_size=futures_ws_config.trade_batch_max_size,
-                enable_private_stream=False,
+                enable_private_stream=futures_ws_config.enable_private_stream,
             )
             clients[f"binance_{index}"] = BinanceWebSocketClient(
                 config=config,
@@ -142,15 +166,15 @@ def build_exchange_ws_clients(
                 config=config,
                 event_bus=event_bus,
                 symbols=symbols,
-                streams=["trade", "orderbook", "kline", "liquidation"],
-                category="linear",
-                orderbook_depth=50,
-                kline_interval="1",
-                orderbook_emit_min_interval_ms=100,
-                orderbook_batch_max_size=500,
-                trade_emit_min_interval_ms=250,
-                trade_batch_max_size=1000,
-                enable_private_stream=False,
+                streams=list(settings.bybit_ws_streams),
+                category=settings.bybit_category,
+                orderbook_depth=settings.bybit_orderbook_depth,
+                kline_interval=settings.bybit_kline_interval,
+                orderbook_emit_min_interval_ms=settings.bybit_orderbook_emit_min_interval_ms,
+                orderbook_batch_max_size=settings.bybit_orderbook_batch_max_size,
+                trade_emit_min_interval_ms=settings.bybit_trade_emit_min_interval_ms,
+                trade_batch_max_size=settings.bybit_trade_batch_max_size,
+                enable_private_stream=settings.bybit_enable_private_stream,
             )
 
     if "okx" in settings.market_data_exchanges:
@@ -159,14 +183,14 @@ def build_exchange_ws_clients(
                 config=config,
                 event_bus=event_bus,
                 inst_ids=inst_ids,
-                streams=["trades", "books", "candle"],
-                orderbook_channel="books5",
-                candle_channel="candle1m",
-                orderbook_emit_min_interval_ms=100,
-                orderbook_batch_max_size=500,
-                trade_emit_min_interval_ms=250,
-                trade_batch_max_size=1000,
-                enable_private_stream=False,
+                streams=list(settings.okx_ws_streams),
+                orderbook_channel=settings.okx_orderbook_channel,
+                candle_channel=settings.okx_candle_channel,
+                orderbook_emit_min_interval_ms=settings.okx_orderbook_emit_min_interval_ms,
+                orderbook_batch_max_size=settings.okx_orderbook_batch_max_size,
+                trade_emit_min_interval_ms=settings.okx_trade_emit_min_interval_ms,
+                trade_batch_max_size=settings.okx_trade_batch_max_size,
+                enable_private_stream=settings.okx_enable_private_stream,
             )
 
     if "mexc" in settings.market_data_exchanges:
@@ -175,13 +199,13 @@ def build_exchange_ws_clients(
                 config=config,
                 event_bus=event_bus,
                 symbols=symbols,
-                streams=["deal", "depth", "kline"],
-                kline_interval="Min1",
-                orderbook_emit_min_interval_ms=100,
-                orderbook_batch_max_size=500,
-                trade_emit_min_interval_ms=250,
-                trade_batch_max_size=1000,
-                enable_private_stream=False,
+                streams=list(settings.mexc_ws_streams),
+                kline_interval=settings.mexc_kline_interval,
+                orderbook_emit_min_interval_ms=settings.mexc_orderbook_emit_min_interval_ms,
+                orderbook_batch_max_size=settings.mexc_orderbook_batch_max_size,
+                trade_emit_min_interval_ms=settings.mexc_trade_emit_min_interval_ms,
+                trade_batch_max_size=settings.mexc_trade_batch_max_size,
+                enable_private_stream=settings.mexc_enable_private_stream,
             )
 
     return clients
@@ -242,19 +266,39 @@ def build_analytics_components(
     scheduler: Scheduler,
     caches: dict[str, Any],
     universe: ExchangeUniverse,
+    settings: RuntimeSettings,
 ) -> list[Any]:
-    symbols = universe.all_canonical_symbols()
-    binance_symbols = [symbol for symbol in universe.binance if str(symbol).strip()]
-    price_action_symbols = binance_symbols or symbols or ["BTCUSDT"]
-    price_action_timeframes = ("1m", "15m")
+    """
+    Build analytics from .env-driven RuntimeSettings.
 
-    # Dev-friendly defaults: liquidity still uses canonical cache-layer topics,
-    # but it can build initial snapshots faster and also reacts to candles-cache
-    # updates. For stricter production behavior, raise min_candles_for_snapshot
-    # back to 30.
+    Symbols/timeframes/exchange/market_type are not defined in this factory.
+    They are resolved from RuntimeSettings.from_env() and exchange discovery.
+    """
+    discovered_symbols = universe.all_canonical_symbols()
+    configured_analytics_symbols = [
+        str(symbol).upper()
+        for symbol in settings.analytics_symbols
+        if str(symbol).strip()
+    ]
+
+    price_action_symbols = [
+        str(symbol).upper()
+        for symbol in (settings.price_action_symbols or configured_analytics_symbols)
+        if str(symbol).strip()
+    ]
+    if not price_action_symbols:
+        source_exchange_symbols = getattr(universe, settings.price_action_exchange, [])
+        price_action_symbols = [str(symbol).upper() for symbol in source_exchange_symbols if str(symbol).strip()]
+    if not price_action_symbols:
+        price_action_symbols = discovered_symbols
+
+    price_action_timeframes = [str(tf).strip() for tf in settings.price_action_timeframes if str(tf).strip()]
+    if not price_action_timeframes:
+        price_action_timeframes = [str(tf).strip() for tf in settings.timeframes if str(tf).strip()]
+
     liquidity_config = LiquidityConfig(
-        candles_updated_input_topics=("market.candles.updated",),
-        min_candles_for_snapshot=5,
+        candles_updated_input_topics=tuple(settings.liquidity_candles_updated_topics),
+        min_candles_for_snapshot=settings.liquidity_min_candles_for_snapshot,
     )
     liquidity_map = LiquidityMap(config=liquidity_config)
 
@@ -264,9 +308,9 @@ def build_analytics_components(
             scheduler=scheduler,
             trades_cache=caches["trades"],
             orderbook_cache=caches["orderbook"],
-            default_exchange="binance",
-            default_market_type="usdm_futures",
-            default_timeframe="1m",
+            default_exchange=settings.orderflow_default_exchange,
+            default_market_type=settings.orderflow_default_market_type,
+            default_timeframe=settings.orderflow_default_timeframe,
         ),
         OIAnalyzer(event_bus=event_bus, scheduler=scheduler),
         FundingAnalyzer(event_bus=event_bus, scheduler=scheduler),
@@ -286,8 +330,8 @@ def build_analytics_components(
                 symbol,
                 timeframe=timeframe,
                 event_bus=event_bus,
-                exchange="binance",
-                market_type="usdm_futures",
+                exchange=settings.price_action_exchange,
+                market_type=settings.price_action_market_type,
                 scheduler=scheduler,
             )
             for symbol in price_action_symbols
@@ -400,18 +444,19 @@ def build_strategy_engine(
     event_bus: EventBus,
     scheduler: Scheduler,
     universe: ExchangeUniverse,
+    settings: RuntimeSettings,
 ) -> StrategyEngine:
     strategy_config = build_default_strategy_config(
         symbols=universe.all_canonical_symbols(),
-        preset_name="scalping",
-        use_required_features=False,
+        preset_name=settings.strategy_preset_name,
+        use_required_features=settings.strategy_use_required_features,
     )
     registry = build_default_strategy_registry(
         config=strategy_config,
         event_bus=event_bus,
         scheduler=scheduler,
         strategy_factories=build_strategy_factories(),
-        strict=False,
+        strict=settings.strategy_registry_strict,
     )
     return StrategyEngine(
         config=strategy_config,

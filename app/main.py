@@ -88,7 +88,35 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "MARKET_DATA_EXCHANGES",
         "MARKET_DATA_DISCOVER_ALL_SYMBOLS",
         "MARKET_DATA_SYMBOL_ALLOWLIST",
+        "MARKET_DATA_SYMBOL_BLOCKLIST",
+        "MARKET_DATA_QUOTE_ASSET",
+        "MARKET_DATA_TIMEFRAMES",
+        "ANALYTICS_EXCHANGE",
+        "ANALYTICS_MARKET_TYPE",
+        "ANALYTICS_SYMBOLS",
+        "PRICE_ACTION_EXCHANGE",
+        "PRICE_ACTION_MARKET_TYPE",
+        "PRICE_ACTION_SYMBOLS",
+        "PRICE_ACTION_TIMEFRAMES",
+        "ORDERFLOW_DEFAULT_EXCHANGE",
+        "ORDERFLOW_DEFAULT_MARKET_TYPE",
+        "ORDERFLOW_DEFAULT_TIMEFRAME",
+        "LIQUIDITY_CANDLES_UPDATED_TOPICS",
+        "LIQUIDITY_MIN_CANDLES_FOR_SNAPSHOT",
+        "BINANCE_WS_STREAMS",
+        "BINANCE_LIQUIDATION_STREAM_NAME",
+        "BINANCE_WS_KLINE_INTERVAL",
+        "BYBIT_WS_STREAMS",
+        "BYBIT_LIQUIDATION_STREAM_NAME",
+        "BYBIT_CATEGORY",
+        "OKX_WS_STREAMS",
+        "OKX_CANDLE_CHANNEL",
+        "MEXC_WS_STREAMS",
+        "MEXC_KLINE_INTERVAL",
+        "STARTUP_WARMUP_EXCHANGE",
+        "DERIVATIVE_SNAPSHOT_EXCHANGE",
         "EXECUTION_EXCHANGE",
+        "EXECUTION_MARKET_TYPE",
         "EXECUTION_MODE",
         "EXECUTION_LIVE_TRADING_ENABLED",
         "TELEGRAM_BOT_ENABLED",
@@ -207,7 +235,7 @@ class TradingSystemRuntime:
         await self.scheduler.start()
 
         # REST clients first: needed for discovery and Binance execution.
-        self.rest_clients = build_rest_clients(self.config, self.event_bus, self.scheduler)
+        self.rest_clients = build_rest_clients(self.config, self.event_bus, self.scheduler, self.settings)
         for rest in self.rest_clients.values():
             await register_component(rest)
             await start_component(rest)
@@ -273,6 +301,7 @@ class TradingSystemRuntime:
                 scheduler=self.scheduler,
                 caches=self.caches,
                 universe=universe,
+                settings=self.settings,
             )
             for component in analytics_components:
                 # Components that have start() call register() internally (e.g.
@@ -309,6 +338,7 @@ class TradingSystemRuntime:
                 event_bus=self.event_bus,
                 scheduler=self.scheduler,
                 universe=universe,
+                settings=self.settings,
             )
             self.components.append(strategy_engine)
             await start_component(strategy_engine)
@@ -365,16 +395,13 @@ class TradingSystemRuntime:
             bool(self.settings.startup_warmup_enabled)
             and self.settings.enable_market_data
             and self.settings.enable_analytics
-            and "binance" in self.settings.market_data_exchanges
+            and self.settings.startup_warmup_exchange in self.settings.market_data_exchanges
         )
 
     def _startup_warmup_timeframes(self) -> list[str]:
         configured = [str(tf).strip() for tf in self.settings.startup_warmup_timeframes if str(tf).strip()]
         if not configured:
             configured = [str(tf).strip() for tf in self.settings.timeframes if str(tf).strip()]
-        if not configured:
-            configured = ["1m", "15m"]
-
         # Preserve order and remove duplicates.
         seen: set[str] = set()
         result: list[str] = []
@@ -537,17 +564,18 @@ class TradingSystemRuntime:
             )
             return
 
-        binance = self.rest_clients.get("binance")
-        if binance is None:
-            message = "Startup warmup cannot run: Binance REST client is missing"
+        warmup_exchange = self.settings.startup_warmup_exchange
+        rest = self.rest_clients.get(warmup_exchange)
+        if rest is None:
+            message = f"Startup warmup cannot run: {warmup_exchange} REST client is missing"
             if self.settings.startup_warmup_required:
                 raise RuntimeError(message)
             logger.warning(message)
             return
 
-        symbols = self._derivative_snapshot_symbols(universe)
+        symbols = self._derivative_snapshot_symbols(universe, exchange=warmup_exchange)
         if not symbols:
-            message = "Startup warmup cannot run: Binance universe is empty"
+            message = f"Startup warmup cannot run: {warmup_exchange} universe is empty"
             if self.settings.startup_warmup_required:
                 raise RuntimeError(message)
             logger.warning(message)
@@ -560,7 +588,8 @@ class TradingSystemRuntime:
         batch_size = max(1, int(self.settings.startup_warmup_batch_size))
 
         logger.info(
-            "Startup warmup started | exchange=binance symbols=%s timeframes=%s kline_limit=%s funding_limit=%s concurrency=%s batch_size=%s",
+            "Startup warmup started | exchange=%s symbols=%s timeframes=%s kline_limit=%s funding_limit=%s concurrency=%s batch_size=%s",
+            warmup_exchange,
             len(symbols),
             timeframes,
             kline_limit,
@@ -578,7 +607,7 @@ class TradingSystemRuntime:
         async def warmup_klines(symbol: str, timeframe: str) -> tuple[str, str, int, str | None]:
             async with sem:
                 try:
-                    candles = await binance.get_klines(
+                    candles = await rest.get_klines(
                         symbol=symbol,
                         interval=timeframe,
                         limit=kline_limit,
@@ -588,7 +617,8 @@ class TradingSystemRuntime:
                     if self._is_derivative_symbol_unavailable_error(exc):
                         self._disable_derivative_snapshot_symbol(symbol, exc)
                     logger.exception(
-                        "Startup candle warmup failed | exchange=binance symbol=%s timeframe=%s",
+                        "Startup candle warmup failed | exchange=%s symbol=%s timeframe=%s",
+                        warmup_exchange,
                         symbol,
                         timeframe,
                     )
@@ -597,7 +627,7 @@ class TradingSystemRuntime:
         async def warmup_funding(symbol: str) -> tuple[str, int, str | None]:
             async with sem:
                 try:
-                    items = await binance.get_funding_rate(
+                    items = await rest.get_funding_rate(
                         symbol=symbol,
                         limit=funding_limit,
                     )
@@ -606,7 +636,8 @@ class TradingSystemRuntime:
                     if self._is_derivative_symbol_unavailable_error(exc):
                         self._disable_derivative_snapshot_symbol(symbol, exc)
                     logger.exception(
-                        "Startup funding warmup failed | exchange=binance symbol=%s",
+                        "Startup funding warmup failed | exchange=%s symbol=%s",
+                        warmup_exchange,
                         symbol,
                     )
                     return symbol, 0, str(exc)
@@ -689,9 +720,15 @@ class TradingSystemRuntime:
             configured.append((name, [str(stream) for stream in streams]))
 
             lowered = {str(stream).lower() for stream in streams}
-            if name.startswith("binance") and "forceorder" not in lowered:
+            if (
+                name.startswith("binance")
+                and self.settings.binance_liquidation_stream_name.lower() not in lowered
+            ):
                 missing.append(name)
-            if name.startswith("bybit") and "liquidation" not in lowered:
+            if (
+                name.startswith("bybit")
+                and self.settings.bybit_liquidation_stream_name.lower() not in lowered
+            ):
                 missing.append(name)
 
         logger.info(
@@ -707,26 +744,15 @@ class TradingSystemRuntime:
             )
 
     def _derivative_snapshot_poll_interval_seconds(self) -> float:
-        value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS")
-        if value is None or not value.strip():
-            return 60.0
-
-        try:
-            interval = float(value)
-        except ValueError:
+        interval = float(self.settings.derivative_snapshot_poll_interval_seconds)
+        minimum = float(self.settings.derivative_snapshot_min_interval_seconds)
+        if interval < minimum:
             logger.warning(
-                "Invalid DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS=%r; using default 60s",
-                value,
-            )
-            return 60.0
-
-        if interval < 10.0:
-            logger.warning(
-                "DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS=%s is too low; clamping to 10s",
+                "DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS=%s is too low; clamping to %s",
                 interval,
+                minimum,
             )
-            return 10.0
-
+            return minimum
         return interval
 
     @staticmethod
@@ -763,10 +789,11 @@ class TradingSystemRuntime:
             exc,
         )
 
-    def _derivative_snapshot_symbols(self, universe: Any) -> list[str]:
+    def _derivative_snapshot_symbols(self, universe: Any, exchange: str | None = None) -> list[str]:
+        source_exchange = exchange or self.settings.derivative_snapshot_exchange
         symbols = [
             str(symbol).upper()
-            for symbol in getattr(universe, "binance", [])
+            for symbol in getattr(universe, source_exchange, [])
             if str(symbol).strip()
         ]
 
@@ -791,30 +818,10 @@ class TradingSystemRuntime:
         return unique_symbols
 
     def _derivative_snapshot_poll_concurrency(self) -> int:
-        value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_CONCURRENCY")
-        if value is None or not value.strip():
-            return 8
-        try:
-            return max(1, int(value))
-        except ValueError:
-            logger.warning(
-                "Invalid DERIVATIVE_SNAPSHOT_POLL_CONCURRENCY=%r; using default 8",
-                value,
-            )
-            return 8
+        return max(1, int(self.settings.derivative_snapshot_poll_concurrency))
 
     def _derivative_snapshot_poll_batch_size(self) -> int:
-        value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_BATCH_SIZE")
-        if value is None or not value.strip():
-            return 50
-        try:
-            return max(1, int(value))
-        except ValueError:
-            logger.warning(
-                "Invalid DERIVATIVE_SNAPSHOT_POLL_BATCH_SIZE=%r; using default 50",
-                value,
-            )
-            return 50
+        return max(1, int(self.settings.derivative_snapshot_poll_batch_size))
 
     def _start_derivative_snapshot_polling(self, universe: Any) -> None:
         """
@@ -830,17 +837,21 @@ class TradingSystemRuntime:
         if not self.settings.enable_market_data or not self.settings.enable_analytics:
             return
 
-        if "binance" not in self.settings.market_data_exchanges:
+        snapshot_exchange = self.settings.derivative_snapshot_exchange
+        if snapshot_exchange not in self.settings.market_data_exchanges:
             return
 
-        binance = self.rest_clients.get("binance")
-        if binance is None:
-            logger.warning("Derivative snapshot polling disabled: Binance REST client is missing")
+        rest = self.rest_clients.get(snapshot_exchange)
+        if rest is None:
+            logger.warning(
+                "Derivative snapshot polling disabled: %s REST client is missing",
+                snapshot_exchange,
+            )
             return
 
-        symbols = self._derivative_snapshot_symbols(universe)
+        symbols = self._derivative_snapshot_symbols(universe, exchange=snapshot_exchange)
         if not symbols:
-            logger.warning("Derivative snapshot polling disabled: Binance universe is empty")
+            logger.warning("Derivative snapshot polling disabled: %s universe is empty", snapshot_exchange)
             return
 
         interval = self._derivative_snapshot_poll_interval_seconds()
@@ -852,24 +863,26 @@ class TradingSystemRuntime:
         async def poll_symbol(symbol: str, sem: asyncio.Semaphore) -> None:
             async with sem:
                 try:
-                    await binance.get_open_interest(symbol=symbol)
+                    await rest.get_open_interest(symbol=symbol)
                 except Exception as exc:
                     if self._is_derivative_symbol_unavailable_error(exc):
                         self._disable_derivative_snapshot_symbol(symbol, exc)
                         return
                     logger.exception(
-                        "Failed to poll Binance open interest snapshot | symbol=%s",
+                        "Failed to poll derivative open interest snapshot | exchange=%s symbol=%s",
+                        snapshot_exchange,
                         symbol,
                     )
 
                 try:
-                    await binance.get_funding_rate(symbol=symbol, limit=1)
+                    await rest.get_funding_rate(symbol=symbol, limit=self.settings.derivative_snapshot_funding_limit)
                 except Exception as exc:
                     if self._is_derivative_symbol_unavailable_error(exc):
                         self._disable_derivative_snapshot_symbol(symbol, exc)
                         return
                     logger.exception(
-                        "Failed to poll Binance funding snapshot | symbol=%s",
+                        "Failed to poll derivative funding snapshot | exchange=%s symbol=%s",
+                        snapshot_exchange,
                         symbol,
                     )
 
@@ -882,7 +895,7 @@ class TradingSystemRuntime:
 
             if not active_symbols:
                 logger.warning(
-                    "Derivative snapshot polling skipped: all Binance symbols are disabled | original_symbols=%s",
+                    "Derivative snapshot polling skipped: all derivative snapshot symbols are disabled | original_symbols=%s",
                     len(symbols),
                 )
                 return
@@ -897,7 +910,8 @@ class TradingSystemRuntime:
         async def fixed_rate_loop() -> None:
             next_run = asyncio.get_running_loop().time()
             logger.info(
-                "Derivative snapshot polling loop started | exchange=binance symbols=%s interval=%s concurrency=%s batch_size=%s",
+                "Derivative snapshot polling loop started | exchange=%s symbols=%s interval=%s concurrency=%s batch_size=%s",
+                snapshot_exchange,
                 len(symbols),
                 interval,
                 concurrency,
@@ -942,9 +956,9 @@ class TradingSystemRuntime:
 
         self._derivative_snapshot_poll_task = asyncio.create_task(
             fixed_rate_loop(),
-            name="binance-derivative-snapshots-poll",
+            name=f"{snapshot_exchange}-derivative-snapshots-poll",
         )
-        self._derivative_snapshot_poll_job_id = "binance-derivative-snapshots-poll"
+        self._derivative_snapshot_poll_job_id = f"{snapshot_exchange}-derivative-snapshots-poll"
 
     async def _stop_derivative_snapshot_polling(self) -> None:
         task = self._derivative_snapshot_poll_task

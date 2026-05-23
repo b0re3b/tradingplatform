@@ -42,15 +42,16 @@ def okx_to_canonical(inst_id: str) -> str:
     return value.replace("-", "")
 
 
-def canonical_to_okx_swap(symbol: str, quote_asset: str = "USDT") -> str:
+def canonical_to_okx_swap(symbol: str, quote_asset: str = "USDT", suffix: str = "SWAP") -> str:
     normalized = to_canonical_symbol(symbol)
     quote = quote_asset.upper()
+    suffix = suffix.upper()
 
     if not normalized.endswith(quote):
         return normalized
 
     base = normalized[: -len(quote)]
-    return f"{base}-{quote}-SWAP"
+    return f"{base}-{quote}-{suffix}"
 
 
 def mexc_to_canonical(symbol: str) -> str:
@@ -154,11 +155,11 @@ async def discover_binance_symbols(rest: Any, settings: RuntimeSettings) -> list
             continue
 
         status = _first_str(item, "status")
-        if status and status.upper() != "TRADING":
+        if status and status.upper() != settings.binance_required_status:
             continue
 
         contract_type = _first_str(item, "contractType", "contract_type")
-        if contract_type and contract_type.upper() != "PERPETUAL":
+        if contract_type and contract_type.upper() != settings.binance_contract_type:
             continue
 
         if _allowed(symbol, settings):
@@ -172,7 +173,7 @@ async def discover_bybit_symbols(rest: Any, settings: RuntimeSettings) -> list[s
     cursor: str | None = None
 
     while True:
-        kwargs: dict[str, Any] = {"category": "linear", "limit": 1000}
+        kwargs: dict[str, Any] = {"category": settings.bybit_category, "limit": settings.bybit_limit}
         if cursor:
             kwargs["cursor"] = cursor
 
@@ -200,7 +201,7 @@ async def discover_bybit_symbols(rest: Any, settings: RuntimeSettings) -> list[s
             if "-" in symbol or delivery_time not in {"", "0"}:
                 continue
 
-            if contract_type and contract_type not in {"linearperpetual", "perpetual", "swap"}:
+            if contract_type and contract_type not in set(settings.bybit_contract_types):
                 continue
 
             if not _truthy_active_state(status):
@@ -217,7 +218,7 @@ async def discover_bybit_symbols(rest: Any, settings: RuntimeSettings) -> list[s
 
 
 async def discover_okx_symbols(rest: Any, settings: RuntimeSettings) -> list[str]:
-    payload = await rest.get_instruments(inst_type="SWAP")
+    payload = await rest.get_instruments(inst_type=settings.okx_inst_type)
     items = payload.get("data", []) if isinstance(payload, dict) else []
     symbols: list[str] = []
 
@@ -235,7 +236,7 @@ async def discover_okx_symbols(rest: Any, settings: RuntimeSettings) -> list[str
         if quote and quote != settings.quote_asset:
             continue
 
-        if not inst_id.endswith(f"-{settings.quote_asset}-SWAP"):
+        if not inst_id.endswith(f"-{settings.quote_asset}-{settings.okx_symbol_suffix}"):
             continue
 
         if not _truthy_active_state(state):
@@ -303,16 +304,7 @@ async def discover_mexc_symbols(rest: Any, settings: RuntimeSettings) -> list[st
         state = _first_str(item, "state", "status")
         if state:
             normalized_state = state.strip().lower()
-            inactive_states = {
-                "offline",
-                "disabled",
-                "disable",
-                "closed",
-                "delisted",
-                "suspended",
-                "suspend",
-            }
-            if normalized_state in inactive_states:
+            if normalized_state in set(settings.mexc_inactive_states):
                 continue
 
         hidden = item.get("isHidden", item.get("is_hidden", item.get("hidden", False)))
@@ -343,7 +335,7 @@ async def discover_exchange_universe(rest_clients: dict[str, Any], settings: Run
             binance=manual if "binance" in settings.market_data_exchanges else [],
             bybit=manual if "bybit" in settings.market_data_exchanges else [],
             okx=[
-                canonical_to_okx_swap(symbol, settings.quote_asset)
+                canonical_to_okx_swap(symbol, settings.quote_asset, settings.okx_symbol_suffix)
                 for symbol in manual
             ]
             if "okx" in settings.market_data_exchanges
