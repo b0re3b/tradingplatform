@@ -29,6 +29,11 @@ class QueueFullPolicy(str, Enum):
     DROP_OLDEST = "drop_oldest"
 
 
+class HandlerDispatchMode(str, Enum):
+    SEQUENTIAL = "sequential"
+    CONCURRENT = "concurrent"
+
+
 @dataclass(slots=True)
 class Event:
     topic: str
@@ -71,6 +76,7 @@ class Subscription:
     handler: HandlerType
     name: str
     enabled: bool = True
+    dispatch_mode: HandlerDispatchMode | None = None
 
 
 @dataclass(slots=True)
@@ -129,6 +135,8 @@ class EventBus:
         max_retries: int = 1,
         retry_delay: float = 0.02,
         enable_metrics: bool = True,
+        handler_dispatch_mode: HandlerDispatchMode | str = HandlerDispatchMode.CONCURRENT,
+        handler_timeout: float | None = None,
         service_name: str = "event_bus",
     ) -> None:
         self._max_queue_size = max_queue_size
@@ -137,6 +145,8 @@ class EventBus:
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._enable_metrics = enable_metrics
+        self._handler_dispatch_mode = self._coerce_dispatch_mode(handler_dispatch_mode)
+        self._handler_timeout = handler_timeout
         self._service_name = service_name
 
         self._logger = get_logger(
@@ -176,6 +186,7 @@ class EventBus:
             "drop_reasons": {},
             "protected_enqueue_waits": 0,
             "handler_errors": {},
+            "handler_dispatch_mode": self._handler_dispatch_mode.value,
         }
 
     # ---------------------------------------------------------------------
@@ -198,10 +209,12 @@ class EventBus:
             self._workers.append(task)
 
         self._logger.info(
-            "EventBus started | workers=%s max_queue_size=%s policy=%s",
+            "EventBus started | workers=%s max_queue_size=%s policy=%s handler_dispatch_mode=%s handler_timeout=%s",
             self._worker_count,
             self._max_queue_size,
             self._queue_full_policy.value,
+            self._handler_dispatch_mode.value,
+            self._handler_timeout,
         )
 
     async def stop(self, *, drain: bool = True, timeout: float = 10.0) -> None:
@@ -250,19 +263,22 @@ class EventBus:
         handler: HandlerType,
         *,
         name: Optional[str] = None,
+        dispatch_mode: HandlerDispatchMode | str | None = None,
     ) -> Subscription:
         subscription = Subscription(
             pattern=pattern,
             handler=handler,
             name=name or getattr(handler, "__name__", "anonymous_handler"),
+            dispatch_mode=self._coerce_dispatch_mode(dispatch_mode) if dispatch_mode is not None else None,
         )
         self._subscriptions.append(subscription)
         self._metrics["subscriptions"] = len(self._subscriptions)
 
         self._logger.info(
-            "Handler subscribed | pattern=%s handler=%s",
+            "Handler subscribed | pattern=%s handler=%s dispatch_mode=%s",
             pattern,
             subscription.name,
+            (subscription.dispatch_mode or self._handler_dispatch_mode).value,
         )
         return subscription
 
@@ -433,36 +449,70 @@ class EventBus:
             )
             return
 
-        for subscription in matched_subscriptions:
-            try:
-                await self._invoke_handler(subscription, event)
-            except Exception as exc:
-                self._register_handler_error(subscription.name)
+        # Keep compatibility with order-sensitive handlers by allowing per-
+        # subscription or global sequential mode. The default is concurrent so
+        # one slow analytics/cache/notification handler does not block every
+        # other handler for the same market-data event.
+        sequential_subscriptions = [
+            sub for sub in matched_subscriptions
+            if (sub.dispatch_mode or self._handler_dispatch_mode) == HandlerDispatchMode.SEQUENTIAL
+        ]
+        concurrent_subscriptions = [
+            sub for sub in matched_subscriptions
+            if (sub.dispatch_mode or self._handler_dispatch_mode) == HandlerDispatchMode.CONCURRENT
+        ]
 
-                get_logger(
-                    __name__,
-                    event_type="event_handler",
-                    handler_name=subscription.name,
-                ).exception(
-                    "Handler failed | topic=%s event_id=%s",
-                    event.topic,
-                    event.event_id,
-                )
+        for subscription in sequential_subscriptions:
+            await self._invoke_handler_safely(subscription, event)
 
-                await self._handle_dispatch_error(
-                    event=event,
-                    exc=exc,
-                    location=subscription.name,
-                )
+        if concurrent_subscriptions:
+            await asyncio.gather(
+                *(self._invoke_handler_safely(subscription, event) for subscription in concurrent_subscriptions),
+                return_exceptions=True,
+            )
+
+    async def _invoke_handler_safely(self, subscription: Subscription, event: Event) -> None:
+        try:
+            await self._invoke_handler(subscription, event)
+        except Exception as exc:
+            self._register_handler_error(subscription.name)
+
+            get_logger(
+                __name__,
+                event_type="event_handler",
+                handler_name=subscription.name,
+            ).exception(
+                "Handler failed | topic=%s event_id=%s",
+                event.topic,
+                event.event_id,
+            )
+
+            await self._handle_dispatch_error(
+                event=event,
+                exc=exc,
+                location=subscription.name,
+            )
 
     async def _invoke_handler(self, subscription: Subscription, event: Event) -> None:
         result = subscription.handler(event)
         if inspect.isawaitable(result):
-            await result
+            if self._handler_timeout is not None:
+                await asyncio.wait_for(result, timeout=self._handler_timeout)
+            else:
+                await result
 
     # ---------------------------------------------------------------------
     # Queue / middleware / matching
     # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_dispatch_mode(value: HandlerDispatchMode | str) -> HandlerDispatchMode:
+        if isinstance(value, HandlerDispatchMode):
+            return value
+        try:
+            return HandlerDispatchMode(str(value).strip().lower())
+        except Exception as exc:
+            raise ValueError(f"Invalid handler dispatch mode: {value!r}") from exc
 
     def _match_subscriptions(self, topic: str) -> list[Subscription]:
         return [

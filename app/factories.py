@@ -12,6 +12,7 @@ from data.market_stream import MarketStream
 from data.open_interest_cache import OpenInterestCache
 from data.orderbook_cache import OrderBookCache
 from data.trades_cache import TradesCache
+from storage.parquet_storage import ParquetStorage, ParquetStorageConfig
 
 from exchanges.binance.binance_rest import BinanceRestClient
 from exchanges.binance.binance_ws import BinanceWebSocketClient, BinanceWebSocketClientConfig
@@ -195,6 +196,22 @@ def build_data_caches(config: Config, event_bus: EventBus, scheduler: Scheduler)
         "open_interest": OpenInterestCache(config=config, event_bus=event_bus, scheduler=scheduler),
     }
 
+
+
+def build_parquet_storage(config: Config, event_bus: EventBus, scheduler: Scheduler) -> ParquetStorage:
+    """
+    EventBus-driven market-data persistence.
+
+    Must be started before startup warmup so REST candle/funding snapshots that
+    pass through caches are persisted to Parquet before strategy/risk/execution
+    are allowed to start.
+    """
+    return ParquetStorage(
+        config=config,
+        event_bus=event_bus,
+        scheduler=scheduler,
+        storage_config=ParquetStorageConfig.from_core_config(config),
+    )
 
 def build_market_stream(
     *,
@@ -386,7 +403,7 @@ def build_strategy_engine(
 ) -> StrategyEngine:
     strategy_config = build_default_strategy_config(
         symbols=universe.all_canonical_symbols(),
-        preset_name="default",
+        preset_name="scalping",
         use_required_features=False,
     )
     registry = build_default_strategy_registry(

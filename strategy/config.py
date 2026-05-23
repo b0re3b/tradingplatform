@@ -178,6 +178,9 @@ class RoutingConfig:
     _logger = logging.getLogger(__name__ + ".RoutingConfig")
     reevaluate_on_any_update: bool = False
     route_hybrid_on_domain_signal: bool = True
+    min_domains_for_hybrid_route: int = 3
+    require_fresh_domains_for_hybrid_route: bool = True
+    hybrid_route_stale_seconds: int = 30
     allow_partial_context: bool = True
     stale_feature_threshold_seconds: int = 30
     event_to_categories: dict[str, list[StrategyCategory]] = field(default_factory=dict)
@@ -189,6 +192,16 @@ class RoutingConfig:
         if self.stale_feature_threshold_seconds <= 0:
             raise StrategyConfigError(
                 "RoutingConfig.stale_feature_threshold_seconds must be > 0"
+            )
+
+        if self.min_domains_for_hybrid_route <= 1:
+            raise StrategyConfigError(
+                "RoutingConfig.min_domains_for_hybrid_route must be > 1"
+            )
+
+        if self.hybrid_route_stale_seconds <= 0:
+            raise StrategyConfigError(
+                "RoutingConfig.hybrid_route_stale_seconds must be > 0"
             )
 
         for event_name, categories in self.event_to_categories.items():
@@ -295,13 +308,6 @@ class RoutingConfig:
 
             if category not in result:
                 result.append(category)
-
-        if (
-                self.route_hybrid_on_domain_signal
-                and result
-                and StrategyCategory.HYBRID not in result
-        ):
-            result.append(StrategyCategory.HYBRID)
 
         return result
 

@@ -21,6 +21,23 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+class ScheduleMode(str, Enum):
+    """
+    How periodic interval jobs calculate their next run.
+
+    FIXED_RATE keeps the cadence anchored to the planned schedule. If a job
+    takes longer than expected, the scheduler skips missed slots and schedules
+    the next future slot instead of drifting forever.
+
+    FIXED_DELAY preserves the old behaviour: wait `interval` seconds after a
+    job finishes before running it again. Use this only for maintenance jobs
+    where exact cadence does not matter.
+    """
+
+    FIXED_RATE = "fixed_rate"
+    FIXED_DELAY = "fixed_delay"
+
+
 @dataclass(slots=True)
 class ScheduledJob:
     job_id: str
@@ -36,14 +53,18 @@ class ScheduledJob:
     retry_delay: float = 1.0
     timeout: Optional[float] = None
     allow_overlap: bool = False
+    schedule_mode: ScheduleMode = ScheduleMode.FIXED_RATE
     next_run_at: Optional[float] = None
     last_run_at: Optional[float] = None
+    last_scheduled_run_at: Optional[float] = None
     last_finish_at: Optional[float] = None
     last_error: Optional[str] = None
     status: JobStatus = JobStatus.IDLE
     total_runs: int = 0
     total_failures: int = 0
     total_success: int = 0
+    total_skipped: int = 0
+    total_missed_slots: int = 0
     one_shot: bool = False
     task: Optional[asyncio.Task] = None
 
@@ -64,6 +85,12 @@ class Scheduler:
     - overlap control
     - graceful shutdown
     - інтеграція з EventBus
+
+    Важливо для live:
+    - periodic jobs за замовчуванням працюють у fixed-rate режимі;
+    - fixed-rate не накопичує drift після довгих виконань;
+    - якщо overlap заборонений і попередній запуск ще працює, scheduler
+      пропускає прострочений слот і переходить до наступного майбутнього слоту.
     """
 
     def __init__(
@@ -71,10 +98,12 @@ class Scheduler:
         *,
         event_bus: Optional[Any] = None,
         tick_interval: float = 0.2,
+        default_schedule_mode: ScheduleMode | str = ScheduleMode.FIXED_RATE,
         service_name: str = "scheduler",
     ) -> None:
         self._event_bus = event_bus
         self._tick_interval = tick_interval
+        self._default_schedule_mode = self._coerce_schedule_mode(default_schedule_mode)
         self._service_name = service_name
 
         self._logger = get_logger(
@@ -106,9 +135,10 @@ class Scheduler:
         )
 
         self._logger.info(
-            "Scheduler started | tick_interval=%s jobs=%s",
+            "Scheduler started | tick_interval=%s jobs=%s default_schedule_mode=%s",
             self._tick_interval,
             len(self._jobs),
+            self._default_schedule_mode.value,
         )
 
     async def stop(self, *, wait_running_jobs: bool = True, timeout: float = 10.0) -> None:
@@ -139,7 +169,7 @@ class Scheduler:
         ]
 
         if running_tasks and wait_running_jobs:
-            done, pending = await asyncio.wait(running_tasks, timeout=timeout)
+            _, pending = await asyncio.wait(running_tasks, timeout=timeout)
             if pending:
                 self._logger.warning(
                     "Scheduler stop timeout reached, cancelling running jobs | count=%s",
@@ -177,6 +207,7 @@ class Scheduler:
         retry_delay: float = 1.0,
         timeout: Optional[float] = None,
         allow_overlap: bool = False,
+        schedule_mode: ScheduleMode | str | None = None,
         enabled: bool = True,
     ) -> str:
         if interval <= 0:
@@ -184,6 +215,7 @@ class Scheduler:
 
         job_id = str(uuid.uuid4())
         now = time.time()
+        mode = self._coerce_schedule_mode(schedule_mode or self._default_schedule_mode)
 
         job = ScheduledJob(
             job_id=job_id,
@@ -198,6 +230,7 @@ class Scheduler:
             retry_delay=retry_delay,
             timeout=timeout,
             allow_overlap=allow_overlap,
+            schedule_mode=mode,
             next_run_at=now if run_immediately else now + interval,
             one_shot=False,
         )
@@ -205,11 +238,12 @@ class Scheduler:
         self._jobs[job_id] = job
 
         self._job_logger(job).info(
-            "Interval job added | interval=%s run_immediately=%s enabled=%s allow_overlap=%s",
+            "Interval job added | interval=%s run_immediately=%s enabled=%s allow_overlap=%s schedule_mode=%s",
             interval,
             run_immediately,
             enabled,
             allow_overlap,
+            mode.value,
         )
         return job_id
 
@@ -244,6 +278,7 @@ class Scheduler:
             retry_delay=retry_delay,
             timeout=timeout,
             allow_overlap=False,
+            schedule_mode=ScheduleMode.FIXED_DELAY,
             next_run_at=now + delay,
             one_shot=True,
         )
@@ -270,7 +305,7 @@ class Scheduler:
             return
 
         log.info("Manual run requested")
-        await self._launch_job(job)
+        await self._launch_job(job, scheduled_run_at=time.time(), reserve_next=False)
 
     def remove_job(self, job_id: str) -> None:
         job = self._get_job_or_raise(job_id)
@@ -316,13 +351,17 @@ class Scheduler:
                 "status": job.status.value,
                 "interval": job.interval,
                 "delay": job.delay,
+                "schedule_mode": job.schedule_mode.value,
                 "next_run_at": job.next_run_at,
                 "last_run_at": job.last_run_at,
+                "last_scheduled_run_at": job.last_scheduled_run_at,
                 "last_finish_at": job.last_finish_at,
                 "last_error": job.last_error,
                 "total_runs": job.total_runs,
                 "total_success": job.total_success,
                 "total_failures": job.total_failures,
+                "total_skipped": job.total_skipped,
+                "total_missed_slots": job.total_missed_slots,
                 "one_shot": job.one_shot,
                 "allow_overlap": job.allow_overlap,
             }
@@ -343,6 +382,7 @@ class Scheduler:
             "jobs_enabled": enabled_jobs,
             "jobs_running": running_jobs,
             "tick_interval": self._tick_interval,
+            "default_schedule_mode": self._default_schedule_mode.value,
         }
 
     # ---------------------------------------------------------------------
@@ -363,9 +403,13 @@ class Scheduler:
                     if now < job.next_run_at:
                         continue
 
+                    scheduled_run_at = job.next_run_at
+
                     if job.task is not None and not job.task.done() and not job.allow_overlap:
+                        job.total_skipped += 1
                         self._job_logger(job).warning(
-                            "Job skipped due to overlap protection"
+                            "Job skipped due to overlap protection | scheduled_run_at=%s",
+                            scheduled_run_at,
                         )
                         await self._emit_scheduler_event(
                             "system.scheduler.job_skipped",
@@ -373,14 +417,16 @@ class Scheduler:
                                 "job_id": job.job_id,
                                 "job_name": job.name,
                                 "reason": "overlap_blocked",
+                                "scheduled_run_at": scheduled_run_at,
+                                "schedule_mode": job.schedule_mode.value,
                             },
                         )
 
                         if job.is_periodic:
-                            job.next_run_at = now + (job.interval or 0.0)
+                            self._schedule_next_run(job, completed_at=now, previous_scheduled_run_at=scheduled_run_at)
                         continue
 
-                    await self._launch_job(job)
+                    await self._launch_job(job, scheduled_run_at=scheduled_run_at, reserve_next=True)
 
                 await asyncio.sleep(self._tick_interval)
 
@@ -393,27 +439,49 @@ class Scheduler:
         finally:
             self._logger.info("Scheduler loop finished")
 
-    async def _launch_job(self, job: ScheduledJob) -> None:
+    async def _launch_job(
+        self,
+        job: ScheduledJob,
+        *,
+        scheduled_run_at: Optional[float],
+        reserve_next: bool,
+    ) -> None:
         if self._stopping:
             return
 
+        if reserve_next and job.is_periodic and job.schedule_mode == ScheduleMode.FIXED_RATE:
+            self._schedule_next_run(
+                job,
+                completed_at=time.time(),
+                previous_scheduled_run_at=scheduled_run_at,
+            )
+
+        if job.one_shot:
+            job.enabled = False
+            job.next_run_at = None
+
         job.task = asyncio.create_task(
-            self._execute_job(job),
+            self._execute_job(job, scheduled_run_at=scheduled_run_at),
             name=f"scheduler-job-{job.name}-{job.job_id[:8]}",
         )
 
-    async def _execute_job(self, job: ScheduledJob) -> None:
+    async def _execute_job(self, job: ScheduledJob, *, scheduled_run_at: Optional[float]) -> None:
         log = self._job_logger(job)
 
         job.status = JobStatus.RUNNING
         job.last_run_at = time.time()
+        job.last_scheduled_run_at = scheduled_run_at
         job.total_runs += 1
 
+        lag = max(0.0, job.last_run_at - scheduled_run_at) if scheduled_run_at is not None else 0.0
+
         log.info(
-            "Job started | run=%s one_shot=%s periodic=%s",
+            "Job started | run=%s one_shot=%s periodic=%s schedule_mode=%s lag=%.3fs",
             job.total_runs,
             job.one_shot,
             job.is_periodic,
+            job.schedule_mode.value,
+            lag,
         )
 
         await self._emit_scheduler_event(
@@ -422,6 +490,10 @@ class Scheduler:
                 "job_id": job.job_id,
                 "job_name": job.name,
                 "run_number": job.total_runs,
+                "scheduled_run_at": scheduled_run_at,
+                "actual_run_at": job.last_run_at,
+                "lag_seconds": lag,
+                "schedule_mode": job.schedule_mode.value,
             },
         )
 
@@ -437,9 +509,10 @@ class Scheduler:
                 job.total_success += 1
 
                 log.info(
-                    "Job completed | success=%s failures=%s",
+                    "Job completed | success=%s failures=%s duration=%.3fs",
                     job.total_success,
                     job.total_failures,
+                    job.last_finish_at - job.last_run_at,
                 )
 
                 await self._emit_scheduler_event(
@@ -448,10 +521,15 @@ class Scheduler:
                         "job_id": job.job_id,
                         "job_name": job.name,
                         "run_number": job.total_runs,
+                        "duration_seconds": job.last_finish_at - job.last_run_at,
                     },
                 )
 
-                self._schedule_next_run(job)
+                if job.one_shot:
+                    job.status = JobStatus.STOPPED
+                    self._job_logger(job).info("One-shot job finished and disabled")
+                elif job.schedule_mode == ScheduleMode.FIXED_DELAY:
+                    self._schedule_next_run(job, completed_at=job.last_finish_at, previous_scheduled_run_at=scheduled_run_at)
                 return
 
             except asyncio.CancelledError:
@@ -487,7 +565,14 @@ class Scheduler:
                 )
 
                 if attempt > job.max_retries:
-                    self._schedule_next_run(job)
+                    if job.one_shot:
+                        job.enabled = False
+                        job.next_run_at = None
+                        job.status = JobStatus.STOPPED
+                    elif job.schedule_mode == ScheduleMode.FIXED_DELAY:
+                        self._schedule_next_run(job, completed_at=job.last_finish_at, previous_scheduled_run_at=scheduled_run_at)
+                    else:
+                        job.status = JobStatus.IDLE
                     return
 
                 if job.retry_delay > 0:
@@ -508,9 +593,13 @@ class Scheduler:
         else:
             await thread_call
 
-    def _schedule_next_run(self, job: ScheduledJob) -> None:
-        now = time.time()
-
+    def _schedule_next_run(
+        self,
+        job: ScheduledJob,
+        *,
+        completed_at: float,
+        previous_scheduled_run_at: Optional[float],
+    ) -> None:
         if job.one_shot:
             job.enabled = False
             job.next_run_at = None
@@ -524,13 +613,35 @@ class Scheduler:
             self._job_logger(job).warning("Job has no interval, disabling scheduling")
             return
 
-        job.next_run_at = now + job.interval
+        if job.schedule_mode == ScheduleMode.FIXED_DELAY:
+            job.next_run_at = completed_at + job.interval
+        else:
+            anchor = previous_scheduled_run_at if previous_scheduled_run_at is not None else completed_at
+            next_run_at = anchor + job.interval
+            missed = 0
+            # Skip missed historical slots. This prevents a long job from causing
+            # a burst of immediate catch-up runs and keeps live cadence stable.
+            while next_run_at <= completed_at:
+                next_run_at += job.interval
+                missed += 1
+
+            if missed:
+                job.total_missed_slots += missed
+                self._job_logger(job).warning(
+                    "Fixed-rate job missed slots | missed=%s next_run_at=%s",
+                    missed,
+                    next_run_at,
+                )
+
+            job.next_run_at = next_run_at
+
         job.status = JobStatus.IDLE
 
         self._job_logger(job).debug(
-            "Next run scheduled | next_run_at=%s interval=%s",
+            "Next run scheduled | next_run_at=%s interval=%s schedule_mode=%s",
             job.next_run_at,
             job.interval,
+            job.schedule_mode.value,
         )
 
     async def _emit_scheduler_event(self, topic: str, payload: dict[str, Any]) -> None:
@@ -555,11 +666,20 @@ class Scheduler:
             raise KeyError(f"Job not found: {job_id}")
         return job
 
+    @staticmethod
+    def _coerce_schedule_mode(value: ScheduleMode | str) -> ScheduleMode:
+        if isinstance(value, ScheduleMode):
+            return value
+        try:
+            return ScheduleMode(str(value).strip().lower())
+        except Exception as exc:
+            raise ValueError(f"Invalid schedule mode: {value!r}") from exc
+
     def _job_logger(self, job: ScheduledJob):
         return get_logger(
             __name__,
             service=self._service_name,
-            event_type="scheduled_job",
-            job_id=job.job_id,
+            event_type="scheduler_job",
             job_name=job.name,
+            job_id=job.job_id,
         )

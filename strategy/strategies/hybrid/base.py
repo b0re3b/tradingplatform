@@ -230,7 +230,7 @@ class HybridStrategyConfig:
 
     stale_feature_max_age_seconds: float | None = DEFAULT_HYBRID_STALE_AFTER_SECONDS
 
-    min_required_domains: int = 2
+    min_required_domains: int = 3
     allow_missing_required_domains: int = 0
     require_same_side_alignment: bool = True
     reject_direct_conflicts: bool = True
@@ -290,8 +290,8 @@ class HybridStrategyConfig:
         ):
             raise StrategyConfigError("stale_feature_max_age_seconds must be > 0")
 
-        if self.min_required_domains <= 0:
-            raise StrategyConfigError("min_required_domains must be > 0")
+        if self.min_required_domains <= 1:
+            raise StrategyConfigError("min_required_domains must be > 1")
 
         if self.allow_missing_required_domains < 0:
             raise StrategyConfigError("allow_missing_required_domains must be >= 0")

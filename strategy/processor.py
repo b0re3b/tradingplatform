@@ -610,6 +610,1016 @@ class SignalNormalizer(BaseStrategyComponent):
                 return feature_map[key]
         return None
 
+
+    # ------------------------------------------------------------------
+    # Strategy contract safety-net adapters
+    # ------------------------------------------------------------------
+
+    def _analytics_effective_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Return a flattened analytics payload view for contract adapters.
+
+        Some analytics services publish direct payloads, while others wrap the
+        real payload under payload/data/result.  Strategy contracts should not
+        depend on this transport envelope.  Top-level metadata stays
+        authoritative, while nested analytics sections are made visible to the
+        domain adapters.
+        """
+        result: dict[str, Any] = {}
+
+        def merge_mapping(value: Any) -> None:
+            mapping = self._as_mapping_or_none(value)
+            if isinstance(mapping, dict):
+                result.update(mapping)
+
+        for key in ("payload", "data", "result", "analysis"):
+            merge_mapping(payload.get(key))
+
+        # Top-level fields override envelope fields such as event_name/source.
+        result.update(payload)
+        return result
+
+    @staticmethod
+    def _contract_get_path(value: Any, path: str, default: Any = None) -> Any:
+        if value is None or not isinstance(path, str) or not path.strip():
+            return default
+
+        current = value
+        for part in path.split("."):
+            if current is None:
+                return default
+            part = part.strip()
+            if not part:
+                return default
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                current = getattr(current, part, None)
+        return default if current is None else current
+
+    @classmethod
+    def _contract_set_path(cls, target: dict[str, Any], path: str, value: Any) -> None:
+        if value is None or not isinstance(path, str) or not path.strip():
+            return
+        parts = [part for part in path.split(".") if part]
+        if not parts:
+            return
+        current = target
+        for part in parts[:-1]:
+            item = current.get(part)
+            if not isinstance(item, dict):
+                item = {}
+                current[part] = item
+            current = item
+        current.setdefault(parts[-1], value)
+
+    def _contract_first_value(
+            self,
+            *paths: str,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+            default: Any = None,
+    ) -> Any:
+        feature_map = payload.get("feature_map")
+        if not isinstance(feature_map, dict):
+            feature_map = {}
+
+        containers: tuple[Any, ...] = (
+            domain_data,
+            payload,
+            feature_map,
+            payload.get("context"),
+            payload.get("stats"),
+            payload.get("signal"),
+            payload.get("snapshot"),
+            payload.get("state"),
+            payload.get("event"),
+            payload.get("setup"),
+        )
+        for path in paths:
+            for container in containers:
+                value = self._contract_get_path(container, path, None)
+                if value is not None:
+                    return value
+        return default
+
+    def _contract_first_mapping(
+            self,
+            *paths: str,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        for path in paths:
+            value = self._contract_first_value(
+                path,
+                payload=payload,
+                domain_data=domain_data,
+                default=None,
+            )
+            mapping = self._as_mapping_or_none(value)
+            if isinstance(mapping, dict) and mapping:
+                return dict(mapping)
+        return None
+
+    @staticmethod
+    def _contract_section_present(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            return bool(value)
+        return True
+
+    @staticmethod
+    def _contract_side(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(getattr(value, "value", value)).strip().lower()
+        if not text:
+            return None
+        if text in {"buy", "long", "bull", "bullish", "up", "bid"}:
+            return "buy"
+        if text in {"sell", "short", "bear", "bearish", "down", "ask"}:
+            return "sell"
+        return text
+
+    def _ensure_strategy_domain_contracts(
+            self,
+            *,
+            source: FeatureSource,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        """
+        Final analytics -> strategy contract adapter.
+
+        Domain-specific adapters above preserve rich analytics structures.  This
+        safety net closes transport/shape gaps that commonly made strategies
+        appear silent: wrapped payloads, CVD delta-only events, funding events
+        under payload.*, opportunity-like spread signals, single whale trade
+        events, and detector-style spoofing events.
+        """
+        effective_payload = self._analytics_effective_payload(payload)
+
+        if source is FeatureSource.ORDERFLOW:
+            self._ensure_orderflow_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.FUNDING:
+            self._ensure_funding_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.SPREADS:
+            self._ensure_spreads_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.WHALES:
+            self._ensure_whales_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.SPOOFING:
+            self._ensure_spoofing_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.LIQUIDATIONS:
+            self._ensure_liquidations_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.LIQUIDITY:
+            self._ensure_liquidity_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.OPEN_INTEREST:
+            self._ensure_open_interest_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+        elif source is FeatureSource.PRICE_ACTION:
+            self._ensure_price_action_strategy_contract(
+                payload=effective_payload,
+                domain_data=domain_data,
+            )
+
+    def _ensure_orderflow_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(
+            *paths,
+            payload=payload,
+            domain_data=domain_data,
+            default=default,
+        )
+
+        cvd = self._contract_first_mapping("cvd", "cumulative_volume_delta", payload=payload, domain_data=domain_data) or {}
+        volume_delta = self._contract_first_mapping("volume_delta", "delta", payload=payload, domain_data=domain_data) or {}
+        aggressive = self._contract_first_mapping(
+            "aggressive_trades",
+            "aggression",
+            "aggressive",
+            payload=payload,
+            domain_data=domain_data,
+        ) or {}
+        orderbook = self._contract_first_mapping(
+            "orderbook_imbalance",
+            "book_imbalance",
+            "imbalance",
+            payload=payload,
+            domain_data=domain_data,
+        ) or {}
+
+        cvd_value = get("cvd.value", "cvd", "cumulative_volume_delta", "stats.cvd", "context.cvd")
+        delta_value = get("volume_delta.volume_delta", "volume_delta", "delta", "stats.volume_delta", "context.volume_delta")
+        delta_ratio = get(
+            "cvd.delta_ratio",
+            "volume_delta.delta_ratio",
+            "delta_ratio",
+            "stats.delta_ratio",
+            "context.delta_ratio",
+        )
+        buy_volume = _to_float(get("buy_volume", "stats.buy_volume", "context.buy_volume"), None)
+        sell_volume = _to_float(get("sell_volume", "stats.sell_volume", "context.sell_volume"), None)
+        total_volume = _to_float(get("total_volume", "volume", "stats.total_volume", "context.total_volume"), None)
+        if total_volume is None and buy_volume is not None and sell_volume is not None:
+            total_volume = buy_volume + sell_volume
+
+        buy_ratio = _to_float(get("buy_ratio", "stats.buy_ratio", "context.buy_ratio", "aggressive_trades.buy_ratio"), None)
+        sell_ratio = _to_float(get("sell_ratio", "stats.sell_ratio", "context.sell_ratio", "aggressive_trades.sell_ratio"), None)
+        if total_volume and total_volume > 0:
+            if buy_ratio is None and buy_volume is not None:
+                buy_ratio = buy_volume / total_volume
+            if sell_ratio is None and sell_volume is not None:
+                sell_ratio = sell_volume / total_volume
+        if buy_ratio is None and sell_ratio is not None:
+            buy_ratio = max(0.0, 1.0 - sell_ratio)
+        if sell_ratio is None and buy_ratio is not None:
+            sell_ratio = max(0.0, 1.0 - buy_ratio)
+
+        for key, value in {
+            "value": cvd_value,
+            "delta_ratio": delta_ratio,
+            "cvd_change_pct": get("cvd.cvd_change_pct", "cvd_change_pct", "change_pct"),
+            "cvd_slope": get("cvd.cvd_slope", "cvd_slope", "slope"),
+            "price_change_pct": get("cvd.price_change_pct", "price_change_pct", "price_delta_pct"),
+            "buy_ratio": buy_ratio,
+            "sell_ratio": sell_ratio,
+        }.items():
+            if value is not None:
+                cvd.setdefault(key, value)
+
+        for key, value in {
+            "volume_delta": delta_value,
+            "delta_ratio": delta_ratio,
+            "cumulative_volume_delta": get("volume_delta.cumulative_volume_delta", "cumulative_volume_delta", "cvd"),
+            "notional_delta": get("volume_delta.notional_delta", "notional_delta"),
+            "cumulative_notional_delta": get("volume_delta.cumulative_notional_delta", "cumulative_notional_delta"),
+        }.items():
+            if value is not None:
+                volume_delta.setdefault(key, value)
+
+        net_volume_delta = get("aggressive_trades.net_volume_delta", "net_volume_delta", "volume_delta", "delta")
+        for key, value in {
+            "buy_ratio": buy_ratio,
+            "sell_ratio": sell_ratio,
+            "net_volume_delta": net_volume_delta,
+            "net_notional_delta": get("aggressive_trades.net_notional_delta", "net_notional_delta", "notional_delta"),
+            "burst_score": get("aggressive_trades.burst_score", "burst_score", "aggression_score"),
+            "large_buy_trades": get("aggressive_trades.large_buy_trades", "large_buy_trades"),
+            "large_sell_trades": get("aggressive_trades.large_sell_trades", "large_sell_trades"),
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+        }.items():
+            if value is not None:
+                aggressive.setdefault(key, value)
+
+        for key, value in {
+            "ratio": get("orderbook_imbalance.ratio", "imbalance_ratio", "orderbook_imbalance_ratio"),
+            "diff": get("orderbook_imbalance.diff", "imbalance_diff", "orderbook_imbalance_diff"),
+        }.items():
+            if value is not None:
+                orderbook.setdefault(key, value)
+
+        if cvd:
+            domain_data.setdefault("cvd", cvd)
+        if volume_delta:
+            domain_data.setdefault("volume_delta", volume_delta)
+        if aggressive:
+            domain_data.setdefault("aggressive_trades", aggressive)
+        if orderbook:
+            domain_data.setdefault("orderbook_imbalance", orderbook)
+
+        for key, value in {
+            "trades_count": get("trades_count", "trades", "trade_count", "stats.trades_count"),
+            "total_volume": total_volume,
+            "total_notional": get("total_notional", "notional", "stats.total_notional"),
+            "last_price": get("last_price", "price", "close", "mark_price"),
+            "price_change_pct": get("price_change_pct", "price_delta_pct", "cvd.price_change_pct"),
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+            "delta_ratio": delta_ratio,
+            "side": self._contract_side(get("side", "direction", "signal.side")),
+            "score": get("score", "signal.score", "strength"),
+            "confidence": get("confidence", "signal.confidence", "strength"),
+        }.items():
+            if value is not None:
+                domain_data.setdefault(key, value)
+
+        # Dotted aliases make context.domain_dict(ORDERFLOW) usable even when
+        # a strategy/helper requests full contract paths directly.
+        for path, value in {
+            "orderflow.cvd": cvd or None,
+            "orderflow.cvd.value": cvd.get("value"),
+            "orderflow.cvd.delta_ratio": cvd.get("delta_ratio"),
+            "orderflow.cvd.cvd_change_pct": cvd.get("cvd_change_pct"),
+            "orderflow.cvd.cvd_slope": cvd.get("cvd_slope"),
+            "orderflow.cvd.price_change_pct": cvd.get("price_change_pct"),
+            "orderflow.volume_delta": volume_delta or None,
+            "orderflow.volume_delta.volume_delta": volume_delta.get("volume_delta"),
+            "orderflow.volume_delta.delta_ratio": volume_delta.get("delta_ratio"),
+            "orderflow.aggressive_trades": aggressive or None,
+            "orderflow.aggressive_trades.buy_ratio": aggressive.get("buy_ratio"),
+            "orderflow.aggressive_trades.sell_ratio": aggressive.get("sell_ratio"),
+            "orderflow.aggressive_trades.net_volume_delta": aggressive.get("net_volume_delta"),
+            "orderflow.trades_count": domain_data.get("trades_count"),
+            "orderflow.total_volume": domain_data.get("total_volume"),
+            "orderflow.total_notional": domain_data.get("total_notional"),
+            "orderflow.last_price": domain_data.get("last_price"),
+            "orderflow.price_change_pct": domain_data.get("price_change_pct"),
+        }.items():
+            if value is not None:
+                domain_data.setdefault(path, value)
+
+    def _ensure_funding_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        def mapping(*paths: str) -> dict[str, Any] | None:
+            return self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data)
+
+        def get(*paths: str, default: Any = None) -> Any:
+            return self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+
+        sections = {
+            "snapshot": mapping("snapshot", "funding_snapshot"),
+            "statistics": mapping("statistics", "stats", "funding_statistics"),
+            "regime": mapping("regime", "regime_state", "funding_regime", "funding_regime_state"),
+            "pressure": mapping("pressure", "pressure_state", "funding_pressure", "funding_pressure_state"),
+            "extreme": mapping("extreme", "extreme_event", "funding_extreme", "funding_extreme_event"),
+            "divergence": mapping("divergence", "divergence_event", "funding_divergence", "funding_divergence_event"),
+            "flip": mapping("flip", "flip_event", "funding_flip", "funding_flip_event"),
+            "signal": mapping("signal", "funding_signal", "setup", "strategy_signal"),
+        }
+
+        if sections["snapshot"] is None:
+            flat_snapshot = {
+                key: get(key)
+                for key in (
+                    "funding_rate",
+                    "current_rate",
+                    "next_funding_rate",
+                    "predicted_rate",
+                    "annualized_rate",
+                    "premium_index",
+                    "mark_price",
+                    "index_price",
+                    "next_funding_time",
+                    "exchange",
+                    "market_type",
+                    "symbol",
+                    "exchange_symbol",
+                    "timeframe",
+                    "timestamp",
+                )
+                if get(key) is not None
+            }
+            if flat_snapshot:
+                sections["snapshot"] = flat_snapshot
+
+        if sections["statistics"] is None:
+            flat_stats = {
+                key: get(key)
+                for key in (
+                    "mean_rate",
+                    "median_rate",
+                    "std_rate",
+                    "zscore",
+                    "z_score",
+                    "percentile",
+                    "min_rate",
+                    "max_rate",
+                    "samples",
+                )
+                if get(key) is not None
+            }
+            if flat_stats:
+                sections["statistics"] = flat_stats
+
+        for name, section in list(sections.items()):
+            if isinstance(section, dict) and section:
+                section.setdefault("confidence", get(f"{name}_confidence", "confidence", default=section.get("confidence")))
+                section.setdefault("score", get(f"{name}_score", "score", default=section.get("score")))
+                if name in {"extreme", "divergence", "flip", "signal"}:
+                    section.setdefault("detected", section.get("active", section.get("confirmed", True)))
+                    section.setdefault("type", section.get(f"{name}_type", section.get("event_type", section.get("bias"))))
+                domain_data[name] = section
+
+        for alias, canonical in {
+            "funding_snapshot": "snapshot",
+            "stats": "statistics",
+            "regime_state": "regime",
+            "pressure_state": "pressure",
+            "extreme_event": "extreme",
+            "divergence_event": "divergence",
+            "flip_event": "flip",
+            "funding_signal": "signal",
+        }.items():
+            if canonical in domain_data:
+                domain_data.setdefault(alias, domain_data[canonical])
+
+        for path, value in {
+            "funding.snapshot": domain_data.get("snapshot"),
+            "funding.statistics": domain_data.get("statistics"),
+            "funding.regime": domain_data.get("regime"),
+            "funding.pressure": domain_data.get("pressure"),
+            "funding.extreme": domain_data.get("extreme"),
+            "funding.divergence": domain_data.get("divergence"),
+            "funding.flip": domain_data.get("flip"),
+            "funding.signal": domain_data.get("signal"),
+        }.items():
+            if value is not None:
+                domain_data.setdefault(path, value)
+
+    def _ensure_spreads_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+        mapping = lambda *paths: self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data)
+
+        snapshot = mapping("snapshot", "spread_snapshot", "basis", "spread")
+        signal = mapping("signal", "spread_signal", "setup")
+        opportunity = mapping("opportunity", "arb_opportunity", "cross_exchange_opportunity")
+
+        flat = {
+            key: get(key)
+            for key in (
+                "spread_type",
+                "type",
+                "symbol",
+                "exchange_a",
+                "exchange_b",
+                "market_type_a",
+                "market_type_b",
+                "exchange_symbol_a",
+                "exchange_symbol_b",
+                "spread_bps",
+                "basis",
+                "funding_adjusted_spread",
+                "net_edge",
+                "net_edge_bps",
+                "zscore",
+                "z_score",
+                "regime",
+                "direction",
+                "signal_type",
+                "quote_validity",
+                "has_edge",
+                "confidence",
+                "opportunity_key",
+                "opportunity_status",
+                "persistence_ms",
+                "buy_exchange",
+                "sell_exchange",
+                "buy_market_type",
+                "sell_market_type",
+                "instrument_type",
+            )
+            if get(key) is not None
+        }
+
+        if snapshot is None and flat:
+            snapshot = dict(flat)
+        if signal is None and any(key in flat for key in ("signal_type", "direction", "has_edge", "confidence")):
+            signal = dict(flat)
+        if opportunity is None and any(key in flat for key in ("buy_exchange", "sell_exchange", "net_edge", "net_edge_bps", "has_edge")):
+            opportunity = dict(flat)
+            opportunity.setdefault("detected", bool(flat.get("has_edge", True)))
+
+        for name, section in (("snapshot", snapshot), ("signal", signal), ("opportunity", opportunity)):
+            if isinstance(section, dict) and section:
+                domain_data[name] = section
+
+        for key, value in flat.items():
+            if value is not None:
+                normalized_key = "zscore" if key == "z_score" else key
+                domain_data.setdefault(normalized_key, value)
+
+        for path, value in {
+            "spreads.snapshot": domain_data.get("snapshot"),
+            "spreads.signal": domain_data.get("signal"),
+            "spreads.opportunity": domain_data.get("opportunity"),
+        }.items():
+            if value is not None:
+                domain_data.setdefault(path, value)
+
+    def _ensure_whales_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+        mapping = lambda *paths: self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data)
+
+        pressure = mapping("pressure", "whale_pressure", "whale_pressure_signal")
+        activity = mapping("activity", "whale_activity", "whale_activity_signal")
+        large_trade = mapping("large_trade", "large_trade_signal", "whale_large_trade")
+        cluster = mapping("cluster", "whale_cluster", "whale_cluster_signal")
+        cluster_update = mapping("cluster_update", "whale_cluster_update")
+        cluster_exhaustion = mapping("cluster_exhaustion", "whale_cluster_exhaustion")
+        liquidation_context = mapping("liquidation_context", "whale_liquidation_context")
+
+        flat = {
+            key: get(key)
+            for key in (
+                "dominant_side",
+                "whale_side",
+                "side",
+                "liquidation_side",
+                "exhausted_side",
+                "cluster_side",
+                "imbalance_ratio",
+                "pressure_score",
+                "context_strength",
+                "cluster_score",
+                "continuation_probability",
+                "exhaustion_probability",
+                "total_notional",
+                "notional",
+                "liquidation_notional",
+                "trade_count",
+                "large_trade_notional",
+                "large_notional",
+                "large_trade_zscore",
+                "zscore",
+                "reference_price",
+                "price",
+                "confidence",
+                "timestamp",
+            )
+            if get(key) is not None
+        }
+        if "side" in flat and "dominant_side" not in flat:
+            flat["dominant_side"] = self._contract_side(flat.get("side"))
+        if "notional" in flat and "total_notional" not in flat:
+            flat["total_notional"] = flat["notional"]
+        if "large_notional" in flat and "large_trade_notional" not in flat:
+            flat["large_trade_notional"] = flat["large_notional"]
+        if "price" in flat and "reference_price" not in flat:
+            flat["reference_price"] = flat["price"]
+
+        if large_trade is None and any(key in flat for key in ("large_trade_notional", "large_trade_zscore", "total_notional")):
+            large_trade = dict(flat)
+        if activity is None and (large_trade or cluster or cluster_update or flat):
+            activity = dict(flat)
+            if large_trade:
+                activity.setdefault("large_trade", large_trade)
+        if pressure is None and any(key in flat for key in ("pressure_score", "imbalance_ratio", "dominant_side", "whale_side")):
+            pressure = dict(flat)
+        if liquidation_context is None and any(key in flat for key in ("liquidation_side", "liquidation_notional", "exhaustion_probability")):
+            liquidation_context = dict(flat)
+
+        for name, section in (
+            ("pressure", pressure),
+            ("activity", activity),
+            ("large_trade", large_trade),
+            ("cluster", cluster),
+            ("cluster_update", cluster_update),
+            ("cluster_exhaustion", cluster_exhaustion),
+            ("liquidation_context", liquidation_context),
+        ):
+            if self._contract_section_present(section):
+                domain_data[name] = dict(section) if isinstance(section, dict) else section
+
+        for key, value in flat.items():
+            if value is not None:
+                normalized_key = {
+                    "side": "dominant_side",
+                    "notional": "total_notional",
+                    "large_notional": "large_trade_notional",
+                    "zscore": "large_trade_zscore",
+                    "price": "reference_price",
+                }.get(key, key)
+                domain_data.setdefault(normalized_key, value)
+
+    def _ensure_spoofing_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+        mapping = lambda *paths: self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data)
+
+        signal = mapping("signal", "spoofing_signal", "setup")
+        features = mapping("features", "spoofing_features") or {}
+        detector_results = mapping("detector_results", "detectors", "results")
+
+        for key in (
+            "pull_ratio",
+            "fill_ratio",
+            "price_reaction_bps",
+            "signed_price_reaction_bps",
+            "lifetime_ms",
+            "wall_notional",
+            "pulled_notional",
+            "cancel_to_fill_ratio",
+            "distance_from_mid_bps",
+            "layer_count",
+            "layer_price_span_bps",
+            "pressure_flip_strength",
+        ):
+            value = get(key, f"features.{key}")
+            if value is not None:
+                features.setdefault(key, value)
+
+        signal_flat = {
+            key: get(key)
+            for key in (
+                "type",
+                "spoofing_type",
+                "pattern",
+                "side",
+                "severity",
+                "status",
+                "score",
+                "confidence",
+                "price_level",
+                "wall_id",
+                "event_time",
+            )
+            if get(key) is not None
+        }
+        if signal is None and signal_flat:
+            signal = dict(signal_flat)
+            signal.setdefault("detected", True)
+
+        if signal:
+            domain_data["signal"] = signal
+        if features:
+            domain_data["features"] = features
+        if detector_results:
+            domain_data["detector_results"] = detector_results
+
+    def _ensure_liquidations_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+        mapping = lambda *paths: self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data)
+        for name, aliases in {
+            "cascade": ("cascade", "cascade_result", "liquidation_cascade"),
+            "exhaustion": ("exhaustion", "exhaustion_result"),
+            "squeeze": ("squeeze", "squeeze_result"),
+            "cluster": ("cluster", "liquidation_cluster"),
+        }.items():
+            section = mapping(*aliases)
+            if section is None:
+                flat = {
+                    key: get(key)
+                    for key in (
+                        "confidence", "intensity_score", "direction", "severity",
+                        "continuation_bias", "exhaustion_bias", "total_notional_usd",
+                        "event_count", "confirmed", "score", "duration_seconds",
+                        "avg_notional_per_event", "side_imbalance_ratio",
+                        "event_imbalance_ratio", "acceleration_ratio",
+                    )
+                    if get(key) is not None
+                }
+                if name == "cascade" and any(k in flat for k in ("intensity_score", "direction", "severity")):
+                    section = flat
+                elif name == "exhaustion" and any(k in flat for k in ("exhaustion_bias", "confirmed")):
+                    section = flat
+                elif name == "squeeze" and any(k in flat for k in ("score", "direction", "confirmed")):
+                    section = flat
+                elif name == "cluster" and any(k in flat for k in ("duration_seconds", "side_imbalance_ratio", "event_count")):
+                    section = flat
+            if section:
+                domain_data[name] = section
+
+    def _ensure_liquidity_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+        mapping = lambda *paths: self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data)
+        snapshot = mapping("snapshot", "map", "liquidity_map", "map_snapshot")
+        active_levels = get("active_levels", "levels", "level")
+        stop_clusters = get("stop_clusters", "clusters", "stop_cluster")
+        if snapshot is None:
+            flat = {
+                key: get(key)
+                for key in (
+                    "current_price", "above_liquidity_score", "below_liquidity_score",
+                    "pressure_score", "bias", "nearest_above_level", "nearest_below_level",
+                    "strongest_cluster_above", "strongest_cluster_below",
+                    "equal_levels", "zones",
+                )
+                if get(key) is not None
+            }
+            if active_levels is not None:
+                flat.setdefault("active_levels", active_levels)
+            if stop_clusters is not None:
+                flat.setdefault("stop_clusters", stop_clusters)
+            if flat:
+                snapshot = flat
+        if snapshot:
+            domain_data["snapshot"] = snapshot
+            domain_data.setdefault("map", snapshot)
+        if active_levels is not None:
+            domain_data.setdefault("active_levels", active_levels)
+        if stop_clusters is not None:
+            domain_data.setdefault("stop_clusters", stop_clusters)
+
+    def _ensure_open_interest_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        get = lambda *paths, default=None: self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
+        for name, aliases in {
+            "features": ("features", "oi_features", "open_interest_features"),
+            "regime": ("regime", "regime_result", "oi_regime"),
+            "divergence": ("divergence", "divergence_result", "oi_divergence"),
+            "anomaly": ("anomaly", "anomaly_result", "oi_anomaly"),
+            "snapshot": ("snapshot", "oi_snapshot", "open_interest_snapshot"),
+        }.items():
+            section = self._contract_first_mapping(*aliases, payload=payload, domain_data=domain_data)
+            if section:
+                domain_data.setdefault(name, section)
+        if "anomaly" not in domain_data and get("anomaly_type", "type") is not None and "anomaly" in self._topic_from_payload(payload):
+            domain_data["anomaly"] = {
+                "detected": True,
+                "type": get("anomaly_type", "type"),
+                "anomaly_type": get("anomaly_type", "type"),
+                "confidence": get("anomaly_confidence", "confidence", default=0.0),
+                "score": get("anomaly_score", "score", default=0.0),
+            }
+        if "divergence" not in domain_data and get("divergence_type", "type") is not None and "divergence" in self._topic_from_payload(payload):
+            domain_data["divergence"] = {
+                "detected": True,
+                "type": get("divergence_type", "type"),
+                "divergence_type": get("divergence_type", "type"),
+                "confidence": get("divergence_confidence", "confidence", default=0.0),
+                "score": get("divergence_score", "score", default=0.0),
+            }
+
+    def _ensure_price_action_strategy_contract(
+            self,
+            *,
+            payload: dict[str, Any],
+            domain_data: dict[str, Any],
+    ) -> None:
+        section = self._direct_topic_section(FeatureSource.PRICE_ACTION, payload)
+        direct = self._direct_payload_value(payload)
+        direct_map = self._as_mapping_or_none(direct)
+        if section and direct_map and section not in domain_data:
+            domain_data[section] = direct_map
+        if "fair_value_gap" in domain_data:
+            domain_data.setdefault("fvg", domain_data["fair_value_gap"])
+
+    def _build_strategy_contract_feature_snapshots(
+            self,
+            *,
+            source: FeatureSource,
+            symbol: str,
+            domain_data: dict[str, Any],
+            timestamp: datetime,
+    ) -> list[FeatureSnapshot]:
+        """Create FeatureSnapshot entries from canonical domain sections."""
+        if not isinstance(domain_data, dict):
+            return []
+
+        contract_paths: dict[FeatureSource, tuple[tuple[str, str], ...]] = {
+            FeatureSource.ORDERFLOW: (
+                ("orderflow.cvd", "cvd"),
+                ("orderflow.cvd.value", "cvd.value"),
+                ("orderflow.cvd.delta_ratio", "cvd.delta_ratio"),
+                ("orderflow.cvd.cvd_change_pct", "cvd.cvd_change_pct"),
+                ("orderflow.cvd.cvd_slope", "cvd.cvd_slope"),
+                ("orderflow.cvd.price_change_pct", "cvd.price_change_pct"),
+                ("orderflow.volume_delta", "volume_delta"),
+                ("orderflow.volume_delta.volume_delta", "volume_delta.volume_delta"),
+                ("orderflow.volume_delta.delta_ratio", "volume_delta.delta_ratio"),
+                ("orderflow.aggressive_trades", "aggressive_trades"),
+                ("orderflow.aggressive_trades.buy_ratio", "aggressive_trades.buy_ratio"),
+                ("orderflow.aggressive_trades.sell_ratio", "aggressive_trades.sell_ratio"),
+                ("orderflow.aggressive_trades.net_volume_delta", "aggressive_trades.net_volume_delta"),
+                ("orderflow.aggressive_trades.net_notional_delta", "aggressive_trades.net_notional_delta"),
+                ("orderflow.orderbook_imbalance", "orderbook_imbalance"),
+                ("orderflow.orderbook_imbalance.ratio", "orderbook_imbalance.ratio"),
+                ("orderflow.orderbook_imbalance.diff", "orderbook_imbalance.diff"),
+                ("orderflow.trades_count", "trades_count"),
+                ("orderflow.total_volume", "total_volume"),
+                ("orderflow.total_notional", "total_notional"),
+                ("orderflow.last_price", "last_price"),
+                ("orderflow.price_change_pct", "price_change_pct"),
+            ),
+            FeatureSource.FUNDING: (
+                ("funding.snapshot", "snapshot"),
+                ("funding.statistics", "statistics"),
+                ("funding.regime", "regime"),
+                ("funding.regime.confidence", "regime.confidence"),
+                ("funding.pressure", "pressure"),
+                ("funding.pressure.score", "pressure.score"),
+                ("funding.pressure.level", "pressure.level"),
+                ("funding.pressure.direction", "pressure.direction"),
+                ("funding.extreme", "extreme"),
+                ("funding.extreme.type", "extreme.type"),
+                ("funding.extreme.severity", "extreme.severity"),
+                ("funding.extreme.mean_reversion_probability", "extreme.mean_reversion_probability"),
+                ("funding.extreme.squeeze_probability", "extreme.squeeze_probability"),
+                ("funding.divergence", "divergence"),
+                ("funding.divergence.type", "divergence.type"),
+                ("funding.divergence.confidence", "divergence.confidence"),
+                ("funding.divergence.score", "divergence.score"),
+                ("funding.flip", "flip"),
+                ("funding.flip.type", "flip.type"),
+                ("funding.flip.confidence", "flip.confidence"),
+                ("funding.signal", "signal"),
+                ("funding.signal.type", "signal.type"),
+                ("funding.signal.score", "signal.score"),
+                ("funding.signal.confidence", "signal.confidence"),
+                ("funding.signal.bias", "signal.bias"),
+            ),
+            FeatureSource.SPREADS: (
+                ("spreads.snapshot", "snapshot"),
+                ("spreads.signal", "signal"),
+                ("spreads.opportunity", "opportunity"),
+                ("spreads.spread_bps", "spread_bps"),
+                ("spreads.basis", "basis"),
+                ("spreads.funding_adjusted_spread", "funding_adjusted_spread"),
+                ("spreads.net_edge", "net_edge"),
+                ("spreads.net_edge_bps", "net_edge_bps"),
+                ("spreads.zscore", "zscore"),
+                ("spreads.regime", "regime"),
+                ("spreads.direction", "direction"),
+                ("spreads.has_edge", "has_edge"),
+                ("spreads.confidence", "confidence"),
+                ("spreads.buy_exchange", "buy_exchange"),
+                ("spreads.sell_exchange", "sell_exchange"),
+            ),
+            FeatureSource.WHALES: (
+                ("whales.pressure", "pressure"),
+                ("whales.activity", "activity"),
+                ("whales.large_trade", "large_trade"),
+                ("whales.cluster", "cluster"),
+                ("whales.cluster_update", "cluster_update"),
+                ("whales.cluster_exhaustion", "cluster_exhaustion"),
+                ("whales.liquidation_context", "liquidation_context"),
+                ("whales.dominant_side", "dominant_side"),
+                ("whales.whale_side", "whale_side"),
+                ("whales.liquidation_side", "liquidation_side"),
+                ("whales.pressure_score", "pressure_score"),
+                ("whales.context_strength", "context_strength"),
+                ("whales.cluster_score", "cluster_score"),
+                ("whales.continuation_probability", "continuation_probability"),
+                ("whales.exhaustion_probability", "exhaustion_probability"),
+                ("whales.total_notional", "total_notional"),
+                ("whales.trade_count", "trade_count"),
+                ("whales.large_trade_notional", "large_trade_notional"),
+                ("whales.large_trade_zscore", "large_trade_zscore"),
+                ("whales.reference_price", "reference_price"),
+                ("whales.confidence", "confidence"),
+            ),
+            FeatureSource.SPOOFING: (
+                ("spoofing.signal", "signal"),
+                ("spoofing.features", "features"),
+                ("spoofing.detector_results", "detector_results"),
+                ("spoofing.type", "signal.type"),
+                ("spoofing.pattern", "signal.pattern"),
+                ("spoofing.side", "signal.side"),
+                ("spoofing.severity", "signal.severity"),
+                ("spoofing.score", "signal.score"),
+                ("spoofing.confidence", "signal.confidence"),
+                ("spoofing.features.pull_ratio", "features.pull_ratio"),
+                ("spoofing.features.fill_ratio", "features.fill_ratio"),
+                ("spoofing.features.cancel_to_fill_ratio", "features.cancel_to_fill_ratio"),
+                ("spoofing.features.distance_from_mid_bps", "features.distance_from_mid_bps"),
+                ("spoofing.features.layer_count", "features.layer_count"),
+            ),
+            FeatureSource.LIQUIDATIONS: (
+                ("liquidations.cascade", "cascade"),
+                ("liquidations.cascade.confidence", "cascade.confidence"),
+                ("liquidations.cascade.intensity_score", "cascade.intensity_score"),
+                ("liquidations.cascade.direction", "cascade.direction"),
+                ("liquidations.cascade.severity", "cascade.severity"),
+                ("liquidations.cascade.continuation_bias", "cascade.continuation_bias"),
+                ("liquidations.cascade.exhaustion_bias", "cascade.exhaustion_bias"),
+                ("liquidations.exhaustion", "exhaustion"),
+                ("liquidations.exhaustion.confidence", "exhaustion.confidence"),
+                ("liquidations.exhaustion.exhaustion_bias", "exhaustion.exhaustion_bias"),
+                ("liquidations.exhaustion.confirmed", "exhaustion.confirmed"),
+                ("liquidations.squeeze", "squeeze"),
+                ("liquidations.squeeze.confirmed", "squeeze.confirmed"),
+                ("liquidations.squeeze.score", "squeeze.score"),
+                ("liquidations.squeeze.direction", "squeeze.direction"),
+                ("liquidations.cluster", "cluster"),
+            ),
+            FeatureSource.LIQUIDITY: (
+                ("liquidity.snapshot", "snapshot"),
+                ("liquidity.map.snapshot", "snapshot"),
+                ("liquidity.current_price", "snapshot.current_price"),
+                ("liquidity.above_liquidity_score", "snapshot.above_liquidity_score"),
+                ("liquidity.below_liquidity_score", "snapshot.below_liquidity_score"),
+                ("liquidity.pressure_score", "snapshot.pressure_score"),
+                ("liquidity.bias", "snapshot.bias"),
+                ("liquidity.equal_levels", "snapshot.equal_levels"),
+                ("liquidity.active_levels", "active_levels"),
+                ("liquidity.stop_clusters", "stop_clusters"),
+                ("liquidity.zones", "snapshot.zones"),
+            ),
+            FeatureSource.OPEN_INTEREST: (
+                ("open_interest.analysis", "analysis"),
+                ("open_interest.snapshot", "snapshot"),
+                ("open_interest.context", "market_context"),
+                ("open_interest.features", "features"),
+                ("open_interest.regime", "regime"),
+                ("open_interest.regime.type", "regime.type"),
+                ("open_interest.regime.confidence", "regime.confidence"),
+                ("open_interest.divergence", "divergence"),
+                ("open_interest.divergence.detected", "divergence.detected"),
+                ("open_interest.divergence.type", "divergence.type"),
+                ("open_interest.divergence.confidence", "divergence.confidence"),
+                ("open_interest.anomaly", "anomaly"),
+                ("open_interest.anomaly.detected", "anomaly.detected"),
+                ("open_interest.anomaly.type", "anomaly.type"),
+                ("open_interest.anomaly.confidence", "anomaly.confidence"),
+                ("open_interest.features.oi_delta_pct", "features.oi_delta_pct"),
+                ("open_interest.features.price_delta_pct", "features.price_delta_pct"),
+                ("open_interest.features.oi_pressure_score", "features.oi_pressure_score"),
+            ),
+            FeatureSource.PRICE_ACTION: (
+                ("price_action.market_structure", "market_structure"),
+                ("price_action.support_resistance", "support_resistance"),
+                ("price_action.fair_value_gap", "fair_value_gap"),
+                ("price_action.fvg", "fvg"),
+                ("price_action.trend", "trend"),
+                ("price_action.current_price", "current_price"),
+                ("price_action.last_price", "last_price"),
+            ),
+        }
+
+        result: list[FeatureSnapshot] = []
+        for name, path in contract_paths.get(source, ()):  # type: ignore[arg-type]
+            value = self._contract_get_path(domain_data, path, None)
+            if value is None and name in domain_data:
+                value = domain_data.get(name)
+            if value is None:
+                continue
+            confidence = self._contract_get_path(domain_data, "confidence", None)
+            if confidence is None:
+                root = path.split(".")[0]
+                confidence = self._contract_get_path(domain_data, f"{root}.confidence", 0.0)
+            try:
+                result.append(
+                    self._snapshot_from_raw_value(
+                        source=source,
+                        symbol=symbol,
+                        name=name,
+                        value=value,
+                        timestamp=timestamp,
+                        confidence=confidence if confidence is not None else 0.0,
+                        metadata={"origin": "strategy_contract_adapter", "path": path},
+                    )
+                )
+            except Exception as exc:
+                self.log_debug(
+                    "Strategy contract feature skipped",
+                    source=source.value,
+                    symbol=symbol,
+                    feature=name,
+                    error=str(exc),
+                )
+        return result
+
     def _direct_topic_section(
             self,
             source: FeatureSource,
@@ -5723,6 +6733,11 @@ class SignalNormalizer(BaseStrategyComponent):
             payload=payload,
             domain_data=domain_data,
         )
+        self._ensure_strategy_domain_contracts(
+            source=source,
+            payload=payload,
+            domain_data=domain_data,
+        )
         return domain_data
 
     def _ensure_common_domain_contract(
@@ -6458,6 +7473,16 @@ class SignalNormalizer(BaseStrategyComponent):
                 source=source,
                 symbol=symbol,
                 payload=augmented_contract_payload,
+                timestamp=ts,
+        ):
+            if snapshot.name not in known_feature_names:
+                features.append(snapshot)
+                known_feature_names.add(snapshot.name)
+
+        for snapshot in self._build_strategy_contract_feature_snapshots(
+                source=source,
+                symbol=symbol,
+                domain_data=domain_data,
                 timestamp=ts,
         ):
             if snapshot.name not in known_feature_names:
@@ -11731,6 +12756,7 @@ class SignalRouter(BaseStrategyComponent):
         categories = self._resolve_categories(
             event_name=event_name,
             source=source,
+            context=context,
         )
 
         selected: list[BaseStrategy] = []
@@ -11828,31 +12854,152 @@ class SignalRouter(BaseStrategyComponent):
             *,
             event_name: str,
             source: FeatureSource | None,
+            context: StrategyContext,
     ) -> list[StrategyCategory]:
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering SignalRouter._resolve_categories")
         categories = self.routing_config.categories_for_event(event_name)
 
-        if categories:
-            return categories
+        if not categories and source is not None:
+            mapped = self._map_source_to_category(source)
+            if mapped is not None:
+                categories = [mapped]
 
-        if source is None:
+        if not categories:
             return []
-
-        mapped = self._map_source_to_category(source)
-        if mapped is None:
-            return []
-
-        categories = [mapped]
 
         if (
                 self.routing_config.route_hybrid_on_domain_signal
                 and StrategyCategory.HYBRID not in categories
+                and self._should_route_hybrid(context=context, trigger_source=source)
         ):
             categories.append(StrategyCategory.HYBRID)
 
         return categories
+
+    def _should_route_hybrid(
+            self,
+            *,
+            context: StrategyContext,
+            trigger_source: FeatureSource | None,
+    ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter._should_route_hybrid")
+        if trigger_source not in self._hybrid_route_domain_sources():
+            return False
+
+        fresh_sources = self._fresh_hybrid_domain_sources(context)
+        return len(fresh_sources) >= self.routing_config.min_domains_for_hybrid_route
+
+    def _fresh_hybrid_domain_sources(self, context: StrategyContext) -> list[FeatureSource]:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter._fresh_hybrid_domain_sources")
+        fresh: list[FeatureSource] = []
+
+        for source in self._hybrid_route_domain_sources():
+            domain = context.domain_dict(source)
+            if not domain:
+                continue
+
+            if not self.routing_config.require_fresh_domains_for_hybrid_route:
+                fresh.append(source)
+                continue
+
+            if not self._domain_is_stale_for_hybrid_route(context=context, domain=domain):
+                fresh.append(source)
+
+        return fresh
+
+    def _domain_is_stale_for_hybrid_route(
+            self,
+            *,
+            context: StrategyContext,
+            domain: dict[str, Any],
+    ) -> bool:
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        if _strategy_logger.isEnabledFor(logging.DEBUG):
+            _strategy_logger.debug("Entering SignalRouter._domain_is_stale_for_hybrid_route")
+        timestamp = self._extract_domain_timestamp(domain)
+        parsed = self._coerce_domain_timestamp(timestamp)
+        if parsed is None:
+            return True
+
+        age_seconds = max(0.0, (context.timestamp - parsed).total_seconds())
+        return age_seconds > float(self.routing_config.hybrid_route_stale_seconds)
+
+    @staticmethod
+    def _coerce_domain_timestamp(value: Any) -> datetime | None:
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return ensure_aware_utc(value)
+
+        if isinstance(value, (int, float)):
+            raw = float(value)
+            # Support both seconds and milliseconds epoch values.
+            if raw > 10_000_000_000:
+                raw = raw / 1000.0
+            try:
+                return datetime.fromtimestamp(raw, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+
+            if text.isdigit():
+                return SignalRouter._coerce_domain_timestamp(float(text))
+
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return ensure_aware_utc(parsed)
+
+        return None
+
+    @classmethod
+    def _extract_domain_timestamp(cls, domain: dict[str, Any]) -> Any:
+        for key in (
+                "timestamp",
+                "created_at",
+                "updated_at",
+                "event_time",
+                "event_timestamp",
+                "ts",
+        ):
+            value = domain.get(key)
+            if value is not None:
+                return value
+
+        for nested_key in ("contract", "scope", "summary", "raw"):
+            nested = domain.get(nested_key)
+            if isinstance(nested, dict):
+                value = cls._extract_domain_timestamp(nested)
+                if value is not None:
+                    return value
+
+        return None
+
+    @staticmethod
+    def _hybrid_route_domain_sources() -> tuple[FeatureSource, ...]:
+        return (
+            FeatureSource.ORDERFLOW,
+            FeatureSource.LIQUIDITY,
+            FeatureSource.PRICE_ACTION,
+            FeatureSource.LIQUIDATIONS,
+            FeatureSource.WHALES,
+            FeatureSource.SPOOFING,
+            FeatureSource.SPREADS,
+            FeatureSource.FUNDING,
+            FeatureSource.OPEN_INTEREST,
+        )
 
     @staticmethod
     def _map_source_to_category(source: FeatureSource) -> StrategyCategory | None:

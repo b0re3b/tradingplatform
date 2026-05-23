@@ -1143,11 +1143,21 @@ def _routing_config(
     stale_feature_threshold_seconds: int,
     reevaluate_on_any_update: bool = False,
     route_hybrid_on_domain_signal: bool = True,
+    min_domains_for_hybrid_route: int = 3,
+    require_fresh_domains_for_hybrid_route: bool = True,
+    hybrid_route_stale_seconds: int | None = None,
     allow_partial_context: bool = True,
 ) -> RoutingConfig:
     routing = RoutingConfig(
         reevaluate_on_any_update=reevaluate_on_any_update,
         route_hybrid_on_domain_signal=route_hybrid_on_domain_signal,
+        min_domains_for_hybrid_route=min_domains_for_hybrid_route,
+        require_fresh_domains_for_hybrid_route=require_fresh_domains_for_hybrid_route,
+        hybrid_route_stale_seconds=(
+            hybrid_route_stale_seconds
+            if hybrid_route_stale_seconds is not None
+            else stale_feature_threshold_seconds
+        ),
         allow_partial_context=allow_partial_context,
         stale_feature_threshold_seconds=stale_feature_threshold_seconds,
         event_to_categories={
@@ -1160,8 +1170,10 @@ def _routing_config(
             "analytics.spread": [StrategyCategory.SPREADS],
             "analytics.whales": [StrategyCategory.WHALES],
             "analytics.whale": [StrategyCategory.WHALES],
-            "analytics.hybrid": [StrategyCategory.HYBRID],
-            "analytics.confluence": [StrategyCategory.HYBRID],
+            "analytics.liquidity": [StrategyCategory.LIQUIDITY],
+            "analytics.liquidations": [StrategyCategory.LIQUIDATIONS],
+            "analytics.liquidation": [StrategyCategory.LIQUIDATIONS],
+            "analytics.funding": [StrategyCategory.FUNDING],
         },
     )
     routing.validate()

@@ -62,9 +62,20 @@ class ParquetStorageConfig:
         if root_dir is None:
             root_dir = getattr(storage, "data_dir", None)
         if root_dir is None:
-            root_dir = cls.root_dir
+            app = getattr(config, "app", None)
+            data_dir = getattr(app, "data_dir", None)
+            root_dir = str(Path(data_dir) / "parquet") if data_dir is not None else cls.root_dir
 
-        return cls(root_dir=str(root_dir))
+        enabled = bool(getattr(storage, "parquet_enabled", cls.enabled)) if storage is not None else cls.enabled
+        flush_interval = float(getattr(storage, "flush_interval_seconds", cls.flush_interval_seconds)) if storage is not None else cls.flush_interval_seconds
+        batch_size = int(getattr(storage, "batch_size", cls.max_records_per_dataset)) if storage is not None else cls.max_records_per_dataset
+
+        return cls(
+            root_dir=str(root_dir),
+            enabled=enabled,
+            flush_interval_seconds=flush_interval,
+            max_records_per_dataset=max(1, batch_size),
+        )
 
 
 @dataclass(slots=True)

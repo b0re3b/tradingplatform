@@ -114,6 +114,22 @@ class RuntimeSettings:
     enable_execution: bool = True
     enable_telegram: bool = True
     enable_news: bool = True
+
+    # Startup warmup gate. Trading components are not started until historical
+    # candle/funding data has been fetched and propagated through caches + analytics.
+    startup_warmup_enabled: bool = True
+    startup_warmup_required: bool = True
+    startup_warmup_timeframes: list[str] = field(default_factory=lambda: ["1m", "15m"])
+    startup_warmup_kline_limit: int = 500
+    startup_warmup_funding_limit: int = 24
+    startup_warmup_concurrency: int = 8
+    startup_warmup_batch_size: int = 50
+    startup_warmup_eventbus_idle_timeout: float = 30.0
+    startup_warmup_settle_seconds: float = 0.25
+    startup_warmup_persist_enabled: bool = True
+    startup_warmup_persist_required: bool = True
+    startup_warmup_flush_storage_before_trading: bool = True
+
     ws_shard_size_binance: int = 80
     ws_shard_size_bybit: int = 50
     ws_shard_size_okx: int = 80
@@ -138,6 +154,18 @@ class RuntimeSettings:
             enable_execution=env_bool("EXECUTION_ENABLED", True),
             enable_telegram=env_bool("TELEGRAM_BOT_ENABLED", True),
             enable_news=env_bool("NEWS_AI_ENABLED", True),
+            startup_warmup_enabled=env_bool("STARTUP_WARMUP_ENABLED", True),
+            startup_warmup_required=env_bool("STARTUP_WARMUP_REQUIRED", True),
+            startup_warmup_timeframes=env_list("STARTUP_WARMUP_TIMEFRAMES", env_list("MARKET_DATA_TIMEFRAMES", ["1m", "15m"])),
+            startup_warmup_kline_limit=env_int("STARTUP_WARMUP_KLINE_LIMIT", 500),
+            startup_warmup_funding_limit=env_int("STARTUP_WARMUP_FUNDING_LIMIT", 24),
+            startup_warmup_concurrency=max(1, env_int("STARTUP_WARMUP_CONCURRENCY", 8)),
+            startup_warmup_batch_size=max(1, env_int("STARTUP_WARMUP_BATCH_SIZE", 50)),
+            startup_warmup_eventbus_idle_timeout=env_float("STARTUP_WARMUP_EVENTBUS_IDLE_TIMEOUT", 30.0),
+            startup_warmup_settle_seconds=env_float("STARTUP_WARMUP_SETTLE_SECONDS", 0.25),
+            startup_warmup_persist_enabled=env_bool("STARTUP_WARMUP_PERSIST_ENABLED", True),
+            startup_warmup_persist_required=env_bool("STARTUP_WARMUP_PERSIST_REQUIRED", True),
+            startup_warmup_flush_storage_before_trading=env_bool("STARTUP_WARMUP_FLUSH_STORAGE_BEFORE_TRADING", True),
             ws_shard_size_binance=env_int("BINANCE_WS_SHARD_SIZE", 80),
             ws_shard_size_bybit=env_int("BYBIT_WS_SHARD_SIZE", 50),
             ws_shard_size_okx=env_int("OKX_WS_SHARD_SIZE", 80),

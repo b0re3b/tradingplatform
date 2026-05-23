@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ from app.factories import (
     build_execution_components,
     build_market_stream,
     build_news_service,
+    build_parquet_storage,
     build_rest_clients,
     build_risk_manager,
     build_strategy_engine,
@@ -95,6 +98,20 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "TELEGRAM_CHAT_ID",
         "TELEGRAM_DEFAULT_CHAT_ID",
         "NEWS_AI_ENABLED",
+        "STARTUP_WARMUP_ENABLED",
+        "STARTUP_WARMUP_REQUIRED",
+        "STARTUP_WARMUP_TIMEFRAMES",
+        "STARTUP_WARMUP_KLINE_LIMIT",
+        "STARTUP_WARMUP_FUNDING_LIMIT",
+        "STARTUP_WARMUP_CONCURRENCY",
+        "STARTUP_WARMUP_BATCH_SIZE",
+        "STARTUP_WARMUP_PERSIST_ENABLED",
+        "STARTUP_WARMUP_PERSIST_REQUIRED",
+        "STARTUP_WARMUP_FLUSH_STORAGE_BEFORE_TRADING",
+        "STORAGE_PARQUET_ENABLED",
+        "STORAGE_PARQUET_DIR",
+        "STORAGE_FLUSH_INTERVAL_SECONDS",
+        "STORAGE_BATCH_SIZE",
     ]
 
     logger.info(
@@ -172,9 +189,13 @@ class TradingSystemRuntime:
         self.ws_clients: dict[str, Any] = {}
         self.caches: dict[str, Any] = {}
         self.components: list[Any] = []
+        self.parquet_storage: Any | None = None
         self.telegram: Any | None = None
         self.news_service: Any | None = None
+        self._market_stream: Any | None = None
         self._derivative_snapshot_poll_job_id: str | None = None
+        self._derivative_snapshot_poll_task: asyncio.Task[None] | None = None
+        self._derivative_snapshot_poll_stop: asyncio.Event | None = None
         self._derivative_snapshot_disabled_symbols: set[str] = set()
         self._started = False
 
@@ -210,6 +231,24 @@ class TradingSystemRuntime:
                 settings=self.settings,
             )
             self.caches = build_data_caches(self.config, self.event_bus, self.scheduler)
+
+            if self.settings.startup_warmup_persist_enabled:
+                self.parquet_storage = build_parquet_storage(
+                    self.config,
+                    self.event_bus,
+                    self.scheduler,
+                )
+                # Append storage before market_stream so shutdown happens in reverse:
+                # analytics/execution -> market_stream -> parquet final flush.
+                self.components.append(self.parquet_storage)
+                await register_component(self.parquet_storage)
+                await start_component(self.parquet_storage)
+                self._validate_startup_storage_ready()
+            elif self.settings.startup_warmup_persist_required and self._startup_warmup_enabled():
+                raise RuntimeError(
+                    "STARTUP_WARMUP_PERSIST_REQUIRED=true but STARTUP_WARMUP_PERSIST_ENABLED=false"
+                )
+
             market_stream = build_market_stream(
                 config=self.config,
                 event_bus=self.event_bus,
@@ -217,12 +256,15 @@ class TradingSystemRuntime:
                 exchange_clients=self.ws_clients,
                 caches=self.caches,
             )
-            # MarketStream.start() guarantees its own registration.
-            # Calling register_component() here and then start_component() causes
-            # cache subscriptions to be registered twice unless every child cache is
-            # perfectly idempotent.
+            self._market_stream = market_stream
             self.components.append(market_stream)
-            await start_component(market_stream)
+
+            # Register caches now, but intentionally do not start WS clients yet.
+            # Historical REST warmup must populate caches/analytics before live
+            # market-data events and before strategy/risk/execution are started.
+            # ParquetStorage is already registered at this point, so every closed
+            # warmup candle emitted by CandlesCache is persisted.
+            await register_component(market_stream)
 
         if self.settings.enable_analytics:
             analytics_components = build_analytics_components(
@@ -244,11 +286,23 @@ class TradingSystemRuntime:
                 self.components.append(component)
                 await _start_analytics_component(component)
 
-            # Orderflow is WebSocket-driven, but Binance USD-M open interest and
-            # funding are REST snapshot endpoints. Start the poller only after
-            # caches and analytics have subscribed to market.*.snapshot events so
-            # the first run_immediately tick is not lost.
+            await self._run_startup_warmup(universe)
+
+            # Orderflow/liquidations are live WebSocket-driven. Start WS only after
+            # warmup has completed, so live analytics cannot race ahead of
+            # historical context.
+            if self._market_stream is not None:
+                await start_component(self._market_stream)
+                self._verify_liquidation_ws_capability()
+
+            # Binance USD-M open interest/funding are REST snapshot endpoints.
+            # Start live fixed-rate polling after warmup and after all caches +
+            # analytics subscriptions are active.
             self._start_derivative_snapshot_polling(universe)
+        elif self._market_stream is not None:
+            # Analytics disabled: market stream can start immediately after caches
+            # registration because there is no strategy warmup dependency.
+            await start_component(self._market_stream)
 
         if self.settings.enable_strategy:
             strategy_engine = build_strategy_engine(
@@ -305,6 +359,352 @@ class TradingSystemRuntime:
             source="app.main",
         )
         self._started = True
+
+    def _startup_warmup_enabled(self) -> bool:
+        return (
+            bool(self.settings.startup_warmup_enabled)
+            and self.settings.enable_market_data
+            and self.settings.enable_analytics
+            and "binance" in self.settings.market_data_exchanges
+        )
+
+    def _startup_warmup_timeframes(self) -> list[str]:
+        configured = [str(tf).strip() for tf in self.settings.startup_warmup_timeframes if str(tf).strip()]
+        if not configured:
+            configured = [str(tf).strip() for tf in self.settings.timeframes if str(tf).strip()]
+        if not configured:
+            configured = ["1m", "15m"]
+
+        # Preserve order and remove duplicates.
+        seen: set[str] = set()
+        result: list[str] = []
+        for timeframe in configured:
+            if timeframe in seen:
+                continue
+            seen.add(timeframe)
+            result.append(timeframe)
+        return result
+
+    def _validate_startup_storage_ready(self) -> None:
+        if not self.settings.startup_warmup_persist_enabled:
+            return
+
+        if self.parquet_storage is None:
+            if self.settings.startup_warmup_persist_required and self._startup_warmup_enabled():
+                raise RuntimeError("Startup warmup persistence is required but ParquetStorage was not created")
+            return
+
+        stats_method = getattr(self.parquet_storage, "stats", None)
+        stats = stats_method() if callable(stats_method) else {}
+        enabled = bool(stats.get("enabled", True))
+        started = bool(stats.get("started", False))
+        registered = bool(stats.get("registered", False))
+
+        if self.settings.startup_warmup_persist_required and self._startup_warmup_enabled():
+            if not enabled:
+                raise RuntimeError("Startup warmup persistence is required but ParquetStorage is disabled")
+            if not registered or not started:
+                raise RuntimeError(
+                    f"Startup warmup persistence is required but ParquetStorage is not ready: {stats}"
+                )
+
+        logger.info(
+            "Startup warmup persistence ready | enabled=%s registered=%s started=%s root_dir=%s",
+            enabled,
+            registered,
+            started,
+            stats.get("root_dir"),
+        )
+
+    async def _flush_startup_warmup_storage(self) -> None:
+        if not (
+            self._startup_warmup_enabled()
+            and self.settings.startup_warmup_persist_enabled
+            and self.settings.startup_warmup_flush_storage_before_trading
+        ):
+            return
+
+        if self.parquet_storage is None:
+            if self.settings.startup_warmup_persist_required:
+                raise RuntimeError("Startup warmup persistence is required but ParquetStorage is missing")
+            logger.warning("Startup warmup Parquet flush skipped: ParquetStorage is missing")
+            return
+
+        flush = getattr(self.parquet_storage, "flush", None)
+        if not callable(flush):
+            if self.settings.startup_warmup_persist_required:
+                raise RuntimeError("ParquetStorage has no flush() method")
+            logger.warning("Startup warmup Parquet flush skipped: flush() method is missing")
+            return
+
+        result = flush()
+        if inspect.isawaitable(result):
+            result = await result
+
+        stats_method = getattr(self.parquet_storage, "stats", None)
+        stats = stats_method() if callable(stats_method) else {}
+
+        logger.info(
+            "Startup warmup Parquet flush completed | result=%s stats=%s",
+            result,
+            stats,
+        )
+
+        if not self.settings.startup_warmup_persist_required:
+            return
+
+        records_written = int(stats.get("records_written") or 0)
+        files_written = int(stats.get("files_written") or 0)
+        buffered_total = int(stats.get("buffered_total") or 0)
+        if records_written <= 0 or files_written <= 0:
+            raise RuntimeError(
+                "Startup warmup persistence failed: no Parquet records/files were written "
+                f"before trading startup | result={result} stats={stats}"
+            )
+        if buffered_total > 0:
+            raise RuntimeError(
+                "Startup warmup persistence failed: Parquet buffer is not empty after forced flush "
+                f"| result={result} stats={stats}"
+            )
+
+    async def _wait_event_bus_idle(self, *, timeout: float | None = None) -> None:
+        """
+        Best-effort wait until REST warmup events have propagated through caches
+        and analytics subscriptions.
+
+        EventBus intentionally does not expose a public drain API while running.
+        Using the internal queue size here is restricted to application bootstrap;
+        it prevents strategy/risk/execution from starting while warmup events are
+        still waiting in the queue.
+        """
+        queue = getattr(self.event_bus, "_queue", None)
+        if queue is None or not hasattr(queue, "qsize"):
+            await asyncio.sleep(max(0.0, self.settings.startup_warmup_settle_seconds))
+            return
+
+        deadline = asyncio.get_running_loop().time() + (
+            self.settings.startup_warmup_eventbus_idle_timeout if timeout is None else timeout
+        )
+        stable_empty_ticks = 0
+
+        while True:
+            try:
+                qsize = int(queue.qsize())
+            except Exception:
+                qsize = 0
+
+            if qsize <= 0:
+                stable_empty_ticks += 1
+                if stable_empty_ticks >= 2:
+                    break
+            else:
+                stable_empty_ticks = 0
+
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning(
+                    "Startup warmup EventBus idle wait timed out | remaining_queue=%s",
+                    qsize,
+                )
+                break
+
+            await asyncio.sleep(0.05)
+
+        settle = max(0.0, self.settings.startup_warmup_settle_seconds)
+        if settle:
+            await asyncio.sleep(settle)
+
+    async def _run_startup_warmup(self, universe: Any) -> None:
+        """
+        Load the minimum historical context required by analytics before the
+        trading pipeline starts.
+
+        Startup order is intentional:
+        - EventBus/Scheduler/REST are running.
+        - Caches are registered.
+        - Analytics are registered/started.
+        - Strategy/risk/execution/Telegram/news are NOT started yet.
+
+        This lets price_action/liquidity/funding build initial state without
+        producing live strategy/risk/execution side effects.
+        """
+        if not self._startup_warmup_enabled():
+            logger.info(
+                "Startup warmup skipped | enabled=%s market_data=%s analytics=%s exchanges=%s",
+                self.settings.startup_warmup_enabled,
+                self.settings.enable_market_data,
+                self.settings.enable_analytics,
+                self.settings.market_data_exchanges,
+            )
+            return
+
+        binance = self.rest_clients.get("binance")
+        if binance is None:
+            message = "Startup warmup cannot run: Binance REST client is missing"
+            if self.settings.startup_warmup_required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return
+
+        symbols = self._derivative_snapshot_symbols(universe)
+        if not symbols:
+            message = "Startup warmup cannot run: Binance universe is empty"
+            if self.settings.startup_warmup_required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return
+
+        timeframes = self._startup_warmup_timeframes()
+        kline_limit = max(1, int(self.settings.startup_warmup_kline_limit))
+        funding_limit = max(1, int(self.settings.startup_warmup_funding_limit))
+        concurrency = max(1, int(self.settings.startup_warmup_concurrency))
+        batch_size = max(1, int(self.settings.startup_warmup_batch_size))
+
+        logger.info(
+            "Startup warmup started | exchange=binance symbols=%s timeframes=%s kline_limit=%s funding_limit=%s concurrency=%s batch_size=%s",
+            len(symbols),
+            timeframes,
+            kline_limit,
+            funding_limit,
+            concurrency,
+            batch_size,
+        )
+
+        kline_success = 0
+        kline_failed: list[str] = []
+        funding_success = 0
+        funding_failed: list[str] = []
+        sem = asyncio.Semaphore(concurrency)
+
+        async def warmup_klines(symbol: str, timeframe: str) -> tuple[str, str, int, str | None]:
+            async with sem:
+                try:
+                    candles = await binance.get_klines(
+                        symbol=symbol,
+                        interval=timeframe,
+                        limit=kline_limit,
+                    )
+                    return symbol, timeframe, len(candles or []), None
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                    logger.exception(
+                        "Startup candle warmup failed | exchange=binance symbol=%s timeframe=%s",
+                        symbol,
+                        timeframe,
+                    )
+                    return symbol, timeframe, 0, str(exc)
+
+        async def warmup_funding(symbol: str) -> tuple[str, int, str | None]:
+            async with sem:
+                try:
+                    items = await binance.get_funding_rate(
+                        symbol=symbol,
+                        limit=funding_limit,
+                    )
+                    return symbol, len(items or []), None
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                    logger.exception(
+                        "Startup funding warmup failed | exchange=binance symbol=%s",
+                        symbol,
+                    )
+                    return symbol, 0, str(exc)
+
+        # Candle warmup is shared by price_action and liquidity. REST emits
+        # market.candles.snapshot; CandlesCache turns it into market.candles.updated;
+        # price_action/liquidity analytics consume those updates before strategy starts.
+        kline_jobs = [(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
+        for start in range(0, len(kline_jobs), batch_size):
+            batch = kline_jobs[start : start + batch_size]
+            results = await asyncio.gather(
+                *(warmup_klines(symbol, timeframe) for symbol, timeframe in batch),
+                return_exceptions=False,
+            )
+            for symbol, timeframe, count, error in results:
+                if count > 0:
+                    kline_success += 1
+                else:
+                    kline_failed.append(f"{symbol}:{timeframe}:{error or 'empty'}")
+            await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
+
+        # Funding warmup gives FundingAnalyzer enough samples for statistics/regime.
+        for start in range(0, len(symbols), batch_size):
+            batch = symbols[start : start + batch_size]
+            results = await asyncio.gather(
+                *(warmup_funding(symbol) for symbol in batch),
+                return_exceptions=False,
+            )
+            for symbol, count, error in results:
+                if count > 0:
+                    funding_success += 1
+                else:
+                    funding_failed.append(f"{symbol}:{error or 'empty'}")
+            await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
+
+        await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
+
+        if self.settings.startup_warmup_required:
+            if kline_jobs and kline_success <= 0:
+                raise RuntimeError(
+                    "Startup warmup failed: no historical candles were loaded for price_action/liquidity"
+                )
+            if symbols and funding_success <= 0:
+                raise RuntimeError(
+                    "Startup warmup failed: no historical funding records were loaded"
+                )
+
+        logger.info(
+            "Startup warmup completed | kline_success=%s kline_failed=%s funding_success=%s funding_failed=%s disabled_symbols=%s",
+            kline_success,
+            len(kline_failed),
+            funding_success,
+            len(funding_failed),
+            len(self._derivative_snapshot_disabled_symbols),
+        )
+
+        if kline_failed:
+            logger.warning(
+                "Startup candle warmup had partial failures | failed_count=%s examples=%s",
+                len(kline_failed),
+                kline_failed[:20],
+            )
+        if funding_failed:
+            logger.warning(
+                "Startup funding warmup had partial failures | failed_count=%s examples=%s",
+                len(funding_failed),
+                funding_failed[:20],
+            )
+
+    def _verify_liquidation_ws_capability(self) -> None:
+        if not self.settings.enable_market_data or not self.settings.enable_analytics:
+            return
+
+        configured: list[tuple[str, list[str]]] = []
+        missing: list[str] = []
+
+        for name, client in self.ws_clients.items():
+            ws_config = getattr(client, "_ws_config", None) or getattr(client, "ws_config", None) or getattr(client, "config", None)
+            streams = list(getattr(ws_config, "streams", []) or [])
+            configured.append((name, [str(stream) for stream in streams]))
+
+            lowered = {str(stream).lower() for stream in streams}
+            if name.startswith("binance") and "forceorder" not in lowered:
+                missing.append(name)
+            if name.startswith("bybit") and "liquidation" not in lowered:
+                missing.append(name)
+
+        logger.info(
+            "Liquidation WS capability checked | clients=%s missing_liquidation_stream=%s",
+            configured,
+            missing,
+        )
+
+        if missing:
+            logger.warning(
+                "Some WS clients are missing liquidation streams; liquidation analytics will be silent for those shards | clients=%s",
+                missing,
+            )
 
     def _derivative_snapshot_poll_interval_seconds(self) -> float:
         value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS")
@@ -390,15 +790,41 @@ class TradingSystemRuntime:
 
         return unique_symbols
 
+    def _derivative_snapshot_poll_concurrency(self) -> int:
+        value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_CONCURRENCY")
+        if value is None or not value.strip():
+            return 8
+        try:
+            return max(1, int(value))
+        except ValueError:
+            logger.warning(
+                "Invalid DERIVATIVE_SNAPSHOT_POLL_CONCURRENCY=%r; using default 8",
+                value,
+            )
+            return 8
+
+    def _derivative_snapshot_poll_batch_size(self) -> int:
+        value = os.getenv("DERIVATIVE_SNAPSHOT_POLL_BATCH_SIZE")
+        if value is None or not value.strip():
+            return 50
+        try:
+            return max(1, int(value))
+        except ValueError:
+            logger.warning(
+                "Invalid DERIVATIVE_SNAPSHOT_POLL_BATCH_SIZE=%r; using default 50",
+                value,
+            )
+            return 50
+
     def _start_derivative_snapshot_polling(self, universe: Any) -> None:
         """
-        Start REST polling for derivative-only market-data snapshots.
+        Start live fixed-rate REST polling for derivative-only market snapshots.
 
-        Orderflow is fed by WebSocket trades/orderbook data. Binance USD-M open
-        interest and funding are REST endpoints in this project, so caches and
-        analytics stay silent unless the REST client is called periodically.
+        This is intentionally not a Scheduler job. Open interest/funding snapshots
+        are market-data inputs, and they must not drift behind maintenance jobs or
+        wait for fixed-delay scheduler semantics.
         """
-        if self._derivative_snapshot_poll_job_id is not None:
+        if self._derivative_snapshot_poll_task is not None and not self._derivative_snapshot_poll_task.done():
             return
 
         if not self.settings.enable_market_data or not self.settings.enable_analytics:
@@ -418,8 +844,36 @@ class TradingSystemRuntime:
             return
 
         interval = self._derivative_snapshot_poll_interval_seconds()
+        concurrency = self._derivative_snapshot_poll_concurrency()
+        batch_size = self._derivative_snapshot_poll_batch_size()
+        stop_event = asyncio.Event()
+        self._derivative_snapshot_poll_stop = stop_event
 
-        async def poll_binance_derivative_snapshots() -> None:
+        async def poll_symbol(symbol: str, sem: asyncio.Semaphore) -> None:
+            async with sem:
+                try:
+                    await binance.get_open_interest(symbol=symbol)
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                        return
+                    logger.exception(
+                        "Failed to poll Binance open interest snapshot | symbol=%s",
+                        symbol,
+                    )
+
+                try:
+                    await binance.get_funding_rate(symbol=symbol, limit=1)
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                        return
+                    logger.exception(
+                        "Failed to poll Binance funding snapshot | symbol=%s",
+                        symbol,
+                    )
+
+        async def poll_once() -> None:
             active_symbols = [
                 symbol
                 for symbol in symbols
@@ -433,63 +887,87 @@ class TradingSystemRuntime:
                 )
                 return
 
-            for symbol in active_symbols:
-                try:
-                    await binance.get_open_interest(symbol=symbol)
-                except Exception as exc:
-                    if self._is_derivative_symbol_unavailable_error(exc):
-                        self._disable_derivative_snapshot_symbol(symbol, exc)
-                        continue
+            sem = asyncio.Semaphore(concurrency)
+            for start in range(0, len(active_symbols), batch_size):
+                if stop_event.is_set():
+                    return
+                batch = active_symbols[start : start + batch_size]
+                await asyncio.gather(*(poll_symbol(symbol, sem) for symbol in batch))
 
-                    logger.exception(
-                        "Failed to poll Binance open interest snapshot | symbol=%s",
-                        symbol,
+        async def fixed_rate_loop() -> None:
+            next_run = asyncio.get_running_loop().time()
+            logger.info(
+                "Derivative snapshot polling loop started | exchange=binance symbols=%s interval=%s concurrency=%s batch_size=%s",
+                len(symbols),
+                interval,
+                concurrency,
+                batch_size,
+            )
+
+            while not stop_event.is_set():
+                now = asyncio.get_running_loop().time()
+                sleep_for = next_run - now
+                if sleep_for > 0:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+                started_at = asyncio.get_running_loop().time()
+                try:
+                    await poll_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Derivative snapshot polling tick failed")
+
+                # Fixed-rate schedule: advance from the previous planned tick, not
+                # from completion time. If we are behind, skip missed ticks instead
+                # of accumulating backlog.
+                next_run += interval
+                now = asyncio.get_running_loop().time()
+                while next_run <= now:
+                    next_run += interval
+
+                duration = now - started_at
+                if duration > interval:
+                    logger.warning(
+                        "Derivative snapshot polling tick exceeded interval | duration=%.3f interval=%.3f",
+                        duration,
+                        interval,
                     )
 
-                try:
-                    await binance.get_funding_rate(symbol=symbol, limit=1)
-                except Exception as exc:
-                    if self._is_derivative_symbol_unavailable_error(exc):
-                        self._disable_derivative_snapshot_symbol(symbol, exc)
-                        continue
+            logger.info("Derivative snapshot polling loop stopped")
 
-                    logger.exception(
-                        "Failed to poll Binance funding snapshot | symbol=%s",
-                        symbol,
-                    )
-
-        self._derivative_snapshot_poll_job_id = self.scheduler.add_interval_job(
+        self._derivative_snapshot_poll_task = asyncio.create_task(
+            fixed_rate_loop(),
             name="binance-derivative-snapshots-poll",
-            func=poll_binance_derivative_snapshots,
-            interval=interval,
-            run_immediately=True,
-            max_retries=0,
-            timeout=max(30.0, min(interval * 0.8, 120.0)),
-            allow_overlap=False,
         )
+        self._derivative_snapshot_poll_job_id = "binance-derivative-snapshots-poll"
 
-        logger.info(
-            "Derivative snapshot polling started | exchange=binance symbols=%s interval=%s job_id=%s",
-            len(symbols),
-            interval,
-            self._derivative_snapshot_poll_job_id,
-        )
-
-    def _stop_derivative_snapshot_polling(self) -> None:
-        job_id = self._derivative_snapshot_poll_job_id
-        if job_id is None:
-            return
+    async def _stop_derivative_snapshot_polling(self) -> None:
+        task = self._derivative_snapshot_poll_task
+        stop_event = self._derivative_snapshot_poll_stop
 
         self._derivative_snapshot_poll_job_id = None
-        try:
-            self.scheduler.remove_job(job_id)
-        except Exception:
-            logger.exception("Failed to remove derivative snapshot polling job | job_id=%s", job_id)
-        else:
-            logger.info("Derivative snapshot polling stopped | job_id=%s", job_id)
+        self._derivative_snapshot_poll_task = None
+        self._derivative_snapshot_poll_stop = None
+
+        if stop_event is not None:
+            stop_event.set()
+
+        if task is None:
+            return
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        logger.info("Derivative snapshot polling stopped")
 
     async def stop(self) -> None:
-        self._stop_derivative_snapshot_polling()
+        await self._stop_derivative_snapshot_polling()
 
         # Stop in reverse order. Telegram/news/execution/risk/strategy/analytics/market_stream.
         for component in reversed(self.components):

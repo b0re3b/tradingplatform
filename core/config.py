@@ -131,11 +131,14 @@ class EventBusConfig:
     max_retries: int = 1
     retry_delay: float = 0.02
     enable_metrics: bool = True
+    handler_dispatch_mode: str = "concurrent"
+    handler_timeout: float | None = None
 
 
 @dataclass(slots=True)
 class SchedulerConfig:
     tick_interval: float = 0.2
+    default_schedule_mode: str = "fixed_rate"
     graceful_shutdown_timeout: float = 10.0
     wait_running_jobs_on_shutdown: bool = True
 
@@ -267,9 +270,20 @@ class Config:
                 max_retries=_to_int(_get_env("EVENT_BUS_MAX_RETRIES"), 1),
                 retry_delay=_to_float(_get_env("EVENT_BUS_RETRY_DELAY"), 0.02),
                 enable_metrics=_to_bool(_get_env("EVENT_BUS_ENABLE_METRICS"), True),
+                handler_dispatch_mode=(
+                    _get_env("EVENT_BUS_HANDLER_DISPATCH_MODE", "concurrent") or "concurrent"
+                ),
+                handler_timeout=(
+                    _to_float(_get_env("EVENT_BUS_HANDLER_TIMEOUT"), 0.0)
+                    if _get_env("EVENT_BUS_HANDLER_TIMEOUT") not in {None, ""}
+                    else None
+                ),
             ),
             scheduler=SchedulerConfig(
                 tick_interval=_to_float(_get_env("SCHEDULER_TICK_INTERVAL"), 0.2),
+                default_schedule_mode=(
+                    _get_env("SCHEDULER_DEFAULT_SCHEDULE_MODE", "fixed_rate") or "fixed_rate"
+                ),
                 graceful_shutdown_timeout=_to_float(_get_env("SCHEDULER_SHUTDOWN_TIMEOUT"), 10.0),
                 wait_running_jobs_on_shutdown=_to_bool(
                     _get_env("SCHEDULER_WAIT_RUNNING_JOBS_ON_SHUTDOWN"),
