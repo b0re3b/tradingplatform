@@ -1,22 +1,3 @@
-"""
-Telegram bot package formatter.
-
-Formatter layer для Telegram notification service.
-
-Цей модуль:
-- не викликає Telegram API;
-- не підписується на EventBus;
-- не містить торгової бізнес-логіки;
-- не читає market data напряму;
-- тільки перетворює TelegramEventPayload + TelegramTopicRoute
-  у TelegramFormattedMessage.
-
-Важливо:
-- Основний parse_mode: HTML.
-- Усі значення payload екрануються через html.escape().
-- bot_token/secrets ніколи не форматуються в повідомлення.
-"""
-
 from __future__ import annotations
 
 import json
@@ -169,66 +150,46 @@ class TelegramFormatter:
         route: TelegramTopicRoute,
         event: TelegramEventPayload,
     ) -> TelegramFormattedMessage:
-        payload = self._sanitize_payload(event.payload)
-        domain = self._analytics_domain(event)
-        template = get_template_for_analytics_domain(domain)
+        """
+        Formats analytics events as compact domain-specific Telegram alerts.
 
-        values = self._base_values(event=event, route=route)
-        values.update(
-            {
-                "title": self._safe(payload.get("title", self._analytics_title(domain))),
-                "market_block": self._market_block(payload),
-                "confidence_block": self._confidence_block(payload),
-                "exchange": self._safe(payload.get("exchange")),
-                "symbol": self._safe(payload.get("symbol")),
-                "market_type": self._safe(payload.get("market_type", "futures")),
-                "timeframe": self._safe(payload.get("timeframe")),
-                "side": self._safe(payload.get("side", payload.get("direction", "n/a"))),
-                "signal_name": self._safe(
-                    payload.get("signal_name", payload.get("name", "analytics"))
-                ),
-                "strength": self._safe(payload.get("strength", payload.get("level", "n/a"))),
-                "score": self._format_number(payload.get("score")),
-                "confidence": self._format_number(payload.get("confidence")),
-                "summary": self._multiline(payload.get("summary", payload.get("message", "n/a"))),
-                # domain-specific placeholders
-                "pattern": self._safe(payload.get("pattern")),
-                "delta": self._format_number(payload.get("delta")),
-                "cvd": self._format_number(payload.get("cvd")),
-                "absorption": self._safe(payload.get("absorption", payload.get("absorption_detected"))),
-                "liquidity_event": self._safe(payload.get("liquidity_event", payload.get("event_type"))),
-                "level": self._format_price(payload.get("level", payload.get("price_level"))),
-                "sweep_detected": self._safe(payload.get("sweep_detected")),
-                "structure": self._safe(payload.get("structure")),
-                "trend": self._safe(payload.get("trend")),
-                "liquidation_volume": self._format_number(payload.get("liquidation_volume")),
-                "cluster_price": self._format_price(payload.get("cluster_price")),
-                "cascade_risk": self._safe(payload.get("cascade_risk")),
-                "whale_action": self._safe(payload.get("whale_action", payload.get("action"))),
-                "volume": self._format_number(payload.get("volume")),
-                "notional": self._format_number(payload.get("notional")),
-                "fake_liquidity": self._format_number(payload.get("fake_liquidity")),
-                "base_exchange": self._safe(payload.get("base_exchange")),
-                "quote_exchange": self._safe(payload.get("quote_exchange")),
-                "spread": self._format_number(payload.get("spread")),
-                "spread_pct": self._format_pct(payload.get("spread_pct")),
-                "funding_rate": self._format_pct(payload.get("funding_rate")),
-                "predicted_rate": self._format_pct(payload.get("predicted_rate")),
-                "next_funding_time": self._format_timestamp(payload.get("next_funding_time_ms")),
-                "bias": self._safe(payload.get("bias")),
-                "open_interest": self._format_number(payload.get("open_interest")),
-                "oi_delta": self._format_number(payload.get("oi_delta")),
-                "oi_delta_pct": self._format_pct(payload.get("oi_delta_pct")),
-                "price_change_pct": self._format_pct(payload.get("price_change_pct")),
-                "interpretation": self._safe(payload.get("interpretation")),
-            }
-        )
+        Analytics payloads in this project are intentionally nested and differ
+        across domains. This formatter flattens the public payload and then
+        renders only fields that are actually present. Missing values are not
+        shown as n/a; irrelevant fields are omitted entirely.
+        """
+
+        raw_payload = self._sanitize_payload(event.payload)
+        payload = self._analytics_view_payload(raw_payload)
+        domain = (self._analytics_domain(event) or "analytics").strip().lower()
+        event_name = event.metadata.event_name
+
+        title = self._analytics_signal_title(domain=domain, event_name=event_name, payload=payload)
+        sections = [f"<b>{title}</b>"]
+
+        market_block = self._market_block_compact(payload)
+        if market_block:
+            sections.append(market_block)
+
+        metric_block = self._analytics_metric_block(domain=domain, event_name=event_name, payload=payload)
+        if metric_block:
+            sections.append(metric_block)
+
+        confidence_block = self._analytics_score_block(payload)
+        if confidence_block:
+            sections.append(confidence_block)
+
+        summary = self._analytics_summary(domain, event_name, payload)
+        if summary is not None and str(summary).strip():
+            sections.append(f"<b>Summary:</b>\n{self._multiline(summary)}")
+
+        sections.append(self._footer(event))
 
         return self._build_message(
-            template=template,
-            values=values,
+            template="{body}",
+            values={"body": "\n\n".join(sections)},
             route=route,
-            title=self._analytics_title(domain),
+            title=title,
         )
 
     def format_news_event(
@@ -714,6 +675,439 @@ class TelegramFormatter:
             f"<i>time:</i> <code>{timestamp}</code>"
         )
 
+    def _analytics_view_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+
+
+        merged: dict[str, Any] = {}
+
+        def merge_dict(value: Any) -> None:
+            if isinstance(value, dict):
+                merged.update(value)
+
+        merge_dict(payload.get("payload"))
+        merge_dict(payload.get("data"))
+        merge_dict(payload.get("result"))
+        merge_dict(payload.get("signal"))
+
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+
+        merge_dict(context.get("stats") if isinstance(context, dict) else None)
+        merge_dict(stats)
+        merge_dict(context)
+
+        # Keep scope values available both as nested scope and flat fields.
+        scope = self._first_present(payload, "scope", "context.scope", "stats.scope")
+        if isinstance(scope, dict):
+            for key in ("exchange", "market_type", "symbol", "timeframe", "exchange_symbol"):
+                if key in scope and key not in merged:
+                    merged[key] = scope[key]
+
+        # Top-level fields must win because they are the public event contract.
+        merged.update(payload)
+
+        # Common semantic aliases used by formatter templates.
+        if "cvd" not in merged:
+            cvd = self._first_present(merged, "cvd_value", "cvd_close", "cumulative_volume_delta")
+            if cvd is not None:
+                merged["cvd"] = cvd
+
+        if "delta" not in merged:
+            delta = self._first_present(merged, "volume_delta", "net_volume_delta", "notional_delta", "delta_ratio")
+            if delta is not None:
+                merged["delta"] = delta
+
+        if "score" not in merged and "strength" in merged:
+            merged["score"] = merged["strength"]
+
+        if "confidence" not in merged and "strength" in merged:
+            merged["confidence"] = merged["strength"]
+
+        if "pattern" not in merged:
+            pattern = self._first_present(merged, "metric", "signal_type", "reason")
+            if pattern is not None:
+                merged["pattern"] = pattern
+
+        return merged
+
+    def _first_present(self, payload: dict[str, Any], *paths: str, default: Any = None) -> Any:
+        for path in paths:
+            value = self._get_path(payload, path)
+            if value is not None and value != "":
+                return value
+        return default
+
+    def _get_path(self, payload: dict[str, Any], path: str) -> Any:
+        current: Any = payload
+        for part in path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+                continue
+            return None
+        return current
+
+    def _confidence_block_from_values(self, score: Any, confidence: Any) -> str:
+        return (
+            f"<b>Score:</b> <code>{self._format_number(score)}</code>\n"
+            f"<b>Confidence:</b> <code>{self._format_number(confidence)}</code>"
+        )
+
+    def _analytics_summary(self, domain: str | None, event_name: str, payload: dict[str, Any]) -> Any:
+        explicit = self._first_present(payload, "summary", "message", "description")
+        if explicit is not None:
+            return explicit
+
+        normalized_domain = (domain or "").lower()
+        if normalized_domain == "orderflow":
+            reason = self._safe_plain(self._first_present(payload, "reason", "signal_type", "metric", default="orderflow signal"))
+            parts = [reason.replace("_", " ")]
+
+            last_price = self._first_present(payload, "last_price", "price", "mid_price")
+            if last_price is not None:
+                parts.append(f"last price {self._format_price(last_price)}")
+
+            delta = self._first_present(payload, "volume_delta", "net_volume_delta", "delta")
+            if delta is not None:
+                parts.append(f"delta {self._format_number(delta)}")
+
+            cvd = self._first_present(payload, "cvd_value", "cvd_close", "cvd", "cumulative_volume_delta")
+            if cvd is not None:
+                parts.append(f"CVD {self._format_number(cvd)}")
+
+            delta_ratio = self._first_present(payload, "delta_ratio", "imbalance_ratio")
+            if delta_ratio is not None:
+                parts.append(f"ratio {self._format_number(delta_ratio)}")
+
+            trades_count = self._first_present(payload, "trades_count")
+            if trades_count is not None:
+                parts.append(f"trades {self._format_number(trades_count)}")
+
+            return " | ".join(parts)
+
+        reason = self._first_present(payload, "reason", "signal_type", "event_type")
+        if reason is not None:
+            return str(reason).replace("_", " ")
+
+        return event_name
+
+    def _analytics_signal_title(self, *, domain: str, event_name: str, payload: dict[str, Any]) -> str:
+        domain_title = {
+            "orderflow": "📊 Orderflow Signal",
+            "liquidity": "💧 Liquidity Signal",
+            "price_action": "📈 Price Action Signal",
+            "liquidations": "🔥 Liquidation Signal",
+            "whales": "🐋 Whale Signal",
+            "spoofing": "🎭 Spoofing Signal",
+            "spreads": "🔁 Spread Signal",
+            "funding": "💸 Funding Signal",
+            "open_interest": "📉 Open Interest Signal",
+        }.get(domain, "📊 Analytics Signal")
+
+        event_tail = event_name.split("analytics.", 1)[-1] if event_name else ""
+        detail = self._first_present(
+            payload,
+            "signal_name",
+            "setup_type",
+            "event_type",
+            "signal_type",
+            "metric",
+            "pattern",
+            "reason",
+        )
+        if detail is None and event_tail:
+            parts = event_tail.split(".")
+            if len(parts) > 1:
+                detail = parts[-1] if parts[-1] != "signal" else parts[-2]
+
+        if detail is None:
+            return domain_title
+
+        detail_text = str(detail).replace("_", " ").replace(".", " ").strip().title()
+        if not detail_text or detail_text.lower() in domain_title.lower():
+            return domain_title
+        return f"{domain_title} · {self._safe(detail_text)}"
+
+    def _analytics_metric_block(self, *, domain: str, event_name: str, payload: dict[str, Any]) -> str:
+        normalized = domain.lower()
+        if normalized == "oi":
+            normalized = "open_interest"
+
+        if normalized == "orderflow":
+            specs = self._orderflow_specs(event_name)
+        elif normalized == "liquidity":
+            specs = self._liquidity_specs(event_name)
+        elif normalized == "price_action":
+            specs = self._price_action_specs(event_name)
+        elif normalized == "liquidations":
+            specs = self._liquidations_specs(event_name)
+        elif normalized == "whales":
+            specs = self._whales_specs(event_name)
+        elif normalized == "spoofing":
+            specs = self._spoofing_specs(event_name)
+        elif normalized == "spreads":
+            specs = self._spreads_specs(event_name)
+        elif normalized == "funding":
+            specs = self._funding_specs(event_name)
+        elif normalized == "open_interest":
+            specs = self._open_interest_specs(event_name)
+        else:
+            specs = self._generic_analytics_specs(event_name)
+
+        lines = []
+        seen_labels: set[str] = set()
+        for label, paths, formatter in specs:
+            if label in seen_labels:
+                continue
+            value = self._first_present(payload, *paths)
+            line = self._analytics_line(label, value, formatter=formatter)
+            if line:
+                seen_labels.add(label)
+                lines.append(line)
+
+        return "\n".join(lines)
+
+    def _analytics_score_block(self, payload: dict[str, Any]) -> str:
+        specs = (
+            ("Score", ("score", "quality_score", "signal_score", "setup_score", "confluence_score", "weighted_score"), "number"),
+            ("Confidence", ("confidence", "signal_confidence", "setup_confidence", "confidence_score"), "number"),
+            ("Strength", ("strength", "signal_strength", "level", "intensity"), "number_or_text"),
+        )
+        lines = []
+        for label, paths, formatter in specs:
+            value = self._first_present(payload, *paths)
+            line = self._analytics_line(label, value, formatter=formatter)
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
+
+    def _market_block_compact(self, payload: dict[str, Any]) -> str:
+        specs = (
+            ("Exchange", ("exchange", "scope.exchange", "contract.exchange"), "text"),
+            ("Symbol", ("symbol", "scope.symbol", "contract.symbol"), "text"),
+            ("Market", ("market_type", "scope.market_type", "contract.market_type", "category"), "text"),
+            ("Timeframe", ("timeframe", "scope.timeframe", "contract.timeframe"), "text"),
+        )
+        lines = []
+        for label, paths, formatter in specs:
+            value = self._first_present(payload, *paths)
+            line = self._analytics_line(label, value, formatter=formatter)
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
+
+    def _analytics_line(self, label: str, value: Any, *, formatter: str = "text") -> str:
+        if value is None or value == "":
+            return ""
+
+        if isinstance(value, (list, tuple, set)) and not value:
+            return ""
+
+        if isinstance(value, dict) and not value:
+            return ""
+
+        if formatter == "price":
+            formatted = self._format_price(value, default="")
+        elif formatter == "number":
+            formatted = self._format_number(value, default="")
+        elif formatter == "pct":
+            formatted = self._format_pct(value, default="")
+        elif formatter == "timestamp":
+            formatted = self._format_timestamp(value)
+            if formatted == "n/a":
+                formatted = ""
+        elif formatter == "bool":
+            formatted = self._format_bool(value, default="")
+        elif formatter == "list":
+            formatted = self._format_list(value, default="")
+        elif formatter == "number_or_text":
+            formatted = self._format_number(value, default="")
+            if not formatted:
+                formatted = self._safe(value, default="")
+        else:
+            formatted = self._safe(value, default="")
+
+        if not formatted:
+            return ""
+        return f"<b>{escape(label, quote=True)}:</b> <code>{formatted}</code>"
+
+    def _format_bool(self, value: Any, *, default: str = "n/a") -> str:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        text = str(value).strip().lower()
+        if text in {"true", "1", "yes", "y", "detected"}:
+            return "yes"
+        if text in {"false", "0", "no", "n", "none", "not_detected"}:
+            return "no"
+        return self._safe(value, default=default)
+
+    def _orderflow_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        event = event_name.lower()
+        common = (
+            ("Side", ("side", "direction", "bias"), "text"),
+            ("Price", ("last_price", "price", "mid_price", "close"), "price"),
+        )
+        if "cvd" in event:
+            return common + (
+                ("CVD", ("cvd", "cvd_value", "cvd_close", "cumulative_volume_delta"), "number"),
+                ("Volume Delta", ("volume_delta", "net_volume_delta", "delta"), "number"),
+                ("Delta Ratio", ("delta_ratio", "volume_delta_ratio"), "number"),
+                ("Buy Volume", ("buy_volume", "aggressive_buy_volume"), "number"),
+                ("Sell Volume", ("sell_volume", "aggressive_sell_volume"), "number"),
+                ("Trades", ("trades_count", "trade_count", "count"), "number"),
+            )
+        if "volume_delta" in event:
+            return common + (
+                ("Volume Delta", ("volume_delta", "net_volume_delta", "delta"), "number"),
+                ("Delta Ratio", ("delta_ratio", "volume_delta_ratio"), "number"),
+                ("Buy Volume", ("buy_volume", "aggressive_buy_volume"), "number"),
+                ("Sell Volume", ("sell_volume", "aggressive_sell_volume"), "number"),
+                ("Total Volume", ("total_volume", "volume"), "number"),
+                ("Trades", ("trades_count", "trade_count", "count"), "number"),
+            )
+        if "aggressive" in event:
+            return common + (
+                ("Aggressive Buy", ("aggressive_buy_volume", "buy_volume"), "number"),
+                ("Aggressive Sell", ("aggressive_sell_volume", "sell_volume"), "number"),
+                ("Aggressor Imbalance", ("aggressor_imbalance", "imbalance_ratio", "delta_ratio"), "number"),
+                ("Large Trades", ("large_trades_count", "large_trade_count"), "number"),
+                ("Total Volume", ("total_volume", "volume"), "number"),
+            )
+        if "orderbook_imbalance" in event or "imbalance" in event:
+            return common + (
+                ("Best Bid", ("best_bid", "bid_price"), "price"),
+                ("Best Ask", ("best_ask", "ask_price"), "price"),
+                ("Spread", ("spread",), "price"),
+                ("Bid Volume", ("bid_volume",), "number"),
+                ("Ask Volume", ("ask_volume",), "number"),
+                ("Imbalance Ratio", ("imbalance_ratio", "raw_imbalance_ratio"), "number"),
+                ("Imbalance Diff", ("imbalance_diff",), "number"),
+                ("Depth Levels", ("depth_levels_used", "levels_used"), "number"),
+            )
+        return common + (
+            ("Pattern", ("pattern", "metric", "signal_type", "reason"), "text"),
+            ("Volume Delta", ("volume_delta", "net_volume_delta", "delta"), "number"),
+            ("CVD", ("cvd", "cvd_value", "cvd_close", "cumulative_volume_delta"), "number"),
+            ("Volume", ("volume", "total_volume"), "number"),
+        )
+
+    def _liquidity_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Event", ("liquidity_event", "event_type", "type", "reason"), "text"),
+            ("Side", ("side", "direction", "sweep_side"), "text"),
+            ("Level", ("level", "price_level", "liquidity_level", "price"), "price"),
+            ("Current Price", ("current_price", "last_price", "price", "mid_price"), "price"),
+            ("Sweep", ("sweep_detected", "swept", "is_swept", "detected"), "bool"),
+            ("Liquidity", ("liquidity", "liquidity_score", "liquidity_volume", "volume"), "number"),
+            ("Stop Cluster", ("stop_cluster", "stop_cluster_price", "cluster_price"), "price"),
+            ("Distance", ("distance", "distance_to_level", "distance_pct"), "number_or_text"),
+        )
+
+    def _price_action_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Structure", ("structure", "market_structure", "structure_type"), "text"),
+            ("Pattern", ("pattern", "pattern_type", "event_type", "reason"), "text"),
+            ("Trend", ("trend", "trend_direction", "direction", "bias"), "text"),
+            ("Side", ("side", "signal_side"), "text"),
+            ("Price", ("price", "current_price", "last_price", "close"), "price"),
+            ("Level", ("level", "price_level", "support", "resistance"), "price"),
+            ("Breakout", ("breakout", "breakout_detected"), "bool"),
+            ("Retest", ("retest", "retest_detected"), "bool"),
+        )
+
+    def _liquidations_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Side", ("side", "liquidation_side", "direction"), "text"),
+            ("Price", ("price", "avg_price", "weighted_avg_price", "cluster_price"), "price"),
+            ("Liquidation Volume", ("liquidation_volume", "total_liquidation_volume", "volume", "size"), "number"),
+            ("Notional", ("notional", "notional_value", "total_notional", "usd_value"), "number"),
+            ("Cluster Price", ("cluster_price", "level"), "price"),
+            ("Liquidations", ("liquidation_count", "count", "events_count"), "number"),
+            ("Cascade Risk", ("cascade_risk", "risk", "risk_level", "cascade_score"), "number_or_text"),
+            ("Exhaustion", ("exhaustion", "exhaustion_detected", "is_exhausted"), "bool"),
+        )
+
+    def _whales_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Action", ("whale_action", "action", "event_type", "type"), "text"),
+            ("Side", ("side", "direction", "bias"), "text"),
+            ("Price", ("price", "avg_price", "last_price"), "price"),
+            ("Volume", ("volume", "total_volume", "whale_volume"), "number"),
+            ("Notional", ("notional", "notional_value", "usd_value", "total_notional"), "number"),
+            ("Whale Count", ("whale_count", "wallet_count", "participants", "count"), "number"),
+            ("Pressure", ("pressure", "whale_pressure", "pressure_score"), "number_or_text"),
+            ("Net Flow", ("net_flow", "net_volume", "net_notional"), "number"),
+            ("Absorption", ("absorption", "absorption_detected"), "bool"),
+        )
+
+    def _spoofing_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Pattern", ("pattern", "pattern_type", "spoofing_type", "event_type"), "text"),
+            ("Side", ("side", "direction"), "text"),
+            ("Price", ("price", "level", "best_price"), "price"),
+            ("Fake Liquidity", ("fake_liquidity", "fake_liquidity_score", "spoof_volume", "volume"), "number"),
+            ("Layer Count", ("layer_count", "layers", "levels_count"), "number"),
+            ("Bid Spoof Volume", ("bid_spoof_volume", "spoof_bid_volume"), "number"),
+            ("Ask Spoof Volume", ("ask_spoof_volume", "spoof_ask_volume"), "number"),
+            ("Pull Ratio", ("pull_ratio", "cancel_ratio"), "number"),
+        )
+
+    def _spreads_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Symbol", ("symbol", "base_symbol"), "text"),
+            ("Base Exchange", ("base_exchange", "exchange_a", "long_exchange"), "text"),
+            ("Quote Exchange", ("quote_exchange", "exchange_b", "short_exchange"), "text"),
+            ("Spread", ("spread", "spread_value", "basis", "basis_value"), "number"),
+            ("Spread %", ("spread_pct", "basis_pct", "spread_percent"), "pct"),
+            ("Funding Adj. Basis", ("funding_adjusted_basis", "adjusted_basis"), "number"),
+            ("Long Leg", ("long_leg", "long_exchange"), "text"),
+            ("Short Leg", ("short_leg", "short_exchange"), "text"),
+            ("Expected PnL", ("expected_pnl", "expected_profit", "edge"), "number"),
+        )
+
+    def _funding_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Funding Rate", ("funding_rate", "current_funding_rate"), "pct"),
+            ("Predicted Rate", ("predicted_rate", "predicted_funding_rate", "forecast_funding_rate"), "pct"),
+            ("Next Funding", ("next_funding_time", "next_funding_time_ms", "funding_time"), "timestamp"),
+            ("Bias", ("bias", "direction", "side", "funding_bias"), "text"),
+            ("Mark Price", ("mark_price", "price", "last_price"), "price"),
+            ("Index Price", ("index_price",), "price"),
+            ("Regime", ("regime", "funding_regime", "regime_name"), "text"),
+            ("Pressure", ("pressure", "funding_pressure", "pressure_score"), "number_or_text"),
+        )
+
+    def _open_interest_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Open Interest", ("open_interest", "oi", "current_open_interest", "open_interest_value"), "number"),
+            ("OI Delta", ("oi_delta", "open_interest_delta", "delta"), "number"),
+            ("OI Delta %", ("oi_delta_pct", "open_interest_delta_pct", "delta_pct"), "pct"),
+            ("Price", ("price", "last_price", "mark_price", "close"), "price"),
+            ("Price Change %", ("price_change_pct", "price_pct_change", "change_pct"), "pct"),
+            ("Regime", ("regime", "oi_regime", "regime_name"), "text"),
+            ("Divergence", ("divergence", "divergence_type"), "text"),
+            ("Anomaly", ("anomaly", "anomaly_type"), "text"),
+            ("Interpretation", ("interpretation", "reason", "signal_type"), "text"),
+        )
+
+    def _generic_analytics_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        return (
+            ("Signal", ("signal_name", "name", "event_type", "signal_type", "type"), "text"),
+            ("Side", ("side", "direction", "bias"), "text"),
+            ("Price", ("price", "last_price", "mark_price", "mid_price", "close"), "price"),
+            ("Level", ("level", "price_level"), "price"),
+            ("Volume", ("volume", "total_volume"), "number"),
+            ("Notional", ("notional", "notional_value"), "number"),
+        )
+
+    @staticmethod
+    def _safe_plain(value: Any, *, default: str = "n/a") -> str:
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text if text else default
+
     def _market_block(self, payload: dict[str, Any]) -> str:
         exchange = self._safe(payload.get("exchange"))
         symbol = self._safe(payload.get("symbol"))
@@ -937,7 +1331,15 @@ class TelegramFormatter:
 
     def _format_timestamp(self, timestamp_ms: Any) -> str:
         if timestamp_ms is None or timestamp_ms == "":
-            return datetime.now(timezone.utc).isoformat(timespec="seconds")
+            return "n/a"
+
+        if isinstance(timestamp_ms, str):
+            text = timestamp_ms.strip()
+            if not text:
+                return "n/a"
+            # Already ISO-like timestamp. Keep it instead of trying to parse as float.
+            if "T" in text or "-" in text:
+                return self._safe(text)
 
         try:
             ts = float(timestamp_ms)

@@ -27,7 +27,10 @@ class BinanceFuturesRestClientConfig:
     rest_url: str = "https://testnet.binancefuture.com"
     timeout_seconds: float = 10.0
 
-    recv_window: int = 5000
+    recv_window: int = 10000
+    max_recv_window: int = 60000
+    time_sync_on_start: bool = True
+    resync_time_error_codes: tuple[int, ...] = (-1021,)
     request_retries: int = 2
     retry_delay_seconds: float = 0.25
 
@@ -46,6 +49,10 @@ class BinanceFuturesRestClientConfig:
         return cls(
             rest_url=config.exchange.rest_url or defaults.rest_url,
             timeout_seconds=config.exchange.timeout_seconds,
+            recv_window=defaults.recv_window,
+            max_recv_window=defaults.max_recv_window,
+            time_sync_on_start=defaults.time_sync_on_start,
+            resync_time_error_codes=defaults.resync_time_error_codes,
         )
 
 
@@ -122,10 +129,20 @@ class BinanceRestClient:
         self._started = True
 
         self._logger.info(
-            "Binance Futures REST client started | base_url=%s timeout=%s",
+            "Binance Futures REST client started | base_url=%s timeout=%s recv_window=%s",
             self._rest_config.rest_url,
             self._rest_config.timeout_seconds,
+            self._rest_config.recv_window,
         )
+
+        if self._rest_config.time_sync_on_start:
+            try:
+                await self.sync_time()
+            except Exception:
+                self._logger.warning(
+                    "Initial Binance Futures server time sync failed; will retry before signed requests",
+                    exc_info=True,
+                )
 
         await self._emit_event(
             "system.exchange.rest.started",
@@ -1264,7 +1281,7 @@ class BinanceRestClient:
         assert self._session is not None
 
         method = method.upper()
-        params = dict(params or {})
+        base_params = dict(params or {})
         headers: dict[str, str] = {}
 
         if auth_required:
@@ -1276,38 +1293,51 @@ class BinanceRestClient:
             self._require_credentials()
             assert self._api_secret is not None
 
+            # Keep signed requests tolerant to local clock drift and request latency.
+            # Binance returns -1021 when timestamp is outside recvWindow; on that
+            # error we resync server time, rebuild timestamp/signature, and retry.
             if self._time_offset_ms == 0:
                 await self.sync_time()
 
-            params["timestamp"] = self._current_timestamp_ms() + self._time_offset_ms
-            query_string = self._build_query_string(params)
-            params["signature"] = self._sign(query_string)
+            recv_window = self._safe_int(base_params.get("recvWindow")) or self._rest_config.recv_window
+            recv_window = min(max(recv_window, self._rest_config.recv_window), self._rest_config.max_recv_window)
+            base_params["recvWindow"] = recv_window
 
         url = f"{self._rest_config.rest_url}{path}"
 
         last_error: Exception | None = None
 
         for attempt in range(self._rest_config.request_retries + 1):
+            params_for_attempt = dict(base_params)
+
+            if signed:
+                assert self._api_secret is not None
+                params_for_attempt["timestamp"] = self._current_timestamp_ms() + self._time_offset_ms
+                query_string = self._build_query_string(params_for_attempt)
+                params_for_attempt["signature"] = self._sign(query_string)
+
             try:
                 self._logger.debug(
-                    "Sending Binance Futures REST request | method=%s path=%s signed=%s auth_required=%s attempt=%s",
+                    "Sending Binance Futures REST request | method=%s path=%s signed=%s auth_required=%s attempt=%s time_offset_ms=%s",
                     method,
                     path,
                     signed,
                     auth_required,
                     attempt + 1,
+                    self._time_offset_ms,
                 )
 
                 async with self._session.request(
                     method=method,
                     url=url,
-                    params=params,
+                    params=params_for_attempt,
                     headers=headers,
                 ) as response:
                     response_text = await response.text()
 
                     if response.status >= 400:
                         error_payload = self._parse_error_payload(response_text)
+                        error_code = self._safe_int(error_payload.get("code"))
 
                         await self._handle_http_error(
                             method=method,
@@ -1316,9 +1346,25 @@ class BinanceRestClient:
                             error_payload=error_payload,
                         )
 
+                        if (
+                            signed
+                            and error_code in self._rest_config.resync_time_error_codes
+                            and attempt < self._rest_config.request_retries
+                        ):
+                            self._logger.warning(
+                                "Binance timestamp rejected; resyncing server time before retry | method=%s path=%s code=%s",
+                                method,
+                                path,
+                                error_code,
+                            )
+                            await self.sync_time()
+                            await asyncio.sleep(self._rest_config.retry_delay_seconds)
+                            continue
+
                         raise RuntimeError(
                             f"Binance Futures REST error | method={method} path={path} "
-                            f"status={response.status} code={error_payload.get('code')}"
+                            f"status={response.status} code={error_payload.get('code')} "
+                            f"message={error_payload.get('message')}"
                         )
 
                     payload = await response.json()
@@ -1326,16 +1372,32 @@ class BinanceRestClient:
                     # Binance Futures may return {"code":..., "msg":...} for some business errors
                     # even with HTTP 200.
                     code = payload.get("code") if isinstance(payload, dict) else None
-                    if isinstance(code, int) and code < 0:
+                    code_i = self._safe_int(code)
+                    if isinstance(code_i, int) and code_i < 0:
                         await self._handle_business_error(
                             method=method,
                             path=path,
                             payload=payload,
                         )
 
+                        if (
+                            signed
+                            and code_i in self._rest_config.resync_time_error_codes
+                            and attempt < self._rest_config.request_retries
+                        ):
+                            self._logger.warning(
+                                "Binance business timestamp error; resyncing server time before retry | method=%s path=%s code=%s",
+                                method,
+                                path,
+                                code_i,
+                            )
+                            await self.sync_time()
+                            await asyncio.sleep(self._rest_config.retry_delay_seconds)
+                            continue
+
                         raise RuntimeError(
                             f"Binance Futures business error | method={method} path={path} "
-                            f"code={code} msg={payload.get('msg')}"
+                            f"code={code_i} msg={payload.get('msg')}"
                         )
 
                     if self._rest_config.emit_success_events:

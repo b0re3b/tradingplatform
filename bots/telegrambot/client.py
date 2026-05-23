@@ -1,23 +1,3 @@
-"""
-Telegram bot package client.
-
-Async Telegram HTTP/API client.
-
-Цей модуль:
-- не підписується на EventBus;
-- не містить trading/business logic;
-- не форматує analytics/signal/risk повідомлення;
-- тільки виконує Telegram Bot API requests;
-- не логить bot_token/secrets;
-- підтримує timeout, retry, rate-limit retry_after, healthcheck.
-
-External dependency:
-- aiohttp
-
-Install:
-    pip install aiohttp
-"""
-
 from __future__ import annotations
 
 import asyncio

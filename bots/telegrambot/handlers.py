@@ -1,24 +1,3 @@
-"""
-Telegram bot package handlers.
-
-EventBus handlers для Telegram notification layer.
-
-Цей модуль:
-- слухає core.event_bus.Event через methods, які реєструє service.py;
-- не містить trading/business logic;
-- не читає market data напряму;
-- не викликає analytics/strategy/risk/execution напряму;
-- тільки перетворює EventBus Event у Telegram notification flow.
-
-Pipeline:
-    Event
-        -> TelegramEventPayload
-        -> TelegramRouter.resolve()
-        -> TelegramFormatter.format()
-        -> TelegramBotClient.send_message()
-        -> TelegramBotState.record_delivery()
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
